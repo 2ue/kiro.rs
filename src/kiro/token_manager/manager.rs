@@ -1085,6 +1085,10 @@ const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_mi
 const TIER_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const BOUND_SESSION_COUNT_CACHE_TTL: StdDuration = StdDuration::from_millis(500);
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const SCHEDULER_INSTANCE_HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(5);
+/// A killed instance's leases are reclaimed at most this long after its last heartbeat.
+const SCHEDULER_INSTANCE_HEARTBEAT_TTL: StdDuration = StdDuration::from_secs(30);
+const SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 const CREDENTIAL_RUNTIME_MUTATION_RETENTION: StdDuration =
     StdDuration::from_secs(30 * 24 * 60 * 60);
@@ -5070,13 +5074,14 @@ impl MultiTokenManager {
             .clone();
         let credential_id = guard.credential_id();
         let lease_id = guard.id();
+        let owner_instance_id = self.scheduler_instance_id.clone();
         let redis_acquire = self
             .await_scheduler_redis_hot_outcome(
                 "占用 Redis 凭据并发槽",
                 || guard.arm_redis_commit_unknown(),
                 async move {
                     redis
-                        .acquire_dispatch_lease(
+                        .acquire_dispatch_lease_owned(
                             credential_id,
                             lease_id,
                             effective_max_concurrent_requests,
@@ -5084,6 +5089,7 @@ impl MultiTokenManager {
                             request_weight_units,
                             max_age,
                             InFlightKind::Api.as_str(),
+                            Some(&owner_instance_id),
                         )
                         .await
                 },
@@ -10338,6 +10344,105 @@ impl MultiTokenManager {
             }
         }
         report
+    }
+
+    /// Refreshes this instance's Redis heartbeat and releases the leases of instances whose
+    /// heartbeat has expired, so a killed process gives its concurrency slots back within
+    /// `SCHEDULER_INSTANCE_HEARTBEAT_TTL` instead of after `credentialInFlightLeaseMaxSecs`.
+    pub(crate) async fn heartbeat_and_reclaim_dead_instance_leases(&self) {
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        if let Err(err) = tokio::time::timeout(
+            SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT,
+            redis.heartbeat_scheduler_instance(
+                &self.scheduler_instance_id,
+                SCHEDULER_INSTANCE_HEARTBEAT_TTL,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out"))
+        .and_then(|result| result)
+        {
+            tracing::warn!("刷新 Redis 调度实例心跳失败: {}", err);
+            return;
+        }
+        if let Err(err) = tokio::time::timeout(
+            SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT,
+            redis.touch_instance_in_flight_leases(&self.scheduler_instance_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out"))
+        .and_then(|result| result)
+        {
+            tracing::warn!("刷新本实例 Redis 并发租约活跃时间失败: {}", err);
+        }
+        match tokio::time::timeout(
+            SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT,
+            redis.reclaim_dead_instance_leases(&self.scheduler_instance_id),
+        )
+        .await
+        {
+            Ok(Ok((dead, released))) if dead > 0 => {
+                tracing::warn!(
+                    dead_instances = dead,
+                    released_leases = released,
+                    "已回收心跳过期实例遗留的 Redis 并发租约"
+                );
+                if released > 0 {
+                    *self.last_scheduler_redis_sync_at.lock() = None;
+                    self.scheduler_redis_full_sync_requested
+                        .fetch_add(1, Ordering::AcqRel);
+                    self.refresh_scheduler_state_from_redis_best_effort();
+                    self.notify_dispatch_state_changed();
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!("回收心跳过期实例的 Redis 并发租约失败: {}", err),
+            Err(_) => tracing::warn!("回收心跳过期实例的 Redis 并发租约超时"),
+        }
+    }
+
+    /// Releases every Redis lease this instance owns. Called when the process is stopping so
+    /// the next instance starts with free slots even if in-flight requests never finish.
+    pub(crate) async fn release_own_in_flight_leases(&self, timeout: StdDuration) -> usize {
+        let Some(redis) = &self.redis_store else {
+            return 0;
+        };
+        match tokio::time::timeout(
+            timeout,
+            redis.release_instance_in_flight_leases(&self.scheduler_instance_id),
+        )
+        .await
+        {
+            Ok(Ok(released)) => released,
+            Ok(Err(err)) => {
+                tracing::warn!("退出时释放本实例 Redis 并发租约失败: {}", err);
+                0
+            }
+            Err(_) => {
+                tracing::warn!("退出时释放本实例 Redis 并发租约超时");
+                0
+            }
+        }
+    }
+
+    pub fn spawn_scheduler_instance_heartbeat_worker(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.redis_store.as_ref()?;
+        let manager = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SCHEDULER_INSTANCE_HEARTBEAT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                manager.heartbeat_and_reclaim_dead_instance_leases().await;
+            }
+        }))
     }
 
     pub fn spawn_stats_flush_worker(self: &Arc<Self>) -> StatsFlushWorkerHandle {

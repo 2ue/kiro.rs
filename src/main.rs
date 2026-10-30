@@ -49,6 +49,7 @@ const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30)
 const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+const SHUTDOWN_LEASE_RELEASE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 const MODEL_CAPABILITY_HEALTH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const MODEL_CAPABILITY_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(300);
@@ -560,6 +561,8 @@ async fn async_main() {
     let token_manager = Arc::new(token_manager);
     let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
+    let scheduler_instance_heartbeat_worker =
+        token_manager.spawn_scheduler_instance_heartbeat_worker();
     let external_pool_manager = Arc::new(ExternalPoolManager::new(
         postgres_store.clone(),
         redis_store.clone(),
@@ -797,7 +800,20 @@ async fn async_main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    let server_result = serve_until_shutdown(listener, app).await;
+    let shutdown_token_manager = token_manager.clone();
+    let server_result = serve_until_shutdown(listener, app, move || async move {
+        // Give the concurrency slots back first: `docker stop` sends SIGKILL after 10 seconds
+        // by default, long before in-flight requests finish draining, and leases left in Redis
+        // would otherwise block the next instance.
+        let released = shutdown_token_manager
+            .release_own_in_flight_leases(SHUTDOWN_LEASE_RELEASE_TIMEOUT)
+            .await;
+        tracing::info!(released, "收到停止信号，已释放本实例 Redis 并发租约");
+    })
+    .await;
+    if let Some(worker) = scheduler_instance_heartbeat_worker {
+        worker.abort();
+    }
 
     let shutdown_started_at = Instant::now();
     let shutdown_deadline = shutdown_started_at + BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT;
@@ -1095,14 +1111,22 @@ async fn abort_task_with_timeout<T>(task_name: &'static str, task: tokio::task::
     }
 }
 
-async fn serve_until_shutdown(
+/// `on_shutdown_signal` runs as soon as the stop signal arrives, before in-flight connections
+/// are drained: the container may be killed before draining finishes.
+async fn serve_until_shutdown<F, Fut>(
     listener: tokio::net::TcpListener,
     app: Router,
-) -> std::io::Result<()> {
+    on_shutdown_signal: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
         let _ = shutdown_sender.send(true);
+        on_shutdown_signal().await;
     });
 
     let mut graceful_receiver = shutdown_receiver.clone();

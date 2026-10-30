@@ -15138,3 +15138,76 @@ async fn a_success_does_not_wake_every_queued_request() {
     );
     drop(ctx);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_instance_leases_are_reclaimed_by_a_live_instance_and_shutdown_releases_its_own() {
+    run_isolated_multi_redis_manager_fixture(2, |stores| async move {
+        let mut config = Config::default();
+        config.credential_rpm = None;
+        config.credential_max_concurrent_requests = 1;
+        config.credential_warmup_requests = 0;
+        config.credential_dispatch_max_wait_secs = 1;
+        let mut credential = api_key_credential("reclaim-killed-instance");
+        credential.id = Some(1);
+        let manager = |store: Arc<RedisStore>| {
+            Arc::new(
+                MultiTokenManager::new_with_stores(
+                    config.clone(),
+                    vec![credential.clone()],
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(store),
+                )
+                .unwrap(),
+            )
+        };
+        let killed = manager(stores[0].clone());
+        let live = manager(stores[1].clone());
+        killed.heartbeat_and_reclaim_dead_instance_leases().await;
+        live.heartbeat_and_reclaim_dead_instance_leases().await;
+
+        // The killed instance holds the only slot and never releases it.
+        let held = killed.acquire_context(None).await.unwrap();
+        std::mem::forget(held);
+        assert!(
+            live.acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                1,
+            )
+            .await
+            .is_err(),
+            "the slot is still taken"
+        );
+
+        // Its heartbeat key disappears as it would 30 s after a kill.
+        stores[1]
+            .delete_pattern_bounded(
+                &format!("scheduler:instance_alive:{}", killed.scheduler_instance_id),
+                None,
+            )
+            .await
+            .unwrap();
+        live.heartbeat_and_reclaim_dead_instance_leases().await;
+        let mut ctx = live
+            .acquire_context(None)
+            .await
+            .expect("the killed instance's slot is back");
+        ctx.release_in_flight();
+
+        // A live instance's own leases are released on shutdown even if requests never end.
+        let held = live.acquire_context(None).await.unwrap();
+        std::mem::forget(held);
+        assert_eq!(
+            live.release_own_in_flight_leases(StdDuration::from_secs(3))
+                .await,
+            1
+        );
+        live.refresh_scheduler_state_from_redis_force().unwrap();
+    })
+    .await;
+}

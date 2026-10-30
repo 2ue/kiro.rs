@@ -4353,6 +4353,33 @@ impl RedisStore {
         max_age: Option<StdDuration>,
         kind: &str,
     ) -> anyhow::Result<Option<usize>> {
+        self.acquire_dispatch_lease_owned(
+            credential_id,
+            lease_id,
+            max_concurrent_requests,
+            global_max_concurrent_requests,
+            request_weight_units,
+            max_age,
+            kind,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::acquire_dispatch_lease`], and records `owner_instance_id` as the owner in
+    /// the same script so a killed instance's leases can be found and released.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_dispatch_lease_owned(
+        &self,
+        credential_id: u64,
+        lease_id: u64,
+        max_concurrent_requests: u32,
+        global_max_concurrent_requests: u32,
+        request_weight_units: u32,
+        max_age: Option<StdDuration>,
+        kind: &str,
+        owner_instance_id: Option<&str>,
+    ) -> anyhow::Result<Option<usize>> {
         let request_weight_units = request_weight_units.clamp(1, 64);
         let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
         let ttl_secs = max_age
@@ -4459,6 +4486,9 @@ impl RedisStore {
             redis.call('HSET', KEYS[8], lease_id, kind)
             redis.call('HSET', KEYS[9], lease_id, effective_weight)
             redis.call('INCRBY', KEYS[10], effective_weight)
+            if ARGV[8] ~= '' then
+                redis.call('ZADD', KEYS[14], tonumber(ARGV[8]), lease_id)
+            end
             if ttl_secs > 0 then
                 redis.call('EXPIRE', KEYS[1], ttl_secs)
                 redis.call('EXPIRE', KEYS[2], ttl_secs)
@@ -4477,9 +4507,12 @@ impl RedisStore {
         let global_keys = global_in_flight_keys();
         let lease_id_arg = lease_id.to_string();
         let mut manager = self.scheduler_capacity_manager();
+        let owner_key = self.key(scheduler_lease_owner_key(
+            owner_instance_id.unwrap_or("none"),
+        ));
         let result: Vec<i64> = redis::cmd("EVAL")
             .arg(script)
-            .arg(13)
+            .arg(14)
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&keys.kind))
@@ -4496,6 +4529,7 @@ impl RedisStore {
                 credential_id,
                 &lease_id_arg,
             )))
+            .arg(&owner_key)
             .arg(max_age_ms)
             .arg(max_concurrent_requests)
             .arg(global_max_concurrent_requests)
@@ -4503,6 +4537,11 @@ impl RedisStore {
             .arg(kind)
             .arg(ttl_secs)
             .arg(request_weight_units)
+            .arg(if owner_instance_id.is_some() {
+                credential_id.to_string()
+            } else {
+                String::new()
+            })
             .query_async(&mut manager)
             .await?;
         if result.first().copied().unwrap_or(0) == 1 {
@@ -4789,7 +4828,7 @@ impl RedisStore {
         credential_id: u64,
         lease_id: u64,
     ) -> anyhow::Result<bool> {
-        self.release_in_flight_lease_inner(credential_id, lease_id, false, None)
+        self.release_in_flight_lease_inner(credential_id, lease_id, false, None, None)
             .await
     }
 
@@ -4799,19 +4838,28 @@ impl RedisStore {
         credential_id: u64,
         lease_id: u64,
     ) -> anyhow::Result<bool> {
-        self.release_in_flight_lease_inner(credential_id, lease_id, true, None)
+        self.release_in_flight_lease_inner(credential_id, lease_id, true, None, None)
             .await
     }
 
+    /// `owner_instance_id` is the instance that registered the lease; its ownership entry is
+    /// removed in the same script.
     pub async fn release_in_flight_lease_and_publish_wakeup(
         &self,
         credential_id: u64,
         lease_id: u64,
         tombstone: bool,
         wakeup_payload: &str,
+        owner_instance_id: Option<&str>,
     ) -> anyhow::Result<bool> {
-        self.release_in_flight_lease_inner(credential_id, lease_id, tombstone, Some(wakeup_payload))
-            .await
+        self.release_in_flight_lease_inner(
+            credential_id,
+            lease_id,
+            tombstone,
+            Some(wakeup_payload),
+            owner_instance_id,
+        )
+        .await
     }
 
     async fn release_in_flight_lease_inner(
@@ -4820,6 +4868,7 @@ impl RedisStore {
         lease_id: u64,
         tombstone: bool,
         wakeup_payload: Option<&str>,
+        owner_instance_id: Option<&str>,
     ) -> anyhow::Result<bool> {
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
@@ -4858,14 +4907,18 @@ impl RedisStore {
                     redis.call('SET', KEYS[10], 0)
                 end
             end
+            redis.call('ZREM', KEYS[13], lease_id)
             if removed > 0 and ARGV[4] ~= '' then
                 redis.call('PUBLISH', KEYS[12], ARGV[4])
             end
             return removed
         "#;
+        let owner_key = self.key(scheduler_lease_owner_key(
+            owner_instance_id.unwrap_or("none"),
+        ));
         let removed: i64 = redis::cmd("EVAL")
             .arg(script)
-            .arg(12)
+            .arg(13)
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&keys.kind))
@@ -4878,6 +4931,7 @@ impl RedisStore {
             .arg(self.key(&global_keys.count))
             .arg(self.key(in_flight_released_tombstone_key(credential_id, &lease_id)))
             .arg(self.dispatch_wakeup_channel())
+            .arg(&owner_key)
             .arg(&lease_id)
             .arg(if tombstone { 1 } else { 0 })
             .arg(SCHEDULER_RELEASED_LEASE_TOMBSTONE_TTL_SECS)
@@ -5647,6 +5701,156 @@ impl RedisStore {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Registers this instance and refreshes its heartbeat. Leases owned by an instance whose
+    /// heartbeat has expired are reclaimed by [`Self::reclaim_dead_instance_leases`].
+    pub async fn heartbeat_scheduler_instance(
+        &self,
+        instance_id: &str,
+        ttl: StdDuration,
+    ) -> anyhow::Result<()> {
+        let mut manager = self.scheduler_capacity_manager();
+        let ttl_ms = ttl.as_millis().max(1000) as u64;
+        let _: () = redis::pipe()
+            .cmd("SET")
+            .arg(self.key(scheduler_instance_alive_key(instance_id)))
+            .arg(1)
+            .arg("PX")
+            .arg(ttl_ms)
+            .ignore()
+            .cmd("SADD")
+            .arg(self.key(SCHEDULER_LEASE_INSTANCES_KEY))
+            .arg(instance_id)
+            .ignore()
+            .query_async(&mut manager)
+            .await?;
+        Ok(())
+    }
+
+    /// Marks every lease owned by `instance_id` as active now. Leases of a live instance never
+    /// expire from inactivity this way; a dead instance's leases are reclaimed by its expired
+    /// heartbeat instead. Returns the number of leases touched.
+    pub async fn touch_instance_in_flight_leases(
+        &self,
+        instance_id: &str,
+    ) -> anyhow::Result<usize> {
+        let script = r#"
+            local redis_time = redis.call('TIME')
+            local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+            local owned = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+            local prefix = ARGV[1]
+            local touched = 0
+            for index = 1, #owned, 2 do
+                local lease_id = owned[index]
+                local credential_id = owned[index + 1]
+                local acquired = prefix .. 'scheduler:inflight:' .. credential_id .. ':acquired'
+                if redis.call('ZSCORE', acquired, lease_id) then
+                    redis.call('ZADD', prefix .. 'scheduler:inflight:' .. credential_id .. ':last_seen', now, lease_id)
+                    redis.call('ZADD', KEYS[2], now, lease_id)
+                    touched = touched + 1
+                else
+                    redis.call('ZREM', KEYS[1], lease_id)
+                end
+            end
+            return touched
+        "#;
+        let mut manager = self.scheduler_capacity_manager();
+        let touched: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(2)
+            .arg(self.key(scheduler_lease_owner_key(instance_id)))
+            .arg(self.key(&global_in_flight_keys().last_seen))
+            .arg(self.key(""))
+            .query_async(&mut manager)
+            .await?;
+        Ok(touched.max(0) as usize)
+    }
+
+    /// Releases every lease registered by `instance_id` and forgets the instance. Used for
+    /// instances whose heartbeat expired (killed, crashed) and for this instance on shutdown.
+    /// Returns the number of leases released.
+    pub async fn release_instance_in_flight_leases(
+        &self,
+        instance_id: &str,
+    ) -> anyhow::Result<usize> {
+        let owner_key = self.key(scheduler_lease_owner_key(instance_id));
+        let mut manager = self.scheduler_capacity_manager();
+        let owned: Vec<(String, f64)> = redis::cmd("ZRANGE")
+            .arg(&owner_key)
+            .arg(0)
+            .arg(-1)
+            .arg("WITHSCORES")
+            .query_async(&mut manager)
+            .await?;
+        let mut released = 0usize;
+        for (lease_id, credential_id) in owned {
+            let Ok(lease_id) = lease_id.parse::<u64>() else {
+                continue;
+            };
+            let credential_id = credential_id as u64;
+            let wakeup = serde_json::json!({
+                "kind": "dispatch_wakeup",
+                "credentialId": credential_id,
+                "leaseId": lease_id,
+                "sourceInstanceId": format!("reclaim:{instance_id}"),
+                "changedAt": Utc::now().to_rfc3339(),
+            })
+            .to_string();
+            if self
+                .release_in_flight_lease_and_publish_wakeup(
+                    credential_id,
+                    lease_id,
+                    false,
+                    &wakeup,
+                    Some(instance_id),
+                )
+                .await?
+            {
+                released += 1;
+            }
+        }
+        let _: () = redis::pipe()
+            .cmd("DEL")
+            .arg(&owner_key)
+            .ignore()
+            .cmd("SREM")
+            .arg(self.key(SCHEDULER_LEASE_INSTANCES_KEY))
+            .arg(instance_id)
+            .ignore()
+            .query_async(&mut manager)
+            .await?;
+        Ok(released)
+    }
+
+    /// Releases the leases of every registered instance whose heartbeat key is gone, except
+    /// `self_instance_id`. Returns (dead instances, leases released).
+    pub async fn reclaim_dead_instance_leases(
+        &self,
+        self_instance_id: &str,
+    ) -> anyhow::Result<(usize, usize)> {
+        let mut manager = self.scheduler_capacity_manager();
+        let instances: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(self.key(SCHEDULER_LEASE_INSTANCES_KEY))
+            .query_async(&mut manager)
+            .await?;
+        let mut dead = 0usize;
+        let mut released = 0usize;
+        for instance_id in instances {
+            if instance_id == self_instance_id {
+                continue;
+            }
+            let alive: bool = redis::cmd("EXISTS")
+                .arg(self.key(scheduler_instance_alive_key(&instance_id)))
+                .query_async(&mut manager)
+                .await?;
+            if alive {
+                continue;
+            }
+            dead += 1;
+            released += self.release_instance_in_flight_leases(&instance_id).await?;
+        }
+        Ok((dead, released))
     }
 
     pub async fn touch_in_flight_lease(
@@ -7470,6 +7674,18 @@ fn in_flight_keys(credential_id: u64) -> InFlightKeys {
     }
 }
 
+/// Instances that own in-flight leases.
+const SCHEDULER_LEASE_INSTANCES_KEY: &str = "scheduler:lease_instances:v1";
+
+fn scheduler_instance_alive_key(instance_id: &str) -> String {
+    format!("scheduler:instance_alive:{instance_id}")
+}
+
+/// ZSET of lease ids owned by an instance, scored by credential id.
+fn scheduler_lease_owner_key(instance_id: &str) -> String {
+    format!("scheduler:lease_owner:{instance_id}")
+}
+
 fn global_in_flight_keys() -> InFlightKeys {
     InFlightKeys {
         last_seen: "scheduler:global:inflight:last_seen".to_string(),
@@ -7818,6 +8034,99 @@ mod tests {
                 .unwrap(),
             ExternalPoolCoordinatorGuardState::Ready { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn redis_dead_instance_leases_are_reclaimed_by_heartbeat_not_by_idle_age() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let max_age = Some(StdDuration::from_secs(900));
+        let acquire = |credential_id: u64, lease_id: u64, owner: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .acquire_dispatch_lease_owned(
+                        credential_id,
+                        lease_id,
+                        3,
+                        0,
+                        1,
+                        max_age,
+                        "api",
+                        Some(owner),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("slot available")
+            }
+        };
+        store
+            .heartbeat_scheduler_instance("alive", StdDuration::from_secs(30))
+            .await
+            .unwrap();
+        store
+            .heartbeat_scheduler_instance("killed", StdDuration::from_millis(1000))
+            .await
+            .unwrap();
+        acquire(7, 1, "alive").await;
+        acquire(7, 2, "killed").await;
+        acquire(8, 3, "killed").await;
+        assert_eq!(
+            store
+                .touch_instance_in_flight_leases("killed")
+                .await
+                .unwrap(),
+            2
+        );
+
+        // The killed instance's heartbeat expires; its leases go, the live instance's stay.
+        tokio::time::sleep(StdDuration::from_millis(1200)).await;
+        let (dead, released) = store.reclaim_dead_instance_leases("alive").await.unwrap();
+        assert_eq!((dead, released), (1, 2));
+        let states = store
+            .scheduler_state_for_credentials(&[7, 8])
+            .await
+            .unwrap();
+        assert_eq!(states[&7].in_flight_leases.len(), 1);
+        assert_eq!(states[&7].in_flight_leases[0].id, 1);
+        assert!(
+            states
+                .get(&8)
+                .is_none_or(|state| state.in_flight_leases.is_empty())
+        );
+        assert_eq!(
+            store.reclaim_dead_instance_leases("alive").await.unwrap(),
+            (0, 0)
+        );
+
+        // A normal release also drops the ownership entry, so it is not released twice.
+        assert!(
+            store
+                .release_in_flight_lease_and_publish_wakeup(7, 1, false, "", Some("alive"))
+                .await
+                .unwrap()
+        );
+        acquire(9, 4, "alive").await;
+        // Shutdown releases whatever the instance still owns.
+        assert_eq!(
+            store
+                .release_instance_in_flight_leases("alive")
+                .await
+                .unwrap(),
+            1
+        );
+        let states = store
+            .scheduler_state_for_credentials(&[7, 9])
+            .await
+            .unwrap();
+        assert!(
+            states
+                .values()
+                .all(|state| state.in_flight_leases.is_empty())
+        );
     }
 
     fn test_config() -> Option<Config> {

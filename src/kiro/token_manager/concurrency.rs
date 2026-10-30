@@ -56,6 +56,7 @@ pub(super) async fn release_redis_in_flight_lease_and_wakeup(
                 lease_id,
                 tombstone,
                 &payload,
+                Some(&source_instance_id),
             ),
         )
         .await
