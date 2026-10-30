@@ -7883,30 +7883,39 @@ async fn test_credential_rpm_override_zero_bypasses_global_limit() {
 }
 
 #[tokio::test]
-async fn priority_mode_respects_warmup_candidate_share() {
+async fn priority_mode_splits_warmup_only_inside_the_preferred_tier() {
+    // A warming credential in a lower tier never takes traffic while the preferred tier has a
+    // ready credential, even with the largest warmup share.
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_warmup_selection_percent = 100;
+    config.credential_warmup_max_selection_percent = 100;
+    let mut ready = test_access_token_credential("ready", "Pro");
+    ready.priority = 0;
+    let mut warming = test_access_token_credential("warming", "Pro");
+    warming.priority = 10;
+    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    manager.set_warmup_remaining(2, 5).unwrap();
+    for round in 0..5 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 1, "round {round}: warmup must not cross tiers");
+        ctx.release_in_flight();
+    }
+
+    // A warming credential in the preferred tier wins over a ready one in a lower tier, even
+    // when the warmup share is zero: the tier comes first, warmup only splits inside it.
     let mut config = Config::default();
     config.load_balancing_mode = "priority".to_string();
     config.credential_warmup_selection_percent = 0;
     config.credential_warmup_max_selection_percent = 0;
-
     let mut ready = test_access_token_credential("ready", "Pro");
     ready.priority = 10;
     let mut warming = test_access_token_credential("warming", "Pro");
     warming.priority = 0;
-
     let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
-    manager
-        .set_warmup_remaining(2, 5)
-        .expect("mark second credential warming");
-
-    let mut ctx = manager
-        .acquire_context(None)
-        .await
-        .expect("ready credential should be selected");
-    assert_eq!(
-        ctx.id, 1,
-        "priority mode must not bypass warmup share to select the lower-priority warming account"
-    );
+    manager.set_warmup_remaining(2, 5).unwrap();
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2, "the preferred tier is used before a lower tier");
     ctx.release_in_flight();
 }
 
@@ -14015,7 +14024,7 @@ async fn fast_tier_never_bypasses_dispatch_safety_rules() {
 }
 
 #[test]
-fn fast_slot_race_overflows_to_lower_tier_in_priority_mode() {
+fn slot_race_overflows_to_any_dispatchable_tier_in_priority_mode() {
     let mut config = Config::default();
     config.credential_warmup_requests = 0;
     let mut fast = fast_test_credential("fast", 1);
@@ -14036,15 +14045,16 @@ fn fast_slot_race_overflows_to_lower_tier_in_priority_mode() {
 
     // The Fast credential lost its slot: overflowing to a plain credential is allowed even
     // though its priority differs.
-    assert!(
-        manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 1, 0, 1, 1)
-    );
+    assert!(manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 1, 1));
 
-    // Between plain credentials priority mode still waits on its own priority level.
+    // Between plain credentials the slot race uses the same rule as the first pick: a full
+    // tier overflows to the next one instead of queueing behind it.
     excluded.insert(1);
-    assert!(
-        !manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 2, 9, 0, 1)
-    );
+    assert!(manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 2, 1));
+
+    // Waiting is only right when nothing else can take the request.
+    excluded.insert(3);
+    assert!(!manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 2, 1));
 }
 
 #[tokio::test]
@@ -14109,8 +14119,8 @@ async fn fast_sticky_sessions_migrate_gradually_and_rebind() {
     );
     new_session.release_in_flight();
 
-    *manager.fast_sticky_migration_last.lock() =
-        Some(Instant::now() - FAST_STICKY_MIGRATION_INTERVAL);
+    *manager.tier_sticky_migration_last.lock() =
+        Some(Instant::now() - TIER_STICKY_MIGRATION_INTERVAL);
     let mut later = manager
         .acquire_context_for_session(None, Some("fast-sticky-b"), &empty)
         .await
@@ -14162,7 +14172,7 @@ async fn fast_sticky_session_stays_when_fast_tier_is_full() {
     );
     assert!(stay.sticky_bound);
     assert!(
-        manager.fast_sticky_migration_last.lock().is_none(),
+        manager.tier_sticky_migration_last.lock().is_none(),
         "a skipped migration does not consume the pacing slot"
     );
     stay.release_in_flight();
@@ -14577,20 +14587,12 @@ fn selection_matrix_slot_race_alternative_scope() {
             ],
         );
         let excluded_fast = HashSet::from([3]);
-        let lower_tier_only = manager.has_alternate_dispatchable_credential_for_slot_race(
-            None,
-            &excluded_fast,
-            1,
-            0,
-            0,
-            1,
-        );
+        let lower_tier_only =
+            manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded_fast, 1, 1);
         let other_fast_tier = manager.has_alternate_dispatchable_credential_for_slot_race(
             None,
             &HashSet::from([2]),
             1,
-            0,
-            0,
             1,
         );
         actual.push(format!(
@@ -14608,7 +14610,7 @@ tiers_fill_in_order/priority: 1 2 1 2 3 4 3 4 E
 tiers_fill_in_order/balanced: 1 2 1 2 3 4 3 4 E
 tiers_fill_in_order/health_balanced: 1 2 3 4 1 2 3 4 E
 tiers_fill_in_order/weighted_least_inflight: 1 2 3 4 1 2 3 4 E
-warmup_in_lower_tier/priority: 3 1 2 1 2 1 2 1
+warmup_in_lower_tier/priority: 1 2 1 2 1 2 1 2
 warmup_in_lower_tier/balanced: 3 1 2 1 2 1 2 1
 warmup_in_lower_tier/health_balanced: 3 1 2 1 2 1 2 1
 warmup_in_lower_tier/weighted_least_inflight: 3 1 2 1 2 1 2 1
@@ -14632,15 +14634,137 @@ sticky_borrows_when_bound_is_full/priority: 1 1 2 | 1
 sticky_borrows_when_bound_is_full/balanced: 1 1 2 | 1
 sticky_borrows_when_bound_is_full/health_balanced: 1 1 2 | 1
 sticky_borrows_when_bound_is_full/weighted_least_inflight: 1 1 2 | 1
-sticky_bound_in_lower_tier/priority: 1 1 2 | 2 2
+sticky_bound_in_lower_tier/priority: 1 1 2 | 1 1
 sticky_bound_in_lower_tier/balanced: 1 1 2 | 2 2
 sticky_bound_in_lower_tier/health_balanced: 1 2 1 | 1 1
 sticky_bound_in_lower_tier/weighted_least_inflight: 1 2 1 | 1 1
 "#;
 
 const SELECTION_MATRIX_SLOT_RACE_EXPECTED: &str = r#"
-priority: lower_tier=false other_fast=true
+priority: lower_tier=true other_fast=true
 balanced: lower_tier=true other_fast=true
 health_balanced: lower_tier=true other_fast=true
 weighted_least_inflight: lower_tier=true other_fast=true
 "#;
+
+#[tokio::test]
+async fn priority_mode_overflows_to_next_tier_in_the_same_pick_when_preferred_is_full() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[
+            matrix_credential(0, 0, 0),
+            matrix_credential(5, 0, 0),
+            matrix_credential(10, 0, 0),
+        ],
+    );
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(manager.acquire_context(None).await.unwrap());
+    }
+    // Tier 0 is full: the next request lands on tier 5 at once, without queueing.
+    let started = Instant::now();
+    let ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2);
+    assert!(started.elapsed() < StdDuration::from_millis(200));
+    held.push(ctx);
+    held.push(manager.acquire_context(None).await.unwrap());
+    // Tier 5 is full as well: tier 10 is next.
+    assert_eq!(manager.acquire_context(None).await.unwrap().id, 3);
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+}
+
+#[tokio::test]
+async fn sticky_sessions_bound_to_a_lower_tier_move_back_one_per_interval_and_rebind() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(10, 0, 0)],
+    );
+    let empty = HashSet::new();
+    // Fill tier 0 so both sessions bind to the tier-10 credential.
+    let mut blockers = vec![
+        manager.acquire_context(None).await.unwrap(),
+        manager.acquire_context(None).await.unwrap(),
+    ];
+    for session in ["back-a", "back-b"] {
+        let mut ctx = manager
+            .acquire_context_for_session(None, Some(session), &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        ctx.release_in_flight();
+    }
+    for ctx in &mut blockers {
+        ctx.release_in_flight();
+    }
+
+    // Tier 0 is free again: one session moves back and is rebound there.
+    let mut moved = manager
+        .acquire_context_for_session(None, Some("back-a"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(moved.id, 1);
+    assert!(!moved.sticky_bound);
+    moved.release_in_flight();
+    // Within the same interval the other session stays where it is.
+    let mut stayed = manager
+        .acquire_context_for_session(None, Some("back-b"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(stayed.id, 2);
+    assert!(stayed.sticky_bound);
+    stayed.release_in_flight();
+
+    // The moved session is now bound to tier 0.
+    let mut again = manager
+        .acquire_context_for_session(None, Some("back-a"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(again.id, 1);
+    assert!(again.sticky_bound);
+    again.release_in_flight();
+
+    // After the interval the second session moves too.
+    *manager.tier_sticky_migration_last.lock() =
+        Some(Instant::now() - TIER_STICKY_MIGRATION_INTERVAL);
+    let mut moved = manager
+        .acquire_context_for_session(None, Some("back-b"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(moved.id, 1);
+    moved.release_in_flight();
+}
+
+#[tokio::test]
+async fn sticky_session_in_preferred_tier_borrows_without_rebinding_when_bound_is_full() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(0, 0, 0)],
+    );
+    let empty = HashSet::new();
+    let mut first = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    let mut second = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    assert_eq!((first.id, second.id), (1, 1));
+    let mut borrowed = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(borrowed.id, 2);
+    assert!(borrowed.fallback_from_sticky);
+    for ctx in [&mut first, &mut second, &mut borrowed] {
+        ctx.release_in_flight();
+    }
+    let mut back = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(back.id, 1, "a temporary borrow keeps the original binding");
+    back.release_in_flight();
+}

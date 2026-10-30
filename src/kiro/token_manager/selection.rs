@@ -8,6 +8,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 use super::account_state::CredentialEntry;
@@ -87,8 +88,12 @@ impl FromStr for LoadBalancingMode {
 /// 1. Catalog preference: when any candidate's catalog lists the model, unknown-catalog
 ///    candidates are dropped.
 /// 2. Fast: only the highest Fast tier competes.
-/// 3. Warmup share: the warming or the ready group is chosen by target share.
-/// 4. The mode orders the chosen group.
+/// 3. Priority mode: only the preferred priority tier (the lowest priority value that still
+///    has a dispatchable credential) competes. A full tier is simply absent from
+///    `dispatchable`, so traffic overflows to the next tier in the same pick.
+/// 4. Warmup share: the warming or the ready group is chosen by target share, inside the
+///    tier chosen above, so warming credentials never pull traffic across tiers.
+/// 5. The mode orders the chosen group.
 pub(crate) fn select_candidate<'a>(
     mode: LoadBalancingMode,
     dispatchable: Vec<&'a CredentialEntry>,
@@ -101,8 +106,50 @@ pub(crate) fn select_candidate<'a>(
         return None;
     }
     retain_top_fast_tier(&mut available);
+    if mode.fills_priority_tiers_in_order() {
+        retain_preferred_priority_tier(&mut available);
+    }
     let candidates = warmup_group(available, config);
     order_by_mode(mode, &candidates, model, now_ms, config)
+}
+
+/// The preferred priority tier: the lowest priority value among the candidates.
+pub(crate) fn preferred_priority<'a>(
+    candidates: impl IntoIterator<Item = &'a CredentialEntry>,
+) -> Option<u32> {
+    candidates
+        .into_iter()
+        .map(|entry| entry.credentials.priority)
+        .min()
+}
+
+/// The tier a sticky binding lives in, used to decide whether a session should move up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StickyTier {
+    pub(crate) fast: u32,
+    pub(crate) priority: u32,
+}
+
+impl StickyTier {
+    pub(crate) fn of(credentials: &KiroCredentials) -> Self {
+        Self {
+            fast: credentials.fast,
+            priority: credentials.priority,
+        }
+    }
+
+    /// Fast always ranks above priority; priority only counts when the mode fills priority
+    /// tiers in order.
+    pub(crate) fn is_better_than(self, other: Self, compare_priority: bool) -> bool {
+        self.fast > other.fast
+            || (compare_priority && self.fast == other.fast && self.priority < other.priority)
+    }
+}
+
+fn retain_preferred_priority_tier(available: &mut Vec<&CredentialEntry>) {
+    if let Some(preferred) = preferred_priority(available.iter().copied()) {
+        available.retain(|entry| entry.credentials.priority == preferred);
+    }
 }
 
 fn prefer_catalog_listed<'a>(
