@@ -6099,6 +6099,14 @@ impl AdminService {
             credential_network_error_cooldown_secs: config.credential_network_error_cooldown_secs,
             credential_stream_error_cooldown_secs: config.credential_stream_error_cooldown_secs,
             credential_empty_turn_cooldown_enabled: config.credential_empty_turn_cooldown_enabled,
+            credential_upstream_failure_cooldown_enabled: config
+                .credential_upstream_failure_cooldown_enabled,
+            credential_auto_heal_min_interval_secs: config.credential_auto_heal_min_interval_secs,
+            credential_auto_heal_max_consecutive_rounds: config
+                .credential_auto_heal_max_consecutive_rounds,
+            kiro_version_auto_sync_enabled: config.kiro_version_auto_sync_enabled,
+            kiro_version_latest: crate::kiro::kiro_version::latest(),
+            kiro_runtime_domain_enabled: config.kiro_runtime_domain_enabled,
             credential_protocol_error_cooldown_secs: config.credential_protocol_error_cooldown_secs,
             credential_auth_error_cooldown_secs: config.credential_auth_error_cooldown_secs,
             credential_cooldown_backoff_multiplier: config.credential_cooldown_backoff_multiplier,
@@ -6381,6 +6389,23 @@ impl AdminService {
         let credential_empty_turn_cooldown_enabled = req
             .credential_empty_turn_cooldown_enabled
             .unwrap_or(current_config.credential_empty_turn_cooldown_enabled);
+        let credential_upstream_failure_cooldown_enabled = req
+            .credential_upstream_failure_cooldown_enabled
+            .unwrap_or(current_config.credential_upstream_failure_cooldown_enabled);
+        let credential_auto_heal_min_interval_secs = req
+            .credential_auto_heal_min_interval_secs
+            .unwrap_or(current_config.credential_auto_heal_min_interval_secs)
+            .min(86_400);
+        let credential_auto_heal_max_consecutive_rounds = req
+            .credential_auto_heal_max_consecutive_rounds
+            .unwrap_or(current_config.credential_auto_heal_max_consecutive_rounds)
+            .min(1_000);
+        let kiro_version_auto_sync_enabled = req
+            .kiro_version_auto_sync_enabled
+            .unwrap_or(current_config.kiro_version_auto_sync_enabled);
+        let kiro_runtime_domain_enabled = req
+            .kiro_runtime_domain_enabled
+            .unwrap_or(current_config.kiro_runtime_domain_enabled);
         let credential_protocol_error_cooldown_secs = req
             .credential_protocol_error_cooldown_secs
             .unwrap_or(current_config.credential_protocol_error_cooldown_secs);
@@ -6930,6 +6955,14 @@ impl AdminService {
                     credential_stream_error_cooldown_secs;
                 config.credential_empty_turn_cooldown_enabled =
                     credential_empty_turn_cooldown_enabled;
+                config.credential_upstream_failure_cooldown_enabled =
+                    credential_upstream_failure_cooldown_enabled;
+                config.credential_auto_heal_min_interval_secs =
+                    credential_auto_heal_min_interval_secs;
+                config.credential_auto_heal_max_consecutive_rounds =
+                    credential_auto_heal_max_consecutive_rounds;
+                config.kiro_version_auto_sync_enabled = kiro_version_auto_sync_enabled;
+                config.kiro_runtime_domain_enabled = kiro_runtime_domain_enabled;
                 config.credential_protocol_error_cooldown_secs =
                     credential_protocol_error_cooldown_secs;
                 config.credential_auth_error_cooldown_secs = credential_auth_error_cooldown_secs;

@@ -23,6 +23,7 @@ pub(crate) const PUBLIC_MODEL_UNAVAILABLE_MESSAGE: &str =
     "The requested model is not available for this endpoint.";
 pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "The request body is invalid. Simplify the message, tools, tool results, files, or images and retry.";
 pub(crate) const PUBLIC_IMAGE_TOO_LARGE_MESSAGE: &str = "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.";
+pub(crate) const PUBLIC_IMAGE_COUNT_EXCEEDED_MESSAGE: &str = "This request carries more than 100 images, the upstream limit per request. Start a new conversation or send fewer screenshots.";
 pub(crate) const PUBLIC_RATE_LIMIT_MESSAGE: &str =
     "No account is ready for this request right now. Please retry shortly.";
 

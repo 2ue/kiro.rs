@@ -664,6 +664,15 @@ impl KiroCredentials {
             .unwrap_or(config.effective_api_region())
     }
 
+    /// 是否走这个账号自己的线路（凭据级代理或绑定的代理资源）。这类账号的网络/传输故障
+    /// 可能出在它自己的代理上，属于账号线路问题；走全局代理或直连时与具体账号无关。
+    pub fn uses_dedicated_proxy(&self) -> bool {
+        match self.proxy_url.as_deref() {
+            Some(url) => !url.eq_ignore_ascii_case(Self::PROXY_DIRECT),
+            None => self.proxy_resource_id.is_some(),
+        }
+    }
+
     /// 获取有效的代理配置
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）

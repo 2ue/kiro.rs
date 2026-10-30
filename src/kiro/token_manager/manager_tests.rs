@@ -7152,6 +7152,9 @@ fn test_health_balanced_score_parameters_are_effective() {
         health: SchedulerHealthState::default(),
         model_health: HashMap::new(),
         selection_events: VecDeque::new(),
+        last_auto_heal_at: None,
+        auto_heal_consecutive_rounds: 0,
+        upstream_fault_streak: 0,
     };
     worse.health.recent_error_rate = 0.5;
     worse.health.latency_ewma_ms = Some(1_000.0);
@@ -7184,6 +7187,9 @@ fn test_health_balanced_score_parameters_are_effective() {
         health: SchedulerHealthState::default(),
         model_health: HashMap::new(),
         selection_events: VecDeque::new(),
+        last_auto_heal_at: None,
+        auto_heal_consecutive_rounds: 0,
+        upstream_fault_streak: 0,
     };
 
     let mut config = Config::default();
@@ -14342,4 +14348,95 @@ fn credential_route_policy_setter_normalizes_rules() {
     let entries = manager.entries.lock();
     assert_eq!(entries[0].credentials.route_rules, vec!["/cc".to_string()]);
     assert!(entries[0].credentials.allows_route("/cc/v1/messages"));
+}
+
+/// Auto-heal is throttled per account: at least `credentialAutoHealMinIntervalSecs` between two
+/// heals, and at most `credentialAutoHealMaxConsecutiveRounds` heals in a row without a success.
+/// A success or a manual reset starts the count again.
+#[test]
+fn auto_heal_respects_min_interval_and_consecutive_round_limit() {
+    let mut config = Config::default();
+    config.credential_auto_heal_min_interval_secs = 300;
+    config.credential_auto_heal_max_consecutive_rounds = 2;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![api_key_credential("ksk_auto_heal_throttle")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let disable = |manager: &MultiTokenManager| {
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        let entry = manager.snapshot().entries.into_iter().next().unwrap();
+        assert!(entry.disabled);
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some(DisabledReason::TooManyFailures.as_str())
+        );
+    };
+    let age_last_heal = |manager: &MultiTokenManager| {
+        let mut entries = manager.entries.lock();
+        let entry = &mut entries[0];
+        entry.last_auto_heal_at = entry
+            .last_auto_heal_at
+            .map(|at| at - StdDuration::from_secs(301));
+    };
+    let ready = |manager: &MultiTokenManager| {
+        manager.local_pool_route_state(None).kind == LocalPoolRouteStateKind::Ready
+    };
+
+    disable(&manager);
+    assert!(ready(&manager), "first heal");
+    disable(&manager);
+    assert!(
+        !ready(&manager),
+        "second heal inside the minimum interval is skipped"
+    );
+    age_last_heal(&manager);
+    assert!(ready(&manager), "second heal after the interval");
+    disable(&manager);
+    age_last_heal(&manager);
+    assert!(
+        !ready(&manager),
+        "third consecutive heal is over the round limit"
+    );
+
+    manager.reset_and_enable(1).unwrap();
+    assert!(ready(&manager));
+    disable(&manager);
+    assert!(ready(&manager), "a manual reset starts the count again");
+
+    manager.report_success_with_latency(1, None, None);
+    disable(&manager);
+    age_last_heal(&manager);
+    assert!(ready(&manager), "a success starts the count again");
+    assert_eq!(manager.entries.lock()[0].auto_heal_consecutive_rounds, 1);
+}
+
+#[test]
+fn auto_heal_limits_of_zero_mean_unlimited() {
+    let mut config = Config::default();
+    config.credential_auto_heal_min_interval_secs = 0;
+    config.credential_auto_heal_max_consecutive_rounds = 0;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![api_key_credential("ksk_auto_heal_unlimited")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    for round in 1..=8 {
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert_eq!(
+            manager.local_pool_route_state(None).kind,
+            LocalPoolRouteStateKind::Ready,
+            "round {round}"
+        );
+    }
 }

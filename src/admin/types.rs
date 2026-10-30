@@ -1859,6 +1859,14 @@ pub struct RuntimeConfigResponse {
     pub credential_network_error_cooldown_secs: u64,
     pub credential_stream_error_cooldown_secs: u64,
     pub credential_empty_turn_cooldown_enabled: bool,
+    pub credential_upstream_failure_cooldown_enabled: bool,
+    pub credential_auto_heal_min_interval_secs: u64,
+    pub credential_auto_heal_max_consecutive_rounds: u32,
+    pub kiro_version_auto_sync_enabled: bool,
+    /// 最近一次自动同步读到的官方版本；未开启或尚未读到时为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_version_latest: Option<String>,
+    pub kiro_runtime_domain_enabled: bool,
     pub credential_protocol_error_cooldown_secs: u64,
     pub credential_auth_error_cooldown_secs: u64,
     pub credential_cooldown_backoff_multiplier: f64,
@@ -2010,6 +2018,16 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_stream_error_cooldown_secs: Option<u64>,
     #[serde(default)]
     pub credential_empty_turn_cooldown_enabled: Option<bool>,
+    #[serde(default)]
+    pub credential_upstream_failure_cooldown_enabled: Option<bool>,
+    #[serde(default)]
+    pub credential_auto_heal_min_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_auto_heal_max_consecutive_rounds: Option<u32>,
+    #[serde(default)]
+    pub kiro_version_auto_sync_enabled: Option<bool>,
+    #[serde(default)]
+    pub kiro_runtime_domain_enabled: Option<bool>,
     #[serde(default)]
     pub credential_protocol_error_cooldown_secs: Option<u64>,
     #[serde(default)]

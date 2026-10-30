@@ -229,6 +229,15 @@ impl ApiUpstreamFailureKind {
         self.transient_failure_kind().is_some()
     }
 
+    /// 换任何账号都可能遇到、与账号本身无关的上游故障（5xx、超时、读取/协议错误）。
+    /// 限流、鉴权、额度、风控是账号问题，不在其中。
+    fn is_upstream_fault(self) -> bool {
+        matches!(
+            self,
+            Self::Server | Self::Timeout | Self::BodyRead | Self::ResponseTooLarge | Self::Protocol
+        )
+    }
+
     fn effective_public_status(self, upstream_status: reqwest::StatusCode) -> u16 {
         match self {
             Self::RateLimit => 429,
@@ -880,7 +889,7 @@ impl KiroApiCompletion {
     /// 按流式错误冷却。
     pub fn report_empty_turn(&self, reason: impl Into<String>) {
         if self.token_manager.empty_turn_cooldown_enabled() {
-            self.report_upstream_body_status_failure(reason);
+            self.report_body_status_failure(reason.into(), true);
         } else {
             self.release();
         }
@@ -889,23 +898,39 @@ impl KiroApiCompletion {
     /// Upstream returned successful headers, but the complete EventStream body
     /// contained a retryable Kiro status event before any downstream response
     /// was committed.
+    ///
+    /// 这是上游故障，不是账号故障：默认不冷却账号（调用方在本请求内排除它），只记会话软失败；
+    /// `credentialUpstreamFailureCooldownEnabled` 打开时同时冷却。
     pub fn report_upstream_body_status_failure(&self, reason: impl Into<String>) {
+        let cool_down = self.token_manager.upstream_failure_cooldown_enabled()
+            || self.token_manager.note_upstream_fault(self.credential_id);
+        self.report_body_status_failure(reason.into(), cool_down);
+    }
+
+    fn report_body_status_failure(&self, reason: String, cool_down: bool) {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
         self.in_flight_lease.lock().take();
-        let reason = reason.into();
-        if let Err(err) = self.token_manager.report_transient_failure_kind(
-            self.credential_id,
-            self.model.as_deref(),
-            TransientFailureKind::Stream,
-            None,
-            format!("non_stream_status_error {}", reason),
-        ) {
-            tracing::warn!(
+        if cool_down {
+            if let Err(err) = self.token_manager.report_transient_failure_kind(
+                self.credential_id,
+                self.model.as_deref(),
+                TransientFailureKind::Stream,
+                None,
+                format!("non_stream_status_error {}", reason),
+            ) {
+                tracing::warn!(
+                    credential_id = self.credential_id,
+                    "记录上游非流式状态事件失败冷却失败: {}",
+                    err
+                );
+            }
+        } else {
+            tracing::info!(
                 credential_id = self.credential_id,
-                "记录上游非流式状态事件失败冷却失败: {}",
-                err
+                reason = %reason,
+                "上游故障与账号无关，不冷却账号"
             );
         }
         if let Some(session_id) = self.session_id.as_deref() {
@@ -1023,6 +1048,15 @@ impl KiroStreamCompletion {
     /// 上游流中断、idle timeout 或上游错误事件时调用。
     ///
     /// 这里不调用 `report_failure`，避免瞬态流读取问题直接禁用账号。
+    /// 本轮输出内容有问题（例如工具参数截断、格式错误），与账号无关：只释放占用，不冷却账号、
+    /// 不记会话软失败。
+    pub fn report_content_failure(&self) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.in_flight_lease.lock().take();
+    }
+
     pub fn report_soft_failure(&self) {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
@@ -1039,7 +1073,7 @@ impl KiroStreamCompletion {
     /// 按流式错误冷却。
     pub fn report_empty_turn(&self, reason: impl Into<String>) {
         if self.token_manager.empty_turn_cooldown_enabled() {
-            self.report_upstream_stream_failure(reason);
+            self.report_stream_failure(reason.into(), true);
             return;
         }
         if self.reported.swap(true, Ordering::AcqRel) {
@@ -1048,24 +1082,40 @@ impl KiroStreamCompletion {
         self.in_flight_lease.lock().take();
     }
 
-    /// 上游流读取错误、idle timeout 或上游错误事件时调用，并让调度器短暂避开该凭据。
+    /// 上游流读取错误、idle timeout 或上游错误事件时调用。
+    ///
+    /// 这是上游故障，不是账号故障：默认不冷却账号（调用方在本请求内排除它），只记会话软失败；
+    /// `credentialUpstreamFailureCooldownEnabled` 打开时同时冷却。
     pub fn report_upstream_stream_failure(&self, reason: impl Into<String>) {
+        let cool_down = self.token_manager.upstream_failure_cooldown_enabled()
+            || self.token_manager.note_upstream_fault(self.credential_id);
+        self.report_stream_failure(reason.into(), cool_down);
+    }
+
+    fn report_stream_failure(&self, reason: String, cool_down: bool) {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
         self.in_flight_lease.lock().take();
-        let reason = reason.into();
-        if let Err(err) = self.token_manager.report_transient_failure_kind(
-            self.credential_id,
-            self.model.as_deref(),
-            TransientFailureKind::Stream,
-            None,
-            format!("stream_error {}", reason),
-        ) {
-            tracing::warn!(
+        if cool_down {
+            if let Err(err) = self.token_manager.report_transient_failure_kind(
+                self.credential_id,
+                self.model.as_deref(),
+                TransientFailureKind::Stream,
+                None,
+                format!("stream_error {}", reason),
+            ) {
+                tracing::warn!(
+                    credential_id = self.credential_id,
+                    "记录上游流式失败冷却失败: {}",
+                    err
+                );
+            }
+        } else {
+            tracing::info!(
                 credential_id = self.credential_id,
-                "记录上游流式失败冷却失败: {}",
-                err
+                reason = %reason,
+                "上游故障与账号无关，不冷却账号"
             );
         }
         if let Some(session_id) = self.session_id.as_deref() {
@@ -1120,7 +1170,9 @@ impl KiroStreamResponse {
 /// Swaps `conversationState.conversationId` and, when present, `agentContinuationId` for
 /// fresh UUIDs. The ids are replaced in place so the rest of the serialized body (field
 /// order, formatting) stays byte-identical. Returns `None` when the ids cannot be located.
-fn refresh_kiro_request_identity(body: &str) -> Option<String> {
+/// 上游已经开始处理过这一轮之后的重发：换掉 `conversationId` 和 `agentContinuationId`。
+/// 线上 2026-09-30 统计，5xx 之后用原标识重发 137 次全部返回 400 Improperly formed request。
+pub(crate) fn refresh_kiro_request_identity(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let state = value.get("conversationState")?;
     let mut refreshed = body.to_string();
@@ -2576,9 +2628,46 @@ mod tests {
             }),
             _ => serde_json::json!({"message": "Bad request"}),
         };
+        let response = match scenario.as_str() {
+            "tool_mismatch_500" => serde_json::json!({
+                "message": "Tool use and tool result do not match",
+                "reason": "TOOL_USE_RESULT_MISMATCH"
+            }),
+            "tool_schema_invalid_nested_500" => serde_json::json!({
+                "error": {
+                    "message": "tools.3.custom.input_schema is invalid",
+                    "reason": "TOOL_SCHEMA_INVALID"
+                }
+            }),
+            "expected_tool_result_text_500" => serde_json::json!({
+                "message": "Expected toolResult blocks at messages.3.content for the following Ids: tooluse_abc"
+            }),
+            // Mentions the reason only inside free text: must stay a retryable 5xx.
+            "tool_reason_in_free_text_500" => serde_json::json!({
+                "message": "internal error while checking TOOL_USE_RESULT_MISMATCH rules"
+            }),
+            "gateway_timeout_524" => serde_json::json!({
+                "message": "error code: 524"
+            }),
+            "gateway_timeout_page_502" => serde_json::json!({
+                "message": "A timeout occurred. Error code 524."
+            }),
+            "image_count_exceeded" => serde_json::json!({
+                "message": "too many inline media segments: 123 exceeds limit 100",
+                "reason": "IMAGE_COUNT_EXCEEDED"
+            }),
+            _ => response,
+        };
         let status = match scenario.as_str() {
-            "rescue_server_error" | "provider_status_500" => StatusCode::INTERNAL_SERVER_ERROR,
+            "rescue_server_error"
+            | "provider_status_500"
+            | "tool_mismatch_500"
+            | "tool_schema_invalid_nested_500"
+            | "expected_tool_result_text_500"
+            | "tool_reason_in_free_text_500" => StatusCode::INTERNAL_SERVER_ERROR,
             "provider_status_503" => StatusCode::SERVICE_UNAVAILABLE,
+            "gateway_timeout_524" => StatusCode::from_u16(524).expect("524 is a valid status"),
+            "gateway_timeout_page_502" => StatusCode::BAD_GATEWAY,
             "invalid_model_404" | "model_unavailable_404" => StatusCode::NOT_FOUND,
             "provider_status_401" => StatusCode::UNAUTHORIZED,
             "provider_status_403" => StatusCode::FORBIDDEN,
@@ -4775,6 +4864,27 @@ mod tests {
         is_stream: bool,
         response_timeout_secs: u64,
     ) -> ProviderFailureOutcome {
+        call_fake_provider_failure_with(
+            server,
+            scenario,
+            pool_size,
+            round,
+            is_stream,
+            response_timeout_secs,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn call_fake_provider_failure_with(
+        server: &FakeBadRequestServer,
+        scenario: &str,
+        pool_size: usize,
+        round: usize,
+        is_stream: bool,
+        response_timeout_secs: u64,
+        configure: impl FnOnce(&mut Config),
+    ) -> ProviderFailureOutcome {
         let marker = format!(
             "PRIVATE_PROVIDER_MARKER_{scenario}_{pool_size}_{round}_{}",
             if is_stream { "stream" } else { "nonstream" }
@@ -4790,6 +4900,7 @@ mod tests {
         config.credential_auth_error_cooldown_secs = 60;
         config.credential_max_cooldown_secs = 60;
         config.credential_cooldown_jitter_percent = 0;
+        configure(&mut config);
         let manager = Arc::new(
             MultiTokenManager::new(
                 config,
@@ -5753,26 +5864,37 @@ mod tests {
                     assert_eq!(snapshot.local_attempts, 4);
                     assert_eq!(snapshot.external_attempts, 0);
                     let manager_snapshot = manager.snapshot();
-                    assert!(
-                        manager_snapshot
-                            .entries
-                            .iter()
-                            .any(|entry| entry.cooled_down),
-                        "{scenario} stream={is_stream} round={round}: expected transient cooldown"
-                    );
                     let cooldown_reasons = manager_snapshot
                         .entries
                         .iter()
                         .flat_map(|entry| entry.cooldowns.iter())
                         .filter_map(|cooldown| cooldown.reason.as_deref())
                         .collect::<Vec<_>>();
-                    assert!(
-                        cooldown_reasons
-                            .iter()
-                            .any(|reason| reason.contains(cooldown_reason)),
-                        "{scenario} stream={is_stream} round={round}: {:?}",
-                        cooldown_reasons
-                    );
+                    if expected_status == 429 {
+                        // Rate limits are about the account: it is cooled down.
+                        assert!(
+                            manager_snapshot
+                                .entries
+                                .iter()
+                                .any(|entry| entry.cooled_down),
+                            "{scenario} stream={is_stream} round={round}: expected rate-limit cooldown"
+                        );
+                        assert!(
+                            cooldown_reasons
+                                .iter()
+                                .any(|reason| reason.contains(cooldown_reason)),
+                            "{scenario} stream={is_stream} round={round}: {:?}",
+                            cooldown_reasons
+                        );
+                    } else {
+                        // A 5xx is an upstream fault: the retry moves to other accounts (checked
+                        // above) without cooling any of them down.
+                        assert!(
+                            cooldown_reasons.is_empty(),
+                            "{scenario} stream={is_stream} round={round}: {:?}",
+                            cooldown_reasons
+                        );
+                    }
                 }
             }
         }
@@ -6099,6 +6221,174 @@ mod tests {
         );
     }
 
+    /// A 5xx whose body is a request-shape validation failure fails like the matching 400: one
+    /// send, no account cooldown, a 400-class diagnostic. A 5xx that only mentions the reason in
+    /// free text stays a retryable server error that switches accounts.
+    #[tokio::test]
+    async fn server_error_with_client_validation_body_fails_fast_for_five_rounds() {
+        let server = FakeBadRequestServer::start().await;
+        for is_stream in [false, true] {
+            for scenario in [
+                "tool_mismatch_500",
+                "tool_schema_invalid_nested_500",
+                "expected_tool_result_text_500",
+            ] {
+                for round in 1..=5 {
+                    let outcome =
+                        call_fake_provider_failure(&server, scenario, 20, round, is_stream, 0)
+                            .await;
+                    let label = format!("{scenario} stream={is_stream} round={round}");
+                    assert_eq!(outcome.consumed_sends, 1, "{label}: no retry");
+                    assert_eq!(outcome.attempts.len(), 1, "{label}");
+                    assert_eq!(
+                        outcome.attempts[0].error_type.as_deref(),
+                        Some("tool_use_format_bad_request"),
+                        "{label}"
+                    );
+                    assert_eq!(outcome.attempts[0].action, "fail", "{label}");
+                    assert!(
+                        outcome.error_text.contains("class=invalid_request"),
+                        "{label}: {}",
+                        outcome.error_text
+                    );
+                    assert!(
+                        outcome.error_text.contains("public_status=400"),
+                        "{label}: {}",
+                        outcome.error_text
+                    );
+                    assert!(
+                        outcome.cooled_down.iter().all(|cooled| !*cooled),
+                        "{label}: a malformed request must not cool the account"
+                    );
+                }
+            }
+            for round in 1..=5 {
+                let outcome = call_fake_provider_failure(
+                    &server,
+                    "tool_reason_in_free_text_500",
+                    20,
+                    round,
+                    is_stream,
+                    0,
+                )
+                .await;
+                let label = format!("free-text stream={is_stream} round={round}");
+                assert_eq!(outcome.consumed_sends, 4, "{label}: still a retryable 5xx");
+                assert!(
+                    outcome.error_text.contains("class=server_error"),
+                    "{label}: {}",
+                    outcome.error_text
+                );
+            }
+        }
+    }
+
+    /// A Cloudflare 524 (or a 5xx whose body is the 524 timeout page) fails on the first send:
+    /// no retry, no account switch, no cooldown, and a gateway-timeout diagnostic for the client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_timeout_fails_fast_without_retry_or_cooldown() {
+        let server = FakeBadRequestServer::start().await;
+        for scenario in ["gateway_timeout_524", "gateway_timeout_page_502"] {
+            for is_stream in [false, true] {
+                for round in 1..=3 {
+                    let outcome =
+                        call_fake_provider_failure(&server, scenario, 20, round, is_stream, 0)
+                            .await;
+                    let label = format!("{scenario} stream={is_stream} round={round}");
+                    assert_eq!(outcome.consumed_sends, 1, "{label}: no retry");
+                    assert_eq!(outcome.attempts.len(), 1, "{label}");
+                    assert_eq!(
+                        outcome.attempts[0].error_type.as_deref(),
+                        Some("gateway_timeout"),
+                        "{label}"
+                    );
+                    assert!(
+                        outcome.error_text.contains("reason=api_gateway_timeout"),
+                        "{label}: {}",
+                        outcome.error_text
+                    );
+                    assert!(
+                        outcome.cooled_down.iter().all(|cooled| !*cooled),
+                        "{label}: a gateway timeout must not cool the account"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_timeout_detection_needs_524_and_a_timeout_wording() {
+        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        assert!(KiroProvider::is_gateway_timeout(status(524), ""));
+        assert!(KiroProvider::is_gateway_timeout(
+            status(502),
+            "<title>A timeout occurred | error code 524</title>"
+        ));
+        assert!(!KiroProvider::is_gateway_timeout(
+            status(502),
+            "body_bytes=1524"
+        ));
+        assert!(!KiroProvider::is_gateway_timeout(
+            status(500),
+            "internal error"
+        ));
+        assert!(!KiroProvider::is_gateway_timeout(
+            status(400),
+            "A timeout occurred. Error code 524."
+        ));
+    }
+
+    #[test]
+    fn server_error_client_validation_detection_needs_an_exact_reason() {
+        for body in [
+            r#"{"message":"x","reason":"TOOL_USE_RESULT_MISMATCH"}"#,
+            r#"{"error":{"reason":"TOOL_SCHEMA_INVALID"}}"#,
+            "Expected toolResult blocks at messages.3.content",
+        ] {
+            assert!(
+                KiroProvider::is_server_error_client_validation(body),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+            r#"{"message":"checking TOOL_USE_RESULT_MISMATCH","reason":"INTERNAL"}"#,
+            r#"{"__type":"ValidationException","message":"tool"}"#,
+            "upstream timed out",
+        ] {
+            assert!(
+                !KiroProvider::is_server_error_client_validation(body),
+                "{body}"
+            );
+        }
+    }
+
+    /// Production 2026-10-28: `IMAGE_COUNT_EXCEEDED` was classified as a generic `bad_request`.
+    /// It is now its own reason and still fails fast (the request itself is the problem).
+    #[tokio::test]
+    async fn image_count_exceeded_400_is_classified_and_not_retried() {
+        let server = FakeBadRequestServer::start().await;
+        for round in 0..3 {
+            let (hits, attempts) =
+                call_fake_bad_request_provider(&server, "image_count_exceeded", 20, round, true)
+                    .await;
+            assert_eq!(hits, 1, "round {round}");
+            assert_eq!(
+                attempts
+                    .last()
+                    .and_then(|attempt| attempt.error_type.as_deref()),
+                Some("image_count_exceeded_bad_request"),
+                "round {round}"
+            );
+        }
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"too many inline media segments: 123 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}"#
+            ),
+            "image_count_exceeded_bad_request"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_model_400_moves_across_catalog_listed_credentials_within_budget_for_five_rounds()
      {
@@ -6304,7 +6594,8 @@ mod tests {
                 "upstream_timeout",
                 Some(408),
                 true,
-                Some("api_timeout"),
+                // 上游故障，不是账号故障：换号但不冷却。
+                None,
             ),
             (
                 "provider_status_429",
@@ -6318,21 +6609,24 @@ mod tests {
                 "server_error",
                 Some(500),
                 true,
-                Some("api_server_error"),
+                // 上游故障，不是账号故障：换号但不冷却。
+                None,
             ),
             (
                 "provider_status_503",
                 "server_error",
                 Some(503),
                 true,
-                Some("api_server_error"),
+                // 上游故障，不是账号故障：换号但不冷却。
+                None,
             ),
             (
                 "provider_200_non_eventstream",
                 "protocol_error",
                 Some(200),
                 true,
-                Some("api_protocol_error"),
+                // 上游故障，不是账号故障：换号但不冷却。
+                None,
             ),
         ];
         let mut all_markers = Vec::new();
@@ -6411,7 +6705,7 @@ mod tests {
                     } else {
                         assert!(
                             outcome.cooled_down.iter().all(|cooled| !*cooled),
-                            "{scenario} stream={is_stream} pool={pool_size} round={round}: invalid/unknown failures must not cool credentials"
+                            "{scenario} stream={is_stream} pool={pool_size} round={round}: invalid requests and upstream faults must not cool credentials"
                         );
                         assert!(outcome.cooldown_reasons.is_empty());
                         assert!(outcome.cooldown_kinds.iter().all(Option::is_none));
@@ -6432,6 +6726,58 @@ mod tests {
                 !logs.contains(&marker),
                 "provider logs captured private upstream response marker {marker}"
             );
+        }
+    }
+
+    /// Upstream faults (5xx, timeouts, broken bodies) switch accounts without cooling them down by
+    /// default; rate limits and auth failures are about the account and always cool it down. The
+    /// `credentialUpstreamFailureCooldownEnabled` switch restores the old cooldown for upstream
+    /// faults. A send failure on an account with its own proxy may be that proxy, so it cools down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upstream_faults_cool_down_only_when_switched_on() {
+        let server = FakeBadRequestServer::start().await;
+        for (scenario, response_timeout_secs, account_fault) in [
+            ("provider_status_500", 10, false),
+            ("provider_status_503", 10, false),
+            ("provider_status_408", 10, false),
+            ("provider_200_non_eventstream", 10, false),
+            ("provider_body_disconnect", 10, false),
+            ("provider_header_timeout", 1, false),
+            ("provider_status_429", 10, true),
+            ("provider_status_401", 10, true),
+        ] {
+            for switch_on in [false, true] {
+                for round in 1..=3 {
+                    let outcome = call_fake_provider_failure_with(
+                        &server,
+                        scenario,
+                        4,
+                        round,
+                        round % 2 == 0,
+                        response_timeout_secs,
+                        |config| config.credential_upstream_failure_cooldown_enabled = switch_on,
+                    )
+                    .await;
+                    let switched: HashSet<_> = outcome
+                        .attempts
+                        .iter()
+                        .map(|attempt| attempt.credential_id)
+                        .collect();
+                    assert_eq!(
+                        switched.len(),
+                        outcome.attempts.len(),
+                        "{scenario} switch={switch_on} round={round}: every retry moves to another account {:?}",
+                        outcome.attempts
+                    );
+                    let cooled = outcome.cooled_down.iter().any(|cooled| *cooled);
+                    assert_eq!(
+                        cooled,
+                        account_fault || switch_on,
+                        "{scenario} switch={switch_on} round={round}: {:?}",
+                        outcome.cooldown_reasons
+                    );
+                }
+            }
         }
     }
 
@@ -6572,15 +6918,16 @@ mod tests {
                             "{scenario} stream={is_stream} pool={pool_size} round={round}: private marker escaped: {surface}"
                         );
                     }
-                    assert!(outcome.cooled_down.iter().any(|cooled| *cooled));
+                    // Transport and body faults on a shared route are upstream faults, not account
+                    // faults: the retry moves to other accounts without cooling any of them down.
+                    // `cooldown_reason` is still the scheduler reason recorded for the attempt.
+                    let _ = cooldown_reason;
                     assert!(
-                        outcome
-                            .cooldown_reasons
-                            .iter()
-                            .any(|reason| reason.contains(cooldown_reason)),
+                        outcome.cooled_down.iter().all(|cooled| !*cooled),
                         "{scenario} stream={is_stream} pool={pool_size} round={round}: {:?}",
                         outcome.cooldown_reasons
                     );
+                    assert!(outcome.cooldown_reasons.is_empty());
                     all_markers.push(outcome.marker);
                 }
                 if scenario == "provider_body_timeout" {
@@ -7150,32 +7497,82 @@ mod tests {
     }
 
     #[test]
-    fn stream_completion_upstream_failure_cools_down_credential() {
+    fn stream_completion_upstream_failure_cools_down_only_when_switched_on() {
+        for cooldown_enabled in [false, true] {
+            let mut cred = KiroCredentials::default();
+            cred.access_token = Some("token".to_string());
+            cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            let mut config = Config::default();
+            config.credential_upstream_failure_cooldown_enabled = cooldown_enabled;
+            let manager =
+                Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+            let completion = KiroStreamCompletion::new(
+                manager.clone(),
+                1,
+                None,
+                Some("session".into()),
+                Some("claude-sonnet-4.5".into()),
+                false,
+                false,
+                Vec::new(),
+                Instant::now(),
+            );
+
+            completion.report_upstream_stream_failure("upstream stream read error");
+            completion.report_success();
+
+            let snapshot = manager.snapshot();
+            assert_eq!(snapshot.entries[0].success_count, 0);
+            assert_eq!(
+                snapshot.entries[0].cooled_down, cooldown_enabled,
+                "cooldown_enabled={cooldown_enabled}: an upstream stream fault is not an account fault"
+            );
+            assert_eq!(snapshot.entries[0].failure_count, 0);
+        }
+    }
+
+    /// A one-off upstream fault does not cool the account, but the same account failing
+    /// `UPSTREAM_FAULT_STREAK_COOLDOWN` times in a row (no success in between) does: the problem is
+    /// then most likely that account. A success resets the count.
+    #[test]
+    fn repeated_upstream_faults_on_one_account_cool_it_down() {
         let mut cred = KiroCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion = KiroStreamCompletion::new(
-            manager.clone(),
-            1,
-            None,
-            Some("session".into()),
-            Some("claude-sonnet-4.5".into()),
-            false,
-            false,
-            Vec::new(),
-            Instant::now(),
+        let completion = || {
+            KiroStreamCompletion::new(
+                manager.clone(),
+                1,
+                None,
+                None,
+                Some("claude-sonnet-4.5".into()),
+                false,
+                false,
+                Vec::new(),
+                Instant::now(),
+            )
+        };
+        let streak = crate::kiro::token_manager::UPSTREAM_FAULT_STREAK_COOLDOWN;
+        for _ in 1..streak {
+            completion().report_upstream_stream_failure("upstream stream read error");
+            assert!(!manager.snapshot().entries[0].cooled_down);
+        }
+        completion().report_success();
+        for _ in 1..streak {
+            completion().report_upstream_stream_failure("upstream stream read error");
+        }
+        assert!(
+            !manager.snapshot().entries[0].cooled_down,
+            "a success in between starts the count again"
         );
-
-        completion.report_upstream_stream_failure("upstream stream read error");
-        completion.report_success();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].success_count, 0);
-        assert!(snapshot.entries[0].cooled_down);
-        assert_eq!(snapshot.entries[0].failure_count, 0);
+        completion().report_upstream_stream_failure("upstream stream read error");
+        assert!(
+            manager.snapshot().entries[0].cooled_down,
+            "the {streak}th fault in a row cools the account"
+        );
     }
 
     #[test]
@@ -8638,6 +9035,47 @@ impl KiroProvider {
         self.token_manager.runtime_config()
     }
 
+    /// 上游故障是否冷却账号（`credentialUpstreamFailureCooldownEnabled`，默认否）。
+    pub fn upstream_failure_cooldown_enabled(&self) -> bool {
+        self.token_manager.upstream_failure_cooldown_enabled()
+    }
+
+    /// 账号问题（限流、鉴权、额度、风控）照常冷却；上游故障默认不冷却，本请求内的换号由
+    /// `excluded_ids` 负责，开关打开时恢复冷却。网络/传输故障出现在走专属代理的账号上时，
+    /// 可能是它自己的代理坏了，仍然冷却。
+    ///
+    /// 同一个账号连续几次上游故障（中间没有成功）时也冷却：问题多半在这个账号上，不冷却的话
+    /// 优先级调度会让后面每个请求都先在它身上失败一次。
+    fn cools_down_for(
+        &self,
+        credential_id: u64,
+        failure_kind: ApiUpstreamFailureKind,
+        credentials: &KiroCredentials,
+    ) -> bool {
+        if !failure_kind.is_upstream_fault() || self.upstream_failure_cooldown_enabled() {
+            return true;
+        }
+        let repeated = self.token_manager.note_upstream_fault(credential_id);
+        repeated
+            || matches!(
+                failure_kind,
+                ApiUpstreamFailureKind::Timeout | ApiUpstreamFailureKind::BodyRead
+            ) && credentials.uses_dedicated_proxy()
+    }
+
+    fn log_upstream_fault_without_cooldown(
+        credential_id: u64,
+        credential_label: &str,
+        failure_kind: ApiUpstreamFailureKind,
+    ) {
+        tracing::info!(
+            credential_id,
+            credential_label = %credential_label,
+            failure_class = failure_kind.as_error_type(),
+            "上游故障与账号无关，不冷却账号，只在本次请求内换号"
+        );
+    }
+
     #[cfg(test)]
     fn profile_arn_discovery_metrics(&self) -> ProfileArnDiscoveryMetricsSnapshot {
         self.profile_arn_discovery_metrics.snapshot()
@@ -9568,14 +10006,18 @@ impl KiroProvider {
             "x-amz-user-agent",
             HeaderValue::from_str(&format!(
                 "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-                config.kiro_version, machine_id
+                config.effective_kiro_version(),
+                machine_id
             ))?,
         );
         headers.insert(
             "user-agent",
             HeaderValue::from_str(&format!(
                 "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.34 m/E KiroIDE-{}-{}",
-                config.system_version, config.node_version, config.kiro_version, machine_id
+                config.system_version,
+                config.node_version,
+                config.effective_kiro_version(),
+                machine_id
             ))?,
         );
         headers.insert("host", HeaderValue::from_str(host)?);
@@ -12527,15 +12969,25 @@ impl KiroProvider {
                         model.as_deref(),
                     );
                     last_error = Some(anyhow::anyhow!(message.clone()));
-                    if let Err(err) = self.token_manager.report_transient_failure_kind(
-                        ctx.id,
-                        model.as_deref(),
-                        failure_kind
-                            .transient_failure_kind()
-                            .unwrap_or(TransientFailureKind::Network),
-                        None,
-                        failure_kind.scheduler_reason(),
-                    ) {
+                    let cooldown = if self.cools_down_for(ctx.id, failure_kind, &ctx.credentials) {
+                        self.token_manager.report_transient_failure_kind(
+                            ctx.id,
+                            model.as_deref(),
+                            failure_kind
+                                .transient_failure_kind()
+                                .unwrap_or(TransientFailureKind::Network),
+                            None,
+                            failure_kind.scheduler_reason(),
+                        )
+                    } else {
+                        Self::log_upstream_fault_without_cooldown(
+                            ctx.id,
+                            &credential_label,
+                            failure_kind,
+                        );
+                        Ok(true)
+                    };
+                    if let Err(err) = cooldown {
                         let final_message = format!(
                             "{} API 请求发送失败（{}，调度状态写入失败）: {}",
                             api_type, credential_context, err
@@ -12688,7 +13140,20 @@ impl KiroProvider {
                         attempt_started_at,
                         model.as_deref(),
                     );
-                    if let Some(transient_kind) = read_failure.kind.transient_failure_kind() {
+                    let cools_down =
+                        self.cools_down_for(ctx.id, read_failure.kind, &ctx.credentials);
+                    if !cools_down {
+                        Self::log_upstream_fault_without_cooldown(
+                            ctx.id,
+                            &credential_label,
+                            read_failure.kind,
+                        );
+                    }
+                    if let Some(transient_kind) = read_failure
+                        .kind
+                        .transient_failure_kind()
+                        .filter(|_| cools_down)
+                    {
                         if let Err(err) = self.token_manager.report_transient_failure_kind(
                             ctx.id,
                             model.as_deref(),
@@ -12792,7 +13257,17 @@ impl KiroProvider {
                     model.as_deref(),
                 );
                 Self::attach_raw_upstream_error(&mut attempts, status, content_kind, &body);
-                if let Some(transient_kind) = failure_kind.transient_failure_kind() {
+                let cools_down = self.cools_down_for(ctx.id, failure_kind, &ctx.credentials);
+                if !cools_down {
+                    Self::log_upstream_fault_without_cooldown(
+                        ctx.id,
+                        &credential_label,
+                        failure_kind,
+                    );
+                }
+                if let Some(transient_kind) =
+                    failure_kind.transient_failure_kind().filter(|_| cools_down)
+                {
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
                         ctx.id,
                         model.as_deref(),
@@ -13525,6 +14000,75 @@ impl KiroProvider {
                     ));
                 }
 
+                // 与主循环相同：5xx 但实为请求体协议校验失败，换号也一样，直接按 400 失败。
+                if retry_status.is_server_error()
+                    && Self::is_server_error_client_validation(&retry_upstream_body.text)
+                {
+                    let message = Self::api_failure_diagnostic(
+                        ApiUpstreamFailureKind::InvalidRequest,
+                        retry_status,
+                        Some(retry_upstream_body.bytes),
+                        retry_after,
+                        Some(retry_content_kind),
+                        Some(Self::bad_request_diagnostic_reason(
+                            "tool_use_format_bad_request",
+                        )),
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt.saturating_add(1),
+                        ctx.id,
+                        &credential_label,
+                        Some(retry_status),
+                        "fail",
+                        Some("tool_use_format_bad_request"),
+                        Some(message.clone()),
+                        retry_started_at,
+                        model.as_deref(),
+                    );
+                    Self::attach_raw_upstream_error(
+                        &mut attempts,
+                        retry_status,
+                        retry_content_kind,
+                        &retry_upstream_body.text,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(message, &attempts));
+                }
+
+                if Self::is_gateway_timeout(retry_status, &retry_upstream_body.text) {
+                    let message = Self::api_failure_diagnostic(
+                        ApiUpstreamFailureKind::Timeout,
+                        retry_status,
+                        Some(retry_upstream_body.bytes),
+                        retry_after,
+                        Some(retry_content_kind),
+                        Some("api_gateway_timeout"),
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt.saturating_add(1),
+                        ctx.id,
+                        &credential_label,
+                        Some(retry_status),
+                        "fail",
+                        Some("gateway_timeout"),
+                        Some(message.clone()),
+                        retry_started_at,
+                        model.as_deref(),
+                    );
+                    Self::attach_raw_upstream_error(
+                        &mut attempts,
+                        retry_status,
+                        retry_content_kind,
+                        &retry_upstream_body.text,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(message, &attempts));
+                }
+
                 if matches!(retry_status.as_u16(), 408 | 429) || retry_status.is_server_error() {
                     let failure_kind = match retry_status.as_u16() {
                         408 => ApiUpstreamFailureKind::Timeout,
@@ -13593,15 +14137,25 @@ impl KiroProvider {
                         retry_content_kind,
                         &retry_upstream_body.text,
                     );
-                    if let Err(err) = self.token_manager.report_transient_failure_kind(
-                        ctx.id,
-                        model.as_deref(),
-                        failure_kind
-                            .transient_failure_kind()
-                            .expect("retryable status has a transient failure kind"),
-                        retry_after,
-                        failure_kind.scheduler_reason(),
-                    ) {
+                    let cooldown = if self.cools_down_for(ctx.id, failure_kind, &ctx.credentials) {
+                        self.token_manager.report_transient_failure_kind(
+                            ctx.id,
+                            model.as_deref(),
+                            failure_kind
+                                .transient_failure_kind()
+                                .expect("retryable status has a transient failure kind"),
+                            retry_after,
+                            failure_kind.scheduler_reason(),
+                        )
+                    } else {
+                        Self::log_upstream_fault_without_cooldown(
+                            ctx.id,
+                            &credential_label,
+                            failure_kind,
+                        );
+                        Ok(true)
+                    };
+                    if let Err(err) = cooldown {
                         let final_message = format!(
                             "{} API thinking-signature retry 失败（{}，调度状态写入失败）: {}",
                             api_type, credential_context, err
@@ -14163,6 +14717,80 @@ impl KiroProvider {
                 continue;
             }
 
+            // 5xx 但报文是消息数组本身的协议校验失败（工具调用与结果配对不上、工具定义不合法）：
+            // 根因在请求体，换号重发结果相同，只会把一个坏请求放大成多次上游调用。按 400 工具格式
+            // 错误处理：不重试、不换号、不冷却账号，对外返回 400。
+            if status.is_server_error() && Self::is_server_error_client_validation(&body) {
+                let message = Self::api_failure_diagnostic(
+                    ApiUpstreamFailureKind::InvalidRequest,
+                    status,
+                    Some(body_bytes),
+                    retry_after,
+                    Some(content_kind),
+                    Some(Self::bad_request_diagnostic_reason(
+                        "tool_use_format_bad_request",
+                    )),
+                );
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    upstream_status = status.as_u16(),
+                    body_bytes,
+                    "Kiro API 以 5xx 返回请求格式错误，不重试"
+                );
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "fail",
+                    Some("tool_use_format_bad_request"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                    model.as_deref(),
+                );
+                Self::attach_raw_upstream_error(&mut attempts, status, content_kind, &body);
+                Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                self.finish_attempt(&mut ctx);
+                return Err(Self::traced_error(message, &attempts));
+            }
+
+            // 524 网关超时：不重试、不换号、不冷却账号，对外返回 504，由客户端决定是否重发。
+            if Self::is_gateway_timeout(status, &body) {
+                let message = Self::api_failure_diagnostic(
+                    ApiUpstreamFailureKind::Timeout,
+                    status,
+                    Some(body_bytes),
+                    retry_after,
+                    Some(content_kind),
+                    Some("api_gateway_timeout"),
+                );
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    upstream_status = status.as_u16(),
+                    body_bytes,
+                    "Kiro API 上游网关超时（524），不重试、不冷却账号"
+                );
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "fail",
+                    Some("gateway_timeout"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                    model.as_deref(),
+                );
+                Self::attach_raw_upstream_error(&mut attempts, status, content_kind, &body);
+                Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                self.finish_attempt(&mut ctx);
+                return Err(Self::traced_error(message, &attempts));
+            }
+
             // 429/408/5xx - 瞬态上游错误：不禁用凭据；若本机内存态存在备选，
             // 仅在当前请求内临时排除失败账号，避免重试链反复命中同一账号。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
@@ -14246,6 +14874,12 @@ impl KiroProvider {
                         credential_id = ctx.id,
                         credential_label = %credential_label,
                         "上游模型容量不足（429），换号重试且不写账号冷却"
+                    );
+                } else if !self.cools_down_for(ctx.id, failure_kind, &ctx.credentials) {
+                    Self::log_upstream_fault_without_cooldown(
+                        ctx.id,
+                        &credential_label,
+                        failure_kind,
                     );
                 } else if !berserk_skips_cooldown {
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
@@ -14750,6 +15384,9 @@ impl KiroProvider {
         if Self::bad_request_body_indicates_image_too_large(&lower) {
             return "image_too_large_bad_request";
         }
+        if Self::bad_request_body_indicates_image_count_exceeded(&lower) {
+            return "image_count_exceeded_bad_request";
+        }
         // Image failures can mention tool-result images, so classify them before tool protocol
         // failures. Neither image failures nor a generic REQUEST_BODY_INVALID is account-specific.
         if Self::bad_request_body_indicates_invalid_image(&lower) {
@@ -14855,6 +15492,46 @@ impl KiroProvider {
     /// `messages.6.content.1.image.source.base64: image exceeds 5 MB maximum: ...`.
     fn bad_request_body_indicates_image_too_large(lower_body: &str) -> bool {
         lower_body.contains("image_size_exceeded") || lower_body.contains("image exceeds")
+    }
+
+    /// 上游以 5xx 返回、但实为请求体协议校验失败的报文。只认精确特征：JSON 顶层 `reason` 或
+    /// `error.reason` 为 `TOOL_USE_RESULT_MISMATCH` / `TOOL_SCHEMA_INVALID`，或纯文本里出现
+    /// `Expected toolResult blocks`。不按 `ValidationException` 之类的宽泛类型匹配，以免把真正
+    /// 可重试的上游故障误判为不可重试。
+    /// Cloudflare 524：上游边缘层等源站超时。源站这时多半还在处理同一轮，换号重发只会把客户端
+    /// 的等待放大好几倍、再占用几个账号；直接失败，让客户端自己重试。
+    fn is_gateway_timeout(status: reqwest::StatusCode, body: &str) -> bool {
+        if status.as_u16() == 524 {
+            return true;
+        }
+        if !status.is_server_error() || !body.contains("524") {
+            return false;
+        }
+        let lower = body.to_ascii_lowercase();
+        lower.contains("a timeout occurred")
+            || lower.contains("gateway timeout")
+            || lower.contains("error code 524")
+    }
+
+    fn is_server_error_client_validation(body: &str) -> bool {
+        const REASONS: &[&str] = &["TOOL_USE_RESULT_MISMATCH", "TOOL_SCHEMA_INVALID"];
+        let structured_reason = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .is_some_and(|value| {
+                ["/reason", "/error/reason"].into_iter().any(|pointer| {
+                    value
+                        .pointer(pointer)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|reason| REASONS.contains(&reason))
+                })
+            });
+        structured_reason || body.contains("Expected toolResult blocks")
+    }
+
+    /// `{"message":"too many inline media segments: 123 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}`
+    fn bad_request_body_indicates_image_count_exceeded(lower_body: &str) -> bool {
+        lower_body.contains("image_count_exceeded")
+            || lower_body.contains("too many inline media segments")
     }
 
     fn bad_request_body_indicates_invalid_image(lower_body: &str) -> bool {
@@ -14970,6 +15647,7 @@ impl KiroProvider {
             | "tool_use_format_bad_request"
             | "image_invalid_bad_request"
             | "image_too_large_bad_request"
+            | "image_count_exceeded_bad_request"
             | "request_body_invalid_bad_request"
             | "content_length_exceeds_threshold"
             | "context_window_full_bad_request"

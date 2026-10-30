@@ -299,7 +299,8 @@ impl InferenceAttemptBudget {
         self.dispatch_route.get().map(String::as_str)
     }
 
-    /// 记录在本请求内空回的本地账号。
+    /// 记录在本请求内空回（或输出了无法修复的工具参数）的本地账号：后续换号不再选它，
+    /// 但不冷却，不影响其他请求。
     pub(crate) fn exclude_empty_turn_credential(&self, credential_id: u64) {
         self.empty_turn_credential_ids.lock().insert(credential_id);
     }

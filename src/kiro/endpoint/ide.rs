@@ -38,20 +38,39 @@ impl IdeEndpoint {
         format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 
-    fn base_url(&self, ctx: &RequestContext<'_>) -> String {
+    /// 对话和联网搜索的上游主机。开启 `kiroRuntimeDomainEnabled` 时改走新版 Kiro 域名，
+    /// 其余接口（模型列表等）始终用 [`Self::host`]。
+    fn runtime_host(&self, ctx: &RequestContext<'_>) -> String {
+        if ctx.config.kiro_runtime_domain_enabled {
+            format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        } else {
+            self.host(ctx)
+        }
+    }
+
+    fn base_url_for_host(&self, ctx: &RequestContext<'_>, host: &str) -> String {
         ctx.config
             .kiro_upstream_base_url
             .as_deref()
             .map(str::trim)
             .filter(|base| !base.is_empty())
             .map(|base| base.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| format!("https://{}", self.host(ctx)))
+            .unwrap_or_else(|| format!("https://{host}"))
+    }
+
+    fn base_url(&self, ctx: &RequestContext<'_>) -> String {
+        self.base_url_for_host(ctx, &self.host(ctx))
+    }
+
+    fn runtime_base_url(&self, ctx: &RequestContext<'_>) -> String {
+        self.base_url_for_host(ctx, &self.runtime_host(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            ctx.config.kiro_version, ctx.machine_id
+            ctx.config.effective_kiro_version(),
+            ctx.machine_id
         )
     }
 
@@ -60,7 +79,7 @@ impl IdeEndpoint {
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             ctx.config.system_version,
             ctx.config.node_version,
-            ctx.config.kiro_version,
+            ctx.config.effective_kiro_version(),
             ctx.machine_id
         )
     }
@@ -78,11 +97,11 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("{}/generateAssistantResponse", self.base_url(ctx))
+        format!("{}/generateAssistantResponse", self.runtime_base_url(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("{}/mcp", self.base_url(ctx))
+        format!("{}/mcp", self.runtime_base_url(ctx))
     }
 
     fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String {
@@ -109,7 +128,7 @@ impl KiroEndpoint for IdeEndpoint {
             )
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
+            .header("host", self.runtime_host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
@@ -127,7 +146,7 @@ impl KiroEndpoint for IdeEndpoint {
         let mut req = req
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
+            .header("host", self.runtime_host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
@@ -767,6 +786,60 @@ mod tests {
                 body,
                 "round {round}: an IDE no-op transform must preserve exact bytes"
             );
+        }
+    }
+
+    /// The runtime-domain switch moves only chat and MCP to `runtime.{region}.kiro.dev`; the
+    /// model list keeps the q host, and the request headers stay the IDE ones.
+    #[test]
+    fn runtime_domain_switch_moves_chat_and_mcp_only() {
+        let credentials = KiroCredentials::default();
+        let mut config = Config::default();
+        config.region = "eu-central-1".to_string();
+        let endpoint = IdeEndpoint::new();
+        for enabled in [false, true] {
+            config.kiro_runtime_domain_enabled = enabled;
+            let ctx = RequestContext {
+                credentials: &credentials,
+                token: "token",
+                machine_id: "machine",
+                config: &config,
+                region_override: None,
+            };
+            let runtime = if enabled {
+                "runtime.eu-central-1.kiro.dev"
+            } else {
+                "q.eu-central-1.amazonaws.com"
+            };
+            assert_eq!(
+                endpoint.api_url(&ctx),
+                format!("https://{runtime}/generateAssistantResponse")
+            );
+            assert_eq!(endpoint.mcp_url(&ctx), format!("https://{runtime}/mcp"));
+            assert!(
+                endpoint
+                    .models_url(&ctx, None)
+                    .starts_with("https://q.eu-central-1.amazonaws.com/ListAvailableModels"),
+                "enabled={enabled}"
+            );
+            let client = reqwest::Client::new();
+            for request in [
+                endpoint.decorate_api(client.post("http://example.invalid"), &ctx),
+                endpoint.decorate_mcp(client.post("http://example.invalid"), &ctx),
+            ] {
+                let request = request.build().unwrap();
+                assert_eq!(
+                    request.headers().get("host").and_then(|v| v.to_str().ok()),
+                    Some(runtime),
+                    "enabled={enabled}"
+                );
+                let user_agent = request
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap();
+                assert!(user_agent.contains("KiroIDE-"), "{user_agent}");
+            }
         }
     }
 

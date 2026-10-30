@@ -108,6 +108,42 @@ pub struct ImageProcessingConfig {
 
     #[serde(default = "default_true")]
     pub safe_normalize_base64_media_types: bool,
+
+    /// 是否在发给上游前压缩过大的图片（默认关闭）。打开后，长边超过 `resize_max_long_side` 或
+    /// base64 长度超过 `resize_max_bytes` 的 PNG/JPEG/WebP 图片会等比缩小并重新编码为 JPEG；
+    /// GIF 不处理，失败时保留原图。只在本地多模态预处理阶段执行：直接转发给外部池的请求
+    /// （原样转发路径）不经过这一步，保持原图。
+    #[serde(default)]
+    pub resize_enabled: bool,
+
+    /// 压缩后的长边上限（像素）。
+    #[serde(default = "default_image_resize_max_long_side")]
+    pub resize_max_long_side: u32,
+
+    /// 压缩目标：base64 编码后的字节数上限。
+    #[serde(default = "default_image_resize_max_bytes")]
+    pub resize_max_bytes: usize,
+
+    /// 重新编码为 JPEG 时的初始画质（1..=100）。
+    #[serde(default = "default_image_resize_jpeg_quality")]
+    pub resize_jpeg_quality: u8,
+}
+
+pub const IMAGE_RESIZE_MIN_LONG_SIDE: u32 = 256;
+pub const IMAGE_RESIZE_MAX_LONG_SIDE: u32 = 8000;
+pub const IMAGE_RESIZE_MIN_BYTES: usize = 32 * 1024;
+pub const IMAGE_RESIZE_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+fn default_image_resize_max_long_side() -> u32 {
+    1568
+}
+
+fn default_image_resize_max_bytes() -> usize {
+    400_000
+}
+
+fn default_image_resize_jpeg_quality() -> u8 {
+    85
 }
 
 impl Default for ImageProcessingConfig {
@@ -117,19 +153,34 @@ impl Default for ImageProcessingConfig {
             safe_materialize_file_sources: true,
             safe_download_remote_sources: true,
             safe_normalize_base64_media_types: true,
+            resize_enabled: false,
+            resize_max_long_side: default_image_resize_max_long_side(),
+            resize_max_bytes: default_image_resize_max_bytes(),
+            resize_jpeg_quality: default_image_resize_jpeg_quality(),
         }
     }
 }
 
 impl ImageProcessingConfig {
     pub fn normalized(self) -> Self {
-        match self.mode {
-            ImageProcessingMode::Safe => self,
+        let resize = Self {
+            resize_max_long_side: self
+                .resize_max_long_side
+                .clamp(IMAGE_RESIZE_MIN_LONG_SIDE, IMAGE_RESIZE_MAX_LONG_SIDE),
+            resize_max_bytes: self
+                .resize_max_bytes
+                .clamp(IMAGE_RESIZE_MIN_BYTES, IMAGE_RESIZE_MAX_BYTES),
+            resize_jpeg_quality: self.resize_jpeg_quality.clamp(40, 100),
+            ..self
+        };
+        match resize.mode {
+            ImageProcessingMode::Safe => resize,
             ImageProcessingMode::Light => Self {
                 mode: ImageProcessingMode::Light,
                 safe_materialize_file_sources: false,
                 safe_download_remote_sources: false,
                 safe_normalize_base64_media_types: false,
+                ..resize
             },
         }
     }
@@ -218,6 +269,14 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub history_placeholder_tools: bool,
 
+    /// 历史里重复出现的同一张图片只发第一次（默认关闭）。
+    ///
+    /// Claude Code 反复截同一个屏、或工具结果里多次返回同一张图时，历史会带上很多份完全相同的
+    /// base64。打开后从第二份起换成一行文字说明，减少请求体积和输入 token；当前这一轮的图片
+    /// 总是原样发送。只按图片数据完全相同判断，内容稍有不同就不算重复。
+    #[serde(default)]
+    pub history_image_dedup: bool,
+
     /// Anthropic `code_execution_*` 服务端工具的本地受限执行配置。
     ///
     /// 默认关闭。关闭时保持普通 `tool_use` 透传，避免在未配置执行环境时
@@ -257,6 +316,7 @@ impl Default for BodyConversionConfig {
             synthetic_thinking_signatures: true,
             tool_pairing_repair: true,
             history_placeholder_tools: true,
+            history_image_dedup: false,
             code_execution: CodeExecutionConfig::default(),
             model_driven_web_search: None,
         }
@@ -4879,6 +4939,23 @@ pub struct Config {
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
+    /// 是否自动同步 Kiro 客户端版本号（默认关闭）。
+    ///
+    /// 打开后，后台每 12 小时从官方发布元数据读取当前版本，所有上游请求头里的 `KiroIDE-{版本}`
+    /// 改用读到的版本；读取失败或尚未读到时继续使用 `kiro_version`。版本号是上游身份的一部分，
+    /// 会同时影响所有账号，所以默认关闭。
+    #[serde(default)]
+    pub kiro_version_auto_sync_enabled: bool,
+
+    /// IDE 端点的对话和联网搜索请求是否改走新版 Kiro 域名 `runtime.{region}.kiro.dev`（默认关闭，
+    /// 走 `q.{region}.amazonaws.com`）。只换地址，请求头仍是 IDE 那一套；模型列表、用量查询、
+    /// token 刷新不受影响。命令行端点本来就走新域名。
+    ///
+    /// 2026-10-30 用 FREE 账号实测：同一批账号走旧域名正常，打开后对话请求每次都被新域名以 429
+    /// 拒绝（命令行端点走新域名正常），所以生产上不要打开，除非先用自己的账号验证过。
+    #[serde(default)]
+    pub kiro_runtime_domain_enabled: bool,
+
     #[serde(default)]
     pub machine_id: Option<String>,
 
@@ -5006,6 +5083,29 @@ pub struct Config {
     /// 开启时按 `credential_stream_error_cooldown_secs` 冷却，并记会话失败。
     #[serde(default)]
     pub credential_empty_turn_cooldown_enabled: bool,
+
+    /// 上游故障是否让账号进入冷却（默认关闭）。
+    ///
+    /// 上游故障指换任何账号都可能遇到、与账号本身无关的错误：上游 5xx、上游在响应里发出的
+    /// 异常/错误事件、EventStream 解码或读取失败、网络发送失败。关闭时账号不冷却、不记会话失败，
+    /// 只在当次请求内排除并换号；开启时按各自的冷却秒数冷却（0.0.225 及之前的行为）。
+    /// 限流、鉴权、额度、风控等账号问题不受这个开关影响，照常冷却。
+    #[serde(default)]
+    pub credential_upstream_failure_cooldown_enabled: bool,
+
+    /// 自愈最小间隔秒数（默认 300，0 表示不限）。
+    ///
+    /// 所有可调度账号都失效时，调度器会自动重新启用因连续失败被禁用的账号。同一个账号两次自愈
+    /// 之间至少隔这么久，避免坏账号在"禁用→自愈→再禁用"之间来回打转、每轮都消耗请求。
+    #[serde(default = "default_credential_auto_heal_min_interval_secs")]
+    pub credential_auto_heal_min_interval_secs: u64,
+
+    /// 同一个账号最多连续自愈几轮（默认 5，0 表示不限）。
+    ///
+    /// 自愈后还没有成功过一次就又被禁用，算连续一轮；有一次调用成功或管理员手动启用/重置后清零。
+    /// 达到上限后不再自动恢复，等管理员处理。
+    #[serde(default = "default_credential_auto_heal_max_consecutive_rounds")]
+    pub credential_auto_heal_max_consecutive_rounds: u32,
 
     /// 可重试协议异常或无法分类错误的基础冷却秒数。
     #[serde(default = "default_credential_protocol_error_cooldown_secs")]
@@ -5571,6 +5671,19 @@ fn default_region() -> String {
 
 const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 13;
 
+impl Config {
+    /// 上游请求头里实际使用的 Kiro 客户端版本：开启自动同步且已读到官方版本时用读到的版本，
+    /// 否则用配置的 `kiro_version`。
+    pub fn effective_kiro_version(&self) -> String {
+        if self.kiro_version_auto_sync_enabled
+            && let Some(version) = crate::kiro::kiro_version::latest()
+        {
+            return version;
+        }
+        self.kiro_version.clone()
+    }
+}
+
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
 }
@@ -5669,6 +5782,14 @@ fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
 
 pub const STREAM_PRE_OUTPUT_HOLD_MAX_SECS: u64 = 60;
 pub const STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS: u64 = 3600;
+
+fn default_credential_auto_heal_min_interval_secs() -> u64 {
+    300
+}
+
+fn default_credential_auto_heal_max_consecutive_rounds() -> u32 {
+    5
+}
 
 fn default_stream_pre_output_hold_secs() -> u64 {
     15
@@ -6623,6 +6744,8 @@ impl Default for Config {
             auth_region: None,
             api_region: None,
             kiro_version: default_kiro_version(),
+            kiro_version_auto_sync_enabled: false,
+            kiro_runtime_domain_enabled: false,
             machine_id: None,
             global_machine_id_fallback_enabled: false,
             api_key: None,
@@ -6650,6 +6773,11 @@ impl Default for Config {
             ),
             credential_stream_error_cooldown_secs: default_credential_stream_error_cooldown_secs(),
             credential_empty_turn_cooldown_enabled: false,
+            credential_upstream_failure_cooldown_enabled: false,
+            credential_auto_heal_min_interval_secs: default_credential_auto_heal_min_interval_secs(
+            ),
+            credential_auto_heal_max_consecutive_rounds:
+                default_credential_auto_heal_max_consecutive_rounds(),
             credential_protocol_error_cooldown_secs:
                 default_credential_protocol_error_cooldown_secs(),
             credential_auth_error_cooldown_secs: default_credential_auth_error_cooldown_secs(),
@@ -7543,6 +7671,20 @@ mod tests {
         assert!(
             !config.credential_empty_turn_cooldown_enabled,
             "空回默认不让账号冷却"
+        );
+        assert!(
+            !config.credential_upstream_failure_cooldown_enabled,
+            "上游故障默认不让账号冷却"
+        );
+        assert_eq!(config.credential_auto_heal_min_interval_secs, 300);
+        assert_eq!(config.credential_auto_heal_max_consecutive_rounds, 5);
+        assert!(
+            !config.kiro_version_auto_sync_enabled,
+            "版本号自动同步默认关闭"
+        );
+        assert!(
+            !config.kiro_runtime_domain_enabled,
+            "新版 Kiro 域名默认关闭"
         );
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 5);

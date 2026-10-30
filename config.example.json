@@ -49,7 +49,11 @@
     "mode": "safe",
     "safeMaterializeFileSources": true,
     "safeDownloadRemoteSources": true,
-    "safeNormalizeBase64MediaTypes": true
+    "safeNormalizeBase64MediaTypes": true,
+    "resizeEnabled": false,
+    "resizeMaxLongSide": 1568,
+    "resizeMaxBytes": 400000,
+    "resizeJpegQuality": 85
   },
   "bodyConversion": {
     "toolSchemaNormalization": true,
