@@ -150,11 +150,14 @@ impl CapacityWaiter {
         }
     }
 
+    /// The waiter got a slot. A waiter that was woken by a credit already consumed it in
+    /// [`Self::wait_for_change`]; consuming another here stole the wakeup of a second waiter, so
+    /// with several slots freed at once one waiter slept on until the next release or its queue
+    /// timeout. `unregister` trims credits that no remaining waiter can claim.
     pub(crate) fn finish_acquired(&mut self) {
         if !self.active {
             return;
         }
-        let _ = self.signal.consume_credit();
         self.signal.unregister();
         self.active = false;
     }
@@ -227,6 +230,26 @@ mod tests {
         signal.capacity_released(2);
         first.finish_acquired();
         drop(second);
+        assert_eq!(signal.test_snapshot(), (0, 0, 0));
+    }
+
+    /// Two slots freed at once, two waiters: both must wake. The first waiter's acquire used to
+    /// consume a second credit and leave the other one asleep.
+    #[tokio::test]
+    async fn two_slots_freed_at_once_wake_both_waiters() {
+        let signal = Arc::new(CapacitySignal::default());
+        let mut first = signal.register();
+        let mut second = signal.register();
+        signal.capacity_released(2);
+
+        tokio::time::timeout(Duration::from_millis(100), first.wait_for_change())
+            .await
+            .expect("first waiter wakes");
+        first.finish_acquired();
+        tokio::time::timeout(Duration::from_millis(100), second.wait_for_change())
+            .await
+            .expect("the second freed slot still wakes the second waiter");
+        second.finish_acquired();
         assert_eq!(signal.test_snapshot(), (0, 0, 0));
     }
 
