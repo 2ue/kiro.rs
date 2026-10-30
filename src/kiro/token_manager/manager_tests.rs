@@ -9028,6 +9028,51 @@ fn test_local_pool_route_state_auto_heals_too_many_failures() {
     assert!(healed.disabled_reason.is_none());
 }
 
+/// Production-like report 2026-10-31: accounts brought back by the too-many-failures auto heal
+/// showed enabled, idle and with RPM 0, yet were never dispatched. Disabling had set the 24 h
+/// Redis dispatch block, which every Redis lease checks first, and the heal never cleared it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_auto_healed_credential_is_dispatchable_again() {
+    run_isolated_redis_manager_fixture(|redis_store| async move {
+        let mut config = Config::default();
+        config.credential_warmup_requests = 0;
+        config.credential_dispatch_max_wait_secs = 1;
+        let manager = MultiTokenManager::new_with_stores(
+            config,
+            vec![api_key_credential("ksk_auto_heal_redis_block")],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap();
+
+        assert!(manager.report_failure(1));
+        assert!(manager.report_failure(1));
+        assert!(!manager.report_failure(1));
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
+            .await;
+        assert!(manager.snapshot().entries[0].disabled);
+
+        // The route preflight heals the only credential; the Redis block must go with it.
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert!(!manager.snapshot().entries[0].disabled);
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
+            .await;
+
+        let mut ctx =
+            tokio::time::timeout(StdDuration::from_secs(5), manager.acquire_context(None))
+                .await
+                .expect("acquire finished")
+                .expect("the healed credential gets a Redis lease");
+        assert_eq!(ctx.id, 1);
+        ctx.release_in_flight();
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn test_local_pool_route_state_proxy_blocked_recovers_after_resource_enabled() {
     let mut credential = api_key_credential("ksk_proxy_dynamic");

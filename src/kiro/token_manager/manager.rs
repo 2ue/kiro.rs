@@ -3944,7 +3944,7 @@ impl MultiTokenManager {
             return false;
         }
 
-        for healed_id in healed_ids {
+        for &healed_id in &healed_ids {
             self.record_scheduler_credential_audit(
                 "auto_enable_credential",
                 healed_id,
@@ -3956,6 +3956,9 @@ impl MultiTokenManager {
                 }),
             );
         }
+        // Disabling set a 24 h Redis dispatch block; every Redis lease attempt checks it first, so
+        // without this the healed credential looks enabled and idle but can never be dispatched.
+        self.clear_scheduler_dispatch_blocks_deferred(&healed_ids);
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("auto_heal_too_many_failures");
@@ -7641,6 +7644,22 @@ impl MultiTokenManager {
                         }
                         SchedulerRedisSelectionAdmission::RateLimited(wait) => {
                             drop(in_flight_lease);
+                            // Losing the RPM race on this credential (another request or instance
+                            // took its last call of the minute) is like losing a slot race: the
+                            // credential is now marked rate limited, so re-select right away when
+                            // another one can take the request instead of queueing behind it.
+                            if self.has_alternate_dispatchable_credential_for_slot_race(
+                                model,
+                                &local_excluded_ids,
+                                id,
+                                request_weight_units,
+                            ) {
+                                tracing::debug!(
+                                    credential_id = id,
+                                    "Redis 凭据 RPM 已被其他请求用完，立即改选其他可用凭据"
+                                );
+                                continue;
+                            }
                             if acquire_mode.is_fail_fast() {
                                 local_scheduler_bail!(
                                     LocalSchedulerErrorKind::CapacityUnavailable,
@@ -11575,6 +11594,23 @@ impl MultiTokenManager {
             redis.clear_scheduler_dispatch_block(id).await
         })?;
         Ok(())
+    }
+
+    fn clear_scheduler_dispatch_blocks_deferred(&self, ids: &[u64]) {
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let redis = redis.clone();
+        let ids = ids.to_vec();
+        spawn_best_effort_storage_task("异步清理 Redis 凭据调度阻断", async move {
+            for id in ids {
+                redis.clear_scheduler_dispatch_block(id).await?;
+            }
+            Ok(())
+        });
     }
 
     fn set_scheduler_dispatch_block_for_credential_deferred(&self, id: u64) {

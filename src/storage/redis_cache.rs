@@ -5940,64 +5940,78 @@ impl RedisStore {
         Ok(())
     }
 
+    /// Removes leases whose last heartbeat is older than `max_age`. Credentials are swept
+    /// [`SCHEDULER_STATE_BATCH_SIZE`] per call: one call per credential meant a hundred round trips
+    /// on the scheduler capacity connection every few seconds with a hundred accounts, queueing
+    /// in front of the requests' own lease calls whenever Redis slowed down.
     pub async fn cleanup_expired_in_flight_leases(
         &self,
         credential_ids: &[u64],
         max_age: StdDuration,
     ) -> anyhow::Result<usize> {
         let max_age_ms = max_age.as_millis() as i64;
+        // KEYS[1..5]: global last_seen, acquired, kind, weight, count.
+        // KEYS[6 + 5k .. 10 + 5k]: the same five keys of the k-th credential in the batch.
         let script = r#"
             local redis_time = redis.call('TIME')
             local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
             local max_age_ms = tonumber(ARGV[1])
-            local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - max_age_ms)
-            for _, member in ipairs(expired) do
-                local local_weight = tonumber(redis.call('HGET', KEYS[4], member) or '1')
-                local global_weight = tonumber(redis.call('HGET', KEYS[9], member) or '1')
-                redis.call('ZREM', KEYS[1], member)
-                local local_acquired_removed = redis.call('ZREM', KEYS[2], member)
-                redis.call('HDEL', KEYS[3], member)
-                redis.call('HDEL', KEYS[4], member)
-                if local_acquired_removed > 0 then
-                    local next_count = redis.call('DECRBY', KEYS[5], local_weight)
-                    if tonumber(next_count) < 0 then
-                        redis.call('SET', KEYS[5], 0)
+            local removed_total = 0
+            local credential_count = (#KEYS - 5) / 5
+            for k = 0, credential_count - 1 do
+                local base = 6 + k * 5
+                local expired = redis.call('ZRANGEBYSCORE', KEYS[base], '-inf', now - max_age_ms)
+                for _, member in ipairs(expired) do
+                    local local_weight = tonumber(redis.call('HGET', KEYS[base + 3], member) or '1')
+                    local global_weight = tonumber(redis.call('HGET', KEYS[4], member) or '1')
+                    redis.call('ZREM', KEYS[base], member)
+                    local local_acquired_removed = redis.call('ZREM', KEYS[base + 1], member)
+                    redis.call('HDEL', KEYS[base + 2], member)
+                    redis.call('HDEL', KEYS[base + 3], member)
+                    if local_acquired_removed > 0 then
+                        local next_count = redis.call('DECRBY', KEYS[base + 4], local_weight)
+                        if tonumber(next_count) < 0 then
+                            redis.call('SET', KEYS[base + 4], 0)
+                        end
+                    end
+                    redis.call('ZREM', KEYS[1], member)
+                    local global_acquired_removed = redis.call('ZREM', KEYS[2], member)
+                    redis.call('HDEL', KEYS[3], member)
+                    redis.call('HDEL', KEYS[4], member)
+                    if global_acquired_removed > 0 then
+                        local next_global_count = redis.call('DECRBY', KEYS[5], global_weight)
+                        if tonumber(next_global_count) < 0 then
+                            redis.call('SET', KEYS[5], 0)
+                        end
                     end
                 end
-                redis.call('ZREM', KEYS[6], member)
-                local global_acquired_removed = redis.call('ZREM', KEYS[7], member)
-                redis.call('HDEL', KEYS[8], member)
-                redis.call('HDEL', KEYS[9], member)
-                if global_acquired_removed > 0 then
-                    local next_global_count = redis.call('DECRBY', KEYS[10], global_weight)
-                    if tonumber(next_global_count) < 0 then
-                        redis.call('SET', KEYS[10], 0)
-                    end
-                end
+                removed_total = removed_total + #expired
             end
-            return #expired
+            return removed_total
         "#;
         let mut manager = self.scheduler_capacity_manager();
         let mut cleaned = 0usize;
         let global_keys = global_in_flight_keys();
-        for credential_id in credential_ids {
-            let keys = in_flight_keys(*credential_id);
-            let removed: i64 = redis::cmd("EVAL")
+        for batch in credential_ids.chunks(SCHEDULER_STATE_BATCH_SIZE) {
+            let mut command = redis::cmd("EVAL");
+            command
                 .arg(script)
-                .arg(10)
-                .arg(self.key(&keys.last_seen))
-                .arg(self.key(&keys.acquired))
-                .arg(self.key(&keys.kind))
-                .arg(self.key(&keys.weight))
-                .arg(self.key(&keys.count))
+                .arg(5 + batch.len() * 5)
                 .arg(self.key(&global_keys.last_seen))
                 .arg(self.key(&global_keys.acquired))
                 .arg(self.key(&global_keys.kind))
                 .arg(self.key(&global_keys.weight))
-                .arg(self.key(&global_keys.count))
-                .arg(max_age_ms)
-                .query_async(&mut manager)
-                .await?;
+                .arg(self.key(&global_keys.count));
+            for credential_id in batch {
+                let keys = in_flight_keys(*credential_id);
+                command
+                    .arg(self.key(&keys.last_seen))
+                    .arg(self.key(&keys.acquired))
+                    .arg(self.key(&keys.kind))
+                    .arg(self.key(&keys.weight))
+                    .arg(self.key(&keys.count));
+            }
+            let removed: i64 = command.arg(max_age_ms).query_async(&mut manager).await?;
             cleaned += removed.max(0) as usize;
         }
         Ok(cleaned)
@@ -10740,6 +10754,89 @@ mod tests {
         );
         let state = store.scheduler_state_for_credentials(&[9]).await.unwrap();
         assert_eq!(state.get(&9).unwrap().in_flight_leases.len(), 0);
+    }
+
+    /// The sweep covers many credentials per call; every expired lease is reclaimed, live ones and
+    /// their counts stay, and the global count follows.
+    #[tokio::test]
+    async fn redis_expired_lease_cleanup_sweeps_many_credentials_in_batches() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        // More credentials than one batch, so the sweep spans several calls.
+        let ids: Vec<u64> = (1_000..1_000 + SCHEDULER_STATE_BATCH_SIZE as u64 * 2 + 3).collect();
+        for &id in &ids {
+            let lease = store.next_in_flight_lease_id().await.unwrap();
+            let max_age = if id % 2 == 0 {
+                StdDuration::from_millis(1)
+            } else {
+                StdDuration::from_secs(60)
+            };
+            assert!(
+                store
+                    .acquire_in_flight_lease(id, lease, 1, Some(max_age), "stream")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        let expired = ids.iter().filter(|id| **id % 2 == 0).count();
+        // Leases are stale relative to the sweep's own max age, not their acquire hint.
+        let cleaned = store
+            .cleanup_expired_in_flight_leases(&ids, StdDuration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            cleaned,
+            ids.len(),
+            "every lease older than the max age is reclaimed"
+        );
+        let state = store.scheduler_state_for_credentials(&ids).await.unwrap();
+        for id in &ids {
+            assert!(
+                state.get(id).unwrap().in_flight_leases.is_empty(),
+                "credential {id}"
+            );
+        }
+        assert_eq!(
+            store
+                .global_capacity_state()
+                .await
+                .unwrap()
+                .in_flight_requests,
+            0
+        );
+        assert!(expired > 0);
+
+        // A live lease survives a sweep with a long max age.
+        let live_id = ids[0];
+        let lease = store.next_in_flight_lease_id().await.unwrap();
+        assert!(
+            store
+                .acquire_in_flight_lease(live_id, lease, 1, Some(StdDuration::from_secs(60)), "api")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .cleanup_expired_in_flight_leases(&ids, StdDuration::from_secs(60))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .global_capacity_state()
+                .await
+                .unwrap()
+                .in_flight_requests,
+            1
+        );
+        assert!(store.release_in_flight_lease(live_id, lease).await.unwrap());
     }
 
     #[tokio::test]

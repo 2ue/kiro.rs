@@ -33,8 +33,33 @@ const control = {
   chunkDelayMs: 0,
   midStreamResetRate: 0,
 };
+// - slowTokens / slowExtraMs: extra header delay for the listed tokens, to model slower accounts.
+// - jitterMs: random extra header delay 0..jitterMs on every call.
+// `GET /__control` also returns, per access token, the calls in flight right now and the highest
+// in-flight count and per-minute call count seen since the last reset (`perToken`).
 const emptyCounters = () => ({ requests: 0, failed: 0, ok: 0, midStreamResets: 0, byToken: {}, conversations: [] });
 const counters = { ...emptyCounters(), inFlight: 0, maxInFlight: 0 };
+// token -> { inFlight, maxInFlight, recent: [call start ms], maxPerMinute }
+let perToken = new Map();
+
+function tokenStats(token) {
+  let stats = perToken.get(token);
+  if (!stats) {
+    stats = { inFlight: 0, maxInFlight: 0, recent: [], maxPerMinute: 0 };
+    perToken.set(token, stats);
+  }
+  return stats;
+}
+
+function perTokenSnapshot() {
+  const now = Date.now();
+  const out = {};
+  for (const [token, stats] of perToken) {
+    stats.recent = stats.recent.filter((at) => now - at < 60000);
+    out[token] = { inFlight: stats.inFlight, maxInFlight: stats.maxInFlight, lastMinute: stats.recent.length, maxPerMinute: stats.maxPerMinute };
+  }
+  return out;
+}
 
 const models = [
   { id: "sonnet", displayName: "Sonnet", maxInputTokens: 200000 },
@@ -387,7 +412,20 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
   });
   const token = bearerToken(req);
   counters.byToken[token] = (counters.byToken[token] || 0) + 1;
-  const headerDelayMs = Number.parseInt(url.searchParams.get("headerDelayMs") || `${control.headerDelayMs}`, 10);
+  const stats = tokenStats(token);
+  const startedAt = Date.now();
+  stats.inFlight += 1;
+  stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
+  stats.recent = stats.recent.filter((at) => startedAt - at < 60000);
+  stats.recent.push(startedAt);
+  stats.maxPerMinute = Math.max(stats.maxPerMinute, stats.recent.length);
+  res.on("close", () => {
+    stats.inFlight -= 1;
+  });
+  const slowExtraMs = (control.slowTokens || []).includes(token) ? Number(control.slowExtraMs) || 0 : 0;
+  const jitterMs = Number(control.jitterMs) > 0 ? Math.floor(Math.random() * Number(control.jitterMs)) : 0;
+  const headerDelayMs =
+    Number.parseInt(url.searchParams.get("headerDelayMs") || `${control.headerDelayMs}`, 10) + slowExtraMs + jitterMs;
   if (headerDelayMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, headerDelayMs));
     // The request body has already been read, so only the response side tells whether the
@@ -492,9 +530,13 @@ const server = http.createServer(async (req, res) => {
         Object.assign(control, patch || {});
         if (patch && patch.resetCounters) {
           Object.assign(counters, emptyCounters(), { maxInFlight: counters.inFlight });
+          for (const stats of perToken.values()) {
+            stats.maxInFlight = stats.inFlight;
+            stats.maxPerMinute = 0;
+          }
         }
       }
-      json(res, 200, { control, counters });
+      json(res, 200, { control, counters: { ...counters, perToken: perTokenSnapshot() } });
       return;
     }
 

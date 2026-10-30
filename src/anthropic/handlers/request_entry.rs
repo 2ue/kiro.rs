@@ -486,16 +486,6 @@ fn local_pool_fast_fail_response_parts(
             RequestRejectionReason::LocalPoolUnavailable,
             None,
         ),
-        LocalPoolRouteStateKind::SchedulerRedisDegraded => {
-            let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                envelope::public_rate_limit_message(Some(retry_after_secs)),
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
-                Some(retry_after_secs),
-            )
-        }
         LocalPoolRouteStateKind::RiskCircuitOpen => {
             let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
             (
@@ -506,10 +496,15 @@ fn local_pool_fast_fail_response_parts(
                 Some(retry_after_secs),
             )
         }
+        // A Redis scheduler breaker that opened on a few slow Redis calls says nothing about the
+        // accounts: the dispatch path still serves them from local state with a bounded wait.
+        // Rejecting here turned every Redis hiccup into seconds of 429s for the whole pool while
+        // every account was idle (mock 2026-10-31: 52,605 rejections at 120-180 of 300 slots).
         LocalPoolRouteStateKind::Ready
         | LocalPoolRouteStateKind::NoModelCompatible
         | LocalPoolRouteStateKind::AllCoolingDown
-        | LocalPoolRouteStateKind::CapacityFull => return None,
+        | LocalPoolRouteStateKind::CapacityFull
+        | LocalPoolRouteStateKind::SchedulerRedisDegraded => return None,
     })
 }
 
@@ -1525,24 +1520,16 @@ mod tests {
                 assert_eq!(retry_after, None, "round {round}");
             }
 
-            let (status, error_type, message, reason, retry_after) =
+            // A degraded Redis scheduler is served from local state by the dispatch path, so the
+            // entry must not turn it into a pool-wide rejection.
+            assert!(
                 local_pool_fast_fail_response_parts(
                     LocalPoolRouteStateKind::SchedulerRedisDegraded,
                     Some(4),
                 )
-                .expect("scheduler degraded should fast-fail");
-            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "round {round}");
-            assert_eq!(error_type, "rate_limit_error", "round {round}");
-            assert!(
-                message.contains("Retry after 4 seconds."),
-                "round {round}: {message}"
+                .is_none(),
+                "round {round}: a degraded Redis scheduler is not a reason to reject at the entry"
             );
-            assert_eq!(
-                reason,
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
-                "round {round}"
-            );
-            assert_eq!(retry_after, Some(4), "round {round}");
 
             let (status, error_type, message, reason, retry_after) =
                 local_pool_fast_fail_response_parts(LocalPoolRouteStateKind::RiskCircuitOpen, None)
