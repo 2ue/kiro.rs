@@ -6250,8 +6250,8 @@ fn build_simulated_usage(
                 return (None, None);
             }
 
-            // credential_id 需要等 provider 选中账号后才能确定；这里先保留 profile，
-            // 真正的 local prompt-cache 计算在 attach credential 后重新完成。
+            // local prompt-cache 计算延后到选定账号后执行（usage 需要带上账号归属）；
+            // scope 只由 conversation_id + 路由命名空间决定，不含 credential_id。
             if prompt_cache_profile.is_some() {
                 (None, Some(UsageSource::LocalPromptCache))
             } else {

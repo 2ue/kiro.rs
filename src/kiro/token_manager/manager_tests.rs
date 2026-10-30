@@ -6555,9 +6555,10 @@ async fn test_catalog_listed_credentials_win_over_unknown_catalog_for_five_round
             let mut config = Config::default();
             config.load_balancing_mode = mode.to_string();
 
-            // An unknown catalog (discovery failed) with the best priority must not win while a
-            // credential whose catalog lists the model is dispatchable.
-            let mut unknown = test_access_token_credential("unknown-catalog", "Pro");
+            // An API key credential with an unknown catalog (discovery failed) and the best
+            // priority must not win while a credential whose catalog lists the model is
+            // dispatchable.
+            let mut unknown = api_key_credential("unknown-catalog");
             unknown.priority = 0;
             unknown.supported_models = Vec::new();
             let mut listed = test_access_token_credential("listed", "Pro");
@@ -6596,6 +6597,44 @@ async fn test_catalog_listed_credentials_win_over_unknown_catalog_for_five_round
             ctx.release_in_flight();
         }
     }
+}
+
+#[tokio::test]
+async fn empty_catalog_credentials_take_traffic_once_listed_ones_are_full() {
+    // Catalog preference only reorders: with the listed credential full, the empty-catalog one
+    // serves the next request immediately instead of the request queueing.
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    config.credential_max_concurrent_requests = 1;
+    let mut empty_catalog = test_access_token_credential("empty-catalog", "Pro");
+    empty_catalog.priority = 0;
+    let mut listed = api_key_credential("listed-api-key");
+    listed.priority = 0;
+    listed.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
+    let manager =
+        MultiTokenManager::new(config, vec![empty_catalog, listed], None, None, false).unwrap();
+    let empty = HashSet::new();
+    let mut first = manager
+        .acquire_context_for_session(Some("claude-sonnet-4"), None, &empty)
+        .await
+        .unwrap();
+    assert_eq!(first.id, 2, "the listed credential is preferred");
+    let mut second = manager
+        .acquire_context_for_session_with_mode(
+            Some("claude-sonnet-4"),
+            None,
+            &empty,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.id, 1,
+        "no capacity is lost to the catalog preference"
+    );
+    first.release_in_flight();
+    second.release_in_flight();
 }
 
 #[tokio::test]

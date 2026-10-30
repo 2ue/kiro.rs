@@ -162,9 +162,11 @@ fn prefer_catalog_listed<'a>(
     dispatchable: Vec<&'a CredentialEntry>,
     model: Option<&str>,
 ) -> Vec<&'a CredentialEntry> {
-    // Credentials with an empty model catalog are only a fallback: when any dispatchable
-    // credential's catalog lists the model, unknown-catalog credentials (failed discovery,
-    // invalid keys) must not win the selection and burn an attempt.
+    // When a dispatchable credential's catalog lists the model, credentials with an empty
+    // catalog (discovery failed or never ran) are not picked: an invalid-model answer from them
+    // would burn an attempt. This only reorders: the filter applies to *dispatchable*
+    // credentials, so once every listed credential is full the empty-catalog ones take the
+    // traffic and no capacity is lost.
     let prefer_listed = dispatchable
         .iter()
         .any(|entry| credential_catalog_lists_model(entry, model));

@@ -1683,6 +1683,7 @@ impl CachePointPolicyPatch {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheBoundsPolicy {
+    /// 每个会话 scope（conversation_id + 路由命名空间）最多保留的条目数；字段名为兼容保留。
     #[serde(default = "default_prompt_cache_max_entries_per_account")]
     pub max_entries_per_account: usize,
     #[serde(default = "default_prompt_cache_max_entries_global")]
@@ -5487,7 +5488,8 @@ pub struct Config {
     #[serde(default)]
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
 
-    /// 本地 prompt-cache 每个账号最多保留的 fingerprint 条目。
+    /// 本地 prompt-cache 每个会话 scope（conversation_id + 路由命名空间）最多保留的 fingerprint
+    /// 条目。scope 不含账号，同一会话换号后仍命中同一组条目；键名里的 PerAccount 只为兼容保留。
     #[serde(default = "default_prompt_cache_max_entries_per_account")]
     pub prompt_cache_max_entries_per_account: usize,
 

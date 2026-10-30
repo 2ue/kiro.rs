@@ -26,9 +26,9 @@ pub(super) fn credential_is_usable_for_model(entry: &CredentialEntry, model: Opt
     true
 }
 
-/// Whether the credential's discovered model catalog explicitly lists `model`. An empty
-/// catalog (discovery never ran or failed) only passes `supports_model` as "unknown", so it
-/// is not a known supporter.
+/// Whether the credential's model catalog explicitly lists `model`. An empty catalog only
+/// passes `supports_model` as "unknown": for OAuth credentials it means unrestricted (they
+/// never run model discovery), for API key credentials that discovery failed or never ran.
 pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
     model.is_some_and(|model| !model.trim().is_empty())
         && !entry.credentials.supported_models.is_empty()
