@@ -6199,6 +6199,133 @@ async fn run_native_reasoning_reaches_client_before_reasoning_ends() {
     }
 }
 
+/// Thinking display follows the Anthropic API for Claude Code: a model whose official default is
+/// `omitted` hides reasoning text when the request leaves `display` out, the token-count beta
+/// adds `estimated_tokens` progress on the hidden block, and an older model keeps its text.
+async fn run_thinking_display_follows_official_defaults() {
+    struct Case {
+        label: &'static str,
+        model: &'static str,
+        thinking: serde_json::Value,
+        beta: Option<&'static str>,
+        hidden: bool,
+        estimates: bool,
+    }
+    let cases = [
+        Case {
+            label: "sonnet-5.5 without display",
+            model: "claude-sonnet-5-5",
+            thinking: json!({"type": "adaptive"}),
+            beta: None,
+            hidden: true,
+            estimates: false,
+        },
+        Case {
+            label: "sonnet-5.5 without display, token-count beta",
+            model: "claude-sonnet-5-5",
+            thinking: json!({"type": "adaptive"}),
+            beta: Some("interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13"),
+            hidden: true,
+            estimates: true,
+        },
+        Case {
+            label: "opus-5.5 omitted, token-count beta",
+            model: "claude-opus-5-5",
+            thinking: json!({"type": "adaptive", "display": "omitted"}),
+            beta: Some("thinking-token-count-2026-05-13"),
+            hidden: true,
+            estimates: true,
+        },
+        Case {
+            label: "sonnet-5.5 summarized opts back in",
+            model: "claude-sonnet-5-5",
+            thinking: json!({"type": "adaptive", "display": "summarized"}),
+            beta: Some("thinking-token-count-2026-05-13"),
+            hidden: false,
+            estimates: false,
+        },
+        Case {
+            label: "sonnet-4 keeps summarized as its default",
+            model: "claude-sonnet-4-20250514",
+            thinking: json!({"type": "enabled", "budget_tokens": 1024}),
+            beta: Some("thinking-token-count-2026-05-13"),
+            hidden: false,
+            estimates: false,
+        },
+    ];
+    for case in cases {
+        let label = case.label;
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::ReasoningThenLongPauseThenText,
+        )
+        .await;
+        let (app, _usage_recorder) = first_output_router(&upstream.base_url, 1, 15, 0);
+        let mut request = multimodal_handler_request(
+            "/cc/v1/messages",
+            json!({
+                "model": case.model,
+                "max_tokens": 2048,
+                "stream": true,
+                "messages": [{"role": "user", "content": "exercise the EventStream fixture"}],
+                "thinking": case.thinking,
+            })
+            .to_string(),
+        );
+        if let Some(beta) = case.beta {
+            request
+                .headers_mut()
+                .insert("anthropic-beta", beta.parse().expect("beta header"));
+        }
+        let response = tokio::time::timeout(Duration::from_secs(10), app.oneshot(request))
+            .await
+            .expect("response timed out")
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{label}");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(body.contains(r#""type":"thinking""#), "{label}: {body}");
+        assert!(
+            body.contains("fixture-signature"),
+            "{label}: signature is kept"
+        );
+        assert!(
+            body.contains("answer after reasoning"),
+            "{label}: answer is kept"
+        );
+        assert_eq!(
+            body.contains("Planning the"),
+            !case.hidden,
+            "{label}: reasoning text visible={}",
+            !case.hidden
+        );
+        assert_eq!(
+            body.contains("estimated_tokens"),
+            case.estimates,
+            "{label}: estimated_tokens present={}: {body}",
+            case.estimates
+        );
+        if case.hidden {
+            assert!(
+                body.contains(r#""delta":{"thinking":"","type":"thinking_delta""#)
+                    || body.contains(r#""delta":{"type":"thinking_delta","thinking":"""#)
+                    || body.contains(r#""thinking":"","type":"thinking_delta""#),
+                "{label}: the hidden block carries the official empty thinking_delta: {body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn handler_thinking_display_follows_official_defaults() {
+    run_handler_fixture_on_large_stack_thread(
+        "thinking-display-official-defaults",
+        run_thinking_display_follows_official_defaults,
+    );
+}
+
 #[test]
 fn handler_native_reasoning_reaches_client_before_reasoning_ends() {
     run_handler_fixture_on_large_stack_thread(
@@ -10004,6 +10131,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -10123,6 +10251,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -10220,6 +10349,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -10322,6 +10452,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -10459,6 +10590,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -10546,6 +10678,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -10697,6 +10830,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -11038,6 +11172,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -11216,6 +11351,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -11329,6 +11465,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -11422,6 +11559,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -12284,6 +12422,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -12390,6 +12529,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
@@ -16233,6 +16373,7 @@ fn stable_segment_usage_context(policy: StableSegmentCachePolicy) -> RequestUsag
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
+        report_thinking_token_estimates: false,
         strip_injected_control_blocks: false,
         identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),

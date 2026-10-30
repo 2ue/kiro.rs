@@ -360,8 +360,11 @@ struct RequestUsageContext {
     requested_max_tokens: i32,
     /// 规范化后的 stop_sequences，由代理在输出侧实现。
     stop_sequences: Vec<String>,
-    /// `thinking.display` 为 `omitted`：thinking 块只下发空文本与 signature。
+    /// 推理对客户端隐藏（`display` 为 `omitted`/`updates`，或请求没写 `display` 而模型的
+    /// 官方默认是 `omitted`）：thinking 块只下发空文本与 signature。
     omit_thinking_display: bool,
+    /// 客户端带 `thinking-token-count-2026-05-13` beta：隐藏推理期间附带 `estimated_tokens`。
+    report_thinking_token_estimates: bool,
     /// 是否清洗正文中复述的代理注入控制块；客户端自身使用同名标签时关闭。
     strip_injected_control_blocks: bool,
     /// Remove channel-revealing self-descriptions from assistant text (identity output guard),
@@ -5908,6 +5911,7 @@ fn prepare_usage_context(
         )),
         None,
         None,
+        false,
     )
 }
 
@@ -5924,6 +5928,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     top_level_cache_ttl: Option<super::cache::CacheWriteTtl>,
+    report_thinking_token_estimates: bool,
 ) -> RequestUsageContext {
     let policy = cache_route.policy;
     let simulation_mode = prompt_cache_simulation_mode_for_policy(&policy);
@@ -6081,10 +6086,13 @@ fn prepare_usage_context_with_inference_attempt_budget(
         stop_sequences: super::stop_sequence::normalize_stop_sequences(
             payload.stop_sequences.as_deref(),
         ),
-        omit_thinking_display: payload
-            .thinking
-            .as_ref()
-            .is_some_and(|thinking| thinking.display_mode().hides_reasoning()),
+        omit_thinking_display: request_hides_reasoning(
+            payload,
+            model_resolution
+                .as_ref()
+                .and_then(|resolution| resolution.upstream_model.as_deref()),
+        ),
+        report_thinking_token_estimates,
         strip_injected_control_blocks: !super::control_block_cleaner::request_mentions_control_tags(
             payload,
         ),
@@ -8279,6 +8287,7 @@ async fn post_messages_inner(
             inference_attempt_budget.clone(),
             request_api_key_id.clone(),
             top_level_cache_ttl,
+            request_reports_thinking_token_estimates(&headers),
         );
         let request_id = usage_context.request_id.clone();
         let error_id = usage_context.error_id.clone();
@@ -8589,6 +8598,7 @@ async fn post_messages_inner(
         inference_attempt_budget.clone(),
         request_api_key_id,
         top_level_cache_ttl,
+        request_reports_thinking_token_estimates(&headers),
     );
     usage_context.request_capture = request_capture;
     if let Some(report) = payload_guard_report.clone() {
@@ -9269,7 +9279,10 @@ impl StreamContextTemplate {
         ctx.set_code_execution(self.code_execution.clone());
         ctx.set_synthetic_thinking_signatures(self.synthetic_thinking_signatures);
         ctx.set_stop_sequences(credential_usage.request.stop_sequences.clone());
-        ctx.set_omit_thinking_display(credential_usage.request.omit_thinking_display);
+        ctx.set_omit_thinking_display(
+            credential_usage.request.omit_thinking_display,
+            credential_usage.request.report_thinking_token_estimates,
+        );
         ctx.set_strip_injected_control_blocks(
             credential_usage.request.strip_injected_control_blocks,
         );
@@ -10364,6 +10377,34 @@ fn keepalive_sse_bytes(ctx: &StreamContext, noop_delta_keepalive: bool) -> Bytes
     }
     tracing::trace!("发送 ping 保活事件");
     create_ping_sse()
+}
+
+/// Whether the client should get thinking blocks without their text. An explicit `display`
+/// decides; without one, the model's official default applies (`omitted` on Claude Opus 5.x,
+/// Sonnet 5.x and the Fable/Mythos 5 family), so Claude Code sees the same blocks it would get
+/// from the Anthropic API. A disabled thinking config has nothing to hide.
+fn request_hides_reasoning(payload: &MessagesRequest, upstream_model: Option<&str>) -> bool {
+    use super::types::ThinkingDisplay;
+    let hidden_by_model = |model: &str| ThinkingDisplay::default_for_model(model).hides_reasoning();
+    let model_default =
+        if hidden_by_model(&payload.model) || upstream_model.is_some_and(hidden_by_model) {
+            ThinkingDisplay::Omitted
+        } else {
+            ThinkingDisplay::Summarized
+        };
+    match payload.thinking.as_ref() {
+        Some(thinking) if thinking.thinking_type == "disabled" => false,
+        Some(thinking) => thinking.display_mode(model_default).hides_reasoning(),
+        None => model_default.hides_reasoning(),
+    }
+}
+
+fn request_reports_thinking_token_estimates(headers: &HeaderMap) -> bool {
+    super::thinking_display::beta_requests_thinking_token_count(
+        headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 fn request_user_agent(headers: &HeaderMap) -> Option<&str> {

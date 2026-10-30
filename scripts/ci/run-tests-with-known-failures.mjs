@@ -55,6 +55,60 @@ export function parseTestOutput(output) {
   };
 }
 
+/**
+ * The first panic location and message printed for each failed test, so a CI annotation can say
+ * what failed without anyone opening the raw log.
+ */
+export function failureDetails(output, names) {
+  const details = new Map();
+  const lines = output.split(/\r?\n/).map((line) => line.replace(ANSI_ESCAPE, ""));
+  for (const name of names) {
+    const header = lines.findIndex((line) => line.trim() === `---- ${name} stdout ----`);
+    if (header === -1) {
+      continue;
+    }
+    const panic = lines.slice(header + 1, header + 40).findIndex((line) => / panicked at /.test(line));
+    if (panic === -1) {
+      continue;
+    }
+    const at = header + 1 + panic;
+    const location = lines[at].match(/ panicked at ([^:]+):(\d+):\d+/);
+    const message = lines
+      .slice(at + 1, at + 6)
+      .filter((line) => line.trim() && !line.startsWith("note:") && !line.startsWith("----"))
+      .join(" ")
+      .slice(0, 400);
+    details.set(name, {
+      file: location?.[1],
+      line: location ? Number(location[2]) : undefined,
+      message,
+    });
+  }
+  return details;
+}
+
+/** GitHub Actions error annotations for unexpected failures; empty outside Actions. */
+export function githubFailureAnnotations(result, output, env = process.env) {
+  if (env.GITHUB_ACTIONS !== "true" || result.unexpectedFailures.length === 0) {
+    return [];
+  }
+  const escape = (value) =>
+    String(value).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  const escapeProperty = (value) => escape(value).replace(/:/g, "%3A").replace(/,/g, "%2C");
+  const details = failureDetails(output, result.unexpectedFailures);
+  return result.unexpectedFailures.map((name) => {
+    const detail = details.get(name) ?? {};
+    const props = [`title=${escapeProperty(`test failed: ${name}`)}`];
+    if (detail.file) {
+      props.push(`file=${escapeProperty(detail.file)}`);
+      if (detail.line) {
+        props.push(`line=${detail.line}`);
+      }
+    }
+    return `::error ${props.join(",")}::${escape(detail.message || name)}`;
+  });
+}
+
 export function parseKnownFailures(contents) {
   return new Set(
     contents
@@ -169,6 +223,9 @@ async function main() {
   }
   if (report.stderr) {
     process.stderr.write(`${report.stderr}\n`);
+  }
+  for (const annotation of githubFailureAnnotations(result, outputLines.join("\n"))) {
+    process.stdout.write(`${annotation}\n`);
   }
 
   process.exit(result.exitCode);

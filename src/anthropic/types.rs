@@ -195,6 +195,35 @@ impl ThinkingDisplay {
     pub fn hides_reasoning(self) -> bool {
         matches!(self, Self::Omitted | Self::Updates)
     }
+
+    /// The official default `display` for a model when the request leaves it out. Claude Opus 5,
+    /// Opus 5.5, Sonnet 5, Sonnet 5.5 and the Fable/Mythos 5 family default to `omitted`
+    /// (thinking runs, its text stays hidden until the request opts in); earlier models default
+    /// to `summarized`. `model` may be the client name (`claude-sonnet-5-5`) or the Kiro one
+    /// (`claude-sonnet-5.5`).
+    pub fn default_for_model(model: &str) -> Self {
+        let name = model.trim().to_ascii_lowercase().replace('.', "-");
+        let name = name.strip_prefix("claude-").unwrap_or(&name);
+        let hidden_by_default = [
+            "opus-5-5",
+            "opus-5",
+            "sonnet-5-5",
+            "sonnet-5",
+            "fable-5-1",
+            "fable-5",
+            "mythos-5-1",
+            "mythos-5",
+            "mythos-preview",
+        ]
+        .iter()
+        // A dated or variant suffix (`-20260801`, `-thinking`) belongs to the same family.
+        .any(|family| name == *family || name.starts_with(&format!("{family}-")));
+        if hidden_by_default {
+            Self::Omitted
+        } else {
+            Self::Summarized
+        }
+    }
 }
 
 impl Thinking {
@@ -213,17 +242,18 @@ impl Thinking {
         }
     }
 
-    /// 宽容解析 `thinking.display`：非法值记录日志并按默认（summarized）处理。
-    pub fn display_mode(&self) -> ThinkingDisplay {
+    /// 宽容解析 `thinking.display`：缺省时用 `model_default`（模型的官方默认值），非法值
+    /// 记录日志后同样按 `model_default` 处理。
+    pub fn display_mode(&self, model_default: ThinkingDisplay) -> ThinkingDisplay {
         match (self.display.as_ref(), self.parsed_display()) {
             (_, Some(display)) => display,
-            (None | Some(serde_json::Value::Null), None) => ThinkingDisplay::default(),
+            (None | Some(serde_json::Value::Null), None) => model_default,
             (Some(value), None) => {
                 tracing::warn!(
                     thinking_display = %value,
-                    "ignoring unsupported thinking.display value; using default display"
+                    "ignoring unsupported thinking.display value; using the model default"
                 );
-                ThinkingDisplay::default()
+                model_default
             }
         }
     }
@@ -421,28 +451,111 @@ mod tests {
     }
 
     #[test]
+    fn default_display_follows_the_official_per_model_defaults() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5.5",
+            "claude-opus-5.5",
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-mythos-preview",
+            "claude-opus-5-5-20260801",
+            "CLAUDE-SONNET-5-5",
+        ] {
+            assert_eq!(
+                ThinkingDisplay::default_for_model(model),
+                ThinkingDisplay::Omitted,
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-haiku-5-5",
+            "sonnet-thinking",
+            "claude-sonnet-50",
+            "",
+        ] {
+            assert_eq!(
+                ThinkingDisplay::default_for_model(model),
+                ThinkingDisplay::Summarized,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
     fn thinking_display_is_parsed_leniently() {
         let parse = |value: serde_json::Value| -> Thinking {
             serde_json::from_value(value).expect("thinking")
         };
 
         let omitted = parse(serde_json::json!({"type": "adaptive", "display": "omitted"}));
-        assert_eq!(omitted.display_mode(), ThinkingDisplay::Omitted);
+        assert_eq!(
+            omitted.display_mode(ThinkingDisplay::Summarized),
+            ThinkingDisplay::Omitted
+        );
         let summarized = parse(serde_json::json!({"type": "adaptive", "display": "summarized"}));
-        assert_eq!(summarized.display_mode(), ThinkingDisplay::Summarized);
+        assert_eq!(
+            summarized.display_mode(ThinkingDisplay::Summarized),
+            ThinkingDisplay::Summarized
+        );
         let missing = parse(serde_json::json!({"type": "adaptive"}));
-        assert_eq!(missing.display_mode(), ThinkingDisplay::Summarized);
+        assert_eq!(
+            missing.display_mode(ThinkingDisplay::Summarized),
+            ThinkingDisplay::Summarized
+        );
         // 非法字符串与非法类型都不报错，按默认处理。
         let bogus = parse(serde_json::json!({"type": "adaptive", "display": "bogus"}));
-        assert_eq!(bogus.display_mode(), ThinkingDisplay::Summarized);
+        assert_eq!(
+            bogus.display_mode(ThinkingDisplay::Summarized),
+            ThinkingDisplay::Summarized
+        );
         let wrong_type = parse(serde_json::json!({"type": "adaptive", "display": 3}));
-        assert_eq!(wrong_type.display_mode(), ThinkingDisplay::Summarized);
+        assert_eq!(
+            wrong_type.display_mode(ThinkingDisplay::Summarized),
+            ThinkingDisplay::Summarized
+        );
         // Claude Code 2.1.287+ sends the `updates` beta value on interactive requests.
         let updates = parse(serde_json::json!({"type": "adaptive", "display": "updates"}));
-        assert_eq!(updates.display_mode(), ThinkingDisplay::Updates);
-        assert!(updates.display_mode().hides_reasoning());
-        assert!(omitted.display_mode().hides_reasoning());
-        assert!(!summarized.display_mode().hides_reasoning());
+        assert_eq!(
+            updates.display_mode(ThinkingDisplay::Summarized),
+            ThinkingDisplay::Updates
+        );
+        assert!(
+            updates
+                .display_mode(ThinkingDisplay::Summarized)
+                .hides_reasoning()
+        );
+        assert!(
+            omitted
+                .display_mode(ThinkingDisplay::Summarized)
+                .hides_reasoning()
+        );
+        assert!(
+            !summarized
+                .display_mode(ThinkingDisplay::Summarized)
+                .hides_reasoning()
+        );
+        // A missing or invalid value takes the model's default; an explicit one wins over it.
+        assert_eq!(
+            missing.display_mode(ThinkingDisplay::Omitted),
+            ThinkingDisplay::Omitted
+        );
+        assert_eq!(
+            bogus.display_mode(ThinkingDisplay::Omitted),
+            ThinkingDisplay::Omitted
+        );
+        assert_eq!(
+            summarized.display_mode(ThinkingDisplay::Omitted),
+            ThinkingDisplay::Summarized
+        );
 
         assert_eq!(
             serde_json::to_value(&omitted).unwrap(),
