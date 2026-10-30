@@ -3817,6 +3817,8 @@ enum HandlerEventStreamFault {
     InvalidToolInputThenRecover,
     /// 工具调用 stop=true，参数是合法 JSON 但末尾多了一个右括号。
     RedundantToolInputTail,
+    /// 第一次：工具参数截断且无法修复；之后正常回答（用来验证非流式换号重试）。
+    BrokenToolInputThenNormal,
     CompleteToolWithoutStatus,
     /// Completed call to the Claude Code `StructuredOutput` client tool.
     StructuredOutputToolUse,
@@ -4306,6 +4308,22 @@ async fn handler_eventstream_fault_upstream(
                 json!({
                     "name":"Bash",
                     "toolUseId":"toolu_invalid_input",
+                    "input":"{\"command\":\"printf broken",
+                    "stop":true
+                }),
+            );
+            body.extend(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"COMPLETED"}),
+            ));
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::BrokenToolInputThenNormal => {
+            let mut body = eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_broken_then_normal",
                     "input":"{\"command\":\"printf broken",
                     "stop":true
                 }),
@@ -5501,7 +5519,7 @@ async fn run_single_credential_precommit_retry_matrix() {
             1,
             "round={round} body={body}"
         );
-        assert!(body.contains(r#""type":"api_error""#));
+        assert!(body.contains(r#""type":"overloaded_error""#));
         assert!(!body.contains("event: message_stop"));
         assert!(!body.contains("recovered-ok"));
         assert!(!body.contains(&marker));
@@ -5607,7 +5625,7 @@ async fn run_handler_eventstream_postcommit_faults_matrix() {
                 "fault={fault:?} round={round} body={body}"
             );
             assert!(body.contains(r#""type":"error""#));
-            assert!(body.contains(r#""type":"api_error""#));
+            assert!(body.contains(r#""type":"overloaded_error""#));
             assert!(!body.contains("event: message_stop"));
             assert!(!body.contains("upstream stream read error"));
             assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
@@ -13780,6 +13798,16 @@ fn external_fallback_classifier_allows_capacity_and_transient_errors() {
             .as_deref(),
         Some("local_transient_exhausted")
     );
+    // A Cloudflare 524 fails fast locally but is still handed to an external pool.
+    assert_eq!(
+        classify_local_error_for_external_fallback(
+            "upstream_failure class=upstream_timeout upstream_status=524 public_status=524 body_bytes=21 retry_after_secs=unknown content_type=json reason=api_gateway_timeout",
+            &[],
+            &config,
+        )
+        .as_deref(),
+        Some("local_transient_exhausted")
+    );
 }
 
 #[test]
@@ -17520,6 +17548,16 @@ fn gateway_timeout_is_reported_as_504() {
     assert_eq!(public.status_code, 504);
     assert_eq!(public.error_type, "api_error");
     assert!(public.message.contains("req_gateway"), "{}", public.message);
+
+    // The response the client actually receives is 504 too, so Claude Code retries it.
+    let response = map_provider_error(
+        anyhow::anyhow!(diagnostic),
+        Some("req_gateway"),
+        Some("req_gateway"),
+        None,
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
 }
 
 fn responses_request(stream: bool) -> serde_json::Value {
@@ -17794,5 +17832,116 @@ fn oversized_current_image_is_resized_when_switched_on() {
     run_handler_fixture_on_large_stack_thread(
         "oversized-image-resize",
         run_oversized_current_image_is_resized_when_switched_on,
+    );
+}
+
+/// Non-streaming: nothing has reached the client yet, so an unrepairable tool argument is retried
+/// on another account instead of answering 502. The broken account is not cooled down.
+async fn run_non_stream_broken_tool_input_is_retried_on_another_account() {
+    for round in 1..=3 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::BrokenToolInputThenNormal,
+        )
+        .await;
+        let (app, usage_recorder, token_manager) =
+            handler_eventstream_fault_router_with_manager(&upstream.base_url, 2, 1, |_| {}, None);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert!(body.contains("recovered-ok"), "round={round} body={body}");
+        assert_eq!(upstream.hits(), 2, "round={round}");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let accounts: HashSet<_> = record
+            .credential_attempts
+            .iter()
+            .map(|attempt| attempt.credential_id)
+            .collect();
+        assert_eq!(
+            accounts.len(),
+            2,
+            "round={round}: the retry uses the other account"
+        );
+        assert!(
+            cooled_down_credentials(&token_manager).is_empty(),
+            "round={round}: broken tool input is not an account failure"
+        );
+    }
+}
+
+#[test]
+fn non_stream_broken_tool_input_is_retried_on_another_account() {
+    run_handler_fixture_on_large_stack_thread(
+        "non-stream-broken-tool-input-retry",
+        run_non_stream_broken_tool_input_is_retried_on_another_account,
+    );
+}
+
+/// Only explicit rate-limit wording is classified as a rate limit: "rate" alone matches ordinary
+/// words such as "generate", which used to turn an upstream failure into a non-retryable 429.
+#[test]
+fn json_stream_error_rate_limit_needs_explicit_wording() {
+    let classify = |message: &str| {
+        let value = json!({"message": message});
+        classify_json_stream_error(
+            &value,
+            value.to_string().as_bytes(),
+            Some("application/json"),
+        )
+        .error_type
+    };
+    assert_eq!(classify("Failed to generate a response"), "api_error");
+    assert_eq!(classify("Moderate load, please retry"), "api_error");
+    assert_eq!(classify("Rate limit exceeded"), "rate_limit_error");
+    assert_eq!(
+        classify("ThrottlingException: slow down"),
+        "rate_limit_error"
+    );
+    assert_eq!(classify("Too many requests"), "rate_limit_error");
+    assert_eq!(
+        classify("ValidationException: bad field"),
+        "invalid_request_error"
+    );
+}
+
+/// A pre-output retry resends a turn the upstream already started processing, so it carries a new
+/// conversation identity: production saw 137 of 137 same-id resends after a 5xx rejected as
+/// "Improperly formed request". Stream and non-stream retries both do this.
+async fn run_pre_output_retry_uses_a_fresh_conversation_identity() {
+    for stream in [true, false] {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::ExceptionEventBeforeOutput,
+        )
+        .await;
+        let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
+        assert_eq!(status, StatusCode::OK, "stream={stream} body={body}");
+        assert!(body.contains("recovered-ok"), "stream={stream} body={body}");
+        let bodies = upstream.bodies_snapshot();
+        assert_eq!(bodies.len(), 2, "stream={stream}");
+        let ids: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                (
+                    body["conversationState"]["conversationId"].clone(),
+                    body["conversationState"]["agentContinuationId"].clone(),
+                )
+            })
+            .collect();
+        assert!(ids[0].0.is_string(), "stream={stream}: {:?}", ids[0]);
+        assert_ne!(
+            ids[0].0, ids[1].0,
+            "stream={stream}: conversationId must change"
+        );
+        assert_ne!(
+            ids[0].1, ids[1].1,
+            "stream={stream}: agentContinuationId must change"
+        );
+    }
+}
+
+#[test]
+fn pre_output_retry_uses_a_fresh_conversation_identity() {
+    run_handler_fixture_on_large_stack_thread(
+        "pre-output-retry-fresh-identity",
+        run_pre_output_retry_uses_a_fresh_conversation_identity,
     );
 }

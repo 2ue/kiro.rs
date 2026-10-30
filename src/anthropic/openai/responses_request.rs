@@ -27,6 +27,8 @@ pub(super) struct TranslatedResponsesRequest {
     /// 声明为 custom（自由文本）的工具：模型输出的参数是 `{"input": "..."}`，响应里还原成
     /// `custom_tool_call` 的原始字符串。
     pub(super) custom_tools: Vec<String>,
+    /// `namespace` 工具组展开后的名字 → (组名, 原工具名)，响应里还原成带 `namespace` 的调用。
+    pub(super) namespaced_tools: Vec<(String, String, String)>,
 }
 
 pub(super) fn translate_request(
@@ -87,7 +89,11 @@ pub(super) fn translate_request(
         body.insert("system".to_string(), Value::Array(system));
     }
 
-    let (tools, custom_tools) = translate_tools(field("tools"))?;
+    let TranslatedTools {
+        tools,
+        custom: custom_tools,
+        namespaced,
+    } = translate_tools(field("tools"))?;
     let parallel_tool_calls = field("parallel_tool_calls")
         .and_then(Value::as_bool)
         .unwrap_or(true);
@@ -139,6 +145,7 @@ pub(super) fn translate_request(
         body: Value::Object(body),
         echo,
         custom_tools,
+        namespaced_tools: namespaced,
     })
 }
 
@@ -172,9 +179,17 @@ fn translate_input_item(
     match item_type {
         Some("function_call") => {
             let call_id = call_id(item, index)?;
-            let name = required_str(item, "name", index)?;
-            let input = tool_call_input(item.get("arguments"))
-                .ok_or_else(|| format!("input[{index}].arguments: must be a JSON object"))?;
+            let name = history_tool_name(item, index)?;
+            // 历史里的参数是之前某一轮的输出，坏了也修不回来；按空参数回放，
+            // 不能让一条坏历史把之后每一轮都变成 400。
+            let input = tool_call_input(item.get("arguments")).unwrap_or_else(|| {
+                tracing::warn!(
+                    index,
+                    call_id = %call_id,
+                    "Responses 历史里的 function_call 参数不是合法 JSON 对象，按空参数回放"
+                );
+                json!({})
+            });
             push_turn(
                 turns,
                 "assistant",
@@ -183,7 +198,7 @@ fn translate_input_item(
         }
         Some("custom_tool_call") => {
             let call_id = call_id(item, index)?;
-            let name = required_str(item, "name", index)?;
+            let name = history_tool_name(item, index)?;
             let input = item
                 .get("input")
                 .and_then(Value::as_str)
@@ -210,7 +225,10 @@ fn translate_input_item(
             push_turn(turns, "user", vec![block]);
         }
         // 推理摘要和服务端工具调用不回放：Kiro 不接受外来的推理签名，联网搜索由本代理重新执行。
-        Some("reasoning") | Some("web_search_call") | Some("file_search_call") => {}
+        Some(
+            "reasoning" | "web_search_call" | "file_search_call" | "compaction"
+            | "compaction_trigger",
+        ) => {}
         Some("item_reference") => {
             return Err(format!(
                 "input[{index}]: item_reference needs stored responses, which are not supported"
@@ -233,13 +251,23 @@ fn translate_input_item(
                 }
             }
         }
+        // 其他输出项（例如服务端工具的调用记录）上游无法回放，跳过即可，不影响对话。
         Some(other) => {
-            return Err(format!(
-                "input[{index}].type: unsupported input item '{other}'"
-            ));
+            tracing::warn!(
+                index,
+                item_type = other,
+                "Responses 请求里的输入项类型不受支持，已跳过"
+            );
         }
     }
     Ok(())
+}
+
+/// 历史工具调用的名字：带 `namespace` 时按请求里展开工具组的规则拼成 `组名__工具名`。
+fn history_tool_name(item: &Value, index: usize) -> Result<String> {
+    let name = required_str(item, "name", index)?;
+    let namespace = item.get("namespace").and_then(Value::as_str);
+    Ok(flat_tool_name(namespace, name))
 }
 
 fn call_id(item: &Value, index: usize) -> Result<String> {
@@ -327,14 +355,42 @@ fn tool_output_content(output: Option<&Value>, index: usize) -> Result<Value> {
 
 /// Responses 的工具是扁平格式 `{type, name, description, parameters}`。
 /// custom 工具接受自由文本，包成只有一个字符串参数 `input` 的函数，语法说明附在描述里。
-/// 联网搜索换成 Anthropic 的服务端搜索工具。
-fn translate_tools(tools: Option<&Value>) -> Result<(Vec<Value>, Vec<String>)> {
+/// `namespace` 工具组展开成 `组名__工具名`，响应里再还原。联网搜索换成 Anthropic 的服务端搜索工具。
+/// 其他托管工具（`file_search`、`local_shell`、`computer_use` 等）上游没有对应能力，跳过并记日志，
+/// 不让整个请求失败：Codex 会把它们和普通工具一起声明。
+fn translate_tools(tools: Option<&Value>) -> Result<TranslatedTools> {
+    let mut translated = TranslatedTools::default();
     let Some(tools) = tools else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(translated);
     };
     let tools = tools.as_array().ok_or("tools: must be an array")?;
-    let mut translated = Vec::with_capacity(tools.len());
-    let mut custom = Vec::new();
+    translate_tool_list(tools, None, "tools", &mut translated)?;
+    Ok(translated)
+}
+
+#[derive(Default)]
+pub(super) struct TranslatedTools {
+    pub(super) tools: Vec<Value>,
+    /// 声明为 custom 的工具（展开后的名字）。
+    pub(super) custom: Vec<String>,
+    /// 展开后的名字 → (组名, 原工具名)。
+    pub(super) namespaced: Vec<(String, String, String)>,
+}
+
+/// 组名和工具名用 `__` 拼起来，满足上游工具名只含字母、数字、`_`、`-` 的要求。
+pub(super) fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) if !namespace.is_empty() => format!("{namespace}__{name}"),
+        _ => name.to_string(),
+    }
+}
+
+fn translate_tool_list(
+    tools: &[Value],
+    namespace: Option<&str>,
+    path: &str,
+    translated: &mut TranslatedTools,
+) -> Result<()> {
     for (index, tool) in tools.iter().enumerate() {
         let tool_type = tool
             .get("type")
@@ -344,70 +400,110 @@ fn translate_tools(tools: Option<&Value>) -> Result<(Vec<Value>, Vec<String>)> {
             tool.get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
-                .ok_or_else(|| format!("tools[{index}].name: field is required"))
+                .ok_or_else(|| format!("{path}[{index}].name: field is required"))
         };
-        let description = tool
+        let mut description = tool
             .get("description")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
         match tool_type {
-            "function" => {
-                let mut schema = match tool.get("parameters") {
-                    None | Some(Value::Null) => Map::new(),
-                    Some(Value::Object(schema)) => schema.clone(),
-                    Some(_) => {
-                        return Err(format!("tools[{index}].parameters: must be a JSON object"));
-                    }
-                };
-                schema
-                    .entry("type")
-                    .or_insert_with(|| Value::String("object".to_string()));
-                let mut entry = json!({"name": name()?, "input_schema": schema});
-                if !description.is_empty() {
-                    entry["description"] = json!(description);
-                }
-                translated.push(entry);
-            }
-            "custom" => {
+            "function" | "custom" => {
                 let name = name()?;
-                let mut description = description.to_string();
-                if let Some(definition) = tool
-                    .get("format")
-                    .and_then(|format| format.get("definition"))
-                    .and_then(Value::as_str)
-                {
-                    let syntax = tool
+                let flat = flat_tool_name(namespace, name);
+                let schema = if tool_type == "function" {
+                    let mut schema = match tool.get("parameters") {
+                        None | Some(Value::Null) => Map::new(),
+                        Some(Value::Object(schema)) => schema.clone(),
+                        Some(_) => {
+                            return Err(format!(
+                                "{path}[{index}].parameters: must be a JSON object"
+                            ));
+                        }
+                    };
+                    schema
+                        .entry("type")
+                        .or_insert_with(|| Value::String("object".to_string()));
+                    Value::Object(schema)
+                } else {
+                    if let Some(definition) = tool
                         .get("format")
-                        .and_then(|format| format.get("syntax"))
+                        .and_then(|format| format.get("definition"))
                         .and_then(Value::as_str)
-                        .unwrap_or("grammar");
-                    description.push_str(&format!("\n\nInput format ({syntax}):\n{definition}"));
-                }
-                translated.push(json!({
-                    "name": name,
-                    "description": description,
-                    "input_schema": {
+                    {
+                        let syntax = tool
+                            .get("format")
+                            .and_then(|format| format.get("syntax"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("grammar");
+                        description
+                            .push_str(&format!("\n\nInput format ({syntax}):\n{definition}"));
+                    }
+                    translated.custom.push(flat.clone());
+                    json!({
                         "type": "object",
                         "properties": {"input": {
                             "type": "string",
                             "description": "The complete raw tool input text. Do not wrap it in JSON."
                         }},
                         "required": ["input"]
-                    }
-                }));
-                custom.push(name.to_string());
+                    })
+                };
+                if let Some(namespace) = namespace {
+                    translated.namespaced.push((
+                        flat.clone(),
+                        namespace.to_string(),
+                        name.to_string(),
+                    ));
+                }
+                let mut entry = json!({"name": flat, "input_schema": schema});
+                if !description.is_empty() {
+                    entry["description"] = json!(description);
+                }
+                translated.tools.push(entry);
             }
-            "web_search" | "web_search_preview" => {
-                translated.push(json!({"type": "web_search_20250305", "name": "web_search"}));
+            "namespace" if namespace.is_none() => {
+                let group = name()?;
+                let members = tool
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let before = translated.tools.len();
+                translate_tool_list(
+                    members,
+                    Some(group),
+                    &format!("{path}[{index}].tools"),
+                    translated,
+                )?;
+                if !description.is_empty() {
+                    for member in &mut translated.tools[before..] {
+                        let own = member["description"].as_str().unwrap_or_default();
+                        member["description"] = json!(format!("[{group}] {description}\n{own}"));
+                    }
+                }
+            }
+            "web_search" | "web_search_preview" if namespace.is_none() => {
+                if !translated
+                    .tools
+                    .iter()
+                    .any(|tool| tool["name"] == "web_search")
+                {
+                    translated
+                        .tools
+                        .push(json!({"type": "web_search_20250305", "name": "web_search"}));
+                }
             }
             other => {
-                return Err(format!(
-                    "tools[{index}].type: unsupported tool type '{other}'; function, custom and web_search are supported"
-                ));
+                tracing::warn!(
+                    tool_type = other,
+                    path = %format!("{path}[{index}]"),
+                    "Responses 请求里的工具类型不受支持，已跳过"
+                );
             }
         }
     }
-    Ok((translated, custom))
+    Ok(())
 }
 
 /// Responses 的 `tool_choice`：`auto` / `required` / `none`，或 `{"type":"function","name":..}`。
@@ -639,6 +735,54 @@ mod tests {
         }))
     }
 
+    /// Codex declares tool groups (`namespace`) and hosted tools the upstream cannot run. Groups
+    /// are flattened to `group__tool`, unknown hosted tools are skipped instead of failing the
+    /// request, and a broken history tool call is replayed with empty arguments.
+    #[test]
+    fn tool_groups_unknown_tools_and_broken_history_are_absorbed() {
+        let translated = translate(json!({
+            "model": "claude-sonnet-4-5",
+            "input": [
+                {"role": "user", "content": "read a"},
+                {"type": "function_call", "call_id": "call_1", "name": "read",
+                 "namespace": "fs", "arguments": "{\"path\":"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "partial"},
+                {"type": "local_shell_call", "id": "lsc_1"},
+                {"role": "user", "content": "again"}
+            ],
+            "tools": [
+                {"type": "namespace", "name": "fs", "description": "file system", "tools": [
+                    {"type": "function", "name": "read", "description": "read a file",
+                     "parameters": {"type": "object"}}
+                ]},
+                {"type": "local_shell"},
+                {"type": "file_search", "vector_store_ids": ["vs_1"]},
+                {"type": "web_search"},
+                {"type": "web_search_preview"}
+            ]
+        }))
+        .expect("request should translate");
+        assert_eq!(
+            translated.namespaced_tools,
+            vec![("fs__read".to_string(), "fs".to_string(), "read".to_string())]
+        );
+        let tools = translated.body["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["fs__read", "web_search"]);
+        assert!(
+            tools[0]["description"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("[fs] file system"))
+        );
+        let messages = &translated.body["messages"];
+        assert_eq!(messages[1]["content"][0]["name"], "fs__read");
+        assert_eq!(messages[1]["content"][0]["input"], json!({}));
+        assert_eq!(messages.as_array().unwrap().len(), 3);
+    }
+
     #[test]
     fn unsupported_or_stateful_requests_are_rejected() {
         for (request, expected) in [
@@ -663,15 +807,6 @@ mod tests {
             (
                 json!({"model": "m", "input": [{"role": "developer", "content": "only system"}]}),
                 "at least one",
-            ),
-            (
-                json!({"model": "m", "input": "hi", "tools": [{"type": "file_search"}]}),
-                "file_search",
-            ),
-            (
-                json!({"model": "m", "input": [{"type": "function_call", "call_id": "c",
-                    "name": "x", "arguments": "{\"a\":"}]}),
-                "arguments",
             ),
         ] {
             let error = translate(request.clone()).err().unwrap_or_default();

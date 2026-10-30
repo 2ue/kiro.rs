@@ -4444,6 +4444,15 @@ impl StreamContext {
             // 执行工具；保持打开时 CLI 丢弃该块并把本轮视为失败。
             events.extend(self.state_manager.close_open_non_tool_use_blocks());
             let message = self.public_stream_error_message(&error_type, raw_message);
+            // Claude Code 只会自动重发流里 `type` 为 overloaded_error 的错误（流内的 api_error
+            // 会直接停下这一轮，见 claude-code 的 shouldRetry）。上游瞬态失败（读流、解码、
+            // 静默超时、上游错误事件、工具参数没收完）重发通常就能成功，所以对外报成
+            // overloaded_error，让客户端自己无感重试；请求本身的问题保持原类型。
+            let error_type = if error_type == "api_error" {
+                "overloaded_error".to_string()
+            } else {
+                error_type
+            };
             events.push(Self::create_error_event(error_type, message));
             return events;
         }
@@ -7262,7 +7271,7 @@ mod tests {
             .iter()
             .find(|event| event.event == "error")
             .expect("error event should be emitted");
-        assert_eq!(error.data["error"]["type"], "api_error");
+        assert_eq!(error.data["error"]["type"], "overloaded_error");
         let message = error.data["error"]["message"]
             .as_str()
             .expect("message should be string");

@@ -2930,6 +2930,7 @@ fn classify_local_error_for_external_fallback_with_scheduler_kind(
     }
     if config.fallback_on_local_transient_exhausted
         && (lower.contains("临时冷却")
+            || lower.contains("api_gateway_timeout")
             || lower.contains("429")
             || lower.contains("too many")
             || lower.contains("rate limit")
@@ -6934,6 +6935,19 @@ fn map_provider_error(
         );
     }
 
+    // 524 网关超时：provider 已直接失败（不重试、不冷却），对外 504，客户端会自己重发。
+    if err_str.contains("reason=api_gateway_timeout") {
+        log_provider_error_with_hint(&err_str, "上游网关超时（524）", error_id);
+        return public_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
+    }
+
     log_provider_error_with_hint(&err_str, "Kiro API 调用失败", error_id);
     public_error_response(
         StatusCode::BAD_GATEWAY,
@@ -10800,7 +10814,11 @@ fn classify_json_stream_error(
         "invalid_request_error"
     } else if combined.contains("throttl")
         || combined.contains("too many requests")
-        || combined.contains("rate")
+        // 只认明确的限流写法："rate" 单独出现会命中 generate、accurate 之类的普通词。
+        || combined.contains("rate limit")
+        || combined.contains("rate_limit")
+        || combined.contains("ratelimit")
+        || combined.contains("rate exceeded")
     {
         "rate_limit_error"
     } else {
@@ -11004,6 +11022,25 @@ fn parse_non_stream_tool_input(buffer: &str) -> Result<serde_json::Value, serde_
             serde_json::from_str(buffer)
         }
     }
+}
+
+/// 非流式事件里是否有已结束、但参数无法修复的工具调用（同一个调用的分片拼起来再判断）。
+fn non_stream_events_have_unrepairable_tool_input(events: &[Event]) -> bool {
+    let mut buffers: HashMap<&str, String> = HashMap::new();
+    for event in events {
+        let Event::ToolUse(tool_use) = event else {
+            continue;
+        };
+        let buffer = buffers.entry(tool_use.tool_use_id.as_str()).or_default();
+        buffer.push_str(&tool_use.input);
+        if tool_use.stop
+            && super::stream::classify_tool_input_json(buffer)
+                == super::stream::ToolInputJson::Invalid
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn non_stream_status_error_event(events: &[Event]) -> Option<String> {
@@ -11240,6 +11277,8 @@ fn usage_only_retry_request(
         super::empty_turn_nudge::append_empty_turn_nudge(&mut request, nudge);
     }
     let body = serialize_kiro_request(&request).ok()?;
+    // 上游已经处理过这一轮，重发换新的会话标识。
+    let body = crate::kiro::provider::refresh_kiro_request_identity(&body).unwrap_or(body);
     Some((body, request))
 }
 
@@ -11261,6 +11300,13 @@ struct NonStreamEmptyTurnRetry<'a> {
 /// 返回 `Some` 表示已拿到新账号的响应，调用方继续读取；`None` 表示没有拿到新响应（首输出前重试
 /// 关闭、次数用完，或换号请求没能发出），调用方上报空回后按失败终态返回。换号请求发出前，这里
 /// 已经替当前账号上报过空回；空回上报只生效一次，调用方再报不会重复计。
+/// 上游已经处理过这一轮之后的非流式重发：换新的会话标识（见 `refresh_kiro_request_identity`）。
+fn retry_body_with_fresh_identity(request_body: &str) -> std::borrow::Cow<'_, str> {
+    crate::kiro::provider::refresh_kiro_request_identity(request_body)
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(request_body))
+}
+
 async fn retry_non_stream_empty_turn(
     retry: NonStreamEmptyTurnRetry<'_>,
     completion: &crate::kiro::provider::KiroApiCompletion,
@@ -11285,9 +11331,10 @@ async fn retry_non_stream_empty_turn(
     attempt_budget.exclude_empty_turn_credential(completion.credential_id());
     completion.report_empty_turn(detail);
     let consumed_before = attempt_budget.snapshot().consumed;
+    let retry_body = retry_body_with_fresh_identity(retry.request_body);
     let retry_dispatch = call_api_maybe_fail_fast(
         retry.provider,
-        retry.request_body,
+        &retry_body,
         Some(retry.kiro_request),
         Some(retry.request_id),
         retry.external_fallback,
@@ -11398,10 +11445,14 @@ async fn retry_stream_before_downstream_commit(
     state.prior_attempts =
         merge_credential_attempts(std::mem::take(&mut state.prior_attempts), previous_attempts);
     state.usage_guard.complete();
+    // 上游已经处理过这一轮：重发换新的会话标识，否则上游会以 Improperly formed request 拒绝。
+    let retry_body = crate::kiro::provider::refresh_kiro_request_identity(&plan.request_body)
+        .map(Arc::<str>::from)
+        .unwrap_or_else(|| plan.request_body.clone());
     let consumed_before = attempt_budget.snapshot().consumed;
     let retry_dispatch = call_api_stream_maybe_fail_fast(
         &plan.provider,
-        plan.request_body.as_ref(),
+        retry_body.as_ref(),
         plan.kiro_request.as_deref(),
         Some(&plan.request_id),
         plan.external_fallback.as_ref(),
@@ -13566,9 +13617,10 @@ async fn handle_non_stream_request(
                 }
                 completion.report_upstream_body_status_failure(detail.clone());
                 let consumed_before = attempt_budget.snapshot().consumed;
+                let retry_body = retry_body_with_fresh_identity(request_body);
                 let retry_dispatch = call_api_maybe_fail_fast(
                     &provider,
-                    request_body,
+                    &retry_body,
                     Some(kiro_request),
                     Some(&request_id),
                     external_fallback.as_ref(),
@@ -13725,6 +13777,65 @@ async fn handle_non_stream_request(
                             "非流式空轮次的续写重试未能发出"
                         );
                     }
+                }
+            }
+        }
+
+        // 工具参数截断或格式错误：还没有任何内容发给客户端，换号重发本轮，而不是直接返回 502。
+        // 这是本轮输出的问题，不冷却账号，只在本请求内排除它。
+        if stream_retry_config.active()
+            && stream_retry_config.allows(StreamRetryReason::ProtocolError)
+            && non_stream_status_retry_attempt < stream_retry_config.max_attempts
+            && non_stream_events_have_unrepairable_tool_input(&upstream_events)
+        {
+            let next_attempt = non_stream_status_retry_attempt.saturating_add(1);
+            tracing::warn!(
+                request_id = %request_id,
+                attempt = non_stream_status_retry_attempt,
+                next_attempt,
+                max_attempts = stream_retry_config.max_attempts,
+                "本地 Kiro 非流式响应的工具参数无法修复，换号重试（不冷却账号）"
+            );
+            retry_attempt_prefix =
+                merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
+            let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
+            attempt_budget.exclude_empty_turn_credential(completion.credential_id());
+            completion.release();
+            let consumed_before = attempt_budget.snapshot().consumed;
+            let retry_body = retry_body_with_fresh_identity(request_body);
+            let retry_dispatch = call_api_maybe_fail_fast(
+                &provider,
+                &retry_body,
+                Some(kiro_request),
+                Some(&request_id),
+                external_fallback.as_ref(),
+                capacity_weight_units,
+                Some(model),
+                attempt_budget.clone(),
+            )
+            .await;
+            let retry_sends = attempt_budget
+                .snapshot()
+                .consumed
+                .saturating_sub(consumed_before);
+            if retry_sends > 0 {
+                usage_context
+                    .mark_stream_retry_sends(retry_sends, StreamRetryReason::ProtocolError);
+            } else if retry_dispatch.is_err() {
+                usage_context.mark_stream_retry_dispatch_failure(StreamRetryReason::ProtocolError);
+            }
+            match retry_dispatch {
+                Ok(response) => {
+                    api_response = response;
+                    non_stream_status_retry_attempt = next_attempt;
+                    continue;
+                }
+                Err(retry_error) => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %retry_error,
+                        "非流式工具参数问题的换号重试未能发出"
+                    );
                 }
             }
         }

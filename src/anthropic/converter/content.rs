@@ -117,7 +117,21 @@ pub(super) fn process_message_content_with_dedup(
                                 text_parts.push(HISTORY_REMOTE_IMAGE_PLACEHOLDER.to_string());
                                 continue;
                             }
-                            let image = convert_image_source(source)?;
+                            let image = match convert_image_source(source) {
+                                Ok(image) => image,
+                                // 历史里的坏图片（base64 损坏、格式不支持）发不出去也修不好；换成
+                                // 一行说明，否则这条历史会让之后每一轮都 400，整个会话坏掉。
+                                // 当前这一轮的图片仍然直接报错，用户正在问的就是它。
+                                Err(error) if image_mode == UserImageMode::History => {
+                                    tracing::warn!(
+                                        %error,
+                                        "历史消息中的图片无法发送，已替换为占位文本"
+                                    );
+                                    text_parts.push(format!("[image omitted: {error}]"));
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                             if first_sighting(&mut seen_images, &image) {
                                 images.push(image);
                             } else {

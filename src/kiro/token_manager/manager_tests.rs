@@ -7154,6 +7154,7 @@ fn test_health_balanced_score_parameters_are_effective() {
         selection_events: VecDeque::new(),
         last_auto_heal_at: None,
         auto_heal_consecutive_rounds: 0,
+        upstream_fault_streak: 0,
     };
     worse.health.recent_error_rate = 0.5;
     worse.health.latency_ewma_ms = Some(1_000.0);
@@ -7188,6 +7189,7 @@ fn test_health_balanced_score_parameters_are_effective() {
         selection_events: VecDeque::new(),
         last_auto_heal_at: None,
         auto_heal_consecutive_rounds: 0,
+        upstream_fault_streak: 0,
     };
 
     let mut config = Config::default();

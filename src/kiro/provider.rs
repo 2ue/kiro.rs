@@ -902,7 +902,8 @@ impl KiroApiCompletion {
     /// 这是上游故障，不是账号故障：默认不冷却账号（调用方在本请求内排除它），只记会话软失败；
     /// `credentialUpstreamFailureCooldownEnabled` 打开时同时冷却。
     pub fn report_upstream_body_status_failure(&self, reason: impl Into<String>) {
-        let cool_down = self.token_manager.upstream_failure_cooldown_enabled();
+        let cool_down = self.token_manager.upstream_failure_cooldown_enabled()
+            || self.token_manager.note_upstream_fault(self.credential_id);
         self.report_body_status_failure(reason.into(), cool_down);
     }
 
@@ -1086,7 +1087,8 @@ impl KiroStreamCompletion {
     /// 这是上游故障，不是账号故障：默认不冷却账号（调用方在本请求内排除它），只记会话软失败；
     /// `credentialUpstreamFailureCooldownEnabled` 打开时同时冷却。
     pub fn report_upstream_stream_failure(&self, reason: impl Into<String>) {
-        let cool_down = self.token_manager.upstream_failure_cooldown_enabled();
+        let cool_down = self.token_manager.upstream_failure_cooldown_enabled()
+            || self.token_manager.note_upstream_fault(self.credential_id);
         self.report_stream_failure(reason.into(), cool_down);
     }
 
@@ -1168,7 +1170,9 @@ impl KiroStreamResponse {
 /// Swaps `conversationState.conversationId` and, when present, `agentContinuationId` for
 /// fresh UUIDs. The ids are replaced in place so the rest of the serialized body (field
 /// order, formatting) stays byte-identical. Returns `None` when the ids cannot be located.
-fn refresh_kiro_request_identity(body: &str) -> Option<String> {
+/// 上游已经开始处理过这一轮之后的重发：换掉 `conversationId` 和 `agentContinuationId`。
+/// 线上 2026-09-30 统计，5xx 之后用原标识重发 137 次全部返回 400 Improperly formed request。
+pub(crate) fn refresh_kiro_request_identity(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let state = value.get("conversationState")?;
     let mut refreshed = body.to_string();
@@ -7527,6 +7531,50 @@ mod tests {
         }
     }
 
+    /// A one-off upstream fault does not cool the account, but the same account failing
+    /// `UPSTREAM_FAULT_STREAK_COOLDOWN` times in a row (no success in between) does: the problem is
+    /// then most likely that account. A success resets the count.
+    #[test]
+    fn repeated_upstream_faults_on_one_account_cool_it_down() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let completion = || {
+            KiroStreamCompletion::new(
+                manager.clone(),
+                1,
+                None,
+                None,
+                Some("claude-sonnet-4.5".into()),
+                false,
+                false,
+                Vec::new(),
+                Instant::now(),
+            )
+        };
+        let streak = crate::kiro::token_manager::UPSTREAM_FAULT_STREAK_COOLDOWN;
+        for _ in 1..streak {
+            completion().report_upstream_stream_failure("upstream stream read error");
+            assert!(!manager.snapshot().entries[0].cooled_down);
+        }
+        completion().report_success();
+        for _ in 1..streak {
+            completion().report_upstream_stream_failure("upstream stream read error");
+        }
+        assert!(
+            !manager.snapshot().entries[0].cooled_down,
+            "a success in between starts the count again"
+        );
+        completion().report_upstream_stream_failure("upstream stream read error");
+        assert!(
+            manager.snapshot().entries[0].cooled_down,
+            "the {streak}th fault in a row cools the account"
+        );
+    }
+
     #[test]
     fn api_completion_drop_releases_in_flight_without_counting_success() {
         let mut cred = KiroCredentials::default();
@@ -8995,18 +9043,24 @@ impl KiroProvider {
     /// 账号问题（限流、鉴权、额度、风控）照常冷却；上游故障默认不冷却，本请求内的换号由
     /// `excluded_ids` 负责，开关打开时恢复冷却。网络/传输故障出现在走专属代理的账号上时，
     /// 可能是它自己的代理坏了，仍然冷却。
+    ///
+    /// 同一个账号连续几次上游故障（中间没有成功）时也冷却：问题多半在这个账号上，不冷却的话
+    /// 优先级调度会让后面每个请求都先在它身上失败一次。
     fn cools_down_for(
         &self,
+        credential_id: u64,
         failure_kind: ApiUpstreamFailureKind,
         credentials: &KiroCredentials,
     ) -> bool {
         if !failure_kind.is_upstream_fault() || self.upstream_failure_cooldown_enabled() {
             return true;
         }
-        matches!(
-            failure_kind,
-            ApiUpstreamFailureKind::Timeout | ApiUpstreamFailureKind::BodyRead
-        ) && credentials.uses_dedicated_proxy()
+        let repeated = self.token_manager.note_upstream_fault(credential_id);
+        repeated
+            || matches!(
+                failure_kind,
+                ApiUpstreamFailureKind::Timeout | ApiUpstreamFailureKind::BodyRead
+            ) && credentials.uses_dedicated_proxy()
     }
 
     fn log_upstream_fault_without_cooldown(
@@ -12915,7 +12969,7 @@ impl KiroProvider {
                         model.as_deref(),
                     );
                     last_error = Some(anyhow::anyhow!(message.clone()));
-                    let cooldown = if self.cools_down_for(failure_kind, &ctx.credentials) {
+                    let cooldown = if self.cools_down_for(ctx.id, failure_kind, &ctx.credentials) {
                         self.token_manager.report_transient_failure_kind(
                             ctx.id,
                             model.as_deref(),
@@ -13086,7 +13140,8 @@ impl KiroProvider {
                         attempt_started_at,
                         model.as_deref(),
                     );
-                    let cools_down = self.cools_down_for(read_failure.kind, &ctx.credentials);
+                    let cools_down =
+                        self.cools_down_for(ctx.id, read_failure.kind, &ctx.credentials);
                     if !cools_down {
                         Self::log_upstream_fault_without_cooldown(
                             ctx.id,
@@ -13202,7 +13257,7 @@ impl KiroProvider {
                     model.as_deref(),
                 );
                 Self::attach_raw_upstream_error(&mut attempts, status, content_kind, &body);
-                let cools_down = self.cools_down_for(failure_kind, &ctx.credentials);
+                let cools_down = self.cools_down_for(ctx.id, failure_kind, &ctx.credentials);
                 if !cools_down {
                     Self::log_upstream_fault_without_cooldown(
                         ctx.id,
@@ -14082,7 +14137,7 @@ impl KiroProvider {
                         retry_content_kind,
                         &retry_upstream_body.text,
                     );
-                    let cooldown = if self.cools_down_for(failure_kind, &ctx.credentials) {
+                    let cooldown = if self.cools_down_for(ctx.id, failure_kind, &ctx.credentials) {
                         self.token_manager.report_transient_failure_kind(
                             ctx.id,
                             model.as_deref(),
@@ -14820,7 +14875,7 @@ impl KiroProvider {
                         credential_label = %credential_label,
                         "上游模型容量不足（429），换号重试且不写账号冷却"
                     );
-                } else if !self.cools_down_for(failure_kind, &ctx.credentials) {
+                } else if !self.cools_down_for(ctx.id, failure_kind, &ctx.credentials) {
                     Self::log_upstream_fault_without_cooldown(
                         ctx.id,
                         &credential_label,

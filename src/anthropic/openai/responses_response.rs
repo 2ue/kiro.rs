@@ -57,6 +57,43 @@ fn custom_tool_input(arguments: &str) -> String {
         .unwrap_or_else(|| arguments.to_string())
 }
 
+/// 请求里声明的工具：哪些是 custom 自由文本工具，哪些来自 `namespace` 工具组。
+#[derive(Default)]
+pub(super) struct DeclaredTools {
+    pub(super) custom: HashSet<String>,
+    /// 展开后的名字 → (组名, 原工具名)。
+    pub(super) namespaced: HashMap<String, (String, String)>,
+}
+
+impl DeclaredTools {
+    pub(super) fn new(custom: Vec<String>, namespaced: Vec<(String, String, String)>) -> Self {
+        Self {
+            custom: custom.into_iter().collect(),
+            namespaced: namespaced
+                .into_iter()
+                .map(|(flat, namespace, name)| (flat, (namespace, name)))
+                .collect(),
+        }
+    }
+
+    fn is_custom(&self, name: &Value) -> bool {
+        name.as_str().is_some_and(|name| self.custom.contains(name))
+    }
+
+    /// 工具组里的工具还原成 `{name, namespace}`。
+    fn restore(&self, item: &mut Value) {
+        let Some((namespace, name)) = item["name"]
+            .as_str()
+            .and_then(|flat| self.namespaced.get(flat))
+            .cloned()
+        else {
+            return;
+        };
+        item["name"] = json!(name);
+        item["namespace"] = json!(namespace);
+    }
+}
+
 fn tool_call_item(
     id: &str,
     call_id: &Value,
@@ -132,7 +169,7 @@ impl ResponseShell {
 pub(super) fn translate_message(
     message: &Value,
     mut shell: ResponseShell,
-    custom_tools: &HashSet<String>,
+    declared: &DeclaredTools,
 ) -> Value {
     shell.model = model_or(message["model"].as_str(), &shell.model).to_string();
     if let Some(id) = message["id"].as_str() {
@@ -154,17 +191,17 @@ pub(super) fn translate_message(
                 }
             }
             Some("tool_use") => {
-                let custom = block["name"]
-                    .as_str()
-                    .is_some_and(|name| custom_tools.contains(name));
-                output.push(tool_call_item(
+                let custom = declared.is_custom(&block["name"]);
+                let mut item = tool_call_item(
                     &prefixed_id(if custom { "ctc_" } else { "fc_" }, None),
                     &block["id"],
                     &block["name"],
                     &tool_arguments(&block["input"]),
                     custom,
                     "completed",
-                ));
+                );
+                declared.restore(&mut item);
+                output.push(item);
             }
             _ => {}
         }
@@ -214,7 +251,7 @@ enum BlockKind {
 /// 逐事件把 Anthropic 流翻译成 Responses 事件。每个事件都带递增的 `sequence_number`。
 pub(super) struct ResponsesStreamTranslator {
     shell: ResponseShell,
-    custom_tools: HashSet<String>,
+    declared: DeclaredTools,
     sequence: u64,
     started: bool,
     finished: bool,
@@ -226,10 +263,10 @@ pub(super) struct ResponsesStreamTranslator {
 }
 
 impl ResponsesStreamTranslator {
-    pub(super) fn new(shell: ResponseShell, custom_tools: HashSet<String>) -> Self {
+    pub(super) fn new(shell: ResponseShell, declared: DeclaredTools) -> Self {
         Self {
             shell,
-            custom_tools,
+            declared,
             sequence: 0,
             started: false,
             finished: false,
@@ -357,13 +394,12 @@ impl ResponsesStreamTranslator {
             Some("text") => BlockKind::Text,
             Some("thinking") => BlockKind::Thinking,
             Some("tool_use") => {
-                let custom = block["name"]
-                    .as_str()
-                    .is_some_and(|name| self.custom_tools.contains(name));
+                let custom = self.declared.is_custom(&block["name"]);
                 let output_index = self.reserve_output();
                 let id = prefixed_id(if custom { "ctc_" } else { "fc_" }, None);
-                let item =
+                let mut item =
                     tool_call_item(&id, &block["id"], &block["name"], "", custom, "in_progress");
+                self.declared.restore(&mut item);
                 out.push(self.event(
                     "response.output_item.added",
                     json!({"output_index": output_index, "item": item}),
@@ -635,7 +671,9 @@ impl ResponsesStreamTranslator {
                         json!({"item_id": id, "output_index": output_index, "arguments": arguments}),
                     ));
                 }
-                let item = tool_call_item(&id, &call_id, &name, &arguments, custom, "completed");
+                let mut item =
+                    tool_call_item(&id, &call_id, &name, &arguments, custom, "completed");
+                self.declared.restore(&mut item);
                 out.push(self.finish_item(output_index, item));
             }
         }
@@ -709,7 +747,10 @@ mod tests {
         let mut parser = SseParser::default();
         let mut translator = ResponsesStreamTranslator::new(
             shell(),
-            custom.iter().map(|name| name.to_string()).collect(),
+            DeclaredTools::new(
+                custom.iter().map(|name| name.to_string()).collect(),
+                Vec::new(),
+            ),
         );
         let mut out = Vec::new();
         for chunk in body.as_bytes().chunks(split) {
@@ -943,13 +984,17 @@ mod tests {
                     {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
                     {"type": "text", "text": "running"},
                     {"type": "tool_use", "id": "toolu_1", "name": "shell", "input": {"command": ["ls"]}},
-                    {"type": "tool_use", "id": "toolu_2", "name": "apply_patch", "input": {"input": "diff"}}
+                    {"type": "tool_use", "id": "toolu_2", "name": "apply_patch", "input": {"input": "diff"}},
+                    {"type": "tool_use", "id": "toolu_3", "name": "fs__read", "input": {"path": "a"}}
                 ],
                 "stop_reason": "tool_use",
                 "usage": {"input_tokens": 3, "output_tokens": 7, "cache_read_input_tokens": 100}
             }),
             shell(),
-            &HashSet::from(["apply_patch".to_string()]),
+            &DeclaredTools::new(
+                vec!["apply_patch".to_string()],
+                vec![("fs__read".to_string(), "fs".to_string(), "read".to_string())],
+            ),
         );
         assert_eq!(response["id"], "resp_01full");
         assert_eq!(response["object"], "response");
@@ -964,8 +1009,17 @@ mod tests {
             .collect();
         assert_eq!(
             types,
-            vec!["reasoning", "message", "function_call", "custom_tool_call"]
+            vec![
+                "reasoning",
+                "message",
+                "function_call",
+                "custom_tool_call",
+                "function_call"
+            ]
         );
+        assert_eq!(output[4]["name"], "read");
+        assert_eq!(output[4]["namespace"], "fs");
+        assert!(output[2].get("namespace").is_none());
         assert_eq!(output[1]["content"][0]["text"], "running");
         assert_eq!(output[2]["arguments"], "{\"command\":[\"ls\"]}");
         assert_eq!(output[3]["input"], "diff");
@@ -979,7 +1033,7 @@ mod tests {
             &json!({"type": "message", "content": [{"type": "text", "text": "no"}],
                 "stop_reason": "refusal"}),
             shell(),
-            &HashSet::new(),
+            &DeclaredTools::default(),
         );
         assert_eq!(refused["status"], "incomplete");
         assert_eq!(

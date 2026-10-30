@@ -303,7 +303,10 @@ async fn responses(
             .to_string(),
         echo: translated.echo,
     };
-    let custom_tools = translated.custom_tools.into_iter().collect();
+    let declared = responses_response::DeclaredTools::new(
+        translated.custom_tools,
+        translated.namespaced_tools,
+    );
     headers.remove(header::CONTENT_LENGTH);
     let response = post_messages_for_endpoint(
         state,
@@ -321,7 +324,7 @@ async fn responses(
     if stream && is_event_stream(response.headers()) {
         return translate_stream_response(
             response,
-            ResponsesStreamTranslator::new(shell, custom_tools),
+            ResponsesStreamTranslator::new(shell, declared),
         );
     }
     let (mut parts, body) = response.into_parts();
@@ -337,7 +340,7 @@ async fn responses(
             &response_request_id(&parts.headers),
         );
     };
-    let translated = responses_response::translate_message(&message, shell, &custom_tools);
+    let translated = responses_response::translate_message(&message, shell, &declared);
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.insert(
         header::CONTENT_TYPE,

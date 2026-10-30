@@ -1181,6 +1181,28 @@ mod tests {
         }
     }
 
+    /// A broken image in history (bad base64 or a non-image payload) becomes a text note: it can
+    /// never be sent, and rejecting it would fail every later turn of the conversation.
+    #[test]
+    fn broken_history_image_is_replaced_with_a_note() {
+        let fake_png = BASE64_STANDARD.encode(b"not-an-image-at-all");
+        let content = serde_json::json!([
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": fake_png}}
+        ]);
+        let (text, images, _) = super::content::process_message_content_with_mode(
+            &content,
+            super::content::UserImageMode::History,
+        )
+        .expect("history image errors are absorbed");
+        assert!(images.is_empty());
+        assert!(text.starts_with("look\n[image omitted:"), "{text}");
+        assert!(
+            process_message_content(&content).is_err(),
+            "the current turn still reports the broken image"
+        );
+    }
+
     #[test]
     fn test_process_message_content_rejects_fake_declared_image() {
         let fake_png = BASE64_STANDARD.encode(b"not-an-image-at-all");

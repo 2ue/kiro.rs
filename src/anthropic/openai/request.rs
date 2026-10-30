@@ -387,8 +387,16 @@ fn assistant_blocks(message: &Value, content: Option<&Value>, index: usize) -> R
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| format!("{path}.function.name: field is required"))?;
+        // 历史里的参数是之前某一轮的输出，坏了也修不回来；按空参数回放，
+        // 不能让一条坏历史把之后每一轮都变成 400。
         let input = tool_call_input(function.and_then(|function| function.get("arguments")))
-            .ok_or_else(|| format!("{path}.function.arguments: must be a JSON object"))?;
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    path = %path,
+                    "历史里的工具调用参数不是合法 JSON 对象，按空参数回放"
+                );
+                json!({})
+            });
         blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
     }
     Ok(blocks)
@@ -443,14 +451,19 @@ fn translate_tools(tools: Option<&Value>) -> Result<Vec<Value>> {
     let tools = tools.as_array().ok_or("tools: must be an array")?;
     let mut translated = Vec::with_capacity(tools.len());
     for (index, tool) in tools.iter().enumerate() {
-        if tool
+        // 非函数工具（例如 OpenAI 托管的 file_search）上游没有对应能力：跳过并记日志，
+        // 不让整个请求失败。
+        if let Some(tool_type) = tool
             .get("type")
             .and_then(Value::as_str)
-            .is_some_and(|tool_type| tool_type != "function")
+            .filter(|tool_type| *tool_type != "function")
         {
-            return Err(format!(
-                "tools[{index}].type: only function tools are supported"
-            ));
+            tracing::warn!(
+                tool_type,
+                index,
+                "Chat Completions 请求里的工具类型不受支持，已跳过"
+            );
+            continue;
         }
         let function = tool
             .get("function")
@@ -779,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn history_tool_arguments_are_cleaned_or_rejected() {
+    fn history_tool_arguments_are_cleaned_or_replayed_empty() {
         let request = |arguments: &str| {
             translate(json!({
                 "model": "claude-sonnet-4-5",
@@ -801,8 +814,9 @@ mod tests {
         };
         assert_eq!(input(""), json!({}));
         assert_eq!(input(r#"{"command":"ls"}}"#), json!({"command": "ls"}));
-        assert!(request(r#"{"command":"ls""#).is_err());
-        assert!(request("[1,2]").is_err());
+        // Unrepairable history arguments are replayed as `{}` instead of failing every turn.
+        assert_eq!(input(r#"{"command":"ls""#), json!({}));
+        assert_eq!(input("[1,2]"), json!({}));
     }
 
     #[test]

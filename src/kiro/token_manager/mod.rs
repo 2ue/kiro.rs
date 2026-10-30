@@ -28,6 +28,8 @@ pub(crate) use auxiliary::{
 };
 pub use concurrency::InFlightLeaseGuard;
 pub(crate) use manager::AutomaticTokenRecoveryOutcome;
+#[cfg(test)]
+pub(crate) use manager::UPSTREAM_FAULT_STREAK_COOLDOWN;
 #[allow(unused_imports)]
 pub use manager::{
     BackgroundTokenRefreshPassReport, BackgroundTokenRefreshShutdownReport,

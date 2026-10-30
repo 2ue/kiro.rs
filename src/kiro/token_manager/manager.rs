@@ -1068,6 +1068,9 @@ const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_mi
 const FAST_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 
+/// 同一个账号连续几次上游故障（中间没有成功）后按账号问题冷却。
+pub(crate) const UPSTREAM_FAULT_STREAK_COOLDOWN: u32 = 3;
+
 #[derive(Debug, Clone, Copy)]
 struct AutoHealLimits {
     min_interval: StdDuration,
@@ -2309,6 +2312,7 @@ impl MultiTokenManager {
                     selection_events: VecDeque::new(),
                     last_auto_heal_at: None,
                     auto_heal_consecutive_rounds: 0,
+                    upstream_fault_streak: 0,
                 }
             })
             .collect();
@@ -2514,6 +2518,18 @@ impl MultiTokenManager {
     /// 空回是否让账号冷却（全局开关，默认关闭）。
     pub fn empty_turn_cooldown_enabled(&self) -> bool {
         self.config.lock().credential_empty_turn_cooldown_enabled
+    }
+
+    /// 记一次与账号无关的上游故障。同一个账号连续出现 [`UPSTREAM_FAULT_STREAK_COOLDOWN`] 次
+    /// （中间没有一次成功）时返回 true：问题多半出在这个账号上，调用方按原规则冷却它，
+    /// 否则优先级调度会让每个请求都先在它身上失败一次再换号。
+    pub fn note_upstream_fault(&self, id: u64) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        entry.upstream_fault_streak = entry.upstream_fault_streak.saturating_add(1);
+        entry.upstream_fault_streak >= UPSTREAM_FAULT_STREAK_COOLDOWN
     }
 
     /// 上游故障（5xx、异常/错误事件、解码/读取/发送失败）是否冷却账号，默认否。
@@ -9286,6 +9302,7 @@ impl MultiTokenManager {
                 selection_events: VecDeque::new(),
                 last_auto_heal_at: None,
                 auto_heal_consecutive_rounds: 0,
+                upstream_fault_streak: 0,
             };
             if let Some(state) = runtime_states.get(&id) {
                 Self::apply_runtime_state_if_newer(&mut entry, state);
@@ -11187,6 +11204,7 @@ impl MultiTokenManager {
         entry.failure_count = 0;
         entry.refresh_failure_count = 0;
         entry.auto_heal_consecutive_rounds = 0;
+        entry.upstream_fault_streak = 0;
         let expected_generation = entry.runtime_generation;
         if entry.warmup_remaining > 0 {
             entry.warmup_remaining -= 1;
@@ -12880,6 +12898,7 @@ impl MultiTokenManager {
             if !disabled {
                 entry.auto_heal_consecutive_rounds = 0;
                 entry.last_auto_heal_at = None;
+                entry.upstream_fault_streak = 0;
             }
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
@@ -13266,6 +13285,7 @@ impl MultiTokenManager {
             }
             entry.auto_heal_consecutive_rounds = 0;
             entry.last_auto_heal_at = None;
+            entry.upstream_fault_streak = 0;
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
             entry.model_cooldowns.clear();
@@ -13748,6 +13768,7 @@ impl MultiTokenManager {
                 selection_events: VecDeque::new(),
                 last_auto_heal_at: None,
                 auto_heal_consecutive_rounds: 0,
+                upstream_fault_streak: 0,
             });
         }
 
