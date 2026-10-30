@@ -147,6 +147,9 @@
 }
 
 @theme inline {
+  /* Wide screens: pages fill the window, so grids add columns here instead of stretching cards. */
+  --breakpoint-3xl: 120rem;
+  --breakpoint-4xl: 150rem;
   --color-background: hsl(var(--background));
   --color-surface-subtle: hsl(var(--surface-subtle));
   --color-foreground: hsl(var(--foreground));

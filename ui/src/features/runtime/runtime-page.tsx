@@ -1693,8 +1693,8 @@ export function RuntimePage() {
         </section>
       </div>
 
-      <div className="fixed inset-x-0 bottom-0 z-40 border-t border-border/80 bg-background/95 px-4 py-3 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur">
-        <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center justify-between gap-3">
+      <div className="fixed inset-x-0 bottom-0 z-40 border-t border-border/80 bg-background/95 px-4 py-3 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur lg:left-[15rem] lg:px-5">
+        <div className="flex w-full flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-sm font-semibold">
               {hasDraftChanges ? '运行配置有未保存改动' : '运行配置已是最新'}

@@ -288,7 +288,7 @@ export function InventoryPage() {
               action={<Button size="sm" onClick={() => setImportOpen(true)}><Upload />导入到库存</Button>}
             />
           ) : (
-            <div className="grid items-start gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+            <div className="grid items-start gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6">
               {items.map((item) => (
                 <InventoryCard key={item.id} item={item} selected={selectedIds.has(item.id)} onToggle={() => toggle(item.id)} onEdit={() => setEditing(item)} />
               ))}
