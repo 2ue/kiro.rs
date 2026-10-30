@@ -135,8 +135,8 @@ use super::strategy::{
     entry_effective_health_mut, record_local_selection, refresh_local_selection_windows_locked,
 };
 use super::types::{
-    AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
-    TransientFailureKind,
+    AcquireMode, CallContext, CredentialAuthUpdate, DispatchAdmission,
+    EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind, TransientFailureKind,
 };
 
 #[cfg(test)]
@@ -5527,11 +5527,20 @@ impl MultiTokenManager {
         }
     }
 
+    /// Queue limit for one dispatch: `0` (no limit) for a retry, see [`DispatchAdmission::Retry`].
+    fn dispatch_queue_limit(&self, admission: DispatchAdmission) -> u32 {
+        match admission {
+            DispatchAdmission::New => self.max_queued_requests(),
+            DispatchAdmission::Retry => 0,
+        }
+    }
+
     async fn try_enter_dispatch_queue(
         &self,
         max_wait: Option<StdDuration>,
+        admission: DispatchAdmission,
     ) -> anyhow::Result<Option<DispatchQueueGuard>> {
-        let max_queued = self.max_queued_requests();
+        let max_queued = self.dispatch_queue_limit(admission);
         if !self.try_enter_local_dispatch_queue(max_queued) {
             return Ok(None);
         }
@@ -5634,8 +5643,9 @@ impl MultiTokenManager {
     fn try_enter_local_only_dispatch_queue(
         &self,
         max_wait: Option<StdDuration>,
+        admission: DispatchAdmission,
     ) -> Option<DispatchQueueGuard> {
-        let max_queued = self.max_queued_requests();
+        let max_queued = self.dispatch_queue_limit(admission);
         if !self.try_enter_local_dispatch_queue(max_queued) {
             return None;
         }
@@ -5696,6 +5706,50 @@ impl MultiTokenManager {
             return false;
         }
         self.has_alternate_usable_credential_from_current_state(model, excluded_ids, current_id)
+    }
+
+    /// Whether a request whose attempt on `current_id` just failed upstream has another
+    /// credential to retry on, from the local state only (no storage round trip on the failure
+    /// path).
+    ///
+    /// A request that may wait for capacity can retry on a credential that is merely busy: its
+    /// next dispatch queues for that slot like any other request (see
+    /// [`DispatchAdmission::Retry`]). Requiring a free slot right now would turn every upstream
+    /// error under load into a client error. Credentials cooling down, RPM-limited, disabled or
+    /// behind an unavailable proxy are no target either way. A fail-fast request cannot queue,
+    /// so it still needs a free slot.
+    pub fn has_alternate_retry_target_cached(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+        waits_for_capacity: bool,
+    ) -> bool {
+        if !waits_for_capacity {
+            return self.has_alternate_usable_credential_from_current_state(
+                model,
+                excluded_ids,
+                current_id,
+            );
+        }
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        if self.redis_store.is_none() {
+            refresh_local_selection_windows_locked(&mut entries, now);
+        }
+        let proxy_resources = self.proxy_resources.lock();
+        entries.iter().any(|entry| {
+            entry.id != current_id
+                && !excluded_ids.contains(&entry.id)
+                && credential_is_temporarily_available(
+                    &proxy_resources,
+                    entry,
+                    model,
+                    now,
+                    global_rpm,
+                )
+        })
     }
 
     /// 判断当前本机内存态中是否还有其他可调度凭据。
@@ -6471,12 +6525,38 @@ impl MultiTokenManager {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn acquire_context_for_session_with_mode_and_auxiliary_budget(
         &self,
         model: Option<&str>,
         session_id: Option<&str>,
         excluded_ids: &HashSet<u64>,
         acquire_mode: AcquireMode,
+        request_weight_units: u32,
+        auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_dispatch(
+            model,
+            session_id,
+            excluded_ids,
+            acquire_mode,
+            DispatchAdmission::New,
+            request_weight_units,
+            auxiliary_attempt_budget,
+        )
+        .await
+    }
+
+    /// Selects a credential for one dispatch of a request; `admission` tells a first dispatch
+    /// from a retry after a failed attempt (see [`DispatchAdmission`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn acquire_context_for_dispatch(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        acquire_mode: AcquireMode,
+        admission: DispatchAdmission,
         request_weight_units: u32,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     ) -> anyhow::Result<CallContext> {
@@ -7033,7 +7113,9 @@ impl MultiTokenManager {
                         }
                     }
                     if queue_guard.is_none() {
-                        queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
+                        queue_guard = self
+                            .try_enter_dispatch_queue(dispatch_max_wait, admission)
+                            .await?;
                         if queue_guard.is_none() {
                             return Err(self.dispatch_queue_full_error());
                         }
@@ -7126,8 +7208,10 @@ impl MultiTokenManager {
                             .into());
                         }
                         if queue_guard.is_none() {
-                            queue_guard =
-                                self.try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
+                            queue_guard = self.try_enter_local_only_dispatch_queue(
+                                redis_degraded_max_wait,
+                                admission,
+                            );
                             if queue_guard.is_none() {
                                 return Err(self.dispatch_queue_full_error());
                             }
@@ -7259,7 +7343,9 @@ impl MultiTokenManager {
                     continue;
                 }
                 if queue_guard.is_none() {
-                    queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
+                    queue_guard = self
+                        .try_enter_dispatch_queue(dispatch_max_wait, admission)
+                        .await?;
                     if queue_guard.is_none() {
                         return Err(self.dispatch_queue_full_error());
                     }
@@ -7353,8 +7439,10 @@ impl MultiTokenManager {
                                 .into());
                             }
                             if queue_guard.is_none() {
-                                queue_guard = self
-                                    .try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
+                                queue_guard = self.try_enter_local_only_dispatch_queue(
+                                    redis_degraded_max_wait,
+                                    admission,
+                                );
                                 if queue_guard.is_none() {
                                     return Err(self.dispatch_queue_full_error());
                                 }
@@ -7426,8 +7514,9 @@ impl MultiTokenManager {
                                 );
                             }
                             if queue_guard.is_none() {
-                                queue_guard =
-                                    self.try_enter_dispatch_queue(dispatch_max_wait).await?;
+                                queue_guard = self
+                                    .try_enter_dispatch_queue(dispatch_max_wait, admission)
+                                    .await?;
                                 if queue_guard.is_none() {
                                     return Err(self.dispatch_queue_full_error());
                                 }
