@@ -413,6 +413,9 @@ struct RequestUsageContext {
     first_token_latency_ms: Arc<AtomicU64>,
     capacity_weight_units: Arc<AtomicU32>,
     latency: RequestLatencyTraceState,
+    /// Set once a usage record has been written for this request, shared by every clone, so a
+    /// guard that fires on cancellation never writes a second record.
+    recorded: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -5381,6 +5384,7 @@ impl CredentialUsageContext {
             self.error_metadata.clone(),
             self.request.error_metadata.lock().clone(),
         );
+        self.request.recorded.store(true, Ordering::Release);
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -5591,6 +5595,55 @@ impl WebSearchPreResponseUsageGuard {
         self.usage_context
             .take()
             .expect("WebSearch usage context can only be completed once")
+    }
+}
+
+/// Holds the request's usage context while the local path waits for a credential and for the
+/// upstream response headers. If the client goes away during that time the handler future is
+/// dropped before any usage record exists; the guard then records the request as
+/// `client_dropped`, attributed to the credential selected so far. A request that already wrote
+/// any record (success, failure, rejection) is left alone.
+struct LocalPreResponseUsageGuard {
+    usage_context: Option<RequestUsageContext>,
+    attribution_sink: Arc<McpCallAttributionSink>,
+}
+
+impl LocalPreResponseUsageGuard {
+    fn new(
+        usage_context: RequestUsageContext,
+        attribution_sink: Arc<McpCallAttributionSink>,
+    ) -> Self {
+        Self {
+            usage_context: Some(usage_context),
+            attribution_sink,
+        }
+    }
+
+    /// The handler returned normally: the response (or its stream) now owns usage recording.
+    fn disarm(mut self) {
+        self.usage_context = None;
+    }
+}
+
+impl Drop for LocalPreResponseUsageGuard {
+    fn drop(&mut self) {
+        let Some(usage_context) = self.usage_context.take() else {
+            return;
+        };
+        if usage_context.recorded.load(Ordering::Acquire) {
+            return;
+        }
+        let attribution = self.attribution_sink.snapshot_for_client_drop();
+        usage_context.mark_client_dropped();
+        usage_context
+            .attach_credential(
+                attribution.credential_id,
+                attribution.credential_label,
+                false,
+                false,
+                attribution.attempts,
+            )
+            .record_client_dropped();
     }
 }
 
@@ -6142,6 +6195,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::with_inference_attempt_budget(inference_attempt_budget),
     }
 }
@@ -8562,7 +8616,13 @@ async fn post_messages_inner(
         })
     });
 
-    if payload.stream {
+    // Covers the time spent waiting for a credential and for the upstream headers: if the
+    // client disconnects then, this future is dropped before any usage record exists.
+    let pre_response_usage_guard = LocalPreResponseUsageGuard::new(
+        usage_context.clone(),
+        inference_attempt_budget.attribution(),
+    );
+    let response = if payload.stream {
         let claude_code_noop_delta_keepalive =
             should_use_claude_code_noop_delta_keepalive(request_user_agent(&headers));
         // 流式响应
@@ -8633,7 +8693,9 @@ async fn post_messages_inner(
             capacity_weight_units,
         )
         .await
-    }
+    };
+    pre_response_usage_guard.disarm();
+    response
 }
 
 async fn call_api_stream_maybe_fail_fast(

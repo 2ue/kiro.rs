@@ -9953,6 +9953,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let usage = CacheUsage {
@@ -10068,6 +10069,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let usage = CacheUsage {
@@ -10174,6 +10176,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let raw_usage = CacheUsage {
@@ -10283,6 +10286,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let credential_usage =
@@ -10407,6 +10411,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let credential_usage = usage_context.attach_credential(Some(9), None, false, false, Vec::new());
@@ -10512,6 +10517,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
 
@@ -10647,6 +10653,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
 
@@ -10994,6 +11001,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let cc_context = RequestUsageContext {
@@ -11179,6 +11187,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let credential_usage = usage_context.attach_credential(Some(1), None, false, false, Vec::new());
@@ -11282,6 +11291,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     usage_context
@@ -11376,6 +11386,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
 
@@ -12197,6 +12208,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     }
     .attach_credential(Some(1), None, false, false, Vec::new());
@@ -12313,6 +12325,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     }
     .attach_credential(Some(1), None, false, false, Vec::new());
@@ -16148,6 +16161,7 @@ fn stable_segment_usage_context(policy: StableSegmentCachePolicy) -> RequestUsag
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     }
 }
@@ -16906,5 +16920,53 @@ fn full_dispatch_queue_is_rejected_before_body_processing() {
     run_handler_fixture_on_large_stack_thread(
         "full-dispatch-queue-entry-reject",
         run_full_dispatch_queue_is_rejected_before_body_processing,
+    );
+}
+
+async fn run_request_cancelled_while_queued_records_client_dropped() {
+    for stream in [false, true] {
+        let (app, usage_recorder, token_manager) = handler_eventstream_fault_router_with_manager(
+            "http://127.0.0.1:9",
+            1,
+            1,
+            |config| {
+                config.credential_max_concurrent_requests = 1;
+                config.dispatch_max_queued_requests = 10;
+                config.credential_dispatch_max_wait_secs = 30;
+            },
+            None,
+        );
+        let _held = token_manager
+            .acquire_in_flight_lease_for_test(1)
+            .expect("occupy the only slot so the request queues");
+        let all_records = || usage_recorder.query(UsageRecordQuery::default()).records;
+        let before = all_records().len();
+        let request = handler_eventstream_fault_request_for_path("/cc/v1/messages", stream);
+        // The client gives up while the request waits in the dispatch queue.
+        let outcome = tokio::time::timeout(Duration::from_millis(300), app.oneshot(request)).await;
+        assert!(
+            outcome.is_err(),
+            "stream={stream}: the request was still queued"
+        );
+        let records = all_records();
+        assert_eq!(
+            records.len(),
+            before + 1,
+            "stream={stream}: exactly one record"
+        );
+        let record = &records[0];
+        assert_eq!(
+            record.status,
+            UsageRecordStatus::ClientDropped,
+            "stream={stream}"
+        );
+    }
+}
+
+#[test]
+fn request_cancelled_while_queued_records_client_dropped() {
+    run_handler_fixture_on_large_stack_thread(
+        "cancelled-while-queued-client-dropped",
+        run_request_cancelled_while_queued_records_client_dropped,
     );
 }

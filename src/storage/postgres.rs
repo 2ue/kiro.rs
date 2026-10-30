@@ -773,8 +773,7 @@ impl PostgresStore {
             .url
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
-        let pool = PgPoolOptions::new()
-            .max_connections(config.postgres.max_connections.max(1))
+        let pool = production_pool_options(config.postgres.max_connections)
             .connect(url)
             .await?;
         let store = Self {
@@ -797,8 +796,7 @@ impl PostgresStore {
             .url
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
-        let pool = PgPoolOptions::new()
-            .max_connections(config.postgres.usage_max_connections.max(1))
+        let pool = production_pool_options(config.postgres.usage_max_connections)
             .connect(url)
             .await?;
         let store = Self {
@@ -9767,6 +9765,54 @@ fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
     })
 }
 
+/// A transaction left open this long without a statement is ended by PostgreSQL itself.
+/// Every transaction in this code base is a short burst of statements, so an idle open
+/// transaction can only be one whose client future was cancelled mid-way.
+const IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS: u64 = 60_000;
+
+/// Pool options for the production pools.
+///
+/// sqlx 0.8 cannot always roll back a transaction whose future is cancelled while `BEGIN` is
+/// in flight (for example by an outer `tokio::time::timeout`): the connection goes back to the
+/// pool inside an open transaction, the next user's `BEGIN` warns "there is already a
+/// transaction in progress", and its statements join the stale transaction. Two guards:
+/// - the server ends such a transaction after `IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS`;
+/// - a connection returned to the pool inside a transaction is closed instead of reused.
+fn production_pool_options(max_connections: u32) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(max_connections.max(1))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(&format!(
+                    "SET idle_in_transaction_session_timeout = {IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS}"
+                ))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                outside_transaction(conn).await
+            })
+        })
+}
+
+/// Whether the connection is outside any transaction. Inside one, `now()` stays at the
+/// transaction start while `statement_timestamp()` moves with each statement. This must run
+/// over the simple query protocol: with the extended protocol the Execute message moves
+/// `statement_timestamp()` past the start of the implicit transaction even when no explicit
+/// transaction is open.
+async fn outside_transaction(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    // A plain `&str` carries no arguments, so sqlx sends it as a simple Query message.
+    let row = sqlx::Executor::fetch_one(conn, "SELECT now() = statement_timestamp()").await?;
+    let outside_transaction: bool = row.try_get(0)?;
+    if !outside_transaction {
+        tracing::warn!("PgSQL 连接归还时仍处于未结束的事务中，关闭该连接而不是放回连接池");
+    }
+    Ok(outside_transaction)
+}
+
 async fn configure_usage_cleanup_transaction(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
@@ -14586,6 +14632,52 @@ mod tests {
     };
     use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn production_pool_discards_connections_left_inside_a_transaction() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let url = config.postgres.url.clone().unwrap();
+        let pool = production_pool_options(1).connect(&url).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let timeout: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(timeout, "1min");
+        let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        // What a cancelled `begin()` leaves behind: BEGIN ran, sqlx never counted it.
+        sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+        drop(conn);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let second_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_ne!(
+            first_pid, second_pid,
+            "the dangling connection must not be reused"
+        );
+        assert!(outside_transaction(&mut conn).await.unwrap());
+        drop(conn);
+
+        // A clean connection is kept.
+        let mut conn = pool.acquire().await.unwrap();
+        let third_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(second_pid, third_pid);
+        drop(conn);
+        pool.close().await;
+    }
 
     fn test_config() -> Option<Config> {
         let url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")?;

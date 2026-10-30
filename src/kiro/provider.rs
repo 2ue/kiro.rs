@@ -12333,6 +12333,11 @@ impl KiroProvider {
                 InFlightKind::Api
             });
             let credential_label = self.credential_log_label(ctx.id);
+            if let Some(budget) = inference_attempt_budget {
+                budget
+                    .attribution()
+                    .begin_send(attempt + 1, ctx.id, &credential_label);
+            }
             let credential_context = format!("账号 {}", credential_label);
             let attempt_started_at = Instant::now();
 
