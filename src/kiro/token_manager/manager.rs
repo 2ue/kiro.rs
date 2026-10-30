@@ -90,6 +90,7 @@ use super::cooldown::{
     entry_any_cooldown_remaining, entry_cooldown_remaining, entry_global_cooldown_remaining,
     model_state_key,
 };
+use super::dispatch_progress::DispatchProgress;
 use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
     format_effective_concurrency_range, min_dispatch_wait, rate_limit_blocked_count,
@@ -1032,6 +1033,7 @@ pub struct MultiTokenManager {
     released_in_flight_lease_tombstones: ReleasedInFlightLeaseTombstones,
     next_in_flight_lease_id: AtomicU64,
     queued_requests: Arc<AtomicU32>,
+    dispatch_progress: DispatchProgress,
     /// Serializes only candidate selection plus the local provisional reservation.
     /// Redis and upstream awaits always run after this guard is dropped.
     selection_reservation_gate: Mutex<()>,
@@ -2470,6 +2472,7 @@ impl MultiTokenManager {
             released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
             next_in_flight_lease_id: AtomicU64::new(initial_lease_id),
             queued_requests: Arc::new(AtomicU32::new(0)),
+            dispatch_progress: DispatchProgress::default(),
             selection_reservation_gate: Mutex::new(()),
             tier_sticky_migration_last: Mutex::new(None),
             auto_heal_gate: TokioMutex::new(()),
@@ -3827,6 +3830,70 @@ impl MultiTokenManager {
         self.config.lock().dispatch_global_max_concurrent_requests
     }
 
+    /// Fast path for the request entry: `Some(retry_after_secs)` when the dispatch queue is
+    /// full and no credential has a free slot, so the request would be turned away by the
+    /// scheduler anyway. Reads only local counters (no Redis, no PgSQL) so it stays cheap
+    /// when thousands of requests per minute are arriving during an overload.
+    pub fn dispatch_queue_full_retry_after(&self) -> Option<u64> {
+        let max_queued = self.max_queued_requests();
+        let queued = self.queued_requests.load(Ordering::Acquire);
+        if max_queued == 0 || queued < max_queued {
+            return None;
+        }
+        let has_free_slot = {
+            let entries = self.entries.lock();
+            let proxy_resources = self.proxy_resources.lock();
+            let config = self.config.lock();
+            let now = Instant::now();
+            let global_in_flight = entries
+                .iter()
+                .map(|entry| entry.in_flight_requests)
+                .sum::<u32>();
+            global_has_concurrency_capacity(
+                global_in_flight,
+                config.dispatch_global_max_concurrent_requests,
+                1,
+            ) && entries.iter().any(|entry| {
+                credential_is_dispatchable(
+                    &proxy_resources,
+                    entry,
+                    None,
+                    now,
+                    config.credential_max_concurrent_requests,
+                    config.credential_rpm.unwrap_or(0),
+                    1,
+                )
+            })
+        };
+        if has_free_slot {
+            return None;
+        }
+        Some(
+            self.dispatch_progress
+                .queue_full_retry_after_secs(queued, Instant::now()),
+        )
+    }
+
+    /// The queue is full: tell the client to come back once the current queue has had time to
+    /// drain at the recent dispatch rate, instead of retrying every second into a full queue.
+    fn dispatch_queue_full_error(&self) -> anyhow::Error {
+        let queued = self.queued_requests.load(Ordering::Acquire);
+        let retry_after_secs = self
+            .dispatch_progress
+            .queue_full_retry_after_secs(queued, Instant::now());
+        LocalSchedulerError::new(
+            LocalSchedulerErrorKind::QueueFull,
+            format!(
+                "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}, queued={}, retry_after_secs={}）",
+                self.max_queued_requests(),
+                self.global_max_concurrent_requests(),
+                queued,
+                retry_after_secs
+            ),
+        )
+        .into()
+    }
+
     fn max_queued_requests(&self) -> u32 {
         self.config.lock().dispatch_max_queued_requests
     }
@@ -5078,6 +5145,11 @@ impl MultiTokenManager {
             return Ok(None);
         };
         self.confirm_prepared_in_flight_slot(prepared).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_queued_requests_for_test(&self, queued: u32) {
+        self.queued_requests.store(queued, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -6921,12 +6993,7 @@ impl MultiTokenManager {
                     if queue_guard.is_none() {
                         queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                         if queue_guard.is_none() {
-                            local_scheduler_bail!(
-                                LocalSchedulerErrorKind::QueueFull,
-                                "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                self.max_queued_requests(),
-                                self.global_max_concurrent_requests()
-                            );
+                            return Err(self.dispatch_queue_full_error());
                         }
                     }
                     let now = Instant::now();
@@ -7020,12 +7087,7 @@ impl MultiTokenManager {
                             queue_guard =
                                 self.try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                             if queue_guard.is_none() {
-                                local_scheduler_bail!(
-                                    LocalSchedulerErrorKind::QueueFull,
-                                    "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                    self.max_queued_requests(),
-                                    self.global_max_concurrent_requests()
-                                );
+                                return Err(self.dispatch_queue_full_error());
                             }
                         }
                         let now = Instant::now();
@@ -7157,12 +7219,7 @@ impl MultiTokenManager {
                 if queue_guard.is_none() {
                     queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                     if queue_guard.is_none() {
-                        local_scheduler_bail!(
-                            LocalSchedulerErrorKind::QueueFull,
-                            "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                            self.max_queued_requests(),
-                            self.global_max_concurrent_requests()
-                        );
+                        return Err(self.dispatch_queue_full_error());
                     }
                 }
                 let now = Instant::now();
@@ -7210,6 +7267,7 @@ impl MultiTokenManager {
             };
             capacity_waiter.finish_acquired();
             drop(queue_guard.take());
+            self.dispatch_progress.record_dispatch(Instant::now());
 
             // 尝试获取/刷新 Token
             match self
@@ -7256,12 +7314,7 @@ impl MultiTokenManager {
                                 queue_guard = self
                                     .try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                                 if queue_guard.is_none() {
-                                    local_scheduler_bail!(
-                                        LocalSchedulerErrorKind::QueueFull,
-                                        "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                        self.max_queued_requests(),
-                                        self.global_max_concurrent_requests()
-                                    );
+                                    return Err(self.dispatch_queue_full_error());
                                 }
                             }
                             let now = Instant::now();
@@ -7334,12 +7387,7 @@ impl MultiTokenManager {
                                 queue_guard =
                                     self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                                 if queue_guard.is_none() {
-                                    local_scheduler_bail!(
-                                        LocalSchedulerErrorKind::QueueFull,
-                                        "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                        self.max_queued_requests(),
-                                        self.global_max_concurrent_requests()
-                                    );
+                                    return Err(self.dispatch_queue_full_error());
                                 }
                             }
                             let now = Instant::now();
@@ -11199,7 +11247,9 @@ impl MultiTokenManager {
             self.clear_disabled_credential_request_state(id);
         }
         self.record_scheduler_success_health(id, model, latency, success.alpha);
-        self.notify_dispatch_state_changed();
+        if success.runtime_state_changed || disabled {
+            self.notify_dispatch_state_changed();
+        }
     }
 
     /// Request/stream completion path variant: update local scheduling state immediately and
@@ -11231,7 +11281,12 @@ impl MultiTokenManager {
         }
         self.record_success_stats_delta(id, &success.last_used_at);
         self.record_scheduler_success_health(id, model, latency, success.alpha);
-        self.notify_dispatch_state_changed();
+        // The freed slot already wakes one waiter per released unit when the lease drops.
+        // Waking every waiter on each success made all queued requests contend for the
+        // selection gate at the request completion rate.
+        if success.runtime_state_changed {
+            self.notify_dispatch_state_changed();
+        }
     }
 
     fn record_success_local(

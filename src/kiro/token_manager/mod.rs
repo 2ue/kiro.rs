@@ -4,6 +4,7 @@ mod auxiliary;
 mod capacity;
 mod concurrency;
 mod cooldown;
+mod dispatch_progress;
 mod manager;
 mod queue;
 mod redis_runtime;

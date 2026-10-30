@@ -15048,3 +15048,93 @@ fn selection_failure_samples_list_blocking_accounts_before_disabled_ones() {
     );
     assert_eq!(summary.rejected_account_count, 5);
 }
+
+fn queue_test_manager(credentials: usize, max_queued: u32) -> Arc<MultiTokenManager> {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.credential_warmup_requests = 0;
+    config.dispatch_max_queued_requests = max_queued;
+    config.credential_dispatch_max_wait_secs = 30;
+    let list = (0..credentials)
+        .map(|index| test_access_token_credential(&format!("queue-{index}"), "Pro"))
+        .collect();
+    Arc::new(MultiTokenManager::new(config, list, None, None, false).unwrap())
+}
+
+#[tokio::test]
+async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate() {
+    let manager = queue_test_manager(1, 2);
+    let mut holder = manager.acquire_context(None).await.unwrap();
+    assert_eq!(
+        manager.dispatch_queue_full_retry_after(),
+        None,
+        "queue not full yet"
+    );
+
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.acquire_context(None).await })
+        })
+        .collect();
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 2 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 2);
+
+    // Nothing has been dispatched recently: the queue is not moving, ask for the longest wait.
+    assert_eq!(manager.dispatch_queue_full_retry_after(), Some(60));
+    let started = Instant::now();
+    let error = match manager.acquire_context(None).await {
+        Ok(mut ctx) => {
+            ctx.release_in_flight();
+            panic!("a full queue must reject the request");
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        started.elapsed() < StdDuration::from_millis(200),
+        "rejected without waiting"
+    );
+    assert!(error.contains("账号调度等待队列已满"), "{error}");
+    assert!(error.contains("retry_after_secs=60"), "{error}");
+
+    // Queued requests move on as the slot frees up, in order, without waiting for a timeout.
+    holder.release_in_flight();
+    let mut served = Vec::new();
+    for waiter in waiters {
+        let mut ctx = tokio::time::timeout(StdDuration::from_secs(5), waiter)
+            .await
+            .expect("queued request must be dispatched once a slot frees up")
+            .unwrap()
+            .unwrap();
+        served.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert_eq!(served, vec![1, 1]);
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
+    // Three dispatches in the last 30 seconds (0.1/s): a queue of 2 drains in about 20 s.
+    assert_eq!(
+        manager
+            .dispatch_progress
+            .queue_full_retry_after_secs(2, Instant::now()),
+        20
+    );
+}
+
+#[tokio::test]
+async fn a_success_does_not_wake_every_queued_request() {
+    let manager = queue_test_manager(1, 10);
+    let ctx = manager.acquire_context(None).await.unwrap();
+    let (_, _, generation_before) = manager.capacity_signal.test_snapshot();
+    manager.report_success_with_latency_deferred(ctx.id, None, None);
+    let (_, _, generation_after) = manager.capacity_signal.test_snapshot();
+    assert_eq!(
+        generation_before, generation_after,
+        "a plain success frees no slot by itself; the lease release wakes one waiter"
+    );
+    drop(ctx);
+}

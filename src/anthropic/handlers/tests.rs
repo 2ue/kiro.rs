@@ -16854,3 +16854,57 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
         }
     });
 }
+
+async fn run_full_dispatch_queue_is_rejected_before_body_processing() {
+    // Nothing listens at this address: any request that got past the entry would fail with a
+    // connection error instead of the 429 asserted below.
+    let (app, usage_recorder, token_manager) = handler_eventstream_fault_router_with_manager(
+        "http://127.0.0.1:9",
+        1,
+        1,
+        |config| {
+            config.credential_max_concurrent_requests = 1;
+            config.dispatch_max_queued_requests = 3;
+        },
+        None,
+    );
+    let _held = token_manager
+        .acquire_in_flight_lease_for_test(1)
+        .expect("occupy the only slot");
+    token_manager.set_queued_requests_for_test(3);
+
+    let started = std::time::Instant::now();
+    let response = app
+        .clone()
+        .oneshot(handler_eventstream_fault_request_for_path(
+            "/cc/v1/messages",
+            false,
+        ))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("60"),
+        "no dispatch yet, so the longest wait is advertised"
+    );
+    let request_id = response_request_id(&response);
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    assert_eq!(record.status, UsageRecordStatus::Error);
+
+    // With room in the queue the request goes on to the scheduler as before.
+    token_manager.set_queued_requests_for_test(0);
+    assert_eq!(token_manager.dispatch_queue_full_retry_after(), None);
+}
+
+#[test]
+fn full_dispatch_queue_is_rejected_before_body_processing() {
+    run_handler_fixture_on_large_stack_thread(
+        "full-dispatch-queue-entry-reject",
+        run_full_dispatch_queue_is_rejected_before_body_processing,
+    );
+}
