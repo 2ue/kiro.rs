@@ -14790,7 +14790,8 @@ fn external_pool_auto_disable_window_has_own_default() {
     let config = ExternalPoolsConfig::default();
 
     assert_eq!(config.external_pool_auto_disable_window_secs, 60);
-    assert_eq!(config.local_pool_circuit_window_secs, 60);
+    // The local pool circuit uses its own, longer window since it counts distinct accounts.
+    assert_eq!(config.local_pool_circuit_window_secs, 300);
 }
 
 #[test]

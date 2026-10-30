@@ -314,6 +314,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialProbationSecs: toWhole(draft.credentialProbationSecs),
     credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
     credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+    credentialSessionMaxConcurrentRequests: toWhole(draft.credentialSessionMaxConcurrentRequests),
     kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
     kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
     streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
@@ -423,7 +424,9 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
       localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
       localPoolCircuitRequireDistinctCredentials: toWhole(draft.externalPools.localPoolCircuitRequireDistinctCredentials),
+      localPoolCircuitMinRatioPercent: toWhole(draft.externalPools.localPoolCircuitMinRatioPercent),
       localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
+      localPoolCircuitHalfOpenProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenProbes, 1),
       externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
       externalPoolAutoDisableWindowSecs: toWhole(draft.externalPools.externalPoolAutoDisableWindowSecs, 1),
       externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
@@ -822,7 +825,8 @@ export function RuntimePage() {
                     ))}
                   </div>
                 </div>
-                <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
+                <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。建议 30 到 60 秒，过载时快速返回，避免请求一直挂起。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
+                <NumField label="单会话单账号最大并发" desc="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。0 表示等于账号自身的并发上限。" value={draft.credentialSessionMaxConcurrentRequests} min={0} max={1000} suffix="个" onChange={set('credentialSessionMaxConcurrentRequests')} />
                 <TogField label="自动同步 Kiro 客户端版本" desc={`默认关闭。打开后每 12 小时从官方读取当前版本，所有账号的上游请求头改用该版本；读取失败时继续用配置的版本。版本号是上游身份的一部分，会同时影响所有账号。${draft.kiroVersionLatest ? `最近读到：${draft.kiroVersionLatest}` : ''}`} checked={draft.kiroVersionAutoSyncEnabled} onChange={set('kiroVersionAutoSyncEnabled')} />
                 <TogField label="对话改走 Kiro 新域名" desc="默认关闭。打开后 IDE 端点的对话和联网搜索改发到 runtime.{区域}.kiro.dev，请求头不变；模型列表、额度查询、令牌刷新不受影响。注意：实测 FREE 账号打开后对话全部被新域名限流（429），打开前请先用自己的账号小范围验证。" checked={draft.kiroRuntimeDomainEnabled} onChange={set('kiroRuntimeDomainEnabled')} />
                 <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />

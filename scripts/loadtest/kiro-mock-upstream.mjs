@@ -8,6 +8,9 @@ const DEFAULT_PORT = Number.parseInt(process.env.PORT || process.env.KIRO_MOCK_P
 const DEFAULT_HOST = process.env.HOST || "127.0.0.1";
 const DEFAULT_SCENARIO = process.env.KIRO_MOCK_SCENARIO || "success";
 const LOG_REQUESTS = process.env.KIRO_MOCK_LOG_REQUESTS === "1";
+// Delay before the response headers of generateAssistantResponse, to reproduce a slow upstream.
+// `?headerDelayMs=` on the request overrides it.
+const DEFAULT_HEADER_DELAY_MS = Number.parseInt(process.env.KIRO_MOCK_HEADER_DELAY_MS || "0", 10);
 
 const models = [
   { id: "sonnet", displayName: "Sonnet", maxInputTokens: 200000 },
@@ -304,7 +307,16 @@ function handleListModels(req, res, url, scenario) {
   });
 }
 
-function handleGenerateAssistantResponse(req, res, url, scenario, body) {
+async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
+  const headerDelayMs = Number.parseInt(url.searchParams.get("headerDelayMs") || `${DEFAULT_HEADER_DELAY_MS}`, 10);
+  if (headerDelayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, headerDelayMs));
+    // The request body has already been read, so only the response side tells whether the
+    // client is still there.
+    if (res.destroyed || res.writableEnded) {
+      return;
+    }
+  }
   if (scenario === "429") {
     json(res, 429, { message: "rate limited", reason: "THROTTLED" }, { "retry-after": "1" });
     return;

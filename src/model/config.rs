@@ -1743,6 +1743,7 @@ impl CachePointPolicyPatch {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheBoundsPolicy {
+    /// 每个会话 scope（conversation_id + 路由命名空间）最多保留的条目数；字段名为兼容保留。
     #[serde(default = "default_prompt_cache_max_entries_per_account")]
     pub max_entries_per_account: usize,
     #[serde(default = "default_prompt_cache_max_entries_global")]
@@ -4335,16 +4336,29 @@ pub struct ExternalPoolsConfig {
     pub external_pool_local_rescue_on_capacity: bool,
     #[serde(default = "default_external_pool_local_rescue_max_wait_secs")]
     pub external_pool_local_rescue_max_wait_secs: u64,
+    /// 本地账号池风险保护（全池熔断），默认关闭：被风控的账号只禁用它自己，其余账号照常调度。
+    /// 打开后只统计曾经成功过的账号被上游风控（暂停、封禁、锁定），同一账号在窗口内只计一次；
+    /// 从未成功过的账号（新导入、预热中）被风控只禁用它自己。
     #[serde(default)]
     pub local_pool_circuit_enabled: bool,
     #[serde(default = "default_local_pool_circuit_window_secs")]
     pub local_pool_circuit_window_secs: u64,
+    /// 兼容字段：旧版本按"失败次数"计数。现在每个账号在窗口内只计一次，所以该值只作为
+    /// `local_pool_circuit_require_distinct_credentials` 的下限参与判断。
     #[serde(default = "default_local_pool_circuit_open_after_failures")]
     pub local_pool_circuit_open_after_failures: u32,
+    /// 窗口内至少有多少个不同账号被风控才打开。
     #[serde(default = "default_local_pool_circuit_require_distinct_credentials")]
     pub local_pool_circuit_require_distinct_credentials: u32,
+    /// 被风控的账号还需占"被风控账号 + 当前可调度账号"的这个百分比以上才打开，
+    /// 避免大池子里几个账号出问题就挡住全部请求。0 表示只看账号数。
+    #[serde(default = "default_local_pool_circuit_min_ratio_percent")]
+    pub local_pool_circuit_min_ratio_percent: u32,
     #[serde(default = "default_local_pool_circuit_open_secs")]
     pub local_pool_circuit_open_secs: u64,
+    /// 打开期满后进入半开状态，最多放行这么多个探测请求；探测成功即关闭，再次被风控就重新打开。
+    #[serde(default = "default_local_pool_circuit_half_open_probes")]
+    pub local_pool_circuit_half_open_probes: u32,
     #[serde(default)]
     pub external_pool_auto_disable_enabled: bool,
     #[serde(default = "default_true")]
@@ -4497,13 +4511,15 @@ impl Default for ExternalPoolsConfig {
             external_pool_local_rescue_on_capacity: true,
             external_pool_local_rescue_max_wait_secs:
                 default_external_pool_local_rescue_max_wait_secs(),
-            local_pool_circuit_enabled: true,
+            local_pool_circuit_enabled: false,
             local_pool_circuit_window_secs: default_local_pool_circuit_window_secs(),
             local_pool_circuit_open_after_failures: default_local_pool_circuit_open_after_failures(
             ),
             local_pool_circuit_require_distinct_credentials:
                 default_local_pool_circuit_require_distinct_credentials(),
             local_pool_circuit_open_secs: default_local_pool_circuit_open_secs(),
+            local_pool_circuit_min_ratio_percent: default_local_pool_circuit_min_ratio_percent(),
+            local_pool_circuit_half_open_probes: default_local_pool_circuit_half_open_probes(),
             external_pool_auto_disable_enabled: false,
             external_pool_auto_disable_on_auth_error: true,
             external_pool_auto_disable_on_security_lock: true,
@@ -5138,6 +5154,13 @@ pub struct Config {
     #[serde(default = "default_credential_dispatch_max_wait_secs")]
     pub credential_dispatch_max_wait_secs: u64,
 
+    /// 同一会话在单个凭据上的最大并发请求数。
+    ///
+    /// `0` 表示等于该凭据自身的并发上限（同一会话的并发全部叠在绑定账号上，对上游缓存最友好）；
+    /// `>0` 时，同一会话在绑定账号上的并发达到该值后，后续并发请求临时借用其他账号，不改绑。
+    #[serde(default)]
+    pub credential_session_max_concurrent_requests: u32,
+
     /// Kiro 上游响应头最长等待秒数。
     ///
     /// 只限制请求发出到拿到响应头的阶段；响应头之后的流式 body 读取仍由
@@ -5566,7 +5589,8 @@ pub struct Config {
     #[serde(default)]
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
 
-    /// 本地 prompt-cache 每个账号最多保留的 fingerprint 条目。
+    /// 本地 prompt-cache 每个会话 scope（conversation_id + 路由命名空间）最多保留的 fingerprint
+    /// 条目。scope 不含账号，同一会话换号后仍命中同一组条目；键名里的 PerAccount 只为兼容保留。
     #[serde(default = "default_prompt_cache_max_entries_per_account")]
     pub prompt_cache_max_entries_per_account: usize,
 
@@ -6333,15 +6357,23 @@ fn default_audit_log_retention_days() -> u32 {
 }
 
 fn default_local_pool_circuit_window_secs() -> u64 {
-    60
+    300
 }
 
 fn default_local_pool_circuit_open_after_failures() -> u32 {
-    3
+    5
 }
 
 fn default_local_pool_circuit_require_distinct_credentials() -> u32 {
-    2
+    5
+}
+
+fn default_local_pool_circuit_min_ratio_percent() -> u32 {
+    30
+}
+
+fn default_local_pool_circuit_half_open_probes() -> u32 {
+    3
 }
 
 fn default_local_pool_circuit_open_secs() -> u64 {
@@ -6787,6 +6819,7 @@ impl Default for Config {
             credential_probation_secs: default_credential_probation_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
+            credential_session_max_concurrent_requests: 0,
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
             kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
             ),
@@ -7149,10 +7182,9 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 8 {
-            // Risk-control bursts must fail safe. Older persisted runtime configs materialized
-            // this field as false because the original circuit only fed external direct policy;
-            // v8 makes it a local-account safety circuit as well.
-            self.external_pools.local_pool_circuit_enabled = true;
+            // v8 used to switch the local pool circuit on. It is off by default now: a
+            // risk-controlled account disables only itself and the rest of the pool keeps
+            // serving. The persisted value is left as it is.
             self.runtime_config_migration_version = 8;
             changed = true;
         }
@@ -10126,6 +10158,40 @@ mod tests {
         config.postgres.compress_usage_rollups_on_start = true;
         assert!(!config.apply_runtime_config_migrations());
         assert!(config.postgres.compress_usage_rollups_on_start);
+    }
+
+    #[test]
+    fn runtime_config_migrations_never_change_the_pool_circuit() {
+        for enabled in [false, true] {
+            let mut config = Config {
+                runtime_config_migration_version: 0,
+                external_pools: ExternalPoolsConfig {
+                    local_pool_circuit_enabled: enabled,
+                    local_pool_circuit_window_secs: 60,
+                    local_pool_circuit_open_after_failures: 3,
+                    local_pool_circuit_require_distinct_credentials: 2,
+                    ..ExternalPoolsConfig::default()
+                },
+                ..Config::default()
+            };
+            config.apply_runtime_config_migrations();
+            let pools = &config.external_pools;
+            assert_eq!(
+                pools.local_pool_circuit_enabled, enabled,
+                "the switch is left as it is"
+            );
+            assert_eq!(pools.local_pool_circuit_window_secs, 60);
+            assert_eq!(pools.local_pool_circuit_open_after_failures, 3);
+            assert_eq!(pools.local_pool_circuit_require_distinct_credentials, 2);
+        }
+    }
+
+    #[test]
+    fn pool_circuit_is_off_by_default() {
+        let pools: ExternalPoolsConfig = serde_json::from_str("{}").unwrap();
+        assert!(!pools.local_pool_circuit_enabled);
+        assert!(!ExternalPoolsConfig::default().local_pool_circuit_enabled);
+        assert!(!Config::default().external_pools.local_pool_circuit_enabled);
     }
 
     #[test]

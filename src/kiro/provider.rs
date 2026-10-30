@@ -9104,6 +9104,10 @@ impl KiroProvider {
             .local_pool_route_state_fresh_for_route(model, route)
     }
 
+    pub fn dispatch_queue_full_retry_after(&self) -> Option<u64> {
+        self.token_manager.dispatch_queue_full_retry_after()
+    }
+
     pub fn local_pool_route_state_cached_for_route(
         &self,
         model: Option<&str>,
@@ -12771,6 +12775,11 @@ impl KiroProvider {
                 InFlightKind::Api
             });
             let credential_label = self.credential_log_label(ctx.id);
+            if let Some(budget) = inference_attempt_budget {
+                budget
+                    .attribution()
+                    .begin_send(attempt + 1, ctx.id, &credential_label);
+            }
             let credential_context = format!("账号 {}", credential_label);
             let attempt_started_at = Instant::now();
 

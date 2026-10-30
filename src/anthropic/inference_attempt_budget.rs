@@ -200,6 +200,9 @@ pub(crate) struct InferenceAttemptBudget {
     empty_turn_credential_ids: Mutex<HashSet<u64>>,
     credential_dispatch_elapsed_ms: AtomicU64,
     upstream_header_wait_ms: AtomicU64,
+    /// Credentials selected for this request so far, so a request cancelled before the
+    /// upstream answered can still be attributed in its usage record.
+    attribution: Arc<crate::kiro::call_trace::McpCallAttributionSink>,
 }
 
 const DOWNSTREAM_COMMITTED_BIT: u32 = 1 << 31;
@@ -232,7 +235,12 @@ impl InferenceAttemptBudget {
             empty_turn_credential_ids: Mutex::new(HashSet::new()),
             credential_dispatch_elapsed_ms: AtomicU64::new(0),
             upstream_header_wait_ms: AtomicU64::new(0),
+            attribution: Arc::default(),
         }
+    }
+
+    pub(crate) fn attribution(&self) -> Arc<crate::kiro::call_trace::McpCallAttributionSink> {
+        self.attribution.clone()
     }
 
     pub(crate) fn record_credential_dispatch_elapsed(&self, elapsed: Duration) {

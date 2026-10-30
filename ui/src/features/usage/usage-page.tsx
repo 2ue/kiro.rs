@@ -30,6 +30,7 @@ import {
   useRefreshUsageQueriesAfterCleanup,
   useModelPricing,
   useSyncModelPricing,
+  useUsageWriterStats,
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
 import { getCredentialList, getExternalPools } from '@/api/credentials'
@@ -1175,6 +1176,7 @@ export function UsagePage() {
   const summary = useUsageSummary(autoRefresh.refetchInterval)
   const cleanupStatus = useUsageCleanupStatus()
   const modelPricing = useModelPricing(autoRefresh.refetchInterval)
+  const writerStats = useUsageWriterStats(autoRefresh.refetchInterval)
   const syncPricing = useSyncModelPricing()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
@@ -1189,6 +1191,9 @@ export function UsagePage() {
     data?.localPromptCacheInputTokens ?? 0,
   )
   const pricingStatus = modelPricing.data
+  // Records the writer gave up on (queue full or PgSQL timing out). They are missing from the
+  // numbers on this page, so say how many instead of letting the page look complete.
+  const droppedRecords = (writerStats.data?.droppedPersistRecords ?? 0) + (writerStats.data?.droppedRedisRecords ?? 0)
 
   const handleSyncPricing = () => {
     syncPricing.mutate(undefined, {
@@ -1233,6 +1238,15 @@ export function UsagePage() {
         <span>· {formatNumber(pricingStatus?.modelCount ?? 0)} 模型</span>
         {pricingStatus?.lastError && <span className="max-w-40 truncate text-destructive" title={pricingStatus.lastError}>· {pricingStatus.lastError}</span>}
       </div>
+      {droppedRecords > 0 && (
+        <div
+          className="flex items-center gap-1 rounded-lg border bg-card px-2 py-1 text-xs text-muted-foreground"
+          title="写入数据库失败或排队已满而未保存的用量记录数，从本进程启动起累计；这部分请求不在本页统计里。"
+        >
+          <span className="font-medium text-foreground">未保存记录</span>
+          <span className="text-destructive">{formatNumber(droppedRecords)} 条</span>
+        </div>
+      )}
       <Button variant="outline" size="sm" onClick={handleSyncPricing} disabled={syncPricing.isPending}>
         {syncPricing.isPending ? <Spinner size="sm" /> : <DollarSign className="h-3.5 w-3.5" />}
         同步价格

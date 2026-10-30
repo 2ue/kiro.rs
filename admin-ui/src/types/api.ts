@@ -1883,7 +1883,9 @@ export interface ExternalPoolsConfig {
   localPoolCircuitWindowSecs: number
   localPoolCircuitOpenAfterFailures: number
   localPoolCircuitRequireDistinctCredentials: number
+  localPoolCircuitMinRatioPercent: number
   localPoolCircuitOpenSecs: number
+  localPoolCircuitHalfOpenProbes: number
   externalPoolAutoDisableEnabled: boolean
   externalPoolAutoDisableOnAuthError: boolean
   externalPoolAutoDisableOnSecurityLock: boolean
@@ -2169,6 +2171,7 @@ export interface RuntimeConfig {
   credentialProbationSecs: number
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
+  credentialSessionMaxConcurrentRequests: number
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
   streamKeepaliveIntervalSecs: number
