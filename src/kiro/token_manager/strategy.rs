@@ -189,17 +189,3 @@ pub(super) fn select_health_weighted<'a>(
     }
     top.last().map(|(entry, _)| *entry)
 }
-
-pub(super) fn priority_selection_key(
-    entry: &CredentialEntry,
-) -> (u32, u32, u32, u32, u64, u64, u64) {
-    (
-        entry.credentials.priority,
-        entry.in_flight_requests,
-        entry.health.recent_selection_count_10s,
-        entry.health.recent_selection_count_60s,
-        entry.success_count,
-        entry.total_selection_count,
-        entry.id,
-    )
-}

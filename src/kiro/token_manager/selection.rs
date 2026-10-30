@@ -5,6 +5,7 @@
 //! request should take, so every load-balancing mode is expressed as a pure function over the
 //! candidate list and can be tested without the acquire machinery.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -12,10 +13,8 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 use super::account_state::CredentialEntry;
-use super::capacity::credential_catalog_lists_model;
-use super::strategy::{
-    priority_selection_key, select_health_weighted, should_select_warming_from_totals,
-};
+use super::capacity::{credential_catalog_lists_model, effective_max_concurrent_requests};
+use super::strategy::{select_health_weighted, should_select_warming_from_totals};
 
 /// Load-balancing mode. Persisted as its snake_case name; unknown names are rejected when the
 /// configuration is validated instead of silently falling back to `priority`.
@@ -94,12 +93,16 @@ impl FromStr for LoadBalancingMode {
 /// 4. Warmup share: the warming or the ready group is chosen by target share, inside the
 ///    tier chosen above, so warming credentials never pull traffic across tiers.
 /// 5. The mode orders the chosen group.
+///
+/// `bound_sessions` maps a credential id to the number of sessions bound to it that were
+/// active in the last [`ACTIVE_SESSION_WINDOW_SECS`].
 pub(crate) fn select_candidate<'a>(
     mode: LoadBalancingMode,
     dispatchable: Vec<&'a CredentialEntry>,
     model: Option<&str>,
     now_ms: i64,
     config: &Config,
+    bound_sessions: &HashMap<u64, u32>,
 ) -> Option<&'a CredentialEntry> {
     let mut available = prefer_catalog_listed(dispatchable, model);
     if available.is_empty() {
@@ -110,8 +113,11 @@ pub(crate) fn select_candidate<'a>(
         retain_preferred_priority_tier(&mut available);
     }
     let candidates = warmup_group(available, config);
-    order_by_mode(mode, &candidates, model, now_ms, config)
+    order_by_mode(mode, &candidates, model, now_ms, config, bound_sessions)
 }
+
+/// Sessions count as active on a credential for this long after their last request.
+pub(crate) const ACTIVE_SESSION_WINDOW_SECS: i64 = 10 * 60;
 
 /// The preferred priority tier: the lowest priority value among the candidates.
 pub(crate) fn preferred_priority<'a>(
@@ -216,14 +222,51 @@ fn order_by_mode<'a>(
     model: Option<&str>,
     now_ms: i64,
     config: &Config,
+    bound_sessions: &HashMap<u64, u32>,
 ) -> Option<&'a CredentialEntry> {
     if mode.uses_scores() {
         return select_health_weighted(candidates, model, now_ms, config);
     }
-    candidates
-        .iter()
-        .copied()
-        .min_by_key(|entry| priority_selection_key(entry))
+    candidates.iter().copied().min_by_key(|entry| {
+        spread_key(
+            entry,
+            config.credential_max_concurrent_requests,
+            bound_sessions.get(&entry.id).copied().unwrap_or(0),
+        )
+    })
+}
+
+/// Ordering inside a tier, lowest first. New sessions go to the credential that is least
+/// loaded right now, then to the one carrying the fewest active sessions, so bound sessions
+/// even out across the tier over time instead of piling onto a few credentials:
+/// 1. priority (only differs in `balanced` mode, where tiers are not pre-filtered);
+/// 2. in-flight load as a share of the credential's own concurrency limit;
+/// 3. active sessions bound to the credential;
+/// 4. selections in the last 60 seconds;
+/// 5. least recently selected first (never selected sorts first);
+/// 6. id, for a stable order.
+///
+/// Lifetime success counts are deliberately not used: they made idle credentials with a long
+/// history lose every tie, so old credentials stayed idle while new ones took the traffic.
+fn spread_key(
+    entry: &CredentialEntry,
+    global_max_concurrent_requests: u32,
+    bound_sessions: u32,
+) -> (u32, u64, u32, u32, Option<std::time::Instant>, u64) {
+    let max_concurrent = effective_max_concurrent_requests(entry, global_max_concurrent_requests);
+    let load_per_mille = if max_concurrent > 0 {
+        (entry.in_flight_requests as u64 * 1000) / max_concurrent as u64
+    } else {
+        0
+    };
+    (
+        entry.credentials.priority,
+        load_per_mille,
+        bound_sessions,
+        entry.health.recent_selection_count_60s,
+        entry.selection_events.back().copied(),
+        entry.id,
+    )
 }
 
 #[cfg(test)]

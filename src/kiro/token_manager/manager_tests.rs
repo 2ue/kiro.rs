@@ -14768,3 +14768,62 @@ async fn sticky_session_in_preferred_tier_borrows_without_rebinding_when_bound_i
     assert_eq!(back.id, 1, "a temporary borrow keeps the original binding");
     back.release_in_flight();
 }
+
+#[tokio::test]
+async fn new_sessions_spread_evenly_across_a_tier_by_active_bound_sessions() {
+    for mode in ["priority", "balanced"] {
+        let manager = selection_matrix_manager(
+            mode,
+            &[
+                matrix_credential(0, 0, 0),
+                matrix_credential(0, 0, 0),
+                matrix_credential(0, 0, 0),
+            ],
+        );
+        // Credential 1 has a long history; it must not stay idle because of it.
+        manager.entries.lock()[0].success_count = 1_000_000;
+        let empty = HashSet::new();
+        let mut per_credential = HashMap::new();
+        for index in 0..30 {
+            let session = format!("{mode}-spread-{index}");
+            let mut ctx = manager
+                .acquire_context_for_session(None, Some(&session), &empty)
+                .await
+                .unwrap();
+            *per_credential.entry(ctx.id).or_insert(0u32) += 1;
+            ctx.release_in_flight();
+            // Selection windows are not what spreads sessions here: clear them so only the
+            // bound-session count breaks ties.
+            for entry in manager.entries.lock().iter_mut() {
+                entry.selection_events.clear();
+                entry.health.recent_selection_count_10s = 0;
+                entry.health.recent_selection_count_60s = 0;
+            }
+            manager.invalidate_bound_session_counts();
+        }
+        assert_eq!(
+            per_credential,
+            HashMap::from([(1, 10), (2, 10), (3, 10)]),
+            "{mode}: 30 new sessions over 3 equal credentials"
+        );
+    }
+}
+
+#[tokio::test]
+async fn idle_credentials_are_picked_before_recently_selected_ones_on_a_tie() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(0, 0, 0)],
+    );
+    let mut order = Vec::new();
+    for _ in 0..4 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        order.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert_eq!(
+        order,
+        vec![1, 2, 1, 2],
+        "ties rotate instead of sticking to one id"
+    );
+}

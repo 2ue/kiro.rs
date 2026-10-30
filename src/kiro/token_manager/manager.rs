@@ -113,7 +113,9 @@ use super::rpm::{
     rate_limit_interval_for_rpm,
 };
 use super::scheduler_error::{LocalSchedulerError, LocalSchedulerErrorKind};
-use super::selection::{LoadBalancingMode, StickyTier, select_candidate};
+use super::selection::{
+    ACTIVE_SESSION_WINDOW_SECS, LoadBalancingMode, StickyTier, select_candidate,
+};
 use super::sticky::{
     MAX_SESSION_SOFT_FAILURES, SESSION_BINDING_TTL_SECS,
     bind_session_to_credential as bind_sticky_session_to_credential,
@@ -1012,6 +1014,9 @@ pub struct MultiTokenManager {
     runtime_mutation_flush_cursor: AtomicU64,
     /// 会话粘性绑定：conversationId -> credential id
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
+    /// Active bound sessions per credential, recomputed at most every
+    /// `BOUND_SESSION_COUNT_CACHE_TTL` and dropped whenever a binding changes.
+    bound_session_counts: Mutex<Option<(Instant, Arc<HashMap<u64, u32>>)>>,
     /// 凭据容量 credit 与广播 generation；多槽释放不会折叠成一个通知。
     capacity_signal: Arc<CapacitySignal>,
     /// 进程内本地账号池风控熔断。它不依赖 Redis，确保 Redis degraded 或外部池
@@ -1071,6 +1076,7 @@ const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_mi
 /// cold requests on the Fast account; pacing keeps the shift gradual while new sessions go to
 /// the Fast tier immediately.
 const TIER_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const BOUND_SESSION_COUNT_CACHE_TTL: StdDuration = StdDuration::from_millis(500);
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 const CREDENTIAL_RUNTIME_MUTATION_RETENTION: StdDuration =
@@ -2452,6 +2458,7 @@ impl MultiTokenManager {
             overflow_runtime_mutations: AtomicU64::new(0),
             runtime_mutation_flush_cursor: AtomicU64::new(0),
             session_bindings: Mutex::new(HashMap::new()),
+            bound_session_counts: Mutex::new(None),
             capacity_signal: Arc::new(CapacitySignal::default()),
             local_pool_risk_circuit: Mutex::new(LocalPoolRiskCircuit::default()),
             released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
@@ -5754,6 +5761,7 @@ impl MultiTokenManager {
             tracing::warn!("选择凭据前同步 Redis 调度状态失败: {}", err);
             return None;
         }
+        let bound_sessions = self.active_bound_session_counts();
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
@@ -5795,8 +5803,35 @@ impl MultiTokenManager {
             model,
             Utc::now().timestamp_millis(),
             &config,
+            &bound_sessions,
         )?;
         Some((entry.id, entry.credentials.clone()))
+    }
+
+    /// Sessions bound to each credential that sent a request in the last
+    /// `ACTIVE_SESSION_WINDOW_SECS`. Counts come from this instance's binding cache, so with
+    /// several instances each one evens out the sessions it serves.
+    fn active_bound_session_counts(&self) -> Arc<HashMap<u64, u32>> {
+        let now = Instant::now();
+        if let Some((computed_at, counts)) = self.bound_session_counts.lock().as_ref() {
+            if now.saturating_duration_since(*computed_at) < BOUND_SESSION_COUNT_CACHE_TTL {
+                return counts.clone();
+            }
+        }
+        let cutoff = Utc::now() - chrono::Duration::seconds(ACTIVE_SESSION_WINDOW_SECS);
+        let mut counts = HashMap::new();
+        for binding in self.session_bindings.lock().values() {
+            if binding.last_used_at >= cutoff {
+                *counts.entry(binding.credential_id).or_insert(0u32) += 1;
+            }
+        }
+        let counts = Arc::new(counts);
+        *self.bound_session_counts.lock() = Some((now, counts.clone()));
+        counts
+    }
+
+    fn invalidate_bound_session_counts(&self) {
+        self.bound_session_counts.lock().take();
     }
 
     fn get_bound_credential(
@@ -5951,6 +5986,16 @@ impl MultiTokenManager {
     }
 
     async fn bind_session_to_credential_for_request(&self, session_id: &str, credential_id: u64) {
+        self.bind_session_to_credential_for_request_inner(session_id, credential_id)
+            .await;
+        self.invalidate_bound_session_counts();
+    }
+
+    async fn bind_session_to_credential_for_request_inner(
+        &self,
+        session_id: &str,
+        credential_id: u64,
+    ) {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
