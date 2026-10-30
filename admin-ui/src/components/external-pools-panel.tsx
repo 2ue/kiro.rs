@@ -395,7 +395,9 @@ export function ExternalPoolsPanel() {
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
           localPoolCircuitRequireDistinctCredentials: whole(configDraft.localPoolCircuitRequireDistinctCredentials),
+          localPoolCircuitMinRatioPercent: whole(configDraft.localPoolCircuitMinRatioPercent),
           localPoolCircuitOpenSecs: whole(configDraft.localPoolCircuitOpenSecs, 1),
+          localPoolCircuitHalfOpenProbes: whole(configDraft.localPoolCircuitHalfOpenProbes, 1),
           externalPoolAutoDisableFailureThreshold: whole(configDraft.externalPoolAutoDisableFailureThreshold, 1),
           externalPoolAutoDisableWindowSecs: whole(configDraft.externalPoolAutoDisableWindowSecs, 1),
           externalPoolAutoDisableDurationSecs: whole(configDraft.externalPoolAutoDisableDurationSecs),
@@ -684,9 +686,10 @@ export function ExternalPoolsPanel() {
                 <div className="mt-3 grid gap-3 md:grid-cols-5">
                   <Toggle label="启用本地熔断统计" checked={configDraft.localPoolCircuitEnabled} onChange={(localPoolCircuitEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitEnabled }))} />
                   <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="熔断窗口秒数" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(localPoolCircuitWindowSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitWindowSecs }))} />
-                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="失败次数阈值" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(localPoolCircuitOpenAfterFailures) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenAfterFailures }))} />
-                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="涉及凭证数" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(localPoolCircuitRequireDistinctCredentials) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitRequireDistinctCredentials }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="至少被风控账号数" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(localPoolCircuitRequireDistinctCredentials) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitRequireDistinctCredentials, localPoolCircuitOpenAfterFailures: localPoolCircuitRequireDistinctCredentials }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="且占可用账号百分比" value={configDraft.localPoolCircuitMinRatioPercent} min={0} max={100} onChange={(localPoolCircuitMinRatioPercent) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitMinRatioPercent }))} />
                   <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="熔断秒数" value={configDraft.localPoolCircuitOpenSecs} min={1} onChange={(localPoolCircuitOpenSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenSecs }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="恢复时探测请求数" value={configDraft.localPoolCircuitHalfOpenProbes} min={1} onChange={(localPoolCircuitHalfOpenProbes) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitHalfOpenProbes }))} />
                 </div>
               </FormSection>
             </div>
@@ -1533,11 +1536,11 @@ function TextBox({
   )
 }
 
-function NumberBox({ label, description, value, min = 0, disabled = false, onChange }: { label: string; description?: string; value: number; min?: number; disabled?: boolean; onChange: (value: number) => void }) {
+function NumberBox({ label, description, value, min = 0, max, disabled = false, onChange }: { label: string; description?: string; value: number; min?: number; max?: number; disabled?: boolean; onChange: (value: number) => void }) {
   return (
     <label className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
       <span className="text-muted-foreground">{label}</span>
-      <Input type="number" min={min} value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} />
+      <Input type="number" min={min} max={max} value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} />
       {description && <span className="block text-xs leading-4 text-muted-foreground">{description}</span>}
     </label>
   )

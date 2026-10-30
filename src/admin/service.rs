@@ -8035,6 +8035,14 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     {
         return Err("localPoolCircuitOpenSecs 必须在 1 到 86400 之间".to_string());
     }
+    if config.local_pool_circuit_min_ratio_percent > 100 {
+        return Err("localPoolCircuitMinRatioPercent 必须在 0 到 100 之间".to_string());
+    }
+    if config.local_pool_circuit_half_open_probes == 0
+        || config.local_pool_circuit_half_open_probes > 1_000
+    {
+        return Err("localPoolCircuitHalfOpenProbes 必须在 1 到 1000 之间".to_string());
+    }
     if config.external_pool_auto_disable_failure_threshold == 0
         || config.external_pool_auto_disable_failure_threshold > 10_000
     {

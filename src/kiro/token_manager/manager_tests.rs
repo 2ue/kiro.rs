@@ -13322,43 +13322,45 @@ fn test_report_risk_controlled_disables_with_specific_reason() {
     assert_eq!(disabled.failure_count, MAX_FAILURES_PER_CREDENTIAL);
 }
 
-#[tokio::test]
-async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
+fn risk_circuit_manager(count: usize, ratio_percent: u32) -> MultiTokenManager {
     let mut config = Config::default();
     config.external_pools.local_pool_circuit_enabled = true;
     config.external_pools.local_pool_circuit_open_after_failures = 2;
     config
         .external_pools
         .local_pool_circuit_require_distinct_credentials = 2;
+    config.external_pools.local_pool_circuit_min_ratio_percent = ratio_percent;
     config.external_pools.local_pool_circuit_open_secs = 30;
+    config.external_pools.local_pool_circuit_half_open_probes = 1;
+    let credentials = (0..count)
+        .map(|index| test_access_token_credential(&format!("risk-{index}"), "Pro"))
+        .collect();
+    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    // Every credential has served traffic before, so its risk control counts for the pool.
+    for entry in manager.entries.lock().iter_mut() {
+        entry.success_count = 1;
+    }
+    manager
+}
 
-    let manager = MultiTokenManager::new(
-        config,
-        vec![
-            test_access_token_credential("risk-1", "Pro"),
-            test_access_token_credential("risk-2", "Pro"),
-            test_access_token_credential("risk-3", "Pro"),
-        ],
-        None,
-        None,
-        false,
-    )
-    .unwrap();
-
-    let first = manager.report_risk_controlled_outcome(
-        1,
+fn report_suspended(manager: &MultiTokenManager, id: u64) -> RiskControlReportOutcome {
+    manager.report_risk_controlled_outcome(
+        id,
         CredentialRiskControlReason::TemporarilySuspended,
-        "TEMPORARILY_SUSPENDED first",
-    );
+        "TEMPORARILY_SUSPENDED",
+    )
+}
+
+#[tokio::test]
+async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
+    let manager = risk_circuit_manager(3, 0);
+
+    let first = report_suspended(&manager, 1);
     assert!(first.can_retry_local());
     assert!(!first.circuit_open);
     assert_eq!(manager.available_count(), 2);
 
-    let second = manager.report_risk_controlled_outcome(
-        2,
-        CredentialRiskControlReason::TemporarilySuspended,
-        "TEMPORARILY_SUSPENDED second",
-    );
+    let second = report_suspended(&manager, 2);
     assert!(
         second.has_available_credentials,
         "one untouched credential remains available"
@@ -13390,6 +13392,97 @@ async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
     assert!(
         !untouched.disabled,
         "circuit must not disable untouched accounts"
+    );
+}
+
+#[test]
+fn risk_circuit_ignores_credentials_that_never_succeeded() {
+    let manager = risk_circuit_manager(4, 0);
+    for entry in manager.entries.lock().iter_mut() {
+        entry.success_count = 0;
+    }
+    for id in 1..=3 {
+        let outcome = report_suspended(&manager, id);
+        assert!(
+            !outcome.circuit_open,
+            "fresh import #{id} must not open the pool circuit"
+        );
+        assert!(outcome.can_retry_local());
+    }
+    assert_eq!(
+        manager.available_count(),
+        1,
+        "each one is still disabled on its own"
+    );
+}
+
+#[test]
+fn risk_circuit_counts_each_credential_once() {
+    let manager = risk_circuit_manager(4, 0);
+    report_suspended(&manager, 1);
+    // Concurrent requests on the same credential report it again after it is disabled.
+    for _ in 0..5 {
+        assert!(!report_suspended(&manager, 1).circuit_open);
+    }
+    // A credential that no longer exists is not counted either.
+    assert!(!report_suspended(&manager, 99).circuit_open);
+    assert!(
+        report_suspended(&manager, 2).circuit_open,
+        "the second distinct credential opens it"
+    );
+}
+
+#[test]
+fn risk_circuit_ratio_keeps_large_pools_serving() {
+    // With 20 credentials the 30% ratio needs 6 risk-controlled credentials: each one leaves
+    // the dispatchable set, so after k reports the share is k / (k + (20 - k)) = k / 20.
+    let manager = risk_circuit_manager(20, 30);
+    for id in 1..=5 {
+        assert!(
+            !report_suspended(&manager, id).circuit_open,
+            "#{id}: {id} of 20 is below 30%"
+        );
+    }
+    assert!(
+        report_suspended(&manager, 6).circuit_open,
+        "6 of 20 reaches 30%"
+    );
+}
+
+#[tokio::test]
+async fn risk_circuit_half_open_probe_closes_on_success_and_reopens_on_risk_control() {
+    let manager = risk_circuit_manager(4, 0);
+    report_suspended(&manager, 1);
+    assert!(report_suspended(&manager, 2).circuit_open);
+    assert!(
+        manager.local_pool_risk_circuit.lock().failures.is_empty(),
+        "opening clears the window so one late event cannot re-open it"
+    );
+
+    // Open period over: exactly one probe is admitted.
+    manager.local_pool_risk_circuit.lock().open_until = Some(Instant::now());
+    let mut probe = manager.acquire_context(None).await.unwrap();
+    assert!(
+        manager.acquire_context(None).await.is_err(),
+        "the second request waits while the probe runs"
+    );
+    // The probe is risk-controlled: the circuit re-opens at once.
+    probe.release_in_flight();
+    assert!(report_suspended(&manager, probe.id).circuit_open);
+
+    // Next half-open probe succeeds: the circuit closes.
+    manager.local_pool_risk_circuit.lock().open_until = Some(Instant::now());
+    let mut probe = manager.acquire_context(None).await.unwrap();
+    manager.report_success_with_latency_deferred(probe.id, None, None);
+    probe.release_in_flight();
+    for _ in 0..3 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        ctx.release_in_flight();
+    }
+    assert!(
+        !manager
+            .local_pool_risk_circuit_snapshot(Instant::now())
+            .open
     );
 }
 
@@ -14921,4 +15014,37 @@ async fn session_concurrency_limit_never_blocks_when_no_other_credential_is_free
     );
     first.release_in_flight();
     second.release_in_flight();
+}
+
+#[test]
+fn selection_failure_samples_list_blocking_accounts_before_disabled_ones() {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.selection_failure_sample_limit = 2;
+    let credentials = (0..5)
+        .map(|index| test_access_token_credential(&format!("sample-{index}"), "Pro"))
+        .collect();
+    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    for id in 1..=3 {
+        manager.set_disabled(id, true).unwrap();
+    }
+    for entry in manager.entries.lock().iter_mut() {
+        if entry.id >= 4 {
+            entry.in_flight_requests = 1;
+        }
+    }
+    let summary = manager.selection_failure_summary("req", "local_account", None, "capacity");
+    let reasons: Vec<_> = summary
+        .sampled_accounts
+        .iter()
+        .map(|sample| (sample.account_id, sample.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            (4, AccountRejectReason::AccountConcurrencyFull),
+            (5, AccountRejectReason::AccountConcurrencyFull),
+        ]
+    );
+    assert_eq!(summary.rejected_account_count, 5);
 }

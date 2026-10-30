@@ -529,17 +529,19 @@ impl RiskControlReportOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LocalPoolRiskCircuitEvent {
-    at: Instant,
-    credential_id: u64,
-}
-
+/// Pool-wide risk circuit. Opens only when credentials that have succeeded before are being
+/// risk-controlled across a meaningful share of the pool; a single bad batch of new imports
+/// only disables those credentials.
 #[derive(Debug, Default)]
 struct LocalPoolRiskCircuit {
-    failures: VecDeque<LocalPoolRiskCircuitEvent>,
+    /// Most recent risk-control time per distinct credential inside the window.
+    failures: HashMap<u64, Instant>,
     open_until: Option<Instant>,
     reason: Option<CredentialRiskControlReason>,
+    /// Half-open state after `open_until` passes: (probes left, end of the half-open period).
+    /// A success closes the circuit, a risk-controlled probe re-opens it, and a half-open
+    /// period that ends without either closes it, so it can never stay stuck.
+    half_open: Option<(u32, Instant)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3162,6 +3164,9 @@ impl MultiTokenManager {
             .open;
         let mut reason_counts: BTreeMap<AccountRejectReason, usize> = BTreeMap::new();
         let mut sampled_accounts = Vec::new();
+        // Disabled credentials sort first by id and used to fill the whole sample, hiding the
+        // accounts that actually blocked the request. They only fill what is left.
+        let mut sampled_disabled = Vec::new();
         let mut rejected_account_count = 0usize;
         let mut waitable_account_count = 0usize;
 
@@ -3198,8 +3203,13 @@ impl MultiTokenManager {
             rejected_account_count = rejected_account_count.saturating_add(1);
             *reason_counts.entry(reason).or_insert(0) += 1;
 
-            if sampled_accounts.len() < sample_limit {
-                sampled_accounts.push(RejectedAccountSample {
+            let bucket = if reason == AccountRejectReason::Disabled {
+                &mut sampled_disabled
+            } else {
+                &mut sampled_accounts
+            };
+            if bucket.len() < sample_limit {
+                bucket.push(RejectedAccountSample {
                     account_id: entry.id,
                     reason,
                     rpm_limit: Some(effective_rpm(entry, global_rpm)),
@@ -3214,6 +3224,8 @@ impl MultiTokenManager {
             }
         }
 
+        let room = sample_limit.saturating_sub(sampled_accounts.len());
+        sampled_accounts.extend(sampled_disabled.into_iter().take(room));
         (
             reason_counts,
             sampled_accounts,
@@ -3230,25 +3242,9 @@ impl MultiTokenManager {
         if !config.external_pools.local_pool_circuit_enabled {
             return LocalPoolRiskCircuitSnapshot::default();
         }
-        let window =
-            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
         let mut circuit = self.local_pool_risk_circuit.lock();
-        while circuit
-            .failures
-            .front()
-            .is_some_and(|event| now.saturating_duration_since(event.at) > window)
-        {
-            circuit.failures.pop_front();
-        }
-        let open_until = circuit.open_until.filter(|until| *until > now);
-        if open_until.is_none() {
-            circuit.open_until = None;
-            circuit.reason = None;
-        }
-        LocalPoolRiskCircuitSnapshot {
-            open: open_until.is_some(),
-            retry_after: open_until.map(|until| until.saturating_duration_since(now)),
-        }
+        Self::prune_local_pool_risk_circuit(&mut circuit, now, config);
+        Self::local_pool_risk_circuit_snapshot_locked(&circuit, now)
     }
 
     fn local_pool_risk_circuit_snapshot(&self, now: Instant) -> LocalPoolRiskCircuitSnapshot {
@@ -3256,77 +3252,152 @@ impl MultiTokenManager {
         self.local_pool_risk_circuit_snapshot_from_config(now, &config)
     }
 
+    fn prune_local_pool_risk_circuit(
+        circuit: &mut LocalPoolRiskCircuit,
+        now: Instant,
+        config: &Config,
+    ) {
+        let window =
+            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
+        circuit
+            .failures
+            .retain(|_, at| now.saturating_duration_since(*at) <= window);
+        let open_for =
+            StdDuration::from_secs(config.external_pools.local_pool_circuit_open_secs.max(1));
+        if let Some(until) = circuit.open_until.filter(|until| *until <= now) {
+            // Open period over: let a few probes through instead of closing outright.
+            circuit.open_until = None;
+            circuit.half_open = Some((
+                config
+                    .external_pools
+                    .local_pool_circuit_half_open_probes
+                    .max(1),
+                until.checked_add(open_for).unwrap_or(until),
+            ));
+        }
+        if circuit.half_open.is_some_and(|(_, until)| until <= now) {
+            circuit.half_open = None;
+            circuit.reason = None;
+            tracing::info!("本地账号池风险保护半开期结束且未再被风控，已关闭");
+        }
+    }
+
+    /// Open while the open period runs, and during half-open once every probe has been
+    /// handed out.
+    fn local_pool_risk_circuit_snapshot_locked(
+        circuit: &LocalPoolRiskCircuit,
+        now: Instant,
+    ) -> LocalPoolRiskCircuitSnapshot {
+        let blocked_until = circuit.open_until.filter(|until| *until > now).or_else(|| {
+            circuit
+                .half_open
+                .filter(|(left, until)| *left == 0 && *until > now)
+                .map(|(_, until)| until)
+        });
+        LocalPoolRiskCircuitSnapshot {
+            open: blocked_until.is_some(),
+            retry_after: blocked_until.map(|until| until.saturating_duration_since(now)),
+        }
+    }
+
+    /// Admits one half-open probe, or returns how long to wait when the circuit is open or the
+    /// half-open probes are used up.
+    fn admit_local_pool_risk_circuit_request(&self, now: Instant) -> Option<StdDuration> {
+        let config = self.config.lock().clone();
+        if !config.external_pools.local_pool_circuit_enabled {
+            return None;
+        }
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        Self::prune_local_pool_risk_circuit(&mut circuit, now, &config);
+        if let Some(retry_after) =
+            Self::local_pool_risk_circuit_snapshot_locked(&circuit, now).retry_after
+        {
+            return Some(retry_after);
+        }
+        if let Some((left, _)) = circuit.half_open.as_mut() {
+            *left = left.saturating_sub(1);
+        }
+        None
+    }
+
+    /// A successful local call closes a half-open circuit.
+    fn record_local_pool_risk_circuit_success(&self) {
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        if circuit.half_open.take().is_some() {
+            circuit.reason = None;
+            tracing::info!("本地账号池风险保护半开探测成功，已关闭");
+        }
+    }
+
+    /// Counts one risk-controlled credential towards the pool circuit.
+    ///
+    /// `ever_succeeded` must be false for credentials that never served a successful request
+    /// (fresh imports, warmup): their risk control says nothing about the rest of the pool.
+    /// `dispatchable_now` is the number of credentials that can still take requests, used for
+    /// the ratio threshold.
     fn record_local_pool_risk_circuit_failure(
         &self,
         credential_id: u64,
         reason: CredentialRiskControlReason,
+        ever_succeeded: bool,
+        dispatchable_now: usize,
     ) -> LocalPoolRiskCircuitSnapshot {
         let config = self.config.lock().clone();
         if !config.external_pools.local_pool_circuit_enabled {
             return LocalPoolRiskCircuitSnapshot::default();
         }
         let now = Instant::now();
-        let window =
-            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        Self::prune_local_pool_risk_circuit(&mut circuit, now, &config);
+        if !ever_succeeded {
+            tracing::warn!(
+                credential_id,
+                risk_reason = reason.event_reason(),
+                "从未成功过的账号被风控，只禁用该账号，不计入本地账号池风险保护"
+            );
+            return Self::local_pool_risk_circuit_snapshot_locked(&circuit, now);
+        }
+        circuit.failures.insert(credential_id, now);
+
         let open_for =
             StdDuration::from_secs(config.external_pools.local_pool_circuit_open_secs.max(1));
-        let open_after_failures = config
-            .external_pools
-            .local_pool_circuit_open_after_failures
-            .max(1);
         let required_distinct = config
             .external_pools
             .local_pool_circuit_require_distinct_credentials
-            .max(1);
-
-        let mut circuit = self.local_pool_risk_circuit.lock();
-        while circuit
-            .failures
-            .front()
-            .is_some_and(|event| now.saturating_duration_since(event.at) > window)
-        {
-            circuit.failures.pop_front();
-        }
-        circuit.failures.push_back(LocalPoolRiskCircuitEvent {
-            at: now,
-            credential_id,
-        });
-
-        let distinct_credentials = circuit
-            .failures
-            .iter()
-            .map(|event| event.credential_id)
-            .collect::<HashSet<_>>()
-            .len()
-            .min(u32::MAX as usize) as u32;
-        let recent_failures = circuit.failures.len().min(u32::MAX as usize) as u32;
-
+            .max(config.external_pools.local_pool_circuit_open_after_failures)
+            .max(1) as usize;
+        let min_ratio_percent = config
+            .external_pools
+            .local_pool_circuit_min_ratio_percent
+            .min(100) as usize;
+        let distinct_credentials = circuit.failures.len();
+        let pool = distinct_credentials + dispatchable_now;
+        let ratio_reached =
+            min_ratio_percent == 0 || distinct_credentials * 100 >= pool * min_ratio_percent;
+        let half_open = circuit.half_open.is_some();
         let already_open = circuit.open_until.is_some_and(|until| until > now);
-        if already_open {
-            if circuit.reason.is_none() {
-                circuit.reason = Some(reason);
-            }
-        } else if recent_failures >= open_after_failures
-            && distinct_credentials >= required_distinct
+
+        if !already_open
+            && (half_open || (distinct_credentials >= required_distinct && ratio_reached))
         {
             let open_until = now.checked_add(open_for).unwrap_or(now);
             circuit.open_until = Some(open_until);
             circuit.reason = Some(reason);
+            circuit.half_open = None;
+            // Start the next window from zero so the circuit cannot re-open on a single late
+            // event right after the open period.
+            circuit.failures.clear();
             tracing::error!(
                 credential_id,
                 risk_reason = reason.event_reason(),
-                recent_failures,
                 distinct_credentials,
+                dispatchable_now,
+                half_open_probe_failed = half_open,
                 open_secs = open_for.as_secs(),
                 "本地账号池风控熔断已打开，暂停继续探测剩余本地账号"
             );
         }
-
-        let open_until = circuit.open_until.filter(|until| *until > now);
-        LocalPoolRiskCircuitSnapshot {
-            open: open_until.is_some(),
-            retry_after: open_until.map(|until| until.saturating_duration_since(now)),
-        }
+        Self::local_pool_risk_circuit_snapshot_locked(&circuit, now)
     }
 
     fn compute_local_pool_route_state(
@@ -6337,6 +6408,8 @@ impl MultiTokenManager {
         // 自愈只会把 TooManyFailures 禁用的凭据恢复为可用，所以"自愈轮"与"普通判定轮"交替出现，
         // 普通判定轮的终止条件（选中、排队超时、bail）与原逻辑一致，不会无限循环。
         let mut auto_heal_just_attempted = false;
+        // A request takes at most one half-open probe, however many times it loops.
+        let mut risk_circuit_admitted = false;
         let mut auxiliary_refresh_error: Option<anyhow::Error> = None;
         let mut health_neutral_refresh_error: Option<anyhow::Error> = None;
         let request_bound_id = match session_id {
@@ -6345,10 +6418,14 @@ impl MultiTokenManager {
         };
 
         loop {
-            if let Some(retry_after) = self
-                .local_pool_risk_circuit_snapshot(Instant::now())
-                .retry_after
-            {
+            let circuit_retry_after = if risk_circuit_admitted {
+                self.local_pool_risk_circuit_snapshot(Instant::now())
+                    .retry_after
+            } else {
+                risk_circuit_admitted = true;
+                self.admit_local_pool_risk_circuit_request(Instant::now())
+            };
+            if let Some(retry_after) = circuit_retry_after {
                 local_scheduler_bail!(
                     LocalSchedulerErrorKind::RiskCircuitOpen,
                     "本地账号池风险保护已打开（retry_after_secs={}）",
@@ -8480,6 +8557,22 @@ impl MultiTokenManager {
         entry.disabled = entry.runtime_persistence_quarantined
             || entry.credentials.disabled
             || entry.disabled_reason.is_some();
+    }
+
+    /// Credentials that could take a request right now apart from concurrency: enabled, not
+    /// quota-blocked, proxy usable and not cooling down. Used for the pool circuit ratio.
+    fn local_dispatchable_credential_count(&self) -> usize {
+        let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
+        let now = Instant::now();
+        entries
+            .iter()
+            .filter(|entry| {
+                Self::entry_is_scheduler_available(entry)
+                    && credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
+                    && entry_any_cooldown_remaining(entry, now).is_none()
+            })
+            .count()
     }
 
     fn entry_is_scheduler_available(entry: &CredentialEntry) -> bool {
@@ -11091,6 +11184,7 @@ impl MultiTokenManager {
         let Some(success) = self.record_success_local(id, model, latency) else {
             return;
         };
+        self.record_local_pool_risk_circuit_success();
         let should_persist = success.runtime_state_changed
             || self.has_pending_runtime_mutations(id)
             || self.should_probe_persisted_runtime_success_state(id);
@@ -11120,6 +11214,7 @@ impl MultiTokenManager {
         let Some(success) = self.record_success_local(id, model, latency) else {
             return;
         };
+        self.record_local_pool_risk_circuit_success();
         if success.runtime_state_changed
             || self.has_pending_runtime_mutations(id)
             || self.should_probe_persisted_runtime_success_state(id)
@@ -11839,6 +11934,7 @@ impl MultiTokenManager {
         let disabled_reason = reason.disabled_reason();
         let last_used_at: String;
         let expected_generation: u64;
+        let ever_succeeded: bool;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -11846,7 +11942,8 @@ impl MultiTokenManager {
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
                 None => {
-                    let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                    // The credential is gone: nothing to count, report the current state.
+                    let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                     return RiskControlReportOutcome {
                         has_available_credentials: Self::any_scheduler_available(&entries),
                         circuit_open: circuit.open,
@@ -11858,7 +11955,9 @@ impl MultiTokenManager {
             };
 
             if entry.disabled {
-                let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                // Already disabled, usually by a concurrent request on the same credential that
+                // was counted then; counting it again would inflate the pool circuit.
+                let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                 return RiskControlReportOutcome {
                     has_available_credentials: Self::any_scheduler_available(&entries),
                     circuit_open: circuit.open,
@@ -11868,6 +11967,7 @@ impl MultiTokenManager {
                 };
             }
             expected_generation = entry.runtime_generation;
+            ever_succeeded = entry.success_count > 0;
 
             entry.disabled = true;
             entry.disabled_reason = Some(disabled_reason);
@@ -11902,7 +12002,13 @@ impl MultiTokenManager {
                 false
             }
         };
-        let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+        let dispatchable_now = self.local_dispatchable_credential_count();
+        let circuit = self.record_local_pool_risk_circuit_failure(
+            id,
+            reason,
+            ever_succeeded,
+            dispatchable_now,
+        );
         self.clear_disabled_credential_request_state(id);
         self.persist_disabled_state(
             id,
@@ -11966,6 +12072,7 @@ impl MultiTokenManager {
         let disabled_reason = reason.disabled_reason();
         let last_used_at: String;
         let expected_generation: u64;
+        let ever_succeeded: bool;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -11973,7 +12080,8 @@ impl MultiTokenManager {
             let entry = match entries.iter_mut().find(|entry| entry.id == id) {
                 Some(entry) => entry,
                 None => {
-                    let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                    // The credential is gone: nothing to count, report the current state.
+                    let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                     return RiskControlReportOutcome {
                         has_available_credentials: Self::any_scheduler_available(&entries),
                         circuit_open: circuit.open,
@@ -11985,7 +12093,9 @@ impl MultiTokenManager {
             };
 
             if entry.disabled {
-                let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                // Already disabled, usually by a concurrent request on the same credential that
+                // was counted then; counting it again would inflate the pool circuit.
+                let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                 return RiskControlReportOutcome {
                     has_available_credentials: Self::any_scheduler_available(&entries),
                     circuit_open: circuit.open,
@@ -11995,6 +12105,7 @@ impl MultiTokenManager {
                 };
             }
             expected_generation = entry.runtime_generation;
+            ever_succeeded = entry.success_count > 0;
 
             entry.disabled = true;
             entry.disabled_reason = Some(disabled_reason);
@@ -12029,7 +12140,13 @@ impl MultiTokenManager {
                 false
             }
         };
-        let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+        let dispatchable_now = self.local_dispatchable_credential_count();
+        let circuit = self.record_local_pool_risk_circuit_failure(
+            id,
+            reason,
+            ever_succeeded,
+            dispatchable_now,
+        );
         self.clear_disabled_credential_request_state(id);
         self.persist_disabled_state_deferred(
             id,

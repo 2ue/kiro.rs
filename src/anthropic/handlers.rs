@@ -2438,31 +2438,6 @@ impl ExternalFallbackContext {
             );
             return None;
         }
-        if self.config.local_pool_circuit_enabled {
-            let mut seen_credentials = HashSet::new();
-            let mut recorded = false;
-            if classified_reason != "local_request_body_invalid" {
-                for attempt in &classification_attempts {
-                    if seen_credentials.insert(attempt.credential_id) {
-                        recorded = true;
-                        let _ = self
-                            .manager
-                            .record_local_pool_failure(
-                                &self.config,
-                                Some(attempt.credential_id),
-                                &classified_reason,
-                            )
-                            .await;
-                    }
-                }
-                if !recorded {
-                    let _ = self
-                        .manager
-                        .record_local_pool_failure(&self.config, None, &classified_reason)
-                        .await;
-                }
-            }
-        }
         tracing::warn!(
             request_id,
             classified_reason,

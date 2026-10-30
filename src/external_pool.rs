@@ -94,8 +94,8 @@ use crate::{
             ExternalPoolCoordinatorGuardError, ExternalPoolCoordinatorGuardState,
             ExternalPoolCoordinatorSnapshot, ExternalPoolCoordinatorSnapshotRequest,
             ExternalPoolLeaseAcquireResult as RedisExternalPoolLeaseAcquireResult,
-            ExternalPoolLeaseReleaseRequest, ExternalPoolQualityState, LocalPoolCircuitState,
-            RedisStore, external_pool_quality_key,
+            ExternalPoolLeaseReleaseRequest, ExternalPoolQualityState, RedisStore,
+            external_pool_quality_key,
         },
     },
     token,
@@ -6144,75 +6144,13 @@ impl ExternalPoolManager {
         }
     }
 
-    pub async fn record_local_pool_failure(
-        &self,
-        config: &ExternalPoolsConfig,
-        credential_id: Option<u64>,
-        reason: &str,
-    ) -> Option<LocalPoolCircuitState> {
-        if !config.local_pool_circuit_enabled {
-            return None;
-        }
-        match self
-            .redis
-            .record_local_pool_circuit_failure(
-                credential_id,
-                reason,
-                Duration::from_secs(config.local_pool_circuit_window_secs.max(1)),
-                config.local_pool_circuit_open_after_failures.max(1),
-                config
-                    .local_pool_circuit_require_distinct_credentials
-                    .max(1),
-                Duration::from_secs(config.local_pool_circuit_open_secs.max(1)),
-            )
-            .await
-        {
-            Ok(state) => Some(state),
-            Err(err) => {
-                tracing::warn!("记录本地凭据池熔断失败状态到 Redis 失败: {}", err);
-                None
-            }
-        }
-    }
-
-    pub async fn local_pool_circuit_state(
-        &self,
-        config: &ExternalPoolsConfig,
-    ) -> LocalPoolCircuitState {
-        if !config.local_pool_circuit_enabled {
-            return LocalPoolCircuitState::default();
-        }
-        match self
-            .redis
-            .local_pool_circuit_state(Duration::from_secs(
-                config.local_pool_circuit_window_secs.max(1),
-            ))
-            .await
-        {
-            Ok(state) => state,
-            Err(err) => {
-                tracing::warn!("读取本地凭据池 Redis 熔断状态失败: {}", err);
-                LocalPoolCircuitState::default()
-            }
-        }
-    }
-
     pub async fn direct_policy_reason(
         &self,
         config: &ExternalPoolsConfig,
         endpoint: &str,
         model: &str,
     ) -> Option<String> {
-        let reason = direct_external_policy_static_reason(config, endpoint, model)?;
-        if reason != EXPLICIT_DIRECT_POLICY_REASON {
-            return Some(reason);
-        }
-        if config.direct_external_on_local_maintenance
-            && self.local_pool_circuit_state(config).await.open
-        {
-            return Some("local_pool_circuit_open".to_string());
-        }
-        Some(reason)
+        direct_external_policy_static_reason(config, endpoint, model)
     }
 
     pub async fn forward_with_failover(
