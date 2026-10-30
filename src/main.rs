@@ -1432,6 +1432,54 @@ fn apply_request_api_key_runtime(
     );
 }
 
+/// Runs credential reloads one at a time on a blocking thread and folds notifications that
+/// arrive while one is running into a single follow-up reload. A full reload reads every
+/// credential from PgSQL and rewrites the in-memory pool; running it inline on the event task,
+/// once per notification, kept async worker threads busy during notification bursts.
+#[derive(Clone, Default)]
+struct CredentialsReloadCoalescer {
+    state: Arc<parking_lot::Mutex<CredentialsReloadState>>,
+}
+
+#[derive(Default)]
+struct CredentialsReloadState {
+    running: bool,
+    pending: Option<String>,
+}
+
+impl CredentialsReloadCoalescer {
+    fn request(&self, token_manager: Arc<kiro::token_manager::MultiTokenManager>, reason: String) {
+        {
+            let mut state = self.state.lock();
+            if state.running {
+                state.pending = Some(reason);
+                return;
+            }
+            state.running = true;
+        }
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut reason = reason;
+            loop {
+                match token_manager.reload_credentials_from_postgres() {
+                    Ok(true) => tracing::info!(reason, "已根据 Redis 通知同步凭据快照"),
+                    Ok(false) => tracing::debug!(reason, "收到凭据通知，但凭据快照无变化"),
+                    Err(err) => tracing::warn!(reason, "同步凭据快照失败: {}", err),
+                }
+                token_manager.notify_dispatch_state_changed();
+                let mut guard = state.lock();
+                match guard.pending.take() {
+                    Some(next) => reason = next,
+                    None => {
+                        guard.running = false;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
@@ -1460,6 +1508,7 @@ fn spawn_redis_runtime_event_listener(
             tracing::info!("已订阅 Redis 运行时事件");
             let mut stream = pubsub.on_message();
             let mut periodic_reload = tokio::time::interval(std::time::Duration::from_secs(60));
+            let credentials_reload = CredentialsReloadCoalescer::default();
             loop {
                 tokio::select! {
                     message = stream.next() => {
@@ -1471,6 +1520,12 @@ fn spawn_redis_runtime_event_listener(
                             .get_payload::<String>()
                             .unwrap_or_else(|_| String::new());
                         health.mark_event();
+                        if (channel == config_channel || channel == credentials_channel)
+                            && token_manager.runtime_event_is_from_this_instance(&payload)
+                        {
+                            // Already applied locally when it was published.
+                            continue;
+                        }
                         if channel == config_channel {
                             let previous_external_pools =
                                 token_manager.runtime_config().external_pools;
@@ -1496,12 +1551,7 @@ fn spawn_redis_runtime_event_listener(
                                 Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
                             }
                         } else if channel == credentials_channel {
-                            match token_manager.reload_credentials_from_postgres() {
-                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知同步凭据快照"),
-                                Ok(false) => tracing::debug!(payload, "收到凭据通知，但凭据快照无变化"),
-                                Err(err) => tracing::warn!(payload, "同步凭据快照失败: {}", err),
-                            }
-                            token_manager.notify_dispatch_state_changed();
+                            credentials_reload.request(token_manager.clone(), payload);
                         } else if channel == wakeup_channel {
                             if !token_manager.notify_remote_dispatch_state_changed(&payload) {
                                 tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");
@@ -1537,9 +1587,7 @@ fn spawn_redis_runtime_event_listener(
                             Ok(false) => {}
                             Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),
                         }
-                        if let Err(err) = token_manager.reload_credentials_from_postgres() {
-                            tracing::warn!("定时同步凭据快照失败: {}", err);
-                        }
+                        credentials_reload.request(token_manager.clone(), "periodic".to_string());
                     }
                 }
             }
