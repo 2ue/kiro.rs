@@ -99,6 +99,8 @@ pub(super) struct CredentialEntry {
     /// 连续几次上游故障（5xx、错误事件、读取失败等）之间没有一次成功。偶发故障不冷却账号，
     /// 同一个账号连续出故障说明问题多半在它身上，达到阈值后按原规则冷却。成功一次清零。
     pub(super) upstream_fault_streak: u32,
+    /// Pool-wide sequence number of this credential's last upstream fault.
+    pub(super) upstream_fault_seq: u64,
 }
 
 #[derive(Debug, Clone)]

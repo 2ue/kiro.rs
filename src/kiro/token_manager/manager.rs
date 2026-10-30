@@ -1009,6 +1009,9 @@ pub struct MultiTokenManager {
     scheduler_redis_full_sync_applied: Arc<AtomicU64>,
     scheduler_redis_dirty_credential_ids: Arc<Mutex<HashSet<u64>>>,
     scheduler_instance_id: Arc<str>,
+    /// Recent upstream faults of all credentials, see [`Self::note_upstream_fault`]. Locked
+    /// only while `entries` is held, never the other way round.
+    upstream_fault_log: Mutex<UpstreamFaultLog>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// 未落盘的统计增量。请求热路径只合并内存 delta，后台任务定期写入 PgSQL。
@@ -1103,6 +1106,43 @@ const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(
 
 /// 同一个账号连续几次上游故障（中间没有成功）后按账号问题冷却。
 pub(crate) const UPSTREAM_FAULT_STREAK_COOLDOWN: u32 = 3;
+/// Recent upstream faults kept to tell an account's own faults from a pool-wide wave.
+const UPSTREAM_FAULT_LOG_CAPACITY: usize = 256;
+
+/// Recent upstream faults (5xx, error events, read failures) of all credentials, in order.
+#[derive(Debug, Default)]
+struct UpstreamFaultLog {
+    next_seq: u64,
+    /// `(seq, credential id)`, oldest first.
+    recent: VecDeque<(u64, u64)>,
+}
+
+impl UpstreamFaultLog {
+    /// Records a fault of `credential_id` and returns its sequence number together with the
+    /// number of other credentials that faulted after `since_seq`, or `None` when the log no
+    /// longer reaches back that far (more faults happened in between than it keeps).
+    fn record(&mut self, credential_id: u64, since_seq: u64) -> (u64, Option<usize>) {
+        let reaches_back = self
+            .recent
+            .front()
+            .is_none_or(|(oldest, _)| *oldest <= since_seq.saturating_add(1));
+        let others_since = reaches_back.then(|| {
+            self.recent
+                .iter()
+                .filter(|(seq, id)| *seq > since_seq && *id != credential_id)
+                .map(|(_, id)| *id)
+                .collect::<HashSet<_>>()
+                .len()
+        });
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        if self.recent.len() >= UPSTREAM_FAULT_LOG_CAPACITY {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((seq, credential_id));
+        (seq, others_since)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct AutoHealLimits {
@@ -2350,6 +2390,7 @@ impl MultiTokenManager {
                     last_auto_heal_at: None,
                     auto_heal_consecutive_rounds: 0,
                     upstream_fault_streak: 0,
+                    upstream_fault_seq: 0,
                 }
             })
             .collect();
@@ -2486,6 +2527,7 @@ impl MultiTokenManager {
             scheduler_redis_full_sync_applied: Arc::new(AtomicU64::new(0)),
             scheduler_redis_dirty_credential_ids: Arc::new(Mutex::new(HashSet::new())),
             scheduler_instance_id,
+            upstream_fault_log: Mutex::new(UpstreamFaultLog::default()),
             stats_dirty: AtomicBool::new(false),
             pending_stats_deltas: Mutex::new(HashMap::new()),
             pending_stats_batches: Mutex::new(VecDeque::new()),
@@ -2564,12 +2606,31 @@ impl MultiTokenManager {
     /// 记一次与账号无关的上游故障。同一个账号连续出现 [`UPSTREAM_FAULT_STREAK_COOLDOWN`] 次
     /// （中间没有一次成功）时返回 true：问题多半出在这个账号上，调用方按原规则冷却它，
     /// 否则优先级调度会让每个请求都先在它身上失败一次再换号。
+    ///
+    /// 故障只有集中在少数账号上才计入连续次数：从这个账号上次故障以来，其他可用账号里
+    /// 出过上游故障的不到一半。上游整体出错时（全挂或成片 5xx）各账号都会连着失败，这说明
+    /// 不了是哪个账号的问题，按账号冷却只会把整个池冷掉，故障重新从 1 计。
     pub fn note_upstream_fault(&self, id: u64) -> bool {
         let mut entries = self.entries.lock();
+        let other_usable = entries
+            .iter()
+            .filter(|entry| entry.id != id && !entry.disabled)
+            .count();
         let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
             return false;
         };
-        entry.upstream_fault_streak = entry.upstream_fault_streak.saturating_add(1);
+        let (seq, others_since) = self
+            .upstream_fault_log
+            .lock()
+            .record(id, entry.upstream_fault_seq);
+        entry.upstream_fault_seq = seq;
+        let concentrated =
+            other_usable == 0 || others_since.is_some_and(|others| others * 2 < other_usable);
+        entry.upstream_fault_streak = if entry.upstream_fault_streak > 0 && concentrated {
+            entry.upstream_fault_streak.saturating_add(1)
+        } else {
+            1
+        };
         entry.upstream_fault_streak >= UPSTREAM_FAULT_STREAK_COOLDOWN
     }
 
@@ -9603,6 +9664,7 @@ impl MultiTokenManager {
                 last_auto_heal_at: None,
                 auto_heal_consecutive_rounds: 0,
                 upstream_fault_streak: 0,
+                upstream_fault_seq: 0,
             };
             if let Some(state) = runtime_states.get(&id) {
                 Self::apply_runtime_state_if_newer(&mut entry, state);
@@ -14223,6 +14285,7 @@ impl MultiTokenManager {
                 last_auto_heal_at: None,
                 auto_heal_consecutive_rounds: 0,
                 upstream_fault_streak: 0,
+                upstream_fault_seq: 0,
             });
         }
 

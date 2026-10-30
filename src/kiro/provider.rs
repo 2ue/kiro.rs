@@ -7538,9 +7538,11 @@ mod tests {
     /// then most likely that account. A success resets the count.
     #[test]
     fn repeated_upstream_faults_on_one_account_cool_it_down() {
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("token".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let cred = KiroCredentials {
+            access_token: Some("token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
@@ -7575,6 +7577,67 @@ mod tests {
             manager.snapshot().entries[0].cooled_down,
             "the {streak}th fault in a row cools the account"
         );
+    }
+
+    /// Mock run 2026-10-30 (30% upstream 500 on every account): each account reached three faults
+    /// in a row by chance, the backoff stretched the cooldowns to 10-23 s and the whole pool was
+    /// cooling, so the success rate fell from 98% to below 1%. Faults spread over the pool say
+    /// nothing about one account; one account failing while the others keep working still cools.
+    #[test]
+    fn faults_spread_over_the_pool_do_not_cool_accounts_but_one_failing_account_still_does() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                fake_bad_request_credentials(5),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let completion = |id: u64| {
+            KiroStreamCompletion::new(
+                manager.clone(),
+                id,
+                None,
+                None,
+                Some("claude-sonnet-4.5".into()),
+                false,
+                false,
+                Vec::new(),
+                Instant::now(),
+            )
+        };
+        let cooled = |id: u64| {
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.cooled_down)
+        };
+
+        // A wave across the pool: every account fails round after round.
+        for _ in 0..4 {
+            for id in 1..=5 {
+                completion(id).report_upstream_stream_failure("upstream stream read error");
+            }
+        }
+        assert!(
+            (1..=5).all(|id| !cooled(id)),
+            "a pool-wide wave must not cool the pool"
+        );
+
+        // Account 1 alone keeps failing while the rest of the pool answers.
+        let streak = crate::kiro::token_manager::UPSTREAM_FAULT_STREAK_COOLDOWN;
+        for round in 1..=streak {
+            for id in 2..=5 {
+                completion(id).report_success();
+            }
+            completion(1).report_upstream_stream_failure("upstream stream read error");
+            assert_eq!(cooled(1), round == streak, "round {round}");
+        }
+        assert!((2..=5).all(|id| !cooled(id)));
     }
 
     #[test]
