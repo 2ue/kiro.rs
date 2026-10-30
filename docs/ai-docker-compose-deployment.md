@@ -310,12 +310,13 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
-| `loadBalancingMode` | `priority` 或 `balanced` | 控制多凭据调度方式；`balanced` 会先尊重账号优先级，再在同优先级账号内均衡。 |
+| `loadBalancingMode` | `priority` | 控制多凭据调度方式。`priority` 先用满优先级最高的一档，满了立刻降到下一档；`balanced` 也按优先级排序，但不限定只用首选档。 |
 | `credentialRpm` | `null` | 控制每个凭据的本地请求速率限制。`null` 或 `0` 表示关闭。 |
 | `credentialMaxConcurrentRequests` | `0` | 控制每个凭据最多同时处理多少个请求。`0` 表示不限制。 |
 | `credentialTransientCooldownSecs` | `10` | 控制上游临时错误但没有 `Retry-After` 时，单个凭据临时冷却多少秒。 |
 | `credentialMaxCooldownSecs` | `300` | 控制临时冷却最长秒数。 |
-| `credentialDispatchMaxWaitSecs` | `120` | 控制单个请求最多排队等待凭据可调度多久。`0` 表示不限制。 |
+| `credentialDispatchMaxWaitSecs` | `60` | 控制单个请求最多排队等待凭据可调度多久。`0` 表示不限制。过长会让过载时请求一直挂起。 |
+| `credentialSessionMaxConcurrentRequests` | `0` | 控制同一会话在单个凭据上最多同时跑几个请求，`0` 表示等于凭据上限。 |
 | `credentialInFlightLeaseMaxSecs` | `900` | 控制单个并发占用超过多久未活跃时自动释放。 |
 | `credentialWarmupRequests` | `3` | 控制新凭据预热剩余请求数。预热不会伪造成功次数，只降低被选中的概率。 |
 | `credentialWarmupSelectionPercent` | `5` | 控制 `balanced` 模式下预热凭据参与真实请求调度的概率百分比。 |

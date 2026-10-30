@@ -1866,6 +1866,7 @@ pub struct RuntimeConfigResponse {
     pub credential_probation_secs: u64,
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
+    pub credential_session_max_concurrent_requests: u32,
     pub kiro_upstream_response_timeout_secs: u64,
     pub kiro_upstream_stream_idle_timeout_secs: u64,
     pub stream_keepalive_interval_secs: u64,
@@ -2023,6 +2024,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_max_cooldown_secs: u64,
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_session_max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub kiro_upstream_response_timeout_secs: Option<u64>,
     #[serde(default)]

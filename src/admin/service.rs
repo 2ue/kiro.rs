@@ -6106,6 +6106,8 @@ impl AdminService {
             credential_probation_secs: config.credential_probation_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
+            credential_session_max_concurrent_requests: config
+                .credential_session_max_concurrent_requests,
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             stream_keepalive_interval_secs: config.stream_keepalive_interval_secs,
@@ -6288,6 +6290,9 @@ impl AdminService {
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
+        let credential_session_max_concurrent_requests = req
+            .credential_session_max_concurrent_requests
+            .unwrap_or(current_config.credential_session_max_concurrent_requests);
         let kiro_upstream_response_timeout_secs = req
             .kiro_upstream_response_timeout_secs
             .unwrap_or(current_config.kiro_upstream_response_timeout_secs);
@@ -6640,6 +6645,11 @@ impl AdminService {
                 "credentialCooldownBackoffMultiplier 必须在 1 到 10 之间".to_string(),
             ));
         }
+        if credential_session_max_concurrent_requests > 1_000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialSessionMaxConcurrentRequests 不能大于 1000".to_string(),
+            ));
+        }
         if credential_cooldown_jitter_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialCooldownJitterPercent 不能大于 100".to_string(),
@@ -6939,6 +6949,8 @@ impl AdminService {
                 config.credential_probation_secs = credential_probation_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
+                config.credential_session_max_concurrent_requests =
+                    credential_session_max_concurrent_requests;
                 config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
                 config.kiro_upstream_stream_idle_timeout_secs =
                     kiro_upstream_stream_idle_timeout_secs;

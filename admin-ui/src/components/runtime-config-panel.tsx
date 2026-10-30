@@ -525,7 +525,8 @@ const emptyConfig: RuntimeConfig = {
   credentialCooldownJitterPercent: 20,
   credentialProbationSecs: 30,
   credentialMaxCooldownSecs: 300,
-  credentialDispatchMaxWaitSecs: 120,
+  credentialDispatchMaxWaitSecs: 5,
+  credentialSessionMaxConcurrentRequests: 0,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   streamKeepaliveIntervalSecs: 5,
@@ -3816,6 +3817,9 @@ export function RuntimeConfigPanel() {
       credentialProbationSecs: toWhole(draft.credentialProbationSecs),
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+      credentialSessionMaxConcurrentRequests: toWhole(
+        draft.credentialSessionMaxConcurrentRequests,
+      ),
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
       streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
@@ -4117,6 +4121,16 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(credentialDispatchMaxWaitSecs) =>
                 setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))
+              }
+            />
+            <NumberField
+              title="单会话单账号最大并发"
+              description="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。填 0 表示等于账号自身的并发上限。"
+              value={draft.credentialSessionMaxConcurrentRequests}
+              min={0}
+              max={1000}
+              onChange={(credentialSessionMaxConcurrentRequests) =>
+                setDraft((prev) => ({ ...prev, credentialSessionMaxConcurrentRequests }))
               }
             />
             <NumberField

@@ -5038,6 +5038,13 @@ pub struct Config {
     #[serde(default = "default_credential_dispatch_max_wait_secs")]
     pub credential_dispatch_max_wait_secs: u64,
 
+    /// 同一会话在单个凭据上的最大并发请求数。
+    ///
+    /// `0` 表示等于该凭据自身的并发上限（同一会话的并发全部叠在绑定账号上，对上游缓存最友好）；
+    /// `>0` 时，同一会话在绑定账号上的并发达到该值后，后续并发请求临时借用其他账号，不改绑。
+    #[serde(default)]
+    pub credential_session_max_concurrent_requests: u32,
+
     /// Kiro 上游响应头最长等待秒数。
     ///
     /// 只限制请求发出到拿到响应头的阶段；响应头之后的流式 body 读取仍由
@@ -6659,6 +6666,7 @@ impl Default for Config {
             credential_probation_secs: default_credential_probation_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
+            credential_session_max_concurrent_requests: 0,
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
             kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
             ),

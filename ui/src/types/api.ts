@@ -2526,6 +2526,7 @@ export interface RuntimeConfig {
   credentialProbationSecs: number
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
+  credentialSessionMaxConcurrentRequests: number
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
   streamKeepaliveIntervalSecs: number

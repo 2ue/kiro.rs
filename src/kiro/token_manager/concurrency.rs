@@ -589,6 +589,56 @@ pub struct InFlightLeaseGuard {
     next_redis_touch_at_millis: AtomicU64,
     redis_touch_in_flight: Arc<AtomicBool>,
     released: AtomicBool,
+    session_slot: Mutex<Option<SessionConcurrencySlot>>,
+}
+
+/// Per-session in-flight counts on one credential, keyed by (session id, credential id).
+pub(super) type SessionConcurrency = Arc<Mutex<HashMap<(String, u64), u32>>>;
+
+/// One request's share of its session's in-flight count on a credential. Dropping it (when the
+/// owning lease is released on any path) gives the share back, so the count cannot leak.
+pub(super) struct SessionConcurrencySlot {
+    counts: SessionConcurrency,
+    key: (String, u64),
+}
+
+impl SessionConcurrencySlot {
+    pub(super) fn acquire(
+        counts: &SessionConcurrency,
+        session_id: &str,
+        credential_id: u64,
+    ) -> Self {
+        let key = (session_id.to_string(), credential_id);
+        *counts.lock().entry(key.clone()).or_insert(0) += 1;
+        Self {
+            counts: counts.clone(),
+            key,
+        }
+    }
+}
+
+impl Drop for SessionConcurrencySlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
+pub(super) fn session_in_flight_on(
+    counts: &SessionConcurrency,
+    session_id: &str,
+    credential_id: u64,
+) -> u32 {
+    counts
+        .lock()
+        .get(&(session_id.to_string(), credential_id))
+        .copied()
+        .unwrap_or(0)
 }
 
 impl fmt::Debug for InFlightLeaseGuard {
@@ -632,7 +682,12 @@ impl InFlightLeaseGuard {
             next_redis_touch_at_millis: AtomicU64::new(redis_touch_interval_millis),
             redis_touch_in_flight: Arc::new(AtomicBool::new(false)),
             released: AtomicBool::new(false),
+            session_slot: Mutex::new(None),
         }
+    }
+
+    pub(super) fn attach_session_slot(&self, slot: SessionConcurrencySlot) {
+        *self.session_slot.lock() = Some(slot);
     }
 
     pub(super) fn credential_id(&self) -> u64 {
@@ -681,6 +736,7 @@ impl InFlightLeaseGuard {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.session_slot.lock().take();
         let release_kind = match self.redis_acquisition_state {
             RedisLeaseAcquisitionState::NotStarted
             | RedisLeaseAcquisitionState::Definitive { acquired: false } => None,

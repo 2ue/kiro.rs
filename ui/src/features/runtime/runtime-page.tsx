@@ -309,6 +309,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialProbationSecs: toWhole(draft.credentialProbationSecs),
     credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
     credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+    credentialSessionMaxConcurrentRequests: toWhole(draft.credentialSessionMaxConcurrentRequests),
     kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
     kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
     streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
@@ -817,7 +818,8 @@ export function RuntimePage() {
                     ))}
                   </div>
                 </div>
-                <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
+                <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。建议 30 到 60 秒，过载时快速返回，避免请求一直挂起。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
+                <NumField label="单会话单账号最大并发" desc="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。0 表示等于账号自身的并发上限。" value={draft.credentialSessionMaxConcurrentRequests} min={0} max={1000} suffix="个" onChange={set('credentialSessionMaxConcurrentRequests')} />
                 <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
                 <NumField label="流式保活间隔" desc="上游暂时没有新内容时，每隔多久向客户端发一次保活心跳，防止客户端或中间代理因空闲断开；默认 5 秒。" value={draft.streamKeepaliveIntervalSecs} min={1} max={300} suffix="秒" onChange={set('streamKeepaliveIntervalSecs')} />

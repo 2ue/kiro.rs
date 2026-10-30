@@ -14827,3 +14827,98 @@ async fn idle_credentials_are_picked_before_recently_selected_ones_on_a_tie() {
         "ties rotate instead of sticking to one id"
     );
 }
+
+#[tokio::test]
+async fn session_concurrency_limit_borrows_without_rebinding_and_releases_on_drop() {
+    let empty = HashSet::new();
+
+    // Default (0): a session stacks on its bound credential up to the credential's own limit.
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(0, 0, 0)],
+    );
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(
+            manager
+                .acquire_context_for_session(None, Some("stack"), &empty)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        held.iter().map(|ctx| ctx.id).collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+
+    // Limit 1: the second concurrent request of the session borrows the other credential.
+    manager
+        .update_runtime_config(|config| config.credential_session_max_concurrent_requests = 1)
+        .unwrap();
+    let mut first = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    let bound = first.id;
+    let other = if bound == 1 { 2 } else { 1 };
+    let mut second = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(second.id, other);
+    assert!(second.fallback_from_sticky && !second.sticky_bound);
+    assert_eq!(
+        session_in_flight_on(&manager.session_concurrency, "spread", bound),
+        1
+    );
+
+    // The borrowed credential does not take over the binding.
+    second.release_in_flight();
+    let mut third = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        third.id, other,
+        "the bound credential still has the session's one allowed request"
+    );
+    third.release_in_flight();
+    first.release_in_flight();
+    let fourth = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(fourth.id, bound, "the binding stayed where it was");
+    assert!(fourth.sticky_bound);
+
+    // Dropping a context without an explicit release still returns the session's share.
+    drop(fourth);
+    assert!(manager.session_concurrency.lock().is_empty());
+}
+
+#[tokio::test]
+async fn session_concurrency_limit_never_blocks_when_no_other_credential_is_free() {
+    let manager = selection_matrix_manager("priority", &[matrix_credential(0, 0, 0)]);
+    manager
+        .update_runtime_config(|config| config.credential_session_max_concurrent_requests = 1)
+        .unwrap();
+    let empty = HashSet::new();
+    let mut first = manager
+        .acquire_context_for_session(None, Some("only"), &empty)
+        .await
+        .unwrap();
+    let mut second = manager
+        .acquire_context_for_session(None, Some("only"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.id, second.id),
+        (1, 1),
+        "the per-session limit only spreads load; it never makes a request wait"
+    );
+    first.release_in_flight();
+    second.release_in_flight();
+}

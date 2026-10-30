@@ -83,7 +83,8 @@ use super::capacity::{
 use super::concurrency::record_released_in_flight_lease_tombstone;
 use super::concurrency::{
     DispatchQueueGuard, InFlightLeaseGuard, ReleasedInFlightLeaseTombstones,
-    SchedulerRedisReleaseDispatcher, filter_released_in_flight_leases_from_scheduler_states,
+    SchedulerRedisReleaseDispatcher, SessionConcurrency, SessionConcurrencySlot,
+    filter_released_in_flight_leases_from_scheduler_states, session_in_flight_on,
 };
 use super::cooldown::{
     entry_any_cooldown_remaining, entry_cooldown_remaining, entry_global_cooldown_remaining,
@@ -1017,6 +1018,8 @@ pub struct MultiTokenManager {
     /// Active bound sessions per credential, recomputed at most every
     /// `BOUND_SESSION_COUNT_CACHE_TTL` and dropped whenever a binding changes.
     bound_session_counts: Mutex<Option<(Instant, Arc<HashMap<u64, u32>>)>>,
+    /// In-flight requests per (session, credential) on this instance.
+    session_concurrency: SessionConcurrency,
     /// 凭据容量 credit 与广播 generation；多槽释放不会折叠成一个通知。
     capacity_signal: Arc<CapacitySignal>,
     /// 进程内本地账号池风控熔断。它不依赖 Redis，确保 Redis degraded 或外部池
@@ -2459,6 +2462,7 @@ impl MultiTokenManager {
             runtime_mutation_flush_cursor: AtomicU64::new(0),
             session_bindings: Mutex::new(HashMap::new()),
             bound_session_counts: Mutex::new(None),
+            session_concurrency: SessionConcurrency::default(),
             capacity_signal: Arc::new(CapacitySignal::default()),
             local_pool_risk_circuit: Mutex::new(LocalPoolRiskCircuit::default()),
             released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
@@ -5834,6 +5838,18 @@ impl MultiTokenManager {
         self.bound_session_counts.lock().take();
     }
 
+    /// Whether `session_id` already has `credentialSessionMaxConcurrentRequests` requests in
+    /// flight on `credential_id`. `0` means the credential's own limit applies, which the
+    /// regular slot reservation already enforces.
+    fn session_at_concurrency_limit(&self, session_id: &str, credential_id: u64) -> bool {
+        let limit = self
+            .config
+            .lock()
+            .credential_session_max_concurrent_requests;
+        limit > 0
+            && session_in_flight_on(&self.session_concurrency, session_id, credential_id) >= limit
+    }
+
     fn get_bound_credential(
         &self,
         bound_id: u64,
@@ -6436,10 +6452,26 @@ impl MultiTokenManager {
             }
 
             let selection_reservation_guard = self.selection_reservation_gate.lock();
+            let mut session_limited_bound: Option<u64> = None;
             let decision = {
                 let bound_hit = request_bound_id
                     .and_then(|bound_id| {
                         self.get_bound_credential(bound_id, model, &local_excluded_ids)
+                    })
+                    .filter(|(bound_id, _)| {
+                        // The session already has as many requests on its bound credential as
+                        // allowed: borrow another credential for this one, keep the binding.
+                        let at_session_limit = session_id.is_some_and(|session_id| {
+                            self.session_at_concurrency_limit(session_id, *bound_id)
+                        });
+                        if at_session_limit {
+                            session_limited_bound = Some(*bound_id);
+                            tracing::debug!(
+                                credential_id = *bound_id,
+                                "同一会话在绑定账号上的并发已达上限，本次临时借用其他账号"
+                            );
+                        }
+                        !at_session_limit
                     })
                     .filter(|(bound_id, bound_credentials)| {
                         if tier_migration_from.is_some() {
@@ -6471,11 +6503,26 @@ impl MultiTokenManager {
                     let fallback_from_sticky = request_bound_id.is_some();
                     {
                         // 根据负载均衡策略选择；priority 模式也会在同优先级账号之间优先低并发。
-                        let best = self.select_next_credential_excluding(
-                            model,
-                            &local_excluded_ids,
-                            request_weight_units,
-                        );
+                        // A session over its per-credential limit prefers any other credential;
+                        // the limit only spreads load, so with nothing else free the bound
+                        // credential is still used within its own concurrency limit.
+                        let best = session_limited_bound
+                            .and_then(|bound_id| {
+                                let mut excluded = local_excluded_ids.clone();
+                                excluded.insert(bound_id);
+                                self.select_next_credential_excluding(
+                                    model,
+                                    &excluded,
+                                    request_weight_units,
+                                )
+                            })
+                            .or_else(|| {
+                                self.select_next_credential_excluding(
+                                    model,
+                                    &local_excluded_ids,
+                                    request_weight_units,
+                                )
+                            });
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈。
                         // 自愈要写 PgSQL，不能在持有 selection_reservation_gate 时执行；这里只做本地
@@ -7282,6 +7329,11 @@ impl MultiTokenManager {
                             self.bind_session_to_credential_for_request(sid, ctx.id)
                                 .await;
                         }
+                        in_flight_lease.attach_session_slot(SessionConcurrencySlot::acquire(
+                            &self.session_concurrency,
+                            sid,
+                            ctx.id,
+                        ));
                     }
                     return Ok(CallContext {
                         sticky_bound,
