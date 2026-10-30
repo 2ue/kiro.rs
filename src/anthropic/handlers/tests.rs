@@ -14143,6 +14143,30 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     );
 }
 
+/// Mock run 2026-10-30: every local 524 answered 504 although an external pool was ready. The
+/// 524 cools no account, so the fresh pool snapshot looked dispatchable and suppressed the
+/// fallback. The attempt outcome now decides; other transient errors still follow the snapshot.
+#[test]
+fn a_local_gateway_timeout_falls_back_even_while_the_pool_looks_dispatchable() {
+    let gateway_timeout = "upstream_failure class=upstream_timeout upstream_status=524 public_status=524 body_bytes=21 retry_after_secs=unknown content_type=json reason=api_gateway_timeout";
+    assert_eq!(
+        local_attempt_outcome_route_reason("local_transient_exhausted", gateway_timeout),
+        Some("local_transient_exhausted")
+    );
+    assert_eq!(
+        local_attempt_outcome_route_reason(
+            "local_transient_exhausted",
+            "upstream_failure class=server_error upstream_status=500 public_status=500 reason=api_server_error",
+        ),
+        None,
+        "an ordinary 5xx still lets a dispatchable pool retry locally first"
+    );
+    assert_eq!(
+        local_attempt_outcome_route_reason("local_scheduler_redis_degraded", gateway_timeout),
+        Some("local_scheduler_redis_degraded")
+    );
+}
+
 #[test]
 fn classified_scheduler_degraded_fallback_is_not_suppressed_by_stale_ready_snapshot() {
     assert_eq!(

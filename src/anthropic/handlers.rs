@@ -2398,7 +2398,7 @@ impl ExternalFallbackContext {
             _ => None,
         };
         let classified_route_reason =
-            classified_local_error_route_reason(classified_reason.as_str());
+            local_attempt_outcome_route_reason(classified_reason.as_str(), error_message);
         let route_reason = typed_auxiliary_route_reason
             .or(classified_route_reason)
             .or_else(|| {
@@ -2799,6 +2799,21 @@ fn local_route_reason_requires_immediate_external_capacity(reason: &str) -> bool
             | "local_auxiliary_concurrency_saturated"
             | "local_attempt_reserved_for_fallback"
     )
+}
+
+/// Route reason taken from the local attempt outcome itself, so a fresh pool snapshot cannot
+/// cancel the fallback. A Cloudflare 524 is one: it is not retried and cools no account, so the
+/// pool still looks dispatchable although this request has nowhere local left to go.
+fn local_attempt_outcome_route_reason(
+    classified_reason: &str,
+    error_message: &str,
+) -> Option<&'static str> {
+    if classified_reason == "local_transient_exhausted"
+        && error_message.contains("reason=api_gateway_timeout")
+    {
+        return Some("local_transient_exhausted");
+    }
+    classified_local_error_route_reason(classified_reason)
 }
 
 fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
