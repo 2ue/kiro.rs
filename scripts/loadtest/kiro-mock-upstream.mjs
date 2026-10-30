@@ -20,6 +20,10 @@ const DEFAULT_HEADER_DELAY_MS = Number.parseInt(process.env.KIRO_MOCK_HEADER_DEL
 // - failTokens: access tokens (Authorization bearer) that always fail, to fail single accounts.
 // - headerDelayMs: delay before response headers.
 // - streamChunks / chunkDelayMs: long streams.
+// - errorStatus may also name a Kiro failure: tool_mismatch (500 TOOL_USE_RESULT_MISMATCH),
+//   gateway_timeout (524), image_count (400 IMAGE_COUNT_EXCEEDED), quota (402), auth (403).
+// - midStreamResetRate: share of long streams cut halfway, after output has started.
+// `GET /__control` also returns the conversation identity of recent calls.
 const control = {
   errorRate: 0,
   errorStatus: 500,
@@ -27,8 +31,10 @@ const control = {
   headerDelayMs: DEFAULT_HEADER_DELAY_MS,
   streamChunks: 0,
   chunkDelayMs: 0,
+  midStreamResetRate: 0,
 };
-const counters = { requests: 0, failed: 0, ok: 0, inFlight: 0, maxInFlight: 0, byToken: {} };
+const emptyCounters = () => ({ requests: 0, failed: 0, ok: 0, midStreamResets: 0, byToken: {}, conversations: [] });
+const counters = { ...emptyCounters(), inFlight: 0, maxInFlight: 0 };
 
 const models = [
   { id: "sonnet", displayName: "Sonnet", maxInputTokens: 200000 },
@@ -276,7 +282,7 @@ function requestWantsConnectionClose(req) {
   return String(req.headers.connection || "").toLowerCase().split(",").map((part) => part.trim()).includes("close");
 }
 
-function writeStream(req, res, frames, endDelayMs = 0) {
+function writeStream(req, res, frames, endDelayMs = 0, resetAtEnd = false) {
   res.writeHead(200, {
     "content-type": "application/vnd.amazon.eventstream",
     "cache-control": "no-cache",
@@ -285,7 +291,7 @@ function writeStream(req, res, frames, endDelayMs = 0) {
   let index = 0;
   const writeNext = () => {
     if (index >= frames.length) {
-      setTimeout(() => res.end(), endDelayMs);
+      setTimeout(() => (resetAtEnd ? res.socket?.destroy() : res.end()), endDelayMs);
       return;
     }
     const { delayMs, frame } = frames[index++];
@@ -330,9 +336,23 @@ function bearerToken(req) {
   return value.toLowerCase().startsWith("bearer ") ? value.slice(7).trim() : value;
 }
 
+// Named upstream failures, shaped like the real Kiro responses the proxy classifies.
+const NAMED_FAILURES = {
+  tool_mismatch: [500, { message: "Tool use and tool result do not match", reason: "TOOL_USE_RESULT_MISMATCH" }],
+  gateway_timeout: [524, { message: "error code: 524" }],
+  image_count: [400, { message: "too many inline media segments: 123 exceeds limit 100", reason: "IMAGE_COUNT_EXCEEDED" }],
+  quota: [402, { message: "You have reached the limit for monthly requests", reason: "MONTHLY_REQUEST_COUNT" }],
+  auth: [403, { message: "The bearer token included in the request is invalid." }],
+};
+
 function writeControlledFailure(res, status) {
   if (status === "reset") {
     res.socket?.destroy();
+    return;
+  }
+  if (NAMED_FAILURES[status]) {
+    const [code, body] = NAMED_FAILURES[status];
+    json(res, code, body);
     return;
   }
   const code = Number(status);
@@ -343,6 +363,19 @@ function writeControlledFailure(res, status) {
   } else {
     json(res, code || 500, { message: `mock upstream controlled failure ${code}`, requestId: "mock-error" });
   }
+}
+
+// Remembers the conversation identity of every generateAssistantResponse call, so a test can
+// check that a retry after an upstream failure carries a fresh conversationId.
+function recordConversation(body, token, outcome) {
+  const state = body?.conversationState || {};
+  counters.conversations.push({
+    token,
+    outcome,
+    conversationId: state.conversationId || null,
+    agentContinuationId: state.agentContinuationId || null,
+  });
+  if (counters.conversations.length > 5000) counters.conversations.shift();
 }
 
 async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
@@ -365,10 +398,12 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
   }
   if (control.failTokens.includes(token) || (control.errorRate > 0 && Math.random() < control.errorRate)) {
     counters.failed += 1;
+    recordConversation(body, token, "failed");
     writeControlledFailure(res, control.errorStatus);
     return;
   }
   counters.ok += 1;
+  recordConversation(body, token, "ok");
   if (control.streamChunks > 0) {
     const frames = [];
     for (let index = 0; index < control.streamChunks; index += 1) {
@@ -376,6 +411,12 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
         delayMs: control.chunkDelayMs,
         frame: event({ eventType: "assistantResponseEvent" }, { content: `chunk-${index} ` }),
       });
+    }
+    // midStreamResetRate: share of streams cut after half the chunks, once output has started.
+    if (control.midStreamResetRate > 0 && Math.random() < control.midStreamResetRate) {
+      counters.midStreamResets += 1;
+      writeStream(req, res, frames.slice(0, Math.max(1, Math.floor(frames.length / 2))), 0, true);
+      return;
     }
     frames.push({
       delayMs: 0,
@@ -450,7 +491,7 @@ const server = http.createServer(async (req, res) => {
         const { json: patch } = await parseJsonBody(req);
         Object.assign(control, patch || {});
         if (patch && patch.resetCounters) {
-          Object.assign(counters, { requests: 0, failed: 0, ok: 0, maxInFlight: counters.inFlight, byToken: {} });
+          Object.assign(counters, emptyCounters(), { maxInFlight: counters.inFlight });
         }
       }
       json(res, 200, { control, counters });
