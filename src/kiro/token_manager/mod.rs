@@ -11,6 +11,7 @@ mod refresh;
 mod route_state;
 mod rpm;
 mod scheduler_error;
+mod selection;
 mod sticky;
 pub(crate) mod storage_task;
 mod strategy;
@@ -39,6 +40,7 @@ pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 pub use scheduler_error::{
     LocalSchedulerError, LocalSchedulerErrorKind, local_scheduler_error_kind,
 };
+pub(crate) use selection::LoadBalancingMode;
 #[allow(unused_imports)]
 pub use storage_task::{
     StorageTaskDrainReport, StorageTaskShutdownReport, StorageTaskStats,

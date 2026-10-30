@@ -113,6 +113,7 @@ use super::rpm::{
     rate_limit_interval_for_rpm,
 };
 use super::scheduler_error::{LocalSchedulerError, LocalSchedulerErrorKind};
+use super::selection::{LoadBalancingMode, select_candidate};
 use super::sticky::{
     MAX_SESSION_SOFT_FAILURES, SESSION_BINDING_TTL_SECS,
     bind_session_to_credential as bind_sticky_session_to_credential,
@@ -127,9 +128,7 @@ use super::storage_task::{
     block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
 };
 use super::strategy::{
-    balanced_selection_key, entry_effective_health_mut, priority_selection_key,
-    record_local_selection, refresh_local_selection_windows_locked, select_health_weighted,
-    select_weighted_least_inflight, should_select_warming_from_totals,
+    entry_effective_health_mut, record_local_selection, refresh_local_selection_windows_locked,
 };
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
@@ -158,7 +157,15 @@ fn sha256_hex(input: &str) -> String {
     format!("{:x}", result)
 }
 
+fn parse_load_balancing_mode(config: &Config) -> anyhow::Result<LoadBalancingMode> {
+    config
+        .load_balancing_mode
+        .parse::<LoadBalancingMode>()
+        .map_err(anyhow::Error::msg)
+}
+
 fn validate_token_refresh_admission_config(config: &Config) -> anyhow::Result<()> {
+    parse_load_balancing_mode(config)?;
     if !(MIN_TOKEN_REFRESH_MAX_RPM..=MAX_TOKEN_REFRESH_MAX_RPM)
         .contains(&config.token_refresh_max_rpm)
     {
@@ -960,7 +967,7 @@ pub struct MultiTokenManager {
     /// 代理/家宽资源快照。凭据直接代理优先，未设置时可通过 proxy_resource_id 绑定这里的资源。
     proxy_resources: Arc<Mutex<HashMap<u64, ProxyResourceRuntime>>>,
     /// 负载均衡模式（运行时可修改）
-    load_balancing_mode: Mutex<String>,
+    load_balancing_mode: Mutex<LoadBalancingMode>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 最近一次清理 PgSQL 运行态 mutation 幂等记录的时间。
@@ -2366,7 +2373,7 @@ impl MultiTokenManager {
             .map(|e| e.id)
             .unwrap_or(0);
 
-        let load_balancing_mode = config.load_balancing_mode.clone();
+        let load_balancing_mode = parse_load_balancing_mode(&config)?;
         let proxy_resources = if let Some(store) = &postgres_store {
             let store = store.clone();
             match block_on_credential_pgsql("从 PgSQL 加载代理资源", async move {
@@ -2880,7 +2887,7 @@ impl MultiTokenManager {
             .update_limit(config.auxiliary_upstream_max_concurrent_requests);
         self.auxiliary_runtime
             .update_token_refresh_limits(config.token_refresh_max_rpm, config.token_refresh_burst);
-        *self.load_balancing_mode.lock() = config.load_balancing_mode.clone();
+        *self.load_balancing_mode.lock() = parse_load_balancing_mode(&config)?;
         self.update_credential_rpm_from_config();
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
@@ -5617,7 +5624,10 @@ impl MultiTokenManager {
         current_fast: u32,
         request_weight_units: u32,
     ) -> bool {
-        let priority_mode = self.load_balancing_mode.lock().as_str() == "priority";
+        let priority_mode = self
+            .load_balancing_mode
+            .lock()
+            .fills_priority_tiers_in_order();
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let config = self.config.lock().clone();
@@ -5756,122 +5766,33 @@ impl MultiTokenManager {
             request_weight_units,
         );
 
-        let mut available = Vec::new();
-        let mut ready = Vec::new();
-        let mut warming = Vec::new();
-        let mut total_recent = 0u64;
-        let mut warming_recent = 0u64;
-
-        if global_has_capacity {
-            let dispatchable = entries
-                .iter()
-                .filter(|entry| {
-                    !excluded_ids.contains(&entry.id)
-                        && credential_is_dispatchable(
-                            &proxy_resources,
-                            entry,
-                            model,
-                            now,
-                            max_concurrent_requests,
-                            global_rpm,
-                            request_weight_units,
-                        )
-                })
-                .collect::<Vec<_>>();
-            // Credentials with an empty model catalog are only a fallback: when any dispatchable
-            // credential's catalog lists the model, unknown-catalog credentials (failed discovery,
-            // invalid keys) must not win the selection and burn an attempt.
-            let prefer_catalog_listed = dispatchable
-                .iter()
-                .any(|entry| credential_catalog_lists_model(entry, model));
-            for entry in dispatchable {
-                if prefer_catalog_listed && !credential_catalog_lists_model(entry, model) {
-                    continue;
-                }
-
-                let recent = entry.health.recent_selection_count_60s as u64;
-                total_recent = total_recent.saturating_add(recent);
-                available.push(entry);
-                if entry.warmup_remaining > 0 {
-                    warming_recent = warming_recent.saturating_add(recent);
-                    warming.push(entry);
-                } else {
-                    ready.push(entry);
-                }
-            }
-        }
-
-        if available.is_empty() {
+        if !global_has_capacity {
             return None;
         }
-
-        // Fast tiers sit above every load-balancing mode: only the highest Fast tier among the
-        // dispatchable candidates competes, so a tier is filled up to its safety limits
-        // (concurrency, RPM, cooldown, model, proxy) before traffic overflows to the next one.
-        let top_fast = available
+        let dispatchable = entries
             .iter()
-            .map(|entry| entry.credentials.fast)
-            .max()
-            .unwrap_or(0);
-        if top_fast > 0 {
-            ready.retain(|entry| entry.credentials.fast == top_fast);
-            warming.retain(|entry| entry.credentials.fast == top_fast);
-            let tier_recent = |entries: &[&CredentialEntry]| {
-                entries
-                    .iter()
-                    .map(|entry| entry.health.recent_selection_count_60s as u64)
-                    .sum::<u64>()
-            };
-            warming_recent = tier_recent(&warming);
-            total_recent = warming_recent.saturating_add(tier_recent(&ready));
-        }
-
-        let select_warming = should_select_warming_from_totals(
+            .filter(|entry| {
+                !excluded_ids.contains(&entry.id)
+                    && credential_is_dispatchable(
+                        &proxy_resources,
+                        entry,
+                        model,
+                        now,
+                        max_concurrent_requests,
+                        global_rpm,
+                        request_weight_units,
+                    )
+            })
+            .collect::<Vec<_>>();
+        let mode = *self.load_balancing_mode.lock();
+        let entry = select_candidate(
+            mode,
+            dispatchable,
+            model,
+            Utc::now().timestamp_millis(),
             &config,
-            ready.len(),
-            warming.len(),
-            total_recent,
-            warming_recent,
-        );
-        let candidates = if select_warming { &warming } else { &ready };
-        let mode = self.load_balancing_mode.lock().clone();
-
-        match mode.as_str() {
-            "health_balanced" => {
-                // 预热不是后台主动打流量，而是在真实业务请求中按目标份额参与调度；
-                // 份额按预热账号数量放大并受最大预热份额限制，避免批量导入后长期吃不到流量。
-                let entry = select_health_weighted(
-                    candidates,
-                    model,
-                    Utc::now().timestamp_millis(),
-                    &config,
-                )?;
-
-                Some((entry.id, entry.credentials.clone()))
-            }
-            "balanced" => {
-                let entry = candidates
-                    .iter()
-                    .min_by_key(|entry| balanced_selection_key(entry))?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-            "weighted_least_inflight" => {
-                let entry = select_weighted_least_inflight(
-                    candidates,
-                    model,
-                    Utc::now().timestamp_millis(),
-                    &config,
-                )?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-            _ => {
-                // priority 模式（默认）：优先级仍是第一排序，但同优先级账号优先选低并发。
-                let entry = candidates
-                    .iter()
-                    .min_by_key(|e| priority_selection_key(e))?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-        }
+        )?;
+        Some((entry.id, entry.credentials.clone()))
     }
 
     fn get_bound_credential(
@@ -14667,7 +14588,7 @@ impl MultiTokenManager {
     }
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
-        self.load_balancing_mode.lock().clone()
+        self.load_balancing_mode.lock().as_str().to_string()
     }
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
@@ -14688,20 +14609,16 @@ impl MultiTokenManager {
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
-        if !matches!(
-            mode.as_str(),
-            "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-        ) {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
-        }
+        let parsed = mode
+            .parse::<LoadBalancingMode>()
+            .map_err(anyhow::Error::msg)?;
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
+        let previous_mode = *self.load_balancing_mode.lock();
+        if previous_mode == parsed {
             return Ok(());
         }
 
-        *self.load_balancing_mode.lock() = mode.clone();
+        *self.load_balancing_mode.lock() = parsed;
 
         if let Err(err) = self.persist_load_balancing_mode(&mode) {
             *self.load_balancing_mode.lock() = previous_mode;

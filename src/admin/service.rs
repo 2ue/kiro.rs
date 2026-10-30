@@ -7110,16 +7110,9 @@ impl AdminService {
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if !matches!(
-            req.mode.as_str(),
-            "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-        ) {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority'、'balanced'、'health_balanced' 或 'weighted_least_inflight'"
-                    .to_string(),
-            ));
-        }
+        req.mode
+            .parse::<crate::kiro::token_manager::LoadBalancingMode>()
+            .map_err(AdminServiceError::InvalidCredential)?;
 
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())

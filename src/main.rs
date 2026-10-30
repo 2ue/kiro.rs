@@ -1641,14 +1641,11 @@ fn handle_credentials_command(
             if !is_multiple {
                 println!("warning: single credentials format cannot be rewritten by token refresh");
             }
-            if !matches!(
-                config.load_balancing_mode.as_str(),
-                "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-            ) {
-                println!(
-                    "error: invalid loadBalancingMode '{}', expected priority, balanced, health_balanced or weighted_least_inflight",
-                    config.load_balancing_mode
-                );
+            if let Err(err) = config
+                .load_balancing_mode
+                .parse::<kiro::token_manager::LoadBalancingMode>()
+            {
+                println!("error: loadBalancingMode: {err}");
             }
             let mut ids = std::collections::HashSet::new();
             for (index, credential) in credentials.iter().enumerate() {
