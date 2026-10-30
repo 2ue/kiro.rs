@@ -10780,7 +10780,7 @@ fn collect_model_id_item(value: &Value, out: &mut Vec<String>) {
 
 #[cfg(test)]
 #[path = "service_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 // ============ 路由场景辅助 ============
 
@@ -10983,6 +10983,70 @@ impl AdminService {
         .await;
         result.map(|response| response.credential_id)
     }
+}
+
+// Seams for the read-only public pool view (`public_pool.rs`). The view keeps its own router and
+// response types; it only borrows the account snapshot, the status rules and the runtime switch.
+impl AdminService {
+    pub(super) fn public_pool_enabled(&self) -> bool {
+        self.token_manager.public_pool_view_enabled()
+    }
+
+    pub(super) fn set_public_pool_enabled(&self, enabled: bool) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_runtime_config(|config| config.public_pool_view_enabled = enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.audit(
+            "set_public_pool_view",
+            "runtime_config",
+            Some("public_pool_view".to_string()),
+            true,
+            None,
+            json!({ "enabled": enabled }),
+        );
+        Ok(())
+    }
+
+    /// Every account with its quota snapshot and usage totals, in the account page's default order.
+    pub(super) fn public_pool_credentials(&self) -> Vec<CredentialStatusItem> {
+        self.credential_status_items(
+            CredentialStatusBuildOptions::WITH_ACCOUNT_INFO_AND_COST_SUMMARY,
+        )
+        .7
+    }
+
+    pub(super) fn public_pool_dispatch_summary(
+        &self,
+    ) -> crate::kiro::token_manager::ManagerSummarySnapshot {
+        self.token_manager.summary_snapshot()
+    }
+
+    /// Per-model cooldowns live only in the runtime plane, not on `CredentialStatusItem`.
+    pub(super) fn public_pool_cooldowns(
+        &self,
+        ids: &[u64],
+    ) -> HashMap<u64, Vec<CredentialCooldown>> {
+        let snapshot = self.token_manager.runtime_snapshot_for_ids(ids);
+        snapshot
+            .entries
+            .into_iter()
+            .map(|entry| credential_runtime_item_from_snapshot(entry, snapshot.current_id))
+            .filter(|item| !item.cooldowns.is_empty())
+            .map(|item| (item.id, item.cooldowns))
+            .collect()
+    }
+}
+
+/// Whether `credential` falls under the account page's status filter `status` (`normal`,
+/// `cooling`, `quota_exhausted`, `account_error`, `disabled`, ...), with the same rules.
+pub(super) fn credential_matches_status(credential: &CredentialStatusItem, status: &str) -> bool {
+    credential_matches_query(
+        credential,
+        &CredentialListQuery {
+            status: Some(status.to_string()),
+            ..CredentialListQuery::default()
+        },
+    )
 }
 
 pub(super) fn balance_response_from_usage_public(

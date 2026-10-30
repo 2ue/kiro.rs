@@ -27,6 +27,8 @@ import {
   getRuntimeConfig,
   previewPromptInjection,
   getSystemVersion,
+  getPublicPoolConfig,
+  setPublicPoolConfig,
   resetCredentialFailure,
   setCredentialDisabled,
   setCredentialConcurrency,
@@ -477,6 +479,21 @@ export function usePromptInjectionCatalog() {
 
 export function usePromptInjectionPreview() {
   return useMutation({ mutationFn: previewPromptInjection })
+}
+
+export function usePublicPoolConfig() {
+  return useQuery({ queryKey: ['public-pool-config'], queryFn: getPublicPoolConfig })
+}
+
+export function useSetPublicPoolConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setPublicPoolConfig,
+    onSuccess: (data) => {
+      queryClient.setQueryData(['public-pool-config'], data)
+      queryClient.invalidateQueries({ queryKey: ['runtime-config'] })
+    },
+  })
 }
 
 export function useSystemVersion() {

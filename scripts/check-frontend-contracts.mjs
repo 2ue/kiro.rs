@@ -79,6 +79,16 @@ const intentionallyUiOnly = new Set([
   'InventoryPushRequest',
   'InventoryStatus',
   'InventoryUpdateRequest',
+  // The public read-only pool page exists only in the new console.
+  'PublicPoolAccount',
+  'PublicPoolConfig',
+  'PublicPoolCooldown',
+  'PublicPoolOverview',
+  'PublicPoolQuery',
+  'PublicPoolQuota',
+  'PublicPoolRealtime',
+  'PublicPoolResponse',
+  'PublicPoolStatus',
 ])
 const intentionallyAdminOnly = new Set(['AdminErrorResponse', 'BulkCredentialActionError'])
 

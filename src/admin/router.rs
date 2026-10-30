@@ -51,6 +51,7 @@ use super::{
     },
     inventory::http as inventory_http,
     middleware::{AdminState, admin_auth_middleware},
+    public_pool::{get_public_pool_config, set_public_pool_config},
     route_scenarios::http as route_scenario_http,
 };
 
@@ -319,6 +320,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/prompt-injection/preview", post(preview_prompt_injection))
         .route("/system/version", get(get_system_version))
+        .route(
+            "/public-pool",
+            get(get_public_pool_config).put(set_public_pool_config),
+        )
         .route("/diagnostics/capture", get(get_capture_overview))
         .route("/diagnostics/capture/start", post(start_capture))
         .route("/diagnostics/capture/stop", post(stop_capture))

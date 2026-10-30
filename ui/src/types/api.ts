@@ -3035,3 +3035,110 @@ export interface InventoryActionResponse {
   failed: number
   items: InventoryActionItem[]
 }
+
+// ============ 只读号池（免登录） ============
+
+/** The admin switch for the public read-only pool page; off by default. */
+export interface PublicPoolConfig {
+  enabled: boolean
+}
+
+/** The account page's status tabs; the public view filters by these only. */
+export type PublicPoolStatus = 'normal' | 'cooling' | 'quota_exhausted' | 'account_error' | 'disabled'
+
+export interface PublicPoolQuery {
+  page?: number
+  limit?: number
+  status?: PublicPoolStatus
+}
+
+export interface PublicPoolRealtime {
+  windowSeconds: number
+  requests: number
+  errorRequests: number
+  rpm: number
+  totalTpm: number
+}
+
+export interface PublicPoolOverview {
+  total: number
+  enabled: number
+  disabled: number
+  schedulable: number
+  coolingDown: number
+  inUse: number
+  failing: number
+  normal: number
+  cooling: number
+  quotaExhausted: number
+  accountError: number
+  globalInFlightRequests: number
+  globalMaxConcurrentRequests: number
+  queuedRequests: number
+  realtime: PublicPoolRealtime
+  /** Credits used by all accounts over the recorded history. */
+  consumedCredits: number
+  lastCheckedAt?: string | null
+  loadBalancingMode: string
+  updatedAt: string
+}
+
+export interface PublicPoolCooldown {
+  model?: string
+  global: boolean
+  remainingSecs: number
+}
+
+/** The last quota snapshot, in credits. */
+export interface PublicPoolQuota {
+  currentUsage: number
+  usageLimit: number
+  currentOverages: number
+  overageEnabled: boolean
+  checkedAt: string
+}
+
+/**
+ * One account as the public page sees it: no token, hash, proxy, full email, raw error or cost.
+ * `label` is the email with the middle of its name masked; API Key accounts have none.
+ */
+export interface PublicPoolAccount {
+  id: number
+  label?: string
+  subscriptionTitle?: string
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
+  endpoint: string
+  fast: number
+  priority: number
+  disabled: boolean
+  disabledReason?: string
+  isCurrent: boolean
+  cooledDown: boolean
+  cooldownRemainingSecs: number
+  cooldowns?: PublicPoolCooldown[]
+  rateLimited: boolean
+  rateLimitRemainingSecs: number
+  inFlightRequests: number
+  maxConcurrentRequests: number
+  rpm: number
+  recentSchedulerSelectionCount60s: number
+  successCount: number
+  schedulerSelectionCount: number
+  inProbation: boolean
+  probationRemainingSecs: number
+  warmupRemaining: number
+  transientFailureStreak: number
+  quota?: PublicPoolQuota
+  kiroMeteringUsage: number
+  createdAt: string | null
+  lastUsedAt: string | null
+}
+
+export interface PublicPoolResponse {
+  overview: PublicPoolOverview
+  page: number
+  limit: number
+  totalPages: number
+  filteredTotal: number
+  items: PublicPoolAccount[]
+}
