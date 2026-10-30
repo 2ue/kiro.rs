@@ -9590,7 +9590,12 @@ impl MultiTokenManager {
     }
 
     fn publish_runtime_config_changed(&self, version: Option<i64>, reason: &str) {
-        publish_redis_runtime_config_changed(self.redis_store.as_ref(), version, reason);
+        publish_redis_runtime_config_changed(
+            self.redis_store.as_ref(),
+            version,
+            reason,
+            &self.scheduler_instance_id,
+        );
     }
 
     fn publish_credentials_changed(&self, reason: &str) {
@@ -9598,6 +9603,7 @@ impl MultiTokenManager {
             self.postgres_store.as_ref(),
             self.redis_store.as_ref(),
             reason,
+            &self.scheduler_instance_id,
         );
     }
 
@@ -9607,6 +9613,20 @@ impl MultiTokenManager {
 
     pub(crate) fn notify_dispatch_state_changed(&self) {
         self.capacity_signal.notify_state_changed();
+    }
+
+    /// Whether a runtime event payload was published by this instance. This instance already
+    /// applied its own change locally, so reloading on its own event is pure overhead.
+    pub(crate) fn runtime_event_is_from_this_instance(&self, payload: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("sourceInstanceId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|source| source == self.scheduler_instance_id.as_ref())
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn notify_remote_dispatch_state_changed(&self, payload: &str) -> bool {
@@ -10269,10 +10289,14 @@ impl MultiTokenManager {
             }
         }
         if recovered_any {
+            // Only this instance's local view lagged behind PgSQL; the credentials themselves did
+            // not change. Broadcasting made every instance reload all credentials from PgSQL on
+            // each 5-second flush that recovered anything (about 700 times an hour in
+            // production), which kept worker threads busy and slowed scheduling. Other instances
+            // read runtime state on their periodic sync instead.
             self.select_highest_priority();
             self.invalidate_model_capability_cohorts();
             self.notify_dispatch_state_changed();
-            self.publish_credentials_changed("credential_runtime_persistence_recovered");
         }
         if !self.pending_runtime_mutations.lock().is_empty() {
             self.mark_stats_dirty();

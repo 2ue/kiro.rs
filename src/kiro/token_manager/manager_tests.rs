@@ -15375,3 +15375,20 @@ fn dispatch_progress_reports_a_stalled_queue() {
     assert_eq!(status.secs_since_last_dispatch, Some(0));
     manager.set_queued_requests_for_test(0);
 }
+
+#[test]
+fn runtime_events_published_by_this_instance_are_recognised() {
+    let manager = queue_test_manager(1, 10);
+    let own = super::super::redis_runtime::test_runtime_event_payload(
+        "credentials_changed",
+        &manager.scheduler_instance_id,
+    );
+    assert!(manager.runtime_event_is_from_this_instance(&own));
+    let other = super::super::redis_runtime::test_runtime_event_payload(
+        "credentials_changed",
+        "another-instance",
+    );
+    assert!(!manager.runtime_event_is_from_this_instance(&other));
+    assert!(!manager.runtime_event_is_from_this_instance(r#"{"kind":"credentials_changed"}"#));
+    assert!(!manager.runtime_event_is_from_this_instance("not json"));
+}

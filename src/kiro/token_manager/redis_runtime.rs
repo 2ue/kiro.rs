@@ -46,26 +46,43 @@ fn redis_in_flight_lease_is_fresh(
     idle_ms <= max_age.as_millis()
 }
 
-fn runtime_event_payload(kind: &str, version: Option<i64>, reason: &str) -> String {
+fn runtime_event_payload(
+    kind: &str,
+    version: Option<i64>,
+    reason: &str,
+    source_instance_id: &str,
+) -> String {
     serde_json::json!({
         "kind": kind,
         "version": version,
         "reason": reason,
+        "sourceInstanceId": source_instance_id,
         "changedAt": Utc::now().to_rfc3339(),
     })
     .to_string()
+}
+
+#[cfg(test)]
+pub(super) fn test_runtime_event_payload(kind: &str, source_instance_id: &str) -> String {
+    runtime_event_payload(kind, None, "test", source_instance_id)
 }
 
 pub(super) fn publish_runtime_config_changed(
     redis_store: Option<&Arc<RedisStore>>,
     version: Option<i64>,
     reason: &str,
+    source_instance_id: &str,
 ) {
     let Some(redis) = redis_store else {
         return;
     };
     let redis = redis.clone();
-    let payload = runtime_event_payload("runtime_config_changed", version, reason);
+    let payload = runtime_event_payload(
+        "runtime_config_changed",
+        version,
+        reason,
+        source_instance_id,
+    );
     spawn_best_effort_storage_task("发布 Redis 运行配置变更通知", async move {
         redis.publish_runtime_config_changed(payload).await
     });
@@ -75,6 +92,7 @@ pub(super) fn publish_credentials_changed(
     postgres_store: Option<&Arc<PostgresStore>>,
     redis_store: Option<&Arc<RedisStore>>,
     reason: &str,
+    source_instance_id: &str,
 ) {
     if let Some(store) = postgres_store {
         let store = store.clone();
@@ -94,7 +112,7 @@ pub(super) fn publish_credentials_changed(
         return;
     };
     let redis = redis.clone();
-    let payload = runtime_event_payload("credentials_changed", None, reason);
+    let payload = runtime_event_payload("credentials_changed", None, reason, source_instance_id);
     spawn_best_effort_storage_task("发布 Redis 凭据变更通知", async move {
         redis.publish_credentials_changed(payload).await
     });
