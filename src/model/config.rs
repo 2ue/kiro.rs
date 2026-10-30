@@ -5548,6 +5548,11 @@ pub struct Config {
     #[serde(default = "default_audit_log_retention_days")]
     pub audit_log_retention_days: u32,
 
+    /// 是否开放免登录的只读号池页面（`/ui/pool`，接口 `/api/public/pool`）。默认关闭：
+    /// 关闭时接口返回 404，升级后不会对外暴露任何账号信息。
+    #[serde(default)]
+    pub public_pool_view_enabled: bool,
+
     /// 外部备用号池和直连/预检 fallback 策略。
     #[serde(default)]
     pub external_pools: ExternalPoolsConfig,
@@ -6760,6 +6765,7 @@ impl Default for Config {
             expose_proxy_warnings: default_expose_proxy_warnings(),
             audit_log_retention_enabled: false,
             audit_log_retention_days: default_audit_log_retention_days(),
+            public_pool_view_enabled: false,
             external_pools: ExternalPoolsConfig::default(),
             config_path: None,
         }
@@ -7577,6 +7583,8 @@ mod tests {
         // Audit cleanup stays off until an operator turns it on, so upgrades delete nothing.
         assert!(!config.audit_log_retention_enabled);
         assert_eq!(config.audit_log_retention_days, 15);
+        // The public pool page stays closed until an operator opens it.
+        assert!(!config.public_pool_view_enabled);
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
         assert!(config.payload_guard_enabled);

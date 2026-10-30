@@ -43,6 +43,7 @@ import {
 } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import { storage } from '@/lib/storage'
+import { usePublicPoolConfig, useSetPublicPoolConfig } from '@/hooks/use-credentials'
 import {
   createRequestApiKey,
   deleteRequestApiKey,
@@ -506,6 +507,60 @@ function RequestKeysSection({
 
 // ─── SecurityPage ─────────────────────────────────────────────────────────────
 
+/** The switch for the public read-only pool page at `/ui/pool`; off by default. */
+function PublicPoolSection() {
+  const config = usePublicPoolConfig()
+  const update = useSetPublicPoolConfig()
+  const confirm = useConfirm()
+  const enabled = config.data?.enabled ?? false
+  const url = typeof window === 'undefined' ? '/ui/pool' : `${window.location.origin}/ui/pool`
+
+  const toggle = async (next: boolean) => {
+    if (next) {
+      const ok = await confirm({
+        title: '开放只读号池页面？',
+        message: '开放后，任何拿到链接的人都能免登录查看账号状态、额度、积分消耗和调度负载。页面不返回 token、代理、完整邮箱、错误原文和费用，也不能做任何操作。',
+        confirmText: '开放',
+      })
+      if (!ok) return
+    }
+    update.mutate({ enabled: next }, {
+      onSuccess: () => toast.success(next ? '只读号池页面已开放' : '只读号池页面已关闭'),
+      onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  return (
+    <SectionCard
+      title="只读号池页面"
+      description="给下级代理看的免登录账号列表。默认关闭，关闭时页面和接口都返回 404。"
+    >
+      <div className="flex flex-col gap-3">
+        <label className="flex items-center justify-between gap-3 rounded-lg border p-3">
+          <span className="min-w-0">
+            <span className="block text-sm font-medium">开放页面</span>
+            <span className="block text-xs text-muted-foreground">
+              只展示状态、额度、积分消耗和调度负载；邮箱中间打码，按钮都不可用。
+            </span>
+          </span>
+          <Switch
+            checked={enabled}
+            disabled={config.isLoading || update.isPending}
+            onCheckedChange={(next) => void toggle(next)}
+            aria-label="开放只读号池页面"
+          />
+        </label>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Input readOnly aria-label="只读号池页面地址" className="w-full min-w-0 flex-1 font-mono text-xs" value={url} />
+          <Button size="sm" variant="outline" className="sm:shrink-0" onClick={() => copyText('页面地址', url)}>
+            <Copy className="h-4 w-4" />复制
+          </Button>
+        </div>
+      </div>
+    </SectionCard>
+  )
+}
+
 export function SecurityPage() {
   const [keys, setKeys] = useState<AccessKeysResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -752,6 +807,8 @@ export function SecurityPage() {
           </div>
         </div>
       </SectionCard>
+
+      <PublicPoolSection />
 
       {/* 接入说明 */}
       <SectionCard title="客户端接入说明" description="如何配置客户端使用本代理">

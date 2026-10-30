@@ -916,7 +916,7 @@ fn persisted_credit_snapshot_only_infers_fixed_overage_bonus() {
     assert_eq!(trial_like_extra_limit.bonus, 0.0);
 }
 
-fn credential_item(
+pub(in crate::admin) fn credential_item(
     id: u64,
     disabled: bool,
     created_at: Option<&str>,

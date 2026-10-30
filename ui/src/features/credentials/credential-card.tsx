@@ -159,7 +159,7 @@ const METER_FILL_CLASS: Record<MeterTone, string> = { warning: 'bg-warning', ful
  * `percent: null` means the value has no limit: the bar's room is kept so cells in a row stay
  * aligned, but nothing is drawn.
  */
-function Meter({
+export function Meter({
   label,
   value,
   tone,
@@ -249,7 +249,7 @@ function DetailSection({ title, children }: { title: string; children: React.Rea
  * snowflake; a full account (concurrency or RPM) is amber. Each of them also colours the card's top
  * edge, so a page of cards shows at a glance which accounts are broken and which are only waiting.
  */
-const STATE_STYLE: Record<CredentialStateKind, {
+export const STATE_STYLE: Record<CredentialStateKind, {
   tone: 'neutral' | 'success' | 'warning' | 'error' | 'info'
   badgeClass?: string
   icon?: LucideIcon
@@ -270,7 +270,7 @@ const STATE_STYLE: Record<CredentialStateKind, {
 }
 
 /** Counts a snapshot's remaining seconds down every second until the next refresh replaces it. */
-function useCountdown(secs: number | undefined): number | undefined {
+export function useCountdown(secs: number | undefined): number | undefined {
   const [anchor, setAnchor] = useState(() => ({ secs, at: Date.now() }))
   const [, setTick] = useState(0)
   if (anchor.secs !== secs) setAnchor({ secs, at: Date.now() })
@@ -284,7 +284,7 @@ function useCountdown(secs: number | undefined): number | undefined {
   return remaining
 }
 
-function StatusBadge({ status, remaining }: { status: CredentialStatusMeta; remaining?: number }) {
+export function StatusBadge({ status, remaining }: { status: CredentialStatusMeta; remaining?: number }) {
   const style = STATE_STYLE[status.kind]
   const Icon = style.icon
   const suffix = status.usage ?? (remaining !== undefined ? (remaining > 0 ? formatRemaining(remaining) : undefined) : undefined)
@@ -298,7 +298,7 @@ function StatusBadge({ status, remaining }: { status: CredentialStatusMeta; rema
 }
 
 /** Each plan gets its own colour so a page of cards can be read by tier at a glance. */
-const SUBSCRIPTION_CLASS: Record<CredentialSubscriptionKey, string> = {
+export const SUBSCRIPTION_CLASS: Record<CredentialSubscriptionKey, string> = {
   free: 'bg-muted text-muted-foreground',
   students: 'bg-sky-500/10 text-sky-700 dark:text-sky-300',
   pro: 'bg-primary/10 text-primary',
@@ -308,7 +308,7 @@ const SUBSCRIPTION_CLASS: Record<CredentialSubscriptionKey, string> = {
   unknown: 'bg-muted text-muted-foreground',
 }
 
-const AUTH_CLASS: Record<string, string> = {
+export const AUTH_CLASS: Record<string, string> = {
   social: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
   idc: 'bg-blue-500/10 text-blue-700 dark:text-blue-300',
   external_idp: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',

@@ -2506,6 +2506,11 @@ impl MultiTokenManager {
         self.config.lock().credential_empty_turn_cooldown_enabled
     }
 
+    /// 是否开放免登录的只读号池页面（默认关闭）。
+    pub fn public_pool_view_enabled(&self) -> bool {
+        self.config.lock().public_pool_view_enabled
+    }
+
     fn runtime_capacity_change_should_reset_warmup(previous: &Config, current: &Config) -> bool {
         previous.credential_rpm != current.credential_rpm
             || previous.credential_max_concurrent_requests

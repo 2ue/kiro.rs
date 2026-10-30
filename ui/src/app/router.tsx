@@ -48,6 +48,10 @@ const SecurityPage = React.lazy(() =>
 const InventoryPage = React.lazy(() =>
   import('@/features/inventory/inventory-page').then((m) => ({ default: m.InventoryPage }))
 )
+// Read-only pool page for viewers without the admin key; it sits outside the login gate.
+const PublicPoolPage = React.lazy(() =>
+  import('@/features/public-pool/public-pool-page').then((m) => ({ default: m.PublicPoolPage }))
+)
 // Development-only gallery of every credential card state; absent from production builds.
 const CredentialCardPreview = import.meta.env.DEV
   ? React.lazy(() =>
@@ -69,6 +73,7 @@ function Lazy({ children }: { children: React.ReactNode }) {
 
 const router = createBrowserRouter(
   [
+    { path: '/pool', element: <Lazy><PublicPoolPage /></Lazy> },
     {
       path: '/',
       element: (

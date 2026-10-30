@@ -1,6 +1,7 @@
 import { api } from '@/api/http'
 export { validateAdminApiKey } from '@/api/http'
 import type {
+  PublicPoolConfig,
   AddCredentialRequest,
   AddCredentialResponse,
   BalanceResponse,
@@ -396,6 +397,16 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
 
 export async function getSystemVersion(): Promise<SystemVersionResponse> {
   const { data } = await api.get<SystemVersionResponse>('/system/version')
+  return data
+}
+
+export async function getPublicPoolConfig(): Promise<PublicPoolConfig> {
+  const { data } = await api.get<PublicPoolConfig>('/public-pool')
+  return data
+}
+
+export async function setPublicPoolConfig(config: PublicPoolConfig): Promise<PublicPoolConfig> {
+  const { data } = await api.put<PublicPoolConfig>('/public-pool', config)
   return data
 }
 

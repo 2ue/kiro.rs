@@ -723,6 +723,8 @@ async fn async_main() {
             }
             let admin_state =
                 admin::AdminState::with_key_store(admin_api_key_store.clone(), admin_service);
+            // 只读号池视图免登录，默认关闭；它只借用 AdminService 的快照，不挂 Admin 中间件。
+            let public_pool_app = admin::create_public_pool_router(admin_state.service.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建管理后台 UI 路由
@@ -734,6 +736,7 @@ async fn async_main() {
             tracing::info!("New UI 已启用: /ui");
             anthropic_app
                 .nest("/api/admin", admin_app)
+                .nest("/api/public", public_pool_app)
                 .route("/admin/", get(admin_ui_index_redirect))
                 .route("/ui/", get(new_ui_index_redirect))
                 .nest("/admin", admin_ui_app)
@@ -791,6 +794,8 @@ async fn async_main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("Public API（默认关闭）:");
+        tracing::info!("  GET  /api/public/pool");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
         tracing::info!("  GET  /ui");
