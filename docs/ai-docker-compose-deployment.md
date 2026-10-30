@@ -111,12 +111,30 @@ services:
       - ./config:/app/config
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8990/readyz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
     restart: unless-stopped
 
 volumes:
   kiro-rs-postgres-data:
   kiro-rs-redis-data:
 ```
+
+应用服务的三项设置：
+
+- `healthcheck` 用 `/readyz`：除了 PgSQL、Redis 连通性，还检查调度是否在推进。有请求在排队、但 60 秒内没有任何请求拿到账号时返回 503，容器显示为 unhealthy。只检查端口（`nc -z`）发现不了这种情况。
+- `stop_grace_period: 60s`：docker 默认 10 秒后强杀，短于应用 30 秒的优雅退出。应用收到 SIGTERM 时会先释放自己在 Redis 中的并发占用；即使被强杀，其他实例或重启后的新实例也会在约 30 秒内回收。
+- `logging` 限制单个日志文件大小并保留多个文件。不要在升级时删除旧容器日志，事故排查需要它们。
 
 PostgreSQL 18 官方镜像默认使用版本化的数据目录，compose 中挂载父目录
 `/var/lib/postgresql`，不要继续把数据卷直接挂到旧路径

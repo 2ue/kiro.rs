@@ -10,13 +10,24 @@ services:
       - ./logs:/app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # /readyz also fails when requests sit in the dispatch queue and none is dispatched for
+    # 60 seconds, so a wedged scheduler shows up as unhealthy instead of staying green.
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "nc -z 127.0.0.1 8990 || exit 1"
+          "wget -q -O /dev/null http://127.0.0.1:8990/readyz || exit 1"
         ]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 20s
+    # Longer than the 30-second graceful shutdown; concurrency leases are released on SIGTERM.
+    stop_grace_period: 60s
+    # Keep logs across restarts within a bounded size, so an incident can still be read after
+    # the container is recreated.
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"

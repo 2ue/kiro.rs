@@ -517,6 +517,15 @@ impl StatsFlushWorkerHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchProgressStatus {
+    pub progressing: bool,
+    pub queued_requests: u32,
+    pub dispatch_rate_per_sec: f64,
+    pub secs_since_last_dispatch: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RiskControlReportOutcome {
     pub has_available_credentials: bool,
@@ -1034,6 +1043,7 @@ pub struct MultiTokenManager {
     next_in_flight_lease_id: AtomicU64,
     queued_requests: Arc<AtomicU32>,
     dispatch_progress: DispatchProgress,
+    started_at: Instant,
     /// Serializes only candidate selection plus the local provisional reservation.
     /// Redis and upstream awaits always run after this guard is dropped.
     selection_reservation_gate: Mutex<()>,
@@ -2477,6 +2487,7 @@ impl MultiTokenManager {
             next_in_flight_lease_id: AtomicU64::new(initial_lease_id),
             queued_requests: Arc::new(AtomicU32::new(0)),
             dispatch_progress: DispatchProgress::default(),
+            started_at: Instant::now(),
             selection_reservation_gate: Mutex::new(()),
             tier_sticky_migration_last: Mutex::new(None),
             auto_heal_gate: TokioMutex::new(()),
@@ -3876,6 +3887,28 @@ impl MultiTokenManager {
             self.dispatch_progress
                 .queue_full_retry_after_secs(queued, Instant::now()),
         )
+    }
+
+    /// Whether queued requests are turning into dispatches. `false` when requests have been
+    /// waiting in the dispatch queue and nothing was dispatched for `stall_after`, which is
+    /// what a wedged scheduler looks like from the outside.
+    pub fn dispatch_is_progressing(&self, stall_after: StdDuration) -> DispatchProgressStatus {
+        let queued = self.queued_requests.load(Ordering::Acquire);
+        let now = Instant::now();
+        let since_last_dispatch = self
+            .dispatch_progress
+            .last_dispatch_at()
+            .map(|at| now.saturating_duration_since(at));
+        let since_start = now.saturating_duration_since(self.started_at);
+        let stalled = queued > 0
+            && since_last_dispatch.unwrap_or(since_start) >= stall_after
+            && since_start >= stall_after;
+        DispatchProgressStatus {
+            progressing: !stalled,
+            queued_requests: queued,
+            dispatch_rate_per_sec: self.dispatch_progress.recent_rate_per_sec(now),
+            secs_since_last_dispatch: since_last_dispatch.map(|elapsed| elapsed.as_secs()),
+        }
     }
 
     /// The queue is full: tell the client to come back once the current queue has had time to

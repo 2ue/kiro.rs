@@ -15211,3 +15211,32 @@ async fn killed_instance_leases_are_reclaimed_by_a_live_instance_and_shutdown_re
     })
     .await;
 }
+
+#[test]
+fn dispatch_progress_reports_a_stalled_queue() {
+    let manager = queue_test_manager(1, 10);
+    let stall_after = StdDuration::from_secs(60);
+    assert!(
+        manager.dispatch_is_progressing(stall_after).progressing,
+        "empty queue"
+    );
+
+    manager.set_queued_requests_for_test(3);
+    assert!(
+        manager.dispatch_is_progressing(stall_after).progressing,
+        "a just-started process is not stalled yet"
+    );
+    assert!(
+        !manager
+            .dispatch_is_progressing(StdDuration::ZERO)
+            .progressing,
+        "queued requests with no dispatch at all"
+    );
+
+    manager.dispatch_progress.record_dispatch(Instant::now());
+    let status = manager.dispatch_is_progressing(StdDuration::from_millis(500));
+    assert!(status.progressing);
+    assert_eq!(status.queued_requests, 3);
+    assert_eq!(status.secs_since_last_dispatch, Some(0));
+    manager.set_queued_requests_for_test(0);
+}

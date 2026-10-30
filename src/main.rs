@@ -749,6 +749,7 @@ async fn async_main() {
         postgres_store: postgres_store.clone(),
         redis_store: redis_store.clone(),
         runtime_events: runtime_event_health.clone(),
+        token_manager: token_manager.clone(),
     });
     let app = app.merge(create_health_router(health_state));
 
@@ -1329,7 +1330,11 @@ struct AppHealthState {
     postgres_store: Arc<PostgresStore>,
     redis_store: Arc<RedisStore>,
     runtime_events: Arc<RuntimeEventHealth>,
+    token_manager: Arc<kiro::token_manager::MultiTokenManager>,
 }
+
+/// Queued requests with no dispatch for this long mean the scheduler is not moving.
+const DISPATCH_STALL_AFTER: StdDuration = StdDuration::from_secs(60);
 
 fn create_health_router(state: Arc<AppHealthState>) -> Router {
     Router::new()
@@ -1350,7 +1355,10 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
         .runtime_events
         .redis_events_connected
         .load(Ordering::Acquire);
-    let ready = postgres_ok && redis_ok && redis_events_connected;
+    let dispatch = state
+        .token_manager
+        .dispatch_is_progressing(DISPATCH_STALL_AFTER);
+    let ready = postgres_ok && redis_ok && redis_events_connected && dispatch.progressing;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1364,8 +1372,10 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
             "checks": {
                 "postgres": postgres_ok,
                 "redis": redis_ok,
-                "redisRuntimeEvents": redis_events_connected
+                "redisRuntimeEvents": redis_events_connected,
+                "dispatchProgressing": dispatch.progressing
             },
+            "dispatch": dispatch,
             "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),
