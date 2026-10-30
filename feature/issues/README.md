@@ -35,7 +35,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 
 ## 当前权威专题
 
-- [本地账号调度：优先级、分散、熔断与 20:02 故障](scheduling-priority-circuit-20261029/README.md) - 2026-10-29；现网 59137 只读分析：预热份额和会话绑定绕过优先级；并发集中在少数账号；全池熔断被新导入账号误触发；20:02 负载突增加上游变慢，打满排队，600 秒等待和 sub2api 重试让过载持续约 10 分钟；强杀后 Redis 并发租约 15 分钟才回收。状态 `analyzed / not-implemented`。
+- [本地账号调度：优先级、分散、熔断与 20:02 故障](scheduling-priority-circuit-20261029/README.md) - 2026-10-29；现网 59137 只读分析：预热份额和会话绑定绕过优先级；并发集中在少数账号；全池熔断被新导入账号误触发；20:02 负载突增加上游变慢，打满排队，600 秒等待和 sub2api 重试让过载持续约 10 分钟；强杀后 Redis 并发租约 15 分钟才回收。状态 `implemented / not-merged / not-released`。
 - [tool_choice 注入策略在 thinking 中被复述](tool-choice-policy-leak-in-xml-thinking-20261028.md) - 2026-10-28；P1；注入文案改为不带标签和"不要提及"元指令的普通句子，none / any / tool / 禁用并行仍然生效；本地 JSON 账号和现网账号 opus-5.5 都不再复述标签；状态 `fixed / merged-main / not-released`。身份提示词在 thinking 里被分析的问题仍开放。
 - [Claude Code 协议与 Kiro 协议互转审计（2026-09-28）](protocol-conversion-audit-20260928/README.md)：共 25 个单问题文档，覆盖请求、响应、流式和辅助接口的互转偏差，包括 usage 页面样本 `consecutive assistant messages contain multiple native reasoning blocks` 的本地前置 400（P22），以及 P22 之外的 reasoning 多 block 缺口（P23）。
 - [外部池质量感知调度零派发活锁](external-pool-quality-scheduling-zero-dispatch-20260918.md) - 2026-09-18；P0；`v0.0.162`/`v0.0.163`（二者代码一致）外部池零派发、usage 无记录、切回 `v0.0.161` 立即恢复。已确认升级兼容缺陷：质量调度默认值曾为开启，普通瞬态失败可升级池级 hard cooldown；已确认并修复质量采样与正式 Redis 调度链路的资源隔离、相对 cohort probation、selector 空转兜底和无样本 legacy 回退。现网 coordinator/Redis 争用是否为零 upstream 派发的最终根因仍未闭环，状态见专项文档。

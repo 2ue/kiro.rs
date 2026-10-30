@@ -8,17 +8,18 @@
 
 ## 模块拆分
 
-外层流程最容易出 bug（门锁、槽位预占、Redis 并发租约、RPM 预约、Token 刷新），保持不动。只把每种模式自己的决策抽出来：
+外层流程最容易出 bug（门锁、槽位预占、Redis 并发租约、RPM 预约、Token 刷新），保持不动。只把每种模式自己的决策抽出来，放在 `src/kiro/token_manager/selection.rs`：
 
-| 模块 | 内容 |
+| 内容 | 说明 |
 | --- | --- |
-| `candidates`（共用） | 可调度过滤：启用、额度、模型、代理、冷却、RPM、并发、路由排除、空回排除；同时产出拒绝原因，selectionFailure 直接复用 |
-| `warmup` / `fast`（共用） | 预热分组、Fast 档筛选，写成纯函数，由策略决定在哪一步调用 |
-| `sticky`（共用） | 绑定的读写、迁移、限速；是否沿用绑定由策略决定 |
-| `strategy` trait | `select`（从候选中选号）、`sticky_decision`（沿用、迁移、借号）、`slot_race_alternatives`（槽位竞争后的备选范围） |
-| `priority` / `balanced` / `health_weighted` | 每个模式一个文件；health 与 weighted 共用一份实现，两个模式名都保留 |
+| `LoadBalancingMode` 枚举 | 四个模式名都保留；配置校验、运行配置更新、Admin 接口都拒绝未知值 |
+| `select_candidate` | 纯函数：目录优先 → Fast 档 → priority 模式的首选档 → 预热分组 → 档内排序，可脱离拿号流程单独测试 |
+| `spread_key` | 同档排序键（priority 与 balanced 共用） |
+| `StickyTier` | 绑定所在档位，判断是否迁回更优档 |
 
-模式改为枚举，配置校验时拒绝未知值。
+health_balanced 与 weighted_least_inflight 共用一份打分实现；重复的排序键、打分公式和 `effective_max_concurrent_requests` 已删除。可调度过滤（启用、额度、模型、代理、冷却、RPM、并发、排除）仍在 manager 中，由调用方传入候选。
+
+没有引入策略 trait：四种模式只在"是否限定首选档"和"排序还是加权随机"两处不同，枚举上的两个方法已经能表达，trait 会多一层间接而没有收益。
 
 ## 优先级模式规则
 

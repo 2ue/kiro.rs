@@ -33,7 +33,9 @@ Redis 熔断（潜在问题，现网不生效）：
 - 由 `handlers.rs:2437-2462` 写入，除 `local_request_body_invalid` 外的所有可外部兜底的本地错误都计入，包括请求级的 `local_request_excluded_all`、`no_available_credentials`、`local_capacity_exhausted`。
 - 只在 `direct_policy_reason`（`external_pool.rs:6200-6215`）里读取，要求 `directExternalOnLocalMaintenance=true`（现网为 false）。即使打开，它也只改原因标签、不改变是否直连外部，却让每个请求多一次 Redis 读。
 
-## 解决方案（建议）
+## 解决方案
+
+已实现，提交和验收见 [07-implementation.md](07-implementation.md)。
 
 全池熔断要谨慎，不能连续错几次就打开：
 
@@ -43,6 +45,6 @@ Redis 熔断（潜在问题，现网不生效）：
 4. 打开时清空计数窗口；到期后进入半开状态，放少量探测请求，成功就关闭，失败就退避后再打开。
 5. 日志和 selectionFailure 记录真实可调度数；采样优先列出非 disabled 的账号。
 6. 统一默认值；旧配置字段兼容迁移。
-7. Redis 熔断只计入能归到具体账号的原因，或者直接去掉（它不影响路由，只改标签）。
+7. 删除 Redis 熔断：它只改一个默认关闭的标签，口径混杂，还让每个请求多一次 Redis 读。
 
-配置临时缓解（由用户操作）：调高 `localPoolCircuitOpenAfterFailures` 和 `localPoolCircuitRequireDistinctCredentials`（如 10 和 5），或者暂时关闭 `localPoolCircuitEnabled`（迁移版本 13 不会改回去）。
+新增配置 `localPoolCircuitMinRatioPercent`（默认 30）和 `localPoolCircuitHalfOpenProbes`（默认 3），窗口默认 300 秒、账号数默认 5。运行配置迁移 v14 把仍是旧默认值（60 秒、3 次、2 个账号）的配置升级为新默认值，改过的值保留。

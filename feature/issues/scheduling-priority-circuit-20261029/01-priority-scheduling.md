@@ -44,7 +44,9 @@
 
 与 RPM、并发、Fast、路由规则、模型、冷却无关（数据中均未起作用）。
 
-## 解决方案（建议）
+## 解决方案
+
+已实现，提交和验收见 [07-implementation.md](07-implementation.md)。
 
 代码（详见 [05-design-scheduler-modules.md](05-design-scheduler-modules.md)）：
 
