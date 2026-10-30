@@ -15199,6 +15199,13 @@ fn queue_test_manager(credentials: usize, max_queued: u32) -> Arc<MultiTokenMana
 #[tokio::test]
 async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate() {
     let manager = queue_test_manager(1, 2);
+    // About one dispatch per second over the last half minute.
+    let now = Instant::now();
+    for age in (1..=30u64).rev() {
+        manager
+            .dispatch_progress
+            .record_dispatch(now - StdDuration::from_secs(age));
+    }
     let mut holder = manager.acquire_context(None).await.unwrap();
     assert_eq!(
         manager.dispatch_queue_full_retry_after(),
@@ -15220,8 +15227,8 @@ async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate
     }
     assert_eq!(manager.queued_requests.load(Ordering::Acquire), 2);
 
-    // Nothing has been dispatched recently: the queue is not moving, ask for the longest wait.
-    assert_eq!(manager.dispatch_queue_full_retry_after(), Some(60));
+    // A queue of 2 at about one dispatch per second drains in about 2 s.
+    assert_eq!(manager.dispatch_queue_full_retry_after(), Some(2));
     let started = Instant::now();
     let error = match manager.acquire_context(None).await {
         Ok(mut ctx) => {
@@ -15235,7 +15242,7 @@ async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate
         "rejected without waiting"
     );
     assert!(error.contains("账号调度等待队列已满"), "{error}");
-    assert!(error.contains("retry_after_secs=60"), "{error}");
+    assert!(error.contains("retry_after_secs=2"), "{error}");
 
     // Queued requests move on as the slot frees up, in order, without waiting for a timeout.
     holder.release_in_flight();
@@ -15251,12 +15258,12 @@ async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate
     }
     assert_eq!(served, vec![1, 1]);
     assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
-    // Three dispatches in the last 30 seconds (0.1/s): a queue of 2 drains in about 20 s.
-    assert_eq!(
+    // Every dispatch is recorded: the three just made push the recent rate up.
+    assert!(
         manager
             .dispatch_progress
-            .queue_full_retry_after_secs(2, Instant::now()),
-        20
+            .recent_rate_per_sec(Instant::now())
+            > 1.0
     );
 }
 
@@ -15272,6 +15279,131 @@ async fn a_success_does_not_wake_every_queued_request() {
         "a plain success frees no slot by itself; the lease release wakes one waiter"
     );
     drop(ctx);
+}
+
+/// Production under load: every slot taken, an upstream 500 on one credential. The retry used to
+/// need a credential with a free slot right now, so under load the error went to the client
+/// although healthy credentials would free a slot within a second.
+#[tokio::test]
+async fn a_busy_healthy_credential_is_a_retry_target_but_a_cooling_one_is_not() {
+    let manager = queue_test_manager(3, 10);
+    let mut held: Vec<_> = Vec::new();
+    for _ in 0..3 {
+        held.push(manager.acquire_context(None).await.unwrap());
+    }
+    let failed = held[0].id;
+    let excluded = HashSet::from([failed]);
+
+    assert!(
+        !manager.has_alternate_usable_credential_cached(None, &excluded, failed),
+        "no other credential has a free slot"
+    );
+    assert!(
+        manager.has_alternate_retry_target_cached(None, &excluded, failed, true),
+        "a request that may wait can queue for a busy healthy credential"
+    );
+    assert!(
+        !manager.has_alternate_retry_target_cached(None, &excluded, failed, false),
+        "a fail-fast request cannot queue, so it still needs a free slot"
+    );
+
+    for ctx in &held[1..] {
+        manager
+            .report_transient_failure_kind(
+                ctx.id,
+                None,
+                TransientFailureKind::RateLimit,
+                None,
+                "429",
+            )
+            .unwrap();
+    }
+    assert!(
+        !manager.has_alternate_retry_target_cached(None, &excluded, failed, true),
+        "cooling credentials are no retry target, busy or not"
+    );
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+}
+
+/// A retry after a failed attempt gave its slot back; turning it away at a full queue would show
+/// the client an upstream error the pool can still absorb.
+#[tokio::test]
+async fn a_retry_queues_past_a_full_queue_and_a_new_request_does_not() {
+    let manager = queue_test_manager(1, 1);
+    let mut holder = manager.acquire_context(None).await.unwrap();
+    let waiter = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.acquire_context(None).await })
+    };
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 1 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 1);
+
+    let empty = HashSet::new();
+    let error = match manager
+        .acquire_context_for_dispatch(
+            None,
+            None,
+            &empty,
+            AcquireMode::WaitForCapacity,
+            DispatchAdmission::New,
+            1,
+            None,
+        )
+        .await
+    {
+        Ok(mut ctx) => {
+            ctx.release_in_flight();
+            panic!("a new request must be turned away at a full queue");
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("账号调度等待队列已满"), "{error}");
+
+    let retry = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .acquire_context_for_dispatch(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    AcquireMode::WaitForCapacity,
+                    DispatchAdmission::Retry,
+                    1,
+                    None,
+                )
+                .await
+        })
+    };
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 2 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(
+        manager.queued_requests.load(Ordering::Acquire),
+        2,
+        "the retry waits in the queue beside the queued request"
+    );
+
+    holder.release_in_flight();
+    for task in [waiter, retry] {
+        let mut ctx = tokio::time::timeout(StdDuration::from_secs(5), task)
+            .await
+            .expect("both queued dispatches are served as the slot frees up")
+            .unwrap()
+            .unwrap();
+        ctx.release_in_flight();
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

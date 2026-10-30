@@ -51,8 +51,8 @@ pub use storage_task::{
     shutdown_best_effort_storage_tasks,
 };
 pub use types::{
-    AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID,
-    TransientFailureKind,
+    AcquireMode, CallContext, CredentialAuthUpdate, DispatchAdmission,
+    EXTERNAL_CREDENTIAL_CONTEXT_ID, TransientFailureKind,
 };
 
 #[allow(unused_imports)]

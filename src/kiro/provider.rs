@@ -47,7 +47,7 @@ use crate::kiro::protocol::{
 use crate::kiro::retry_pipeline::{BerserkPlan, RotationCursor, RotationStep};
 use crate::kiro::token_manager::{
     AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind,
-    AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason,
+    AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason, DispatchAdmission,
     EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind, InFlightLeaseGuard, LocalPoolRouteState,
     LocalSchedulerErrorKind, MultiTokenManager, RefreshFailure, TokenRefreshAdmissionRejected,
     TransientFailureKind, local_scheduler_error_kind,
@@ -1231,7 +1231,9 @@ mod tests {
     use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::retry_pipeline::KIRO_ROTATION_REGIONS;
-    use crate::kiro::token_manager::{AcquireMode, AuxiliaryConcurrencyKind, MultiTokenManager};
+    use crate::kiro::token_manager::{
+        AcquireMode, AuxiliaryConcurrencyKind, DispatchAdmission, MultiTokenManager,
+    };
     use crate::model::config::Config;
 
     // ==================== 狂暴/端点轮换的 mock 上游调度测试 ====================
@@ -8151,6 +8153,133 @@ mod tests {
         assert_ne!(ids[1].1.as_deref(), Some("conv-429-continuation"));
     }
 
+    /// Mock scenario 2026-10-30 (30% upstream 500 at 40 concurrent requests, every slot taken):
+    /// 157 of 159 upstream errors reached the client because the retry needed a credential with
+    /// a free slot at that very moment. The retry now queues for a busy healthy credential and
+    /// is served once it frees its slot.
+    #[tokio::test]
+    async fn a_server_error_under_full_load_retries_on_a_busy_healthy_credential() {
+        let rule: RotationRule = Arc::new(|attempt: &RotationAttempt| {
+            if attempt.account == 1 {
+                RotationReply::ServerError
+            } else {
+                RotationReply::Success
+            }
+        });
+        let server = RotationServer::start(rule).await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.credential_max_concurrent_requests = 1;
+        config.credential_warmup_requests = 0;
+        config.dispatch_max_queued_requests = 1;
+        config.credential_dispatch_max_wait_secs = 10;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
+                .expect("full-load token manager"),
+        );
+        // Credential 2 is busy with another request, and one more request waits in the queue,
+        // so the queue is full when credential 1 fails.
+        let mut busy = manager
+            .acquire_context_for_dispatch(
+                None,
+                None,
+                &HashSet::from([1]),
+                AcquireMode::WaitForCapacity,
+                DispatchAdmission::New,
+                1,
+                None,
+            )
+            .await
+            .expect("occupy credential 2");
+        assert_eq!(busy.id, 2);
+        let queued = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .acquire_context_for_dispatch(
+                        None,
+                        None,
+                        &HashSet::from([1]),
+                        AcquireMode::WaitForCapacity,
+                        DispatchAdmission::New,
+                        1,
+                        None,
+                    )
+                    .await
+            })
+        };
+        let queued_requests = || {
+            manager
+                .dispatch_is_progressing(std::time::Duration::from_secs(3600))
+                .queued_requests
+        };
+        for _ in 0..200 {
+            if queued_requests() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(queued_requests(), 1, "the queue (limit 1) is full");
+
+        let provider = ide_provider_off_runtime(manager.clone()).await;
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "conv-full-load",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let call = tokio::spawn(async move {
+            provider
+                .call_api_with_context_with_request_id_and_attempt_budget(
+                    &request_body,
+                    Some("req-full-load"),
+                    AcquireMode::WaitForCapacity,
+                    1,
+                    Some("claude-sonnet-4"),
+                    Arc::new(InferenceAttemptBudget::new(4)),
+                    false,
+                )
+                .await
+                .map(|_| ())
+        });
+        // Let the call fail on credential 1 and queue its retry, then free credential 2.
+        for _ in 0..400 {
+            if !server.state.attempts().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !call.is_finished(),
+            "the retry must wait for the busy credential instead of failing"
+        );
+        busy.release_in_flight();
+        let mut queued = tokio::time::timeout(std::time::Duration::from_secs(10), queued)
+            .await
+            .expect("queued request served")
+            .unwrap()
+            .expect("queued request gets credential 2");
+        queued.release_in_flight();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("retried call finished")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        let accounts: Vec<u64> = server
+            .state
+            .attempts()
+            .into_iter()
+            .map(|attempt| attempt.account)
+            .collect();
+        assert_eq!(accounts, vec![1, 2]);
+    }
+
     #[test]
     fn refresh_kiro_request_identity_only_swaps_the_ids() {
         let body = r#"{"conversationState":{"agentContinuationId":"c-1","conversationId":"conv-1","currentMessage":{"userInputMessage":{"content":"conversationId conv-1"}}},"profileArn":"arn"}"#;
@@ -10368,25 +10497,27 @@ impl KiroProvider {
         }
     }
 
+    /// After an upstream failure on `credential_id`, excludes it for the rest of the request and
+    /// tells whether another credential can take the retry. `waits_for_capacity` lets a busy
+    /// but healthy credential count, see [`MultiTokenManager::has_alternate_retry_target_cached`].
     fn maybe_exclude_after_transient_failure(
         &self,
         model: Option<&str>,
         credential_id: u64,
         credential_label: &str,
         excluded_ids: &mut HashSet<u64>,
+        waits_for_capacity: bool,
     ) -> bool {
-        if excluded_ids.contains(&credential_id) {
-            return self.token_manager.has_alternate_usable_credential_cached(
-                model,
-                excluded_ids,
-                credential_id,
-            );
-        }
-        if self.token_manager.has_alternate_usable_credential_cached(
+        let has_target = self.token_manager.has_alternate_retry_target_cached(
             model,
             excluded_ids,
             credential_id,
-        ) {
+            waits_for_capacity,
+        );
+        if excluded_ids.contains(&credential_id) {
+            return has_target;
+        }
+        if has_target {
             tracing::warn!(
                 credential_id,
                 credential_label = %credential_label,
@@ -11676,11 +11807,16 @@ impl KiroProvider {
             let acquire_started_at = Instant::now();
             let acquire_result = self
                 .token_manager
-                .acquire_context_for_session_with_mode_and_auxiliary_budget(
+                .acquire_context_for_dispatch(
                     None,
                     None,
                     &excluded_ids,
                     AcquireMode::WaitForCapacity,
+                    if attempt > 0 {
+                        DispatchAdmission::Retry
+                    } else {
+                        DispatchAdmission::New
+                    },
                     1,
                     Some(auxiliary_attempt_budget.clone()),
                 )
@@ -11898,6 +12034,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
+                        true,
                     );
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries && retry_target_available {
@@ -12016,6 +12153,7 @@ impl KiroProvider {
                             ctx.id,
                             &credential_label,
                             &mut excluded_ids,
+                            true,
                         );
                     if attempt + 1 < max_retries && retry_target_available {
                         sleep(Self::retry_delay(attempt)).await;
@@ -12084,6 +12222,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
+                        true,
                     );
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries && retry_target_available {
@@ -12251,6 +12390,7 @@ impl KiroProvider {
                     ctx.id,
                     &credential_label,
                     &mut excluded_ids,
+                    true,
                 );
                 self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries && retry_target_available {
@@ -12495,6 +12635,7 @@ impl KiroProvider {
                     ctx.id,
                     &credential_label,
                     &mut excluded_ids,
+                    true,
                 );
                 self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries && retry_target_available {
@@ -12583,6 +12724,7 @@ impl KiroProvider {
                     ctx.id,
                     &credential_label,
                     &mut excluded_ids,
+                    true,
                 );
             self.finish_attempt(&mut ctx);
             if attempt + 1 < max_retries && retry_target_available {
@@ -12731,13 +12873,24 @@ impl KiroProvider {
             next_attempt += 1;
             // 获取调用上下文（绑定 index、credentials、token）
             let acquire_started_at = Instant::now();
+            // A stream retried before its first downstream event re-enters this loop with the
+            // same budget, so earlier local sends of the request count too.
+            let admission = if attempt > 0
+                || inference_attempt_budget
+                    .is_some_and(|budget| budget.snapshot().local_attempts > 0)
+            {
+                DispatchAdmission::Retry
+            } else {
+                DispatchAdmission::New
+            };
             let acquire_result = self
                 .token_manager
-                .acquire_context_for_session_with_mode_and_auxiliary_budget(
+                .acquire_context_for_dispatch(
                     model.as_deref(),
                     conversation_id.as_deref(),
                     &excluded_ids,
                     acquire_mode,
+                    admission,
                     capacity_weight_units,
                     Some(auxiliary_attempt_budget.clone()),
                 )
@@ -13022,6 +13175,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
+                        acquire_mode.waits_for_capacity(),
                     );
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries && retry_target_available {
@@ -13196,6 +13350,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
+                        acquire_mode.waits_for_capacity(),
                     );
                     can_retry &= retry_target_available;
                     self.finish_attempt(&mut ctx);
@@ -13312,6 +13467,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
+                        acquire_mode.waits_for_capacity(),
                     );
                     can_retry &= retry_target_available;
                     last_error = Some(anyhow::anyhow!(message.clone()));
@@ -13402,6 +13558,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
+                        acquire_mode.waits_for_capacity(),
                     );
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries && retry_target_available {
@@ -13496,6 +13653,7 @@ impl KiroProvider {
                     ctx.id,
                     &credential_label,
                     &mut excluded_ids,
+                    acquire_mode.waits_for_capacity(),
                 );
                 self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries && retry_target_available {
@@ -14190,6 +14348,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
+                        acquire_mode.waits_for_capacity(),
                     );
                     self.finish_attempt(&mut ctx);
                     if can_retry && retry_target_available {
@@ -14926,6 +15085,7 @@ impl KiroProvider {
                     ctx.id,
                     &credential_label,
                     &mut excluded_ids,
+                    acquire_mode.waits_for_capacity(),
                 );
                 // 优先换号：仅当本轮所有账号都已被排除（无可用备选）时，
                 // 才推进到下一个 region，再不行才推进到下一轮。
