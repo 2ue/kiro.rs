@@ -829,11 +829,17 @@ impl PostgresStore {
                 let schema = schema_for_connect.clone();
                 Box::pin(async move {
                     sqlx::query(&format!(r#"SET search_path TO "{}""#, schema))
-                        .execute(conn)
+                        .execute(&mut *conn)
                         .await?;
+                    sqlx::query(&format!(
+                        "SET idle_in_transaction_session_timeout = {IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS}"
+                    ))
+                    .execute(&mut *conn)
+                    .await?;
                     Ok(())
                 })
             })
+            .after_release(|conn, _meta| Box::pin(async move { outside_transaction(conn).await }))
             .connect(url)
             .await?;
         let store = Self {
@@ -867,11 +873,17 @@ impl PostgresStore {
                 let schema = schema_for_connect.clone();
                 Box::pin(async move {
                     sqlx::query(&format!(r#"SET search_path TO "{}""#, schema))
-                        .execute(conn)
+                        .execute(&mut *conn)
                         .await?;
+                    sqlx::query(&format!(
+                        "SET idle_in_transaction_session_timeout = {IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS}"
+                    ))
+                    .execute(&mut *conn)
+                    .await?;
                     Ok(())
                 })
             })
+            .after_release(|conn, _meta| Box::pin(async move { outside_transaction(conn).await }))
             .connect(url)
             .await?;
         Ok(Self {
@@ -904,11 +916,17 @@ impl PostgresStore {
                 let schema = schema_for_connect.clone();
                 Box::pin(async move {
                     sqlx::query(&format!(r#"SET search_path TO "{}""#, schema))
-                        .execute(conn)
+                        .execute(&mut *conn)
                         .await?;
+                    sqlx::query(&format!(
+                        "SET idle_in_transaction_session_timeout = {IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS}"
+                    ))
+                    .execute(&mut *conn)
+                    .await?;
                     Ok(())
                 })
             })
+            .after_release(|conn, _meta| Box::pin(async move { outside_transaction(conn).await }))
             .connect(url)
             .await?;
         Ok(Self {
