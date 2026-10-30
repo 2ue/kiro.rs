@@ -1029,7 +1029,7 @@ pub struct MultiTokenManager {
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
     /// Active bound sessions per credential, recomputed at most every
     /// `BOUND_SESSION_COUNT_CACHE_TTL` and dropped whenever a binding changes.
-    bound_session_counts: Mutex<Option<(Instant, Arc<HashMap<u64, u32>>)>>,
+    bound_session_counts: Mutex<Option<(Instant, BoundSessionCounts)>>,
     /// In-flight requests per (session, credential) on this instance.
     session_concurrency: SessionConcurrency,
     /// 凭据容量 credit 与广播 generation；多槽释放不会折叠成一个通知。
@@ -1094,6 +1094,9 @@ const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_mi
 /// the Fast tier immediately.
 const TIER_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const BOUND_SESSION_COUNT_CACHE_TTL: StdDuration = StdDuration::from_millis(500);
+
+/// Active bound sessions per credential id.
+type BoundSessionCounts = Arc<HashMap<u64, u32>>;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SCHEDULER_INSTANCE_HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(5);
 /// A killed instance's leases are reclaimed at most this long after its last heartbeat.
@@ -5872,7 +5875,7 @@ impl MultiTokenManager {
             let is_better = |entry: &CredentialEntry| {
                 StickyTier::of(&entry.credentials).is_better_than(bound, compare_priority)
             };
-            if !entries.iter().any(|entry| is_better(entry)) {
+            if !entries.iter().any(&is_better) {
                 return false;
             }
             let proxy_resources = self.proxy_resources.lock();
@@ -5997,7 +6000,7 @@ impl MultiTokenManager {
     /// Sessions bound to each credential that sent a request in the last
     /// `ACTIVE_SESSION_WINDOW_SECS`. Counts come from this instance's binding cache, so with
     /// several instances each one evens out the sessions it serves.
-    fn active_bound_session_counts(&self) -> Arc<HashMap<u64, u32>> {
+    fn active_bound_session_counts(&self) -> BoundSessionCounts {
         let now = Instant::now();
         if let Some((computed_at, counts)) = self.bound_session_counts.lock().as_ref() {
             if now.saturating_duration_since(*computed_at) < BOUND_SESSION_COUNT_CACHE_TTL {
