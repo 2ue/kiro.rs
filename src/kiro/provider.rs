@@ -8795,8 +8795,8 @@ impl KiroProvider {
             .local_pool_route_state_fresh_for_route(model, route)
     }
 
-    pub fn dispatch_queue_full_retry_after(&self) -> Option<u64> {
-        self.token_manager.dispatch_queue_full_retry_after()
+    pub fn dispatch_queue_full_retry_after(&self, model: Option<&str>) -> Option<u64> {
+        self.token_manager.dispatch_queue_full_retry_after(model)
     }
 
     pub fn local_pool_route_state_cached_for_route(
