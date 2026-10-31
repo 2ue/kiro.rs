@@ -9992,8 +9992,12 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
 
 /// Requests follow the route's cache strategy only when Anthropic could return cache usage for
 /// them; the others pass upstream usage through, streaming or not.
+/// The official cache conditions (a cache_control breakpoint and a prefix at the model minimum)
+/// are checked only when the route turns them on, separately for streaming and non-streaming
+/// requests. Both switches are off by default: a request follows the route strategy whether or not
+/// it is marked, and only a request shorter than the model minimum as a whole stays uncached.
 #[test]
-fn non_stream_cache_route_follows_the_request_not_only_the_route() {
+fn strict_cache_eligibility_is_off_by_default_and_switchable_per_stream_kind() {
     let state = AppState::new(
         Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
         true,
@@ -10011,6 +10015,13 @@ fn non_stream_cache_route_follows_the_request_not_only_the_route() {
     assert_eq!(
         route.policy.cache_type,
         PromptCacheStrategyType::CurrentHighCache
+    );
+    assert!(!route.policy.reported_usage.strict_cache_eligibility_stream);
+    assert!(
+        !route
+            .policy
+            .reported_usage
+            .strict_cache_eligibility_non_stream
     );
     let long = "You are a helpful coding assistant with deep knowledge of Go, Rust and Python. "
         .repeat(80);
@@ -10038,45 +10049,84 @@ fn non_stream_cache_route_follows_the_request_not_only_the_route() {
         route.policy.cache_type == PromptCacheStrategyType::CurrentHighCache
             && route.policy.reported_usage.enabled
     };
+    let passthrough = |route: &ResolvedCacheRoutePolicy| {
+        route.policy.cache_type == PromptCacheStrategyType::NoCache
+            && !route.policy.reported_usage.enabled
+            && !route.policy.simulation.enabled
+            && route.namespace.is_none()
+    };
     let model = "claude-sonnet-4-5";
+    // (label, marked, system text, top-level cache_control, passes the strict check,
+    //  long enough as a whole request)
+    let cases = [
+        ("marked", true, long.as_str(), false, true, true),
+        ("automatic", false, long.as_str(), true, true, true),
+        ("unmarked", false, long.as_str(), false, false, true),
+        // The marker sits on a short block; the request as a whole is long.
+        (
+            "short marker",
+            true,
+            "You are a classifier.",
+            false,
+            false,
+            true,
+        ),
+        ("tiny", false, "Reply with one word.", false, false, false),
+    ];
 
-    // Marked prefix above the minimum: shaped by the route strategy, like streaming.
-    let qualified =
-        cache_route_for_local_request(route.clone(), &request(false, true, &long), false, model);
-    assert!(shaped(&qualified));
-    // Top-level cache_control (automatic caching) qualifies an unmarked body.
-    let automatic =
-        cache_route_for_local_request(route.clone(), &request(false, false, &long), true, model);
-    assert!(shaped(&automatic));
-
-    // No cache_control, or a marked prefix below the minimum: upstream usage passes through.
-    for (label, req) in [
-        ("unmarked", request(false, false, &long)),
-        ("too short", request(false, true, "You are a classifier.")),
-    ] {
-        let passthrough = cache_route_for_local_request(route.clone(), &req, false, model);
-        assert_eq!(
-            passthrough.policy.cache_type,
-            PromptCacheStrategyType::NoCache,
-            "{label}"
-        );
-        assert!(!passthrough.policy.reported_usage.enabled, "{label}");
-        assert!(!passthrough.policy.simulation.enabled, "{label}");
-        assert!(passthrough.namespace.is_none(), "{label}");
+    // Default: marked or not, a request long enough as a whole follows the route strategy; a
+    // request shorter than the model minimum stays uncached either way.
+    for stream in [true, false] {
+        for (label, marked, text, top_level, _, long_enough) in cases {
+            let mut req = request(stream, marked, text);
+            if label == "short marker" {
+                req.messages[0].content = json!(long.as_str());
+            }
+            let resolved = cache_route_for_local_request(route.clone(), &req, top_level, model);
+            if long_enough {
+                assert!(shaped(&resolved), "default stream={stream} {label}");
+            } else {
+                assert!(passthrough(&resolved), "default stream={stream} {label}");
+            }
+        }
     }
 
-    // Streaming follows the same rule: an unmarked stream keeps the upstream usage (it used to be
-    // reported with cache writes), a marked one above the minimum is shaped.
-    let stream =
-        cache_route_for_local_request(route.clone(), &request(true, false, "short"), false, model);
-    assert_eq!(stream.policy.cache_type, PromptCacheStrategyType::NoCache);
-    assert!(!stream.policy.reported_usage.enabled);
-    let stream_marked =
-        cache_route_for_local_request(route.clone(), &request(true, true, &long), false, model);
-    assert!(shaped(&stream_marked));
-    let stream_automatic =
-        cache_route_for_local_request(route.clone(), &request(true, false, &long), true, model);
-    assert!(shaped(&stream_automatic));
+    // Each switch turns the strict check on for its own kind only.
+    for strict_stream in [false, true] {
+        for strict_non_stream in [false, true] {
+            let mut strict = route.clone();
+            strict.policy.reported_usage.strict_cache_eligibility_stream = strict_stream;
+            strict
+                .policy
+                .reported_usage
+                .strict_cache_eligibility_non_stream = strict_non_stream;
+            for stream in [true, false] {
+                let checked = if stream {
+                    strict_stream
+                } else {
+                    strict_non_stream
+                };
+                for (label, marked, text, top_level, qualifies, long_enough) in cases {
+                    let mut req = request(stream, marked, text);
+                    if label == "short marker" {
+                        req.messages[0].content = json!(long.as_str());
+                    }
+                    let resolved =
+                        cache_route_for_local_request(strict.clone(), &req, top_level, model);
+                    let label = format!(
+                        "strict stream={strict_stream} non_stream={strict_non_stream}, \
+                         request stream={stream} {label}"
+                    );
+                    let cached = if checked { qualifies } else { long_enough };
+                    if cached {
+                        assert!(shaped(&resolved), "{label}");
+                    } else {
+                        assert!(passthrough(&resolved), "{label}");
+                    }
+                }
+            }
+        }
+    }
 
     // The route-level switch still forces passthrough for every non-streaming request.
     let mut forced = route.clone();
@@ -10086,6 +10136,180 @@ fn non_stream_cache_route_follows_the_request_not_only_the_route() {
         .skip_non_stream_usage_projection = true;
     let forced = cache_route_for_local_request(forced, &request(false, true, &long), false, model);
     assert_eq!(forced.policy.cache_type, PromptCacheStrategyType::NoCache);
+}
+
+/// With the strict check off, an unmarked request still gets no cache below the model's minimum
+/// cacheable length: a short probe keeps its raw input and reports no cache read or write, while
+/// an unmarked request above the minimum is shaped by the route as before 0.0.226.
+#[test]
+fn route_strategy_without_strict_check_never_caches_requests_below_the_model_minimum() {
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/dfcache/gate".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.99),
+                token_scale: Some(2.05),
+                max_simulated_input_tokens: Some(300_000),
+                cap_jitter_min_tokens: Some(12_000),
+                cap_jitter_max_tokens: Some(24_000),
+                scale_min_input_tokens: Some(10_000),
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy {
+                    move_delta_to_cache_read: true,
+                    ..ReportedUsageFieldPolicy::sample_input_max(1_500)
+                },
+                cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(
+                    200_000, 1.5,
+                ),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
+                enabled: Some(true),
+            }),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(64)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.99,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy)
+    .with_defined_cache_routes(vec!["/dfcache/gate".to_string()]);
+    let endpoint = "/dfcache/gate/v1/messages";
+    let route = RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path(endpoint);
+    assert_eq!(
+        route.policy.cache_type,
+        PromptCacheStrategyType::CurrentHighCache
+    );
+
+    let run = |stream: bool, model: &str, system_text: String, session: &str| {
+        let payload = MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 64,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hi"),
+            }],
+            stream,
+            system: Some(vec![SystemMessage {
+                text: system_text,
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            output_format: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_test_account__session_{session}")),
+            }),
+            stop_sequences: None,
+        };
+        let raw_input = token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32;
+        let local_route = cache_route_for_local_request(route.clone(), &payload, false, model);
+        let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
+        let context = prepare_usage_context(
+            &state,
+            local_route,
+            endpoint,
+            stream,
+            &payload,
+            None,
+            Some(conversation_id.clone()),
+            Some(conversation_id),
+            raw_input,
+        );
+        let credential_usage = attach_test_credential_usage(context, 1);
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            raw_input,
+            8,
+            credential_usage.request.simulated_usage,
+            stream,
+        );
+        let source = credential_usage.usage_source(&body, None, false);
+        let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+        (raw_input, reported)
+    };
+
+    // Short unmarked probes (the 42-token haiku shape from production) stay cache-free on every
+    // model family minimum, streaming or not.
+    for (index, (model, text)) in [
+        (
+            "claude-haiku-4-5-20251001",
+            "Reply with one word.".to_string(),
+        ),
+        (
+            "claude-haiku-4-5-20251001",
+            "short system prompt ".repeat(120),
+        ),
+        ("claude-opus-4-6", "short system prompt ".repeat(120)),
+        ("claude-sonnet-4-5", "tiny".to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for stream in [true, false] {
+            let session = format!(
+                "5a1d4c3b-2e1f-4a0b-9c8d-7e6f5a4b3c{index}{}",
+                u8::from(stream)
+            );
+            let (raw_input, reported) = run(stream, model, text.clone(), &session);
+            assert_eq!(
+                reported.cache_read_input_tokens, 0,
+                "{model} stream={stream} raw {raw_input}: {reported:?}"
+            );
+            assert_eq!(
+                reported.cache_creation_input_tokens, 0,
+                "{model} stream={stream} raw {raw_input}: {reported:?}"
+            );
+            assert!(
+                reported.input_tokens <= raw_input.max(1),
+                "{model} stream={stream}: {reported:?}"
+            );
+        }
+    }
+
+    // An unmarked request above the minimum follows the route: the first turn reports a cache
+    // write and no read (cold request guard), as Claude Code sees on a marked first turn.
+    for stream in [true, false] {
+        let session = format!("6b2e5d4c-3f2a-4b1c-8d9e-0f1a2b3c4d5{}", u8::from(stream));
+        let (raw_input, reported) = run(
+            stream,
+            "claude-sonnet-4-5",
+            "You are a helpful coding assistant with deep knowledge of Go and Rust. ".repeat(600),
+            &session,
+        );
+        assert!(raw_input > 10_000, "raw {raw_input}");
+        assert_eq!(
+            reported.cache_read_input_tokens, 0,
+            "stream={stream}: {reported:?}"
+        );
+        assert!(
+            reported.cache_creation_input_tokens > 0,
+            "stream={stream}: an unmarked long request follows the route strategy {reported:?}"
+        );
+        assert!(
+            reported.input_tokens + reported.cache_creation_input_tokens <= raw_input.max(1) + 1,
+            "stream={stream}: cold request stays within the raw input {reported:?}"
+        );
+    }
 }
 
 #[test]

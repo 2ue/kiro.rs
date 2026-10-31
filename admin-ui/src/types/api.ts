@@ -1405,6 +1405,10 @@ export interface ReportedUsageFieldPolicy {
 export interface ReportedUsagePathPolicy {
   enabled: boolean
   skipNonStreamUsageProjection: boolean
+  /** Streaming requests must meet the official cache conditions before shaping; off by default. */
+  strictCacheEligibilityStream?: boolean
+  /** Non-streaming requests must meet the official cache conditions before shaping; off by default. */
+  strictCacheEligibilityNonStream?: boolean
   finalCacheReadMaxTokens: number
   finalCacheReadJitterMinTokens: number
   finalCacheReadJitterMaxTokens: number

@@ -1631,7 +1631,7 @@ const NON_STREAM_CACHE_OPTIONS: Array<{ value: NonStreamCacheMode; label: string
   {
     value: 'by_request',
     label: '按场景',
-    desc: '按官方规则判断：请求带 cache_control，且断点前内容达到模型最小缓存长度，就按本路径缓存策略整理 usage；其余非流式请求不整理，直接透传上游 usage。',
+    desc: '非流式请求按本路径缓存策略整理 usage；是否还要先满足官方缓存条件，由下面的"非流式按官方条件严格检查"决定。',
   },
   {
     value: 'force_off',
@@ -1664,6 +1664,42 @@ function NonStreamCacheSelect({
   )
 }
 
+const STRICT_CACHE_ELIGIBILITY_RULE =
+  '官方条件：请求带 cache_control（某个内容块上，或请求顶层的自动缓存），且从开头到最后一个标记的内容达到模型最小缓存长度（opus 4.5~4.7、haiku 4.5 为 4096，haiku 3.5 为 2048，其余 1024 Token）。'
+
+/**
+ * Per-route switches for the official cache conditions, one for streaming and one for
+ * non-streaming requests. Both are off by default: requests follow the route strategy directly,
+ * and the local simulation still never caches a request below the model minimum.
+ */
+function StrictCacheEligibilityToggles({
+  policy,
+  onChange,
+}: {
+  policy: ReportedUsagePathPolicy
+  onChange: (next: ReportedUsagePathPolicy) => void
+}) {
+  return (
+    <>
+      <TogField
+        label="流式按官方条件严格检查"
+        desc={`默认关闭：流式请求不看有没有 cache_control，直接按本路径缓存策略整理，只有整条请求短于模型最小缓存长度时不算缓存。开启后，不满足官方条件的流式请求不做缓存模拟，usage 原样透传。${STRICT_CACHE_ELIGIBILITY_RULE}`}
+        checked={Boolean(policy.strictCacheEligibilityStream)}
+        onChange={(strictCacheEligibilityStream) => onChange({ ...policy, strictCacheEligibilityStream })}
+      />
+      <TogField
+        label="非流式按官方条件严格检查"
+        desc={policy.skipNonStreamUsageProjection
+          ? '"非流式缓存"已选强制不缓存，非流式请求一律透传，这里不生效。'
+          : `默认关闭：非流式请求不看有没有 cache_control，直接按本路径缓存策略整理，只有整条请求短于模型最小缓存长度时不算缓存。开启后，不满足官方条件的非流式请求不做缓存模拟，usage 原样透传。${STRICT_CACHE_ELIGIBILITY_RULE}`}
+        checked={Boolean(policy.strictCacheEligibilityNonStream)}
+        disabled={policy.skipNonStreamUsageProjection}
+        onChange={(strictCacheEligibilityNonStream) => onChange({ ...policy, strictCacheEligibilityNonStream })}
+      />
+    </>
+  )
+}
+
 function NonStreamCacheToggle({
   value,
   fallbackPrefix,
@@ -1675,10 +1711,13 @@ function NonStreamCacheToggle({
 }) {
   const policy = value ?? defaultUsagePatch(fallbackPrefix)
   return (
-    <NonStreamCacheSelect
-      checked={policy.skipNonStreamUsageProjection}
-      onChange={(skipNonStreamUsageProjection) => onChange({ ...policy, skipNonStreamUsageProjection })}
-    />
+    <div className="grid gap-x-8 gap-y-5 lg:grid-cols-2">
+      <NonStreamCacheSelect
+        checked={policy.skipNonStreamUsageProjection}
+        onChange={(skipNonStreamUsageProjection) => onChange({ ...policy, skipNonStreamUsageProjection })}
+      />
+      <StrictCacheEligibilityToggles policy={policy} onChange={onChange} />
+    </div>
   )
 }
 
@@ -1795,7 +1834,7 @@ export function StrategyTemplateEditor({
         />
       ) : cacheType === 'stable_segment_cache' ? (
         <>
-          <ParameterGroup title="非流式请求">
+          <ParameterGroup title="缓存条件">
             <NonStreamCacheToggle
               value={template.reportedUsage}
               fallbackPrefix="/v1"
@@ -1816,7 +1855,7 @@ export function StrategyTemplateEditor({
         </>
       ) : (
         <>
-          <ParameterGroup title="非流式请求">
+          <ParameterGroup title="缓存条件">
             <NonStreamCacheToggle
               value={template.reportedUsage}
               fallbackPrefix="/v1"
@@ -2117,7 +2156,7 @@ export function PathStrategyBindingCard({
                   onChange={(routeNamespace) => patch({ routeNamespace })}
                 />
               </ParameterGroup>
-              <ParameterGroup title="非流式请求" desc="决定非流式请求按场景整理缓存 usage，还是一律不缓存。">
+              <ParameterGroup title="缓存条件" desc="决定非流式请求是否一律不缓存，以及流式、非流式请求是否先按官方条件检查。">
                 <NonStreamCacheToggle
                   value={effectivePolicy.reportedUsage}
                   fallbackPrefix={prefix}
@@ -2141,7 +2180,7 @@ export function PathStrategyBindingCard({
             </div>
           ) : (
             <div className="space-y-7">
-              <ParameterGroup title="非流式请求" desc="决定非流式请求按场景整理缓存 usage，还是一律不缓存。">
+              <ParameterGroup title="缓存条件" desc="决定非流式请求是否一律不缓存，以及流式、非流式请求是否先按官方条件检查。">
                 <NonStreamCacheToggle
                   value={effectivePolicy.reportedUsage}
                   fallbackPrefix={prefix}
@@ -2923,6 +2962,7 @@ function PathPolicyEditor({
             checked={policy.skipNonStreamUsageProjection}
             onChange={set('skipNonStreamUsageProjection')}
           />
+          <StrictCacheEligibilityToggles policy={policy} onChange={onChange} />
         </div>
         {!policy.enabled && (
           <div className="rounded-md bg-warning/5 px-3 py-2 text-xs leading-5 text-warning">

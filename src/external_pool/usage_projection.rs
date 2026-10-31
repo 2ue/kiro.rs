@@ -266,16 +266,17 @@ fn build_template(
         .upstream_model
         .clone()
         .unwrap_or_else(|| payload.model.clone());
-    // Same rule as local requests: a request the Anthropic API could not return cache usage for
-    // (no cache breakpoint, or a prefix below the model minimum) keeps the upstream usage,
-    // streaming or not.
+    // Same rule as local requests: with the route's strict check on, a request the Anthropic API
+    // could not return cache usage for (no cache breakpoint, or a prefix below the model minimum)
+    // keeps the upstream usage; with it off, only a request shorter than the minimum does.
     if route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
         && !crate::anthropic::prompt_cache::request_qualifies_for_prompt_cache(
             payload,
-            route
-                .effective_raw_probe
-                .as_deref()
-                .is_some_and(|probe| probe.top_level_cache_control),
+            !reported_usage.strict_cache_eligibility(stream)
+                || route
+                    .effective_raw_probe
+                    .as_deref()
+                    .is_some_and(|probe| probe.top_level_cache_control),
             &model,
         )
     {

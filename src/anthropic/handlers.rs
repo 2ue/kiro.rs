@@ -1320,23 +1320,29 @@ fn cache_route_for_request_stream(
     disable_cache_route(cache_route)
 }
 
-/// A request follows the route's cache strategy only when the Anthropic API itself could return
-/// cache usage for it (see `request_qualifies_for_prompt_cache`): the client marked a cache
-/// breakpoint and the prefix up to it reaches the model's minimum cacheable length. Any other
-/// request, streaming or not, keeps the upstream usage and neither reads nor writes the local
-/// cache state, so an unmarked request is never reported with cache writes. Non-streaming
-/// requests additionally honour `skipNonStreamUsageProjection` (force no cache). No-cache routes
-/// are unchanged.
+/// A request follows the route's cache strategy when it could be cached at all (see
+/// `request_qualifies_for_prompt_cache`). With the route's strict check on for this kind of
+/// request (`strictCacheEligibilityStream` / `strictCacheEligibilityNonStream`), it must meet the
+/// official conditions: a cache breakpoint and a prefix up to it at the model's minimum cacheable
+/// length. With the check off (the default) the whole request counts as marked, so only a request
+/// shorter than that minimum is left uncached; Anthropic never caches one either. A request that is
+/// left uncached keeps the upstream usage and neither reads nor writes the local cache state.
+/// Non-streaming requests additionally honour `skipNonStreamUsageProjection` (force no cache).
+/// No-cache routes are unchanged.
 fn cache_route_for_local_request(
     cache_route: ResolvedCacheRoutePolicy,
     payload: &MessagesRequest,
     top_level_cache_control: bool,
     cache_model: &str,
 ) -> ResolvedCacheRoutePolicy {
+    let strict = cache_route
+        .policy
+        .reported_usage
+        .strict_cache_eligibility(payload.stream);
     if cache_route.policy.cache_type != PromptCacheStrategyType::NoCache
         && !super::prompt_cache::request_qualifies_for_prompt_cache(
             payload,
-            top_level_cache_control,
+            top_level_cache_control || !strict,
             cache_model,
         )
     {

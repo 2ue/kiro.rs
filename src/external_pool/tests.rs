@@ -15546,40 +15546,94 @@ fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
 /// A non-streaming request without any cache breakpoint, or whose marked prefix is below the
 /// model minimum, keeps the external upstream usage exactly as `skipNonStreamUsageProjection`
 /// would; streaming requests are still shaped.
+/// External pools follow the same switches as local requests: by default a request long enough as
+/// a whole is shaped by the path strategy whether or not it is marked; with the strict check on for
+/// a request kind, a request the Anthropic API would not cache (no breakpoint, or a prefix below
+/// the model minimum) keeps upstream usage.
 #[test]
-fn usage_projection_passes_through_non_stream_requests_anthropic_would_not_cache() {
+fn usage_projection_strict_cache_eligibility_is_switchable_per_stream_kind() {
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-
-    let mut unmarked = test_route("claude-sonnet-4-5");
-    if let Some(payload) = unmarked.payload.as_mut() {
-        payload.system.as_mut().unwrap()[0].cache_control = None;
-    }
-    assert!(projection_context(&unmarked, &pool, 0).is_none());
-
+    let strict = |route: &mut ExternalRouteRequest, stream: bool, non_stream: bool| {
+        route.reported_usage.default.strict_cache_eligibility_stream = stream;
+        route
+            .reported_usage
+            .default
+            .strict_cache_eligibility_non_stream = non_stream;
+        for policy in route.reported_usage.path_overrides.values_mut() {
+            policy.strict_cache_eligibility_stream = stream;
+            policy.strict_cache_eligibility_non_stream = non_stream;
+        }
+        route.reset_preparation_cache();
+    };
+    let unmarked = |stream: bool| {
+        let mut route = test_route("claude-sonnet-4-5");
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].cache_control = None;
+            payload.stream = stream;
+        }
+        route.reset_preparation_cache();
+        route
+    };
     // The 42-token haiku shape seen in production: marked, but far below Haiku 4.5's minimum.
-    let mut short = test_route("claude-haiku-4-5-20251001");
-    if let Some(payload) = short.payload.as_mut() {
-        payload.system.as_mut().unwrap()[0].text = "Reply with one word.".to_string();
-    }
-    short.request_input_tokens = 42;
-    assert!(projection_context(&short, &pool, 0).is_none());
+    let short = |stream: bool| {
+        let mut route = test_route("claude-haiku-4-5-20251001");
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].text = "Reply with one word.".to_string();
+            payload.stream = stream;
+        }
+        route.request_input_tokens = 42;
+        route.reset_preparation_cache();
+        route
+    };
 
-    // Streaming follows the same rule (fresh routes: the projection template is cached per
-    // route): an unmarked stream keeps upstream usage, a marked one is shaped.
-    let mut unmarked_stream = test_route("claude-sonnet-4-5");
-    if let Some(payload) = unmarked_stream.payload.as_mut() {
-        payload.system.as_mut().unwrap()[0].cache_control = None;
-        payload.stream = true;
+    // Default: no strict check, unmarked requests are shaped too; a request shorter than the
+    // model minimum as a whole (the 42-token probe) still keeps upstream usage.
+    for stream in [true, false] {
+        assert!(
+            projection_context(&unmarked(stream), &pool, 0).is_some(),
+            "stream={stream}"
+        );
+        assert!(
+            projection_context(&short(stream), &pool, 0).is_none(),
+            "stream={stream}"
+        );
     }
-    assert!(projection_context(&unmarked_stream, &pool, 0).is_none());
-    let mut marked_stream = test_route("claude-sonnet-4-5");
-    if let Some(payload) = marked_stream.payload.as_mut() {
-        payload.stream = true;
-    }
-    assert!(projection_context(&marked_stream, &pool, 0).is_some());
 
-    // A raw body that only sets top-level cache_control (automatic caching) is shaped.
+    for stream in [true, false] {
+        for (strict_stream, strict_non_stream) in [(true, false), (false, true), (true, true)] {
+            let checked = if stream {
+                strict_stream
+            } else {
+                strict_non_stream
+            };
+            let label = format!("stream={stream} strict=({strict_stream},{strict_non_stream})");
+            let mut route = unmarked(stream);
+            strict(&mut route, strict_stream, strict_non_stream);
+            assert_eq!(
+                projection_context(&route, &pool, 0).is_none(),
+                checked,
+                "unmarked {label}"
+            );
+            let mut route = short(stream);
+            strict(&mut route, strict_stream, strict_non_stream);
+            assert!(
+                projection_context(&route, &pool, 0).is_none(),
+                "short {label}"
+            );
+            let mut marked = test_route("claude-sonnet-4-5");
+            if let Some(payload) = marked.payload.as_mut() {
+                payload.stream = stream;
+            }
+            strict(&mut marked, strict_stream, strict_non_stream);
+            assert!(
+                projection_context(&marked, &pool, 0).is_some(),
+                "marked {label}"
+            );
+        }
+    }
+
+    // A raw body that only sets top-level cache_control (automatic caching) passes the check.
     let raw = serde_json::json!({
         "model": "claude-sonnet-4-5",
         "max_tokens": 8,
@@ -15587,11 +15641,14 @@ fn usage_projection_passes_through_non_stream_requests_anthropic_would_not_cache
         "messages": [{"role": "user", "content": "hello"}],
         "stream": false
     });
-    let unmarked_raw = raw_test_route(raw.to_string().as_bytes());
+    let mut unmarked_raw = raw_test_route(raw.to_string().as_bytes());
+    assert!(projection_context(&unmarked_raw, &pool, 0).is_some());
+    strict(&mut unmarked_raw, false, true);
     assert!(projection_context(&unmarked_raw, &pool, 0).is_none());
     let mut automatic = raw.clone();
     automatic["cache_control"] = serde_json::json!({"type": "ephemeral"});
-    let automatic_raw = raw_test_route(automatic.to_string().as_bytes());
+    let mut automatic_raw = raw_test_route(automatic.to_string().as_bytes());
+    strict(&mut automatic_raw, false, true);
     assert!(projection_context(&automatic_raw, &pool, 0).is_some());
 }
 

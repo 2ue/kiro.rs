@@ -58,6 +58,8 @@ export function pathPolicy(
   return {
     enabled,
     skipNonStreamUsageProjection: false,
+    strictCacheEligibilityStream: false,
+    strictCacheEligibilityNonStream: false,
     finalCacheReadMaxTokens: 700000,
     finalCacheReadJitterMinTokens: 0,
     finalCacheReadJitterMaxTokens: 0,
@@ -726,6 +728,8 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
   return {
     ...policy,
     skipNonStreamUsageProjection: Boolean(policy.skipNonStreamUsageProjection),
+    strictCacheEligibilityStream: Boolean(policy.strictCacheEligibilityStream),
+    strictCacheEligibilityNonStream: Boolean(policy.strictCacheEligibilityNonStream),
     finalCacheReadMaxTokens,
     finalCacheReadJitterMinTokens,
     finalCacheReadJitterMaxTokens,
