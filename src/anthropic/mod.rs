@@ -8,6 +8,8 @@
 //! - `GET /v1/models` - 获取可用模型列表
 //! - `POST /v1/messages` - 创建消息（对话）
 //! - `POST /v1/messages/count_tokens` - 计算 token 数量
+//! - `POST /v1/chat/completions` - OpenAI Chat Completions 兼容接口（各前缀下同名路径同样可用）
+//! - `POST /v1/responses` - OpenAI Responses 兼容接口（各前缀下同名路径同样可用）
 //!
 //! ## 内置端点 (/na/v1)
 //! - `GET /na/v1/models` - 获取可用模型列表
@@ -45,11 +47,13 @@ pub(crate) mod envelope;
 pub(crate) mod files;
 mod handlers;
 mod identity_guard;
+mod image_resize;
 pub(crate) mod inference_attempt_budget;
 pub(crate) mod kiro_plus_shaping;
 pub(crate) mod language_preference;
 mod middleware;
 pub(crate) mod model_capabilities;
+mod openai;
 pub(crate) mod payload_guard;
 pub(crate) mod payload_guard_runtime;
 pub(crate) mod pricing;

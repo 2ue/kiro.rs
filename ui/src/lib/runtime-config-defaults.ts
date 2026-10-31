@@ -132,6 +132,10 @@ export function defaultImageProcessing(): ImageProcessingConfig {
     safeMaterializeFileSources: true,
     safeDownloadRemoteSources: true,
     safeNormalizeBase64MediaTypes: true,
+    resizeEnabled: false,
+    resizeMaxLongSide: 1568,
+    resizeMaxBytes: 400000,
+    resizeJpegQuality: 85,
   }
 }
 
@@ -146,6 +150,7 @@ export function defaultBodyConversion(): BodyConversionConfig {
     syntheticThinkingSignatures: true,
     toolPairingRepair: true,
     historyPlaceholderTools: true,
+    historyImageDedup: false,
     codeExecution: { enabled: false, pathOverrides: {}, timeoutMs: 5000, maxOutputBytes: 16384, maxCodeBytes: 65536 },
   }
 }
@@ -162,6 +167,7 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
     syntheticThinkingSignatures: input?.syntheticThinkingSignatures ?? base.syntheticThinkingSignatures,
     toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
     historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
+    historyImageDedup: input?.historyImageDedup ?? base.historyImageDedup,
     codeExecution: {
       enabled: input?.codeExecution?.enabled ?? base.codeExecution.enabled,
       pathOverrides: { ...(input?.codeExecution?.pathOverrides ?? base.codeExecution.pathOverrides) },
@@ -310,6 +316,10 @@ export function normalizeImageProcessing(input?: Partial<ImageProcessingConfig> 
       safeMaterializeFileSources: false,
       safeDownloadRemoteSources: false,
       safeNormalizeBase64MediaTypes: false,
+      resizeEnabled: Boolean(next.resizeEnabled),
+      resizeMaxLongSide: Math.min(8000, Math.max(256, Math.round(Number(next.resizeMaxLongSide) || 1568))),
+      resizeMaxBytes: Math.min(5242880, Math.max(32768, Math.round(Number(next.resizeMaxBytes) || 400000))),
+      resizeJpegQuality: Math.min(100, Math.max(40, Math.round(Number(next.resizeJpegQuality) || 85))),
     }
   }
   return {
@@ -317,6 +327,10 @@ export function normalizeImageProcessing(input?: Partial<ImageProcessingConfig> 
     safeMaterializeFileSources: Boolean(next.safeMaterializeFileSources),
     safeDownloadRemoteSources: Boolean(next.safeDownloadRemoteSources),
     safeNormalizeBase64MediaTypes: Boolean(next.safeNormalizeBase64MediaTypes),
+    resizeEnabled: Boolean(next.resizeEnabled),
+    resizeMaxLongSide: Math.min(8000, Math.max(256, Math.round(Number(next.resizeMaxLongSide) || 1568))),
+    resizeMaxBytes: Math.min(5242880, Math.max(32768, Math.round(Number(next.resizeMaxBytes) || 400000))),
+    resizeJpegQuality: Math.min(100, Math.max(40, Math.round(Number(next.resizeJpegQuality) || 85))),
   }
 }
 
@@ -399,11 +413,13 @@ export function defaultExternalPoolsConfig() {
     externalPoolLocalRescueOnTimeout: true,
     externalPoolLocalRescueOnCapacity: true,
     externalPoolLocalRescueMaxWaitSecs: 15,
-    localPoolCircuitEnabled: true,
-    localPoolCircuitWindowSecs: 60,
-    localPoolCircuitOpenAfterFailures: 3,
-    localPoolCircuitRequireDistinctCredentials: 2,
+    localPoolCircuitEnabled: false,
+    localPoolCircuitWindowSecs: 300,
+    localPoolCircuitOpenAfterFailures: 5,
+    localPoolCircuitRequireDistinctCredentials: 5,
+    localPoolCircuitMinRatioPercent: 30,
     localPoolCircuitOpenSecs: 30,
+    localPoolCircuitHalfOpenProbes: 3,
     externalPoolAutoDisableEnabled: false,
     externalPoolAutoDisableOnAuthError: true,
     externalPoolAutoDisableOnSecurityLock: true,
@@ -483,13 +499,19 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   credentialNetworkErrorCooldownSecs: 5,
   credentialStreamErrorCooldownSecs: 5,
   credentialEmptyTurnCooldownEnabled: false,
+  credentialUpstreamFailureCooldownEnabled: false,
+  credentialAutoHealMinIntervalSecs: 300,
+  credentialAutoHealMaxConsecutiveRounds: 5,
+  kiroVersionAutoSyncEnabled: false,
+  kiroRuntimeDomainEnabled: false,
   credentialProtocolErrorCooldownSecs: 10,
   credentialAuthErrorCooldownSecs: 10,
   credentialCooldownBackoffMultiplier: 2,
   credentialCooldownJitterPercent: 20,
   credentialProbationSecs: 30,
   credentialMaxCooldownSecs: 300,
-  credentialDispatchMaxWaitSecs: 120,
+  credentialDispatchMaxWaitSecs: 5,
+  credentialSessionMaxConcurrentRequests: 0,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   streamKeepaliveIntervalSecs: 5,

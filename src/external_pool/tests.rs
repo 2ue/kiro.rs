@@ -14790,7 +14790,8 @@ fn external_pool_auto_disable_window_has_own_default() {
     let config = ExternalPoolsConfig::default();
 
     assert_eq!(config.external_pool_auto_disable_window_secs, 60);
-    assert_eq!(config.local_pool_circuit_window_secs, 60);
+    // The local pool circuit uses its own, longer window since it counts distinct accounts.
+    assert_eq!(config.local_pool_circuit_window_secs, 300);
 }
 
 #[test]
@@ -15499,14 +15500,19 @@ fn usage_projection_passes_through_non_stream_requests_anthropic_would_not_cache
     short.request_input_tokens = 42;
     assert!(projection_context(&short, &pool, 0).is_none());
 
-    // Streaming keeps the path policy whatever the request looks like (fresh route: the
-    // projection template is cached per route).
+    // Streaming follows the same rule (fresh routes: the projection template is cached per
+    // route): an unmarked stream keeps upstream usage, a marked one is shaped.
     let mut unmarked_stream = test_route("claude-sonnet-4-5");
     if let Some(payload) = unmarked_stream.payload.as_mut() {
         payload.system.as_mut().unwrap()[0].cache_control = None;
         payload.stream = true;
     }
-    assert!(projection_context(&unmarked_stream, &pool, 0).is_some());
+    assert!(projection_context(&unmarked_stream, &pool, 0).is_none());
+    let mut marked_stream = test_route("claude-sonnet-4-5");
+    if let Some(payload) = marked_stream.payload.as_mut() {
+        payload.stream = true;
+    }
+    assert!(projection_context(&marked_stream, &pool, 0).is_some());
 
     // A raw body that only sets top-level cache_control (automatic caching) is shaped.
     let raw = serde_json::json!({

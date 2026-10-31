@@ -1859,6 +1859,14 @@ pub struct RuntimeConfigResponse {
     pub credential_network_error_cooldown_secs: u64,
     pub credential_stream_error_cooldown_secs: u64,
     pub credential_empty_turn_cooldown_enabled: bool,
+    pub credential_upstream_failure_cooldown_enabled: bool,
+    pub credential_auto_heal_min_interval_secs: u64,
+    pub credential_auto_heal_max_consecutive_rounds: u32,
+    pub kiro_version_auto_sync_enabled: bool,
+    /// 最近一次自动同步读到的官方版本；未开启或尚未读到时为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_version_latest: Option<String>,
+    pub kiro_runtime_domain_enabled: bool,
     pub credential_protocol_error_cooldown_secs: u64,
     pub credential_auth_error_cooldown_secs: u64,
     pub credential_cooldown_backoff_multiplier: f64,
@@ -1866,6 +1874,7 @@ pub struct RuntimeConfigResponse {
     pub credential_probation_secs: u64,
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
+    pub credential_session_max_concurrent_requests: u32,
     pub kiro_upstream_response_timeout_secs: u64,
     pub kiro_upstream_stream_idle_timeout_secs: u64,
     pub stream_keepalive_interval_secs: u64,
@@ -2011,6 +2020,16 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub credential_empty_turn_cooldown_enabled: Option<bool>,
     #[serde(default)]
+    pub credential_upstream_failure_cooldown_enabled: Option<bool>,
+    #[serde(default)]
+    pub credential_auto_heal_min_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_auto_heal_max_consecutive_rounds: Option<u32>,
+    #[serde(default)]
+    pub kiro_version_auto_sync_enabled: Option<bool>,
+    #[serde(default)]
+    pub kiro_runtime_domain_enabled: Option<bool>,
+    #[serde(default)]
     pub credential_protocol_error_cooldown_secs: Option<u64>,
     #[serde(default)]
     pub credential_auth_error_cooldown_secs: Option<u64>,
@@ -2023,6 +2042,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_max_cooldown_secs: u64,
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_session_max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub kiro_upstream_response_timeout_secs: Option<u64>,
     #[serde(default)]

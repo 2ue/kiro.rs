@@ -181,6 +181,10 @@ const defaultImageProcessing = (): ImageProcessingConfig => ({
   safeMaterializeFileSources: true,
   safeDownloadRemoteSources: true,
   safeNormalizeBase64MediaTypes: true,
+  resizeEnabled: false,
+  resizeMaxLongSide: 1568,
+  resizeMaxBytes: 400000,
+  resizeJpegQuality: 85,
 })
 
 const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
@@ -193,6 +197,7 @@ const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
   syntheticThinkingSignatures: true,
   toolPairingRepair: true,
   historyPlaceholderTools: true,
+  historyImageDedup: false,
   codeExecution: { enabled: false, pathOverrides: {}, timeoutMs: 5000, maxOutputBytes: 16384, maxCodeBytes: 65536 },
 })
 
@@ -210,6 +215,7 @@ const normalizeBodyConversion = (
     syntheticThinkingSignatures: input?.syntheticThinkingSignatures ?? base.syntheticThinkingSignatures,
     toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
     historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
+    historyImageDedup: input?.historyImageDedup ?? base.historyImageDedup,
     codeExecution: {
       enabled: input?.codeExecution?.enabled ?? base.codeExecution.enabled,
       pathOverrides: { ...(input?.codeExecution?.pathOverrides ?? base.codeExecution.pathOverrides) },
@@ -267,6 +273,10 @@ const normalizeImageProcessing = (input?: Partial<ImageProcessingConfig> | null)
       safeMaterializeFileSources: false,
       safeDownloadRemoteSources: false,
       safeNormalizeBase64MediaTypes: false,
+      resizeEnabled: Boolean(next.resizeEnabled),
+      resizeMaxLongSide: Math.min(8000, Math.max(256, Math.round(Number(next.resizeMaxLongSide) || 1568))),
+      resizeMaxBytes: Math.min(5242880, Math.max(32768, Math.round(Number(next.resizeMaxBytes) || 400000))),
+      resizeJpegQuality: Math.min(100, Math.max(40, Math.round(Number(next.resizeJpegQuality) || 85))),
     }
   }
   return {
@@ -274,6 +284,10 @@ const normalizeImageProcessing = (input?: Partial<ImageProcessingConfig> | null)
     safeMaterializeFileSources: Boolean(next.safeMaterializeFileSources),
     safeDownloadRemoteSources: Boolean(next.safeDownloadRemoteSources),
     safeNormalizeBase64MediaTypes: Boolean(next.safeNormalizeBase64MediaTypes),
+    resizeEnabled: Boolean(next.resizeEnabled),
+    resizeMaxLongSide: Math.min(8000, Math.max(256, Math.round(Number(next.resizeMaxLongSide) || 1568))),
+    resizeMaxBytes: Math.min(5242880, Math.max(32768, Math.round(Number(next.resizeMaxBytes) || 400000))),
+    resizeJpegQuality: Math.min(100, Math.max(40, Math.round(Number(next.resizeJpegQuality) || 85))),
   }
 }
 
@@ -372,11 +386,13 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolLocalRescueOnTimeout: true,
   externalPoolLocalRescueOnCapacity: true,
   externalPoolLocalRescueMaxWaitSecs: 15,
-  localPoolCircuitEnabled: true,
-  localPoolCircuitWindowSecs: 60,
-  localPoolCircuitOpenAfterFailures: 3,
-  localPoolCircuitRequireDistinctCredentials: 2,
+  localPoolCircuitEnabled: false,
+  localPoolCircuitWindowSecs: 300,
+  localPoolCircuitOpenAfterFailures: 5,
+  localPoolCircuitRequireDistinctCredentials: 5,
+  localPoolCircuitMinRatioPercent: 30,
   localPoolCircuitOpenSecs: 30,
+  localPoolCircuitHalfOpenProbes: 3,
   externalPoolAutoDisableEnabled: false,
   externalPoolAutoDisableOnAuthError: true,
   externalPoolAutoDisableOnSecurityLock: true,
@@ -519,13 +535,19 @@ const emptyConfig: RuntimeConfig = {
   credentialNetworkErrorCooldownSecs: 5,
   credentialStreamErrorCooldownSecs: 5,
   credentialEmptyTurnCooldownEnabled: false,
+  credentialUpstreamFailureCooldownEnabled: false,
+  credentialAutoHealMinIntervalSecs: 300,
+  credentialAutoHealMaxConsecutiveRounds: 5,
+  kiroVersionAutoSyncEnabled: false,
+  kiroRuntimeDomainEnabled: false,
   credentialProtocolErrorCooldownSecs: 10,
   credentialAuthErrorCooldownSecs: 10,
   credentialCooldownBackoffMultiplier: 2,
   credentialCooldownJitterPercent: 20,
   credentialProbationSecs: 30,
   credentialMaxCooldownSecs: 300,
-  credentialDispatchMaxWaitSecs: 120,
+  credentialDispatchMaxWaitSecs: 5,
+  credentialSessionMaxConcurrentRequests: 0,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   streamKeepaliveIntervalSecs: 5,
@@ -3808,7 +3830,12 @@ export function RuntimeConfigPanel() {
       credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
       credentialNetworkErrorCooldownSecs: toWhole(draft.credentialNetworkErrorCooldownSecs, 1),
       credentialStreamErrorCooldownSecs: toWhole(draft.credentialStreamErrorCooldownSecs, 1),
+      credentialAutoHealMinIntervalSecs: toWhole(draft.credentialAutoHealMinIntervalSecs, 0),
+      credentialAutoHealMaxConsecutiveRounds: toWhole(draft.credentialAutoHealMaxConsecutiveRounds, 0),
       credentialEmptyTurnCooldownEnabled: Boolean(draft.credentialEmptyTurnCooldownEnabled),
+      credentialUpstreamFailureCooldownEnabled: Boolean(draft.credentialUpstreamFailureCooldownEnabled),
+      kiroVersionAutoSyncEnabled: Boolean(draft.kiroVersionAutoSyncEnabled),
+      kiroRuntimeDomainEnabled: Boolean(draft.kiroRuntimeDomainEnabled),
       credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
       credentialAuthErrorCooldownSecs: toWhole(draft.credentialAuthErrorCooldownSecs, 1),
       credentialCooldownBackoffMultiplier: Math.max(1, Number(draft.credentialCooldownBackoffMultiplier.toFixed(2))),
@@ -3816,6 +3843,9 @@ export function RuntimeConfigPanel() {
       credentialProbationSecs: toWhole(draft.credentialProbationSecs),
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+      credentialSessionMaxConcurrentRequests: toWhole(
+        draft.credentialSessionMaxConcurrentRequests,
+      ),
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
       streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
@@ -3923,7 +3953,9 @@ export function RuntimeConfigPanel() {
         localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
         localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
         localPoolCircuitRequireDistinctCredentials: toWhole(draft.externalPools.localPoolCircuitRequireDistinctCredentials),
+        localPoolCircuitMinRatioPercent: toWhole(draft.externalPools.localPoolCircuitMinRatioPercent),
         localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
+        localPoolCircuitHalfOpenProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenProbes, 1),
         externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
         externalPoolAutoDisableWindowSecs: toWhole(draft.externalPools.externalPoolAutoDisableWindowSecs, 1),
         externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
@@ -4094,6 +4126,9 @@ export function RuntimeConfigPanel() {
             <NumberField title="网络错误基础冷却" description="发送失败、连接中断等网络错误首次触发的冷却时长。" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialNetworkErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialNetworkErrorCooldownSecs }))} />
             <NumberField title="流读取错误基础冷却" description="流读取错误或上游 idle timeout 首次触发的冷却时长。" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialStreamErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialStreamErrorCooldownSecs }))} />
             <ToggleField title="空回也让账号冷却" description="空回指上游返回成功但没有任何内容：只有用量统计、一帧数据都没有、或响应体为空。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求。打开后按流读取错误基础冷却该账号。" checked={draft.credentialEmptyTurnCooldownEnabled} onCheckedChange={(credentialEmptyTurnCooldownEnabled) => setDraft((prev) => ({ ...prev, credentialEmptyTurnCooldownEnabled }))} />
+            <ToggleField title="上游故障也让账号冷却" description="上游故障指换任何账号都可能遇到的错误：上游 5xx、响应里的异常或错误事件、数据流解码或读取失败、网络超时。默认关闭：只在当次请求里换号，不冷却账号；账号走自己的代理时，网络超时仍会冷却。限流、鉴权、额度、风控照常冷却。" checked={draft.credentialUpstreamFailureCooldownEnabled} onCheckedChange={(credentialUpstreamFailureCooldownEnabled) => setDraft((prev) => ({ ...prev, credentialUpstreamFailureCooldownEnabled }))} />
+            <NumberField title="自愈最小间隔" description="所有账号都不可用时，因连续失败被禁用的账号会自动恢复。同一个账号两次自愈至少隔这么久；0 表示不限。" value={draft.credentialAutoHealMinIntervalSecs} min={0} max={86400} suffix="秒" onChange={(credentialAutoHealMinIntervalSecs) => setDraft((prev) => ({ ...prev, credentialAutoHealMinIntervalSecs }))} />
+            <NumberField title="最多连续自愈" description="自愈后一次都没成功就又被禁用算连续一轮，达到上限后不再自动恢复；成功一次或手动启用后清零；0 表示不限。" value={draft.credentialAutoHealMaxConsecutiveRounds} min={0} max={1000} suffix="轮" onChange={(credentialAutoHealMaxConsecutiveRounds) => setDraft((prev) => ({ ...prev, credentialAutoHealMaxConsecutiveRounds }))} />
             <NumberField title="协议异常基础冷却" description="可重试协议不匹配和未分类瞬态错误首次触发的冷却时长。" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialProtocolErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialProtocolErrorCooldownSecs }))} />
             <NumberField title="认证判定基础冷却" description="401/403 触发刷新或失败判定期间暂停继续调度该账号的时长。" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialAuthErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialAuthErrorCooldownSecs }))} />
             <NumberField title="连续失败退避倍率" description="同一凭据连续发生瞬态错误时冷却倍增倍率。" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={(credentialCooldownBackoffMultiplier) => setDraft((prev) => ({ ...prev, credentialCooldownBackoffMultiplier }))} />
@@ -4117,6 +4152,16 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(credentialDispatchMaxWaitSecs) =>
                 setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))
+              }
+            />
+            <NumberField
+              title="单会话单账号最大并发"
+              description="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。填 0 表示等于账号自身的并发上限。"
+              value={draft.credentialSessionMaxConcurrentRequests}
+              min={0}
+              max={1000}
+              onChange={(credentialSessionMaxConcurrentRequests) =>
+                setDraft((prev) => ({ ...prev, credentialSessionMaxConcurrentRequests }))
               }
             />
             <NumberField
@@ -4171,6 +4216,18 @@ export function RuntimeConfigPanel() {
               onChange={(streamFirstOutputTimeoutSecs) =>
                 setDraft((prev) => ({ ...prev, streamFirstOutputTimeoutSecs }))
               }
+            />
+            <ToggleField
+              title="自动同步 Kiro 客户端版本"
+              description={`默认关闭。打开后每 12 小时从官方读取当前版本，所有账号的上游请求头改用该版本；读取失败时继续用配置的版本。${draft.kiroVersionLatest ? `最近读到：${draft.kiroVersionLatest}` : ''}`}
+              checked={draft.kiroVersionAutoSyncEnabled}
+              onCheckedChange={(kiroVersionAutoSyncEnabled) => setDraft((prev) => ({ ...prev, kiroVersionAutoSyncEnabled }))}
+            />
+            <ToggleField
+              title="对话改走 Kiro 新域名"
+              description="默认关闭。打开后 IDE 端点的对话和联网搜索改发到 runtime.{区域}.kiro.dev，请求头不变；模型列表、额度查询、令牌刷新不受影响。注意：实测 FREE 账号打开后对话全部被新域名限流（429），打开前请先用自己的账号小范围验证。"
+              checked={draft.kiroRuntimeDomainEnabled}
+              onCheckedChange={(kiroRuntimeDomainEnabled) => setDraft((prev) => ({ ...prev, kiroRuntimeDomainEnabled }))}
             />
             <ToggleField
               title="首输出前流式换号"
@@ -4636,6 +4693,21 @@ export function RuntimeConfigPanel() {
                 }))
               }
             />
+            <ToggleField
+              title="压缩过大的图片"
+              description="默认关闭。打开后，长边超过 1568 像素或体积超过约 400KB 的 PNG/JPEG/WebP 会等比缩小并重新编码为 JPEG 再发给上游；GIF 不处理，失败时保留原图。直接转发给外部池的请求保持原样。尺寸、体积和画质可在新版管理后台调整。"
+              checked={Boolean(draft.imageProcessing?.resizeEnabled)}
+              onCheckedChange={(resizeEnabled) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  imageProcessing: {
+                    ...defaultImageProcessing(),
+                    ...prev.imageProcessing,
+                    resizeEnabled,
+                  },
+                }))
+              }
+            />
             <ImpactGroupHeader
               label="提示词注入"
               title="提示词注入与路由功能"
@@ -4654,6 +4726,7 @@ export function RuntimeConfigPanel() {
               ['syntheticThinkingSignatures', 'Thinking 兼容签名', 'Kiro 没有原生签名时，为 Claude Code 输出确定性的兼容签名；回放到 Kiro 前会自动剥离。'],
               ['toolPairingRepair', '工具配对修复', '清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
+              ['historyImageDedup', '历史图片去重', '默认关闭。历史里重复出现的同一张图片只发第一次，之后换成文字说明；当前这一轮的图片总是原样发送。'],
             ].map(([key, title, description]) => (
               <ToggleField
                 key={key}

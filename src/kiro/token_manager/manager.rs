@@ -83,12 +83,14 @@ use super::capacity::{
 use super::concurrency::record_released_in_flight_lease_tombstone;
 use super::concurrency::{
     DispatchQueueGuard, InFlightLeaseGuard, ReleasedInFlightLeaseTombstones,
-    SchedulerRedisReleaseDispatcher, filter_released_in_flight_leases_from_scheduler_states,
+    SchedulerRedisReleaseDispatcher, SessionConcurrency, SessionConcurrencySlot,
+    filter_released_in_flight_leases_from_scheduler_states, session_in_flight_on,
 };
 use super::cooldown::{
     entry_any_cooldown_remaining, entry_cooldown_remaining, entry_global_cooldown_remaining,
     model_state_key,
 };
+use super::dispatch_progress::DispatchProgress;
 use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
     format_effective_concurrency_range, min_dispatch_wait, rate_limit_blocked_count,
@@ -113,6 +115,9 @@ use super::rpm::{
     rate_limit_interval_for_rpm,
 };
 use super::scheduler_error::{LocalSchedulerError, LocalSchedulerErrorKind};
+use super::selection::{
+    ACTIVE_SESSION_WINDOW_SECS, LoadBalancingMode, StickyTier, select_candidate,
+};
 use super::sticky::{
     MAX_SESSION_SOFT_FAILURES, SESSION_BINDING_TTL_SECS,
     bind_session_to_credential as bind_sticky_session_to_credential,
@@ -127,13 +132,11 @@ use super::storage_task::{
     block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
 };
 use super::strategy::{
-    balanced_selection_key, entry_effective_health_mut, priority_selection_key,
-    record_local_selection, refresh_local_selection_windows_locked, select_health_weighted,
-    select_weighted_least_inflight, should_select_warming_from_totals,
+    entry_effective_health_mut, record_local_selection, refresh_local_selection_windows_locked,
 };
 use super::types::{
-    AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
-    TransientFailureKind,
+    AcquireMode, CallContext, CredentialAuthUpdate, DispatchAdmission,
+    EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind, TransientFailureKind,
 };
 
 #[cfg(test)]
@@ -158,7 +161,15 @@ fn sha256_hex(input: &str) -> String {
     format!("{:x}", result)
 }
 
+fn parse_load_balancing_mode(config: &Config) -> anyhow::Result<LoadBalancingMode> {
+    config
+        .load_balancing_mode
+        .parse::<LoadBalancingMode>()
+        .map_err(anyhow::Error::msg)
+}
+
 fn validate_token_refresh_admission_config(config: &Config) -> anyhow::Result<()> {
+    parse_load_balancing_mode(config)?;
     if !(MIN_TOKEN_REFRESH_MAX_RPM..=MAX_TOKEN_REFRESH_MAX_RPM)
         .contains(&config.token_refresh_max_rpm)
     {
@@ -506,6 +517,15 @@ impl StatsFlushWorkerHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchProgressStatus {
+    pub progressing: bool,
+    pub queued_requests: u32,
+    pub dispatch_rate_per_sec: f64,
+    pub secs_since_last_dispatch: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RiskControlReportOutcome {
     pub has_available_credentials: bool,
@@ -519,17 +539,19 @@ impl RiskControlReportOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LocalPoolRiskCircuitEvent {
-    at: Instant,
-    credential_id: u64,
-}
-
+/// Pool-wide risk circuit. Opens only when credentials that have succeeded before are being
+/// risk-controlled across a meaningful share of the pool; a single bad batch of new imports
+/// only disables those credentials.
 #[derive(Debug, Default)]
 struct LocalPoolRiskCircuit {
-    failures: VecDeque<LocalPoolRiskCircuitEvent>,
+    /// Most recent risk-control time per distinct credential inside the window.
+    failures: HashMap<u64, Instant>,
     open_until: Option<Instant>,
     reason: Option<CredentialRiskControlReason>,
+    /// Half-open state after `open_until` passes: (probes left, end of the half-open period).
+    /// A success closes the circuit, a risk-controlled probe re-opens it, and a half-open
+    /// period that ends without either closes it, so it can never stay stuck.
+    half_open: Option<(u32, Instant)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -606,6 +628,8 @@ impl RefreshAttemptIdentity {
         effective_proxy: Option<&ProxyConfig>,
     ) -> Self {
         let base = Self::from_credentials(credentials);
+        // 与刷新请求头里实际发出的版本一致（自动同步打开后会变）。
+        let kiro_version = config.effective_kiro_version();
         let mut hasher = Sha256::new();
         hasher.update(base.0);
         hasher.update([match config.tls_backend {
@@ -614,7 +638,7 @@ impl RefreshAttemptIdentity {
         }]);
         for value in [
             Some(credentials.effective_auth_region(config)),
-            Some(config.kiro_version.as_str()),
+            Some(kiro_version.as_str()),
             config.machine_id.as_deref(),
             Some(config.system_version.as_str()),
             Some(config.node_version.as_str()),
@@ -960,7 +984,7 @@ pub struct MultiTokenManager {
     /// 代理/家宽资源快照。凭据直接代理优先，未设置时可通过 proxy_resource_id 绑定这里的资源。
     proxy_resources: Arc<Mutex<HashMap<u64, ProxyResourceRuntime>>>,
     /// 负载均衡模式（运行时可修改）
-    load_balancing_mode: Mutex<String>,
+    load_balancing_mode: Mutex<LoadBalancingMode>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 最近一次清理 PgSQL 运行态 mutation 幂等记录的时间。
@@ -985,6 +1009,9 @@ pub struct MultiTokenManager {
     scheduler_redis_full_sync_applied: Arc<AtomicU64>,
     scheduler_redis_dirty_credential_ids: Arc<Mutex<HashSet<u64>>>,
     scheduler_instance_id: Arc<str>,
+    /// Recent upstream faults of all credentials, see [`Self::note_upstream_fault`]. Locked
+    /// only while `entries` is held, never the other way round.
+    upstream_fault_log: Mutex<UpstreamFaultLog>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// 未落盘的统计增量。请求热路径只合并内存 delta，后台任务定期写入 PgSQL。
@@ -1005,6 +1032,11 @@ pub struct MultiTokenManager {
     runtime_mutation_flush_cursor: AtomicU64,
     /// 会话粘性绑定：conversationId -> credential id
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
+    /// Active bound sessions per credential, recomputed at most every
+    /// `BOUND_SESSION_COUNT_CACHE_TTL` and dropped whenever a binding changes.
+    bound_session_counts: Mutex<Option<(Instant, BoundSessionCounts)>>,
+    /// In-flight requests per (session, credential) on this instance.
+    session_concurrency: SessionConcurrency,
     /// 凭据容量 credit 与广播 generation；多槽释放不会折叠成一个通知。
     capacity_signal: Arc<CapacitySignal>,
     /// 进程内本地账号池风控熔断。它不依赖 Redis，确保 Redis degraded 或外部池
@@ -1015,11 +1047,13 @@ pub struct MultiTokenManager {
     released_in_flight_lease_tombstones: ReleasedInFlightLeaseTombstones,
     next_in_flight_lease_id: AtomicU64,
     queued_requests: Arc<AtomicU32>,
+    dispatch_progress: DispatchProgress,
+    started_at: Instant,
     /// Serializes only candidate selection plus the local provisional reservation.
     /// Redis and upstream awaits always run after this guard is dropped.
     selection_reservation_gate: Mutex<()>,
     /// Last time this instance moved a sticky session up to a higher Fast tier.
-    fast_sticky_migration_last: Mutex<Option<Instant>>,
+    tier_sticky_migration_last: Mutex<Option<Instant>>,
     /// 异步自愈 single-flight：账号池全灭时大量并发请求会同时走到自愈分支，
     /// 只让一个请求写 PgSQL，其余请求等它完成后按最新状态重新选择。
     auto_heal_gate: TokioMutex<()>,
@@ -1063,8 +1097,62 @@ const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_mi
 /// session drops its upstream prompt cache, so a burst of migrations would turn into a burst of
 /// cold requests on the Fast account; pacing keeps the shift gradual while new sessions go to
 /// the Fast tier immediately.
-const FAST_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const TIER_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const BOUND_SESSION_COUNT_CACHE_TTL: StdDuration = StdDuration::from_millis(500);
+
+/// Active bound sessions per credential id.
+type BoundSessionCounts = Arc<HashMap<u64, u32>>;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+
+/// 同一个账号连续几次上游故障（中间没有成功）后按账号问题冷却。
+pub(crate) const UPSTREAM_FAULT_STREAK_COOLDOWN: u32 = 3;
+/// Recent upstream faults kept to tell an account's own faults from a pool-wide wave.
+const UPSTREAM_FAULT_LOG_CAPACITY: usize = 256;
+
+/// Recent upstream faults (5xx, error events, read failures) of all credentials, in order.
+#[derive(Debug, Default)]
+struct UpstreamFaultLog {
+    next_seq: u64,
+    /// `(seq, credential id)`, oldest first.
+    recent: VecDeque<(u64, u64)>,
+}
+
+impl UpstreamFaultLog {
+    /// Records a fault of `credential_id` and returns its sequence number together with the
+    /// number of other credentials that faulted after `since_seq`, or `None` when the log no
+    /// longer reaches back that far (more faults happened in between than it keeps).
+    fn record(&mut self, credential_id: u64, since_seq: u64) -> (u64, Option<usize>) {
+        let reaches_back = self
+            .recent
+            .front()
+            .is_none_or(|(oldest, _)| *oldest <= since_seq.saturating_add(1));
+        let others_since = reaches_back.then(|| {
+            self.recent
+                .iter()
+                .filter(|(seq, id)| *seq > since_seq && *id != credential_id)
+                .map(|(_, id)| *id)
+                .collect::<HashSet<_>>()
+                .len()
+        });
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        if self.recent.len() >= UPSTREAM_FAULT_LOG_CAPACITY {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((seq, credential_id));
+        (seq, others_since)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutoHealLimits {
+    min_interval: StdDuration,
+    max_consecutive_rounds: u32,
+}
+const SCHEDULER_INSTANCE_HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(5);
+/// A killed instance's leases are reclaimed at most this long after its last heartbeat.
+const SCHEDULER_INSTANCE_HEARTBEAT_TTL: StdDuration = StdDuration::from_secs(30);
+const SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 const CREDENTIAL_RUNTIME_MUTATION_RETENTION: StdDuration =
     StdDuration::from_secs(30 * 24 * 60 * 60);
@@ -2299,6 +2387,10 @@ impl MultiTokenManager {
                     health: SchedulerHealthState::default(),
                     model_health: HashMap::new(),
                     selection_events: VecDeque::new(),
+                    last_auto_heal_at: None,
+                    auto_heal_consecutive_rounds: 0,
+                    upstream_fault_streak: 0,
+                    upstream_fault_seq: 0,
                 }
             })
             .collect();
@@ -2366,7 +2458,7 @@ impl MultiTokenManager {
             .map(|e| e.id)
             .unwrap_or(0);
 
-        let load_balancing_mode = config.load_balancing_mode.clone();
+        let load_balancing_mode = parse_load_balancing_mode(&config)?;
         let proxy_resources = if let Some(store) = &postgres_store {
             let store = store.clone();
             match block_on_credential_pgsql("从 PgSQL 加载代理资源", async move {
@@ -2435,6 +2527,7 @@ impl MultiTokenManager {
             scheduler_redis_full_sync_applied: Arc::new(AtomicU64::new(0)),
             scheduler_redis_dirty_credential_ids: Arc::new(Mutex::new(HashSet::new())),
             scheduler_instance_id,
+            upstream_fault_log: Mutex::new(UpstreamFaultLog::default()),
             stats_dirty: AtomicBool::new(false),
             pending_stats_deltas: Mutex::new(HashMap::new()),
             pending_stats_batches: Mutex::new(VecDeque::new()),
@@ -2445,13 +2538,17 @@ impl MultiTokenManager {
             overflow_runtime_mutations: AtomicU64::new(0),
             runtime_mutation_flush_cursor: AtomicU64::new(0),
             session_bindings: Mutex::new(HashMap::new()),
+            bound_session_counts: Mutex::new(None),
+            session_concurrency: SessionConcurrency::default(),
             capacity_signal: Arc::new(CapacitySignal::default()),
             local_pool_risk_circuit: Mutex::new(LocalPoolRiskCircuit::default()),
             released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
             next_in_flight_lease_id: AtomicU64::new(initial_lease_id),
             queued_requests: Arc::new(AtomicU32::new(0)),
+            dispatch_progress: DispatchProgress::default(),
+            started_at: Instant::now(),
             selection_reservation_gate: Mutex::new(()),
-            fast_sticky_migration_last: Mutex::new(None),
+            tier_sticky_migration_last: Mutex::new(None),
             auto_heal_gate: TokioMutex::new(()),
             #[cfg(test)]
             auto_heal_pgsql_attempts: AtomicU64::new(0),
@@ -2504,6 +2601,44 @@ impl MultiTokenManager {
     /// 空回是否让账号冷却（全局开关，默认关闭）。
     pub fn empty_turn_cooldown_enabled(&self) -> bool {
         self.config.lock().credential_empty_turn_cooldown_enabled
+    }
+
+    /// 记一次与账号无关的上游故障。同一个账号连续出现 [`UPSTREAM_FAULT_STREAK_COOLDOWN`] 次
+    /// （中间没有一次成功）时返回 true：问题多半出在这个账号上，调用方按原规则冷却它，
+    /// 否则优先级调度会让每个请求都先在它身上失败一次再换号。
+    ///
+    /// 故障只有集中在少数账号上才计入连续次数：从这个账号上次故障以来，其他可用账号里
+    /// 出过上游故障的不到一半。上游整体出错时（全挂或成片 5xx）各账号都会连着失败，这说明
+    /// 不了是哪个账号的问题，按账号冷却只会把整个池冷掉，故障重新从 1 计。
+    pub fn note_upstream_fault(&self, id: u64) -> bool {
+        let mut entries = self.entries.lock();
+        let other_usable = entries
+            .iter()
+            .filter(|entry| entry.id != id && !entry.disabled)
+            .count();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        let (seq, others_since) = self
+            .upstream_fault_log
+            .lock()
+            .record(id, entry.upstream_fault_seq);
+        entry.upstream_fault_seq = seq;
+        let concentrated =
+            other_usable == 0 || others_since.is_some_and(|others| others * 2 < other_usable);
+        entry.upstream_fault_streak = if entry.upstream_fault_streak > 0 && concentrated {
+            entry.upstream_fault_streak.saturating_add(1)
+        } else {
+            1
+        };
+        entry.upstream_fault_streak >= UPSTREAM_FAULT_STREAK_COOLDOWN
+    }
+
+    /// 上游故障（5xx、异常/错误事件、解码/读取/发送失败）是否冷却账号，默认否。
+    pub fn upstream_failure_cooldown_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .credential_upstream_failure_cooldown_enabled
     }
 
     /// 是否开放免登录的只读号池页面（默认关闭）。
@@ -2885,7 +3020,7 @@ impl MultiTokenManager {
             .update_limit(config.auxiliary_upstream_max_concurrent_requests);
         self.auxiliary_runtime
             .update_token_refresh_limits(config.token_refresh_max_rpm, config.token_refresh_burst);
-        *self.load_balancing_mode.lock() = config.load_balancing_mode.clone();
+        *self.load_balancing_mode.lock() = parse_load_balancing_mode(&config)?;
         self.update_credential_rpm_from_config();
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
@@ -3149,6 +3284,9 @@ impl MultiTokenManager {
             .open;
         let mut reason_counts: BTreeMap<AccountRejectReason, usize> = BTreeMap::new();
         let mut sampled_accounts = Vec::new();
+        // Disabled credentials sort first by id and used to fill the whole sample, hiding the
+        // accounts that actually blocked the request. They only fill what is left.
+        let mut sampled_disabled = Vec::new();
         let mut rejected_account_count = 0usize;
         let mut waitable_account_count = 0usize;
 
@@ -3185,8 +3323,13 @@ impl MultiTokenManager {
             rejected_account_count = rejected_account_count.saturating_add(1);
             *reason_counts.entry(reason).or_insert(0) += 1;
 
-            if sampled_accounts.len() < sample_limit {
-                sampled_accounts.push(RejectedAccountSample {
+            let bucket = if reason == AccountRejectReason::Disabled {
+                &mut sampled_disabled
+            } else {
+                &mut sampled_accounts
+            };
+            if bucket.len() < sample_limit {
+                bucket.push(RejectedAccountSample {
                     account_id: entry.id,
                     reason,
                     rpm_limit: Some(effective_rpm(entry, global_rpm)),
@@ -3201,6 +3344,8 @@ impl MultiTokenManager {
             }
         }
 
+        let room = sample_limit.saturating_sub(sampled_accounts.len());
+        sampled_accounts.extend(sampled_disabled.into_iter().take(room));
         (
             reason_counts,
             sampled_accounts,
@@ -3217,25 +3362,9 @@ impl MultiTokenManager {
         if !config.external_pools.local_pool_circuit_enabled {
             return LocalPoolRiskCircuitSnapshot::default();
         }
-        let window =
-            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
         let mut circuit = self.local_pool_risk_circuit.lock();
-        while circuit
-            .failures
-            .front()
-            .is_some_and(|event| now.saturating_duration_since(event.at) > window)
-        {
-            circuit.failures.pop_front();
-        }
-        let open_until = circuit.open_until.filter(|until| *until > now);
-        if open_until.is_none() {
-            circuit.open_until = None;
-            circuit.reason = None;
-        }
-        LocalPoolRiskCircuitSnapshot {
-            open: open_until.is_some(),
-            retry_after: open_until.map(|until| until.saturating_duration_since(now)),
-        }
+        Self::prune_local_pool_risk_circuit(&mut circuit, now, config);
+        Self::local_pool_risk_circuit_snapshot_locked(&circuit, now)
     }
 
     fn local_pool_risk_circuit_snapshot(&self, now: Instant) -> LocalPoolRiskCircuitSnapshot {
@@ -3243,77 +3372,152 @@ impl MultiTokenManager {
         self.local_pool_risk_circuit_snapshot_from_config(now, &config)
     }
 
+    fn prune_local_pool_risk_circuit(
+        circuit: &mut LocalPoolRiskCircuit,
+        now: Instant,
+        config: &Config,
+    ) {
+        let window =
+            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
+        circuit
+            .failures
+            .retain(|_, at| now.saturating_duration_since(*at) <= window);
+        let open_for =
+            StdDuration::from_secs(config.external_pools.local_pool_circuit_open_secs.max(1));
+        if let Some(until) = circuit.open_until.filter(|until| *until <= now) {
+            // Open period over: let a few probes through instead of closing outright.
+            circuit.open_until = None;
+            circuit.half_open = Some((
+                config
+                    .external_pools
+                    .local_pool_circuit_half_open_probes
+                    .max(1),
+                until.checked_add(open_for).unwrap_or(until),
+            ));
+        }
+        if circuit.half_open.is_some_and(|(_, until)| until <= now) {
+            circuit.half_open = None;
+            circuit.reason = None;
+            tracing::info!("本地账号池风险保护半开期结束且未再被风控，已关闭");
+        }
+    }
+
+    /// Open while the open period runs, and during half-open once every probe has been
+    /// handed out.
+    fn local_pool_risk_circuit_snapshot_locked(
+        circuit: &LocalPoolRiskCircuit,
+        now: Instant,
+    ) -> LocalPoolRiskCircuitSnapshot {
+        let blocked_until = circuit.open_until.filter(|until| *until > now).or_else(|| {
+            circuit
+                .half_open
+                .filter(|(left, until)| *left == 0 && *until > now)
+                .map(|(_, until)| until)
+        });
+        LocalPoolRiskCircuitSnapshot {
+            open: blocked_until.is_some(),
+            retry_after: blocked_until.map(|until| until.saturating_duration_since(now)),
+        }
+    }
+
+    /// Admits one half-open probe, or returns how long to wait when the circuit is open or the
+    /// half-open probes are used up.
+    fn admit_local_pool_risk_circuit_request(&self, now: Instant) -> Option<StdDuration> {
+        let config = self.config.lock().clone();
+        if !config.external_pools.local_pool_circuit_enabled {
+            return None;
+        }
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        Self::prune_local_pool_risk_circuit(&mut circuit, now, &config);
+        if let Some(retry_after) =
+            Self::local_pool_risk_circuit_snapshot_locked(&circuit, now).retry_after
+        {
+            return Some(retry_after);
+        }
+        if let Some((left, _)) = circuit.half_open.as_mut() {
+            *left = left.saturating_sub(1);
+        }
+        None
+    }
+
+    /// A successful local call closes a half-open circuit.
+    fn record_local_pool_risk_circuit_success(&self) {
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        if circuit.half_open.take().is_some() {
+            circuit.reason = None;
+            tracing::info!("本地账号池风险保护半开探测成功，已关闭");
+        }
+    }
+
+    /// Counts one risk-controlled credential towards the pool circuit.
+    ///
+    /// `ever_succeeded` must be false for credentials that never served a successful request
+    /// (fresh imports, warmup): their risk control says nothing about the rest of the pool.
+    /// `dispatchable_now` is the number of credentials that can still take requests, used for
+    /// the ratio threshold.
     fn record_local_pool_risk_circuit_failure(
         &self,
         credential_id: u64,
         reason: CredentialRiskControlReason,
+        ever_succeeded: bool,
+        dispatchable_now: usize,
     ) -> LocalPoolRiskCircuitSnapshot {
         let config = self.config.lock().clone();
         if !config.external_pools.local_pool_circuit_enabled {
             return LocalPoolRiskCircuitSnapshot::default();
         }
         let now = Instant::now();
-        let window =
-            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        Self::prune_local_pool_risk_circuit(&mut circuit, now, &config);
+        if !ever_succeeded {
+            tracing::warn!(
+                credential_id,
+                risk_reason = reason.event_reason(),
+                "从未成功过的账号被风控，只禁用该账号，不计入本地账号池风险保护"
+            );
+            return Self::local_pool_risk_circuit_snapshot_locked(&circuit, now);
+        }
+        circuit.failures.insert(credential_id, now);
+
         let open_for =
             StdDuration::from_secs(config.external_pools.local_pool_circuit_open_secs.max(1));
-        let open_after_failures = config
-            .external_pools
-            .local_pool_circuit_open_after_failures
-            .max(1);
         let required_distinct = config
             .external_pools
             .local_pool_circuit_require_distinct_credentials
-            .max(1);
-
-        let mut circuit = self.local_pool_risk_circuit.lock();
-        while circuit
-            .failures
-            .front()
-            .is_some_and(|event| now.saturating_duration_since(event.at) > window)
-        {
-            circuit.failures.pop_front();
-        }
-        circuit.failures.push_back(LocalPoolRiskCircuitEvent {
-            at: now,
-            credential_id,
-        });
-
-        let distinct_credentials = circuit
-            .failures
-            .iter()
-            .map(|event| event.credential_id)
-            .collect::<HashSet<_>>()
-            .len()
-            .min(u32::MAX as usize) as u32;
-        let recent_failures = circuit.failures.len().min(u32::MAX as usize) as u32;
-
+            .max(config.external_pools.local_pool_circuit_open_after_failures)
+            .max(1) as usize;
+        let min_ratio_percent = config
+            .external_pools
+            .local_pool_circuit_min_ratio_percent
+            .min(100) as usize;
+        let distinct_credentials = circuit.failures.len();
+        let pool = distinct_credentials + dispatchable_now;
+        let ratio_reached =
+            min_ratio_percent == 0 || distinct_credentials * 100 >= pool * min_ratio_percent;
+        let half_open = circuit.half_open.is_some();
         let already_open = circuit.open_until.is_some_and(|until| until > now);
-        if already_open {
-            if circuit.reason.is_none() {
-                circuit.reason = Some(reason);
-            }
-        } else if recent_failures >= open_after_failures
-            && distinct_credentials >= required_distinct
+
+        if !already_open
+            && (half_open || (distinct_credentials >= required_distinct && ratio_reached))
         {
             let open_until = now.checked_add(open_for).unwrap_or(now);
             circuit.open_until = Some(open_until);
             circuit.reason = Some(reason);
+            circuit.half_open = None;
+            // Start the next window from zero so the circuit cannot re-open on a single late
+            // event right after the open period.
+            circuit.failures.clear();
             tracing::error!(
                 credential_id,
                 risk_reason = reason.event_reason(),
-                recent_failures,
                 distinct_credentials,
+                dispatchable_now,
+                half_open_probe_failed = half_open,
                 open_secs = open_for.as_secs(),
                 "本地账号池风控熔断已打开，暂停继续探测剩余本地账号"
             );
         }
-
-        let open_until = circuit.open_until.filter(|until| *until > now);
-        LocalPoolRiskCircuitSnapshot {
-            open: open_until.is_some(),
-            retry_after: open_until.map(|until| until.saturating_duration_since(now)),
-        }
+        Self::local_pool_risk_circuit_snapshot_locked(&circuit, now)
     }
 
     fn compute_local_pool_route_state(
@@ -3636,39 +3840,70 @@ impl MultiTokenManager {
         self.finish_auto_heal(healed_ids)
     }
 
+    fn auto_heal_limits(&self) -> AutoHealLimits {
+        let config = self.config.lock();
+        AutoHealLimits {
+            min_interval: StdDuration::from_secs(config.credential_auto_heal_min_interval_secs),
+            max_consecutive_rounds: config.credential_auto_heal_max_consecutive_rounds,
+        }
+    }
+
+    /// 能否对这个账号自愈：必须是连续失败禁用，距上次自愈够久，且连续轮数没到上限。
+    fn is_auto_heal_candidate(
+        entry: &CredentialEntry,
+        limits: AutoHealLimits,
+        now: Instant,
+    ) -> bool {
+        entry.disabled
+            && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+            && !entry.runtime_persistence_degraded
+            && (limits.max_consecutive_rounds == 0
+                || entry.auto_heal_consecutive_rounds < limits.max_consecutive_rounds)
+            && (limits.min_interval.is_zero()
+                || entry
+                    .last_auto_heal_at
+                    .is_none_or(|last| now.saturating_duration_since(last) >= limits.min_interval))
+    }
+
     fn has_auto_heal_candidates(&self) -> bool {
-        self.entries.lock().iter().any(|entry| {
-            entry.disabled
-                && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                && !entry.runtime_persistence_degraded
-        })
+        let limits = self.auto_heal_limits();
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .any(|entry| Self::is_auto_heal_candidate(entry, limits, now))
     }
 
     fn auto_heal_candidate_ids(&self) -> Option<Vec<u64>> {
+        let limits = self.auto_heal_limits();
+        let now = Instant::now();
         let entries = self.entries.lock();
-        if !entries.iter().any(|entry| {
+        let candidates: Vec<u64> = entries
+            .iter()
+            .filter(|entry| Self::is_auto_heal_candidate(entry, limits, now))
+            .map(|entry| entry.id)
+            .collect();
+        for entry in entries.iter().filter(|entry| {
             entry.disabled
                 && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                && !entry.runtime_persistence_degraded
+                && limits.max_consecutive_rounds > 0
+                && entry.auto_heal_consecutive_rounds >= limits.max_consecutive_rounds
         }) {
+            tracing::error!(
+                credential_id = entry.id,
+                rounds = entry.auto_heal_consecutive_rounds,
+                "账号已连续自愈多轮仍然失败，不再自动恢复，请人工检查"
+            );
+        }
+        if candidates.is_empty() {
             return None;
         }
 
         tracing::warn!(
+            candidates = candidates.len(),
             "所有可调度凭据均不可用且存在连续失败自动禁用凭据，执行自愈：重置失败计数并重新启用"
         );
-
-        Some(
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry.disabled
-                        && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        && !entry.runtime_persistence_degraded
-                })
-                .map(|entry| entry.id)
-                .collect(),
-        )
+        Some(candidates)
     }
 
     /// 把自愈结果写回本地 entry，返回该凭据是否已恢复为可用。
@@ -3696,6 +3931,11 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
         }
+        if !entry.disabled {
+            entry.last_auto_heal_at = Some(Instant::now());
+            entry.auto_heal_consecutive_rounds =
+                entry.auto_heal_consecutive_rounds.saturating_add(1);
+        }
         !entry.disabled
     }
 
@@ -3704,7 +3944,7 @@ impl MultiTokenManager {
             return false;
         }
 
-        for healed_id in healed_ids {
+        for &healed_id in &healed_ids {
             self.record_scheduler_credential_audit(
                 "auto_enable_credential",
                 healed_id,
@@ -3716,6 +3956,9 @@ impl MultiTokenManager {
                 }),
             );
         }
+        // Disabling set a 24 h Redis dispatch block; every Redis lease attempt checks it first, so
+        // without this the healed credential looks enabled and idle but can never be dispatched.
+        self.clear_scheduler_dispatch_blocks_deferred(&healed_ids);
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("auto_heal_too_many_failures");
@@ -3741,6 +3984,93 @@ impl MultiTokenManager {
 
     fn global_max_concurrent_requests(&self) -> u32 {
         self.config.lock().dispatch_global_max_concurrent_requests
+    }
+
+    /// Fast path for the request entry: `Some(retry_after_secs)` when the dispatch queue is
+    /// full and no credential has a free slot for `model`, so the request would be turned away by
+    /// the scheduler anyway. Reads only local counters (no Redis, no PgSQL) so it stays cheap
+    /// when thousands of requests per minute are arriving during an overload. The model matters:
+    /// checking without it treated every credential with a model catalog as having no free slot.
+    pub fn dispatch_queue_full_retry_after(&self, model: Option<&str>) -> Option<u64> {
+        let max_queued = self.max_queued_requests();
+        let queued = self.queued_requests.load(Ordering::Acquire);
+        if max_queued == 0 || queued < max_queued {
+            return None;
+        }
+        let has_free_slot = {
+            let entries = self.entries.lock();
+            let proxy_resources = self.proxy_resources.lock();
+            let config = self.config.lock();
+            let now = Instant::now();
+            let global_in_flight = entries
+                .iter()
+                .map(|entry| entry.in_flight_requests)
+                .sum::<u32>();
+            global_has_concurrency_capacity(
+                global_in_flight,
+                config.dispatch_global_max_concurrent_requests,
+                1,
+            ) && entries.iter().any(|entry| {
+                credential_is_dispatchable(
+                    &proxy_resources,
+                    entry,
+                    model,
+                    now,
+                    config.credential_max_concurrent_requests,
+                    config.credential_rpm.unwrap_or(0),
+                    1,
+                )
+            })
+        };
+        if has_free_slot {
+            return None;
+        }
+        Some(
+            self.dispatch_progress
+                .queue_full_retry_after_secs(queued, Instant::now()),
+        )
+    }
+
+    /// Whether queued requests are turning into dispatches. `false` when requests have been
+    /// waiting in the dispatch queue and nothing was dispatched for `stall_after`, which is
+    /// what a wedged scheduler looks like from the outside.
+    pub fn dispatch_is_progressing(&self, stall_after: StdDuration) -> DispatchProgressStatus {
+        let queued = self.queued_requests.load(Ordering::Acquire);
+        let now = Instant::now();
+        let since_last_dispatch = self
+            .dispatch_progress
+            .last_dispatch_at()
+            .map(|at| now.saturating_duration_since(at));
+        let since_start = now.saturating_duration_since(self.started_at);
+        let stalled = queued > 0
+            && since_last_dispatch.unwrap_or(since_start) >= stall_after
+            && since_start >= stall_after;
+        DispatchProgressStatus {
+            progressing: !stalled,
+            queued_requests: queued,
+            dispatch_rate_per_sec: self.dispatch_progress.recent_rate_per_sec(now),
+            secs_since_last_dispatch: since_last_dispatch.map(|elapsed| elapsed.as_secs()),
+        }
+    }
+
+    /// The queue is full: tell the client to come back once the current queue has had time to
+    /// drain at the recent dispatch rate, instead of retrying every second into a full queue.
+    fn dispatch_queue_full_error(&self) -> anyhow::Error {
+        let queued = self.queued_requests.load(Ordering::Acquire);
+        let retry_after_secs = self
+            .dispatch_progress
+            .queue_full_retry_after_secs(queued, Instant::now());
+        LocalSchedulerError::new(
+            LocalSchedulerErrorKind::QueueFull,
+            format!(
+                "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}, queued={}, retry_after_secs={}）",
+                self.max_queued_requests(),
+                self.global_max_concurrent_requests(),
+                queued,
+                retry_after_secs
+            ),
+        )
+        .into()
     }
 
     fn max_queued_requests(&self) -> u32 {
@@ -4919,13 +5249,14 @@ impl MultiTokenManager {
             .clone();
         let credential_id = guard.credential_id();
         let lease_id = guard.id();
+        let owner_instance_id = self.scheduler_instance_id.clone();
         let redis_acquire = self
             .await_scheduler_redis_hot_outcome(
                 "占用 Redis 凭据并发槽",
                 || guard.arm_redis_commit_unknown(),
                 async move {
                     redis
-                        .acquire_dispatch_lease(
+                        .acquire_dispatch_lease_owned(
                             credential_id,
                             lease_id,
                             effective_max_concurrent_requests,
@@ -4933,6 +5264,7 @@ impl MultiTokenManager {
                             request_weight_units,
                             max_age,
                             InFlightKind::Api.as_str(),
+                            Some(&owner_instance_id),
                         )
                         .await
                 },
@@ -4994,6 +5326,11 @@ impl MultiTokenManager {
             return Ok(None);
         };
         self.confirm_prepared_in_flight_slot(prepared).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_queued_requests_for_test(&self, queued: u32) {
+        self.queued_requests.store(queued, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -5329,11 +5666,20 @@ impl MultiTokenManager {
         }
     }
 
+    /// Queue limit for one dispatch: `0` (no limit) for a retry, see [`DispatchAdmission::Retry`].
+    fn dispatch_queue_limit(&self, admission: DispatchAdmission) -> u32 {
+        match admission {
+            DispatchAdmission::New => self.max_queued_requests(),
+            DispatchAdmission::Retry => 0,
+        }
+    }
+
     async fn try_enter_dispatch_queue(
         &self,
         max_wait: Option<StdDuration>,
+        admission: DispatchAdmission,
     ) -> anyhow::Result<Option<DispatchQueueGuard>> {
-        let max_queued = self.max_queued_requests();
+        let max_queued = self.dispatch_queue_limit(admission);
         if !self.try_enter_local_dispatch_queue(max_queued) {
             return Ok(None);
         }
@@ -5436,8 +5782,9 @@ impl MultiTokenManager {
     fn try_enter_local_only_dispatch_queue(
         &self,
         max_wait: Option<StdDuration>,
+        admission: DispatchAdmission,
     ) -> Option<DispatchQueueGuard> {
-        let max_queued = self.max_queued_requests();
+        let max_queued = self.dispatch_queue_limit(admission);
         if !self.try_enter_local_dispatch_queue(max_queued) {
             return None;
         }
@@ -5498,6 +5845,50 @@ impl MultiTokenManager {
             return false;
         }
         self.has_alternate_usable_credential_from_current_state(model, excluded_ids, current_id)
+    }
+
+    /// Whether a request whose attempt on `current_id` just failed upstream has another
+    /// credential to retry on, from the local state only (no storage round trip on the failure
+    /// path).
+    ///
+    /// A request that may wait for capacity can retry on a credential that is merely busy: its
+    /// next dispatch queues for that slot like any other request (see
+    /// [`DispatchAdmission::Retry`]). Requiring a free slot right now would turn every upstream
+    /// error under load into a client error. Credentials cooling down, RPM-limited, disabled or
+    /// behind an unavailable proxy are no target either way. A fail-fast request cannot queue,
+    /// so it still needs a free slot.
+    pub fn has_alternate_retry_target_cached(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+        waits_for_capacity: bool,
+    ) -> bool {
+        if !waits_for_capacity {
+            return self.has_alternate_usable_credential_from_current_state(
+                model,
+                excluded_ids,
+                current_id,
+            );
+        }
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        if self.redis_store.is_none() {
+            refresh_local_selection_windows_locked(&mut entries, now);
+        }
+        let proxy_resources = self.proxy_resources.lock();
+        entries.iter().any(|entry| {
+            entry.id != current_id
+                && !excluded_ids.contains(&entry.id)
+                && credential_is_temporarily_available(
+                    &proxy_resources,
+                    entry,
+                    model,
+                    now,
+                    global_rpm,
+                )
+        })
     }
 
     /// 判断当前本机内存态中是否还有其他可调度凭据。
@@ -5613,21 +6004,25 @@ impl MultiTokenManager {
         })
     }
 
+    /// After losing a slot race the request re-selects with the same rule as its first pick:
+    /// any other credential that can take it right now is a valid alternative, including one
+    /// in the next priority or Fast tier. Waiting is only right when nothing else is free.
     fn has_alternate_dispatchable_credential_for_slot_race(
         &self,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
         current_id: u64,
-        current_priority: u32,
-        current_fast: u32,
         request_weight_units: u32,
     ) -> bool {
-        let priority_mode = self.load_balancing_mode.lock().as_str() == "priority";
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let config = self.config.lock().clone();
-        let max_concurrent_requests = config.credential_max_concurrent_requests;
-        let global_rpm = config.credential_rpm.unwrap_or(0);
+        let (max_concurrent_requests, global_rpm) = {
+            let config = self.config.lock();
+            (
+                config.credential_max_concurrent_requests,
+                config.credential_rpm.unwrap_or(0),
+            )
+        };
         if self.redis_store.is_none() {
             refresh_local_selection_windows_locked(&mut entries, now);
         }
@@ -5635,11 +6030,6 @@ impl MultiTokenManager {
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
-                // priority mode waits for its own priority level, but a full Fast tier must
-                // overflow to the next tier instead of queueing behind it.
-                && (!priority_mode
-                    || entry.credentials.priority == current_priority
-                    || entry.credentials.fast != current_fast)
                 && credential_is_dispatchable(
                     &proxy_resources,
                     entry,
@@ -5652,25 +6042,33 @@ impl MultiTokenManager {
         })
     }
 
-    /// Decides whether a sticky session bound to a lower Fast tier should move up on this request.
+    /// Decides whether a sticky session bound to a less preferred tier should move up on this
+    /// request.
     ///
-    /// Moving is only allowed when a higher-tier credential can take the request right now
-    /// (all dispatch safety rules, including its concurrency limit), and at most one session per
-    /// `FAST_STICKY_MIGRATION_INTERVAL` moves on this instance. Otherwise the session stays on
+    /// A credential is "better" than the bound one when its Fast value is higher, or, in
+    /// priority mode, when it has the same Fast value and a lower priority value. Moving is only
+    /// allowed when such a credential can take the request right now (all dispatch safety rules,
+    /// including its concurrency limit), and at most one session per
+    /// `TIER_STICKY_MIGRATION_INTERVAL` moves on this instance, so a freed tier is refilled
+    /// gradually instead of all bound sessions jumping at once. Otherwise the session stays on
     /// its bound credential as before.
-    fn should_migrate_sticky_to_fast_tier(
+    fn should_migrate_sticky_to_better_tier(
         &self,
-        bound_fast: u32,
+        bound: StickyTier,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
         request_weight_units: u32,
     ) -> bool {
-        let has_higher_tier = {
+        let compare_priority = self
+            .load_balancing_mode
+            .lock()
+            .fills_priority_tiers_in_order();
+        let has_better_tier = {
             let entries = self.entries.lock();
-            if !entries
-                .iter()
-                .any(|entry| entry.credentials.fast > bound_fast)
-            {
+            let is_better = |entry: &CredentialEntry| {
+                StickyTier::of(&entry.credentials).is_better_than(bound, compare_priority)
+            };
+            if !entries.iter().any(&is_better) {
                 return false;
             }
             let proxy_resources = self.proxy_resources.lock();
@@ -5685,7 +6083,7 @@ impl MultiTokenManager {
                 config.dispatch_global_max_concurrent_requests,
                 request_weight_units,
             ) && entries.iter().any(|entry| {
-                entry.credentials.fast > bound_fast
+                is_better(entry)
                     && !excluded_ids.contains(&entry.id)
                     && credential_is_dispatchable(
                         &proxy_resources,
@@ -5698,12 +6096,12 @@ impl MultiTokenManager {
                     )
             })
         };
-        if !has_higher_tier {
+        if !has_better_tier {
             return false;
         }
         let now = Instant::now();
-        let mut last = self.fast_sticky_migration_last.lock();
-        if last.is_some_and(|at| now.saturating_duration_since(at) < FAST_STICKY_MIGRATION_INTERVAL)
+        let mut last = self.tier_sticky_migration_last.lock();
+        if last.is_some_and(|at| now.saturating_duration_since(at) < TIER_STICKY_MIGRATION_INTERVAL)
         {
             return false;
         }
@@ -5745,6 +6143,7 @@ impl MultiTokenManager {
             tracing::warn!("选择凭据前同步 Redis 调度状态失败: {}", err);
             return None;
         }
+        let bound_sessions = self.active_bound_session_counts();
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
@@ -5761,122 +6160,72 @@ impl MultiTokenManager {
             request_weight_units,
         );
 
-        let mut available = Vec::new();
-        let mut ready = Vec::new();
-        let mut warming = Vec::new();
-        let mut total_recent = 0u64;
-        let mut warming_recent = 0u64;
-
-        if global_has_capacity {
-            let dispatchable = entries
-                .iter()
-                .filter(|entry| {
-                    !excluded_ids.contains(&entry.id)
-                        && credential_is_dispatchable(
-                            &proxy_resources,
-                            entry,
-                            model,
-                            now,
-                            max_concurrent_requests,
-                            global_rpm,
-                            request_weight_units,
-                        )
-                })
-                .collect::<Vec<_>>();
-            // Credentials with an empty model catalog are only a fallback: when any dispatchable
-            // credential's catalog lists the model, unknown-catalog credentials (failed discovery,
-            // invalid keys) must not win the selection and burn an attempt.
-            let prefer_catalog_listed = dispatchable
-                .iter()
-                .any(|entry| credential_catalog_lists_model(entry, model));
-            for entry in dispatchable {
-                if prefer_catalog_listed && !credential_catalog_lists_model(entry, model) {
-                    continue;
-                }
-
-                let recent = entry.health.recent_selection_count_60s as u64;
-                total_recent = total_recent.saturating_add(recent);
-                available.push(entry);
-                if entry.warmup_remaining > 0 {
-                    warming_recent = warming_recent.saturating_add(recent);
-                    warming.push(entry);
-                } else {
-                    ready.push(entry);
-                }
-            }
-        }
-
-        if available.is_empty() {
+        if !global_has_capacity {
             return None;
         }
-
-        // Fast tiers sit above every load-balancing mode: only the highest Fast tier among the
-        // dispatchable candidates competes, so a tier is filled up to its safety limits
-        // (concurrency, RPM, cooldown, model, proxy) before traffic overflows to the next one.
-        let top_fast = available
+        let dispatchable = entries
             .iter()
-            .map(|entry| entry.credentials.fast)
-            .max()
-            .unwrap_or(0);
-        if top_fast > 0 {
-            ready.retain(|entry| entry.credentials.fast == top_fast);
-            warming.retain(|entry| entry.credentials.fast == top_fast);
-            let tier_recent = |entries: &[&CredentialEntry]| {
-                entries
-                    .iter()
-                    .map(|entry| entry.health.recent_selection_count_60s as u64)
-                    .sum::<u64>()
-            };
-            warming_recent = tier_recent(&warming);
-            total_recent = warming_recent.saturating_add(tier_recent(&ready));
-        }
-
-        let select_warming = should_select_warming_from_totals(
+            .filter(|entry| {
+                !excluded_ids.contains(&entry.id)
+                    && credential_is_dispatchable(
+                        &proxy_resources,
+                        entry,
+                        model,
+                        now,
+                        max_concurrent_requests,
+                        global_rpm,
+                        request_weight_units,
+                    )
+            })
+            .collect::<Vec<_>>();
+        let mode = *self.load_balancing_mode.lock();
+        let entry = select_candidate(
+            mode,
+            dispatchable,
+            model,
+            Utc::now().timestamp_millis(),
             &config,
-            ready.len(),
-            warming.len(),
-            total_recent,
-            warming_recent,
-        );
-        let candidates = if select_warming { &warming } else { &ready };
-        let mode = self.load_balancing_mode.lock().clone();
+            &bound_sessions,
+        )?;
+        Some((entry.id, entry.credentials.clone()))
+    }
 
-        match mode.as_str() {
-            "health_balanced" => {
-                // 预热不是后台主动打流量，而是在真实业务请求中按目标份额参与调度；
-                // 份额按预热账号数量放大并受最大预热份额限制，避免批量导入后长期吃不到流量。
-                let entry = select_health_weighted(
-                    candidates,
-                    model,
-                    Utc::now().timestamp_millis(),
-                    &config,
-                )?;
-
-                Some((entry.id, entry.credentials.clone()))
-            }
-            "balanced" => {
-                let entry = candidates
-                    .iter()
-                    .min_by_key(|entry| balanced_selection_key(entry))?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-            "weighted_least_inflight" => {
-                let entry = select_weighted_least_inflight(
-                    candidates,
-                    model,
-                    Utc::now().timestamp_millis(),
-                    &config,
-                )?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-            _ => {
-                // priority 模式（默认）：优先级仍是第一排序，但同优先级账号优先选低并发。
-                let entry = candidates
-                    .iter()
-                    .min_by_key(|e| priority_selection_key(e))?;
-                Some((entry.id, entry.credentials.clone()))
+    /// Sessions bound to each credential that sent a request in the last
+    /// `ACTIVE_SESSION_WINDOW_SECS`. Counts come from this instance's binding cache, so with
+    /// several instances each one evens out the sessions it serves.
+    fn active_bound_session_counts(&self) -> BoundSessionCounts {
+        let now = Instant::now();
+        if let Some((computed_at, counts)) = self.bound_session_counts.lock().as_ref() {
+            if now.saturating_duration_since(*computed_at) < BOUND_SESSION_COUNT_CACHE_TTL {
+                return counts.clone();
             }
         }
+        let cutoff = Utc::now() - chrono::Duration::seconds(ACTIVE_SESSION_WINDOW_SECS);
+        let mut counts = HashMap::new();
+        for binding in self.session_bindings.lock().values() {
+            if binding.last_used_at >= cutoff {
+                *counts.entry(binding.credential_id).or_insert(0u32) += 1;
+            }
+        }
+        let counts = Arc::new(counts);
+        *self.bound_session_counts.lock() = Some((now, counts.clone()));
+        counts
+    }
+
+    fn invalidate_bound_session_counts(&self) {
+        self.bound_session_counts.lock().take();
+    }
+
+    /// Whether `session_id` already has `credentialSessionMaxConcurrentRequests` requests in
+    /// flight on `credential_id`. `0` means the credential's own limit applies, which the
+    /// regular slot reservation already enforces.
+    fn session_at_concurrency_limit(&self, session_id: &str, credential_id: u64) -> bool {
+        let limit = self
+            .config
+            .lock()
+            .credential_session_max_concurrent_requests;
+        limit > 0
+            && session_in_flight_on(&self.session_concurrency, session_id, credential_id) >= limit
     }
 
     fn get_bound_credential(
@@ -6031,6 +6380,16 @@ impl MultiTokenManager {
     }
 
     async fn bind_session_to_credential_for_request(&self, session_id: &str, credential_id: u64) {
+        self.bind_session_to_credential_for_request_inner(session_id, credential_id)
+            .await;
+        self.invalidate_bound_session_counts();
+    }
+
+    async fn bind_session_to_credential_for_request_inner(
+        &self,
+        session_id: &str,
+        credential_id: u64,
+    ) {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
@@ -6305,12 +6664,38 @@ impl MultiTokenManager {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn acquire_context_for_session_with_mode_and_auxiliary_budget(
         &self,
         model: Option<&str>,
         session_id: Option<&str>,
         excluded_ids: &HashSet<u64>,
         acquire_mode: AcquireMode,
+        request_weight_units: u32,
+        auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_dispatch(
+            model,
+            session_id,
+            excluded_ids,
+            acquire_mode,
+            DispatchAdmission::New,
+            request_weight_units,
+            auxiliary_attempt_budget,
+        )
+        .await
+    }
+
+    /// Selects a credential for one dispatch of a request; `admission` tells a first dispatch
+    /// from a retry after a failed attempt (see [`DispatchAdmission`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn acquire_context_for_dispatch(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        acquire_mode: AcquireMode,
+        admission: DispatchAdmission,
         request_weight_units: u32,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     ) -> anyhow::Result<CallContext> {
@@ -6349,13 +6734,15 @@ impl MultiTokenManager {
         let mut local_excluded_ids = excluded_ids.clone();
         let mut slot_race_excluded_count = 0usize;
         let mut sticky_bound_release_grace_waited = false;
-        // Set once this request decides to move its sticky session up to a higher Fast tier:
-        // (bound credential id, its Fast value).
-        let mut fast_migration_from: Option<(u64, u32)> = None;
+        // Set once this request decides to move its sticky session up to a better tier:
+        // (bound credential id, its tier).
+        let mut tier_migration_from: Option<(u64, StickyTier)> = None;
         // 上一轮已经尝试过自愈：本轮按自愈后的状态正常判定，不再立即重复自愈。
         // 自愈只会把 TooManyFailures 禁用的凭据恢复为可用，所以"自愈轮"与"普通判定轮"交替出现，
         // 普通判定轮的终止条件（选中、排队超时、bail）与原逻辑一致，不会无限循环。
         let mut auto_heal_just_attempted = false;
+        // A request takes at most one half-open probe, however many times it loops.
+        let mut risk_circuit_admitted = false;
         let mut auxiliary_refresh_error: Option<anyhow::Error> = None;
         let mut health_neutral_refresh_error: Option<anyhow::Error> = None;
         let request_bound_id = match session_id {
@@ -6364,10 +6751,14 @@ impl MultiTokenManager {
         };
 
         loop {
-            if let Some(retry_after) = self
-                .local_pool_risk_circuit_snapshot(Instant::now())
-                .retry_after
-            {
+            let circuit_retry_after = if risk_circuit_admitted {
+                self.local_pool_risk_circuit_snapshot(Instant::now())
+                    .retry_after
+            } else {
+                risk_circuit_admitted = true;
+                self.admit_local_pool_risk_circuit_request(Instant::now())
+            };
+            if let Some(retry_after) = circuit_retry_after {
                 local_scheduler_bail!(
                     LocalSchedulerErrorKind::RiskCircuitOpen,
                     "本地账号池风险保护已打开（retry_after_secs={}）",
@@ -6471,28 +6862,46 @@ impl MultiTokenManager {
             }
 
             let selection_reservation_guard = self.selection_reservation_gate.lock();
+            let mut session_limited_bound: Option<u64> = None;
             let decision = {
                 let bound_hit = request_bound_id
                     .and_then(|bound_id| {
                         self.get_bound_credential(bound_id, model, &local_excluded_ids)
                     })
+                    .filter(|(bound_id, _)| {
+                        // The session already has as many requests on its bound credential as
+                        // allowed: borrow another credential for this one, keep the binding.
+                        let at_session_limit = session_id.is_some_and(|session_id| {
+                            self.session_at_concurrency_limit(session_id, *bound_id)
+                        });
+                        if at_session_limit {
+                            session_limited_bound = Some(*bound_id);
+                            tracing::debug!(
+                                credential_id = *bound_id,
+                                "同一会话在绑定账号上的并发已达上限，本次临时借用其他账号"
+                            );
+                        }
+                        !at_session_limit
+                    })
                     .filter(|(bound_id, bound_credentials)| {
-                        if fast_migration_from.is_some() {
+                        if tier_migration_from.is_some() {
                             // Already decided to move this request; keep that decision on retry.
                             return false;
                         }
-                        let migrate = self.should_migrate_sticky_to_fast_tier(
-                            bound_credentials.fast,
+                        let bound_tier = StickyTier::of(bound_credentials);
+                        let migrate = self.should_migrate_sticky_to_better_tier(
+                            bound_tier,
                             model,
                             &local_excluded_ids,
                             request_weight_units,
                         );
                         if migrate {
-                            fast_migration_from = Some((*bound_id, bound_credentials.fast));
+                            tier_migration_from = Some((*bound_id, bound_tier));
                             tracing::debug!(
                                 credential_id = *bound_id,
-                                fast = bound_credentials.fast,
-                                "sticky 会话绑定在较低 Fast 档，本次迁移到更高 Fast 档账号"
+                                fast = bound_tier.fast,
+                                priority = bound_tier.priority,
+                                "sticky 会话绑定在较低档位，本次迁移到更优档位账号"
                             );
                         }
                         !migrate
@@ -6504,11 +6913,26 @@ impl MultiTokenManager {
                     let fallback_from_sticky = request_bound_id.is_some();
                     {
                         // 根据负载均衡策略选择；priority 模式也会在同优先级账号之间优先低并发。
-                        let best = self.select_next_credential_excluding(
-                            model,
-                            &local_excluded_ids,
-                            request_weight_units,
-                        );
+                        // A session over its per-credential limit prefers any other credential;
+                        // the limit only spreads load, so with nothing else free the bound
+                        // credential is still used within its own concurrency limit.
+                        let best = session_limited_bound
+                            .and_then(|bound_id| {
+                                let mut excluded = local_excluded_ids.clone();
+                                excluded.insert(bound_id);
+                                self.select_next_credential_excluding(
+                                    model,
+                                    &excluded,
+                                    request_weight_units,
+                                )
+                            })
+                            .or_else(|| {
+                                self.select_next_credential_excluding(
+                                    model,
+                                    &local_excluded_ids,
+                                    request_weight_units,
+                                )
+                            });
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈。
                         // 自愈要写 PgSQL，不能在持有 selection_reservation_gate 时执行；这里只做本地
@@ -6828,14 +7252,11 @@ impl MultiTokenManager {
                         }
                     }
                     if queue_guard.is_none() {
-                        queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
+                        queue_guard = self
+                            .try_enter_dispatch_queue(dispatch_max_wait, admission)
+                            .await?;
                         if queue_guard.is_none() {
-                            local_scheduler_bail!(
-                                LocalSchedulerErrorKind::QueueFull,
-                                "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                self.max_queued_requests(),
-                                self.global_max_concurrent_requests()
-                            );
+                            return Err(self.dispatch_queue_full_error());
                         }
                     }
                     let now = Instant::now();
@@ -6926,15 +7347,12 @@ impl MultiTokenManager {
                             .into());
                         }
                         if queue_guard.is_none() {
-                            queue_guard =
-                                self.try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
+                            queue_guard = self.try_enter_local_only_dispatch_queue(
+                                redis_degraded_max_wait,
+                                admission,
+                            );
                             if queue_guard.is_none() {
-                                local_scheduler_bail!(
-                                    LocalSchedulerErrorKind::QueueFull,
-                                    "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                    self.max_queued_requests(),
-                                    self.global_max_concurrent_requests()
-                                );
+                                return Err(self.dispatch_queue_full_error());
                             }
                         }
                         let now = Instant::now();
@@ -7051,8 +7469,6 @@ impl MultiTokenManager {
                     model,
                     &local_excluded_ids,
                     id,
-                    credentials.priority,
-                    credentials.fast,
                     request_weight_units,
                 ) {
                     local_excluded_ids.insert(id);
@@ -7066,14 +7482,11 @@ impl MultiTokenManager {
                     continue;
                 }
                 if queue_guard.is_none() {
-                    queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
+                    queue_guard = self
+                        .try_enter_dispatch_queue(dispatch_max_wait, admission)
+                        .await?;
                     if queue_guard.is_none() {
-                        local_scheduler_bail!(
-                            LocalSchedulerErrorKind::QueueFull,
-                            "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                            self.max_queued_requests(),
-                            self.global_max_concurrent_requests()
-                        );
+                        return Err(self.dispatch_queue_full_error());
                     }
                 }
                 let now = Instant::now();
@@ -7121,6 +7534,7 @@ impl MultiTokenManager {
             };
             capacity_waiter.finish_acquired();
             drop(queue_guard.take());
+            self.dispatch_progress.record_dispatch(Instant::now());
 
             // 尝试获取/刷新 Token
             match self
@@ -7164,15 +7578,12 @@ impl MultiTokenManager {
                                 .into());
                             }
                             if queue_guard.is_none() {
-                                queue_guard = self
-                                    .try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
+                                queue_guard = self.try_enter_local_only_dispatch_queue(
+                                    redis_degraded_max_wait,
+                                    admission,
+                                );
                                 if queue_guard.is_none() {
-                                    local_scheduler_bail!(
-                                        LocalSchedulerErrorKind::QueueFull,
-                                        "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                        self.max_queued_requests(),
-                                        self.global_max_concurrent_requests()
-                                    );
+                                    return Err(self.dispatch_queue_full_error());
                                 }
                             }
                             let now = Instant::now();
@@ -7234,6 +7645,22 @@ impl MultiTokenManager {
                         }
                         SchedulerRedisSelectionAdmission::RateLimited(wait) => {
                             drop(in_flight_lease);
+                            // Losing the RPM race on this credential (another request or instance
+                            // took its last call of the minute) is like losing a slot race: the
+                            // credential is now marked rate limited, so re-select right away when
+                            // another one can take the request instead of queueing behind it.
+                            if self.has_alternate_dispatchable_credential_for_slot_race(
+                                model,
+                                &local_excluded_ids,
+                                id,
+                                request_weight_units,
+                            ) {
+                                tracing::debug!(
+                                    credential_id = id,
+                                    "Redis 凭据 RPM 已被其他请求用完，立即改选其他可用凭据"
+                                );
+                                continue;
+                            }
                             if acquire_mode.is_fail_fast() {
                                 local_scheduler_bail!(
                                     LocalSchedulerErrorKind::CapacityUnavailable,
@@ -7242,15 +7669,11 @@ impl MultiTokenManager {
                                 );
                             }
                             if queue_guard.is_none() {
-                                queue_guard =
-                                    self.try_enter_dispatch_queue(dispatch_max_wait).await?;
+                                queue_guard = self
+                                    .try_enter_dispatch_queue(dispatch_max_wait, admission)
+                                    .await?;
                                 if queue_guard.is_none() {
-                                    local_scheduler_bail!(
-                                        LocalSchedulerErrorKind::QueueFull,
-                                        "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
-                                        self.max_queued_requests(),
-                                        self.global_max_concurrent_requests()
-                                    );
+                                    return Err(self.dispatch_queue_full_error());
                                 }
                             }
                             let now = Instant::now();
@@ -7294,11 +7717,17 @@ impl MultiTokenManager {
                         let should_bind = match request_bound_id {
                             None => true,
                             Some(bound_id) if bound_id == ctx.id => true,
-                            // Only a move that actually landed on a higher Fast tier rebinds;
-                            // a temporary fallback keeps the original binding as before.
+                            // Only a move that actually landed on a better tier rebinds; a
+                            // temporary fallback keeps the original binding as before.
                             Some(bound_id)
-                                if fast_migration_from.is_some_and(|(from_id, from_fast)| {
-                                    from_id == bound_id && ctx.credentials.fast > from_fast
+                                if tier_migration_from.is_some_and(|(from_id, from_tier)| {
+                                    from_id == bound_id
+                                        && StickyTier::of(&ctx.credentials).is_better_than(
+                                            from_tier,
+                                            self.load_balancing_mode
+                                                .lock()
+                                                .fills_priority_tiers_in_order(),
+                                        )
                                 }) =>
                             {
                                 true
@@ -7311,6 +7740,11 @@ impl MultiTokenManager {
                             self.bind_session_to_credential_for_request(sid, ctx.id)
                                 .await;
                         }
+                        in_flight_lease.attach_session_slot(SessionConcurrencySlot::acquire(
+                            &self.session_concurrency,
+                            sid,
+                            ctx.id,
+                        ));
                     }
                     return Ok(CallContext {
                         sticky_bound,
@@ -8459,6 +8893,22 @@ impl MultiTokenManager {
             || entry.disabled_reason.is_some();
     }
 
+    /// Credentials that could take a request right now apart from concurrency: enabled, not
+    /// quota-blocked, proxy usable and not cooling down. Used for the pool circuit ratio.
+    fn local_dispatchable_credential_count(&self) -> usize {
+        let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
+        let now = Instant::now();
+        entries
+            .iter()
+            .filter(|entry| {
+                Self::entry_is_scheduler_available(entry)
+                    && credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
+                    && entry_any_cooldown_remaining(entry, now).is_none()
+            })
+            .count()
+    }
+
     fn entry_is_scheduler_available(entry: &CredentialEntry) -> bool {
         !entry.disabled && !entry.account_quota_blocked
     }
@@ -9236,6 +9686,10 @@ impl MultiTokenManager {
                 health: SchedulerHealthState::default(),
                 model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
+                last_auto_heal_at: None,
+                auto_heal_consecutive_rounds: 0,
+                upstream_fault_streak: 0,
+                upstream_fault_seq: 0,
             };
             if let Some(state) = runtime_states.get(&id) {
                 Self::apply_runtime_state_if_newer(&mut entry, state);
@@ -9312,7 +9766,12 @@ impl MultiTokenManager {
     }
 
     fn publish_runtime_config_changed(&self, version: Option<i64>, reason: &str) {
-        publish_redis_runtime_config_changed(self.redis_store.as_ref(), version, reason);
+        publish_redis_runtime_config_changed(
+            self.redis_store.as_ref(),
+            version,
+            reason,
+            &self.scheduler_instance_id,
+        );
     }
 
     fn publish_credentials_changed(&self, reason: &str) {
@@ -9320,6 +9779,7 @@ impl MultiTokenManager {
             self.postgres_store.as_ref(),
             self.redis_store.as_ref(),
             reason,
+            &self.scheduler_instance_id,
         );
     }
 
@@ -9329,6 +9789,20 @@ impl MultiTokenManager {
 
     pub(crate) fn notify_dispatch_state_changed(&self) {
         self.capacity_signal.notify_state_changed();
+    }
+
+    /// Whether a runtime event payload was published by this instance. This instance already
+    /// applied its own change locally, so reloading on its own event is pure overhead.
+    pub(crate) fn runtime_event_is_from_this_instance(&self, payload: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("sourceInstanceId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|source| source == self.scheduler_instance_id.as_ref())
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn notify_remote_dispatch_state_changed(&self, payload: &str) -> bool {
@@ -9991,10 +10465,14 @@ impl MultiTokenManager {
             }
         }
         if recovered_any {
+            // Only this instance's local view lagged behind PgSQL; the credentials themselves did
+            // not change. Broadcasting made every instance reload all credentials from PgSQL on
+            // each 5-second flush that recovered anything (about 700 times an hour in
+            // production), which kept worker threads busy and slowed scheduling. Other instances
+            // read runtime state on their periodic sync instead.
             self.select_highest_priority();
             self.invalidate_model_capability_cohorts();
             self.notify_dispatch_state_changed();
-            self.publish_credentials_changed("credential_runtime_persistence_recovered");
         }
         if !self.pending_runtime_mutations.lock().is_empty() {
             self.mark_stats_dirty();
@@ -10174,6 +10652,105 @@ impl MultiTokenManager {
             }
         }
         report
+    }
+
+    /// Refreshes this instance's Redis heartbeat and releases the leases of instances whose
+    /// heartbeat has expired, so a killed process gives its concurrency slots back within
+    /// `SCHEDULER_INSTANCE_HEARTBEAT_TTL` instead of after `credentialInFlightLeaseMaxSecs`.
+    pub(crate) async fn heartbeat_and_reclaim_dead_instance_leases(&self) {
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        if let Err(err) = tokio::time::timeout(
+            SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT,
+            redis.heartbeat_scheduler_instance(
+                &self.scheduler_instance_id,
+                SCHEDULER_INSTANCE_HEARTBEAT_TTL,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out"))
+        .and_then(|result| result)
+        {
+            tracing::warn!("刷新 Redis 调度实例心跳失败: {}", err);
+            return;
+        }
+        if let Err(err) = tokio::time::timeout(
+            SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT,
+            redis.touch_instance_in_flight_leases(&self.scheduler_instance_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out"))
+        .and_then(|result| result)
+        {
+            tracing::warn!("刷新本实例 Redis 并发租约活跃时间失败: {}", err);
+        }
+        match tokio::time::timeout(
+            SCHEDULER_INSTANCE_HEARTBEAT_OP_TIMEOUT,
+            redis.reclaim_dead_instance_leases(&self.scheduler_instance_id),
+        )
+        .await
+        {
+            Ok(Ok((dead, released))) if dead > 0 => {
+                tracing::warn!(
+                    dead_instances = dead,
+                    released_leases = released,
+                    "已回收心跳过期实例遗留的 Redis 并发租约"
+                );
+                if released > 0 {
+                    *self.last_scheduler_redis_sync_at.lock() = None;
+                    self.scheduler_redis_full_sync_requested
+                        .fetch_add(1, Ordering::AcqRel);
+                    self.refresh_scheduler_state_from_redis_best_effort();
+                    self.notify_dispatch_state_changed();
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!("回收心跳过期实例的 Redis 并发租约失败: {}", err),
+            Err(_) => tracing::warn!("回收心跳过期实例的 Redis 并发租约超时"),
+        }
+    }
+
+    /// Releases every Redis lease this instance owns. Called when the process is stopping so
+    /// the next instance starts with free slots even if in-flight requests never finish.
+    pub(crate) async fn release_own_in_flight_leases(&self, timeout: StdDuration) -> usize {
+        let Some(redis) = &self.redis_store else {
+            return 0;
+        };
+        match tokio::time::timeout(
+            timeout,
+            redis.release_instance_in_flight_leases(&self.scheduler_instance_id),
+        )
+        .await
+        {
+            Ok(Ok(released)) => released,
+            Ok(Err(err)) => {
+                tracing::warn!("退出时释放本实例 Redis 并发租约失败: {}", err);
+                0
+            }
+            Err(_) => {
+                tracing::warn!("退出时释放本实例 Redis 并发租约超时");
+                0
+            }
+        }
+    }
+
+    pub fn spawn_scheduler_instance_heartbeat_worker(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.redis_store.as_ref()?;
+        let manager = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SCHEDULER_INSTANCE_HEARTBEAT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                manager.heartbeat_and_reclaim_dead_instance_leases().await;
+            }
+        }))
     }
 
     pub fn spawn_stats_flush_worker(self: &Arc<Self>) -> StatsFlushWorkerHandle {
@@ -11020,6 +11597,23 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    fn clear_scheduler_dispatch_blocks_deferred(&self, ids: &[u64]) {
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let redis = redis.clone();
+        let ids = ids.to_vec();
+        spawn_best_effort_storage_task("异步清理 Redis 凭据调度阻断", async move {
+            for id in ids {
+                redis.clear_scheduler_dispatch_block(id).await?;
+            }
+            Ok(())
+        });
+    }
+
     fn set_scheduler_dispatch_block_for_credential_deferred(&self, id: u64) {
         let Some(redis) = &self.redis_store else {
             return;
@@ -11068,6 +11662,7 @@ impl MultiTokenManager {
         let Some(success) = self.record_success_local(id, model, latency) else {
             return;
         };
+        self.record_local_pool_risk_circuit_success();
         let should_persist = success.runtime_state_changed
             || self.has_pending_runtime_mutations(id)
             || self.should_probe_persisted_runtime_success_state(id);
@@ -11082,7 +11677,9 @@ impl MultiTokenManager {
             self.clear_disabled_credential_request_state(id);
         }
         self.record_scheduler_success_health(id, model, latency, success.alpha);
-        self.notify_dispatch_state_changed();
+        if success.runtime_state_changed || disabled {
+            self.notify_dispatch_state_changed();
+        }
     }
 
     /// Request/stream completion path variant: update local scheduling state immediately and
@@ -11097,6 +11694,7 @@ impl MultiTokenManager {
         let Some(success) = self.record_success_local(id, model, latency) else {
             return;
         };
+        self.record_local_pool_risk_circuit_success();
         if success.runtime_state_changed
             || self.has_pending_runtime_mutations(id)
             || self.should_probe_persisted_runtime_success_state(id)
@@ -11113,7 +11711,12 @@ impl MultiTokenManager {
         }
         self.record_success_stats_delta(id, &success.last_used_at);
         self.record_scheduler_success_health(id, model, latency, success.alpha);
-        self.notify_dispatch_state_changed();
+        // The freed slot already wakes one waiter per released unit when the lease drops.
+        // Waking every waiter on each success made all queued requests contend for the
+        // selection gate at the request completion rate.
+        if success.runtime_state_changed {
+            self.notify_dispatch_state_changed();
+        }
     }
 
     fn record_success_local(
@@ -11136,6 +11739,8 @@ impl MultiTokenManager {
             || entry.disabled;
         entry.failure_count = 0;
         entry.refresh_failure_count = 0;
+        entry.auto_heal_consecutive_rounds = 0;
+        entry.upstream_fault_streak = 0;
         let expected_generation = entry.runtime_generation;
         if entry.warmup_remaining > 0 {
             entry.warmup_remaining -= 1;
@@ -11816,6 +12421,7 @@ impl MultiTokenManager {
         let disabled_reason = reason.disabled_reason();
         let last_used_at: String;
         let expected_generation: u64;
+        let ever_succeeded: bool;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -11823,7 +12429,8 @@ impl MultiTokenManager {
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
                 None => {
-                    let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                    // The credential is gone: nothing to count, report the current state.
+                    let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                     return RiskControlReportOutcome {
                         has_available_credentials: Self::any_scheduler_available(&entries),
                         circuit_open: circuit.open,
@@ -11835,7 +12442,9 @@ impl MultiTokenManager {
             };
 
             if entry.disabled {
-                let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                // Already disabled, usually by a concurrent request on the same credential that
+                // was counted then; counting it again would inflate the pool circuit.
+                let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                 return RiskControlReportOutcome {
                     has_available_credentials: Self::any_scheduler_available(&entries),
                     circuit_open: circuit.open,
@@ -11845,6 +12454,7 @@ impl MultiTokenManager {
                 };
             }
             expected_generation = entry.runtime_generation;
+            ever_succeeded = entry.success_count > 0;
 
             entry.disabled = true;
             entry.disabled_reason = Some(disabled_reason);
@@ -11879,7 +12489,13 @@ impl MultiTokenManager {
                 false
             }
         };
-        let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+        let dispatchable_now = self.local_dispatchable_credential_count();
+        let circuit = self.record_local_pool_risk_circuit_failure(
+            id,
+            reason,
+            ever_succeeded,
+            dispatchable_now,
+        );
         self.clear_disabled_credential_request_state(id);
         self.persist_disabled_state(
             id,
@@ -11943,6 +12559,7 @@ impl MultiTokenManager {
         let disabled_reason = reason.disabled_reason();
         let last_used_at: String;
         let expected_generation: u64;
+        let ever_succeeded: bool;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -11950,7 +12567,8 @@ impl MultiTokenManager {
             let entry = match entries.iter_mut().find(|entry| entry.id == id) {
                 Some(entry) => entry,
                 None => {
-                    let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                    // The credential is gone: nothing to count, report the current state.
+                    let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                     return RiskControlReportOutcome {
                         has_available_credentials: Self::any_scheduler_available(&entries),
                         circuit_open: circuit.open,
@@ -11962,7 +12580,9 @@ impl MultiTokenManager {
             };
 
             if entry.disabled {
-                let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                // Already disabled, usually by a concurrent request on the same credential that
+                // was counted then; counting it again would inflate the pool circuit.
+                let circuit = self.local_pool_risk_circuit_snapshot(Instant::now());
                 return RiskControlReportOutcome {
                     has_available_credentials: Self::any_scheduler_available(&entries),
                     circuit_open: circuit.open,
@@ -11972,6 +12592,7 @@ impl MultiTokenManager {
                 };
             }
             expected_generation = entry.runtime_generation;
+            ever_succeeded = entry.success_count > 0;
 
             entry.disabled = true;
             entry.disabled_reason = Some(disabled_reason);
@@ -12006,7 +12627,13 @@ impl MultiTokenManager {
                 false
             }
         };
-        let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+        let dispatchable_now = self.local_dispatchable_credential_count();
+        let circuit = self.record_local_pool_risk_circuit_failure(
+            id,
+            reason,
+            ever_succeeded,
+            dispatchable_now,
+        );
         self.clear_disabled_credential_request_state(id);
         self.persist_disabled_state_deferred(
             id,
@@ -12826,6 +13453,11 @@ impl MultiTokenManager {
                     entry.refresh_failure_count = 0;
                 }
             }
+            if !disabled {
+                entry.auto_heal_consecutive_rounds = 0;
+                entry.last_auto_heal_at = None;
+                entry.upstream_fault_streak = 0;
+            }
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
             entry.model_cooldowns.clear();
@@ -12863,7 +13495,7 @@ impl MultiTokenManager {
     /// 设置凭据 Fast 值（Admin API）。
     ///
     /// 0 表示关闭。新会话立即按新的 Fast 档调度；已有 sticky 会话按
-    /// `FAST_STICKY_MIGRATION_INTERVAL` 逐个迁移，不会一次性切走。
+    /// `TIER_STICKY_MIGRATION_INTERVAL` 逐个迁移，不会一次性切走。
     pub fn set_credential_fast(&self, id: u64, fast: u32) -> anyhow::Result<()> {
         self.persist_credential_mutation(id, |credential| {
             credential.fast = fast;
@@ -13209,6 +13841,9 @@ impl MultiTokenManager {
                 entry.disabled = false;
                 entry.disabled_reason = None;
             }
+            entry.auto_heal_consecutive_rounds = 0;
+            entry.last_auto_heal_at = None;
+            entry.upstream_fault_streak = 0;
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
             entry.model_cooldowns.clear();
@@ -13689,6 +14324,10 @@ impl MultiTokenManager {
                 health: SchedulerHealthState::default(),
                 model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
+                last_auto_heal_at: None,
+                auto_heal_consecutive_rounds: 0,
+                upstream_fault_streak: 0,
+                upstream_fault_seq: 0,
             });
         }
 
@@ -14672,7 +15311,7 @@ impl MultiTokenManager {
     }
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
-        self.load_balancing_mode.lock().clone()
+        self.load_balancing_mode.lock().as_str().to_string()
     }
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
@@ -14693,20 +15332,16 @@ impl MultiTokenManager {
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
-        if !matches!(
-            mode.as_str(),
-            "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-        ) {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
-        }
+        let parsed = mode
+            .parse::<LoadBalancingMode>()
+            .map_err(anyhow::Error::msg)?;
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
+        let previous_mode = *self.load_balancing_mode.lock();
+        if previous_mode == parsed {
             return Ok(());
         }
 
-        *self.load_balancing_mode.lock() = mode.clone();
+        *self.load_balancing_mode.lock() = parsed;
 
         if let Err(err) = self.persist_load_balancing_mode(&mode) {
             *self.load_balancing_mode.lock() = previous_mode;

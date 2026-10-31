@@ -39,6 +39,8 @@ pub(crate) struct BodyProcessingReport {
     pub remote_materialized_bytes: usize,
     pub remote_http_attempts: usize,
     pub normalized_image_media_types: usize,
+    pub resized_images: usize,
+    pub resized_image_bytes_saved: usize,
     remote_workflow_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -47,6 +49,7 @@ impl BodyProcessingReport {
         self.materialized_file_sources > 0
             || self.materialized_remote_sources > 0
             || self.normalized_image_media_types > 0
+            || self.resized_images > 0
     }
 }
 
@@ -244,7 +247,7 @@ pub(crate) async fn prepare_multimodal_sources(
 
 pub(crate) async fn prepare_multimodal_message_sources(
     store: &AnthropicFileStore,
-    messages: &mut [Message],
+    messages: &mut Vec<Message>,
     caller_user_agent: Option<&str>,
     config: ImageProcessingConfig,
 ) -> Result<BodyProcessingReport, String> {
@@ -279,6 +282,22 @@ pub(crate) async fn prepare_multimodal_message_sources(
         ImageProcessingMode::Light => {
             reject_non_inline_sources(messages)?;
         }
+    }
+    if config.resize_enabled {
+        // 解码和重新编码会占用 CPU，放到阻塞线程里做，不占异步工作线程。
+        let mut owned = std::mem::take(messages);
+        let (owned, resize) = match tokio::task::spawn_blocking(move || {
+            let resize = super::image_resize::resize_images_in_messages(&mut owned, config);
+            (owned, resize)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => return Err(format!("image resize task failed: {err}")),
+        };
+        *messages = owned;
+        report.resized_images = resize.resized;
+        report.resized_image_bytes_saved = resize.original_bytes.saturating_sub(resize.final_bytes);
     }
 
     if report.was_modified() {

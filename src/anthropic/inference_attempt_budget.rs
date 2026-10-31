@@ -200,6 +200,9 @@ pub(crate) struct InferenceAttemptBudget {
     empty_turn_credential_ids: Mutex<HashSet<u64>>,
     credential_dispatch_elapsed_ms: AtomicU64,
     upstream_header_wait_ms: AtomicU64,
+    /// Credentials selected for this request so far, so a request cancelled before the
+    /// upstream answered can still be attributed in its usage record.
+    attribution: Arc<crate::kiro::call_trace::McpCallAttributionSink>,
 }
 
 const DOWNSTREAM_COMMITTED_BIT: u32 = 1 << 31;
@@ -232,7 +235,12 @@ impl InferenceAttemptBudget {
             empty_turn_credential_ids: Mutex::new(HashSet::new()),
             credential_dispatch_elapsed_ms: AtomicU64::new(0),
             upstream_header_wait_ms: AtomicU64::new(0),
+            attribution: Arc::default(),
         }
+    }
+
+    pub(crate) fn attribution(&self) -> Arc<crate::kiro::call_trace::McpCallAttributionSink> {
+        self.attribution.clone()
     }
 
     pub(crate) fn record_credential_dispatch_elapsed(&self, elapsed: Duration) {
@@ -299,7 +307,8 @@ impl InferenceAttemptBudget {
         self.dispatch_route.get().map(String::as_str)
     }
 
-    /// 记录在本请求内空回的本地账号。
+    /// 记录在本请求内空回（或输出了无法修复的工具参数）的本地账号：后续换号不再选它，
+    /// 但不冷却，不影响其他请求。
     pub(crate) fn exclude_empty_turn_credential(&self, credential_id: u64) {
         self.empty_turn_credential_ids.lock().insert(credential_id);
     }

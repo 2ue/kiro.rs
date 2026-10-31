@@ -49,6 +49,7 @@ const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30)
 const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+const SHUTDOWN_LEASE_RELEASE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 const MODEL_CAPABILITY_HEALTH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const MODEL_CAPABILITY_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(300);
@@ -560,6 +561,9 @@ async fn async_main() {
     let token_manager = Arc::new(token_manager);
     let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
+    let _kiro_version_sync_task = kiro::kiro_version::spawn_auto_sync(token_manager.clone());
+    let scheduler_instance_heartbeat_worker =
+        token_manager.spawn_scheduler_instance_heartbeat_worker();
     let external_pool_manager = Arc::new(ExternalPoolManager::new(
         postgres_store.clone(),
         redis_store.clone(),
@@ -749,6 +753,7 @@ async fn async_main() {
         postgres_store: postgres_store.clone(),
         redis_store: redis_store.clone(),
         runtime_events: runtime_event_health.clone(),
+        token_manager: token_manager.clone(),
     });
     let app = app.merge(create_health_router(health_state));
 
@@ -802,7 +807,20 @@ async fn async_main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    let server_result = serve_until_shutdown(listener, app).await;
+    let shutdown_token_manager = token_manager.clone();
+    let server_result = serve_until_shutdown(listener, app, move || async move {
+        // Give the concurrency slots back first: `docker stop` sends SIGKILL after 10 seconds
+        // by default, long before in-flight requests finish draining, and leases left in Redis
+        // would otherwise block the next instance.
+        let released = shutdown_token_manager
+            .release_own_in_flight_leases(SHUTDOWN_LEASE_RELEASE_TIMEOUT)
+            .await;
+        tracing::info!(released, "收到停止信号，已释放本实例 Redis 并发租约");
+    })
+    .await;
+    if let Some(worker) = scheduler_instance_heartbeat_worker {
+        worker.abort();
+    }
 
     let shutdown_started_at = Instant::now();
     let shutdown_deadline = shutdown_started_at + BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT;
@@ -1100,14 +1118,22 @@ async fn abort_task_with_timeout<T>(task_name: &'static str, task: tokio::task::
     }
 }
 
-async fn serve_until_shutdown(
+/// `on_shutdown_signal` runs as soon as the stop signal arrives, before in-flight connections
+/// are drained: the container may be killed before draining finishes.
+async fn serve_until_shutdown<F, Fut>(
     listener: tokio::net::TcpListener,
     app: Router,
-) -> std::io::Result<()> {
+    on_shutdown_signal: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
         let _ = shutdown_sender.send(true);
+        on_shutdown_signal().await;
     });
 
     let mut graceful_receiver = shutdown_receiver.clone();
@@ -1310,7 +1336,11 @@ struct AppHealthState {
     postgres_store: Arc<PostgresStore>,
     redis_store: Arc<RedisStore>,
     runtime_events: Arc<RuntimeEventHealth>,
+    token_manager: Arc<kiro::token_manager::MultiTokenManager>,
 }
+
+/// Queued requests with no dispatch for this long mean the scheduler is not moving.
+const DISPATCH_STALL_AFTER: StdDuration = StdDuration::from_secs(60);
 
 fn create_health_router(state: Arc<AppHealthState>) -> Router {
     Router::new()
@@ -1331,7 +1361,10 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
         .runtime_events
         .redis_events_connected
         .load(Ordering::Acquire);
-    let ready = postgres_ok && redis_ok && redis_events_connected;
+    let dispatch = state
+        .token_manager
+        .dispatch_is_progressing(DISPATCH_STALL_AFTER);
+    let ready = postgres_ok && redis_ok && redis_events_connected && dispatch.progressing;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1345,8 +1378,10 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
             "checks": {
                 "postgres": postgres_ok,
                 "redis": redis_ok,
-                "redisRuntimeEvents": redis_events_connected
+                "redisRuntimeEvents": redis_events_connected,
+                "dispatchProgressing": dispatch.progressing
             },
+            "dispatch": dispatch,
             "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),
@@ -1403,6 +1438,54 @@ fn apply_request_api_key_runtime(
     );
 }
 
+/// Runs credential reloads one at a time on a blocking thread and folds notifications that
+/// arrive while one is running into a single follow-up reload. A full reload reads every
+/// credential from PgSQL and rewrites the in-memory pool; running it inline on the event task,
+/// once per notification, kept async worker threads busy during notification bursts.
+#[derive(Clone, Default)]
+struct CredentialsReloadCoalescer {
+    state: Arc<parking_lot::Mutex<CredentialsReloadState>>,
+}
+
+#[derive(Default)]
+struct CredentialsReloadState {
+    running: bool,
+    pending: Option<String>,
+}
+
+impl CredentialsReloadCoalescer {
+    fn request(&self, token_manager: Arc<kiro::token_manager::MultiTokenManager>, reason: String) {
+        {
+            let mut state = self.state.lock();
+            if state.running {
+                state.pending = Some(reason);
+                return;
+            }
+            state.running = true;
+        }
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut reason = reason;
+            loop {
+                match token_manager.reload_credentials_from_postgres() {
+                    Ok(true) => tracing::info!(reason, "已根据 Redis 通知同步凭据快照"),
+                    Ok(false) => tracing::debug!(reason, "收到凭据通知，但凭据快照无变化"),
+                    Err(err) => tracing::warn!(reason, "同步凭据快照失败: {}", err),
+                }
+                token_manager.notify_dispatch_state_changed();
+                let mut guard = state.lock();
+                match guard.pending.take() {
+                    Some(next) => reason = next,
+                    None => {
+                        guard.running = false;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
@@ -1431,6 +1514,7 @@ fn spawn_redis_runtime_event_listener(
             tracing::info!("已订阅 Redis 运行时事件");
             let mut stream = pubsub.on_message();
             let mut periodic_reload = tokio::time::interval(std::time::Duration::from_secs(60));
+            let credentials_reload = CredentialsReloadCoalescer::default();
             loop {
                 tokio::select! {
                     message = stream.next() => {
@@ -1442,6 +1526,12 @@ fn spawn_redis_runtime_event_listener(
                             .get_payload::<String>()
                             .unwrap_or_else(|_| String::new());
                         health.mark_event();
+                        if (channel == config_channel || channel == credentials_channel)
+                            && token_manager.runtime_event_is_from_this_instance(&payload)
+                        {
+                            // Already applied locally when it was published.
+                            continue;
+                        }
                         if channel == config_channel {
                             let previous_external_pools =
                                 token_manager.runtime_config().external_pools;
@@ -1467,12 +1557,7 @@ fn spawn_redis_runtime_event_listener(
                                 Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
                             }
                         } else if channel == credentials_channel {
-                            match token_manager.reload_credentials_from_postgres() {
-                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知同步凭据快照"),
-                                Ok(false) => tracing::debug!(payload, "收到凭据通知，但凭据快照无变化"),
-                                Err(err) => tracing::warn!(payload, "同步凭据快照失败: {}", err),
-                            }
-                            token_manager.notify_dispatch_state_changed();
+                            credentials_reload.request(token_manager.clone(), payload);
                         } else if channel == wakeup_channel {
                             if !token_manager.notify_remote_dispatch_state_changed(&payload) {
                                 tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");
@@ -1508,9 +1593,7 @@ fn spawn_redis_runtime_event_listener(
                             Ok(false) => {}
                             Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),
                         }
-                        if let Err(err) = token_manager.reload_credentials_from_postgres() {
-                            tracing::warn!("定时同步凭据快照失败: {}", err);
-                        }
+                        credentials_reload.request(token_manager.clone(), "periodic".to_string());
                     }
                 }
             }
@@ -1646,14 +1729,11 @@ fn handle_credentials_command(
             if !is_multiple {
                 println!("warning: single credentials format cannot be rewritten by token refresh");
             }
-            if !matches!(
-                config.load_balancing_mode.as_str(),
-                "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-            ) {
-                println!(
-                    "error: invalid loadBalancingMode '{}', expected priority, balanced, health_balanced or weighted_least_inflight",
-                    config.load_balancing_mode
-                );
+            if let Err(err) = config
+                .load_balancing_mode
+                .parse::<kiro::token_manager::LoadBalancingMode>()
+            {
+                println!("error: loadBalancingMode: {err}");
             }
             let mut ids = std::collections::HashSet::new();
             for (index, credential) in credentials.iter().enumerate() {

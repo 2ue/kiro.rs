@@ -301,7 +301,12 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
     credentialNetworkErrorCooldownSecs: toWhole(draft.credentialNetworkErrorCooldownSecs, 1),
     credentialStreamErrorCooldownSecs: toWhole(draft.credentialStreamErrorCooldownSecs, 1),
+    credentialAutoHealMinIntervalSecs: toWhole(draft.credentialAutoHealMinIntervalSecs, 0),
+    credentialAutoHealMaxConsecutiveRounds: toWhole(draft.credentialAutoHealMaxConsecutiveRounds, 0),
     credentialEmptyTurnCooldownEnabled: Boolean(draft.credentialEmptyTurnCooldownEnabled),
+    credentialUpstreamFailureCooldownEnabled: Boolean(draft.credentialUpstreamFailureCooldownEnabled),
+    kiroVersionAutoSyncEnabled: Boolean(draft.kiroVersionAutoSyncEnabled),
+    kiroRuntimeDomainEnabled: Boolean(draft.kiroRuntimeDomainEnabled),
     credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
     credentialAuthErrorCooldownSecs: toWhole(draft.credentialAuthErrorCooldownSecs, 1),
     credentialCooldownBackoffMultiplier: Math.max(1, Number(draft.credentialCooldownBackoffMultiplier.toFixed(2))),
@@ -309,6 +314,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialProbationSecs: toWhole(draft.credentialProbationSecs),
     credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
     credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+    credentialSessionMaxConcurrentRequests: toWhole(draft.credentialSessionMaxConcurrentRequests),
     kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
     kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
     streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
@@ -418,7 +424,9 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
       localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
       localPoolCircuitRequireDistinctCredentials: toWhole(draft.externalPools.localPoolCircuitRequireDistinctCredentials),
+      localPoolCircuitMinRatioPercent: toWhole(draft.externalPools.localPoolCircuitMinRatioPercent),
       localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
+      localPoolCircuitHalfOpenProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenProbes, 1),
       externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
       externalPoolAutoDisableWindowSecs: toWhole(draft.externalPools.externalPoolAutoDisableWindowSecs, 1),
       externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
@@ -817,7 +825,10 @@ export function RuntimePage() {
                     ))}
                   </div>
                 </div>
-                <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
+                <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。建议 30 到 60 秒，过载时快速返回，避免请求一直挂起。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
+                <NumField label="单会话单账号最大并发" desc="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。0 表示等于账号自身的并发上限。" value={draft.credentialSessionMaxConcurrentRequests} min={0} max={1000} suffix="个" onChange={set('credentialSessionMaxConcurrentRequests')} />
+                <TogField label="自动同步 Kiro 客户端版本" desc={`默认关闭。打开后每 12 小时从官方读取当前版本，所有账号的上游请求头改用该版本；读取失败时继续用配置的版本。版本号是上游身份的一部分，会同时影响所有账号。${draft.kiroVersionLatest ? `最近读到：${draft.kiroVersionLatest}` : ''}`} checked={draft.kiroVersionAutoSyncEnabled} onChange={set('kiroVersionAutoSyncEnabled')} />
+                <TogField label="对话改走 Kiro 新域名" desc="默认关闭。打开后 IDE 端点的对话和联网搜索改发到 runtime.{区域}.kiro.dev，请求头不变；模型列表、额度查询、令牌刷新不受影响。注意：实测 FREE 账号打开后对话全部被新域名限流（429），打开前请先用自己的账号小范围验证。" checked={draft.kiroRuntimeDomainEnabled} onChange={set('kiroRuntimeDomainEnabled')} />
                 <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
                 <NumField label="流式保活间隔" desc="上游暂时没有新内容时，每隔多久向客户端发一次保活心跳，防止客户端或中间代理因空闲断开；默认 5 秒。" value={draft.streamKeepaliveIntervalSecs} min={1} max={300} suffix="秒" onChange={set('streamKeepaliveIntervalSecs')} />
@@ -1274,6 +1285,9 @@ export function RuntimePage() {
                 <NumField label="网络错误基础冷却" desc="连接超时、DNS 失败等网络层错误后的冷却" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialNetworkErrorCooldownSecs')} />
                 <NumField label="流式中断后暂停" desc="流式响应中途中断后的冷却" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
                 <TogField label="空回也让账号冷却" desc="空回指上游返回成功但没有任何内容：只有用量统计、一帧数据都没有、或响应体为空。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求。打开后按「流式中断后暂停」冷却该账号。" checked={draft.credentialEmptyTurnCooldownEnabled} onChange={set('credentialEmptyTurnCooldownEnabled')} />
+                <TogField label="上游故障也让账号冷却" desc="上游故障指换任何账号都可能遇到的错误：上游 5xx、响应里的异常或错误事件、数据流解码或读取失败、网络超时。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求；账号走自己的代理时，网络超时仍会冷却。限流、鉴权、额度、风控这类账号问题不受影响，照常冷却。打开后恢复旧行为：上游故障也按各自的暂停时长冷却。" checked={draft.credentialUpstreamFailureCooldownEnabled} onChange={set('credentialUpstreamFailureCooldownEnabled')} />
+                <NumField label="自愈最小间隔" desc="所有账号都不可用时，因连续失败被禁用的账号会自动恢复。同一个账号两次自愈至少隔这么久；0 表示不限。" value={draft.credentialAutoHealMinIntervalSecs} min={0} max={86400} suffix="秒" onChange={set('credentialAutoHealMinIntervalSecs')} />
+                <NumField label="最多连续自愈" desc="自愈后一次都没成功就又被禁用，算连续一轮；达到上限后不再自动恢复，等人工处理。成功一次或手动启用后清零；0 表示不限。" value={draft.credentialAutoHealMaxConsecutiveRounds} min={0} max={1000} suffix="轮" onChange={set('credentialAutoHealMaxConsecutiveRounds')} />
                 <NumField label="格式异常后暂停" desc="响应格式/协议异常后的冷却" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />
                 <NumField label="授权异常后暂停" desc="收到 401/403 授权失败后的冷却" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialAuthErrorCooldownSecs')} />
                 <NumField label="最大冷却时长" desc="连续出错时最多暂停多久" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={set('credentialMaxCooldownSecs')} />
@@ -1393,6 +1407,15 @@ export function RuntimePage() {
                       disabled={imageProcessingMode !== 'safe'}
                       onChange={setImageProcessing('safeNormalizeBase64MediaTypes')}
                     />
+                    <TogField
+                      label="压缩过大的图片"
+                      desc="默认关闭。打开后，长边或体积超限的 PNG/JPEG/WebP 会等比缩小并重新编码为 JPEG 再发给上游，可减少请求体积和输入 token；GIF 不处理，失败时保留原图。只作用于经过本地处理的请求（含本地处理后转外部池兜底的请求）；直接转发给外部池的请求保持原样。"
+                      checked={Boolean(draft.imageProcessing?.resizeEnabled)}
+                      onChange={setImageProcessing('resizeEnabled')}
+                    />
+                    <NumField label="压缩后长边上限" desc="超过这个像素数的图片会被等比缩小；默认 1568。" value={draft.imageProcessing?.resizeMaxLongSide ?? 1568} min={256} max={8000} suffix="像素" disabled={!draft.imageProcessing?.resizeEnabled} onChange={setImageProcessing('resizeMaxLongSide')} />
+                    <NumField label="压缩后体积上限" desc="按 base64 编码后的长度计；默认 400000。" value={draft.imageProcessing?.resizeMaxBytes ?? 400000} min={32768} max={5242880} suffix="字节" disabled={!draft.imageProcessing?.resizeEnabled} onChange={setImageProcessing('resizeMaxBytes')} />
+                    <NumField label="压缩画质" desc="重新编码为 JPEG 时的初始画质，体积仍超限时会逐步降低；默认 85。" value={draft.imageProcessing?.resizeJpegQuality ?? 85} min={40} max={100} suffix="" disabled={!draft.imageProcessing?.resizeEnabled} onChange={setImageProcessing('resizeJpegQuality')} />
                   </TwoCol>
                 </div>
                 <div className="space-y-3">
@@ -1447,6 +1470,7 @@ export function RuntimePage() {
                     <TogField label="结构化 tool_choice" desc="按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用（含 disable_parallel_tool_use）。对应的提示词在提示词注入页单独控制。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
                     <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
+                    <TogField label="历史图片去重" desc="默认关闭。打开后，历史里重复出现的同一张图片（包括工具结果里的截图）只发第一次，之后换成一行文字说明，减少请求体积和输入 token；当前这一轮的图片总是原样发送。只按图片数据完全相同判断。" checked={draft.bodyConversion.historyImageDedup} onChange={setBodyConversion('historyImageDedup')} />
                     <TogField label="代码执行（默认关闭）" desc="仅在路由开启时执行 Anthropic code_execution 的 Python 代码，并返回 bash_code_execution 服务端工具结果。" checked={draft.bodyConversion.codeExecution.enabled} onChange={(enabled) => setBodyConversion('codeExecution')({ ...draft.bodyConversion.codeExecution, enabled })} />
                   </TwoCol>
                 </div>

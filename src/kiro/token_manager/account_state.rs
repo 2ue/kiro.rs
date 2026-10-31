@@ -92,6 +92,15 @@ pub(super) struct CredentialEntry {
     pub(super) model_health: HashMap<String, SchedulerHealthState>,
     /// 本进程内的近期调度选中事件；无 Redis 时用于计算短窗口调度压力。
     pub(super) selection_events: VecDeque<Instant>,
+    /// 最近一次自愈的时间，用于自愈最小间隔。
+    pub(super) last_auto_heal_at: Option<Instant>,
+    /// 自愈后还没成功过就又被禁用的连续轮数；成功一次或管理员启用/重置后清零。
+    pub(super) auto_heal_consecutive_rounds: u32,
+    /// 连续几次上游故障（5xx、错误事件、读取失败等）之间没有一次成功。偶发故障不冷却账号，
+    /// 同一个账号连续出故障说明问题多半在它身上，达到阈值后按原规则冷却。成功一次清零。
+    pub(super) upstream_fault_streak: u32,
+    /// Pool-wide sequence number of this credential's last upstream fault.
+    pub(super) upstream_fault_seq: u64,
 }
 
 #[derive(Debug, Clone)]

@@ -6555,9 +6555,10 @@ async fn test_catalog_listed_credentials_win_over_unknown_catalog_for_five_round
             let mut config = Config::default();
             config.load_balancing_mode = mode.to_string();
 
-            // An unknown catalog (discovery failed) with the best priority must not win while a
-            // credential whose catalog lists the model is dispatchable.
-            let mut unknown = test_access_token_credential("unknown-catalog", "Pro");
+            // An API key credential with an unknown catalog (discovery failed) and the best
+            // priority must not win while a credential whose catalog lists the model is
+            // dispatchable.
+            let mut unknown = api_key_credential("unknown-catalog");
             unknown.priority = 0;
             unknown.supported_models = Vec::new();
             let mut listed = test_access_token_credential("listed", "Pro");
@@ -6596,6 +6597,44 @@ async fn test_catalog_listed_credentials_win_over_unknown_catalog_for_five_round
             ctx.release_in_flight();
         }
     }
+}
+
+#[tokio::test]
+async fn empty_catalog_credentials_take_traffic_once_listed_ones_are_full() {
+    // Catalog preference only reorders: with the listed credential full, the empty-catalog one
+    // serves the next request immediately instead of the request queueing.
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    config.credential_max_concurrent_requests = 1;
+    let mut empty_catalog = test_access_token_credential("empty-catalog", "Pro");
+    empty_catalog.priority = 0;
+    let mut listed = api_key_credential("listed-api-key");
+    listed.priority = 0;
+    listed.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
+    let manager =
+        MultiTokenManager::new(config, vec![empty_catalog, listed], None, None, false).unwrap();
+    let empty = HashSet::new();
+    let mut first = manager
+        .acquire_context_for_session(Some("claude-sonnet-4"), None, &empty)
+        .await
+        .unwrap();
+    assert_eq!(first.id, 2, "the listed credential is preferred");
+    let mut second = manager
+        .acquire_context_for_session_with_mode(
+            Some("claude-sonnet-4"),
+            None,
+            &empty,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.id, 1,
+        "no capacity is lost to the catalog preference"
+    );
+    first.release_in_flight();
+    second.release_in_flight();
 }
 
 #[tokio::test]
@@ -7152,6 +7191,10 @@ fn test_health_balanced_score_parameters_are_effective() {
         health: SchedulerHealthState::default(),
         model_health: HashMap::new(),
         selection_events: VecDeque::new(),
+        last_auto_heal_at: None,
+        auto_heal_consecutive_rounds: 0,
+        upstream_fault_streak: 0,
+        upstream_fault_seq: 0,
     };
     worse.health.recent_error_rate = 0.5;
     worse.health.latency_ewma_ms = Some(1_000.0);
@@ -7184,6 +7227,10 @@ fn test_health_balanced_score_parameters_are_effective() {
         health: SchedulerHealthState::default(),
         model_health: HashMap::new(),
         selection_events: VecDeque::new(),
+        last_auto_heal_at: None,
+        auto_heal_consecutive_rounds: 0,
+        upstream_fault_streak: 0,
+        upstream_fault_seq: 0,
     };
 
     let mut config = Config::default();
@@ -7883,30 +7930,39 @@ async fn test_credential_rpm_override_zero_bypasses_global_limit() {
 }
 
 #[tokio::test]
-async fn priority_mode_respects_warmup_candidate_share() {
+async fn priority_mode_splits_warmup_only_inside_the_preferred_tier() {
+    // A warming credential in a lower tier never takes traffic while the preferred tier has a
+    // ready credential, even with the largest warmup share.
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_warmup_selection_percent = 100;
+    config.credential_warmup_max_selection_percent = 100;
+    let mut ready = test_access_token_credential("ready", "Pro");
+    ready.priority = 0;
+    let mut warming = test_access_token_credential("warming", "Pro");
+    warming.priority = 10;
+    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    manager.set_warmup_remaining(2, 5).unwrap();
+    for round in 0..5 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 1, "round {round}: warmup must not cross tiers");
+        ctx.release_in_flight();
+    }
+
+    // A warming credential in the preferred tier wins over a ready one in a lower tier, even
+    // when the warmup share is zero: the tier comes first, warmup only splits inside it.
     let mut config = Config::default();
     config.load_balancing_mode = "priority".to_string();
     config.credential_warmup_selection_percent = 0;
     config.credential_warmup_max_selection_percent = 0;
-
     let mut ready = test_access_token_credential("ready", "Pro");
     ready.priority = 10;
     let mut warming = test_access_token_credential("warming", "Pro");
     warming.priority = 0;
-
     let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
-    manager
-        .set_warmup_remaining(2, 5)
-        .expect("mark second credential warming");
-
-    let mut ctx = manager
-        .acquire_context(None)
-        .await
-        .expect("ready credential should be selected");
-    assert_eq!(
-        ctx.id, 1,
-        "priority mode must not bypass warmup share to select the lower-priority warming account"
-    );
+    manager.set_warmup_remaining(2, 5).unwrap();
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2, "the preferred tier is used before a lower tier");
     ctx.release_in_flight();
 }
 
@@ -8970,6 +9026,51 @@ fn test_local_pool_route_state_auto_heals_too_many_failures() {
     assert!(!healed.disabled);
     assert_eq!(healed.failure_count, 0);
     assert!(healed.disabled_reason.is_none());
+}
+
+/// Production-like report 2026-10-31: accounts brought back by the too-many-failures auto heal
+/// showed enabled, idle and with RPM 0, yet were never dispatched. Disabling had set the 24 h
+/// Redis dispatch block, which every Redis lease checks first, and the heal never cleared it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_auto_healed_credential_is_dispatchable_again() {
+    run_isolated_redis_manager_fixture(|redis_store| async move {
+        let mut config = Config::default();
+        config.credential_warmup_requests = 0;
+        config.credential_dispatch_max_wait_secs = 1;
+        let manager = MultiTokenManager::new_with_stores(
+            config,
+            vec![api_key_credential("ksk_auto_heal_redis_block")],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap();
+
+        assert!(manager.report_failure(1));
+        assert!(manager.report_failure(1));
+        assert!(!manager.report_failure(1));
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
+            .await;
+        assert!(manager.snapshot().entries[0].disabled);
+
+        // The route preflight heals the only credential; the Redis block must go with it.
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert!(!manager.snapshot().entries[0].disabled);
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
+            .await;
+
+        let mut ctx =
+            tokio::time::timeout(StdDuration::from_secs(5), manager.acquire_context(None))
+                .await
+                .expect("acquire finished")
+                .expect("the healed credential gets a Redis lease");
+        assert_eq!(ctx.id, 1);
+        ctx.release_in_flight();
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -13313,43 +13414,45 @@ fn test_report_risk_controlled_disables_with_specific_reason() {
     assert_eq!(disabled.failure_count, MAX_FAILURES_PER_CREDENTIAL);
 }
 
-#[tokio::test]
-async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
+fn risk_circuit_manager(count: usize, ratio_percent: u32) -> MultiTokenManager {
     let mut config = Config::default();
     config.external_pools.local_pool_circuit_enabled = true;
     config.external_pools.local_pool_circuit_open_after_failures = 2;
     config
         .external_pools
         .local_pool_circuit_require_distinct_credentials = 2;
+    config.external_pools.local_pool_circuit_min_ratio_percent = ratio_percent;
     config.external_pools.local_pool_circuit_open_secs = 30;
+    config.external_pools.local_pool_circuit_half_open_probes = 1;
+    let credentials = (0..count)
+        .map(|index| test_access_token_credential(&format!("risk-{index}"), "Pro"))
+        .collect();
+    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    // Every credential has served traffic before, so its risk control counts for the pool.
+    for entry in manager.entries.lock().iter_mut() {
+        entry.success_count = 1;
+    }
+    manager
+}
 
-    let manager = MultiTokenManager::new(
-        config,
-        vec![
-            test_access_token_credential("risk-1", "Pro"),
-            test_access_token_credential("risk-2", "Pro"),
-            test_access_token_credential("risk-3", "Pro"),
-        ],
-        None,
-        None,
-        false,
-    )
-    .unwrap();
-
-    let first = manager.report_risk_controlled_outcome(
-        1,
+fn report_suspended(manager: &MultiTokenManager, id: u64) -> RiskControlReportOutcome {
+    manager.report_risk_controlled_outcome(
+        id,
         CredentialRiskControlReason::TemporarilySuspended,
-        "TEMPORARILY_SUSPENDED first",
-    );
+        "TEMPORARILY_SUSPENDED",
+    )
+}
+
+#[tokio::test]
+async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
+    let manager = risk_circuit_manager(3, 0);
+
+    let first = report_suspended(&manager, 1);
     assert!(first.can_retry_local());
     assert!(!first.circuit_open);
     assert_eq!(manager.available_count(), 2);
 
-    let second = manager.report_risk_controlled_outcome(
-        2,
-        CredentialRiskControlReason::TemporarilySuspended,
-        "TEMPORARILY_SUSPENDED second",
-    );
+    let second = report_suspended(&manager, 2);
     assert!(
         second.has_available_credentials,
         "one untouched credential remains available"
@@ -13381,6 +13484,97 @@ async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
     assert!(
         !untouched.disabled,
         "circuit must not disable untouched accounts"
+    );
+}
+
+#[test]
+fn risk_circuit_ignores_credentials_that_never_succeeded() {
+    let manager = risk_circuit_manager(4, 0);
+    for entry in manager.entries.lock().iter_mut() {
+        entry.success_count = 0;
+    }
+    for id in 1..=3 {
+        let outcome = report_suspended(&manager, id);
+        assert!(
+            !outcome.circuit_open,
+            "fresh import #{id} must not open the pool circuit"
+        );
+        assert!(outcome.can_retry_local());
+    }
+    assert_eq!(
+        manager.available_count(),
+        1,
+        "each one is still disabled on its own"
+    );
+}
+
+#[test]
+fn risk_circuit_counts_each_credential_once() {
+    let manager = risk_circuit_manager(4, 0);
+    report_suspended(&manager, 1);
+    // Concurrent requests on the same credential report it again after it is disabled.
+    for _ in 0..5 {
+        assert!(!report_suspended(&manager, 1).circuit_open);
+    }
+    // A credential that no longer exists is not counted either.
+    assert!(!report_suspended(&manager, 99).circuit_open);
+    assert!(
+        report_suspended(&manager, 2).circuit_open,
+        "the second distinct credential opens it"
+    );
+}
+
+#[test]
+fn risk_circuit_ratio_keeps_large_pools_serving() {
+    // With 20 credentials the 30% ratio needs 6 risk-controlled credentials: each one leaves
+    // the dispatchable set, so after k reports the share is k / (k + (20 - k)) = k / 20.
+    let manager = risk_circuit_manager(20, 30);
+    for id in 1..=5 {
+        assert!(
+            !report_suspended(&manager, id).circuit_open,
+            "#{id}: {id} of 20 is below 30%"
+        );
+    }
+    assert!(
+        report_suspended(&manager, 6).circuit_open,
+        "6 of 20 reaches 30%"
+    );
+}
+
+#[tokio::test]
+async fn risk_circuit_half_open_probe_closes_on_success_and_reopens_on_risk_control() {
+    let manager = risk_circuit_manager(4, 0);
+    report_suspended(&manager, 1);
+    assert!(report_suspended(&manager, 2).circuit_open);
+    assert!(
+        manager.local_pool_risk_circuit.lock().failures.is_empty(),
+        "opening clears the window so one late event cannot re-open it"
+    );
+
+    // Open period over: exactly one probe is admitted.
+    manager.local_pool_risk_circuit.lock().open_until = Some(Instant::now());
+    let mut probe = manager.acquire_context(None).await.unwrap();
+    assert!(
+        manager.acquire_context(None).await.is_err(),
+        "the second request waits while the probe runs"
+    );
+    // The probe is risk-controlled: the circuit re-opens at once.
+    probe.release_in_flight();
+    assert!(report_suspended(&manager, probe.id).circuit_open);
+
+    // Next half-open probe succeeds: the circuit closes.
+    manager.local_pool_risk_circuit.lock().open_until = Some(Instant::now());
+    let mut probe = manager.acquire_context(None).await.unwrap();
+    manager.report_success_with_latency_deferred(probe.id, None, None);
+    probe.release_in_flight();
+    for _ in 0..3 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        ctx.release_in_flight();
+    }
+    assert!(
+        !manager
+            .local_pool_risk_circuit_snapshot(Instant::now())
+            .open
     );
 }
 
@@ -14015,7 +14209,7 @@ async fn fast_tier_never_bypasses_dispatch_safety_rules() {
 }
 
 #[test]
-fn fast_slot_race_overflows_to_lower_tier_in_priority_mode() {
+fn slot_race_overflows_to_any_dispatchable_tier_in_priority_mode() {
     let mut config = Config::default();
     config.credential_warmup_requests = 0;
     let mut fast = fast_test_credential("fast", 1);
@@ -14036,15 +14230,16 @@ fn fast_slot_race_overflows_to_lower_tier_in_priority_mode() {
 
     // The Fast credential lost its slot: overflowing to a plain credential is allowed even
     // though its priority differs.
-    assert!(
-        manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 1, 0, 1, 1)
-    );
+    assert!(manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 1, 1));
 
-    // Between plain credentials priority mode still waits on its own priority level.
+    // Between plain credentials the slot race uses the same rule as the first pick: a full
+    // tier overflows to the next one instead of queueing behind it.
     excluded.insert(1);
-    assert!(
-        !manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 2, 9, 0, 1)
-    );
+    assert!(manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 2, 1));
+
+    // Waiting is only right when nothing else can take the request.
+    excluded.insert(3);
+    assert!(!manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 2, 1));
 }
 
 #[tokio::test]
@@ -14109,8 +14304,8 @@ async fn fast_sticky_sessions_migrate_gradually_and_rebind() {
     );
     new_session.release_in_flight();
 
-    *manager.fast_sticky_migration_last.lock() =
-        Some(Instant::now() - FAST_STICKY_MIGRATION_INTERVAL);
+    *manager.tier_sticky_migration_last.lock() =
+        Some(Instant::now() - TIER_STICKY_MIGRATION_INTERVAL);
     let mut later = manager
         .acquire_context_for_session(None, Some("fast-sticky-b"), &empty)
         .await
@@ -14162,7 +14357,7 @@ async fn fast_sticky_session_stays_when_fast_tier_is_full() {
     );
     assert!(stay.sticky_bound);
     assert!(
-        manager.fast_sticky_migration_last.lock().is_none(),
+        manager.tier_sticky_migration_last.lock().is_none(),
         "a skipped migration does not consume the pacing slot"
     );
     stay.release_in_flight();
@@ -14342,4 +14537,1096 @@ fn credential_route_policy_setter_normalizes_rules() {
     let entries = manager.entries.lock();
     assert_eq!(entries[0].credentials.route_rules, vec!["/cc".to_string()]);
     assert!(entries[0].credentials.allows_route("/cc/v1/messages"));
+}
+
+/// Auto-heal is throttled per account: at least `credentialAutoHealMinIntervalSecs` between two
+/// heals, and at most `credentialAutoHealMaxConsecutiveRounds` heals in a row without a success.
+/// A success or a manual reset starts the count again.
+#[test]
+fn auto_heal_respects_min_interval_and_consecutive_round_limit() {
+    let mut config = Config::default();
+    config.credential_auto_heal_min_interval_secs = 300;
+    config.credential_auto_heal_max_consecutive_rounds = 2;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![api_key_credential("ksk_auto_heal_throttle")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let disable = |manager: &MultiTokenManager| {
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        let entry = manager.snapshot().entries.into_iter().next().unwrap();
+        assert!(entry.disabled);
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some(DisabledReason::TooManyFailures.as_str())
+        );
+    };
+    let age_last_heal = |manager: &MultiTokenManager| {
+        let mut entries = manager.entries.lock();
+        let entry = &mut entries[0];
+        entry.last_auto_heal_at = entry
+            .last_auto_heal_at
+            .map(|at| at - StdDuration::from_secs(301));
+    };
+    let ready = |manager: &MultiTokenManager| {
+        manager.local_pool_route_state(None).kind == LocalPoolRouteStateKind::Ready
+    };
+
+    disable(&manager);
+    assert!(ready(&manager), "first heal");
+    disable(&manager);
+    assert!(
+        !ready(&manager),
+        "second heal inside the minimum interval is skipped"
+    );
+    age_last_heal(&manager);
+    assert!(ready(&manager), "second heal after the interval");
+    disable(&manager);
+    age_last_heal(&manager);
+    assert!(
+        !ready(&manager),
+        "third consecutive heal is over the round limit"
+    );
+
+    manager.reset_and_enable(1).unwrap();
+    assert!(ready(&manager));
+    disable(&manager);
+    assert!(ready(&manager), "a manual reset starts the count again");
+
+    manager.report_success_with_latency(1, None, None);
+    disable(&manager);
+    age_last_heal(&manager);
+    assert!(ready(&manager), "a success starts the count again");
+    assert_eq!(manager.entries.lock()[0].auto_heal_consecutive_rounds, 1);
+}
+
+#[test]
+fn auto_heal_limits_of_zero_mean_unlimited() {
+    let mut config = Config::default();
+    config.credential_auto_heal_min_interval_secs = 0;
+    config.credential_auto_heal_max_consecutive_rounds = 0;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![api_key_credential("ksk_auto_heal_unlimited")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    for round in 1..=8 {
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert_eq!(
+            manager.local_pool_route_state(None).kind,
+            LocalPoolRouteStateKind::Ready,
+            "round {round}"
+        );
+    }
+}
+// ---------------------------------------------------------------------------
+// Selection scenario matrix: pins the dispatch order of every load-balancing mode
+// across tiers, warmup, Fast, cooldown, RPM, sticky sessions and slot races, so a
+// refactor of the selection code must reproduce it exactly and behavior changes are
+// visible as explicit edits to the expected table.
+// ---------------------------------------------------------------------------
+
+const SELECTION_MATRIX_MODES: [&str; 4] = [
+    "priority",
+    "balanced",
+    "health_balanced",
+    "weighted_least_inflight",
+];
+
+#[derive(Clone, Copy)]
+struct MatrixCredential {
+    priority: u32,
+    fast: u32,
+    warmup: u32,
+}
+
+const fn matrix_credential(priority: u32, fast: u32, warmup: u32) -> MatrixCredential {
+    MatrixCredential {
+        priority,
+        fast,
+        warmup,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MatrixStep {
+    /// Acquire and keep the lease.
+    Hold(Option<&'static str>),
+    /// Acquire and release the lease immediately.
+    Pulse(Option<&'static str>),
+    ReleaseAll,
+    Cooldown(u64),
+    Rpm(u64, u32),
+}
+
+fn selection_matrix_manager(mode: &str, credentials: &[MatrixCredential]) -> MultiTokenManager {
+    let mut config = Config::default();
+    config.load_balancing_mode = mode.to_string();
+    config.credential_max_concurrent_requests = 2;
+    config.credential_warmup_requests = 0;
+    // Score-based modes pick randomly among the top K; K = 1 makes them deterministic.
+    config.scheduler_top_k = 1;
+    let list = credentials
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let mut credential = test_access_token_credential(&format!("matrix-{index}"), "Pro");
+            credential.priority = spec.priority;
+            credential.fast = spec.fast;
+            credential
+        })
+        .collect();
+    let manager = MultiTokenManager::new(config, list, None, None, false).unwrap();
+    for (index, spec) in credentials.iter().enumerate() {
+        if spec.warmup > 0 {
+            manager
+                .set_warmup_remaining(index as u64 + 1, spec.warmup)
+                .unwrap();
+        }
+    }
+    manager
+}
+
+async fn run_selection_matrix_scenario(
+    mode: &str,
+    credentials: &[MatrixCredential],
+    steps: &[MatrixStep],
+) -> String {
+    let manager = selection_matrix_manager(mode, credentials);
+    let mut held = Vec::new();
+    let mut trace = Vec::new();
+    for step in steps {
+        match *step {
+            MatrixStep::Hold(session) | MatrixStep::Pulse(session) => {
+                let result = manager
+                    .acquire_context_for_session_with_mode(
+                        None,
+                        session,
+                        &HashSet::new(),
+                        AcquireMode::FailFastOnCapacity,
+                        1,
+                    )
+                    .await;
+                match result {
+                    Ok(mut ctx) => {
+                        trace.push(ctx.id.to_string());
+                        if matches!(step, MatrixStep::Hold(_)) {
+                            held.push(ctx);
+                        } else {
+                            ctx.release_in_flight();
+                        }
+                    }
+                    Err(_) => trace.push("E".to_string()),
+                }
+            }
+            MatrixStep::ReleaseAll => {
+                for ctx in &mut held {
+                    ctx.release_in_flight();
+                }
+                held.clear();
+                trace.push("|".to_string());
+            }
+            MatrixStep::Cooldown(id) => {
+                manager
+                    .report_transient_failure_kind(
+                        id,
+                        None,
+                        TransientFailureKind::RateLimit,
+                        Some(StdDuration::from_secs(120)),
+                        "matrix cooldown",
+                    )
+                    .unwrap();
+            }
+            MatrixStep::Rpm(id, rpm) => manager.set_credential_rpm(id, Some(rpm)).unwrap(),
+        }
+    }
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+    trace.join(" ")
+}
+
+fn selection_matrix_scenarios() -> Vec<(&'static str, Vec<MatrixCredential>, Vec<MatrixStep>)> {
+    use MatrixStep::*;
+    let p = |priority| matrix_credential(priority, 0, 0);
+    vec![
+        (
+            "tiers_fill_in_order",
+            vec![p(0), p(0), p(10), p(10)],
+            vec![Hold(None); 9],
+        ),
+        (
+            "warmup_in_lower_tier",
+            vec![
+                p(0),
+                p(0),
+                matrix_credential(10, 0, 30),
+                matrix_credential(10, 0, 30),
+            ],
+            vec![Pulse(None); 8],
+        ),
+        (
+            "warmup_in_same_tier",
+            vec![p(0), matrix_credential(0, 0, 30), p(0)],
+            vec![Pulse(None); 8],
+        ),
+        (
+            "fast_above_priority",
+            vec![p(0), matrix_credential(10, 1, 0), p(5)],
+            vec![Hold(None); 7],
+        ),
+        (
+            "cooldown_skips_tier_member",
+            vec![p(0), p(0), p(10)],
+            vec![
+                Cooldown(1),
+                Hold(None),
+                Hold(None),
+                Hold(None),
+                Hold(None),
+                Hold(None),
+            ],
+        ),
+        (
+            "rpm_limited_member",
+            vec![p(0), p(0), p(10)],
+            vec![
+                Rpm(1, 1),
+                Pulse(None),
+                Pulse(None),
+                Pulse(None),
+                Pulse(None),
+            ],
+        ),
+        (
+            "sticky_borrows_when_bound_is_full",
+            vec![p(0), p(0), p(10)],
+            vec![
+                Hold(Some("s1")),
+                Hold(Some("s1")),
+                Hold(Some("s1")),
+                ReleaseAll,
+                Hold(Some("s1")),
+            ],
+        ),
+        (
+            "sticky_bound_in_lower_tier",
+            vec![p(0), p(10)],
+            vec![
+                Hold(None),
+                Hold(None),
+                Hold(Some("s2")),
+                ReleaseAll,
+                Pulse(Some("s2")),
+                Pulse(Some("s2")),
+            ],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn selection_scenario_matrix_matches_expected_dispatch_order() {
+    let mut actual = Vec::new();
+    for (name, credentials, steps) in selection_matrix_scenarios() {
+        for mode in SELECTION_MATRIX_MODES {
+            let trace = run_selection_matrix_scenario(mode, &credentials, &steps).await;
+            actual.push(format!("{name}/{mode}: {trace}"));
+        }
+    }
+    let actual = actual.join("\n");
+    assert_eq!(actual, SELECTION_MATRIX_EXPECTED.trim(), "\n{actual}\n");
+}
+
+#[test]
+fn selection_matrix_slot_race_alternative_scope() {
+    // The selected credential (id 1, priority 0) lost its slot; credential 2 (priority 10)
+    // and credential 3 (priority 0, Fast 1) still have capacity.
+    let mut actual = Vec::new();
+    for mode in SELECTION_MATRIX_MODES {
+        let manager = selection_matrix_manager(
+            mode,
+            &[
+                matrix_credential(0, 0, 0),
+                matrix_credential(10, 0, 0),
+                matrix_credential(0, 1, 0),
+            ],
+        );
+        let excluded_fast = HashSet::from([3]);
+        let lower_tier_only =
+            manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded_fast, 1, 1);
+        let other_fast_tier = manager.has_alternate_dispatchable_credential_for_slot_race(
+            None,
+            &HashSet::from([2]),
+            1,
+            1,
+        );
+        actual.push(format!(
+            "{mode}: lower_tier={lower_tier_only} other_fast={other_fast_tier}"
+        ));
+    }
+    assert_eq!(
+        actual.join("\n"),
+        SELECTION_MATRIX_SLOT_RACE_EXPECTED.trim()
+    );
+}
+
+const SELECTION_MATRIX_EXPECTED: &str = r#"
+tiers_fill_in_order/priority: 1 2 1 2 3 4 3 4 E
+tiers_fill_in_order/balanced: 1 2 1 2 3 4 3 4 E
+tiers_fill_in_order/health_balanced: 1 2 3 4 1 2 3 4 E
+tiers_fill_in_order/weighted_least_inflight: 1 2 3 4 1 2 3 4 E
+warmup_in_lower_tier/priority: 1 2 1 2 1 2 1 2
+warmup_in_lower_tier/balanced: 3 1 2 1 2 1 2 1
+warmup_in_lower_tier/health_balanced: 3 1 2 1 2 1 2 1
+warmup_in_lower_tier/weighted_least_inflight: 3 1 2 1 2 1 2 1
+warmup_in_same_tier/priority: 2 1 3 1 3 1 3 1
+warmup_in_same_tier/balanced: 2 1 3 1 3 1 3 1
+warmup_in_same_tier/health_balanced: 2 1 3 1 3 1 3 1
+warmup_in_same_tier/weighted_least_inflight: 2 1 3 1 3 1 3 1
+fast_above_priority/priority: 2 2 1 1 3 3 E
+fast_above_priority/balanced: 2 2 1 1 3 3 E
+fast_above_priority/health_balanced: 2 2 1 3 1 3 E
+fast_above_priority/weighted_least_inflight: 2 2 1 3 1 3 E
+cooldown_skips_tier_member/priority: 2 2 3 3 E
+cooldown_skips_tier_member/balanced: 2 2 3 3 E
+cooldown_skips_tier_member/health_balanced: 2 3 2 3 E
+cooldown_skips_tier_member/weighted_least_inflight: 2 3 2 3 E
+rpm_limited_member/priority: 1 2 2 2
+rpm_limited_member/balanced: 1 2 2 2
+rpm_limited_member/health_balanced: 1 2 3 2
+rpm_limited_member/weighted_least_inflight: 1 2 3 2
+sticky_borrows_when_bound_is_full/priority: 1 1 2 | 1
+sticky_borrows_when_bound_is_full/balanced: 1 1 2 | 1
+sticky_borrows_when_bound_is_full/health_balanced: 1 1 2 | 1
+sticky_borrows_when_bound_is_full/weighted_least_inflight: 1 1 2 | 1
+sticky_bound_in_lower_tier/priority: 1 1 2 | 1 1
+sticky_bound_in_lower_tier/balanced: 1 1 2 | 2 2
+sticky_bound_in_lower_tier/health_balanced: 1 2 1 | 1 1
+sticky_bound_in_lower_tier/weighted_least_inflight: 1 2 1 | 1 1
+"#;
+
+const SELECTION_MATRIX_SLOT_RACE_EXPECTED: &str = r#"
+priority: lower_tier=true other_fast=true
+balanced: lower_tier=true other_fast=true
+health_balanced: lower_tier=true other_fast=true
+weighted_least_inflight: lower_tier=true other_fast=true
+"#;
+
+#[tokio::test]
+async fn priority_mode_overflows_to_next_tier_in_the_same_pick_when_preferred_is_full() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[
+            matrix_credential(0, 0, 0),
+            matrix_credential(5, 0, 0),
+            matrix_credential(10, 0, 0),
+        ],
+    );
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(manager.acquire_context(None).await.unwrap());
+    }
+    // Tier 0 is full: the next request lands on tier 5 at once, without queueing.
+    let started = Instant::now();
+    let ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2);
+    assert!(started.elapsed() < StdDuration::from_millis(200));
+    held.push(ctx);
+    held.push(manager.acquire_context(None).await.unwrap());
+    // Tier 5 is full as well: tier 10 is next.
+    assert_eq!(manager.acquire_context(None).await.unwrap().id, 3);
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+}
+
+#[tokio::test]
+async fn sticky_sessions_bound_to_a_lower_tier_move_back_one_per_interval_and_rebind() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(10, 0, 0)],
+    );
+    let empty = HashSet::new();
+    // Fill tier 0 so both sessions bind to the tier-10 credential.
+    let mut blockers = vec![
+        manager.acquire_context(None).await.unwrap(),
+        manager.acquire_context(None).await.unwrap(),
+    ];
+    for session in ["back-a", "back-b"] {
+        let mut ctx = manager
+            .acquire_context_for_session(None, Some(session), &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        ctx.release_in_flight();
+    }
+    for ctx in &mut blockers {
+        ctx.release_in_flight();
+    }
+
+    // Tier 0 is free again: one session moves back and is rebound there.
+    let mut moved = manager
+        .acquire_context_for_session(None, Some("back-a"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(moved.id, 1);
+    assert!(!moved.sticky_bound);
+    moved.release_in_flight();
+    // Within the same interval the other session stays where it is.
+    let mut stayed = manager
+        .acquire_context_for_session(None, Some("back-b"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(stayed.id, 2);
+    assert!(stayed.sticky_bound);
+    stayed.release_in_flight();
+
+    // The moved session is now bound to tier 0.
+    let mut again = manager
+        .acquire_context_for_session(None, Some("back-a"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(again.id, 1);
+    assert!(again.sticky_bound);
+    again.release_in_flight();
+
+    // After the interval the second session moves too.
+    *manager.tier_sticky_migration_last.lock() =
+        Some(Instant::now() - TIER_STICKY_MIGRATION_INTERVAL);
+    let mut moved = manager
+        .acquire_context_for_session(None, Some("back-b"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(moved.id, 1);
+    moved.release_in_flight();
+}
+
+#[tokio::test]
+async fn sticky_session_in_preferred_tier_borrows_without_rebinding_when_bound_is_full() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(0, 0, 0)],
+    );
+    let empty = HashSet::new();
+    let mut first = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    let mut second = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    assert_eq!((first.id, second.id), (1, 1));
+    let mut borrowed = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(borrowed.id, 2);
+    assert!(borrowed.fallback_from_sticky);
+    for ctx in [&mut first, &mut second, &mut borrowed] {
+        ctx.release_in_flight();
+    }
+    let mut back = manager
+        .acquire_context_for_session(None, Some("borrow"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(back.id, 1, "a temporary borrow keeps the original binding");
+    back.release_in_flight();
+}
+
+#[tokio::test]
+async fn new_sessions_spread_evenly_across_a_tier_by_active_bound_sessions() {
+    for mode in ["priority", "balanced"] {
+        let manager = selection_matrix_manager(
+            mode,
+            &[
+                matrix_credential(0, 0, 0),
+                matrix_credential(0, 0, 0),
+                matrix_credential(0, 0, 0),
+            ],
+        );
+        // Credential 1 has a long history; it must not stay idle because of it.
+        manager.entries.lock()[0].success_count = 1_000_000;
+        let empty = HashSet::new();
+        let mut per_credential = HashMap::new();
+        for index in 0..30 {
+            let session = format!("{mode}-spread-{index}");
+            let mut ctx = manager
+                .acquire_context_for_session(None, Some(&session), &empty)
+                .await
+                .unwrap();
+            *per_credential.entry(ctx.id).or_insert(0u32) += 1;
+            ctx.release_in_flight();
+            // Selection windows are not what spreads sessions here: clear them so only the
+            // bound-session count breaks ties.
+            for entry in manager.entries.lock().iter_mut() {
+                entry.selection_events.clear();
+                entry.health.recent_selection_count_10s = 0;
+                entry.health.recent_selection_count_60s = 0;
+            }
+            manager.invalidate_bound_session_counts();
+        }
+        assert_eq!(
+            per_credential,
+            HashMap::from([(1, 10), (2, 10), (3, 10)]),
+            "{mode}: 30 new sessions over 3 equal credentials"
+        );
+    }
+}
+
+#[tokio::test]
+async fn idle_credentials_are_picked_before_recently_selected_ones_on_a_tie() {
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(0, 0, 0)],
+    );
+    let mut order = Vec::new();
+    for _ in 0..4 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        order.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert_eq!(
+        order,
+        vec![1, 2, 1, 2],
+        "ties rotate instead of sticking to one id"
+    );
+}
+
+#[tokio::test]
+async fn session_concurrency_limit_borrows_without_rebinding_and_releases_on_drop() {
+    let empty = HashSet::new();
+
+    // Default (0): a session stacks on its bound credential up to the credential's own limit.
+    let manager = selection_matrix_manager(
+        "priority",
+        &[matrix_credential(0, 0, 0), matrix_credential(0, 0, 0)],
+    );
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(
+            manager
+                .acquire_context_for_session(None, Some("stack"), &empty)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        held.iter().map(|ctx| ctx.id).collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+
+    // Limit 1: the second concurrent request of the session borrows the other credential.
+    manager
+        .update_runtime_config(|config| config.credential_session_max_concurrent_requests = 1)
+        .unwrap();
+    let mut first = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    let bound = first.id;
+    let other = if bound == 1 { 2 } else { 1 };
+    let mut second = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(second.id, other);
+    assert!(second.fallback_from_sticky && !second.sticky_bound);
+    assert_eq!(
+        session_in_flight_on(&manager.session_concurrency, "spread", bound),
+        1
+    );
+
+    // The borrowed credential does not take over the binding.
+    second.release_in_flight();
+    let mut third = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        third.id, other,
+        "the bound credential still has the session's one allowed request"
+    );
+    third.release_in_flight();
+    first.release_in_flight();
+    let fourth = manager
+        .acquire_context_for_session(None, Some("spread"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(fourth.id, bound, "the binding stayed where it was");
+    assert!(fourth.sticky_bound);
+
+    // Dropping a context without an explicit release still returns the session's share.
+    drop(fourth);
+    assert!(manager.session_concurrency.lock().is_empty());
+}
+
+#[tokio::test]
+async fn session_concurrency_limit_never_blocks_when_no_other_credential_is_free() {
+    let manager = selection_matrix_manager("priority", &[matrix_credential(0, 0, 0)]);
+    manager
+        .update_runtime_config(|config| config.credential_session_max_concurrent_requests = 1)
+        .unwrap();
+    let empty = HashSet::new();
+    let mut first = manager
+        .acquire_context_for_session(None, Some("only"), &empty)
+        .await
+        .unwrap();
+    let mut second = manager
+        .acquire_context_for_session(None, Some("only"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.id, second.id),
+        (1, 1),
+        "the per-session limit only spreads load; it never makes a request wait"
+    );
+    first.release_in_flight();
+    second.release_in_flight();
+}
+
+#[test]
+fn selection_failure_samples_list_blocking_accounts_before_disabled_ones() {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.selection_failure_sample_limit = 2;
+    let credentials = (0..5)
+        .map(|index| test_access_token_credential(&format!("sample-{index}"), "Pro"))
+        .collect();
+    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    for id in 1..=3 {
+        manager.set_disabled(id, true).unwrap();
+    }
+    for entry in manager.entries.lock().iter_mut() {
+        if entry.id >= 4 {
+            entry.in_flight_requests = 1;
+        }
+    }
+    let summary = manager.selection_failure_summary("req", "local_account", None, "capacity");
+    let reasons: Vec<_> = summary
+        .sampled_accounts
+        .iter()
+        .map(|sample| (sample.account_id, sample.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            (4, AccountRejectReason::AccountConcurrencyFull),
+            (5, AccountRejectReason::AccountConcurrencyFull),
+        ]
+    );
+    assert_eq!(summary.rejected_account_count, 5);
+}
+
+fn queue_test_manager(credentials: usize, max_queued: u32) -> Arc<MultiTokenManager> {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.credential_warmup_requests = 0;
+    config.dispatch_max_queued_requests = max_queued;
+    config.credential_dispatch_max_wait_secs = 30;
+    let list = (0..credentials)
+        .map(|index| test_access_token_credential(&format!("queue-{index}"), "Pro"))
+        .collect();
+    Arc::new(MultiTokenManager::new(config, list, None, None, false).unwrap())
+}
+
+#[tokio::test]
+async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate() {
+    let manager = queue_test_manager(1, 2);
+    // About one dispatch per second over the last half minute.
+    let now = Instant::now();
+    for age in (1..=30u64).rev() {
+        manager
+            .dispatch_progress
+            .record_dispatch(now - StdDuration::from_secs(age));
+    }
+    let mut holder = manager.acquire_context(None).await.unwrap();
+    assert_eq!(
+        manager.dispatch_queue_full_retry_after(None),
+        None,
+        "queue not full yet"
+    );
+
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.acquire_context(None).await })
+        })
+        .collect();
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 2 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 2);
+
+    // A queue of 2 at about one dispatch per second drains in about 2 s.
+    assert_eq!(manager.dispatch_queue_full_retry_after(None), Some(2));
+    let started = Instant::now();
+    let error = match manager.acquire_context(None).await {
+        Ok(mut ctx) => {
+            ctx.release_in_flight();
+            panic!("a full queue must reject the request");
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        started.elapsed() < StdDuration::from_millis(200),
+        "rejected without waiting"
+    );
+    assert!(error.contains("账号调度等待队列已满"), "{error}");
+    assert!(error.contains("retry_after_secs=2"), "{error}");
+
+    // Queued requests move on as the slot frees up, in order, without waiting for a timeout.
+    holder.release_in_flight();
+    let mut served = Vec::new();
+    for waiter in waiters {
+        let mut ctx = tokio::time::timeout(StdDuration::from_secs(5), waiter)
+            .await
+            .expect("queued request must be dispatched once a slot frees up")
+            .unwrap()
+            .unwrap();
+        served.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert_eq!(served, vec![1, 1]);
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
+    // Every dispatch is recorded: the three just made push the recent rate up.
+    assert!(
+        manager
+            .dispatch_progress
+            .recent_rate_per_sec(Instant::now())
+            > 1.0
+    );
+}
+
+/// The entry's early rejection checked for a free slot without the request model, so a pool
+/// whose credentials list their models looked full and requests were turned away while those
+/// credentials were idle.
+#[tokio::test]
+async fn a_full_queue_with_idle_catalog_credentials_is_not_rejected_early() {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.credential_warmup_requests = 0;
+    config.dispatch_max_queued_requests = 1;
+    config.credential_dispatch_max_wait_secs = 30;
+    let mut busy = test_access_token_credential("catalog-busy", "Pro");
+    busy.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    let mut idle = test_access_token_credential("catalog-idle", "Pro");
+    idle.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    let manager =
+        Arc::new(MultiTokenManager::new(config, vec![busy, idle], None, None, false).unwrap());
+    let empty = HashSet::new();
+    let mut holder = manager
+        .acquire_context_for_session(Some("claude-sonnet-4.5"), None, &HashSet::from([2]))
+        .await
+        .unwrap();
+    assert_eq!(holder.id, 1);
+    // One more request waits for credential 1 only, filling the one-place queue.
+    let waiter = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .acquire_context_for_session(Some("claude-sonnet-4.5"), None, &HashSet::from([2]))
+                .await
+        })
+    };
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 1 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 1);
+
+    assert_eq!(
+        manager.dispatch_queue_full_retry_after(Some("claude-sonnet-4.5")),
+        None,
+        "credential 2 lists the model and is idle"
+    );
+    let mut served = manager
+        .acquire_context_for_session(Some("claude-sonnet-4.5"), None, &empty)
+        .await
+        .unwrap();
+    assert_eq!(served.id, 2);
+    served.release_in_flight();
+    holder.release_in_flight();
+    let mut ctx = tokio::time::timeout(StdDuration::from_secs(5), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    ctx.release_in_flight();
+}
+
+#[tokio::test]
+async fn a_success_does_not_wake_every_queued_request() {
+    let manager = queue_test_manager(1, 10);
+    let ctx = manager.acquire_context(None).await.unwrap();
+    let (_, _, generation_before) = manager.capacity_signal.test_snapshot();
+    manager.report_success_with_latency_deferred(ctx.id, None, None);
+    let (_, _, generation_after) = manager.capacity_signal.test_snapshot();
+    assert_eq!(
+        generation_before, generation_after,
+        "a plain success frees no slot by itself; the lease release wakes one waiter"
+    );
+    drop(ctx);
+}
+
+/// Production under load: every slot taken, an upstream 500 on one credential. The retry used to
+/// need a credential with a free slot right now, so under load the error went to the client
+/// although healthy credentials would free a slot within a second.
+#[tokio::test]
+async fn a_busy_healthy_credential_is_a_retry_target_but_a_cooling_one_is_not() {
+    let manager = queue_test_manager(3, 10);
+    let mut held: Vec<_> = Vec::new();
+    for _ in 0..3 {
+        held.push(manager.acquire_context(None).await.unwrap());
+    }
+    let failed = held[0].id;
+    let excluded = HashSet::from([failed]);
+
+    assert!(
+        !manager.has_alternate_usable_credential_cached(None, &excluded, failed),
+        "no other credential has a free slot"
+    );
+    assert!(
+        manager.has_alternate_retry_target_cached(None, &excluded, failed, true),
+        "a request that may wait can queue for a busy healthy credential"
+    );
+    assert!(
+        !manager.has_alternate_retry_target_cached(None, &excluded, failed, false),
+        "a fail-fast request cannot queue, so it still needs a free slot"
+    );
+
+    for ctx in &held[1..] {
+        manager
+            .report_transient_failure_kind(
+                ctx.id,
+                None,
+                TransientFailureKind::RateLimit,
+                None,
+                "429",
+            )
+            .unwrap();
+    }
+    assert!(
+        !manager.has_alternate_retry_target_cached(None, &excluded, failed, true),
+        "cooling credentials are no retry target, busy or not"
+    );
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+}
+
+/// A retry after a failed attempt gave its slot back; turning it away at a full queue would show
+/// the client an upstream error the pool can still absorb.
+#[tokio::test]
+async fn a_retry_queues_past_a_full_queue_and_a_new_request_does_not() {
+    let manager = queue_test_manager(1, 1);
+    let mut holder = manager.acquire_context(None).await.unwrap();
+    let waiter = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.acquire_context(None).await })
+    };
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 1 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 1);
+
+    let empty = HashSet::new();
+    let error = match manager
+        .acquire_context_for_dispatch(
+            None,
+            None,
+            &empty,
+            AcquireMode::WaitForCapacity,
+            DispatchAdmission::New,
+            1,
+            None,
+        )
+        .await
+    {
+        Ok(mut ctx) => {
+            ctx.release_in_flight();
+            panic!("a new request must be turned away at a full queue");
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("账号调度等待队列已满"), "{error}");
+
+    let retry = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .acquire_context_for_dispatch(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    AcquireMode::WaitForCapacity,
+                    DispatchAdmission::Retry,
+                    1,
+                    None,
+                )
+                .await
+        })
+    };
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 2 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(
+        manager.queued_requests.load(Ordering::Acquire),
+        2,
+        "the retry waits in the queue beside the queued request"
+    );
+
+    holder.release_in_flight();
+    for task in [waiter, retry] {
+        let mut ctx = tokio::time::timeout(StdDuration::from_secs(5), task)
+            .await
+            .expect("both queued dispatches are served as the slot frees up")
+            .unwrap()
+            .unwrap();
+        ctx.release_in_flight();
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn killed_instance_leases_are_reclaimed_by_a_live_instance_and_shutdown_releases_its_own() {
+    run_isolated_multi_redis_manager_fixture(2, |stores| async move {
+        let mut config = Config::default();
+        config.credential_rpm = None;
+        config.credential_max_concurrent_requests = 1;
+        config.credential_warmup_requests = 0;
+        config.credential_dispatch_max_wait_secs = 1;
+        let mut credential = api_key_credential("reclaim-killed-instance");
+        credential.id = Some(1);
+        let manager = |store: Arc<RedisStore>| {
+            Arc::new(
+                MultiTokenManager::new_with_stores(
+                    config.clone(),
+                    vec![credential.clone()],
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(store),
+                )
+                .unwrap(),
+            )
+        };
+        let killed = manager(stores[0].clone());
+        let live = manager(stores[1].clone());
+        killed.heartbeat_and_reclaim_dead_instance_leases().await;
+        live.heartbeat_and_reclaim_dead_instance_leases().await;
+
+        // The killed instance holds the only slot and never releases it.
+        let held = killed.acquire_context(None).await.unwrap();
+        std::mem::forget(held);
+        assert!(
+            live.acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                1,
+            )
+            .await
+            .is_err(),
+            "the slot is still taken"
+        );
+
+        // Its heartbeat key disappears as it would 30 s after a kill.
+        stores[1]
+            .delete_pattern_bounded(
+                &format!("scheduler:instance_alive:{}", killed.scheduler_instance_id),
+                None,
+            )
+            .await
+            .unwrap();
+        live.heartbeat_and_reclaim_dead_instance_leases().await;
+        let mut ctx = live
+            .acquire_context(None)
+            .await
+            .expect("the killed instance's slot is back");
+        ctx.release_in_flight();
+
+        // A live instance's own leases are released on shutdown even if requests never end.
+        let held = live.acquire_context(None).await.unwrap();
+        std::mem::forget(held);
+        assert_eq!(
+            live.release_own_in_flight_leases(StdDuration::from_secs(3))
+                .await,
+            1
+        );
+        live.refresh_scheduler_state_from_redis_force().unwrap();
+    })
+    .await;
+}
+
+#[test]
+fn dispatch_progress_reports_a_stalled_queue() {
+    let manager = queue_test_manager(1, 10);
+    let stall_after = StdDuration::from_secs(60);
+    assert!(
+        manager.dispatch_is_progressing(stall_after).progressing,
+        "empty queue"
+    );
+
+    manager.set_queued_requests_for_test(3);
+    assert!(
+        manager.dispatch_is_progressing(stall_after).progressing,
+        "a just-started process is not stalled yet"
+    );
+    assert!(
+        !manager
+            .dispatch_is_progressing(StdDuration::ZERO)
+            .progressing,
+        "queued requests with no dispatch at all"
+    );
+
+    manager.dispatch_progress.record_dispatch(Instant::now());
+    let status = manager.dispatch_is_progressing(StdDuration::from_millis(500));
+    assert!(status.progressing);
+    assert_eq!(status.queued_requests, 3);
+    assert_eq!(status.secs_since_last_dispatch, Some(0));
+    manager.set_queued_requests_for_test(0);
+}
+
+#[test]
+fn runtime_events_published_by_this_instance_are_recognised() {
+    let manager = queue_test_manager(1, 10);
+    let own = super::super::redis_runtime::test_runtime_event_payload(
+        "credentials_changed",
+        &manager.scheduler_instance_id,
+    );
+    assert!(manager.runtime_event_is_from_this_instance(&own));
+    let other = super::super::redis_runtime::test_runtime_event_payload(
+        "credentials_changed",
+        "another-instance",
+    );
+    assert!(!manager.runtime_event_is_from_this_instance(&other));
+    assert!(!manager.runtime_event_is_from_this_instance(r#"{"kind":"credentials_changed"}"#));
+    assert!(!manager.runtime_event_is_from_this_instance("not json"));
 }

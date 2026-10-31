@@ -88,6 +88,128 @@ const TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS: usize = 128;
 /// Anthropic stop reason for an upstream content-filter refusal
 /// (`metadataEvent.stopReason = CONTENT_FILTERED`).
 pub(crate) const REFUSAL_STOP_REASON: &str = "refusal";
+pub(crate) const UPSTREAM_INVALID_TOOL_INPUT_DETAIL: &str =
+    "upstream completed a tool call whose input is not valid JSON";
+pub(crate) const UPSTREAM_INCOMPLETE_TOOL_INPUT_DETAIL: &str =
+    "upstream eventstream ended with incomplete tool input buffer(s)";
+
+/// 工具参数出问题是本轮输出内容的问题，与账号无关：不冷却账号、不记会话失败。
+pub(crate) fn is_tool_input_failure_detail(detail: &str) -> bool {
+    detail == UPSTREAM_INVALID_TOOL_INPUT_DETAIL || detail == UPSTREAM_INCOMPLETE_TOOL_INPUT_DETAIL
+}
+
+/// 工具参数 JSON 的检查结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolInputJson {
+    /// 合法（空串按 `{}` 处理）。
+    Valid,
+    /// 第一个完整 JSON 值后面只跟着可安全丢弃的内容（多出来的右括号、逗号，或同一份参数的重复），
+    /// 去掉后与模型本意一致，客户端无感。
+    Cleaned(String),
+    /// 截断或格式错误，无法在不改变含义的前提下修复。
+    Invalid,
+}
+
+pub(crate) fn classify_tool_input_json(input: &str) -> ToolInputJson {
+    if input.trim().is_empty() || serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok() {
+        return ToolInputJson::Valid;
+    }
+    let mut scanner = ToolInputScanner::default();
+    scanner.feed(input);
+    let Some(end) = scanner.complete_len else {
+        return ToolInputJson::Invalid;
+    };
+    let (head, rest) = input.split_at(end);
+    if serde_json::from_str::<serde::de::IgnoredAny>(head).is_err()
+        || !tool_input_remainder_is_redundant(head.trim(), rest)
+    {
+        return ToolInputJson::Invalid;
+    }
+    ToolInputJson::Cleaned(head.to_string())
+}
+
+/// 第一个完整对象之后的内容是否可以安全丢弃：只有空白、右括号、逗号，或者是同一份参数的完整或
+/// 截断的重复。其它内容（可能是另一次调用的参数）不猜，按无法修复处理。
+fn tool_input_remainder_is_redundant(head: &str, rest: &str) -> bool {
+    let mut rest = rest.trim();
+    while !head.is_empty() && rest.starts_with(head) {
+        rest = rest[head.len()..].trim_start();
+    }
+    rest.is_empty()
+        || head.starts_with(rest)
+        || rest
+            .chars()
+            .all(|ch| matches!(ch, '}' | ']' | ',') || ch.is_whitespace())
+}
+
+/// 逐段扫描工具参数，找到第一个顶层对象（或数组）结束的位置。
+///
+/// 流式下参数是边收边发的：顶层对象一旦闭合，后面再来的内容不再转发给客户端，这样即使上游在
+/// 末尾多吐了右括号或重复了一遍参数，客户端拼出来的仍是合法 JSON。按字节扫描是安全的：UTF-8
+/// 多字节字符的每个字节都不小于 0x80，不会被当成引号、反斜杠或括号。
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ToolInputScanner {
+    depth: u32,
+    in_string: bool,
+    escape: bool,
+    started: bool,
+    /// 输入不是以 `{` 或 `[` 开头，无法判断边界，全部照常转发。
+    unstructured: bool,
+    scanned_len: usize,
+    /// 第一个顶层值闭合时的字节长度。
+    complete_len: Option<usize>,
+}
+
+impl ToolInputScanner {
+    /// 扫描新到的一段，返回这一段里属于第一个顶层值的字节数（值闭合之前就是整段）。
+    pub(crate) fn feed(&mut self, fragment: &str) -> usize {
+        if self.unstructured {
+            self.scanned_len += fragment.len();
+            return fragment.len();
+        }
+        if self.complete_len.is_some() {
+            self.scanned_len += fragment.len();
+            return 0;
+        }
+        for (offset, byte) in fragment.bytes().enumerate() {
+            if self.in_string {
+                if self.escape {
+                    self.escape = false;
+                } else if byte == b'\\' {
+                    self.escape = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'{' | b'[' => {
+                    self.started = true;
+                    self.depth += 1;
+                }
+                b'"' if self.started => self.in_string = true,
+                b'}' | b']' if self.started => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        let used = offset + 1;
+                        self.complete_len = Some(self.scanned_len + used);
+                        self.scanned_len += fragment.len();
+                        return used;
+                    }
+                }
+                byte if byte.is_ascii_whitespace() => {}
+                _ if !self.started => {
+                    self.unstructured = true;
+                    self.scanned_len += fragment.len();
+                    return fragment.len();
+                }
+                _ => {}
+            }
+        }
+        self.scanned_len += fragment.len();
+        fragment.len()
+    }
+}
 pub(crate) const UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL: &str = "upstream eventstream ended with only usage/metadata events and no assistant, reasoning, or tool output";
 
 /// 合并一段 Kiro 原生 reasoning 文本。上游有两种形态：每个事件带截至目前的完整内容
@@ -1624,6 +1746,8 @@ pub struct StreamContext {
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具输入 JSON 片段累计，用于 stop 时生成稳定去重签名。
     tool_input_buffers: HashMap<String, String>,
+    /// 每个进行中工具调用的参数扫描状态，用来在顶层对象闭合后停止转发多余内容。
+    tool_input_scanners: HashMap<String, ToolInputScanner>,
     /// 工具输入缓冲对应的上游工具名，用于 EOF 容错 flush。
     tool_input_names: HashMap<String, String>,
     /// 已收到 toolUseEvent 但还没有任何 input 片段的工具调用（按到达顺序）。
@@ -1730,6 +1854,8 @@ pub struct StreamContext {
     saw_upstream_tool_use: bool,
     /// 是否见过 `stop=true` 的完整 toolUseEvent。
     saw_upstream_completed_tool_use: bool,
+    /// 是否有工具调用在 `stop=true` 时参数不是合法 JSON（该工具块不会被结束，本轮按失败处理）。
+    invalid_completed_tool_input: bool,
     /// 是否见过上游 metadataEvent。
     saw_upstream_metadata: bool,
     /// 上游内容过滤拒答说明（`metadataEvent.stopReason = CONTENT_FILTERED`）。
@@ -1897,6 +2023,7 @@ impl StreamContext {
             thinking_token_estimate: StreamTokenEstimate::default(),
             tool_block_indices: HashMap::new(),
             tool_input_buffers: HashMap::new(),
+            tool_input_scanners: HashMap::new(),
             tool_input_names: HashMap::new(),
             pending_tool_starts: Vec::new(),
             pending_leaked_tools: Vec::new(),
@@ -1951,6 +2078,7 @@ impl StreamContext {
             saw_upstream_reasoning_content: false,
             saw_upstream_tool_use: false,
             saw_upstream_completed_tool_use: false,
+            invalid_completed_tool_input: false,
             saw_upstream_metadata: false,
             upstream_content_filter_refusal: None,
             saw_upstream_context_usage: false,
@@ -2112,10 +2240,14 @@ impl StreamContext {
     }
 
     pub fn upstream_terminal_failure_detail(&self) -> Option<&'static str> {
-        if self.has_stream_error()
-            || self.saw_upstream_completed
-            || self.upstream_content_filter_refusal.is_some()
-        {
+        if self.has_stream_error() || self.upstream_content_filter_refusal.is_some() {
+            return None;
+        }
+        // 即使上游随后报了完成状态，非法参数的工具调用也不能当作成功交给客户端。
+        if self.invalid_completed_tool_input {
+            return Some(UPSTREAM_INVALID_TOOL_INPUT_DETAIL);
+        }
+        if self.saw_upstream_completed {
             return None;
         }
         if !self.has_meaningful_upstream_response() {
@@ -2133,7 +2265,7 @@ impl StreamContext {
             if self.has_flushable_incomplete_tool_input_buffers() {
                 return None;
             }
-            return Some("upstream eventstream ended with incomplete tool input buffer(s)");
+            return Some(UPSTREAM_INCOMPLETE_TOOL_INPUT_DETAIL);
         }
         if self.saw_upstream_completed_tool_use {
             return None;
@@ -2164,7 +2296,7 @@ impl StreamContext {
         !self.tool_input_buffers.is_empty()
             && self.tool_input_buffers.iter().all(|(tool_use_id, input)| {
                 self.tool_block_indices.contains_key(tool_use_id)
-                    && (input.trim().is_empty() || serde_json::from_str::<Value>(input).is_ok())
+                    && classify_tool_input_json(input) != ToolInputJson::Invalid
             })
     }
 
@@ -3914,8 +4046,18 @@ impl StreamContext {
         let defer_input_until_stop = original_name == "AskUserQuestion" || has_schema_key_map;
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)。AskUserQuestion 需要先
-        // 累计完整 JSON，避免已经发给 CLI 的增量参数无法修正。
-        let input_delta_event = if !defer_input_until_stop && !tool_use.input.is_empty() {
+        // 累计完整 JSON，避免已经发给 CLI 的增量参数无法修正。顶层对象闭合之后上游再吐的内容
+        // （多余的右括号、重复的参数）不再转发，客户端拼出来的仍是合法 JSON。
+        let forwarded_input = if defer_input_until_stop {
+            ""
+        } else {
+            let scanner = self
+                .tool_input_scanners
+                .entry(tool_use.tool_use_id.clone())
+                .or_default();
+            &tool_use.input[..scanner.feed(&tool_use.input)]
+        };
+        let input_delta_event = if !forwarded_input.is_empty() {
             self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
@@ -3923,7 +4065,7 @@ impl StreamContext {
                     "index": block_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tool_use.input
+                        "partial_json": forwarded_input
                     }
                 }),
             )
@@ -3931,7 +4073,7 @@ impl StreamContext {
             None
         };
         if let Some(delta_event) = input_delta_event {
-            self.output_token_estimate.record(&tool_use.input);
+            self.output_token_estimate.record(forwarded_input);
             events.push(delta_event);
         }
 
@@ -3942,6 +4084,33 @@ impl StreamContext {
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_else(|| tool_use.input.clone());
             self.tool_input_names.remove(&tool_use.tool_use_id);
+            self.tool_input_scanners.remove(&tool_use.tool_use_id);
+            // 参数问题出在本轮输出，与账号无关，任何分支都不冷却账号。末尾多余的内容已在转发时
+            // 截掉，这里把缓冲同样清洗好用于签名和延迟下发的工具；真正截断或格式错误的参数无法在
+            // 不改变含义的前提下修复，不发这个工具块的结束事件，本轮以错误结束，客户端不会执行
+            // 一个参数残缺的工具调用。
+            let full_input = match classify_tool_input_json(&full_input) {
+                ToolInputJson::Valid => full_input,
+                ToolInputJson::Cleaned(cleaned) => {
+                    tracing::info!(
+                        tool_name = %original_name,
+                        input_bytes = full_input.len(),
+                        cleaned_bytes = cleaned.len(),
+                        "上游工具参数末尾有多余内容，已去掉后按合法参数处理"
+                    );
+                    cleaned
+                }
+                ToolInputJson::Invalid => {
+                    tracing::warn!(
+                        tool_name = %original_name,
+                        input_bytes = full_input.len(),
+                        deferred = defer_input_until_stop,
+                        "上游工具调用已结束但参数不是合法 JSON 且无法清洗，本轮以错误结束（不冷却账号）"
+                    );
+                    self.invalid_completed_tool_input = true;
+                    return events;
+                }
+            };
             let output_input = if has_schema_key_map {
                 self.tool_schema_key_map
                     .reverse_tool_input_json(&upstream_name, &full_input)
@@ -4062,8 +4231,13 @@ impl StreamContext {
         }
 
         let pending = std::mem::take(&mut self.tool_input_buffers);
+        self.tool_input_scanners.clear();
         let mut events = Vec::new();
         for (tool_use_id, full_input) in pending {
+            let full_input = match classify_tool_input_json(&full_input) {
+                ToolInputJson::Cleaned(cleaned) => cleaned,
+                ToolInputJson::Valid | ToolInputJson::Invalid => full_input,
+            };
             let Some(&block_index) = self.tool_block_indices.get(&tool_use_id) else {
                 self.tool_input_names.remove(&tool_use_id);
                 continue;
@@ -4193,6 +4367,7 @@ impl StreamContext {
         if self.upstream_content_filter_refusal.is_some() && self.stream_error.is_none() {
             // A refusal can cut a tool call off mid-input. Never complete or report those calls.
             self.tool_input_buffers.clear();
+            self.tool_input_scanners.clear();
             self.pending_tool_starts.clear();
         } else if self.stream_error.is_none() {
             events.extend(self.flush_incomplete_tool_input_buffers());
@@ -4269,6 +4444,15 @@ impl StreamContext {
             // 执行工具；保持打开时 CLI 丢弃该块并把本轮视为失败。
             events.extend(self.state_manager.close_open_non_tool_use_blocks());
             let message = self.public_stream_error_message(&error_type, raw_message);
+            // Claude Code 只会自动重发流里 `type` 为 overloaded_error 的错误（流内的 api_error
+            // 会直接停下这一轮，见 claude-code 的 shouldRetry）。上游瞬态失败（读流、解码、
+            // 静默超时、上游错误事件、工具参数没收完）重发通常就能成功，所以对外报成
+            // overloaded_error，让客户端自己无感重试；请求本身的问题保持原类型。
+            let error_type = if error_type == "api_error" {
+                "overloaded_error".to_string()
+            } else {
+                error_type
+            };
             events.push(Self::create_error_event(error_type, message));
             return events;
         }
@@ -7087,7 +7271,7 @@ mod tests {
             .iter()
             .find(|event| event.event == "error")
             .expect("error event should be emitted");
-        assert_eq!(error.data["error"]["type"], "api_error");
+        assert_eq!(error.data["error"]["type"], "overloaded_error");
         let message = error.data["error"]["message"]
             .as_str()
             .expect("message should be string");
@@ -7606,6 +7790,120 @@ mod tests {
             input: input.to_string(),
             stop,
         })
+    }
+
+    /// Arguments are classified before a tool call is closed: valid ones pass, a redundant tail
+    /// (extra closing brackets, a repeated copy of the same object) is dropped, and anything the
+    /// proxy cannot repair without changing its meaning stays invalid.
+    #[test]
+    fn tool_input_json_cleaning_only_drops_redundant_tails() {
+        let object = r#"{"command":"ls","note":"a } and \" quote"}"#;
+        for (input, expected) in [
+            ("", ToolInputJson::Valid),
+            (object, ToolInputJson::Valid),
+            (r#"{"a":[1,{"b":2}]}"#, ToolInputJson::Valid),
+            (
+                r#"{"command":"ls"}}"#,
+                ToolInputJson::Cleaned(r#"{"command":"ls"}"#.into()),
+            ),
+            (
+                r#"{"command":"ls"} ]},"#,
+                ToolInputJson::Cleaned(r#"{"command":"ls"}"#.into()),
+            ),
+            (
+                r#"{"command":"ls"}{"command":"ls"}"#,
+                ToolInputJson::Cleaned(r#"{"command":"ls"}"#.into()),
+            ),
+            (
+                r#"{"command":"ls"}{"comm"#,
+                ToolInputJson::Cleaned(r#"{"command":"ls"}"#.into()),
+            ),
+            (r#"{"command":"printf broken"#, ToolInputJson::Invalid),
+            (r#"{"command":"ls"}{"other":"x"}"#, ToolInputJson::Invalid),
+            (r#"{"command":"ls"} trailing words"#, ToolInputJson::Invalid),
+            (r#"{"a":1,}"#, ToolInputJson::Invalid),
+            ("not json", ToolInputJson::Invalid),
+        ] {
+            assert_eq!(classify_tool_input_json(input), expected, "input={input:?}");
+        }
+    }
+
+    /// The scanner stops forwarding exactly where the first top-level object closes, even when
+    /// the closing brace, quotes and escapes are split across fragments or inside strings.
+    #[test]
+    fn tool_input_scanner_stops_after_the_first_object_across_fragments() {
+        let mut scanner = ToolInputScanner::default();
+        let fragments = [
+            r#"{"path":"a}b","#,
+            r#""text":"x\"#,
+            r#""y","n":"中文}"#,
+            r#""}"#,
+            "}}",
+        ];
+        let forwarded: String = fragments
+            .iter()
+            .map(|fragment| &fragment[..scanner.feed(fragment)])
+            .collect();
+        assert_eq!(forwarded, r#"{"path":"a}b","text":"x\"y","n":"中文}"}"#);
+        assert!(
+            serde_json::from_str::<Value>(&forwarded).is_ok(),
+            "{forwarded}"
+        );
+
+        let mut scanner = ToolInputScanner::default();
+        assert_eq!(scanner.feed("plain text"), "plain text".len());
+        assert_eq!(scanner.feed(" more"), " more".len());
+    }
+
+    /// A redundant tail is never forwarded, so the client receives valid input and the tool call
+    /// closes normally. An unrepairable input keeps the block open and fails the turn without
+    /// cooling the account (the caller only releases its slot for tool-input failures).
+    #[test]
+    fn completed_tool_call_input_is_cleaned_or_fails_the_turn() {
+        for (fragments, expect_closed) in [
+            (vec![r#"{"command":"ls"}"#, "}"], true),
+            (vec![r#"{"command":"#, r#""ls"}{"command":"ls"}"#], true),
+            (vec![r#"{"command":"printf broken"#], false),
+        ] {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            let last = fragments.len() - 1;
+            for (index, fragment) in fragments.iter().enumerate() {
+                events.extend(ctx.process_kiro_event(&tool_event(
+                    "toolu_clean",
+                    fragment,
+                    index == last,
+                )));
+            }
+            let forwarded = collect_delta_text(&events, "input_json_delta", "partial_json");
+            let label = format!("fragments={fragments:?}");
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| event.event == "content_block_stop"),
+                expect_closed,
+                "{label}"
+            );
+            if expect_closed {
+                assert_eq!(forwarded, r#"{"command":"ls"}"#, "{label}");
+                assert_eq!(ctx.upstream_terminal_failure_detail(), None, "{label}");
+            } else {
+                assert_eq!(
+                    ctx.upstream_terminal_failure_detail(),
+                    Some(UPSTREAM_INVALID_TOOL_INPUT_DETAIL),
+                    "{label}"
+                );
+                assert!(is_tool_input_failure_detail(
+                    UPSTREAM_INVALID_TOOL_INPUT_DETAIL
+                ));
+            }
+        }
+        assert!(is_tool_input_failure_detail(
+            UPSTREAM_INCOMPLETE_TOOL_INPUT_DETAIL
+        ));
+        assert!(!is_tool_input_failure_detail(
+            UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
+        ));
     }
 
     #[test]

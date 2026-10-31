@@ -6099,6 +6099,14 @@ impl AdminService {
             credential_network_error_cooldown_secs: config.credential_network_error_cooldown_secs,
             credential_stream_error_cooldown_secs: config.credential_stream_error_cooldown_secs,
             credential_empty_turn_cooldown_enabled: config.credential_empty_turn_cooldown_enabled,
+            credential_upstream_failure_cooldown_enabled: config
+                .credential_upstream_failure_cooldown_enabled,
+            credential_auto_heal_min_interval_secs: config.credential_auto_heal_min_interval_secs,
+            credential_auto_heal_max_consecutive_rounds: config
+                .credential_auto_heal_max_consecutive_rounds,
+            kiro_version_auto_sync_enabled: config.kiro_version_auto_sync_enabled,
+            kiro_version_latest: crate::kiro::kiro_version::latest(),
+            kiro_runtime_domain_enabled: config.kiro_runtime_domain_enabled,
             credential_protocol_error_cooldown_secs: config.credential_protocol_error_cooldown_secs,
             credential_auth_error_cooldown_secs: config.credential_auth_error_cooldown_secs,
             credential_cooldown_backoff_multiplier: config.credential_cooldown_backoff_multiplier,
@@ -6106,6 +6114,8 @@ impl AdminService {
             credential_probation_secs: config.credential_probation_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
+            credential_session_max_concurrent_requests: config
+                .credential_session_max_concurrent_requests,
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             stream_keepalive_interval_secs: config.stream_keepalive_interval_secs,
@@ -6288,6 +6298,9 @@ impl AdminService {
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
+        let credential_session_max_concurrent_requests = req
+            .credential_session_max_concurrent_requests
+            .unwrap_or(current_config.credential_session_max_concurrent_requests);
         let kiro_upstream_response_timeout_secs = req
             .kiro_upstream_response_timeout_secs
             .unwrap_or(current_config.kiro_upstream_response_timeout_secs);
@@ -6381,6 +6394,23 @@ impl AdminService {
         let credential_empty_turn_cooldown_enabled = req
             .credential_empty_turn_cooldown_enabled
             .unwrap_or(current_config.credential_empty_turn_cooldown_enabled);
+        let credential_upstream_failure_cooldown_enabled = req
+            .credential_upstream_failure_cooldown_enabled
+            .unwrap_or(current_config.credential_upstream_failure_cooldown_enabled);
+        let credential_auto_heal_min_interval_secs = req
+            .credential_auto_heal_min_interval_secs
+            .unwrap_or(current_config.credential_auto_heal_min_interval_secs)
+            .min(86_400);
+        let credential_auto_heal_max_consecutive_rounds = req
+            .credential_auto_heal_max_consecutive_rounds
+            .unwrap_or(current_config.credential_auto_heal_max_consecutive_rounds)
+            .min(1_000);
+        let kiro_version_auto_sync_enabled = req
+            .kiro_version_auto_sync_enabled
+            .unwrap_or(current_config.kiro_version_auto_sync_enabled);
+        let kiro_runtime_domain_enabled = req
+            .kiro_runtime_domain_enabled
+            .unwrap_or(current_config.kiro_runtime_domain_enabled);
         let credential_protocol_error_cooldown_secs = req
             .credential_protocol_error_cooldown_secs
             .unwrap_or(current_config.credential_protocol_error_cooldown_secs);
@@ -6638,6 +6668,11 @@ impl AdminService {
         {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialCooldownBackoffMultiplier 必须在 1 到 10 之间".to_string(),
+            ));
+        }
+        if credential_session_max_concurrent_requests > 1_000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialSessionMaxConcurrentRequests 不能大于 1000".to_string(),
             ));
         }
         if credential_cooldown_jitter_percent > 100 {
@@ -6930,6 +6965,14 @@ impl AdminService {
                     credential_stream_error_cooldown_secs;
                 config.credential_empty_turn_cooldown_enabled =
                     credential_empty_turn_cooldown_enabled;
+                config.credential_upstream_failure_cooldown_enabled =
+                    credential_upstream_failure_cooldown_enabled;
+                config.credential_auto_heal_min_interval_secs =
+                    credential_auto_heal_min_interval_secs;
+                config.credential_auto_heal_max_consecutive_rounds =
+                    credential_auto_heal_max_consecutive_rounds;
+                config.kiro_version_auto_sync_enabled = kiro_version_auto_sync_enabled;
+                config.kiro_runtime_domain_enabled = kiro_runtime_domain_enabled;
                 config.credential_protocol_error_cooldown_secs =
                     credential_protocol_error_cooldown_secs;
                 config.credential_auth_error_cooldown_secs = credential_auth_error_cooldown_secs;
@@ -6939,6 +6982,8 @@ impl AdminService {
                 config.credential_probation_secs = credential_probation_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
+                config.credential_session_max_concurrent_requests =
+                    credential_session_max_concurrent_requests;
                 config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
                 config.kiro_upstream_stream_idle_timeout_secs =
                     kiro_upstream_stream_idle_timeout_secs;
@@ -7110,16 +7155,9 @@ impl AdminService {
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if !matches!(
-            req.mode.as_str(),
-            "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-        ) {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority'、'balanced'、'health_balanced' 或 'weighted_least_inflight'"
-                    .to_string(),
-            ));
-        }
+        req.mode
+            .parse::<crate::kiro::token_manager::LoadBalancingMode>()
+            .map_err(AdminServiceError::InvalidCredential)?;
 
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())
@@ -8029,6 +8067,14 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
         || config.local_pool_circuit_open_secs > 24 * 60 * 60
     {
         return Err("localPoolCircuitOpenSecs 必须在 1 到 86400 之间".to_string());
+    }
+    if config.local_pool_circuit_min_ratio_percent > 100 {
+        return Err("localPoolCircuitMinRatioPercent 必须在 0 到 100 之间".to_string());
+    }
+    if config.local_pool_circuit_half_open_probes == 0
+        || config.local_pool_circuit_half_open_probes > 1_000
+    {
+        return Err("localPoolCircuitHalfOpenProbes 必须在 1 到 1000 之间".to_string());
     }
     if config.external_pool_auto_disable_failure_threshold == 0
         || config.external_pool_auto_disable_failure_threshold > 10_000

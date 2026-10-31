@@ -413,6 +413,9 @@ struct RequestUsageContext {
     first_token_latency_ms: Arc<AtomicU64>,
     capacity_weight_units: Arc<AtomicU32>,
     latency: RequestLatencyTraceState,
+    /// Set once a usage record has been written for this request, shared by every clone, so a
+    /// guard that fires on cancellation never writes a second record.
+    recorded: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -1302,7 +1305,7 @@ impl RequestRuntimeConfig {
 }
 
 fn cache_route_for_request_stream(
-    mut cache_route: ResolvedCacheRoutePolicy,
+    cache_route: ResolvedCacheRoutePolicy,
     stream: bool,
 ) -> ResolvedCacheRoutePolicy {
     if stream
@@ -1314,6 +1317,35 @@ fn cache_route_for_request_stream(
         return cache_route;
     }
 
+    disable_cache_route(cache_route)
+}
+
+/// A request follows the route's cache strategy only when the Anthropic API itself could return
+/// cache usage for it (see `request_qualifies_for_prompt_cache`): the client marked a cache
+/// breakpoint and the prefix up to it reaches the model's minimum cacheable length. Any other
+/// request, streaming or not, keeps the upstream usage and neither reads nor writes the local
+/// cache state, so an unmarked request is never reported with cache writes. Non-streaming
+/// requests additionally honour `skipNonStreamUsageProjection` (force no cache). No-cache routes
+/// are unchanged.
+fn cache_route_for_local_request(
+    cache_route: ResolvedCacheRoutePolicy,
+    payload: &MessagesRequest,
+    top_level_cache_control: bool,
+    cache_model: &str,
+) -> ResolvedCacheRoutePolicy {
+    if cache_route.policy.cache_type != PromptCacheStrategyType::NoCache
+        && !super::prompt_cache::request_qualifies_for_prompt_cache(
+            payload,
+            top_level_cache_control,
+            cache_model,
+        )
+    {
+        return disable_cache_route(cache_route);
+    }
+    cache_route_for_request_stream(cache_route, payload.stream)
+}
+
+fn disable_cache_route(mut cache_route: ResolvedCacheRoutePolicy) -> ResolvedCacheRoutePolicy {
     cache_route.policy.cache_type = PromptCacheStrategyType::NoCache;
     cache_route.policy.simulation.enabled = false;
     cache_route.policy.creation_control.enabled = false;
@@ -1322,37 +1354,6 @@ fn cache_route_for_request_stream(
     cache_route.policy = cache_route.policy.normalized();
     cache_route.namespace = None;
     cache_route
-}
-
-/// Non-streaming requests follow the route's cache strategy only when the Anthropic API itself
-/// could return cache usage for them (see `request_qualifies_for_prompt_cache`). Any other
-/// non-streaming request is handled as if `skipNonStreamUsageProjection` were on: upstream usage
-/// passes through and the local cache state is neither read nor written. Streaming requests and
-/// no-cache routes are unchanged.
-fn cache_route_for_local_request(
-    mut cache_route: ResolvedCacheRoutePolicy,
-    payload: &MessagesRequest,
-    top_level_cache_control: bool,
-    cache_model: &str,
-) -> ResolvedCacheRoutePolicy {
-    if !payload.stream
-        && cache_route.policy.cache_type != PromptCacheStrategyType::NoCache
-        && !cache_route
-            .policy
-            .reported_usage
-            .skip_non_stream_usage_projection
-        && !super::prompt_cache::request_qualifies_for_prompt_cache(
-            payload,
-            top_level_cache_control,
-            cache_model,
-        )
-    {
-        cache_route
-            .policy
-            .reported_usage
-            .skip_non_stream_usage_projection = true;
-    }
-    cache_route_for_request_stream(cache_route, payload.stream)
 }
 
 fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
@@ -2400,7 +2401,7 @@ impl ExternalFallbackContext {
             _ => None,
         };
         let classified_route_reason =
-            classified_local_error_route_reason(classified_reason.as_str());
+            local_attempt_outcome_route_reason(classified_reason.as_str(), error_message);
         let route_reason = typed_auxiliary_route_reason
             .or(classified_route_reason)
             .or_else(|| {
@@ -2437,31 +2438,6 @@ impl ExternalFallbackContext {
                 "fresh local state permits fallback but no external pool is ready for this route reason"
             );
             return None;
-        }
-        if self.config.local_pool_circuit_enabled {
-            let mut seen_credentials = HashSet::new();
-            let mut recorded = false;
-            if classified_reason != "local_request_body_invalid" {
-                for attempt in &classification_attempts {
-                    if seen_credentials.insert(attempt.credential_id) {
-                        recorded = true;
-                        let _ = self
-                            .manager
-                            .record_local_pool_failure(
-                                &self.config,
-                                Some(attempt.credential_id),
-                                &classified_reason,
-                            )
-                            .await;
-                    }
-                }
-                if !recorded {
-                    let _ = self
-                        .manager
-                        .record_local_pool_failure(&self.config, None, &classified_reason)
-                        .await;
-                }
-            }
         }
         tracing::warn!(
             request_id,
@@ -2803,6 +2779,21 @@ fn local_route_reason_requires_immediate_external_capacity(reason: &str) -> bool
     )
 }
 
+/// Route reason taken from the local attempt outcome itself, so a fresh pool snapshot cannot
+/// cancel the fallback. A Cloudflare 524 is one: it is not retried and cools no account, so the
+/// pool still looks dispatchable although this request has nowhere local left to go.
+fn local_attempt_outcome_route_reason(
+    classified_reason: &str,
+    error_message: &str,
+) -> Option<&'static str> {
+    if classified_reason == "local_transient_exhausted"
+        && error_message.contains("reason=api_gateway_timeout")
+    {
+        return Some("local_transient_exhausted");
+    }
+    classified_local_error_route_reason(classified_reason)
+}
+
 fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
     match reason {
         // The local attempt already observed a distributed scheduler failure.
@@ -2932,6 +2923,7 @@ fn classify_local_error_for_external_fallback_with_scheduler_kind(
     }
     if config.fallback_on_local_transient_exhausted
         && (lower.contains("临时冷却")
+            || lower.contains("api_gateway_timeout")
             || lower.contains("429")
             || lower.contains("too many")
             || lower.contains("rate limit")
@@ -5406,6 +5398,7 @@ impl CredentialUsageContext {
             self.error_metadata.clone(),
             self.request.error_metadata.lock().clone(),
         );
+        self.request.recorded.store(true, Ordering::Release);
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -5616,6 +5609,55 @@ impl WebSearchPreResponseUsageGuard {
         self.usage_context
             .take()
             .expect("WebSearch usage context can only be completed once")
+    }
+}
+
+/// Holds the request's usage context while the local path waits for a credential and for the
+/// upstream response headers. If the client goes away during that time the handler future is
+/// dropped before any usage record exists; the guard then records the request as
+/// `client_dropped`, attributed to the credential selected so far. A request that already wrote
+/// any record (success, failure, rejection) is left alone.
+struct LocalPreResponseUsageGuard {
+    usage_context: Option<RequestUsageContext>,
+    attribution_sink: Arc<McpCallAttributionSink>,
+}
+
+impl LocalPreResponseUsageGuard {
+    fn new(
+        usage_context: RequestUsageContext,
+        attribution_sink: Arc<McpCallAttributionSink>,
+    ) -> Self {
+        Self {
+            usage_context: Some(usage_context),
+            attribution_sink,
+        }
+    }
+
+    /// The handler returned normally: the response (or its stream) now owns usage recording.
+    fn disarm(mut self) {
+        self.usage_context = None;
+    }
+}
+
+impl Drop for LocalPreResponseUsageGuard {
+    fn drop(&mut self) {
+        let Some(usage_context) = self.usage_context.take() else {
+            return;
+        };
+        if usage_context.recorded.load(Ordering::Acquire) {
+            return;
+        }
+        let attribution = self.attribution_sink.snapshot_for_client_drop();
+        usage_context.mark_client_dropped();
+        usage_context
+            .attach_credential(
+                attribution.credential_id,
+                attribution.credential_label,
+                false,
+                false,
+                attribution.attempts,
+            )
+            .record_client_dropped();
     }
 }
 
@@ -6167,6 +6209,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::with_inference_attempt_budget(inference_attempt_budget),
     }
 }
@@ -6221,8 +6264,8 @@ fn build_simulated_usage(
                 return (None, None);
             }
 
-            // credential_id 需要等 provider 选中账号后才能确定；这里先保留 profile，
-            // 真正的 local prompt-cache 计算在 attach credential 后重新完成。
+            // local prompt-cache 计算延后到选定账号后执行（usage 需要带上账号归属）；
+            // scope 只由 conversation_id + 路由命名空间决定，不含 credential_id。
             if prompt_cache_profile.is_some() {
                 (None, Some(UsageSource::LocalPromptCache))
             } else {
@@ -6390,6 +6433,16 @@ fn provider_public_error_for_message(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             PROMPT_TOO_LONG_CONTEXT_WINDOW_MESSAGE,
+            error_id,
+        );
+    }
+
+    // 524 网关超时已在 provider 里直接失败（不重试、不冷却），对外是 504，客户端按超时重发。
+    if err_str.contains("reason=api_gateway_timeout") {
+        return usage_public_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
             error_id,
         );
     }
@@ -6772,6 +6825,22 @@ fn map_provider_error(
         );
     }
 
+    if is_upstream_image_count_exceeded_error(&err_str) {
+        log_provider_warning_with_hint(
+            &err_str,
+            "请求被拒绝：图片数量超过上游单请求 100 张上限",
+            error_id,
+        );
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::PUBLIC_IMAGE_COUNT_EXCEEDED_MESSAGE,
+            request_id,
+            error_id,
+            [("x-should-retry", "false".to_string())],
+        );
+    }
+
     if is_upstream_image_too_large_error(&err_str) {
         log_provider_warning_with_hint(&err_str, "请求被拒绝：图片超过上游 5 MB 限制", error_id);
         return public_error_response(
@@ -6910,6 +6979,19 @@ fn map_provider_error(
         );
     }
 
+    // 524 网关超时：provider 已直接失败（不重试、不冷却），对外 504，客户端会自己重发。
+    if err_str.contains("reason=api_gateway_timeout") {
+        log_provider_error_with_hint(&err_str, "上游网关超时（524）", error_id);
+        return public_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
+    }
+
     log_provider_error_with_hint(&err_str, "Kiro API 调用失败", error_id);
     public_error_response(
         StatusCode::BAD_GATEWAY,
@@ -6944,6 +7026,14 @@ fn is_upstream_context_window_full_error(value: &str) -> bool {
 
 /// Upstream `IMAGE_SIZE_EXCEEDED`. The provider error carries the classified reason; the raw
 /// upstream text (which names internal message indexes) is never forwarded to the client.
+/// Upstream `IMAGE_COUNT_EXCEEDED` (more than 100 inline images in one request). The local
+/// payload guard trims old history images below the limit, so this only remains when the current
+/// turn alone carries too many images; resending the same request can never succeed.
+fn is_upstream_image_count_exceeded_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("image_count_exceeded") || lower.contains("too many inline media segments")
+}
+
 fn is_upstream_image_too_large_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("image_too_large_bad_request")
@@ -7613,6 +7703,16 @@ fn models_list_response(state: &AppState, query: &ModelsQuery) -> Response {
     Json(ModelsResponse::paginate(models, query)).into_response()
 }
 
+/// `max_tokens` filled in for clients whose protocol makes it optional (OpenAI Chat
+/// Completions). Uses the configured missing-`max_tokens` default whatever the policy, because
+/// rejecting would fail every request from such clients.
+pub(crate) fn missing_max_tokens_default_value(state: &AppState) -> i32 {
+    live_runtime_config(state)
+        .missing_max_tokens
+        .normalized()
+        .default_value
+}
+
 /// Live runtime config so admin changes apply without a restart.
 fn live_runtime_config(state: &AppState) -> RequestRuntimeConfig {
     match state.kiro_provider.as_ref() {
@@ -7660,7 +7760,10 @@ fn model_retrieve_response(state: &AppState, model_id: &str) -> Response {
     }
 }
 
-fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, Response> {
+pub(crate) fn resolve_defined_cache_route(
+    state: &AppState,
+    route: &str,
+) -> Result<String, Response> {
     let candidate = format!("/dfcache/{route}");
     let Some(prefix) = normalize_defined_cache_route(&candidate) else {
         return Err(envelope::error_response(
@@ -7686,7 +7789,7 @@ fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, 
     Ok(prefix)
 }
 
-fn record_pre_usage_rejection(
+pub(crate) fn record_pre_usage_rejection(
     attribution: Option<&RequestRejectionAttribution>,
     reason: RequestRejectionReason,
     endpoint: &str,
@@ -7898,7 +8001,9 @@ pub async fn post_messages_dfcache(
     .await
 }
 
-async fn post_messages_for_endpoint(
+/// Shared messages entry. Protocol adapters (`/v1/chat/completions`) call it with a body they
+/// already translated into the Anthropic Messages shape.
+pub(crate) async fn post_messages_for_endpoint(
     state: AppState,
     headers: HeaderMap,
     raw_body: Bytes,
@@ -8005,8 +8110,10 @@ async fn post_messages_inner(
     let local_injections =
         runtime_config.injections_for(&endpoint, crate::model::config::UpstreamKind::Local);
     // 当前轮超大图片对所有路由一致地返回 400（历史超大图片仍由 payload guard 占位处理）。
-    if let Some(response) =
-        reject_oversized_current_image(&payload, attribution.as_ref(), &endpoint)
+    // 打开图片压缩时先压缩再检查：多模态预处理之后还有同样的检查，压不下来的仍然 400。
+    if !runtime_config.image_processing.resize_enabled
+        && let Some(response) =
+            reject_oversized_current_image(&payload, attribution.as_ref(), &endpoint)
     {
         return response;
     }
@@ -8587,7 +8694,13 @@ async fn post_messages_inner(
         })
     });
 
-    if payload.stream {
+    // Covers the time spent waiting for a credential and for the upstream headers: if the
+    // client disconnects then, this future is dropped before any usage record exists.
+    let pre_response_usage_guard = LocalPreResponseUsageGuard::new(
+        usage_context.clone(),
+        inference_attempt_budget.attribution(),
+    );
+    let response = if payload.stream {
         let claude_code_noop_delta_keepalive =
             should_use_claude_code_noop_delta_keepalive(request_user_agent(&headers));
         // 流式响应
@@ -8658,7 +8771,9 @@ async fn post_messages_inner(
             capacity_weight_units,
         )
         .await
-    }
+    };
+    pre_response_usage_guard.disarm();
+    response
 }
 
 async fn call_api_stream_maybe_fail_fast(
@@ -10244,25 +10359,20 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// Reads a non-streaming EventStream body like `response_bytes_with_limit_and_body_timeout`,
-/// and additionally gives up when no content event arrives within `first_output_timeout_secs`
-/// (`0` disables it), so a silent upstream does not hold the connection and credential slot
-/// for the whole body timeout.
+/// Reads a non-streaming EventStream body up to `max_bytes`.
+///
+/// The body is bounded by silence, not by total time: the read fails when no new bytes arrive
+/// for `idle_timeout_secs` (the same limit streaming uses, `kiroUpstreamStreamIdleTimeoutSecs`),
+/// and every chunk resets that clock. A wall-clock cap would cut a long answer that is still
+/// being written and throw away every token already generated. In addition, it gives up when no
+/// content event arrives within `first_output_timeout_secs` (`0` disables it), so a silent
+/// upstream does not hold the connection and credential slot.
 async fn read_non_stream_body_with_first_output_deadline(
     response: reqwest::Response,
-    body_timeout_secs: u64,
+    idle_timeout_secs: u64,
     max_bytes: usize,
     first_output_timeout_secs: u64,
 ) -> Result<Bytes, NonStreamBodyError> {
-    if first_output_timeout_secs == 0 {
-        return crate::http_client::response_bytes_with_limit_and_body_timeout(
-            response,
-            body_timeout_secs,
-            max_bytes,
-        )
-        .await
-        .map_err(NonStreamBodyError::Http);
-    }
     if response
         .content_length()
         .is_some_and(|content_length| content_length > max_bytes as u64)
@@ -10271,34 +10381,34 @@ async fn read_non_stream_body_with_first_output_deadline(
             crate::http_client::HttpSendError::ResponseBodyTooLarge { max_bytes },
         ));
     }
+    let idle_timeout_secs = normalize_stream_idle_timeout_secs(idle_timeout_secs);
+    let idle_timeout = Duration::from_secs(idle_timeout_secs);
     let started = Instant::now();
-    let body_deadline =
-        (body_timeout_secs > 0).then(|| started + Duration::from_secs(body_timeout_secs));
-    let first_output_deadline = started + Duration::from_secs(first_output_timeout_secs);
+    let first_output_deadline = (first_output_timeout_secs > 0)
+        .then(|| started + Duration::from_secs(first_output_timeout_secs));
+    let mut idle_deadline = started + idle_timeout;
     let mut stream = response.bytes_stream();
     let mut body = bytes::BytesMut::with_capacity(max_bytes.min(16 * 1024));
     let mut saw_content = false;
     loop {
-        let deadline = match (saw_content, body_deadline) {
-            (false, Some(body)) => body.min(first_output_deadline),
-            (false, None) => first_output_deadline,
-            (true, Some(body)) => body,
-            (true, None) => started + Duration::from_secs(u32::MAX as u64),
-        };
+        let first_output_pending = first_output_deadline.filter(|_| !saw_content);
+        let deadline = first_output_pending
+            .map(|first| first.min(idle_deadline))
+            .unwrap_or(idle_deadline);
         let next = tokio::select! {
             chunk = stream.next() => chunk,
             _ = sleep_until(deadline) => {
-                return Err(if saw_content || body_deadline.is_some_and(|body| body <= first_output_deadline) {
-                    NonStreamBodyError::Http(crate::http_client::HttpSendError::ResponseBodyTimeout {
-                        timeout_secs: body_timeout_secs,
-                    })
-                } else {
-                    NonStreamBodyError::FirstOutputTimeout {
+                return Err(match first_output_pending {
+                    Some(first) if first <= idle_deadline => NonStreamBodyError::FirstOutputTimeout {
                         timeout_secs: first_output_timeout_secs,
-                    }
+                    },
+                    _ => NonStreamBodyError::Http(crate::http_client::HttpSendError::ResponseBodyTimeout {
+                        timeout_secs: idle_timeout_secs,
+                    }),
                 });
             }
         };
+        idle_deadline = Instant::now() + idle_timeout;
         let Some(chunk) = next else {
             return Ok(body.freeze());
         };
@@ -10756,7 +10866,11 @@ fn classify_json_stream_error(
         "invalid_request_error"
     } else if combined.contains("throttl")
         || combined.contains("too many requests")
-        || combined.contains("rate")
+        // 只认明确的限流写法："rate" 单独出现会命中 generate、accurate 之类的普通词。
+        || combined.contains("rate limit")
+        || combined.contains("rate_limit")
+        || combined.contains("ratelimit")
+        || combined.contains("rate exceeded")
     {
         "rate_limit_error"
     } else {
@@ -10944,6 +11058,43 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
 /// output: the client has received nothing. Production 2026-10-21: four non-stream requests on
 /// Fast account #1948 got partial text followed by "Encountered an unexpected error" and were
 /// returned as 502 without trying another account.
+/// 解析非流式工具参数。末尾多余的右括号、逗号或同一份参数的重复会先去掉（与流式一致，结果与模型
+/// 本意相同）；真正截断或格式错误的参数返回原始解析错误。
+fn parse_non_stream_tool_input(buffer: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match super::stream::classify_tool_input_json(buffer) {
+        super::stream::ToolInputJson::Cleaned(cleaned) => {
+            tracing::info!(
+                input_bytes = buffer.len(),
+                cleaned_bytes = cleaned.len(),
+                "上游工具参数末尾有多余内容，已去掉后按合法参数处理"
+            );
+            serde_json::from_str(&cleaned)
+        }
+        super::stream::ToolInputJson::Valid | super::stream::ToolInputJson::Invalid => {
+            serde_json::from_str(buffer)
+        }
+    }
+}
+
+/// 非流式事件里是否有已结束、但参数无法修复的工具调用（同一个调用的分片拼起来再判断）。
+fn non_stream_events_have_unrepairable_tool_input(events: &[Event]) -> bool {
+    let mut buffers: HashMap<&str, String> = HashMap::new();
+    for event in events {
+        let Event::ToolUse(tool_use) = event else {
+            continue;
+        };
+        let buffer = buffers.entry(tool_use.tool_use_id.as_str()).or_default();
+        buffer.push_str(&tool_use.input);
+        if tool_use.stop
+            && super::stream::classify_tool_input_json(buffer)
+                == super::stream::ToolInputJson::Invalid
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn non_stream_status_error_event(events: &[Event]) -> Option<String> {
     events.iter().find_map(|event| match event {
         Event::Error {
@@ -11178,6 +11329,8 @@ fn usage_only_retry_request(
         super::empty_turn_nudge::append_empty_turn_nudge(&mut request, nudge);
     }
     let body = serialize_kiro_request(&request).ok()?;
+    // 上游已经处理过这一轮，重发换新的会话标识。
+    let body = crate::kiro::provider::refresh_kiro_request_identity(&body).unwrap_or(body);
     Some((body, request))
 }
 
@@ -11199,6 +11352,13 @@ struct NonStreamEmptyTurnRetry<'a> {
 /// 返回 `Some` 表示已拿到新账号的响应，调用方继续读取；`None` 表示没有拿到新响应（首输出前重试
 /// 关闭、次数用完，或换号请求没能发出），调用方上报空回后按失败终态返回。换号请求发出前，这里
 /// 已经替当前账号上报过空回；空回上报只生效一次，调用方再报不会重复计。
+/// 上游已经处理过这一轮之后的非流式重发：换新的会话标识（见 `refresh_kiro_request_identity`）。
+fn retry_body_with_fresh_identity(request_body: &str) -> std::borrow::Cow<'_, str> {
+    crate::kiro::provider::refresh_kiro_request_identity(request_body)
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(request_body))
+}
+
 async fn retry_non_stream_empty_turn(
     retry: NonStreamEmptyTurnRetry<'_>,
     completion: &crate::kiro::provider::KiroApiCompletion,
@@ -11223,9 +11383,10 @@ async fn retry_non_stream_empty_turn(
     attempt_budget.exclude_empty_turn_credential(completion.credential_id());
     completion.report_empty_turn(detail);
     let consumed_before = attempt_budget.snapshot().consumed;
+    let retry_body = retry_body_with_fresh_identity(retry.request_body);
     let retry_dispatch = call_api_maybe_fail_fast(
         retry.provider,
-        retry.request_body,
+        &retry_body,
         Some(retry.kiro_request),
         Some(retry.request_id),
         retry.external_fallback,
@@ -11318,7 +11479,16 @@ async fn retry_stream_before_downstream_commit(
         // 空回：本请求内排除该账号换号；是否冷却由全局开关决定（默认不冷却）。
         attempt_budget.exclude_empty_turn_credential(state.completion.credential_id());
         state.completion.report_empty_turn(detail.clone());
+    } else if super::stream::is_tool_input_failure_detail(&detail) {
+        // 工具参数问题出在本轮输出，与账号无关：不冷却账号、不记会话失败；只在本请求内
+        // 排除该账号，换号重试时不再选回它。
+        attempt_budget.exclude_empty_turn_credential(state.completion.credential_id());
+        state.completion.report_content_failure();
     } else {
+        // 上游故障默认不冷却账号，所以要在本请求内排除它，换号时不再选回同一个账号。
+        if !plan.provider.upstream_failure_cooldown_enabled() {
+            attempt_budget.exclude_empty_turn_credential(state.completion.credential_id());
+        }
         state
             .completion
             .report_upstream_stream_failure(detail.clone());
@@ -11327,10 +11497,14 @@ async fn retry_stream_before_downstream_commit(
     state.prior_attempts =
         merge_credential_attempts(std::mem::take(&mut state.prior_attempts), previous_attempts);
     state.usage_guard.complete();
+    // 上游已经处理过这一轮：重发换新的会话标识，否则上游会以 Improperly formed request 拒绝。
+    let retry_body = crate::kiro::provider::refresh_kiro_request_identity(&plan.request_body)
+        .map(Arc::<str>::from)
+        .unwrap_or_else(|| plan.request_body.clone());
     let consumed_before = attempt_budget.snapshot().consumed;
     let retry_dispatch = call_api_stream_maybe_fail_fast(
         &plan.provider,
-        plan.request_body.as_ref(),
+        retry_body.as_ref(),
         plan.kiro_request.as_deref(),
         Some(&plan.request_id),
         plan.external_fallback.as_ref(),
@@ -12177,6 +12351,8 @@ fn create_sse_stream(
                                             state.attempt_number,
                                         );
                                     }
+                                } else if super::stream::is_tool_input_failure_detail(&detail) {
+                                    state.completion.report_content_failure();
                                 } else {
                                     state
                                         .completion
@@ -13287,7 +13463,7 @@ async fn handle_non_stream_request(
         let runtime = provider.runtime_config();
         let body_read = read_non_stream_body_with_first_output_deadline(
             response,
-            runtime.kiro_upstream_response_timeout_secs,
+            runtime.kiro_upstream_stream_idle_timeout_secs,
             LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
             runtime
                 .stream_first_output_timeout_secs
@@ -13486,12 +13662,17 @@ async fn handle_non_stream_request(
                 );
                 retry_attempt_prefix =
                     merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
-                completion.report_upstream_body_status_failure(detail.clone());
                 let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
+                // 上游故障默认不冷却账号，所以要在本请求内排除它，换号时不再选回同一个账号。
+                if !provider.upstream_failure_cooldown_enabled() {
+                    attempt_budget.exclude_empty_turn_credential(completion.credential_id());
+                }
+                completion.report_upstream_body_status_failure(detail.clone());
                 let consumed_before = attempt_budget.snapshot().consumed;
+                let retry_body = retry_body_with_fresh_identity(request_body);
                 let retry_dispatch = call_api_maybe_fail_fast(
                     &provider,
-                    request_body,
+                    &retry_body,
                     Some(kiro_request),
                     Some(&request_id),
                     external_fallback.as_ref(),
@@ -13652,6 +13833,65 @@ async fn handle_non_stream_request(
             }
         }
 
+        // 工具参数截断或格式错误：还没有任何内容发给客户端，换号重发本轮，而不是直接返回 502。
+        // 这是本轮输出的问题，不冷却账号，只在本请求内排除它。
+        if stream_retry_config.active()
+            && stream_retry_config.allows(StreamRetryReason::ProtocolError)
+            && non_stream_status_retry_attempt < stream_retry_config.max_attempts
+            && non_stream_events_have_unrepairable_tool_input(&upstream_events)
+        {
+            let next_attempt = non_stream_status_retry_attempt.saturating_add(1);
+            tracing::warn!(
+                request_id = %request_id,
+                attempt = non_stream_status_retry_attempt,
+                next_attempt,
+                max_attempts = stream_retry_config.max_attempts,
+                "本地 Kiro 非流式响应的工具参数无法修复，换号重试（不冷却账号）"
+            );
+            retry_attempt_prefix =
+                merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
+            let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
+            attempt_budget.exclude_empty_turn_credential(completion.credential_id());
+            completion.release();
+            let consumed_before = attempt_budget.snapshot().consumed;
+            let retry_body = retry_body_with_fresh_identity(request_body);
+            let retry_dispatch = call_api_maybe_fail_fast(
+                &provider,
+                &retry_body,
+                Some(kiro_request),
+                Some(&request_id),
+                external_fallback.as_ref(),
+                capacity_weight_units,
+                Some(model),
+                attempt_budget.clone(),
+            )
+            .await;
+            let retry_sends = attempt_budget
+                .snapshot()
+                .consumed
+                .saturating_sub(consumed_before);
+            if retry_sends > 0 {
+                usage_context
+                    .mark_stream_retry_sends(retry_sends, StreamRetryReason::ProtocolError);
+            } else if retry_dispatch.is_err() {
+                usage_context.mark_stream_retry_dispatch_failure(StreamRetryReason::ProtocolError);
+            }
+            match retry_dispatch {
+                Ok(response) => {
+                    api_response = response;
+                    non_stream_status_retry_attempt = next_attempt;
+                    continue;
+                }
+                Err(retry_error) => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %retry_error,
+                        "非流式工具参数问题的换号重试未能发出"
+                    );
+                }
+            }
+        }
+
         break (credential_usage, completion, upstream_events);
     };
 
@@ -13761,7 +14001,7 @@ async fn handle_non_stream_request(
                     let input: serde_json::Value = if buffer.is_empty() {
                         serde_json::json!({})
                     } else {
-                        match serde_json::from_str(&buffer) {
+                        match parse_non_stream_tool_input(&buffer) {
                             Ok(input) => input,
                             Err(error) => {
                                 tracing::warn!(
@@ -14013,7 +14253,7 @@ async fn handle_non_stream_request(
             let input: serde_json::Value = if buffer.is_empty() {
                 serde_json::json!({})
             } else {
-                match serde_json::from_str(&buffer) {
+                match parse_non_stream_tool_input(&buffer) {
                     Ok(input) => input,
                     Err(error) => {
                         tracing::warn!(
@@ -14366,25 +14606,28 @@ fn model_version_uses_adaptive_thinking(model: &str, family: &str) -> bool {
     })
 }
 
+/// Opus/Sonnet/Haiku/Fable 4.6+ and the opus/sonnet/fable aliases take `thinking: adaptive`;
+/// older models need `enabled` with `budget_tokens`.
+fn base_model_uses_adaptive_thinking(model_base: &str) -> bool {
+    matches!(
+        model_base,
+        "opus" | "opusplan" | "best" | "default" | "sonnet" | "fable"
+    ) || ["opus", "sonnet", "haiku", "fable"]
+        .iter()
+        .any(|family| model_version_uses_adaptive_thinking(model_base, family))
+}
+
+pub(crate) fn model_uses_adaptive_thinking(model: &str) -> bool {
+    base_model_uses_adaptive_thinking(&strip_model_compat_suffixes(model).0)
+}
+
 fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
     let (model_base, requested_thinking) = strip_model_compat_suffixes(model);
     if !requested_thinking {
         return None;
     }
 
-    let is_opus_alias = matches!(
-        model_base.as_str(),
-        "opus" | "opusplan" | "best" | "default"
-    );
-    let is_sonnet_alias = model_base == "sonnet";
-    let is_fable_alias = model_base == "fable";
-    let adaptive = is_opus_alias
-        || is_sonnet_alias
-        || is_fable_alias
-        || model_version_uses_adaptive_thinking(&model_base, "opus")
-        || model_version_uses_adaptive_thinking(&model_base, "sonnet")
-        || model_version_uses_adaptive_thinking(&model_base, "haiku")
-        || model_version_uses_adaptive_thinking(&model_base, "fable");
+    let adaptive = base_model_uses_adaptive_thinking(&model_base);
     Some(ThinkingModelDefaults {
         thinking_type: if adaptive { "adaptive" } else { "enabled" },
         budget_tokens: if adaptive { 0 } else { 20000 },

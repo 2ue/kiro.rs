@@ -954,6 +954,9 @@ impl PromptCacheTracker {
         state.enforce_bounds(&scope, bounds, now);
     }
 
+    /// Entries are scoped by conversation and route namespace, not by credential, so there is
+    /// nothing to drop when a credential goes away; the method stays for callers that still
+    /// notify on credential removal.
     pub fn clear_credential(&self, credential_id: u64) {
         let _ = credential_id;
     }
