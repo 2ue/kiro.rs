@@ -5081,6 +5081,71 @@ async fn external_pool_authoritative_refresh_survives_leader_cancellation_for_fi
     postgres.drop_test_schema().await.unwrap();
 }
 
+/// Deterministic version of the CI failure of
+/// `external_pool_authoritative_refresh_survives_leader_cancellation_for_five_rounds` ("round 4:
+/// manager-owned PG refresh did not start"). The previous refresh has published and woken its
+/// waiters but its task has not returned yet, which a busy runtime can stretch out. A caller
+/// that arrives after the snapshot was invalidated must still start a new refresh at once. When
+/// the refresh woke waiters before releasing its lock, that caller found the lock taken and
+/// waited for a notification that had already been sent, until its wait timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_authoritative_refresh_starts_while_previous_refresh_task_finishes() {
+    let Some((manager, postgres)) = test_external_pool_manager_without_snapshot_timeouts().await
+    else {
+        return;
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("authoritative-lock-handoff", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=5 {
+        // One completed refresh, held at the end of its task.
+        manager.invalidate_static_pool_snapshot();
+        let gate = TestDispatchAfterPrepareGate::new();
+        manager.set_authoritative_refresh_end_gate(gate.clone());
+        let warm = manager.clone();
+        let warm = tokio::spawn(async move { warm.load_authoritative_pool_snapshot().await });
+        timeout(Duration::from_secs(10), gate.prepared.wait())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: first refresh never reached the gate"));
+        timeout(Duration::from_secs(5), warm)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: first caller was not woken"))
+            .unwrap()
+            .expect("first refresh publishes");
+
+        // The snapshot is invalidated and a new caller arrives while that task is still held.
+        manager.invalidate_static_pool_snapshot();
+        let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+        let caller_manager = manager.clone();
+        let caller =
+            tokio::spawn(async move { caller_manager.load_authoritative_pool_snapshot().await });
+        // Give the caller time to look for the refresh lock before the held task returns. If it
+        // is scheduled later, it finds the lock free either way and the round still passes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        timeout(Duration::from_secs(10), gate.resume.wait())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: gate release timed out"));
+
+        let snapshot = timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}: caller waited for a refresh that never started")
+            })
+            .unwrap()
+            .expect("caller gets the refreshed snapshot");
+        assert!(snapshot.iter().any(|candidate| candidate.id == pool.id));
+        assert_eq!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: the new caller must start exactly one refresh"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_authoritative_pg_timeout_c128_is_one_query_and_recovers_for_three_rounds() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {

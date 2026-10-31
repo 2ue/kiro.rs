@@ -3457,6 +3457,8 @@ pub struct ExternalPoolManager {
     dispatch_fence_pg_loads: Arc<AtomicU64>,
     #[cfg(test)]
     dispatch_after_prepare_gate: Arc<SyncMutex<Option<Arc<TestDispatchAfterPrepareGate>>>>,
+    #[cfg(test)]
+    authoritative_refresh_end_gate: Arc<SyncMutex<Option<Arc<TestDispatchAfterPrepareGate>>>>,
     observed_pool_data_generation: Arc<AtomicU64>,
     success_reset_recent: Arc<SyncMutex<HashMap<u64, Instant>>>,
     success_reset_semaphore: Arc<Semaphore>,
@@ -4789,6 +4791,8 @@ impl ExternalPoolManager {
             dispatch_fence_pg_loads: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             dispatch_after_prepare_gate: Arc::new(SyncMutex::new(None)),
+            #[cfg(test)]
+            authoritative_refresh_end_gate: Arc::new(SyncMutex::new(None)),
             observed_pool_data_generation: Arc::new(AtomicU64::new(0)),
             success_reset_recent: Arc::new(SyncMutex::new(HashMap::new())),
             success_reset_semaphore: Arc::new(Semaphore::new(
@@ -5523,7 +5527,7 @@ impl ExternalPoolManager {
     async fn refresh_authoritative_pool_snapshot(
         &self,
         generation: u64,
-        _refresh_guard: OwnedMutexGuard<()>,
+        refresh_guard: OwnedMutexGuard<()>,
     ) {
         let result = match self.selection_breaker.try_begin() {
             Ok(permit) => {
@@ -5564,7 +5568,30 @@ impl ExternalPoolManager {
             }
         };
         self.publish_authoritative_pool_snapshot(generation, result);
+        // Release the refresh lock before waking waiters. A caller that arrived after the snapshot
+        // was invalidated could not take the lock and is waiting for this notification; woken
+        // with the lock still held, it would find the lock taken again and wait for a
+        // notification that never comes, until its wait timeout.
+        drop(refresh_guard);
         self.authoritative_pool_snapshot_changed.notify_waiters();
+        #[cfg(test)]
+        self.wait_at_authoritative_refresh_end_gate().await;
+    }
+
+    #[cfg(test)]
+    fn set_authoritative_refresh_end_gate(&self, gate: Arc<TestDispatchAfterPrepareGate>) {
+        *self.authoritative_refresh_end_gate.lock() = Some(gate);
+    }
+
+    /// Holds a finished refresh before its task returns, as a busy runtime can after the
+    /// refresh has woken its waiters. Callers must not depend on this task running again.
+    #[cfg(test)]
+    async fn wait_at_authoritative_refresh_end_gate(&self) {
+        let gate = self.authoritative_refresh_end_gate.lock().take();
+        if let Some(gate) = gate {
+            gate.prepared.wait().await;
+            gate.resume.wait().await;
+        }
     }
 
     async fn load_authoritative_pool_snapshot(
