@@ -2112,6 +2112,7 @@ const defaultCacheHitShaping = (): Required<CacheHitShapingPatch> => ({
   minCostRatio: 1,
   maxReadMultiplier: 0,
   minCreationRatio: 0,
+  readAwareCostFloor: false,
 })
 type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
 
@@ -2602,6 +2603,15 @@ function CacheHitShapingForm({
         <NumberField title="计费下限倍数" description={bounded ? '整形后的计费尽量不低于原始用量计费的这个倍数，只在各字段上下限内补；补不上的差额累计，在之后放行写入的请求上补。0 表示不限制。' : '整形后的计费不低于原始用量计费的这个倍数；与目标命中率冲突时以这里为准。1 表示不亏损，0 表示不限制。'} value={merged.minCostRatio} min={0} max={5} step={0.05} suffix="倍" disabled={!merged.enabled} onChange={set('minCostRatio')} />
         <NumberField title="缓存读取上限倍数" description={bounded ? '缓存读取最多为原始输入的多少倍，是最终上限；触及上限后命中率和计费都可以低于目标。0 表示不限制。' : '缓存读取最多为原始输入的多少倍；触及上限后命中率可以低于目标，计费下限仍然生效。0 表示不限制。'} value={merged.maxReadMultiplier} min={0} max={50} step={0.5} suffix="倍" disabled={!merged.enabled} onChange={set('maxReadMultiplier')} />
         <NumberField title="最小写入比例" description="本次允许写入时，缓存写入至少为原始输入的这个比例；不允许写入的请求不受影响。0 表示不限制。" value={merged.minCreationRatio} min={0} max={5} step={0.05} suffix="倍" disabled={!merged.enabled} onChange={set('minCreationRatio')} />
+        {!bounded && (
+          <ToggleField
+            title="计费下限计入读取"
+            description="默认关闭，关闭时与原来一致。开启后，计费达不到下限时按目标命中率同时增加读取和输入，读取的费用也算进计费下限；同样的命中率和计费下限，上报的上下文约为原来的一半。只影响计费不足的请求。"
+            checked={merged.readAwareCostFloor}
+            disabled={!merged.enabled}
+            onCheckedChange={set('readAwareCostFloor')}
+          />
+        )}
       </div>
     </div>
   )

@@ -16508,6 +16508,7 @@ fn bounded_high_cache_external_projection_never_leaves_bounds() {
         min_cost_ratio: 1.0,
         max_read_multiplier: 1.0,
         min_creation_ratio: 0.0,
+        read_aware_cost_floor: false,
     };
     route.prompt_cache_creation_control = PromptCacheCreationControlConfig {
         enabled: true,

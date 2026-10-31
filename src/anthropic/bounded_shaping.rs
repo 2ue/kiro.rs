@@ -403,6 +403,7 @@ mod tests {
             min_cost_ratio,
             max_read_multiplier: 0.0,
             min_creation_ratio: 0.0,
+            read_aware_cost_floor: false,
         }
     }
 

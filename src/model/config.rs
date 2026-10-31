@@ -1869,6 +1869,13 @@ pub struct CacheHitShapingPolicy {
     /// 最小写入：放行写入时，写入不低于原始输入的这个比例，范围 0~5，0 表示不限制。
     #[serde(default)]
     pub min_creation_ratio: f64,
+
+    /// 计费下限计入读取，默认关闭。开启后，计费达不到下限时按目标命中率同时增加读取和
+    /// 非读取部分，读取的费用也算进下限，同样的命中率下上报的上下文更小。关闭时非读取部分
+    /// 先单独满足下限，再在总量之外追加读取到目标命中率（原有行为）。
+    /// 只作用于本地链路的命中率整形；上下限优先策略不使用这个开关。
+    #[serde(default)]
+    pub read_aware_cost_floor: bool,
 }
 
 impl Default for CacheHitShapingPolicy {
@@ -1882,6 +1889,7 @@ impl Default for CacheHitShapingPolicy {
             min_cost_ratio: default_cache_hit_min_cost_ratio(),
             max_read_multiplier: 0.0,
             min_creation_ratio: 0.0,
+            read_aware_cost_floor: false,
         }
     }
 }
@@ -2115,6 +2123,8 @@ pub struct CacheHitShapingPolicyPatch {
     pub max_read_multiplier: Option<f64>,
     #[serde(default)]
     pub min_creation_ratio: Option<f64>,
+    #[serde(default)]
+    pub read_aware_cost_floor: Option<bool>,
 }
 
 impl CacheHitShapingPolicyPatch {
@@ -2143,6 +2153,9 @@ impl CacheHitShapingPolicyPatch {
         if let Some(value) = self.min_creation_ratio {
             policy.min_creation_ratio = value;
         }
+        if let Some(value) = self.read_aware_cost_floor {
+            policy.read_aware_cost_floor = value;
+        }
         policy.normalized()
     }
 
@@ -2155,6 +2168,7 @@ impl CacheHitShapingPolicyPatch {
             && self.min_cost_ratio.is_none()
             && self.max_read_multiplier.is_none()
             && self.min_creation_ratio.is_none()
+            && self.read_aware_cost_floor.is_none()
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {

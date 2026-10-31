@@ -819,6 +819,15 @@ function CacheHitShapingForm({
           onChange={set('minCreationRatio')}
         />
       </FieldGrid>
+      {!bounded && (
+        <TogField
+          label="计费下限计入读取"
+          desc="默认关闭，关闭时与原来一致。开启后，计费达不到下限时按目标命中率同时增加读取和输入，读取的费用也算进计费下限；同样的命中率和计费下限，上报的上下文约为原来的一半。只影响计费不足的请求。"
+          checked={Boolean(merged.readAwareCostFloor)}
+          disabled={!merged.enabled}
+          onChange={set('readAwareCostFloor')}
+        />
+      )}
     </div>
   )
 }

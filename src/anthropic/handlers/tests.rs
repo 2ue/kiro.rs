@@ -15695,6 +15695,7 @@ fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untou
                     min_creation_ratio: Some(2.0),
                     min_cache_read_tokens: Some(1_024),
                     min_cache_creation_tokens: Some(1_024),
+                    read_aware_cost_floor: None,
                 }),
                 ..CacheRoutePolicyPatch::default()
             },
@@ -15887,6 +15888,7 @@ fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
                 min_creation_ratio: Some(0.0),
                 min_cache_read_tokens: Some(1_024),
                 min_cache_creation_tokens: Some(1_024),
+                read_aware_cost_floor: None,
             }),
             cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
                 enabled: Some(true),
@@ -16192,6 +16194,221 @@ fn minea_like_route_keeps_target_hit_ratio_and_no_small_cache_values() {
         write_rounds >= 20,
         "writes should appear on most rounds, got {write_rounds}"
     );
+}
+
+/// 现网 /dfcache/minea 的参数（2026-10-30）跑一个 Claude Code 会话，比较计费下限计入读取的开关：
+/// 第一条（没有历史）两边完全一样；之后每条命中率仍达标、计费不亏，上报的上下文从约 9 倍原始输入
+/// 降到约 5 倍以内；原始输入大到读取顶到 50 万上限的请求，读取两边一样。
+#[test]
+fn minea_prod_params_read_aware_floor_shrinks_small_context_and_keeps_large_ones() {
+    fn route(read_aware: Option<bool>) -> CacheRoutePolicyPatch {
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(true),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.99),
+                token_scale: Some(2.05),
+                max_simulated_input_tokens: Some(600_000),
+                cap_jitter_min_tokens: Some(12_000),
+                cap_jitter_max_tokens: Some(24_000),
+                scale_min_input_tokens: Some(3_000),
+            }),
+            creation_control: Some(PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode:
+                    crate::model::config::PromptCacheCreationControlScopeMode::ConversationModel,
+                min_successful_requests_between_creation: 0,
+                min_creation_interval_secs: 6,
+                min_creation_delta_tokens: 12_000,
+                max_creation_tokens_per_event: 300_000,
+                creation_budget_window_secs: 300,
+                max_creation_tokens_per_window: 600_000,
+                expire_after_idle_secs: 3_600,
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy {
+                    move_delta_to_cache_read: true,
+                    ..ReportedUsageFieldPolicy::sample_input_max(20_000)
+                },
+                output_uplift_min_tokens: 1_000,
+                output_uplift_percent: 70,
+                final_cache_read_max_tokens: 500_000,
+                final_cache_read_jitter_min_tokens: 23_456,
+                final_cache_read_jitter_max_tokens: 54_321,
+                final_cache_creation_max_tokens: 500_000,
+                final_cache_creation_jitter_min_tokens: 23_456,
+                final_cache_creation_jitter_max_tokens: 54_321,
+                ..ReportedUsagePathPolicy::default()
+            }),
+            hit_shaping: Some(crate::model::config::CacheHitShapingPolicyPatch {
+                enabled: Some(true),
+                target_hit_ratio: Some(0.9),
+                ratio_jitter: Some(0.03),
+                min_cost_ratio: Some(1.0),
+                max_read_multiplier: Some(0.0),
+                min_creation_ratio: Some(0.0),
+                min_cache_read_tokens: Some(1_024),
+                min_cache_creation_tokens: Some(1_024),
+                read_aware_cost_floor: read_aware,
+            }),
+            cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
+                enabled: Some(false),
+            }),
+            ..CacheRoutePolicyPatch::default()
+        }
+    }
+    fn run_session(read_aware: Option<bool>, raw_inputs: &[i32]) -> Vec<cache::CacheUsage> {
+        // Each request mixes a thread-local random seed into its shaping jitter; fixing it makes
+        // the three runs see the same seeds, so they differ only by the toggle under test.
+        fastrand::seed(0x006d_696e_6561);
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy
+            .path_overrides
+            .insert("/dfcache/minea".to_string(), route(read_aware));
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(64)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.99,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy);
+        let endpoint = "/dfcache/minea/v1/messages";
+        let cache_route =
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path(endpoint);
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": "你好" }]),
+        }];
+        let mut reported_rounds = Vec::new();
+        for (round, &raw_input) in raw_inputs.iter().enumerate() {
+            let payload = MessagesRequest {
+                model: "claude-opus-4-5".to_string(),
+                max_tokens: 32_000,
+                messages: messages.clone(),
+                stream: true,
+                system: Some(vec![SystemMessage {
+                    text: "stable claude code system prompt ".repeat(900),
+                    cache_control: Some(json!({"type": "ephemeral"})),
+                }]),
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                output_format: None,
+                metadata: Some(Metadata {
+                    user_id: Some(
+                        "user_test_account__session_7a1c2e3f-4b5d-4e6f-8a9b-0c1d2e3f4a5b"
+                            .to_string(),
+                    ),
+                }),
+                stop_sequences: None,
+            };
+            let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
+            let context = prepare_usage_context(
+                &state,
+                cache_route.clone(),
+                endpoint,
+                true,
+                &payload,
+                None,
+                Some(conversation_id.clone()),
+                Some(conversation_id),
+                raw_input,
+            );
+            let credential_usage = attach_test_credential_usage(context, 1);
+            let body = cache::build_usage_with_simulation_policy(
+                None,
+                raw_input,
+                40,
+                credential_usage.request.simulated_usage,
+                true,
+            );
+            let source = credential_usage.usage_source(&body, None, false);
+            let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+            credential_usage.record_success_reported(reported, source, Some(body));
+            reported_rounds.push(reported);
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: json!([{ "type": "text", "text": format!("answer {round} ") }]),
+            });
+            messages.push(Message {
+                role: "user".to_string(),
+                content: json!([{ "type": "text", "text": format!("next {round} ") }]),
+            });
+        }
+        reported_rounds
+    }
+
+    let pricing = PricingCatalog::new()
+        .model_pricing("claude-opus-4-5")
+        .expect("builtin opus pricing");
+    let total = |usage: &cache::CacheUsage| {
+        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    };
+    // Claude Code 干净会话的原始输入（本机实测约 2.8 万~3.3 万），之后上下文增长到读取顶到上限。
+    let raw_inputs = [
+        28_287, 28_388, 30_200, 33_300, 38_000, 45_000, 120_000, 200_000,
+    ];
+    let legacy = run_session(None, &raw_inputs);
+    let explicit_off = run_session(Some(false), &raw_inputs);
+    let read_aware = run_session(Some(true), &raw_inputs);
+    assert_eq!(
+        legacy, explicit_off,
+        "omitting the field keeps the old behavior"
+    );
+
+    assert_eq!(legacy[0], read_aware[0], "first request has no history");
+    assert_eq!(read_aware[0].cache_read_input_tokens, 0);
+    for (round, (&raw_input, (old, new))) in raw_inputs
+        .iter()
+        .zip(legacy.iter().zip(read_aware.iter()))
+        .enumerate()
+        .skip(1)
+    {
+        let raw_cost = pricing.estimate(cache::RawUsage::uncached(raw_input, 40).to_cache_usage());
+        assert!(
+            pricing.estimate(*new) >= raw_cost * (1.0 - 1e-9),
+            "round {round}: billed below raw {new:?}"
+        );
+        let ratio = new.cache_read_input_tokens as f64 / total(new) as f64;
+        let old_ratio = old.cache_read_input_tokens as f64 / total(old) as f64;
+        assert!(
+            ratio >= old_ratio.min(0.9) - 1e-6,
+            "round {round}: ratio {ratio} old {old_ratio}"
+        );
+        for value in [new.cache_read_input_tokens, new.cache_creation_input_tokens] {
+            assert!(value == 0 || value >= 1024, "round {round}: small {new:?}");
+        }
+        let old_ctx = total(old) as f64 / raw_input as f64;
+        let new_ctx = total(new) as f64 / raw_input as f64;
+        if raw_input <= 45_000 {
+            // 命中率 r、读取单价是 input 的 q 倍时，非读取全是 input 也只需要
+            // 原始输入 ÷ ((1 - r) + q·r) 的上下文；minea 的命中率在 0.90~0.93，约 5.3~6.1 倍。
+            let q = pricing.cache_read_input_token_cost / pricing.input_cost_per_token;
+            let minimum = 1.0 / ((1.0 - ratio) + q * ratio);
+            assert!(old_ctx > 7.0, "round {round}: old {old_ctx:.2} {old:?}");
+            assert!(
+                new_ctx <= minimum * 1.01 && new_ctx < old_ctx * 0.65,
+                "round {round}: new {new_ctx:.2} minimum {minimum:.2} old {old_ctx:.2} {new:?}"
+            );
+        } else {
+            // 读取已顶到最终上限的大上下文：读取不变，只有非读取部分可能更少。
+            assert_eq!(
+                new.cache_read_input_tokens, old.cache_read_input_tokens,
+                "round {round}: {old:?} -> {new:?}"
+            );
+            assert!(
+                total(new) <= total(old),
+                "round {round}: {old:?} -> {new:?}"
+            );
+        }
+    }
 }
 
 /// 命中率整形默认关闭时，最终下游 usage 必须与引入整形之前的计算逐轮一致：
