@@ -3987,10 +3987,11 @@ impl MultiTokenManager {
     }
 
     /// Fast path for the request entry: `Some(retry_after_secs)` when the dispatch queue is
-    /// full and no credential has a free slot, so the request would be turned away by the
-    /// scheduler anyway. Reads only local counters (no Redis, no PgSQL) so it stays cheap
-    /// when thousands of requests per minute are arriving during an overload.
-    pub fn dispatch_queue_full_retry_after(&self) -> Option<u64> {
+    /// full and no credential has a free slot for `model`, so the request would be turned away by
+    /// the scheduler anyway. Reads only local counters (no Redis, no PgSQL) so it stays cheap
+    /// when thousands of requests per minute are arriving during an overload. The model matters:
+    /// checking without it treated every credential with a model catalog as having no free slot.
+    pub fn dispatch_queue_full_retry_after(&self, model: Option<&str>) -> Option<u64> {
         let max_queued = self.max_queued_requests();
         let queued = self.queued_requests.load(Ordering::Acquire);
         if max_queued == 0 || queued < max_queued {
@@ -4013,7 +4014,7 @@ impl MultiTokenManager {
                 credential_is_dispatchable(
                     &proxy_resources,
                     entry,
-                    None,
+                    model,
                     now,
                     config.credential_max_concurrent_requests,
                     config.credential_rpm.unwrap_or(0),

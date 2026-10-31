@@ -18026,7 +18026,7 @@ async fn run_full_dispatch_queue_is_rejected_before_body_processing() {
 
     // With room in the queue the request goes on to the scheduler as before.
     token_manager.set_queued_requests_for_test(0);
-    assert_eq!(token_manager.dispatch_queue_full_retry_after(), None);
+    assert_eq!(token_manager.dispatch_queue_full_retry_after(None), None);
 }
 
 #[test]

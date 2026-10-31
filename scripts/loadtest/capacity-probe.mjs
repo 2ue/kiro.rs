@@ -41,6 +41,9 @@ const stepSecs = Number(args.stepSecs || 20);
 const streamShare = Number(args.streamShare ?? 0.5);
 // Number of distinct sticky sessions the clients rotate through; 0 means a new session per call.
 const sessions = Number(args.sessions || 0);
+// --honor-retry-after: after a 429 wait Retry-After (plus up to 50% jitter) before the next call,
+// as Claude Code and sub2api do, instead of retrying at once.
+const honorRetryAfter = args.honorRetryAfter === "true";
 const path = args.path || "/cc/v1/messages";
 const agent = new http.Agent({ keepAlive: true, maxSockets: 4096 });
 
@@ -71,7 +74,12 @@ function sendOne(marker, stream, sessionId) {
         });
         res.on("end", () => {
           const streamError = stream && res.statusCode === 200 && /event: error/.test(tail);
-          resolve({ status: streamError ? "stream_error" : String(res.statusCode), ms: performance.now() - started, at: Date.now() });
+          resolve({
+            status: streamError ? "stream_error" : String(res.statusCode),
+            ms: performance.now() - started,
+            at: Date.now(),
+            retryAfter: Number(res.headers["retry-after"]) || null,
+          });
         });
         res.on("error", () => resolve({ status: "read_error", ms: performance.now() - started, at: Date.now() }));
       },
@@ -111,6 +119,10 @@ async function main() {
       const result = await sendOne(n, stream, sessionId);
       result.target = target;
       results.push(result);
+      if (honorRetryAfter && result.status === "429") {
+        const waitMs = (result.retryAfter || 1) * 1000 * (1 + Math.random() * 0.5);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
     }
     active -= 1;
   };

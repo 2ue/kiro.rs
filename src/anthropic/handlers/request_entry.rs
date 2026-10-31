@@ -386,7 +386,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
             )
         });
     if !external_can_take_route
-        && let Some(retry_after_secs) = provider.dispatch_queue_full_retry_after()
+        && let Some(retry_after_secs) = provider.dispatch_queue_full_retry_after(Some(model))
     {
         if let Some(attribution) = attribution {
             attribution.apply_local_temporary_backoff(retry_after_secs);

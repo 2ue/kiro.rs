@@ -15255,7 +15255,7 @@ async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate
     }
     let mut holder = manager.acquire_context(None).await.unwrap();
     assert_eq!(
-        manager.dispatch_queue_full_retry_after(),
+        manager.dispatch_queue_full_retry_after(None),
         None,
         "queue not full yet"
     );
@@ -15275,7 +15275,7 @@ async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate
     assert_eq!(manager.queued_requests.load(Ordering::Acquire), 2);
 
     // A queue of 2 at about one dispatch per second drains in about 2 s.
-    assert_eq!(manager.dispatch_queue_full_retry_after(), Some(2));
+    assert_eq!(manager.dispatch_queue_full_retry_after(None), Some(2));
     let started = Instant::now();
     let error = match manager.acquire_context(None).await {
         Ok(mut ctx) => {
@@ -15312,6 +15312,65 @@ async fn a_full_queue_is_rejected_at_once_with_a_retry_after_from_the_drain_rate
             .recent_rate_per_sec(Instant::now())
             > 1.0
     );
+}
+
+/// The entry's early rejection checked for a free slot without the request model, so a pool
+/// whose credentials list their models looked full and requests were turned away while those
+/// credentials were idle.
+#[tokio::test]
+async fn a_full_queue_with_idle_catalog_credentials_is_not_rejected_early() {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.credential_warmup_requests = 0;
+    config.dispatch_max_queued_requests = 1;
+    config.credential_dispatch_max_wait_secs = 30;
+    let mut busy = test_access_token_credential("catalog-busy", "Pro");
+    busy.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    let mut idle = test_access_token_credential("catalog-idle", "Pro");
+    idle.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    let manager =
+        Arc::new(MultiTokenManager::new(config, vec![busy, idle], None, None, false).unwrap());
+    let empty = HashSet::new();
+    let mut holder = manager
+        .acquire_context_for_session(Some("claude-sonnet-4.5"), None, &HashSet::from([2]))
+        .await
+        .unwrap();
+    assert_eq!(holder.id, 1);
+    // One more request waits for credential 1 only, filling the one-place queue.
+    let waiter = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .acquire_context_for_session(Some("claude-sonnet-4.5"), None, &HashSet::from([2]))
+                .await
+        })
+    };
+    for _ in 0..100 {
+        if manager.queued_requests.load(Ordering::Acquire) == 1 {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 1);
+
+    assert_eq!(
+        manager.dispatch_queue_full_retry_after(Some("claude-sonnet-4.5")),
+        None,
+        "credential 2 lists the model and is idle"
+    );
+    let mut served = manager
+        .acquire_context_for_session(Some("claude-sonnet-4.5"), None, &empty)
+        .await
+        .unwrap();
+    assert_eq!(served.id, 2);
+    served.release_in_flight();
+    holder.release_in_flight();
+    let mut ctx = tokio::time::timeout(StdDuration::from_secs(5), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    ctx.release_in_flight();
 }
 
 #[tokio::test]
