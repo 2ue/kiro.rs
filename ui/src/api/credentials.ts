@@ -14,6 +14,7 @@ import type {
   CredentialDiagnosticsResponse,
   CredentialInfoRefreshResponse,
   CredentialExportFormat,
+  CredentialExportScope,
   CredentialListItem,
   CredentialListResponse,
   CredentialRuntimeResponse,
@@ -534,12 +535,31 @@ export async function testExternalPool(id: number, req?: ExternalPoolTestRequest
   return data
 }
 
-export async function exportCredentials(format: CredentialExportFormat, ids?: number[], disabledOnly = false): Promise<Blob> {
-  const { data } = await api.get<Blob>('/credentials/export', {
-    params: { format, ids: ids && ids.length ? ids.join(',') : undefined, disabled: disabledOnly ? true : undefined },
-    responseType: 'blob',
-  })
-  return data
+/** 导出凭据。`count` 是后端实际写入文件的账号数（运行状态随时变化，可能与页面上的数字不同）。 */
+export async function exportCredentials(
+  format: CredentialExportFormat,
+  scope: CredentialExportScope,
+): Promise<{ blob: Blob; count: number | null }> {
+  const params = 'ids' in scope
+    ? { format, ids: scope.ids.join(',') }
+    : { format, ...scope.filter }
+  try {
+    const { data, headers } = await api.get<Blob>('/credentials/export', { params, responseType: 'blob' })
+    const count = Number(headers['x-credential-count'])
+    return { blob: data, count: Number.isFinite(count) ? count : null }
+  } catch (error) {
+    // With responseType 'blob' the JSON error body arrives as a Blob; decode it so the
+    // backend's message (e.g. no account matches the filter) reaches the toast.
+    const response = (error as { response?: { data?: unknown } })?.response
+    if (response?.data instanceof Blob) {
+      try {
+        response.data = JSON.parse(await response.data.text())
+      } catch {
+        // Not JSON: keep the generic axios message.
+      }
+    }
+    throw error
+  }
 }
 
 // ============ 路由场景 ============

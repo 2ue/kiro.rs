@@ -25,6 +25,7 @@ import {
   StatCard,
   StatGrid,
   Toolbar,
+  PAGE_SIZE_OPTIONS,
 } from '@/components/patterns'
 import { getPublicPool } from '@/api/public-pool'
 import { formatCredits, formatFullDate, formatNumber } from '@/lib/format'
@@ -37,7 +38,6 @@ import { CREDENTIAL_CARD_GRID } from '@/features/credentials/credential-card'
 import { PublicPoolCard } from './public-pool-card'
 import { PUBLIC_STATUS_TABS } from './public-pool-model'
 
-const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100]
 const REFRESH_INTERVAL_MS = 10_000
 
 /** Downstream agents should not learn that external pools exist. */

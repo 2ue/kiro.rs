@@ -1487,13 +1487,76 @@ fn parse_export_credential_ids(raw: Option<&str>) -> Result<Vec<u64>, String> {
     Ok(ids)
 }
 
+/// 导出时的账号筛选条件。没有任何条件时返回 None（导出全部）。
+/// `disabled=true` 是旧参数，等同于 `status=disabled`。
+fn export_credentials_filter(
+    query: &ExportCredentialsQuery,
+) -> Result<Option<super::service::CredentialListQuery>, String> {
+    let mut status = non_blank(query.status.clone());
+    if query.disabled == Some(true) {
+        match status.as_deref() {
+            None => status = Some("disabled".to_string()),
+            Some("disabled") => {}
+            Some(other) => {
+                return Err(format!("disabled=true 与 status={} 不能同时使用", other));
+            }
+        }
+    }
+    let filter = super::service::CredentialListQuery {
+        q: non_blank(query.q.clone()),
+        credential_id: query.credential_id,
+        account: non_blank(query.account.clone()),
+        region: non_blank(query.region.clone()),
+        model: non_blank(query.model.clone()),
+        endpoint: non_blank(query.endpoint.clone()),
+        priority: query.priority,
+        rpm: query.rpm,
+        concurrency: query.concurrency,
+        status,
+        auth_method: non_blank(query.auth_method.clone()),
+        subscription: non_blank(query.subscription.clone()),
+        proxy_resource_id: query.proxy_resource_id,
+        sort_by: None,
+        sort_order: None,
+    };
+    let has_filter = filter.q.is_some()
+        || filter.credential_id.is_some()
+        || filter.account.is_some()
+        || filter.region.is_some()
+        || filter.model.is_some()
+        || filter.endpoint.is_some()
+        || filter.priority.is_some()
+        || filter.rpm.is_some()
+        || filter.concurrency.is_some()
+        || filter
+            .status
+            .as_deref()
+            .is_some_and(|status| !status.eq_ignore_ascii_case("all"))
+        || filter.auth_method.is_some()
+        || filter.subscription.is_some()
+        || filter.proxy_resource_id.is_some();
+    Ok(has_filter.then_some(filter))
+}
+
 /// GET /api/admin/credentials/export?format=json|backup-json|jsonl&ids=1,2,3
-/// 导出完整凭据。ids 为空时导出全部；ids 非空时仅导出选中凭据。
+/// GET /api/admin/credentials/export?format=json&status=normal&subscription=pro...
+/// 导出完整凭据。ids 和筛选条件二选一：ids 导出选中凭据，筛选条件与账号列表
+/// `/credentials-paged` 含义相同；都为空时导出全部。
 pub async fn export_credentials(
     State(state): State<AdminState>,
     Query(query): Query<ExportCredentialsQuery>,
 ) -> Response {
     let format = query.format.as_deref().unwrap_or("json");
+    let filter = match export_credentials_filter(&query) {
+        Ok(filter) => filter,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorResponse::invalid_request(message)),
+            )
+                .into_response();
+        }
+    };
     let selected_ids = match parse_export_credential_ids(query.ids.as_deref()) {
         Ok(ids) => ids,
         Err(message) => {
@@ -1506,9 +1569,9 @@ pub async fn export_credentials(
     };
     match state
         .service
-        .export_credentials(format, &selected_ids, query.disabled.unwrap_or(false))
+        .export_credentials(format, &selected_ids, filter.as_ref())
     {
-        Ok((body, filename)) => {
+        Ok((body, filename, count)) => {
             let content_type = if filename.ends_with(".jsonl") {
                 "application/x-ndjson; charset=utf-8"
             } else {
@@ -1521,6 +1584,7 @@ pub async fn export_credentials(
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{}\"", filename),
                 )
+                .header("x-credential-count", count)
                 .body(Body::from(body))
                 .expect("valid credentials export response")
         }
@@ -2220,5 +2284,59 @@ mod tests {
             vec![1, 2, 3]
         );
         assert!(parse_export_credential_ids(Some("1,nope")).is_err());
+    }
+
+    #[test]
+    fn export_credentials_query_maps_list_filters_and_legacy_disabled_flag() {
+        let parse = |value: serde_json::Value| -> ExportCredentialsQuery {
+            serde_json::from_value(value).unwrap()
+        };
+
+        // No filter, blank filter values and status=all all mean "export everything".
+        assert!(
+            export_credentials_filter(&parse(serde_json::json!({})))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            export_credentials_filter(&parse(serde_json::json!({
+                "q": "  ",
+                "status": "all",
+                "disabled": false,
+            })))
+            .unwrap()
+            .is_none()
+        );
+
+        let filter = export_credentials_filter(&parse(serde_json::json!({
+            "status": "normal",
+            "subscription": "pro",
+            "region": "us-east-1",
+            "model": "claude-opus-4.8",
+            "proxyResourceId": 3,
+            "q": " user@example.com ",
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(filter.status.as_deref(), Some("normal"));
+        assert_eq!(filter.subscription.as_deref(), Some("pro"));
+        assert_eq!(filter.region.as_deref(), Some("us-east-1"));
+        assert_eq!(filter.model.as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(filter.proxy_resource_id, Some(3));
+        assert_eq!(filter.q.as_deref(), Some("user@example.com"));
+        assert!(filter.sort_by.is_none() && filter.sort_order.is_none());
+
+        // The old `disabled=true` export keeps working as status=disabled.
+        let legacy = export_credentials_filter(&parse(serde_json::json!({ "disabled": true })))
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.status.as_deref(), Some("disabled"));
+        assert!(
+            export_credentials_filter(&parse(serde_json::json!({
+                "disabled": true,
+                "status": "normal",
+            })))
+            .is_err()
+        );
     }
 }

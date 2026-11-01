@@ -26,7 +26,7 @@ use crate::storage::credential_inventory::{
 };
 
 const MAX_IMPORT: usize = 500;
-const MAX_PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = 1000;
 /// A `pushing` row older than this was left by a crash and is reconciled at startup.
 const STALE_PUSH_SECS: i64 = 300;
 const RENEW_ROWS_PER_PASS: usize = 200;

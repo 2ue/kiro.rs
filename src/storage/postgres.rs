@@ -5111,7 +5111,7 @@ impl PostgresStore {
         filter: &AdminAuditLogFilter,
     ) -> anyhow::Result<AdminAuditLogPage> {
         let page = page.max(1);
-        let limit = if limit == 0 { 20 } else { limit.min(200) };
+        let limit = if limit == 0 { 20 } else { limit.min(1000) };
         let offset = page.saturating_sub(1).saturating_mul(limit);
         let mut builder = QueryBuilder::<Postgres>::new(
             "SELECT id, created_at, actor, action, object_type, object_id, success, error_message, detail FROM admin_audit_logs WHERE TRUE",
