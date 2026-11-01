@@ -5740,7 +5740,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 13;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 14;
 
 impl Config {
     /// 上游请求头里实际使用的 Kiro 客户端版本：开启自动同步且已读到官方版本时用读到的版本，
@@ -7270,6 +7270,13 @@ impl Config {
         if self.runtime_config_migration_version < 13 {
             // v13：提示词配置改为 promptInjection / routeFeatures（见 migrate_legacy_prompt_fields）。
             self.runtime_config_migration_version = 13;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 14 {
+            // v14：任务质量和分块写入策略换了内置文本。保存下来的文本若等于旧内置文本，
+            // 说明运营者没改过，删掉后使用新内置文本；改过的文本保持不变。
+            self.prompt_injection.drop_previous_default_texts();
+            self.runtime_config_migration_version = 14;
             changed = true;
         }
         changed
@@ -10188,6 +10195,64 @@ mod tests {
         config.payload_guard_mode = PayloadGuardMode::Preemptive;
         assert!(!config.apply_runtime_config_migrations());
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
+    }
+
+    #[test]
+    fn runtime_config_migration_v14_replaces_unedited_task_quality_and_chunked_texts() {
+        use crate::model::prompt_injection::{TextKey, catalog};
+
+        let previous_task_quality = catalog::previous_default_texts(TextKey::TaskQuality)[0];
+        let previous_chunked = catalog::previous_default_texts(TextKey::ChunkedWritePolicy)[0];
+        let mut config = Config {
+            runtime_config_migration_version: 13,
+            ..Default::default()
+        };
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::ChunkedWritePolicy, previous_chunked.to_string());
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::Custom, "operator text".to_string());
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        let injection = &config.prompt_injection;
+        assert!(!injection.texts.contains_key(&TextKey::TaskQuality));
+        assert!(!injection.texts.contains_key(&TextKey::ChunkedWritePolicy));
+        assert_eq!(
+            injection.text(TextKey::TaskQuality),
+            catalog::DEFAULT_TASK_QUALITY_PROMPT
+        );
+        assert_eq!(injection.text(TextKey::Custom), "operator text");
+        // Route switches are untouched.
+        assert_eq!(
+            injection.path_overrides,
+            PromptInjectionConfig::default().path_overrides
+        );
+
+        // Runs once: a later operator choice of the old text is kept.
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
+        assert!(!config.apply_runtime_config_migrations());
+        assert_eq!(
+            config
+                .prompt_injection
+                .texts
+                .get(&TextKey::TaskQuality)
+                .map(String::as_str),
+            Some(previous_task_quality)
+        );
     }
 
     #[test]
