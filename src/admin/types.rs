@@ -438,6 +438,8 @@ pub struct CredentialSummaryResponse {
     pub cooling: usize,
     pub quota_exhausted: usize,
     pub account_error: usize,
+    /// 不可用：已禁用、额度用尽或账号异常（去重计数）。
+    pub unavailable: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -629,8 +631,24 @@ pub struct ExportCredentialsQuery {
     pub format: Option<String>,
     /// Comma-separated credential ids to export. Empty or absent means export all credentials.
     pub ids: Option<String>,
-    /// Export only disabled credentials when true.
+    /// Export only disabled credentials when true. Same as `status=disabled`.
     pub disabled: Option<bool>,
+    // The account list filters, with the same meaning as on `/credentials-paged`.
+    pub q: Option<String>,
+    #[serde(alias = "id")]
+    pub credential_id: Option<u64>,
+    #[serde(alias = "email")]
+    pub account: Option<String>,
+    pub region: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<u32>,
+    pub rpm: Option<u32>,
+    pub concurrency: Option<u32>,
+    pub status: Option<String>,
+    pub auth_method: Option<String>,
+    pub subscription: Option<String>,
+    pub proxy_resource_id: Option<u64>,
 }
 
 // ============ 操作请求 ============

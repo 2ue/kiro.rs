@@ -23,6 +23,40 @@ interface PaginationProps {
   className?: string
 }
 
+/** 各列表通用的每页条数选项。 */
+export const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100, 200, 500, 1000]
+
+/** 只有上一页/下一页的列表（总数未知）用的每页条数选择器。 */
+export function PageSizeSelect({
+  value,
+  options = PAGE_SIZE_OPTIONS,
+  onChange,
+  disabled = false,
+}: {
+  value: number
+  options?: number[]
+  onChange: (pageSize: number) => void
+  disabled?: boolean
+}) {
+  return (
+    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      <span className="whitespace-nowrap">每页</span>
+      <Select value={String(value)} onValueChange={(next) => onChange(Number(next))} disabled={disabled}>
+        <SelectTrigger size="sm" className="h-8 w-[5.25rem]" aria-label="每页条数">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {options.map((option) => (
+            <SelectItem key={option} value={String(option)}>
+              {option} 条
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  )
+}
+
 type PageItem = number | 'ellipsis-left' | 'ellipsis-right'
 
 function clampPage(page: number, pageCount: number) {
@@ -111,26 +145,8 @@ export function Pagination({
         )}
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
-        {pageSizes.length > 0 && onPageSizeChange && (
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span className="whitespace-nowrap">每页</span>
-            <Select
-              value={String(pageSize)}
-              onValueChange={(value) => onPageSizeChange(Number(value))}
-              disabled={pending}
-            >
-              <SelectTrigger size="sm" className="h-8 w-[5.25rem]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {pageSizes.map((value) => (
-                  <SelectItem key={value} value={String(value)}>
-                    {value} 条
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+        {pageSizes.length > 0 && onPageSizeChange && pageSize !== undefined && (
+          <PageSizeSelect value={pageSize} options={pageSizes} onChange={onPageSizeChange} disabled={pending} />
         )}
         <div className="flex items-center gap-1">
           <Button

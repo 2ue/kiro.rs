@@ -51,6 +51,7 @@ import {
   StatGrid,
   Toolbar,
   useConfirm,
+  PAGE_SIZE_OPTIONS,
 } from '@/components/patterns'
 import { formatCredits, formatFullDate, formatNumber, formatUsdFixed2 } from '@/lib/format'
 import {
@@ -80,6 +81,7 @@ import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import { useModelCapabilities, useUsageSummary } from '@/hooks/use-usage'
 import type {
   BalanceResponse,
+  CredentialExportFilter,
   CredentialSortBy,
   CredentialSortOrder,
   CredentialStatusItem,
@@ -113,7 +115,6 @@ import {
 // Constants
 // ============================================================================
 
-const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100]
 const CREDIT_INFO_DETAIL_BATCH_SIZE = 500
 const EMAIL_SUFFIX_VISIBILITY_STORAGE_KEY = 'kiro-console:credentials:show-email-suffix'
 
@@ -371,6 +372,19 @@ export function CredentialsPage() {
   )
   const hasActiveFilters = regionFilter !== '__all__' || statusFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
   const hasAnyFilters = hasTextFilters || hasActiveFilters
+  // The list's filters minus paging and sorting; undefined when nothing is filtered.
+  const exportFilter = useMemo<CredentialExportFilter | undefined>(() => {
+    if (!hasAnyFilters) return undefined
+    return {
+      q: listQuery.q,
+      credentialId: listQuery.credentialId,
+      model: listQuery.model,
+      region: listQuery.region,
+      status: listQuery.status,
+      subscription: listQuery.subscription,
+      proxyResourceId: listQuery.proxyResourceId,
+    }
+  }, [hasAnyFilters, listQuery])
   const selectedCredentials = currentCredentials.filter((c) => selectedIds.has(c.id))
   const selectedDisabledCount = selectedCredentials.filter((c) => c.disabled).length
   const selectedEnabledCount = selectedCredentials.length - selectedDisabledCount
@@ -1429,7 +1443,16 @@ export function CredentialsPage() {
         onClose={() => setExportOpen(false)}
         selectedIds={Array.from(selectedIds)}
         totalCount={credentialSummary.data?.total ?? credentials.data?.total ?? 0}
-        disabledCount={disabledCount}
+        filter={exportFilter}
+        filteredCount={filteredTotal}
+        statusCounts={{
+          normal: credentialSummary.data?.normal,
+          unavailable: credentialSummary.data?.unavailable,
+          account_error: credentialSummary.data?.accountError,
+          quota_exhausted: credentialSummary.data?.quotaExhausted,
+          cooling: credentialSummary.data?.cooling ?? credentialSummary.data?.coolingDown,
+          disabled: credentialSummary.data ? disabledCount : undefined,
+        }}
       />
       <BatchVerifyModal
         open={verifyOpen}

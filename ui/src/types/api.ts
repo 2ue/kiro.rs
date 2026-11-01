@@ -47,6 +47,8 @@ export interface CredentialSummaryResponse {
   cooling: number
   quotaExhausted: number
   accountError: number
+  /** 已禁用、额度用尽或账号异常（去重）。 */
+  unavailable: number
 }
 
 export interface SystemVersionResponse {
@@ -2799,6 +2801,12 @@ export interface ManualModelResponse {
 }
 
 export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'
+
+/** 导出时的账号筛选条件，含义与账号列表 `/credentials-paged` 相同（不含分页和排序）。 */
+export type CredentialExportFilter = Omit<CredentialsPageQuery, 'page' | 'limit' | 'sortBy' | 'sortOrder'>
+
+/** 导出范围：选中账号，或按筛选条件（空对象表示全部）。二者只能取其一。 */
+export type CredentialExportScope = { ids: number[] } | { filter: CredentialExportFilter }
 
 // ============ 路由场景 ============
 

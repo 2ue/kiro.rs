@@ -114,6 +114,8 @@ use crate::storage::redis_cache::{RedisPatternDeleteStats, RedisStore};
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
+/// 账号列表每页上限，与前端分页选项的最大值一致。
+const MAX_CREDENTIALS_LIST_PAGE_LIMIT: usize = 1000;
 const MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 1;
 const MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 16;
 const MAX_LOCAL_RATE_LIMIT_RETRIES: u32 = 20;
@@ -2333,6 +2335,10 @@ impl AdminService {
             .iter()
             .filter(|credential| is_normal_account(credential))
             .count();
+        let unavailable = detailed
+            .iter()
+            .filter(|credential| is_unavailable_account(credential))
+            .count();
         CredentialSummaryResponse {
             total: snapshot.total,
             available: snapshot.available,
@@ -2352,6 +2358,7 @@ impl AdminService {
             cooling,
             quota_exhausted,
             account_error,
+            unavailable,
         }
     }
 
@@ -4497,10 +4504,10 @@ impl AdminService {
                 "没有选择要修改的账号".to_string(),
             ));
         }
-        if req.ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+        if req.ids.len() > MAX_CREDENTIALS_LIST_PAGE_LIMIT {
             return Err(AdminServiceError::InvalidCredential(format!(
                 "单次最多修改 {} 个账号",
-                MAX_CREDENTIALS_PAGE_LIMIT
+                MAX_CREDENTIALS_LIST_PAGE_LIMIT
             )));
         }
         if req.priority.is_none()
@@ -5650,24 +5657,43 @@ impl AdminService {
     }
 
     /// 导出完整凭据。仅格式化当前内存快照，不修改凭据状态。
+    ///
+    /// `selected_ids` 和 `filter` 二选一：前者导出选中账号，后者按账号列表的筛选规则
+    /// 导出匹配账号；都为空时导出全部。导出内容只有凭据配置，不带运行状态。
     pub fn export_credentials(
         &self,
         format: &str,
         selected_ids: &[u64],
-        disabled_only: bool,
-    ) -> Result<(String, String), AdminServiceError> {
-        let mut credentials = self.token_manager.export_credentials();
-        if disabled_only {
-            credentials.retain(|credential| credential.disabled);
-            if credentials.is_empty() {
-                return Err(AdminServiceError::InvalidCredential(
-                    "没有可导出的已禁用凭据".to_string(),
-                ));
-            }
+        filter: Option<&CredentialListQuery>,
+    ) -> Result<(String, String, usize), AdminServiceError> {
+        if !selected_ids.is_empty() && filter.is_some() {
+            return Err(AdminServiceError::InvalidCredential(
+                "选中账号和筛选条件不能同时用于导出".to_string(),
+            ));
         }
+        let mut credentials = self.token_manager.export_credentials();
         let selected_id_set: HashSet<u64> = selected_ids.iter().copied().collect();
         let selected = !selected_id_set.is_empty();
         filter_export_credentials_by_ids(&mut credentials, &selected_id_set)?;
+        if let Some(filter) = filter {
+            let matching_ids: HashSet<u64> = self
+                .credential_status_items(CredentialStatusBuildOptions {
+                    include_account_info: true,
+                    include_cost_summary: false,
+                })
+                .7
+                .iter()
+                .filter(|credential| credential_matches_query(credential, filter))
+                .map(|credential| credential.id)
+                .collect();
+            credentials
+                .retain(|credential| credential.id.is_some_and(|id| matching_ids.contains(&id)));
+            if credentials.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "当前筛选条件下没有可导出的账号".to_string(),
+                ));
+            }
+        }
         let credential_count = credentials.len();
         let normalized = format.trim().to_ascii_lowercase();
         let result = match normalized.as_str() {
@@ -5675,7 +5701,7 @@ impl AdminService {
                 let body = serde_json::to_string_pretty(&credentials).map_err(|e| {
                     AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                 })?;
-                Ok((body, "kiro-credentials.json".to_string()))
+                Ok((body, "kiro-credentials.json".to_string(), credential_count))
             }
             "backup-json" | "wrapped-json" => {
                 let export = CredentialsBackupExport {
@@ -5686,7 +5712,11 @@ impl AdminService {
                 let body = serde_json::to_string_pretty(&export).map_err(|e| {
                     AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                 })?;
-                Ok((body, "kiro-credentials-backup.json".to_string()))
+                Ok((
+                    body,
+                    "kiro-credentials-backup.json".to_string(),
+                    credential_count,
+                ))
             }
             "jsonl" => {
                 let mut lines = Vec::with_capacity(credentials.len());
@@ -5695,7 +5725,11 @@ impl AdminService {
                         AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                     })?);
                 }
-                Ok((lines.join("\n"), "kiro-credentials.jsonl".to_string()))
+                Ok((
+                    lines.join("\n"),
+                    "kiro-credentials.jsonl".to_string(),
+                    credential_count,
+                ))
             }
             _ => Err(AdminServiceError::InvalidCredential(format!(
                 "不支持的导出格式: {}，可选 json、backup-json、jsonl",
@@ -5713,7 +5747,7 @@ impl AdminService {
                 "count": credential_count,
                 "selected": selected,
                 "requestedIds": selected_ids.len(),
-                "disabledOnly": disabled_only,
+                "filter": filter.map(export_filter_audit_detail),
             }),
         );
         result
@@ -6043,7 +6077,7 @@ impl AdminService {
             tracing::warn!("查询 Admin 审计日志失败: {}", err);
             AdminAuditLogPage {
                 page: page.max(1),
-                limit: if limit == 0 { 20 } else { limit.min(200) },
+                limit: if limit == 0 { 20 } else { limit.min(1000) },
                 has_next: false,
                 records: Vec::new(),
             }
@@ -7454,7 +7488,7 @@ fn normalize_credentials_limit(limit: usize) -> usize {
     if limit == 0 {
         DEFAULT_CREDENTIALS_PAGE_LIMIT
     } else {
-        limit.min(MAX_CREDENTIALS_PAGE_LIMIT)
+        limit.min(MAX_CREDENTIALS_LIST_PAGE_LIMIT)
     }
 }
 
@@ -9012,6 +9046,7 @@ fn credential_matches_query(
             "quota_exhausted" | "quota-exhausted" => is_quota_exhausted(credential),
             "account_error" | "account-error" => is_account_error(credential),
             "normal" => is_normal_account(credential),
+            "unavailable" => is_unavailable_account(credential),
             "proxy_blocked" | "proxy-blocked" => matches!(
                 credential.effective_proxy_source.as_str(),
                 "resource_disabled" | "resource_missing"
@@ -9185,7 +9220,9 @@ fn credential_base_matches_query(
                 subscription_key(credential.subscription_title.as_deref()) == "unknown"
             }
             // Runtime-owned statuses are hydrated separately; keep the base list broad.
-            "current" | "cooldown" | "rate_limited" | "rate-limited" | "error" => true,
+            "current" | "cooldown" | "rate_limited" | "rate-limited" | "error" | "unavailable" => {
+                true
+            }
             _ => true,
         };
         if !matched {
@@ -9226,6 +9263,7 @@ fn status_requires_runtime_filter(status: &str) -> bool {
             | "account_error"
             | "account-error"
             | "normal"
+            | "unavailable"
             | "error"
     )
 }
@@ -10613,6 +10651,30 @@ async fn persist_usage_cleanup_progress(
     Ok(cancel_requested)
 }
 
+/// 审计里只记录实际用到的筛选条件。
+fn export_filter_audit_detail(filter: &CredentialListQuery) -> serde_json::Value {
+    let mut detail = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            detail.insert(key.to_string(), value);
+        }
+    };
+    put("q", filter.q.clone().map(Into::into));
+    put("credentialId", filter.credential_id.map(Into::into));
+    put("account", filter.account.clone().map(Into::into));
+    put("region", filter.region.clone().map(Into::into));
+    put("model", filter.model.clone().map(Into::into));
+    put("endpoint", filter.endpoint.clone().map(Into::into));
+    put("priority", filter.priority.map(Into::into));
+    put("rpm", filter.rpm.map(Into::into));
+    put("concurrency", filter.concurrency.map(Into::into));
+    put("status", filter.status.clone().map(Into::into));
+    put("authMethod", filter.auth_method.clone().map(Into::into));
+    put("subscription", filter.subscription.clone().map(Into::into));
+    put("proxyResourceId", filter.proxy_resource_id.map(Into::into));
+    serde_json::Value::Object(detail)
+}
+
 fn filter_export_credentials_by_ids(
     credentials: &mut Vec<KiroCredentials>,
     selected_id_set: &HashSet<u64>,
@@ -10704,6 +10766,11 @@ fn is_cooling_account(credential: &CredentialStatusItem) -> bool {
         && credential.cooled_down
         && !is_quota_exhausted(credential)
         && !is_account_error(credential)
+}
+
+/// 不可用：已禁用、额度用尽或账号异常。冷却会自行恢复，不算在内。
+fn is_unavailable_account(credential: &CredentialStatusItem) -> bool {
+    credential.disabled || is_quota_exhausted(credential) || is_account_error(credential)
 }
 
 fn is_normal_account(credential: &CredentialStatusItem) -> bool {
