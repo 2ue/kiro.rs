@@ -38,13 +38,15 @@ use super::types::{
     SetCredentialOverageRequest, SetCredentialProxyRequest,
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
     SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
-    SetSupportedModelsRequest, SetWarmupRequest, SupportedModelsResponse, TestCredentialRequest,
-    TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest,
-    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
-    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupResumeRequest,
-    UsageCleanupStatusResponse, UsageDashboardAccountItem, UsageDashboardAccountsResponse,
-    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+    SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
+    SubscriptionModelListItem, SubscriptionModelListsResponse, SupportedModelsResponse,
+    SyncSubscriptionModelListRequest, TestCredentialRequest, TestCredentialResponse,
+    TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
+    UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
+    UsageDashboardAccountItem, UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::request_key_limits::{
     KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
@@ -5656,6 +5658,178 @@ impl AdminService {
         Ok(ManualModelResponse::new(model, "手动模型已删除"))
     }
 
+    /// 订阅等级模型列表：每个已知等级一行，附带该等级的账号数。
+    pub fn get_subscription_model_lists(&self) -> SubscriptionModelListsResponse {
+        const TIERS: [&str; 6] = ["free", "students", "pro", "pro_plus", "pro_max", "power"];
+        let config = self.token_manager.runtime_config();
+        let snapshot = self.token_manager.snapshot();
+        let mut counts: HashMap<&'static str, (usize, usize)> = HashMap::new();
+        for entry in &snapshot.entries {
+            let tier = crate::model::model_support::subscription_tier_key(
+                entry.subscription_title.as_deref(),
+            );
+            let count = counts.entry(tier).or_default();
+            count.0 += 1;
+            if entry.supported_models.is_empty() {
+                count.1 += 1;
+            }
+        }
+        let mut tiers: Vec<String> = TIERS.iter().map(|tier| tier.to_string()).collect();
+        for tier in config.subscription_model_lists.keys() {
+            if !tiers.contains(tier) {
+                tiers.push(tier.clone());
+            }
+        }
+        let items = tiers
+            .into_iter()
+            .map(|tier| {
+                let list = config.subscription_model_lists.get(&tier);
+                let (credential_count, tier_limited_count) =
+                    counts.get(tier.as_str()).copied().unwrap_or_default();
+                SubscriptionModelListItem {
+                    label: subscription_label(&tier).to_string(),
+                    models: list.map(|list| list.models.clone()).unwrap_or_default(),
+                    source: list.map(|list| list.source.clone()),
+                    updated_at: list.and_then(|list| list.updated_at.clone()),
+                    source_credential_id: list.and_then(|list| list.source_credential_id),
+                    credential_count,
+                    tier_limited_count,
+                    tier,
+                }
+            })
+            .collect();
+        SubscriptionModelListsResponse { items }
+    }
+
+    fn validate_subscription_tier(tier: &str) -> Result<String, AdminServiceError> {
+        let tier = tier.trim().to_ascii_lowercase();
+        if matches!(
+            tier.as_str(),
+            "free" | "students" | "pro" | "pro_plus" | "pro_max" | "power"
+        ) {
+            Ok(tier)
+        } else {
+            Err(AdminServiceError::InvalidCredential(format!(
+                "未知订阅等级: {tier}，可选 free、students、pro、pro_plus、pro_max、power"
+            )))
+        }
+    }
+
+    /// 手动设置一个等级的模型列表；空列表删除该等级的列表（不限制）。
+    pub fn set_subscription_model_list(
+        &self,
+        tier: &str,
+        req: SetSubscriptionModelListRequest,
+    ) -> Result<SubscriptionModelListsResponse, AdminServiceError> {
+        let tier = Self::validate_subscription_tier(tier)?;
+        let models = normalize_supported_models(req.models);
+        let removed = models.is_empty();
+        let count = models.len();
+        let list = crate::model::config::SubscriptionModelList {
+            models,
+            source: "manual".to_string(),
+            updated_at: Some(Utc::now().to_rfc3339()),
+            source_credential_id: None,
+        };
+        let key = tier.clone();
+        self.token_manager
+            .update_runtime_config(move |config| {
+                if removed {
+                    config.subscription_model_lists.remove(&key);
+                } else {
+                    config.subscription_model_lists.insert(key, list);
+                }
+            })
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("保存订阅等级模型列表失败: {e}"))
+            })?;
+        self.audit(
+            "set_subscription_model_list",
+            "subscription_model_list",
+            Some(tier.clone()),
+            true,
+            None,
+            json!({ "tier": tier, "count": count, "removed": removed }),
+        );
+        Ok(self.get_subscription_model_lists())
+    }
+
+    /// 用该等级的一个账号重新获取模型列表并覆盖保存（手动同步）。
+    pub async fn sync_subscription_model_list(
+        &self,
+        tier: &str,
+        req: SyncSubscriptionModelListRequest,
+    ) -> Result<SubscriptionModelListsResponse, AdminServiceError> {
+        let tier = Self::validate_subscription_tier(tier)?;
+        let snapshot = self.token_manager.snapshot();
+        let credential_id = match req.credential_id {
+            Some(id) => {
+                let entry = snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .ok_or_else(|| AdminServiceError::NotFound { id })?;
+                let actual = crate::model::model_support::subscription_tier_key(
+                    entry.subscription_title.as_deref(),
+                );
+                if actual != tier {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "账号 #{id} 的订阅等级是 {actual}，不是 {tier}"
+                    )));
+                }
+                id
+            }
+            None => snapshot
+                .entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .find(|entry| {
+                    crate::model::model_support::subscription_tier_key(
+                        entry.subscription_title.as_deref(),
+                    ) == tier
+                })
+                .map(|entry| entry.id)
+                .ok_or_else(|| {
+                    AdminServiceError::InvalidCredential(format!(
+                        "没有可用的 {} 账号可以获取模型列表",
+                        subscription_label(&tier)
+                    ))
+                })?,
+        };
+        let models = self
+            .discover_credential_supported_model_variants(credential_id)
+            .await?;
+        if models.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "账号 #{credential_id} 返回空模型列表，未保存"
+            )));
+        }
+        let count = models.len();
+        let list = crate::model::config::SubscriptionModelList {
+            models,
+            source: "manual".to_string(),
+            updated_at: Some(Utc::now().to_rfc3339()),
+            source_credential_id: Some(credential_id),
+        };
+        let key = tier.clone();
+        self.token_manager
+            .update_runtime_config(move |config| {
+                config.subscription_model_lists.insert(key, list);
+            })
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("保存订阅等级模型列表失败: {e}"))
+            })?;
+        self.audit(
+            "sync_subscription_model_list",
+            "subscription_model_list",
+            Some(tier.clone()),
+            true,
+            None,
+            json!({ "tier": tier, "count": count, "credentialId": credential_id }),
+        );
+        Ok(self.get_subscription_model_lists())
+    }
+
     /// 导出完整凭据。仅格式化当前内存快照，不修改凭据状态。
     ///
     /// `selected_ids` 和 `filter` 二选一：前者导出选中账号，后者按账号列表的筛选规则
@@ -9482,41 +9656,7 @@ fn compare_subscription_change(
 }
 
 fn subscription_key(title: Option<&str>) -> String {
-    let Some(title) = title else {
-        return "unknown".to_string();
-    };
-    let lower = title.trim().to_lowercase();
-    if lower.is_empty() {
-        return "unknown".to_string();
-    }
-    let compact: String = lower
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect();
-    if compact.contains("student") {
-        "students".to_string()
-    } else if compact.contains("power") {
-        "power".to_string()
-    } else if compact.contains("promax") {
-        "pro_max".to_string()
-    } else if lower.contains("pro+")
-        || lower.contains("pro plus")
-        || lower.contains("pro_plus")
-        || lower.contains("pro-plus")
-        || compact.contains("proplus")
-    {
-        "pro_plus".to_string()
-    } else if lower.contains("trial") || lower.contains("试用") {
-        // Kiro no longer publishes Trial as a subscription tier. Treat legacy
-        // trial labels as the current Free tier for filtering and display.
-        "free".to_string()
-    } else if lower.contains("free") || lower.contains("免费") {
-        "free".to_string()
-    } else if lower.contains("pro") {
-        "pro".to_string()
-    } else {
-        "unknown".to_string()
-    }
+    crate::model::model_support::subscription_tier_key(title).to_string()
 }
 
 fn subscription_rank(title: Option<&str>) -> u8 {

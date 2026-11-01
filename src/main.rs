@@ -587,6 +587,7 @@ async fn async_main() {
         config.default_endpoint.clone(),
     );
     let kiro_provider = Arc::new(kiro_provider);
+    kiro_provider.attach_runtime(model_capabilities.clone());
     let initial_capability_cohort_keys = kiro_provider.model_capability_cohort_keys();
     let initial_contract_match = model_capabilities
         .reasoning_capability_cohort_contract_match(&initial_capability_cohort_keys);

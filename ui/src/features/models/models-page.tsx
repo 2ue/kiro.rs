@@ -51,6 +51,7 @@ import {
 } from '@/hooks/use-usage'
 import { useCredentialList } from '@/hooks/use-credentials'
 import type { ModelCapabilityItem, ModelPriceItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
+import { SubscriptionModelListsSection } from './subscription-model-lists'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
 
@@ -576,6 +577,8 @@ export function ModelsPage() {
           </div>
         )}
       </SectionCard>
+
+      <SubscriptionModelListsSection />
 
       <SectionCard
         title="模型清单"

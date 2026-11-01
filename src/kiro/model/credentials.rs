@@ -14,7 +14,9 @@ use base64::{
 };
 
 use crate::http_client::ProxyConfig;
-use crate::model::config::{Config, ExternalPoolRouteMode, route_policy_allows};
+use crate::model::config::{
+    Config, ExternalPoolRouteMode, SubscriptionModelLists, route_policy_allows,
+};
 use crate::model::model_support::{model_is_supported_by_list, normalize_supported_models};
 
 /// Kiro API Key/headless 凭据默认应走 CLI runtime 协议。
@@ -827,21 +829,6 @@ impl KiroCredentials {
         }
     }
 
-    /// 检查凭据是否支持 Opus 模型
-    ///
-    /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
-    pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
-            Some(title) => {
-                let title_upper = title.to_uppercase();
-                // 如果包含 FREE，则不支持 Opus
-                !title_upper.contains("FREE")
-            }
-            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
-        }
-    }
-
     pub fn normalize_supported_models(&mut self) {
         self.supported_models =
             normalize_supported_models(std::mem::take(&mut self.supported_models));
@@ -849,6 +836,40 @@ impl KiroCredentials {
 
     pub fn supports_model(&self, candidates: &[Option<&str>]) -> bool {
         model_is_supported_by_list(&self.supported_models, candidates)
+    }
+
+    /// Subscription tier of this account (`free`, `pro`, `power`, ...; `unknown` before the
+    /// subscription has been fetched).
+    pub fn subscription_tier(&self) -> &'static str {
+        crate::model::model_support::subscription_tier_key(self.subscription_title.as_deref())
+    }
+
+    /// Whether this account may take `candidates`. Only model lists decide: the account's own
+    /// list when it has one, otherwise its subscription tier's list; with neither, nothing is
+    /// restricted. No tier is special-cased here.
+    pub fn supports_model_with_tier_lists(
+        &self,
+        candidates: &[Option<&str>],
+        tier_lists: &SubscriptionModelLists,
+    ) -> bool {
+        if !self.supported_models.is_empty() {
+            return self.supports_model(candidates);
+        }
+        match self.tier_models(tier_lists) {
+            Some(models) => model_is_supported_by_list(models, candidates),
+            None => true,
+        }
+    }
+
+    /// The tier list that applies to this account: only when the account has no list of its own.
+    pub fn tier_models<'a>(&self, tier_lists: &'a SubscriptionModelLists) -> Option<&'a [String]> {
+        if !self.supported_models.is_empty() {
+            return None;
+        }
+        tier_lists
+            .get(self.subscription_tier())
+            .map(|list| list.models.as_slice())
+            .filter(|models| !models.is_empty())
     }
 
     /// 检查是否为 API Key 凭据

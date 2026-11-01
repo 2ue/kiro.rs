@@ -6666,7 +6666,7 @@ async fn test_model_scoped_429_high_concurrency_disabled_and_model_filters() {
     const PER_CREDENTIAL_LIMIT: u32 = 2;
     const GLOBAL_LIMIT: u32 = 12;
 
-    let mut config = Config::default();
+    let mut config = config_with_free_tier_without_opus();
     config.load_balancing_mode = "balanced".to_string();
     config.credential_max_concurrent_requests = PER_CREDENTIAL_LIMIT;
     config.dispatch_global_max_concurrent_requests = GLOBAL_LIMIT;
@@ -8848,7 +8848,14 @@ async fn selection_failure_summary_records_rpm_limited_accounts() {
 async fn selection_failure_summary_records_model_not_supported() {
     let mut free = api_key_credential("ksk_selection_free");
     free.subscription_title = Some("Free".to_string());
-    let manager = MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        config_with_free_tier_without_opus(),
+        vec![free],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let summary = manager.selection_failure_summary(
         "req_model",
@@ -8968,7 +8975,14 @@ fn test_local_pool_route_state_sees_manual_enable_after_all_disabled() {
 async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
     let mut free = api_key_credential("ksk_model_free");
     free.subscription_title = Some("Free".to_string());
-    let manager = MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        config_with_free_tier_without_opus(),
+        vec![free],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let unsupported = manager.local_pool_route_state(Some("claude-opus-4-8"));
     assert_eq!(unsupported.kind, LocalPoolRouteStateKind::NoModelCompatible);
@@ -9292,7 +9306,7 @@ async fn test_acquire_context_all_manually_disabled_fails_without_queueing() {
 
 #[tokio::test]
 async fn test_all_model_incompatible_credentials_fail_fast_without_queueing() {
-    let mut config = Config::default();
+    let mut config = config_with_free_tier_without_opus();
     config.credential_max_concurrent_requests = 1;
     config.credential_dispatch_max_wait_secs = 1;
 
@@ -12951,8 +12965,14 @@ async fn test_current_id_respects_opus_model_filter() {
     pro.access_token = Some("pro-token".to_string());
     pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        config_with_free_tier_without_opus(),
+        vec![free, pro],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let ctx = manager
         .acquire_context(Some("claude-opus-4"))
@@ -15629,4 +15649,210 @@ fn runtime_events_published_by_this_instance_are_recognised() {
     assert!(!manager.runtime_event_is_from_this_instance(&other));
     assert!(!manager.runtime_event_is_from_this_instance(r#"{"kind":"credentials_changed"}"#));
     assert!(!manager.runtime_event_is_from_this_instance("not json"));
+}
+
+fn tier_list(models: &[&str]) -> crate::model::config::SubscriptionModelList {
+    crate::model::config::SubscriptionModelList {
+        models: models.iter().map(|model| model.to_string()).collect(),
+        source: "manual".to_string(),
+        updated_at: None,
+        source_credential_id: None,
+    }
+}
+
+#[test]
+fn subscription_tier_list_limits_accounts_without_their_own_list() {
+    let mut free = api_key_credential("ksk_tier_free");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    let mut pro = api_key_credential("ksk_tier_pro");
+    pro.subscription_title = Some("KIRO PRO".to_string());
+    let mut config = Config::default();
+    config.subscription_model_lists.insert(
+        "free".to_string(),
+        tier_list(&["claude-sonnet-4.5", "claude-haiku-4.5"]),
+    );
+    let manager = MultiTokenManager::new(config, vec![free, pro], None, None, false).unwrap();
+
+    // The Free list allows sonnet: both accounts take it (Pro has no list, so no limit).
+    let sonnet = manager.local_pool_route_state(Some("claude-sonnet-4-5"));
+    assert_eq!(sonnet.model_usable, 2);
+    // A model missing from the Free list leaves only the Pro account.
+    let other = manager.local_pool_route_state(Some("claude-sonnet-5"));
+    assert_eq!(other.model_usable, 1);
+    let summary = manager.selection_failure_summary(
+        "req_tier",
+        "/cc/v1/messages",
+        Some("claude-sonnet-5"),
+        "test",
+    );
+    assert_eq!(
+        summary
+            .reason_counts
+            .get(&AccountRejectReason::ModelNotSupported),
+        Some(&1)
+    );
+}
+
+#[test]
+fn account_own_model_list_replaces_the_tier_list() {
+    let mut free = api_key_credential("ksk_tier_own_list");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    // The account's own list names a model the Free list doesn't, and leaves out one it does.
+    free.supported_models = vec!["claude-sonnet-5".to_string()];
+    let mut config = Config::default();
+    config
+        .subscription_model_lists
+        .insert("free".to_string(), tier_list(&["claude-haiku-4.5"]));
+    let manager = MultiTokenManager::new(config, vec![free], None, None, false).unwrap();
+
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-sonnet-5"))
+            .model_usable,
+        1
+    );
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-haiku-4-5"))
+            .model_usable,
+        0
+    );
+}
+
+#[test]
+fn tier_name_alone_restricts_nothing_only_model_lists_do() {
+    // No tier is special-cased: a Free account without any list takes opus.
+    let mut free = api_key_credential("ksk_tier_no_list");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![free.clone()], None, None, false).unwrap();
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-opus-4-8"))
+            .model_usable,
+        1
+    );
+
+    // Once the Free tier has a list, that list decides: opus is out, sonnet is in.
+    let manager = MultiTokenManager::new(
+        config_with_free_tier_without_opus(),
+        vec![free],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-opus-4-8"))
+            .model_usable,
+        0
+    );
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-sonnet-4-5"))
+            .model_usable,
+        1
+    );
+}
+
+#[test]
+fn subscription_change_is_reported_to_the_tier_observer() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![api_key_credential("ksk_tier_observer")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let sink = seen.clone();
+    manager.set_subscription_tier_observer(Box::new(move |id, tier| {
+        sink.lock().unwrap().push((id, tier));
+    }));
+    // The observer only exists to react to stored subscription changes; calling it here stands
+    // in for `get_usage_limits_for` seeing a new subscription title.
+    manager
+        .subscription_tier_observer
+        .get()
+        .expect("observer registered")(1, "free");
+    assert_eq!(*seen.lock().unwrap(), vec![(1, "free")]);
+}
+
+#[test]
+fn tier_list_filters_but_does_not_make_accounts_preferred() {
+    // A Free list naming sonnet must not pull sonnet traffic onto Free accounts ahead of Pro
+    // accounts without any list.
+    let mut free = api_key_credential("ksk_tier_pref_free");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    let mut pro = api_key_credential("ksk_tier_pref_pro");
+    pro.subscription_title = Some("KIRO PRO".to_string());
+    let manager = MultiTokenManager::new(
+        config_with_free_tier_without_opus(),
+        vec![free, pro],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(!manager.has_alternate_catalog_listed_credential_cached(
+        Some("claude-sonnet-4-5"),
+        &HashSet::new(),
+        2,
+    ));
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-sonnet-4-5"))
+            .model_usable,
+        2
+    );
+}
+
+#[test]
+fn set_subscription_model_list_only_if_missing_keeps_an_existing_list() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![api_key_credential("ksk_tier_set")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(
+        manager
+            .set_subscription_model_list("free", tier_list(&["claude-sonnet-4.5"]), true)
+            .unwrap()
+    );
+    // The automatic fetch runs once: a second one does not overwrite.
+    assert!(
+        !manager
+            .set_subscription_model_list("free", tier_list(&["claude-haiku-4.5"]), true)
+            .unwrap()
+    );
+    assert_eq!(
+        manager.runtime_config().subscription_model_lists["free"].models,
+        vec!["claude-sonnet-4.5".to_string()]
+    );
+    // A manual set replaces it.
+    assert!(
+        manager
+            .set_subscription_model_list("free", tier_list(&["claude-haiku-4.5"]), false)
+            .unwrap()
+    );
+    assert_eq!(
+        manager.runtime_config().subscription_model_lists["free"].models,
+        vec!["claude-haiku-4.5".to_string()]
+    );
+}
+
+/// A config whose Free tier list has no opus model: Free accounts are filtered out of opus
+/// requests by their tier list, like any other tier would be.
+fn config_with_free_tier_without_opus() -> Config {
+    let mut config = Config::default();
+    config.subscription_model_lists.insert(
+        "free".to_string(),
+        tier_list(&["claude-sonnet-4.5", "claude-haiku-4.5"]),
+    );
+    config
 }

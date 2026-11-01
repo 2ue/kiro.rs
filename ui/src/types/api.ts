@@ -3156,3 +3156,23 @@ export interface PublicPoolResponse {
   filteredTotal: number
   items: PublicPoolAccount[]
 }
+
+// ============ 订阅等级模型列表 ============
+
+export interface SubscriptionModelListItem {
+  tier: string
+  label: string
+  /** 未设置列表时为空（不限制）。 */
+  models: string[]
+  /** auto：自动获取；manual：手动设置或手动同步。 */
+  source?: string | null
+  updatedAt?: string | null
+  sourceCredentialId?: number | null
+  credentialCount: number
+  /** 没有设置自身支持模型、因而按等级列表限制的账号数。 */
+  tierLimitedCount: number
+}
+
+export interface SubscriptionModelListsResponse {
+  items: SubscriptionModelListItem[]
+}

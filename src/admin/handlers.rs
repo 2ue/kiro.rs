@@ -23,7 +23,8 @@ use super::{
         SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
         SetCredentialRegionsRequest, SetCredentialRoutePolicyRequest, SetCredentialRpmRequest,
         SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse, SyncModelCapabilitiesRequest,
+        SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
+        SuccessResponse, SyncModelCapabilitiesRequest, SyncSubscriptionModelListRequest,
         SystemVersionResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
         UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
         UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
@@ -1429,6 +1430,43 @@ pub async fn sync_model_capabilities(
             )
             .await,
     )
+}
+
+/// GET /api/admin/subscription-model-lists
+/// 各订阅等级的允许模型列表。
+pub async fn get_subscription_model_lists(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_subscription_model_lists())
+}
+
+/// PUT /api/admin/subscription-model-lists/{tier}
+/// 手动设置一个等级的列表；空列表表示删除（不限制）。
+pub async fn set_subscription_model_list(
+    State(state): State<AdminState>,
+    Path(tier): Path<String>,
+    Json(payload): Json<SetSubscriptionModelListRequest>,
+) -> Response {
+    match state.service.set_subscription_model_list(&tier, payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/subscription-model-lists/{tier}/sync
+/// 用该等级的一个账号重新获取模型列表。
+pub async fn sync_subscription_model_list(
+    State(state): State<AdminState>,
+    Path(tier): Path<String>,
+    payload: Option<Json<SyncSubscriptionModelListRequest>>,
+) -> Response {
+    let request = payload.map(|Json(request)| request).unwrap_or_default();
+    match state
+        .service
+        .sync_subscription_model_list(&tier, request)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/model-capabilities/manual

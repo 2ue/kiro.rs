@@ -76,8 +76,7 @@ use super::capacity::{
     credential_is_temporarily_available, credential_is_usable_for_model,
     credential_proxy_availability, credential_proxy_is_dispatchable,
     effective_max_concurrent_requests, effective_weight_for_limit, entry_has_concurrency_capacity,
-    global_has_concurrency_capacity, is_opus_model, normalize_capacity_weight_units,
-    proxy_unavailable_error,
+    global_has_concurrency_capacity, normalize_capacity_weight_units, proxy_unavailable_error,
 };
 #[cfg(test)]
 use super::concurrency::record_released_in_flight_lease_tombstone;
@@ -1062,6 +1061,11 @@ pub struct MultiTokenManager {
     /// Secret-free capability cohorts are rebuilt only after a relevant credential/config/proxy
     /// mutation. Request reads clone one Arc and never scan the account pool.
     model_capability_cohort_generation: AtomicU64,
+    /// Last account-info refresh started after a model rejection, per credential. Bounds the
+    /// refresh to one per account per [`MODEL_REJECTION_REFRESH_INTERVAL`].
+    model_rejection_refreshes: Mutex<HashMap<u64, Instant>>,
+    /// Called with `(credential id, new tier)` after a credential's stored subscription changes.
+    subscription_tier_observer: std::sync::OnceLock<SubscriptionTierObserver>,
     model_capability_cohort_cache: Mutex<ModelCapabilityCohortCache>,
 }
 
@@ -2192,6 +2196,12 @@ where
     Ok(report)
 }
 
+/// Observer of subscription changes, see [`MultiTokenManager::set_subscription_tier_observer`].
+pub(crate) type SubscriptionTierObserver = Box<dyn Fn(u64, &'static str) + Send + Sync>;
+
+/// Minimum time between two account-info refreshes of one credential after model rejections.
+const MODEL_REJECTION_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(10 * 60);
+
 fn block_on_credential_pgsql<T: Send>(
     operation: &'static str,
     future: impl Future<Output = anyhow::Result<T>> + Send,
@@ -2553,6 +2563,8 @@ impl MultiTokenManager {
             #[cfg(test)]
             auto_heal_pgsql_attempts: AtomicU64::new(0),
             model_capability_cohort_generation: AtomicU64::new(1),
+            model_rejection_refreshes: Mutex::new(HashMap::new()),
+            subscription_tier_observer: std::sync::OnceLock::new(),
             model_capability_cohort_cache: Mutex::new(ModelCapabilityCohortCache::default()),
         };
 
@@ -3293,8 +3305,9 @@ impl MultiTokenManager {
         for entry in entries.iter() {
             let (reason, cooldown_remaining) = if entry.disabled {
                 (AccountRejectReason::Disabled, None)
-            } else if !entry.credentials.supports_model(&[model])
-                || (is_opus_model(model) && !entry.credentials.supports_opus())
+            } else if !entry
+                .credentials
+                .supports_model_with_tier_lists(&[model], &config.subscription_model_lists)
             {
                 (AccountRejectReason::ModelNotSupported, None)
             } else if !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
@@ -3586,7 +3599,7 @@ impl MultiTokenManager {
         let mut effective_concurrency_range: Option<(u32, u32)> = None;
 
         for entry in scoped.iter().copied() {
-            if !credential_is_usable_for_model(entry, model) {
+            if !credential_is_usable_for_model(entry, model, &config.subscription_model_lists) {
                 continue;
             }
             model_usable += 1;
@@ -4019,6 +4032,7 @@ impl MultiTokenManager {
                     config.credential_max_concurrent_requests,
                     config.credential_rpm.unwrap_or(0),
                     1,
+                    &config.subscription_model_lists,
                 )
             })
         };
@@ -5873,7 +5887,13 @@ impl MultiTokenManager {
         }
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        let (global_rpm, tiers) = {
+            let config = self.config.lock();
+            (
+                config.credential_rpm.unwrap_or(0),
+                config.subscription_model_lists.clone(),
+            )
+        };
         if self.redis_store.is_none() {
             refresh_local_selection_windows_locked(&mut entries, now);
         }
@@ -5887,6 +5907,7 @@ impl MultiTokenManager {
                     model,
                     now,
                     global_rpm,
+                    &tiers,
                 )
         })
     }
@@ -5959,6 +5980,7 @@ impl MultiTokenManager {
                     max_concurrent_requests,
                     global_rpm,
                     1,
+                    &config.subscription_model_lists,
                 )
         })
     }
@@ -6000,6 +6022,7 @@ impl MultiTokenManager {
                     max_concurrent_requests,
                     global_rpm,
                     1,
+                    &config.subscription_model_lists,
                 )
         })
     }
@@ -6016,11 +6039,12 @@ impl MultiTokenManager {
     ) -> bool {
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let (max_concurrent_requests, global_rpm) = {
+        let (max_concurrent_requests, global_rpm, tiers) = {
             let config = self.config.lock();
             (
                 config.credential_max_concurrent_requests,
                 config.credential_rpm.unwrap_or(0),
+                config.subscription_model_lists.clone(),
             )
         };
         if self.redis_store.is_none() {
@@ -6038,6 +6062,7 @@ impl MultiTokenManager {
                     max_concurrent_requests,
                     global_rpm,
                     request_weight_units,
+                    &tiers,
                 )
         })
     }
@@ -6093,6 +6118,7 @@ impl MultiTokenManager {
                         config.credential_max_concurrent_requests,
                         config.credential_rpm.unwrap_or(0),
                         request_weight_units,
+                        &config.subscription_model_lists,
                     )
             })
         };
@@ -6125,10 +6151,11 @@ impl MultiTokenManager {
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> bool {
+        let tiers = self.config.lock().subscription_model_lists.clone();
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         entries.iter().any(|entry| {
-            credential_is_dispatch_candidate(&proxy_resources, entry, model, excluded_ids)
+            credential_is_dispatch_candidate(&proxy_resources, entry, model, excluded_ids, &tiers)
         })
     }
 
@@ -6175,6 +6202,7 @@ impl MultiTokenManager {
                         max_concurrent_requests,
                         global_rpm,
                         request_weight_units,
+                        &config.subscription_model_lists,
                     )
             })
             .collect::<Vec<_>>();
@@ -6238,10 +6266,16 @@ impl MultiTokenManager {
             return None;
         }
 
+        let (global_rpm, tiers) = {
+            let config = self.config.lock();
+            (
+                config.credential_rpm.unwrap_or(0),
+                config.subscription_model_lists.clone(),
+            )
+        };
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
-        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
         entries
             .iter()
             .find(|e| {
@@ -6252,6 +6286,7 @@ impl MultiTokenManager {
                         model,
                         now,
                         global_rpm,
+                        &tiers,
                     )
             })
             .map(|e| (e.id, e.credentials.clone()))
@@ -6274,7 +6309,7 @@ impl MultiTokenManager {
         let Some(entry) = entries.iter().find(|entry| entry.id == bound_id) else {
             return false;
         };
-        if !credential_is_usable_for_model(entry, model)
+        if !credential_is_usable_for_model(entry, model, &config.subscription_model_lists)
             || !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
         {
             return false;
@@ -6976,26 +7011,38 @@ impl MultiTokenManager {
                             );
                             let model_usable = entries
                                 .iter()
-                                .filter(|e| credential_is_usable_for_model(e, model))
+                                .filter(|e| {
+                                    credential_is_usable_for_model(
+                                        e,
+                                        model,
+                                        &config.subscription_model_lists,
+                                    )
+                                })
                                 .count();
                             let usable = entries
                                 .iter()
                                 .filter(|e| {
-                                    credential_is_usable_for_model(e, model)
-                                        && credential_proxy_is_dispatchable(
-                                            &e.credentials,
-                                            &proxy_resources,
-                                        )
+                                    credential_is_usable_for_model(
+                                        e,
+                                        model,
+                                        &config.subscription_model_lists,
+                                    ) && credential_proxy_is_dispatchable(
+                                        &e.credentials,
+                                        &proxy_resources,
+                                    )
                                 })
                                 .count();
                             let proxy_blocked = entries
                                 .iter()
                                 .filter(|e| {
-                                    credential_is_usable_for_model(e, model)
-                                        && !credential_proxy_is_dispatchable(
-                                            &e.credentials,
-                                            &proxy_resources,
-                                        )
+                                    credential_is_usable_for_model(
+                                        e,
+                                        model,
+                                        &config.subscription_model_lists,
+                                    ) && !credential_proxy_is_dispatchable(
+                                        &e.credentials,
+                                        &proxy_resources,
+                                    )
                                 })
                                 .count();
                             let dispatchable = if global_has_capacity {
@@ -7011,6 +7058,7 @@ impl MultiTokenManager {
                                                 max_concurrent_requests,
                                                 global_rpm,
                                                 request_weight_units,
+                                                &config.subscription_model_lists,
                                             )
                                     })
                                     .count()
@@ -7024,13 +7072,18 @@ impl MultiTokenManager {
                                     model,
                                     &local_excluded_ids,
                                     max_concurrent_requests,
+                                    &config.subscription_model_lists,
                                 ),
                             );
                             let excluded_usable = entries
                                 .iter()
                                 .filter(|e| {
                                     local_excluded_ids.contains(&e.id)
-                                        && credential_is_usable_for_model(e, model)
+                                        && credential_is_usable_for_model(
+                                            e,
+                                            model,
+                                            &config.subscription_model_lists,
+                                        )
                                         && credential_proxy_is_dispatchable(
                                             &e.credentials,
                                             &proxy_resources,
@@ -7092,6 +7145,7 @@ impl MultiTokenManager {
                                             e,
                                             model,
                                             &local_excluded_ids,
+                                            &config.subscription_model_lists,
                                         )
                                     })
                                     .count();
@@ -7103,6 +7157,7 @@ impl MultiTokenManager {
                                             e,
                                             model,
                                             &local_excluded_ids,
+                                            &config.subscription_model_lists,
                                         ) && entry_cooldown_remaining(e, model, now).is_some()
                                     })
                                     .count();
@@ -7113,6 +7168,7 @@ impl MultiTokenManager {
                                     &local_excluded_ids,
                                     now,
                                     global_rpm,
+                                    &config.subscription_model_lists,
                                 );
                                 if dispatch_candidate_count > 0
                                     && cooldown_blocked >= dispatch_candidate_count
@@ -7141,6 +7197,7 @@ impl MultiTokenManager {
                                     global_rpm,
                                     global_has_capacity,
                                     request_weight_units,
+                                    &config.subscription_model_lists,
                                 );
                                 let rate_limit_blocked = rate_limit_blocked_count(
                                     &entries,
@@ -7149,6 +7206,7 @@ impl MultiTokenManager {
                                     &local_excluded_ids,
                                     now,
                                     global_rpm,
+                                    &config.subscription_model_lists,
                                 );
                                 if concurrency_blocked > 0
                                     && concurrency_blocked >= dispatch_candidate_count
@@ -7495,6 +7553,7 @@ impl MultiTokenManager {
                 {
                     let global_credential_max_concurrent_requests = self.max_concurrent_requests();
                     let effective_credential_max_concurrent_requests = {
+                        let tiers = self.config.lock().subscription_model_lists.clone();
                         let entries = self.entries.lock();
                         let proxy_resources = self.proxy_resources.lock();
                         format_effective_concurrency_range(
@@ -7504,6 +7563,7 @@ impl MultiTokenManager {
                                 model,
                                 &local_excluded_ids,
                                 global_credential_max_concurrent_requests,
+                                &tiers,
                             ),
                         )
                     };
@@ -9009,6 +9069,129 @@ impl MultiTokenManager {
         self.apply_account_info_snapshot_for_credential(id, &info);
         self.publish_credentials_changed("credential_quota_account_info_refreshed");
         Ok(())
+    }
+
+    /// Subscription tier of credential `id` and whether that tier has a model list yet.
+    pub(crate) fn credential_subscription_tier(&self, id: u64) -> Option<(&'static str, bool)> {
+        let tier = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.credentials.subscription_tier())?;
+        let has_list = self
+            .config
+            .lock()
+            .subscription_model_lists
+            .get(tier)
+            .is_some_and(|list| !list.models.is_empty());
+        Some((tier, has_list))
+    }
+
+    /// Stores the model list of a subscription tier. With `only_if_missing`, an existing list is
+    /// kept (the automatic Free fetch runs once and never overwrites a manual edit).
+    pub(crate) fn set_subscription_model_list(
+        &self,
+        tier: &str,
+        list: crate::model::config::SubscriptionModelList,
+        only_if_missing: bool,
+    ) -> anyhow::Result<bool> {
+        if only_if_missing
+            && self
+                .config
+                .lock()
+                .subscription_model_lists
+                .get(tier)
+                .is_some_and(|existing| !existing.models.is_empty())
+        {
+            return Ok(false);
+        }
+        let tier = tier.to_string();
+        self.update_runtime_config(move |config| {
+            if only_if_missing
+                && config
+                    .subscription_model_lists
+                    .get(&tier)
+                    .is_some_and(|existing| !existing.models.is_empty())
+            {
+                return;
+            }
+            config.subscription_model_lists.insert(tier, list);
+        })?;
+        Ok(true)
+    }
+
+    /// Registers the observer of subscription changes (set once at startup).
+    pub(crate) fn set_subscription_tier_observer(&self, observer: SubscriptionTierObserver) {
+        let _ = self.subscription_tier_observer.set(observer);
+    }
+
+    /// After the upstream rejected a model on credential `id`: refresh its account info
+    /// (subscription, quota) in the background, at most once per account per
+    /// [`MODEL_REJECTION_REFRESH_INTERVAL`]. A changed subscription reaches the tier observer
+    /// through [`Self::get_usage_limits_for`]; dispatch then follows the new tier's model list.
+    pub(crate) fn spawn_model_rejection_account_refresh(self: &Arc<Self>, id: u64) {
+        // Same preconditions as the quota-exhausted refresh: the snapshot lives in PgSQL.
+        if self.postgres_store.is_none() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        {
+            let now = Instant::now();
+            let mut refreshes = self.model_rejection_refreshes.lock();
+            if refreshes.get(&id).is_some_and(|started| {
+                now.duration_since(*started) < MODEL_REJECTION_REFRESH_INTERVAL
+            }) {
+                return;
+            }
+            refreshes.retain(|_, started| {
+                now.duration_since(*started) < MODEL_REJECTION_REFRESH_INTERVAL
+            });
+            refreshes.insert(id, now);
+        }
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            match manager.get_usage_limits_for(id).await {
+                Ok(usage_limits) => {
+                    {
+                        let info = Self::account_info_row_from_usage_limits(&usage_limits);
+                        if let Some(store) = &manager.postgres_store {
+                            match store
+                                .save_credential_account_info_returning_previous(id, &info)
+                                .await
+                            {
+                                Ok(previous) => manager.record_account_quota_transition(
+                                    id,
+                                    previous,
+                                    &info,
+                                    "model_rejection_refresh",
+                                ),
+                                Err(error) => tracing::warn!(
+                                    credential_id = id,
+                                    "模型被拒后保存账号信息失败: {}",
+                                    error
+                                ),
+                            }
+                        }
+                        manager.apply_account_info_snapshot_for_credential(id, &info);
+                        manager.publish_credentials_changed("model_rejection_account_refreshed");
+                    }
+                    tracing::info!(
+                        credential_id = id,
+                        subscription_tier = manager
+                            .credential_subscription_tier(id)
+                            .map_or("unknown", |(tier, _)| tier),
+                        "上游拒绝模型后已刷新账号信息"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        credential_id = id,
+                        "上游拒绝模型后刷新账号信息失败: {}",
+                        error
+                    );
+                }
+            }
+        });
     }
 
     fn spawn_quota_exhausted_account_info_refresh(self: &Arc<Self>, id: u64) {
@@ -11981,6 +12164,7 @@ impl MultiTokenManager {
                         max_concurrent_requests,
                         global_rpm,
                         1,
+                        &config.subscription_model_lists,
                     )
             })
         };
@@ -13174,6 +13358,7 @@ impl MultiTokenManager {
                     max_concurrent_requests,
                     global_rpm,
                     1,
+                    &config.subscription_model_lists,
                 )
             })
             .collect();
@@ -13349,6 +13534,7 @@ impl MultiTokenManager {
                     max_concurrent_requests,
                     global_rpm,
                     1,
+                    &config.subscription_model_lists,
                 )
             })
             .collect();
@@ -13929,6 +14115,14 @@ impl MultiTokenManager {
                         subscription_title
                     );
                     self.publish_credentials_changed("subscription_title_updated");
+                    if let Some(observer) = self.subscription_tier_observer.get() {
+                        observer(
+                            id,
+                            crate::model::model_support::subscription_tier_key(Some(
+                                subscription_title,
+                            )),
+                        );
+                    }
                 }
             }
         }
