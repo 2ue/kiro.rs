@@ -1064,6 +1064,8 @@ pub struct MultiTokenManager {
     /// Last account-info refresh started after a model rejection, per credential. Bounds the
     /// refresh to one per account per [`MODEL_REJECTION_REFRESH_INTERVAL`].
     model_rejection_refreshes: Mutex<HashMap<u64, Instant>>,
+    /// Called with `(credential id, new tier)` after a credential's stored subscription changes.
+    subscription_tier_observer: std::sync::OnceLock<SubscriptionTierObserver>,
     model_capability_cohort_cache: Mutex<ModelCapabilityCohortCache>,
 }
 
@@ -2194,6 +2196,9 @@ where
     Ok(report)
 }
 
+/// Observer of subscription changes, see [`MultiTokenManager::set_subscription_tier_observer`].
+pub(crate) type SubscriptionTierObserver = Box<dyn Fn(u64, &'static str) + Send + Sync>;
+
 /// Minimum time between two account-info refreshes of one credential after model rejections.
 const MODEL_REJECTION_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(10 * 60);
 
@@ -2559,6 +2564,7 @@ impl MultiTokenManager {
             auto_heal_pgsql_attempts: AtomicU64::new(0),
             model_capability_cohort_generation: AtomicU64::new(1),
             model_rejection_refreshes: Mutex::new(HashMap::new()),
+            subscription_tier_observer: std::sync::OnceLock::new(),
             model_capability_cohort_cache: Mutex::new(ModelCapabilityCohortCache::default()),
         };
 
@@ -5965,7 +5971,7 @@ impl MultiTokenManager {
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
-                && credential_catalog_lists_model(entry, model, &config.subscription_model_lists)
+                && credential_catalog_lists_model(entry, model)
                 && credential_is_dispatchable(
                     &proxy_resources,
                     entry,
@@ -9115,15 +9121,16 @@ impl MultiTokenManager {
         Ok(true)
     }
 
+    /// Registers the observer of subscription changes (set once at startup).
+    pub(crate) fn set_subscription_tier_observer(&self, observer: SubscriptionTierObserver) {
+        let _ = self.subscription_tier_observer.set(observer);
+    }
+
     /// After the upstream rejected a model on credential `id`: refresh its account info
-    /// (subscription, quota) so a downgraded account is filtered by its new tier. Runs in the
-    /// background, at most once per account per [`MODEL_REJECTION_REFRESH_INTERVAL`], and passes
-    /// the tier after the refresh to `on_refreshed`.
-    pub(crate) fn spawn_model_rejection_account_refresh(
-        self: &Arc<Self>,
-        id: u64,
-        on_refreshed: impl FnOnce(Arc<Self>, Option<&'static str>) + Send + 'static,
-    ) {
+    /// (subscription, quota) in the background, at most once per account per
+    /// [`MODEL_REJECTION_REFRESH_INTERVAL`]. A changed subscription reaches the tier observer
+    /// through [`Self::get_usage_limits_for`]; dispatch then follows the new tier's model list.
+    pub(crate) fn spawn_model_rejection_account_refresh(self: &Arc<Self>, id: u64) {
         // Same preconditions as the quota-exhausted refresh: the snapshot lives in PgSQL.
         if self.postgres_store.is_none() || tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -9143,7 +9150,7 @@ impl MultiTokenManager {
         }
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let tier = match manager.get_usage_limits_for(id).await {
+            match manager.get_usage_limits_for(id).await {
                 Ok(usage_limits) => {
                     {
                         let info = Self::account_info_row_from_usage_limits(&usage_limits);
@@ -9168,15 +9175,13 @@ impl MultiTokenManager {
                         manager.apply_account_info_snapshot_for_credential(id, &info);
                         manager.publish_credentials_changed("model_rejection_account_refreshed");
                     }
-                    let tier = manager
-                        .credential_subscription_tier(id)
-                        .map(|(tier, _)| tier);
                     tracing::info!(
                         credential_id = id,
-                        subscription_tier = tier.unwrap_or("unknown"),
+                        subscription_tier = manager
+                            .credential_subscription_tier(id)
+                            .map_or("unknown", |(tier, _)| tier),
                         "上游拒绝模型后已刷新账号信息"
                     );
-                    tier
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -9184,10 +9189,8 @@ impl MultiTokenManager {
                         "上游拒绝模型后刷新账号信息失败: {}",
                         error
                     );
-                    None
                 }
-            };
-            on_refreshed(manager, tier);
+            }
         });
     }
 
@@ -14112,6 +14115,14 @@ impl MultiTokenManager {
                         subscription_title
                     );
                     self.publish_credentials_changed("subscription_title_updated");
+                    if let Some(observer) = self.subscription_tier_observer.get() {
+                        observer(
+                            id,
+                            crate::model::model_support::subscription_tier_key(Some(
+                                subscription_title,
+                            )),
+                        );
+                    }
                 }
             }
         }

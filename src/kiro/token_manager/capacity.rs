@@ -20,16 +20,14 @@ pub(super) fn credential_is_usable_for_model(
             .supports_model_with_tier_lists(&[model], tiers)
 }
 
-/// Whether the credential's model catalog, or its subscription tier's list when the account has
-/// none of its own, explicitly lists `model`. An empty catalog only passes the usable check as
-/// "unknown": OAuth credentials without a list are unrestricted, and API key credentials with an
-/// empty list failed or skipped discovery.
-pub(super) fn credential_catalog_lists_model(
-    entry: &CredentialEntry,
-    model: Option<&str>,
-    tiers: &SubscriptionModelLists,
-) -> bool {
-    model.is_some_and(|model| entry.credentials.model_catalog_lists(model, tiers))
+/// Whether the credential's own model catalog explicitly lists `model`. Only the account's list
+/// counts: subscription-tier lists filter accounts but don't make them preferred, otherwise every
+/// account of a listed tier would take the traffic ahead of unlisted ones. An empty catalog only
+/// passes the usable check as "unknown".
+pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
+    model.is_some_and(|model| !model.trim().is_empty())
+        && !entry.credentials.supported_models.is_empty()
+        && entry.credentials.supports_model(&[model])
 }
 
 pub(super) fn credential_is_dispatchable(

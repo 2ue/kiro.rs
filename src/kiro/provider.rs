@@ -594,8 +594,8 @@ pub struct KiroProvider {
     model_catalog: std::sync::OnceLock<Arc<ModelCapabilitiesCatalog>>,
     /// Weak handle to this provider for background work started from `&self` paths.
     self_handle: std::sync::OnceLock<std::sync::Weak<KiroProvider>>,
-    /// Set while the Free tier list is being fetched, so concurrent Free calls fetch once.
-    free_tier_list_fetching: Arc<AtomicBool>,
+    /// Tiers whose model list is being fetched, so concurrent calls fetch once.
+    tier_list_fetches: Mutex<HashSet<&'static str>>,
 }
 
 struct ProviderClientCacheEntry {
@@ -9282,7 +9282,7 @@ impl KiroProvider {
             profile_arn_discovery_metrics: ProfileArnDiscoveryMetrics::default(),
             model_catalog: std::sync::OnceLock::new(),
             self_handle: std::sync::OnceLock::new(),
-            free_tier_list_fetching: Arc::new(AtomicBool::new(false)),
+            tier_list_fetches: Mutex::new(HashSet::new()),
         }
     }
 
@@ -9291,6 +9291,7 @@ impl KiroProvider {
     pub fn attach_runtime(self: &Arc<Self>, catalog: Arc<ModelCapabilitiesCatalog>) {
         let _ = self.model_catalog.set(catalog);
         let _ = self.self_handle.set(Arc::downgrade(self));
+        self.watch_subscription_changes();
     }
 
     fn self_handle(&self) -> Option<Arc<Self>> {
@@ -9739,16 +9740,14 @@ impl KiroProvider {
             .as_deref()
             .and_then(profile_arn_region);
         let supports_requested_model = model
-            .map(|requested| credentials.supports_model(&[Some(requested)]))
+            .map(|requested| {
+                credentials.supports_model_with_tier_lists(
+                    &[Some(requested)],
+                    &config.subscription_model_lists,
+                )
+            })
             .unwrap_or(true);
-        let supports_opus_model = if model
-            .map(|requested| requested.to_ascii_lowercase().contains("opus"))
-            .unwrap_or(false)
-        {
-            credentials.supports_opus()
-        } else {
-            true
-        };
+        let subscription_tier = credentials.subscription_tier();
         tracing::warn!(
             credential_id,
             credential_label = %credential_label,
@@ -9760,7 +9759,7 @@ impl KiroProvider {
             provider = ?credentials.provider.as_deref(),
             supported_model_count = credentials.supported_models.len(),
             supports_requested_model,
-            supports_opus_model,
+            subscription_tier,
             upstream_status = upstream_status.as_u16(),
             body_bytes,
             attempt,
@@ -11479,60 +11478,69 @@ impl KiroProvider {
             .is_some_and(|catalog| catalog.contains_model(model))
     }
 
-    /// The first call dispatched to a Free account while the Free tier has no model list fetches
-    /// it once, in the background, from that account. Once stored it is never fetched again;
-    /// manual edits and syncs take over from there.
-    fn ensure_free_tier_model_list(&self, ctx: &CallContext) {
-        if ctx.credentials.subscription_tier() != "free"
+    /// Tiers whose model list is fetched automatically the first time one of their accounts is
+    /// seen, by a call or by a subscription change. Every other tier is listed by hand.
+    const AUTO_LISTED_TIERS: &'static [&'static str] = &["free"];
+
+    /// The first call dispatched to an account of an auto-listed tier without a list fetches the
+    /// list once, in the background, from that account.
+    fn ensure_tier_model_list(&self, ctx: &CallContext) {
+        self.ensure_tier_model_list_for(ctx.id, ctx.credentials.subscription_tier());
+    }
+
+    /// Fetches the tier list from credential `id` when `tier` is auto-listed and has no list yet.
+    /// The stored list then restricts every account of that tier through the normal model check.
+    fn ensure_tier_model_list_for(&self, id: u64, tier: &'static str) {
+        if !Self::AUTO_LISTED_TIERS.contains(&tier)
             || self
                 .token_manager
                 .runtime_config()
                 .subscription_model_lists
-                .get("free")
+                .get(tier)
                 .is_some_and(|list| !list.models.is_empty())
         {
             return;
         }
-        if let Some(provider) = self.self_handle() {
-            provider.spawn_free_tier_list_fetch(ctx.id);
-        }
-    }
-
-    /// Starts the background Free list fetch from credential `id` unless one is running.
-    fn spawn_free_tier_list_fetch(self: Arc<Self>, id: u64) {
-        if self.free_tier_list_fetching.swap(true, Ordering::AcqRel) {
+        let Some(provider) = self.self_handle() else {
+            return;
+        };
+        if !provider.tier_list_fetches.lock().insert(tier) {
             return;
         }
-        let fetching = self.free_tier_list_fetching.clone();
         tokio::spawn(async move {
-            self.auto_fetch_subscription_model_list(id, "free").await;
-            fetching.store(false, Ordering::Release);
+            provider.auto_fetch_subscription_model_list(id, tier).await;
+            provider.tier_list_fetches.lock().remove(tier);
         });
     }
 
-    /// Refreshes the rejecting account's info in the background. If it turns out to be on a
-    /// tier without a model list and that tier is Free, the Free list is fetched from this
-    /// account once and stored; other tiers are only listed by hand.
-    fn refresh_account_after_model_rejection(&self, id: u64) {
-        let provider = self.self_handle();
+    /// Hooks subscription changes: an account that moved to an auto-listed tier without a list
+    /// fetches it. Called once at startup.
+    fn watch_subscription_changes(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
         self.token_manager
-            .spawn_model_rejection_account_refresh(id, move |manager, tier| {
-                let (Some(provider), Some("free")) = (provider, tier) else {
-                    return;
-                };
-                if manager
-                    .credential_subscription_tier(id)
-                    .is_some_and(|(_, has_list)| has_list)
-                {
+            .set_subscription_tier_observer(Box::new(move |id, tier| {
+                if tokio::runtime::Handle::try_current().is_err() {
                     return;
                 }
-                provider.spawn_free_tier_list_fetch(id);
-            });
+                if let Some(provider) = weak.upgrade() {
+                    provider.ensure_tier_model_list_for(id, tier);
+                }
+            }));
+    }
+
+    /// Refreshes the rejecting account's info in the background. A changed subscription goes
+    /// through [`Self::watch_subscription_changes`].
+    fn refresh_account_after_model_rejection(&self, id: u64) {
+        if let Some(provider) = self.self_handle() {
+            provider
+                .token_manager
+                .spawn_model_rejection_account_refresh(id);
+        }
     }
 
     /// Fetches the model list of `tier` from credential `id` and stores it unless the tier got a
     /// list in the meantime. A failed or empty fetch stores nothing, so the tier stays
-    /// unrestricted and the next rejection tries again.
+    /// unrestricted and the next call to one of its accounts tries again.
     pub(crate) async fn auto_fetch_subscription_model_list(&self, id: u64, tier: &'static str) {
         let models = match self.list_available_models_for_credential(id).await {
             Ok(models) => {
@@ -13222,7 +13230,7 @@ impl KiroProvider {
                     break;
                 }
             };
-            self.ensure_free_tier_model_list(&ctx);
+            self.ensure_tier_model_list(&ctx);
             ctx.mark_in_flight_kind(if is_stream {
                 InFlightKind::Stream
             } else {
