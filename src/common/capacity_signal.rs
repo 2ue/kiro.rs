@@ -32,7 +32,10 @@ impl CapacitySignal {
             let waiters = self.waiters.load(Ordering::Acquire);
             let current = self.credits.load(Ordering::Acquire);
             let target = current.saturating_add(units).min(waiters);
-            if target == current {
+            // `unregister` lowers `waiters` before it trims `credits`, so a release in between
+            // sees more credits than waiters and `target < current`. There is nothing to add
+            // then; the trim that follows brings the credits back in line.
+            if target <= current {
                 return;
             }
             if self
@@ -250,6 +253,33 @@ mod tests {
             .await
             .expect("the second freed slot still wakes the second waiter");
         second.finish_acquired();
+        assert_eq!(signal.test_snapshot(), (0, 0, 0));
+    }
+
+    /// A release landing between `unregister`'s waiter decrement and its credit trim sees more
+    /// credits than waiters. It used to compute `target - current` with `target < current`:
+    /// a panic in debug builds, and a near-endless `notify_one` loop in release builds.
+    #[test]
+    fn release_between_unregister_steps_adds_nothing() {
+        let signal = Arc::new(CapacitySignal::default());
+        let first = signal.register();
+        let second = signal.register();
+        signal.capacity_released(2);
+        assert_eq!(signal.test_snapshot(), (2, 2, 0));
+
+        // The state `unregister` passes through: waiter count already lowered, credits not yet.
+        signal.waiters.store(1, Ordering::Release);
+        signal.capacity_released(1);
+        assert_eq!(
+            signal.test_snapshot(),
+            (1, 2, 0),
+            "a release adds no credits"
+        );
+
+        // Finishing the trim and dropping the rest leaves a clean signal.
+        signal.waiters.store(2, Ordering::Release);
+        drop(first);
+        drop(second);
         assert_eq!(signal.test_snapshot(), (0, 0, 0));
     }
 
