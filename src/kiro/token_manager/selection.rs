@@ -10,7 +10,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::model::config::Config;
+use crate::model::config::{Config, SubscriptionModelLists};
 
 use super::account_state::CredentialEntry;
 use super::capacity::{credential_catalog_lists_model, effective_max_concurrent_requests};
@@ -104,7 +104,8 @@ pub(crate) fn select_candidate<'a>(
     config: &Config,
     bound_sessions: &HashMap<u64, u32>,
 ) -> Option<&'a CredentialEntry> {
-    let mut available = prefer_catalog_listed(dispatchable, model);
+    let mut available =
+        prefer_catalog_listed(dispatchable, model, &config.subscription_model_lists);
     if available.is_empty() {
         return None;
     }
@@ -161,6 +162,7 @@ fn retain_preferred_priority_tier(available: &mut Vec<&CredentialEntry>) {
 fn prefer_catalog_listed<'a>(
     dispatchable: Vec<&'a CredentialEntry>,
     model: Option<&str>,
+    tiers: &SubscriptionModelLists,
 ) -> Vec<&'a CredentialEntry> {
     // When a dispatchable credential's catalog lists the model, credentials with an empty
     // catalog (discovery failed or never ran) are not picked: an invalid-model answer from them
@@ -169,13 +171,13 @@ fn prefer_catalog_listed<'a>(
     // traffic and no capacity is lost.
     let prefer_listed = dispatchable
         .iter()
-        .any(|entry| credential_catalog_lists_model(entry, model));
+        .any(|entry| credential_catalog_lists_model(entry, model, tiers));
     if !prefer_listed {
         return dispatchable;
     }
     dispatchable
         .into_iter()
-        .filter(|entry| credential_catalog_lists_model(entry, model))
+        .filter(|entry| credential_catalog_lists_model(entry, model, tiers))
         .collect()
 }
 

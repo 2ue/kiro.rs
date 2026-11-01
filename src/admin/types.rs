@@ -2675,3 +2675,43 @@ mod tests {
         assert!(!req.disable_first);
     }
 }
+
+// ============ 订阅等级模型列表 ============
+
+/// 一个订阅等级的模型列表与账号统计。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionModelListItem {
+    pub tier: String,
+    pub label: String,
+    /// 未设置列表时为空。
+    pub models: Vec<String>,
+    pub source: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_credential_id: Option<u64>,
+    /// 该等级的账号数。
+    pub credential_count: usize,
+    /// 其中没有设置自身支持模型、因而按等级列表限制的账号数。
+    pub tier_limited_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionModelListsResponse {
+    pub items: Vec<SubscriptionModelListItem>,
+}
+
+/// 手动设置一个等级的列表；`models` 为空表示删除（不限制）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSubscriptionModelListRequest {
+    pub models: Vec<String>,
+}
+
+/// 从该等级的一个账号重新获取模型列表；不指定账号时自动选一个可用账号。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSubscriptionModelListRequest {
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+}

@@ -15630,3 +15630,166 @@ fn runtime_events_published_by_this_instance_are_recognised() {
     assert!(!manager.runtime_event_is_from_this_instance(r#"{"kind":"credentials_changed"}"#));
     assert!(!manager.runtime_event_is_from_this_instance("not json"));
 }
+
+fn tier_list(models: &[&str]) -> crate::model::config::SubscriptionModelList {
+    crate::model::config::SubscriptionModelList {
+        models: models.iter().map(|model| model.to_string()).collect(),
+        source: "manual".to_string(),
+        updated_at: None,
+        source_credential_id: None,
+    }
+}
+
+#[test]
+fn subscription_tier_list_limits_accounts_without_their_own_list() {
+    let mut free = api_key_credential("ksk_tier_free");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    let mut pro = api_key_credential("ksk_tier_pro");
+    pro.subscription_title = Some("KIRO PRO".to_string());
+    let mut config = Config::default();
+    config.subscription_model_lists.insert(
+        "free".to_string(),
+        tier_list(&["claude-sonnet-4.5", "claude-haiku-4.5"]),
+    );
+    let manager = MultiTokenManager::new(config, vec![free, pro], None, None, false).unwrap();
+
+    // The Free list allows sonnet: both accounts take it (Pro has no list, so no limit).
+    let sonnet = manager.local_pool_route_state(Some("claude-sonnet-4-5"));
+    assert_eq!(sonnet.model_usable, 2);
+    // A model missing from the Free list leaves only the Pro account.
+    let other = manager.local_pool_route_state(Some("claude-sonnet-5"));
+    assert_eq!(other.model_usable, 1);
+    let summary = manager.selection_failure_summary(
+        "req_tier",
+        "/cc/v1/messages",
+        Some("claude-sonnet-5"),
+        "test",
+    );
+    assert_eq!(
+        summary
+            .reason_counts
+            .get(&AccountRejectReason::ModelNotSupported),
+        Some(&1)
+    );
+}
+
+#[test]
+fn account_own_model_list_replaces_the_tier_list() {
+    let mut free = api_key_credential("ksk_tier_own_list");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    // The account's own list names a model the Free list doesn't, and leaves out one it does.
+    free.supported_models = vec!["claude-sonnet-5".to_string()];
+    let mut config = Config::default();
+    config
+        .subscription_model_lists
+        .insert("free".to_string(), tier_list(&["claude-haiku-4.5"]));
+    let manager = MultiTokenManager::new(config, vec![free], None, None, false).unwrap();
+
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-sonnet-5"))
+            .model_usable,
+        1
+    );
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-haiku-4-5"))
+            .model_usable,
+        0
+    );
+}
+
+#[test]
+fn tier_without_a_list_keeps_the_built_in_free_opus_rule() {
+    let mut free = api_key_credential("ksk_tier_no_list");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![free.clone()], None, None, false).unwrap();
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-opus-4-8"))
+            .model_usable,
+        0
+    );
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-sonnet-4-5"))
+            .model_usable,
+        1
+    );
+
+    // An explicit Free list that names opus is the operator's call and is followed.
+    let mut config = Config::default();
+    config
+        .subscription_model_lists
+        .insert("free".to_string(), tier_list(&["claude-opus-4.8"]));
+    let manager = MultiTokenManager::new(config, vec![free], None, None, false).unwrap();
+    assert_eq!(
+        manager
+            .local_pool_route_state(Some("claude-opus-4-8"))
+            .model_usable,
+        1
+    );
+}
+
+#[test]
+fn tier_list_counts_as_a_listed_catalog_for_alternate_selection() {
+    let mut free = api_key_credential("ksk_tier_alt_free");
+    free.subscription_title = Some("KIRO FREE".to_string());
+    let mut unknown = api_key_credential("ksk_tier_alt_unknown");
+    unknown.subscription_title = Some("KIRO PRO".to_string());
+    let mut config = Config::default();
+    config
+        .subscription_model_lists
+        .insert("free".to_string(), tier_list(&["claude-sonnet-4.5"]));
+    let manager = MultiTokenManager::new(config, vec![free, unknown], None, None, false).unwrap();
+    // Credential 2 (Pro, no list anywhere) rejected the model; credential 1's tier list names
+    // it, so it is a known supporter worth moving to.
+    assert!(manager.has_alternate_catalog_listed_credential_cached(
+        Some("claude-sonnet-4-5"),
+        &HashSet::new(),
+        2,
+    ));
+    assert!(!manager.has_alternate_catalog_listed_credential_cached(
+        Some("claude-sonnet-4-5"),
+        &HashSet::new(),
+        1,
+    ));
+}
+
+#[test]
+fn set_subscription_model_list_only_if_missing_keeps_an_existing_list() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![api_key_credential("ksk_tier_set")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(
+        manager
+            .set_subscription_model_list("free", tier_list(&["claude-sonnet-4.5"]), true)
+            .unwrap()
+    );
+    // The automatic fetch runs once: a second one does not overwrite.
+    assert!(
+        !manager
+            .set_subscription_model_list("free", tier_list(&["claude-haiku-4.5"]), true)
+            .unwrap()
+    );
+    assert_eq!(
+        manager.runtime_config().subscription_model_lists["free"].models,
+        vec!["claude-sonnet-4.5".to_string()]
+    );
+    // A manual set replaces it.
+    assert!(
+        manager
+            .set_subscription_model_list("free", tier_list(&["claude-haiku-4.5"]), false)
+            .unwrap()
+    );
+    assert_eq!(
+        manager.runtime_config().subscription_model_lists["free"].models,
+        vec!["claude-haiku-4.5".to_string()]
+    );
+}

@@ -14,7 +14,9 @@ use base64::{
 };
 
 use crate::http_client::ProxyConfig;
-use crate::model::config::{Config, ExternalPoolRouteMode, route_policy_allows};
+use crate::model::config::{
+    Config, ExternalPoolRouteMode, SubscriptionModelLists, route_policy_allows,
+};
 use crate::model::model_support::{model_is_supported_by_list, normalize_supported_models};
 
 /// Kiro API Key/headless 凭据默认应走 CLI runtime 协议。
@@ -849,6 +851,62 @@ impl KiroCredentials {
 
     pub fn supports_model(&self, candidates: &[Option<&str>]) -> bool {
         model_is_supported_by_list(&self.supported_models, candidates)
+    }
+
+    /// Subscription tier of this account (`free`, `pro`, `power`, ...; `unknown` before the
+    /// subscription has been fetched).
+    pub fn subscription_tier(&self) -> &'static str {
+        crate::model::model_support::subscription_tier_key(self.subscription_title.as_deref())
+    }
+
+    /// Whether this account may take `candidates`, with the subscription-tier lists applied.
+    ///
+    /// The account's own list wins whenever it is set (the existing rule, including the Free/opus
+    /// check). Without one, its tier's list decides; a tier without a list keeps the built-in
+    /// rule that Free accounts don't take opus.
+    pub fn supports_model_with_tier_lists(
+        &self,
+        candidates: &[Option<&str>],
+        tier_lists: &SubscriptionModelLists,
+    ) -> bool {
+        if !self.supported_models.is_empty() {
+            return self.supports_model(candidates) && self.supports_opus_for(candidates);
+        }
+        match self.tier_models(tier_lists) {
+            Some(models) => model_is_supported_by_list(models, candidates),
+            None => self.supports_opus_for(candidates),
+        }
+    }
+
+    /// The tier list that applies to this account: only when the account has no list of its own.
+    pub fn tier_models<'a>(&self, tier_lists: &'a SubscriptionModelLists) -> Option<&'a [String]> {
+        if !self.supported_models.is_empty() {
+            return None;
+        }
+        tier_lists
+            .get(self.subscription_tier())
+            .map(|list| list.models.as_slice())
+            .filter(|models| !models.is_empty())
+    }
+
+    /// Whether the account's own list or its tier list explicitly names the model.
+    pub fn model_catalog_lists(&self, model: &str, tier_lists: &SubscriptionModelLists) -> bool {
+        if model.trim().is_empty() {
+            return false;
+        }
+        if !self.supported_models.is_empty() {
+            return self.supports_model(&[Some(model)]);
+        }
+        self.tier_models(tier_lists)
+            .is_some_and(|models| model_is_supported_by_list(models, &[Some(model)]))
+    }
+
+    fn supports_opus_for(&self, candidates: &[Option<&str>]) -> bool {
+        let wants_opus = candidates
+            .iter()
+            .flatten()
+            .any(|model| model.to_lowercase().contains("opus"));
+        !wants_opus || self.supports_opus()
     }
 
     /// 检查是否为 API Key 凭据

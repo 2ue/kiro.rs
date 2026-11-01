@@ -23,7 +23,8 @@ use crate::anthropic::inference_attempt_budget::{
     InferenceAttemptBudget, InferenceAttemptKind, InferenceAttemptRejection,
 };
 use crate::anthropic::model_capabilities::{
-    KiroReasoningCapabilityState, intersect_authoritative_reasoning_schemas,
+    KiroReasoningCapabilityState, ModelCapabilitiesCatalog,
+    intersect_authoritative_reasoning_schemas,
 };
 use crate::anthropic::payload_guard::kiro_payload_weight;
 use crate::http_client::{
@@ -53,6 +54,7 @@ use crate::kiro::token_manager::{
     TransientFailureKind, local_scheduler_error_kind,
 };
 use crate::model::config::{Config, TlsBackend};
+use crate::model::model_support::normalize_supported_models;
 use parking_lot::Mutex;
 
 /// 自动模式下单个下游请求共享的 provider 尝试预算，避免随凭据池规模放大上游 RPM。
@@ -587,6 +589,13 @@ pub struct KiroProvider {
     profile_arn_discovery_clock: AtomicU64,
     profile_arn_discovery_policy: ProfileArnDiscoveryPolicy,
     profile_arn_discovery_metrics: ProfileArnDiscoveryMetrics,
+    /// Merged Kiro model catalog, attached at startup. Tells an account-specific model
+    /// rejection (the model exists upstream) from an unknown model id.
+    model_catalog: std::sync::OnceLock<Arc<ModelCapabilitiesCatalog>>,
+    /// Weak handle to this provider for background work started from `&self` paths.
+    self_handle: std::sync::OnceLock<std::sync::Weak<KiroProvider>>,
+    /// Set while the Free tier list is being fetched, so concurrent Free calls fetch once.
+    free_tier_list_fetching: Arc<AtomicBool>,
 }
 
 struct ProviderClientCacheEntry {
@@ -6521,6 +6530,111 @@ mod tests {
         }
     }
 
+    /// A model the merged catalog lists exists upstream, so "invalid model" from one account is
+    /// about that account: the request keeps switching accounts through its attempt budget
+    /// instead of failing after one alternate.
+    #[tokio::test]
+    async fn invalid_model_known_to_the_catalog_switches_accounts_through_the_budget() {
+        let server = FakeBadRequestServer::start().await;
+        let credentials = fake_bad_request_credentials(6);
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 2;
+        config.credential_retry_max_attempts = 3;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, credentials, None, None, false).expect("token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let request = |round: usize| {
+            serde_json::json!({
+                "testScenario": "invalid_model",
+                "conversationState": {
+                    "conversationId": format!("catalog-known-invalid-{round}"),
+                    "currentMessage": {
+                        "userInputMessage": { "content": "test", "modelId": "claude-sonnet-4" }
+                    }
+                }
+            })
+            .to_string()
+        };
+
+        // Without a catalog: one alternate, then fail (the existing bound for unknown ids).
+        let provider = Arc::new(KiroProvider::with_proxy(
+            manager.clone(),
+            None,
+            endpoints.clone(),
+            "ide".to_string(),
+        ));
+        let before = server.state.scenario_hits("invalid_model");
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        let _ = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request(0),
+                Some("req-unknown"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                budget,
+                false,
+            )
+            .await;
+        assert_eq!(server.state.scenario_hits("invalid_model") - before, 2);
+
+        // With the model in the catalog: every send of the budget goes to a different account.
+        let catalog =
+            Arc::new(crate::anthropic::model_capabilities::ModelCapabilitiesCatalog::new());
+        catalog.load_persisted_status(
+            crate::anthropic::model_capabilities::ModelCapabilitiesCatalog::seed_status(),
+        );
+        assert!(catalog.contains_model("claude-sonnet-4"));
+        let provider = Arc::new(KiroProvider::with_proxy(
+            Arc::new(
+                MultiTokenManager::new(
+                    {
+                        let mut config = Config::default();
+                        config.kiro_upstream_base_url = Some(server.base_url.clone());
+                        config.kiro_upstream_response_timeout_secs = 2;
+                        config.credential_retry_max_attempts = 3;
+                        config
+                    },
+                    fake_bad_request_credentials(6),
+                    None,
+                    None,
+                    false,
+                )
+                .expect("token manager"),
+            ),
+            None,
+            endpoints,
+            "ide".to_string(),
+        ));
+        provider.attach_runtime(catalog);
+        let before = server.state.scenario_hits("invalid_model");
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        let error = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request(1),
+                Some("req-known"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                budget.clone(),
+                false,
+            )
+            .await
+            .err()
+            .expect("every account rejects the model");
+        let hits = server.state.scenario_hits("invalid_model") - before;
+        assert_eq!(hits, 5, "all five budgeted sends were used");
+        let attempts = KiroProvider::attempts_from_error(&error);
+        let accounts: HashSet<u64> = attempts
+            .iter()
+            .map(|attempt| attempt.credential_id)
+            .collect();
+        assert_eq!(accounts.len(), 5, "each send went to a different account");
+    }
+
     #[test]
     fn invalid_model_retry_is_unbounded_only_with_a_catalog_listed_alternate() {
         let model = Some("claude-sonnet-5");
@@ -9166,7 +9280,21 @@ impl KiroProvider {
             profile_arn_discovery_clock: AtomicU64::new(0),
             profile_arn_discovery_policy: ProfileArnDiscoveryPolicy::default(),
             profile_arn_discovery_metrics: ProfileArnDiscoveryMetrics::default(),
+            model_catalog: std::sync::OnceLock::new(),
+            self_handle: std::sync::OnceLock::new(),
+            free_tier_list_fetching: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Attaches the merged model catalog and the provider's own handle; called once at startup
+    /// after the provider is wrapped in an `Arc`.
+    pub fn attach_runtime(self: &Arc<Self>, catalog: Arc<ModelCapabilitiesCatalog>) {
+        let _ = self.model_catalog.set(catalog);
+        let _ = self.self_handle.set(Arc::downgrade(self));
+    }
+
+    fn self_handle(&self) -> Option<Arc<Self>> {
+        self.self_handle.get().and_then(std::sync::Weak::upgrade)
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -11341,6 +11469,115 @@ impl KiroProvider {
             .model_capability_cohort_keys_for_credentials(credential_ids)
     }
 
+    /// Whether the merged Kiro model catalog lists `model` (it exists upstream for some account).
+    fn model_is_in_kiro_catalog(&self, model: Option<&str>) -> bool {
+        let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+            return false;
+        };
+        self.model_catalog
+            .get()
+            .is_some_and(|catalog| catalog.contains_model(model))
+    }
+
+    /// The first call dispatched to a Free account while the Free tier has no model list fetches
+    /// it once, in the background, from that account. Once stored it is never fetched again;
+    /// manual edits and syncs take over from there.
+    fn ensure_free_tier_model_list(&self, ctx: &CallContext) {
+        if ctx.credentials.subscription_tier() != "free"
+            || self
+                .token_manager
+                .runtime_config()
+                .subscription_model_lists
+                .get("free")
+                .is_some_and(|list| !list.models.is_empty())
+        {
+            return;
+        }
+        if let Some(provider) = self.self_handle() {
+            provider.spawn_free_tier_list_fetch(ctx.id);
+        }
+    }
+
+    /// Starts the background Free list fetch from credential `id` unless one is running.
+    fn spawn_free_tier_list_fetch(self: Arc<Self>, id: u64) {
+        if self.free_tier_list_fetching.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let fetching = self.free_tier_list_fetching.clone();
+        tokio::spawn(async move {
+            self.auto_fetch_subscription_model_list(id, "free").await;
+            fetching.store(false, Ordering::Release);
+        });
+    }
+
+    /// Refreshes the rejecting account's info in the background. If it turns out to be on a
+    /// tier without a model list and that tier is Free, the Free list is fetched from this
+    /// account once and stored; other tiers are only listed by hand.
+    fn refresh_account_after_model_rejection(&self, id: u64) {
+        let provider = self.self_handle();
+        self.token_manager
+            .spawn_model_rejection_account_refresh(id, move |manager, tier| {
+                let (Some(provider), Some("free")) = (provider, tier) else {
+                    return;
+                };
+                if manager
+                    .credential_subscription_tier(id)
+                    .is_some_and(|(_, has_list)| has_list)
+                {
+                    return;
+                }
+                provider.spawn_free_tier_list_fetch(id);
+            });
+    }
+
+    /// Fetches the model list of `tier` from credential `id` and stores it unless the tier got a
+    /// list in the meantime. A failed or empty fetch stores nothing, so the tier stays
+    /// unrestricted and the next rejection tries again.
+    pub(crate) async fn auto_fetch_subscription_model_list(&self, id: u64, tier: &'static str) {
+        let models = match self.list_available_models_for_credential(id).await {
+            Ok(models) => {
+                normalize_supported_models(models.into_iter().map(|model| model.model_id))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    credential_id = id,
+                    tier,
+                    "自动获取订阅等级模型列表失败: {}",
+                    error
+                );
+                return;
+            }
+        };
+        if models.is_empty() {
+            tracing::warn!(
+                credential_id = id,
+                tier,
+                "自动获取订阅等级模型列表返回空列表，未保存"
+            );
+            return;
+        }
+        let count = models.len();
+        let list = crate::model::config::SubscriptionModelList {
+            models,
+            source: "auto".to_string(),
+            updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            source_credential_id: Some(id),
+        };
+        match self
+            .token_manager
+            .set_subscription_model_list(tier, list, true)
+        {
+            Ok(true) => tracing::info!(
+                credential_id = id,
+                tier,
+                count,
+                "已自动保存订阅等级模型列表"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(tier, "保存订阅等级模型列表失败: {}", error),
+        }
+    }
+
     /// 使用指定凭据同步 Kiro 可用模型列表。
     ///
     /// 该方法会真实调用上游模型列表接口，但不占用普通请求并发槽。
@@ -12985,6 +13222,7 @@ impl KiroProvider {
                     break;
                 }
             };
+            self.ensure_free_tier_model_list(&ctx);
             ctx.mark_in_flight_kind(if is_stream {
                 InFlightKind::Stream
             } else {
@@ -14568,14 +14806,35 @@ impl KiroProvider {
                     self.finish_attempt(&mut ctx);
                     return Err(Self::traced_error(message, &attempts));
                 }
+                // A model the merged catalog lists exists upstream, so a rejection is about this
+                // account (subscription, region): keep moving like an unavailable model.
                 let alternate_catalog_listed = bad_request_reason == "model_invalid_bad_request"
-                    && self
-                        .token_manager
-                        .has_alternate_catalog_listed_credential_cached(
-                            model.as_deref(),
-                            &excluded_ids,
-                            ctx.id,
+                    && (self.model_is_in_kiro_catalog(model.as_deref())
+                        || self
+                            .token_manager
+                            .has_alternate_catalog_listed_credential_cached(
+                                model.as_deref(),
+                                &excluded_ids,
+                                ctx.id,
+                            ));
+                if matches!(
+                    bad_request_reason,
+                    "model_unavailable_bad_request" | "model_invalid_bad_request"
+                ) {
+                    self.refresh_account_after_model_rejection(ctx.id);
+                    // An account-specific rejection moves on through the request's attempt
+                    // budget instead of the default few retries.
+                    if self.model_is_in_kiro_catalog(model.as_deref()) {
+                        max_retries = Self::model_unavailable_retry_limit(
+                            max_retries,
+                            attempt,
+                            extra_sends,
+                            inference_attempt_budget,
+                            preserve_external_attempt,
+                            max_sends,
                         );
+                    }
+                }
                 if Self::should_retry_model_400_bad_request(
                     bad_request_reason,
                     model.as_deref(),
@@ -14743,6 +15002,19 @@ impl KiroProvider {
                         attempt + 1,
                         max_retries,
                     );
+                }
+                if Self::should_retry_model_404_bad_request(bad_request_reason, model.as_deref()) {
+                    self.refresh_account_after_model_rejection(ctx.id);
+                    if self.model_is_in_kiro_catalog(model.as_deref()) {
+                        max_retries = Self::model_unavailable_retry_limit(
+                            max_retries,
+                            attempt,
+                            extra_sends,
+                            inference_attempt_budget,
+                            preserve_external_attempt,
+                            max_sends,
+                        );
+                    }
                 }
                 if Self::should_retry_model_404_bad_request(bad_request_reason, model.as_deref())
                     && attempt + 1 < max_retries

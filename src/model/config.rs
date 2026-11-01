@@ -5435,6 +5435,11 @@ pub struct Config {
     #[serde(default)]
     pub claude_models_only: bool,
 
+    /// 按订阅等级统一设置的允许模型（key 为 `free`、`pro`、`power` 等订阅等级）。账号自己
+    /// 设置了支持模型时以账号为准；没设置时按所属等级的列表限制；等级没有列表时不限制。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscription_model_lists: SubscriptionModelLists,
+
     /// 旧配置字段，只用于迁移，加载后转换成上面三个字段。
     #[serde(default, skip_serializing)]
     pub prompt_steering: Option<serde_json::Value>,
@@ -6810,6 +6815,24 @@ fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -
     normalized
 }
 
+/// 订阅等级 → 允许模型列表。
+pub type SubscriptionModelLists = BTreeMap<String, SubscriptionModelList>;
+
+/// 一个订阅等级允许的模型列表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionModelList {
+    pub models: Vec<String>,
+    /// `auto`：从该等级的账号自动获取；`manual`：在管理页手动设置或手动同步。
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// 自动获取时用的账号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_credential_id: Option<u64>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -6912,6 +6935,7 @@ impl Default for Config {
             prompt_injection: PromptInjectionConfig::default(),
             route_features: RouteFeaturesConfig::default(),
             claude_models_only: false,
+            subscription_model_lists: BTreeMap::new(),
             prompt_steering: None,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),

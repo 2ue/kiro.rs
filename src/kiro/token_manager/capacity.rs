@@ -2,37 +2,34 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::model::config::SubscriptionModelLists;
 
 use super::account_state::{CredentialEntry, ProxyResourceAvailability, ProxyResourceRuntime};
 use super::cooldown::entry_cooldown_remaining;
 use super::rpm::entry_rate_limit_remaining;
 
-pub(super) fn is_opus_model(model: Option<&str>) -> bool {
-    model
-        .map(|m| m.to_lowercase().contains("opus"))
-        .unwrap_or(false)
+pub(super) fn credential_is_usable_for_model(
+    entry: &CredentialEntry,
+    model: Option<&str>,
+    tiers: &SubscriptionModelLists,
+) -> bool {
+    !entry.disabled
+        && !entry.account_quota_blocked
+        && entry
+            .credentials
+            .supports_model_with_tier_lists(&[model], tiers)
 }
 
-pub(super) fn credential_is_usable_for_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
-    if entry.disabled || entry.account_quota_blocked {
-        return false;
-    }
-    if !entry.credentials.supports_model(&[model]) {
-        return false;
-    }
-    if is_opus_model(model) && !entry.credentials.supports_opus() {
-        return false;
-    }
-    true
-}
-
-/// Whether the credential's model catalog explicitly lists `model`. An empty catalog only
-/// passes `supports_model` as "unknown": for OAuth credentials it means unrestricted (they
-/// never run model discovery), for API key credentials that discovery failed or never ran.
-pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
-    model.is_some_and(|model| !model.trim().is_empty())
-        && !entry.credentials.supported_models.is_empty()
-        && entry.credentials.supports_model(&[model])
+/// Whether the credential's model catalog, or its subscription tier's list when the account has
+/// none of its own, explicitly lists `model`. An empty catalog only passes the usable check as
+/// "unknown": OAuth credentials without a list are unrestricted, and API key credentials with an
+/// empty list failed or skipped discovery.
+pub(super) fn credential_catalog_lists_model(
+    entry: &CredentialEntry,
+    model: Option<&str>,
+    tiers: &SubscriptionModelLists,
+) -> bool {
+    model.is_some_and(|model| entry.credentials.model_catalog_lists(model, tiers))
 }
 
 pub(super) fn credential_is_dispatchable(
@@ -43,8 +40,9 @@ pub(super) fn credential_is_dispatchable(
     max_concurrent_requests: u32,
     global_rpm: u32,
     request_weight_units: u32,
+    tiers: &SubscriptionModelLists,
 ) -> bool {
-    credential_is_usable_for_model(entry, model)
+    credential_is_usable_for_model(entry, model, tiers)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
         && entry_cooldown_remaining(entry, model, now).is_none()
         && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
@@ -57,8 +55,9 @@ pub(super) fn credential_is_temporarily_available(
     model: Option<&str>,
     now: Instant,
     global_rpm: u32,
+    tiers: &SubscriptionModelLists,
 ) -> bool {
-    credential_is_usable_for_model(entry, model)
+    credential_is_usable_for_model(entry, model, tiers)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
         && entry_cooldown_remaining(entry, model, now).is_none()
         && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
@@ -69,9 +68,10 @@ pub(super) fn credential_is_dispatch_candidate(
     entry: &CredentialEntry,
     model: Option<&str>,
     excluded_ids: &HashSet<u64>,
+    tiers: &SubscriptionModelLists,
 ) -> bool {
     !excluded_ids.contains(&entry.id)
-        && credential_is_usable_for_model(entry, model)
+        && credential_is_usable_for_model(entry, model, tiers)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
 }
 
