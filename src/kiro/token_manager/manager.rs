@@ -1093,6 +1093,11 @@ const SCHEDULER_REDIS_AFFINITY_MAX_IN_FLIGHT_OPERATIONS: usize = 128;
 const SCHEDULER_REDIS_REMOTE_SYNC_DEBOUNCE: StdDuration = StdDuration::from_millis(25);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE: StdDuration = StdDuration::from_secs(2);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX: StdDuration = StdDuration::from_secs(30);
+/// Redis coordination failure is a control-plane failure, not credential capacity. Keep the
+/// recovery grace independent from the normal dispatch queue deadline so a slow or unavailable
+/// Redis cannot turn every request into a long-lived local queue waiter. External fallback paths
+/// may provide a shorter mode-specific override; ordinary local requests are capped here too.
+const SCHEDULER_REDIS_DEGRADED_MAX_WAIT: StdDuration = StdDuration::from_millis(250);
 /// In local-preflight/external-fallback mode, a sticky-bound request should not immediately
 /// migrate to another credential solely because the previous cross-instance Redis release has
 /// not become visible yet. Keep this window short so a real holder still falls back quickly.
@@ -1714,6 +1719,19 @@ enum PreparedInFlightSlot {
         request_weight_units: u32,
         max_age: Option<StdDuration>,
     },
+}
+
+/// Result of the local part of dispatch admission.
+///
+/// A failed local reservation is normally a real capacity race and may enter the bounded
+/// dispatch queue.  Failure to reserve a release-reconciliation permit is different: it means
+/// the process cannot safely account for the Redis lease that it is about to create.  Treating
+/// that control-plane failure as `None` makes the caller believe that every credential is full,
+/// which is the false queueing symptom seen during Redis incidents.
+enum PreparedInFlightSlotResult {
+    Ready(PreparedInFlightSlot),
+    CapacityFull,
+    RedisReleaseAdmissionUnavailable,
 }
 
 #[derive(Clone, Debug)]
@@ -4143,6 +4161,7 @@ impl MultiTokenManager {
         self.redis_store.as_ref()?;
         self.scheduler_redis_breaker
             .retry_after()
+            .or_else(|| self.scheduler_redis_snapshot_breaker.retry_after())
             .map(|remaining| remaining.as_secs().saturating_add(1).max(1))
     }
 
@@ -4263,7 +4282,7 @@ impl MultiTokenManager {
         if self.redis_store.is_none() {
             return SchedulerRedisHotOutcome::Skipped;
         }
-        match Self::execute_scheduler_redis_operation(
+        let outcome = match Self::execute_scheduler_redis_operation(
             self.scheduler_redis_breaker.clone(),
             SCHEDULER_REDIS_HOT_OP_TIMEOUT,
             operation,
@@ -4284,7 +4303,19 @@ impl MultiTokenManager {
             SchedulerRedisExecutionOutcome::Failed { commit_unknown } => {
                 SchedulerRedisHotOutcome::Failed { commit_unknown }
             }
+        };
+        if matches!(
+            &outcome,
+            SchedulerRedisHotOutcome::Skipped
+                | SchedulerRedisHotOutcome::LocalSchedulerOverloaded
+                | SchedulerRedisHotOutcome::Failed { .. }
+        ) {
+            // Wake requests that were already waiting on the normal capacity queue. They must
+            // observe the degraded coordinator and leave the queue promptly instead of sleeping
+            // until the ordinary credential-dispatch deadline.
+            self.notify_dispatch_state_changed();
         }
+        outcome
     }
 
     fn block_on_scheduler_redis_state_sync<T: Send>(
@@ -5167,7 +5198,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
         request_weight_units: u32,
-    ) -> Option<PreparedInFlightSlot> {
+    ) -> PreparedInFlightSlotResult {
         let max_concurrent_requests = self.max_concurrent_requests();
         let effective_max_concurrent_requests =
             self.effective_max_concurrent_requests_for_id(id, max_concurrent_requests);
@@ -5176,8 +5207,14 @@ impl MultiTokenManager {
         let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
 
         if self.redis_store.is_some() {
-            let release_dispatcher = self.scheduler_redis_release_dispatcher.as_ref()?.clone();
-            let release_reservation = release_dispatcher.try_reserve()?;
+            let Some(release_dispatcher) =
+                self.scheduler_redis_release_dispatcher.as_ref().cloned()
+            else {
+                return PreparedInFlightSlotResult::RedisReleaseAdmissionUnavailable;
+            };
+            let Some(release_reservation) = release_dispatcher.try_reserve() else {
+                return PreparedInFlightSlotResult::RedisReleaseAdmissionUnavailable;
+            };
             if !self.acquire_provisional_local_in_flight_slot_with_id(
                 id,
                 lease_id,
@@ -5186,9 +5223,9 @@ impl MultiTokenManager {
                 global_max_concurrent_requests,
                 request_weight_units,
             ) {
-                return None;
+                return PreparedInFlightSlotResult::CapacityFull;
             }
-            return Some(PreparedInFlightSlot::Redis {
+            return PreparedInFlightSlotResult::Ready(PreparedInFlightSlot::Redis {
                 guard: InFlightLeaseGuard::new(
                     self.entries.clone(),
                     self.redis_store.clone(),
@@ -5215,19 +5252,21 @@ impl MultiTokenManager {
             global_max_concurrent_requests,
             request_weight_units,
         ) {
-            return Some(PreparedInFlightSlot::Local(InFlightLeaseGuard::new(
-                self.entries.clone(),
-                None,
-                None,
-                None,
-                None,
-                self.capacity_signal.clone(),
-                id,
-                lease_id,
-                request_weight_units,
-            )));
+            return PreparedInFlightSlotResult::Ready(PreparedInFlightSlot::Local(
+                InFlightLeaseGuard::new(
+                    self.entries.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.capacity_signal.clone(),
+                    id,
+                    lease_id,
+                    request_weight_units,
+                ),
+            ));
         }
-        None
+        PreparedInFlightSlotResult::CapacityFull
     }
 
     async fn confirm_prepared_in_flight_slot(
@@ -5336,8 +5375,16 @@ impl MultiTokenManager {
         request_weight_units: u32,
     ) -> anyhow::Result<Option<InFlightLeaseGuard>> {
         self.cleanup_expired_in_flight_leases_local_first();
-        let Some(prepared) = self.prepare_in_flight_slot(id, request_weight_units) else {
-            return Ok(None);
+        let prepared = match self.prepare_in_flight_slot(id, request_weight_units) {
+            PreparedInFlightSlotResult::Ready(prepared) => prepared,
+            PreparedInFlightSlotResult::CapacityFull => return Ok(None),
+            PreparedInFlightSlotResult::RedisReleaseAdmissionUnavailable => {
+                return Err(LocalSchedulerError::new(
+                    LocalSchedulerErrorKind::CapacityUnavailable,
+                    "本地账号调度容量暂不可用（release reconciliation 已饱和）",
+                )
+                .into());
+            }
         };
         self.confirm_prepared_in_flight_slot(prepared).await
     }
@@ -5791,27 +5838,6 @@ impl MultiTokenManager {
             lease_policy.ttl_secs,
             lease_policy.renewal_required,
         )))
-    }
-
-    fn try_enter_local_only_dispatch_queue(
-        &self,
-        max_wait: Option<StdDuration>,
-        admission: DispatchAdmission,
-    ) -> Option<DispatchQueueGuard> {
-        let max_queued = self.dispatch_queue_limit(admission);
-        if !self.try_enter_local_dispatch_queue(max_queued) {
-            return None;
-        }
-        let lease_policy = dispatch_queue_lease_policy(max_wait);
-        Some(DispatchQueueGuard::new(
-            None,
-            None,
-            None,
-            self.queued_requests.clone(),
-            None,
-            lease_policy.ttl_secs,
-            lease_policy.renewal_required,
-        ))
     }
 
     fn global_capacity_state(&self) -> SchedulerGlobalCapacityState {
@@ -6764,7 +6790,9 @@ impl MultiTokenManager {
         let dispatch_max_wait = self.dispatch_max_wait(acquire_mode);
         let redis_degraded_max_wait = acquire_mode
             .redis_degraded_max_wait_override()
-            .or(dispatch_max_wait);
+            .or(dispatch_max_wait)
+            .unwrap_or(SCHEDULER_REDIS_DEGRADED_MAX_WAIT)
+            .min(SCHEDULER_REDIS_DEGRADED_MAX_WAIT);
         let mut queue_guard: Option<DispatchQueueGuard> = None;
         let mut local_excluded_ids = excluded_ids.clone();
         let mut slot_race_excluded_count = 0usize;
@@ -6786,6 +6814,49 @@ impl MultiTokenManager {
         };
 
         loop {
+            if let Some(retry_after_secs) = self.scheduler_redis_degraded_retry_after_secs() {
+                // Once the distributed coordinator is known to be degraded, local snapshots are
+                // not authoritative enough to justify waiting for credential capacity. Drop any
+                // queue lease this request already holds and give Redis only a short, queue-free
+                // recovery grace before handing a typed failure to the fallback/error path.
+                drop(queue_guard.take());
+                if acquire_mode.is_redis_degraded_fail_fast() {
+                    return Err(LocalSchedulerError::new(
+                        LocalSchedulerErrorKind::CapacityUnavailable,
+                        format!(
+                            "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={retry_after_secs}）"
+                        ),
+                    )
+                    .into());
+                }
+                let now = Instant::now();
+                if let Some((waited, _)) = self.dispatch_wait_exceeded(
+                    Some(redis_degraded_max_wait),
+                    dispatch_wait_started_at,
+                    now,
+                ) {
+                    return Err(LocalSchedulerError::new(
+                        LocalSchedulerErrorKind::CapacityUnavailable,
+                        format!(
+                            "本地账号调度容量暂不可用（Redis 调度协调状态不可用，degraded_wait_ms={}, retry_after_secs={retry_after_secs}）",
+                            waited.as_millis()
+                        ),
+                    )
+                    .into());
+                }
+                let remaining = self.dispatch_wait_remaining(
+                    Some(redis_degraded_max_wait),
+                    dispatch_wait_started_at,
+                    now,
+                );
+                self.sleep_for_scheduler_redis_recovery(
+                    remaining.unwrap_or(StdDuration::ZERO),
+                    remaining,
+                )
+                .await;
+                continue;
+            }
+
             let circuit_retry_after = if risk_circuit_admitted {
                 self.local_pool_risk_circuit_snapshot(Instant::now())
                     .retry_after
@@ -7260,7 +7331,16 @@ impl MultiTokenManager {
             };
             let prepared_slot = match &decision {
                 AcquireDecision::Selected(id, _, _, _) => {
-                    self.prepare_in_flight_slot(*id, request_weight_units)
+                    match self.prepare_in_flight_slot(*id, request_weight_units) {
+                        PreparedInFlightSlotResult::Ready(prepared) => Some(prepared),
+                        PreparedInFlightSlotResult::CapacityFull => None,
+                        PreparedInFlightSlotResult::RedisReleaseAdmissionUnavailable => {
+                            local_scheduler_bail!(
+                                LocalSchedulerErrorKind::CapacityUnavailable,
+                                "本地账号调度容量暂不可用（release reconciliation 已饱和）"
+                            );
+                        }
+                    }
                 }
                 AcquireDecision::WaitForDispatch { .. } | AcquireDecision::AutoHeal => None,
             };
@@ -7404,50 +7484,17 @@ impl MultiTokenManager {
                             )
                             .into());
                         }
-                        if queue_guard.is_none() {
-                            queue_guard = self.try_enter_local_only_dispatch_queue(
-                                redis_degraded_max_wait,
-                                admission,
-                            );
-                            if queue_guard.is_none() {
-                                return Err(self.dispatch_queue_full_error());
-                            }
-                        }
-                        let now = Instant::now();
-                        if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
-                            redis_degraded_max_wait,
-                            dispatch_wait_started_at,
-                            now,
-                        ) {
-                            local_scheduler_bail!(
-                                LocalSchedulerErrorKind::QueueTimeout,
-                                "账号调度排队等待超时（Redis 调度协调状态不可用，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
-                                waited.as_secs(),
-                                max_wait.as_secs(),
-                                retry_after_secs.max(1)
-                            );
-                        }
-                        let wait_for = if local_overloaded {
-                            StdDuration::from_millis(100)
-                        } else {
-                            StdDuration::from_secs(retry_after_secs.clamp(1, 30))
-                        };
                         tracing::debug!(
                             credential_id = id,
                             retry_after_secs,
                             local_overloaded,
-                            "Redis 调度协调暂不可用，普通本地请求进入本进程有界等待而不是快速失败"
+                            "Redis 并发租约未能确认；不进入调度队列，返回协调错误"
                         );
-                        self.sleep_for_scheduler_redis_recovery(
-                            wait_for,
-                            self.dispatch_wait_remaining(
-                                redis_degraded_max_wait,
-                                dispatch_wait_started_at,
-                                now,
-                            ),
+                        return Err(LocalSchedulerError::new(
+                            LocalSchedulerErrorKind::CapacityUnavailable,
+                            err.to_string(),
                         )
-                        .await;
-                        continue;
+                        .into());
                     }
                 },
                 None => None,
@@ -7637,50 +7684,17 @@ impl MultiTokenManager {
                                 )
                                 .into());
                             }
-                            if queue_guard.is_none() {
-                                queue_guard = self.try_enter_local_only_dispatch_queue(
-                                    redis_degraded_max_wait,
-                                    admission,
-                                );
-                                if queue_guard.is_none() {
-                                    return Err(self.dispatch_queue_full_error());
-                                }
-                            }
-                            let now = Instant::now();
-                            if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
-                                redis_degraded_max_wait,
-                                dispatch_wait_started_at,
-                                now,
-                            ) {
-                                local_scheduler_bail!(
-                                    LocalSchedulerErrorKind::QueueTimeout,
-                                    "账号调度排队等待超时（Redis 调度协调状态不可用，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
-                                    waited.as_secs(),
-                                    max_wait.as_secs(),
-                                    redis_error.retry_after_secs.max(1)
-                                );
-                            }
-                            let wait_for = if redis_error.local_overloaded {
-                                StdDuration::from_millis(100)
-                            } else {
-                                StdDuration::from_secs(redis_error.retry_after_secs.clamp(1, 30))
-                            };
                             tracing::debug!(
                                 credential_id = id,
                                 retry_after_secs = redis_error.retry_after_secs,
                                 local_overloaded = redis_error.local_overloaded,
-                                "Redis 调度协调暂不可用，普通本地请求进入本进程有界等待而不是快速失败"
+                                "Redis RPM reservation 未能确认；不进入调度队列，返回协调错误"
                             );
-                            self.sleep_for_scheduler_redis_recovery(
-                                wait_for,
-                                self.dispatch_wait_remaining(
-                                    redis_degraded_max_wait,
-                                    dispatch_wait_started_at,
-                                    now,
-                                ),
+                            return Err(LocalSchedulerError::new(
+                                LocalSchedulerErrorKind::CapacityUnavailable,
+                                err.to_string(),
                             )
-                            .await;
-                            continue;
+                            .into());
                         }
                     };
                     match selection_admission {
@@ -11569,6 +11583,11 @@ impl MultiTokenManager {
                                 ?reason,
                                 "Redis 调度状态后台同步未准入，沿用本地调度缓存"
                             );
+                            // A request may have entered the ordinary capacity queue while it
+                            // was using the last local snapshot. Wake it after the snapshot
+                            // coordinator is known to be unavailable so it can leave the queue
+                            // through the Redis-degraded path instead of waiting for a slot.
+                            capacity_signal.notify_state_changed();
                             let delay = breaker.retry_after().unwrap_or_else(|| {
                                 SCHEDULER_REDIS_SYNC_MIN_INTERVAL
                                     .saturating_mul(2)
@@ -11587,6 +11606,7 @@ impl MultiTokenManager {
                                 timeout_ms = SCHEDULER_REDIS_SNAPSHOT_OP_TIMEOUT.as_millis() as u64,
                                 "Redis 调度状态后台同步失败，沿用本地调度缓存"
                             );
+                            capacity_signal.notify_state_changed();
                             let delay = breaker.retry_after().unwrap_or_else(|| {
                                 SCHEDULER_REDIS_SYNC_MIN_INTERVAL
                                     .saturating_mul(2)

@@ -10219,21 +10219,42 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
         }
     });
     let waited_at = Instant::now();
-    let queue_error = manager
-        .acquire_context_for_session_with_mode(
-            None,
-            None,
-            &HashSet::new(),
-            AcquireMode::WaitForCapacityMax(StdDuration::from_millis(25)),
-            1,
-        )
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::WaitForCapacity,
+                1,
+            )
+            .await
+    });
+    let peak_queued = tokio::time::timeout(StdDuration::from_secs(2), async {
+        let mut peak_queued = 0;
+        while !waiting.is_finished() {
+            peak_queued = peak_queued.max(manager.queued_requests.load(Ordering::Acquire));
+            tokio::time::sleep(StdDuration::from_millis(1)).await;
+        }
+        peak_queued.max(manager.queued_requests.load(Ordering::Acquire))
+    })
+    .await
+    .expect("Redis degraded request must leave the scheduler within the bounded test window");
+    let queue_error = waiting
         .await
+        .expect("degraded scheduler task should not panic")
         .err()
-        .expect("Redis 退避窗口内普通本地请求应有界等待后拒绝")
+        .expect("Redis 退避窗口内普通本地请求应有界拒绝")
         .to_string();
+    let degraded_wait = waited_at.elapsed();
     assert!(
-        waited_at.elapsed() >= StdDuration::from_millis(20),
-        "普通本地请求不应在 Redis breaker 打开时立即形成 429 storm"
+        degraded_wait >= SCHEDULER_REDIS_DEGRADED_MAX_WAIT,
+        "ordinary local requests should get only the short Redis recovery grace: {degraded_wait:?}"
+    );
+    assert!(
+        degraded_wait < StdDuration::from_millis(600),
+        "Redis failure must not inherit the normal multi-second dispatch deadline: {degraded_wait:?}"
     );
     notifier.abort();
     assert!(
@@ -10241,6 +10262,14 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
         "Redis 退避不应误报为等待队列已满，实际: {queue_error}"
     );
     assert!(queue_error.contains("retry_after_secs="));
+    assert!(
+        queue_error.contains("degraded_wait_ms="),
+        "Redis degraded failure should be identified separately from capacity queue timeout"
+    );
+    assert_eq!(
+        peak_queued, 0,
+        "Redis degraded requests must not occupy the dispatch queue"
+    );
     let breaker_stats = manager.scheduler_redis_breaker.stats_snapshot();
     assert!(
         breaker_stats.suppressed <= 3,
@@ -10320,6 +10349,98 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
             .unwrap_or_default(),
         0
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn redis_capacity_latency_with_idle_credentials_does_not_enter_dispatch_queue() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis high-concurrency false queueing 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+
+    run_isolated_redis_manager_fixture(|redis_store| async move {
+        const CREDENTIALS: usize = 64;
+        const REQUESTS: usize = 128;
+        let mut config = Config::default();
+        config.credential_rpm = None;
+        config.credential_max_concurrent_requests = 30;
+        config.dispatch_global_max_concurrent_requests = 1_000;
+        config.dispatch_max_queued_requests = 200;
+        config.credential_dispatch_max_wait_secs = 30;
+        let credentials = (0..CREDENTIALS)
+            .map(|index| api_key_credential(&format!("idle-credential-{index}")))
+            .collect();
+        let manager = Arc::new(
+            MultiTokenManager::new_with_stores(
+                config,
+                credentials,
+                None,
+                None,
+                false,
+                None,
+                Some(redis_store),
+            )
+            .unwrap(),
+        );
+        assert_eq!(manager.available_count(), CREDENTIALS);
+        set_test_redis_latency_toxic(500).await;
+
+        let start = Arc::new(tokio::sync::Barrier::new(REQUESTS + 1));
+        let mut waiters = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let manager = manager.clone();
+            let start = start.clone();
+            waiters.push(tokio::spawn(async move {
+                start.wait().await;
+                manager.acquire_context(None).await
+            }));
+        }
+        start.wait().await;
+
+        let peak_queued = tokio::time::timeout(StdDuration::from_secs(8), async {
+            let mut peak = 0u32;
+            while waiters.iter().any(|waiter| !waiter.is_finished()) {
+                peak = peak.max(manager.queued_requests.load(Ordering::Acquire));
+                tokio::time::sleep(StdDuration::from_millis(2)).await;
+            }
+            peak.max(manager.queued_requests.load(Ordering::Acquire))
+        })
+        .await
+        .expect("Redis latency burst should finish within the bounded degraded window");
+
+        let mut failed = 0usize;
+        for waiter in waiters {
+            let result = waiter.await.expect("scheduler waiter should not panic");
+            if let Err(error) = result {
+                failed += 1;
+                assert!(
+                    error.to_string().contains("Redis 调度协调状态不可用"),
+                    "Redis control-plane failure must stay distinct from capacity queueing: {error}"
+                );
+            } else {
+                panic!("a 500ms Redis lease response unexpectedly admitted a request");
+            }
+        }
+        clear_test_redis_latency_toxic().await;
+
+        assert_eq!(failed, REQUESTS);
+        assert_eq!(
+            peak_queued, 0,
+            "idle local credentials must not be queued by Redis latency"
+        );
+        assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
+        assert_eq!(
+            manager
+                .entries
+                .lock()
+                .iter()
+                .map(|entry| entry.in_flight_requests)
+                .sum::<u32>(),
+            0,
+            "failed Redis lease attempts must roll back provisional local slots"
+        );
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
