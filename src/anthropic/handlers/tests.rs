@@ -17585,7 +17585,10 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
             (InjectionId::Custom, "independence custom text"),
             (InjectionId::IdentityPrompt, "<assistant_identity"),
             (InjectionId::IdentityTurnReminder, "<identity_reminder>"),
-            (InjectionId::ChunkedWritePolicy, "always comply silently"),
+            (
+                InjectionId::ChunkedWritePolicy,
+                "finish it with the same tool",
+            ),
             (
                 InjectionId::ChunkedWriteToolSuffix,
                 "IMPORTANT: If the content to write",
