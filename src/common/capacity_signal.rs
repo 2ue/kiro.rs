@@ -12,6 +12,9 @@ pub(crate) struct CapacitySignal {
     capacity_changed: Notify,
     state_generation: AtomicU64,
     state_changed: Notify,
+    /// Bumped whenever capacity may have become available (a slot released or the scheduler
+    /// state changed). Lets callers cache a "nothing is free" answer until this moves.
+    capacity_epoch: AtomicU64,
 }
 
 impl CapacitySignal {
@@ -28,11 +31,17 @@ impl CapacitySignal {
         if units == 0 {
             return;
         }
+        self.capacity_epoch.fetch_add(1, Ordering::AcqRel);
         let added = loop {
             let waiters = self.waiters.load(Ordering::Acquire);
             let current = self.credits.load(Ordering::Acquire);
             let target = current.saturating_add(units).min(waiters);
-            if target == current {
+            // `waiters` and `credits` are read separately: waiters registering and being
+            // credited in between can leave `current` above this stale `waiters`. Never lower
+            // credits here (that drops wakeups; `unregister` trims surplus credits) and never
+            // compute `target - current` then: it would underflow, and in release builds the
+            // wrapped count spins `notify_one` forever on a runtime worker.
+            if target <= current {
                 return;
             }
             if self
@@ -49,8 +58,14 @@ impl CapacitySignal {
     }
 
     pub(crate) fn notify_state_changed(&self) {
+        self.capacity_epoch.fetch_add(1, Ordering::AcqRel);
         self.state_generation.fetch_add(1, Ordering::AcqRel);
         self.state_changed.notify_waiters();
+    }
+
+    /// See [`Self::capacity_epoch`]: changes whenever capacity may have been freed.
+    pub(crate) fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch.load(Ordering::Acquire)
     }
 
     fn consume_credit(&self) -> bool {
@@ -251,6 +266,17 @@ mod tests {
             .expect("the second freed slot still wakes the second waiter");
         second.finish_acquired();
         assert_eq!(signal.test_snapshot(), (0, 0, 0));
+    }
+
+    /// Credits above the waiter count is the state a release can observe when other waiters
+    /// register and get credited between its two loads. It used to underflow `target - current`.
+    #[test]
+    fn release_observing_more_credits_than_waiters_keeps_credits() {
+        let signal = Arc::new(CapacitySignal::default());
+        let _waiters = (0..2).map(|_| signal.register()).collect::<Vec<_>>();
+        signal.credits.store(10, Ordering::Release);
+        signal.capacity_released(1);
+        assert_eq!(signal.test_snapshot(), (2, 10, 0));
     }
 
     #[test]

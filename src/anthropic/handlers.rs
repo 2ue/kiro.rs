@@ -987,6 +987,7 @@ struct RequestRuntimeConfig {
     kiro_cache_point_tools_only: bool,
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
+    kiro_upstream_stream_max_duration_secs: u64,
     stream_keepalive_interval_secs: u64,
     stream_pre_output_hold_secs: u64,
     stream_first_output_timeout_secs: u64,
@@ -1046,12 +1047,12 @@ impl RequestRuntimeConfig {
             prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: state.prompt_cache_creation_control,
             prompt_cache_bounds: state.prompt_cache_bounds,
-            reported_usage: state.reported_usage.clone(),
-            cache_policy: state.cache_policy.clone(),
-            defined_cache_routes: state.defined_cache_routes.clone(),
+            reported_usage: ReportedUsageConfig::clone(&state.reported_usage),
+            cache_policy: CachePolicyConfig::clone(&state.cache_policy),
+            defined_cache_routes: state.defined_cache_routes.to_vec(),
             compat_profile: state.compat_profile,
             model_resolution_mode: state.model_resolution_mode,
-            model_mapping: state.model_mapping.clone().normalized(),
+            model_mapping: ModelMappingConfig::clone(&state.model_mapping).normalized(),
             expose_proxy_warnings: state.expose_proxy_warnings,
             payload_guard_enabled: state.payload_guard_enabled,
             payload_guard_mode: state.payload_guard_mode,
@@ -1065,6 +1066,8 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: state.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
+            kiro_upstream_stream_max_duration_secs:
+                crate::model::config::DEFAULT_KIRO_UPSTREAM_STREAM_MAX_DURATION_SECS,
             stream_keepalive_interval_secs: DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
             stream_pre_output_hold_secs: DEFAULT_STREAM_PRE_OUTPUT_HOLD_SECS,
             stream_first_output_timeout_secs: DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS,
@@ -1077,13 +1080,13 @@ impl RequestRuntimeConfig {
             kiro_upstream_stream_retry_on_read_error: true,
             kiro_upstream_stream_retry_on_status_error: true,
             image_processing: state.image_processing.normalized(),
-            body_conversion: state.body_conversion.clone(),
-            prompt_injection: state.prompt_injection.clone().normalized(),
-            route_features: state.route_features.clone().normalized(),
+            body_conversion: BodyConversionConfig::clone(&state.body_conversion),
+            prompt_injection: PromptInjectionConfig::clone(&state.prompt_injection).normalized(),
+            route_features: RouteFeaturesConfig::clone(&state.route_features).normalized(),
             claude_models_only: state.claude_models_only,
             missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
-            external_pools: state.external_pools.clone(),
+            external_pools: ExternalPoolsConfig::clone(&state.external_pools),
             request_capture: crate::model::config::RequestCaptureConfig::default(),
         }
     }
@@ -1158,6 +1161,9 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            kiro_upstream_stream_max_duration_secs: config
+                .kiro_upstream_stream_max_duration_secs
+                .min(crate::model::config::KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS),
             stream_keepalive_interval_secs: normalize_stream_keepalive_interval_secs(
                 config.stream_keepalive_interval_secs,
             ),
@@ -1581,12 +1587,60 @@ impl CachePointRetryRequest {
     }
 }
 
-fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestRuntimeConfig {
-    RequestRuntimeConfig::from_config_with_fallback(
-        &provider.runtime_config(),
+/// Per-request view of the runtime config, shared across requests until the config changes.
+///
+/// Building it normalizes and copies several config sections (the cache policy alone is tens of
+/// KB in production). Every request needs it, including requests that are about to be turned
+/// away during an overload, so it is built once per config generation and route fallback and
+/// handed out as an `Arc`.
+fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> Arc<RequestRuntimeConfig> {
+    let (config, generation) = provider.runtime_config_snapshot_with_generation();
+    let key = RequestRuntimeConfigCacheKey {
+        provider: std::ptr::from_ref(provider) as usize,
+        generation,
+        prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
+        prompt_cache_target_read_ratio_bits: state.prompt_cache_target_read_ratio.to_bits(),
+        prompt_cache_token_scale_bits: state.prompt_cache_token_scale.to_bits(),
+    };
+    {
+        let cache = REQUEST_RUNTIME_CONFIG_CACHE.lock();
+        if let Some((_, cached)) = cache.iter().find(|(cached_key, _)| *cached_key == key) {
+            return cached.clone();
+        }
+    }
+    let built = Arc::new(RequestRuntimeConfig::from_config_with_fallback(
+        &config,
         RequestRuntimeConfig::from_app_state(state),
-    )
+    ));
+    let mut cache = REQUEST_RUNTIME_CONFIG_CACHE.lock();
+    // Entries of older generations are never asked for again.
+    cache.retain(|(cached_key, _)| {
+        cached_key.provider != key.provider || cached_key.generation == key.generation
+    });
+    if cache.len() >= REQUEST_RUNTIME_CONFIG_CACHE_MAX {
+        cache.remove(0);
+    }
+    cache.push((key, built.clone()));
+    built
 }
+
+/// One entry per route fallback (routers carry different prompt-cache defaults) and provider.
+const REQUEST_RUNTIME_CONFIG_CACHE_MAX: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestRuntimeConfigCacheKey {
+    provider: usize,
+    generation: u64,
+    prompt_cache_simulation_mode: PromptCacheSimulationMode,
+    prompt_cache_target_read_ratio_bits: u64,
+    prompt_cache_token_scale_bits: u64,
+}
+
+type RequestRuntimeConfigCacheEntry = (RequestRuntimeConfigCacheKey, Arc<RequestRuntimeConfig>);
+
+static REQUEST_RUNTIME_CONFIG_CACHE: std::sync::LazyLock<
+    Mutex<Vec<RequestRuntimeConfigCacheEntry>>,
+> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
     state
@@ -2622,7 +2676,7 @@ fn clamp_acquire_mode_to_dispatch_deadline(
 }
 
 fn capacity_weight_units_for_local_request(provider: &KiroProvider, input_tokens: i32) -> u32 {
-    let config = provider.runtime_config();
+    let config = provider.runtime_config_snapshot();
     if !config.weighted_capacity.enabled {
         return 1;
     }
@@ -4296,7 +4350,30 @@ fn extract_credential_error_hint(message: &str) -> Option<CredentialErrorHint> {
     Some(CredentialErrorHint { id, label })
 }
 
+/// Local scheduler rejections (queue full, queue timeout, capacity unavailable). During an
+/// overload these arrive thousands of times a second; one WARN per request competes with the
+/// queued requests for the workers and the stdout lock. They are logged through a throttle.
+fn is_local_scheduler_rejection_message(message: &str) -> bool {
+    message.contains("账号调度等待队列已满")
+        || message.contains("凭据调度等待队列已满")
+        || message.contains("账号调度排队等待超时")
+        || message.contains("凭据调度排队等待超时")
+        || message.contains("本地账号调度容量暂不可用")
+        || message.contains("本地凭据调度容量暂不可用")
+}
+
+static LOCAL_SCHEDULER_REJECTION_LOG_THROTTLE: std::sync::LazyLock<
+    crate::common::log_throttle::LogThrottle,
+> = std::sync::LazyLock::new(|| {
+    crate::common::log_throttle::LogThrottle::new(std::time::Duration::from_secs(1))
+});
+
 fn log_provider_call_failure(message: &str, error_id: Option<&str>) {
+    if is_local_scheduler_rejection_message(message) {
+        // Logged once, throttled, by `log_provider_rate_limit_with_hint` on the 429 path.
+        tracing::debug!(error_id = ?error_id, error = %message, "模型请求失败");
+        return;
+    }
     if let Some(hint) = extract_credential_error_hint(message) {
         tracing::warn!(
             error_id = ?error_id,
@@ -4325,6 +4402,25 @@ fn log_provider_warning_with_hint(message: &str, reason: &'static str, error_id:
 }
 
 fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64, error_id: Option<&str>) {
+    if is_local_scheduler_rejection_message(message) {
+        let Some(suppressed) = LOCAL_SCHEDULER_REJECTION_LOG_THROTTLE.admit() else {
+            tracing::debug!(
+                error_id = ?error_id,
+                error = %message,
+                retry_after_secs,
+                "模型请求或本地账号调度临时不可用，返回 429"
+            );
+            return;
+        };
+        tracing::warn!(
+            error_id = ?error_id,
+            error = %message,
+            retry_after_secs,
+            suppressed_since_last = suppressed,
+            "模型请求或本地账号调度临时不可用，返回 429（每秒最多记一条，其余计入 suppressed_since_last）"
+        );
+        return;
+    }
     if let Some(hint) = extract_credential_error_hint(message) {
         tracing::warn!(
             error_id = ?error_id,
@@ -7714,10 +7810,10 @@ pub(crate) fn missing_max_tokens_default_value(state: &AppState) -> i32 {
 }
 
 /// Live runtime config so admin changes apply without a restart.
-fn live_runtime_config(state: &AppState) -> RequestRuntimeConfig {
+fn live_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
     match state.kiro_provider.as_ref() {
         Some(provider) => request_runtime_config(state, provider),
-        None => RequestRuntimeConfig::from_app_state(state),
+        None => Arc::new(RequestRuntimeConfig::from_app_state(state)),
     }
 }
 
@@ -7776,9 +7872,9 @@ pub(crate) fn resolve_defined_cache_route(
         .kiro_provider
         .as_ref()
         .map(|provider| {
-            normalize_defined_cache_routes(&provider.runtime_config().defined_cache_routes)
+            normalize_defined_cache_routes(&provider.runtime_config_snapshot().defined_cache_routes)
         })
-        .unwrap_or_else(|| state.defined_cache_routes.clone());
+        .unwrap_or_else(|| state.defined_cache_routes.to_vec());
     if !defined_cache_routes.iter().any(|item| item == &prefix) {
         return Err(envelope::error_response(
             StatusCode::NOT_FOUND,
@@ -8737,6 +8833,7 @@ async fn post_messages_inner(
             runtime_config.stream_keepalive_interval_secs,
             runtime_config.stream_pre_output_hold_secs,
             runtime_config.stream_first_output_timeout_secs,
+            runtime_config.kiro_upstream_stream_max_duration_secs,
         )
         .await
     } else {
@@ -9455,6 +9552,11 @@ struct SseStreamState {
     first_output_timeout_secs: u64,
     /// Deadline for this attempt's first content event; cleared once content starts.
     first_output_deadline: Option<Instant>,
+    /// When the response has run for `kiroUpstreamStreamMaxDurationSecs` (measured from the
+    /// first attempt). A stream that trickles in just under the idle timeout would otherwise
+    /// hold its credential slot forever.
+    max_duration_deadline: Option<Instant>,
+    max_duration_secs: u64,
     /// A usage-only upstream turn gets one transparent retry per request.
     usage_only_retried: bool,
     initial_events: Vec<SseEvent>,
@@ -9503,6 +9605,10 @@ impl SseStreamState {
             first_output_deadline: StreamKeepalivePolicy::deadline_after(
                 keepalive.first_output_timeout_secs,
             ),
+            max_duration_deadline: StreamKeepalivePolicy::deadline_after(
+                keepalive.max_duration_secs,
+            ),
+            max_duration_secs: keepalive.max_duration_secs,
             usage_only_retried: false,
             initial_events,
             downstream_committed: false,
@@ -9597,6 +9703,7 @@ async fn handle_stream_request(
     stream_keepalive_interval_secs: u64,
     stream_pre_output_hold_secs: u64,
     stream_first_output_timeout_secs: u64,
+    stream_max_duration_secs: u64,
 ) -> Response {
     let requested_model = usage_context.model.clone();
     let prompt_too_long_context = ProviderErrorContext {
@@ -10291,7 +10398,8 @@ async fn handle_stream_request(
         .with_first_output_limits(
             stream_pre_output_hold_secs,
             stream_first_output_timeout_secs,
-        ),
+        )
+        .with_max_duration(stream_max_duration_secs),
     );
 
     // 返回 SSE 响应
@@ -10366,12 +10474,16 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// and every chunk resets that clock. A wall-clock cap would cut a long answer that is still
 /// being written and throw away every token already generated. In addition, it gives up when no
 /// content event arrives within `first_output_timeout_secs` (`0` disables it), so a silent
-/// upstream does not hold the connection and credential slot.
+/// upstream does not hold the connection and credential slot, and when the whole body takes
+/// longer than `max_duration_secs` (`0` disables it), so a trickling one does not either.
+/// `touch` runs on every chunk to keep the credential lease marked active.
 async fn read_non_stream_body_with_first_output_deadline(
     response: reqwest::Response,
     idle_timeout_secs: u64,
     max_bytes: usize,
     first_output_timeout_secs: u64,
+    max_duration_secs: u64,
+    touch: impl Fn(),
 ) -> Result<Bytes, NonStreamBodyError> {
     if response
         .content_length()
@@ -10386,6 +10498,8 @@ async fn read_non_stream_body_with_first_output_deadline(
     let started = Instant::now();
     let first_output_deadline = (first_output_timeout_secs > 0)
         .then(|| started + Duration::from_secs(first_output_timeout_secs));
+    let max_duration_deadline =
+        (max_duration_secs > 0).then(|| started + Duration::from_secs(max_duration_secs));
     let mut idle_deadline = started + idle_timeout;
     let mut stream = response.bytes_stream();
     let mut body = bytes::BytesMut::with_capacity(max_bytes.min(16 * 1024));
@@ -10395,8 +10509,21 @@ async fn read_non_stream_body_with_first_output_deadline(
         let deadline = first_output_pending
             .map(|first| first.min(idle_deadline))
             .unwrap_or(idle_deadline);
+        let max_duration_sleep = async move {
+            match max_duration_deadline {
+                Some(deadline) => sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         let next = tokio::select! {
             chunk = stream.next() => chunk,
+            _ = max_duration_sleep => {
+                return Err(NonStreamBodyError::Http(
+                    crate::http_client::HttpSendError::ResponseBodyTimeout {
+                        timeout_secs: max_duration_secs,
+                    },
+                ));
+            }
             _ = sleep_until(deadline) => {
                 return Err(match first_output_pending {
                     Some(first) if first <= idle_deadline => NonStreamBodyError::FirstOutputTimeout {
@@ -10412,6 +10539,7 @@ async fn read_non_stream_body_with_first_output_deadline(
         let Some(chunk) = next else {
             return Ok(body.freeze());
         };
+        touch();
         let chunk = chunk.map_err(|error| {
             NonStreamBodyError::Http(crate::http_client::HttpSendError::Request(error))
         })?;
@@ -11716,6 +11844,8 @@ struct StreamKeepalivePolicy {
     pre_output_hold_secs: u64,
     /// Longest wait from upstream headers to the first content event; `0` disables it.
     first_output_timeout_secs: u64,
+    /// Longest a response may run in total; `0` disables it.
+    max_duration_secs: u64,
 }
 
 impl StreamKeepalivePolicy {
@@ -11726,7 +11856,13 @@ impl StreamKeepalivePolicy {
             idle_timeout_secs: normalize_stream_idle_timeout_secs(idle_timeout_secs),
             pre_output_hold_secs: DEFAULT_STREAM_PRE_OUTPUT_HOLD_SECS,
             first_output_timeout_secs: DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS,
+            max_duration_secs: 0,
         }
+    }
+
+    fn with_max_duration(mut self, max_duration_secs: u64) -> Self {
+        self.max_duration_secs = max_duration_secs;
+        self
     }
 
     fn with_first_output_limits(mut self, hold_secs: u64, first_output_timeout_secs: u64) -> Self {
@@ -11819,6 +11955,14 @@ fn create_sse_stream(
                 }
             };
             tokio::pin!(first_output_sleep);
+            let max_duration_deadline = state.max_duration_deadline;
+            let max_duration_sleep = async move {
+                match max_duration_deadline {
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(max_duration_sleep);
 
             // 使用 select! 同时等待数据、ping 定时器和上游空闲超时。
             // 如果开启了首输出前重试，在未向客户端发送任何 SSE 字节前不发送 ping，
@@ -12550,6 +12694,32 @@ fn create_sse_stream(
                         &state.usage_guard,
                         UsageRecordStatus::UpstreamTimeout,
                         StreamTerminalReason::UpstreamIdleTimeout,
+                        &state.decoder,
+                        state.attempt_number,
+                        state.downstream_committed,
+                    );
+                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                    state.finished = true;
+                    Some((stream::iter(bytes), state))
+                }
+                _ = &mut max_duration_sleep => {
+                    let detail = format!(
+                        "upstream response exceeded {} seconds",
+                        state.max_duration_secs
+                    );
+                    tracing::warn!(
+                        max_duration_secs = state.max_duration_secs,
+                        downstream_committed = state.downstream_committed,
+                        "上游响应超过总时长上限，结束流并释放账号并发"
+                    );
+                    state.max_duration_deadline = None;
+                    state.completion.report_upstream_stream_failure(detail.clone());
+                    state.ctx.record_stream_error("api_error", detail);
+                    let bytes = finish_stream_with_recorded_error(
+                        &mut state.ctx,
+                        &state.usage_guard,
+                        UsageRecordStatus::UpstreamTimeout,
+                        StreamTerminalReason::UpstreamMaxDuration,
                         &state.decoder,
                         state.attempt_number,
                         state.downstream_committed,
@@ -13460,7 +13630,7 @@ async fn handle_non_stream_request(
             .map(str::to_string);
 
         // 读取响应体
-        let runtime = provider.runtime_config();
+        let runtime = provider.runtime_config_snapshot();
         let body_read = read_non_stream_body_with_first_output_deadline(
             response,
             runtime.kiro_upstream_stream_idle_timeout_secs,
@@ -13468,6 +13638,10 @@ async fn handle_non_stream_request(
             runtime
                 .stream_first_output_timeout_secs
                 .min(crate::model::config::STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS),
+            runtime
+                .kiro_upstream_stream_max_duration_secs
+                .min(crate::model::config::KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS),
+            || completion.touch(),
         )
         .await;
         let first_output_timeout = match &body_read {
@@ -14884,7 +15058,7 @@ async fn count_tokens_for_endpoint(
     // injection are reflected in token counts without a restart.
     let runtime_config = match state.kiro_provider.as_ref() {
         Some(provider) => request_runtime_config(&state, provider),
-        None => RequestRuntimeConfig::from_app_state(&state),
+        None => Arc::new(RequestRuntimeConfig::from_app_state(&state)),
     };
     // count_tokens 按本地 Kiro 链路估算，与 messages 请求注入的 system 一致。
     super::prompt_injection::apply_to_count_tokens_request(

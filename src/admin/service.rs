@@ -6118,6 +6118,7 @@ impl AdminService {
                 .credential_session_max_concurrent_requests,
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            kiro_upstream_stream_max_duration_secs: config.kiro_upstream_stream_max_duration_secs,
             stream_keepalive_interval_secs: config.stream_keepalive_interval_secs,
             stream_pre_output_hold_secs: config.stream_pre_output_hold_secs,
             stream_first_output_timeout_secs: config.stream_first_output_timeout_secs,
@@ -6307,6 +6308,9 @@ impl AdminService {
         let kiro_upstream_stream_idle_timeout_secs = req
             .kiro_upstream_stream_idle_timeout_secs
             .unwrap_or(current_config.kiro_upstream_stream_idle_timeout_secs);
+        let kiro_upstream_stream_max_duration_secs = req
+            .kiro_upstream_stream_max_duration_secs
+            .unwrap_or(current_config.kiro_upstream_stream_max_duration_secs);
         let stream_keepalive_interval_secs = req
             .stream_keepalive_interval_secs
             .unwrap_or(current_config.stream_keepalive_interval_secs);
@@ -6760,6 +6764,14 @@ impl AdminService {
                 "kiroUpstreamStreamIdleTimeoutSecs 不能大于 86400".to_string(),
             ));
         }
+        if kiro_upstream_stream_max_duration_secs
+            > crate::model::config::KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "kiroUpstreamStreamMaxDurationSecs 不能大于 {}",
+                crate::model::config::KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS
+            )));
+        }
         if !(crate::model::config::STREAM_KEEPALIVE_INTERVAL_MIN_SECS
             ..=crate::model::config::STREAM_KEEPALIVE_INTERVAL_MAX_SECS)
             .contains(&stream_keepalive_interval_secs)
@@ -6987,6 +6999,8 @@ impl AdminService {
                 config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
                 config.kiro_upstream_stream_idle_timeout_secs =
                     kiro_upstream_stream_idle_timeout_secs;
+                config.kiro_upstream_stream_max_duration_secs =
+                    kiro_upstream_stream_max_duration_secs;
                 config.stream_keepalive_interval_secs = stream_keepalive_interval_secs;
                 config.stream_pre_output_hold_secs = stream_pre_output_hold_secs;
                 config.stream_first_output_timeout_secs = stream_first_output_timeout_secs;

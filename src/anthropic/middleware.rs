@@ -258,6 +258,9 @@ fn record_http_egress(response: Response, ingress_id: &str) -> Response {
 }
 
 /// 应用共享状态
+///
+/// axum clones the state for every request (router, middleware, extractor), so config sections
+/// that own maps and strings are behind `Arc`: a clone must not copy them.
 #[derive(Clone)]
 pub struct AppState {
     /// 客户端请求 API Key 内存索引。
@@ -300,17 +303,17 @@ pub struct AppState {
     /// 本地 prompt-cache 内存和条目边界
     pub prompt_cache_bounds: PromptCacheBounds,
     /// 下游 usage 上报投影配置
-    pub reported_usage: ReportedUsageConfig,
+    pub reported_usage: Arc<ReportedUsageConfig>,
     /// 路径级缓存策略覆盖
-    pub cache_policy: CachePolicyConfig,
+    pub cache_policy: Arc<CachePolicyConfig>,
     /// 已定义的 /dfcache/{name} 自定义 high-cache 路由。
-    pub defined_cache_routes: Vec<String>,
+    pub defined_cache_routes: Arc<Vec<String>>,
     /// Anthropic compatibility profile
     pub compat_profile: CompatProfile,
     /// 请求模型解析策略
     pub model_resolution_mode: ModelResolutionMode,
     /// 模型映射和兜底规则
-    pub model_mapping: ModelMappingConfig,
+    pub model_mapping: Arc<ModelMappingConfig>,
     /// 是否在响应头中暴露代理改写动作
     pub expose_proxy_warnings: bool,
     /// 是否启用发送 Kiro 上游前的最终 payload 防护
@@ -338,11 +341,11 @@ pub struct AppState {
     /// 多模态图片/文件预处理配置
     pub image_processing: ImageProcessingConfig,
     /// 本地 Anthropic -> Kiro 转换能力配置
-    pub body_conversion: BodyConversionConfig,
+    pub body_conversion: Arc<BodyConversionConfig>,
     /// 提示词注入配置
-    pub prompt_injection: PromptInjectionConfig,
+    pub prompt_injection: Arc<PromptInjectionConfig>,
     /// 按路由控制的功能
-    pub route_features: RouteFeaturesConfig,
+    pub route_features: Arc<RouteFeaturesConfig>,
     /// `/v1/models` 只列出 Claude 模型
     pub claude_models_only: bool,
     /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略
@@ -350,7 +353,7 @@ pub struct AppState {
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池和直连策略配置。
-    pub external_pools: ExternalPoolsConfig,
+    pub external_pools: Arc<ExternalPoolsConfig>,
     /// 外部备用号池管理器。
     pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
 }
@@ -388,12 +391,12 @@ impl AppState {
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
-            reported_usage: ReportedUsageConfig::default(),
-            cache_policy: CachePolicyConfig::default(),
-            defined_cache_routes: Vec::new(),
+            reported_usage: Arc::new(ReportedUsageConfig::default()),
+            cache_policy: Arc::new(CachePolicyConfig::default()),
+            defined_cache_routes: Arc::new(Vec::new()),
             compat_profile,
             model_resolution_mode: ModelResolutionMode::Compatible,
-            model_mapping: ModelMappingConfig::default(),
+            model_mapping: Arc::new(ModelMappingConfig::default()),
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
             payload_guard_enabled: true,
             payload_guard_mode: PayloadGuardMode::OnTooLong,
@@ -407,13 +410,13 @@ impl AppState {
             kiro_cache_point_record_plan: true,
             kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
-            body_conversion: BodyConversionConfig::default(),
-            prompt_injection: PromptInjectionConfig::default(),
-            route_features: RouteFeaturesConfig::default(),
+            body_conversion: Arc::new(BodyConversionConfig::default()),
+            prompt_injection: Arc::new(PromptInjectionConfig::default()),
+            route_features: Arc::new(RouteFeaturesConfig::default()),
             claude_models_only: false,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
-            external_pools: ExternalPoolsConfig::default(),
+            external_pools: Arc::new(ExternalPoolsConfig::default()),
             external_pool_manager: None,
         }
     }
@@ -432,8 +435,8 @@ impl AppState {
         route_features: RouteFeaturesConfig,
         claude_models_only: bool,
     ) -> Self {
-        self.prompt_injection = prompt_injection.normalized();
-        self.route_features = route_features.normalized();
+        self.prompt_injection = Arc::new(prompt_injection.normalized());
+        self.route_features = Arc::new(route_features.normalized());
         self.claude_models_only = claude_models_only;
         self
     }
@@ -481,17 +484,17 @@ impl AppState {
     }
 
     pub fn with_reported_usage(mut self, reported_usage: ReportedUsageConfig) -> Self {
-        self.reported_usage = reported_usage.normalized();
+        self.reported_usage = Arc::new(reported_usage.normalized());
         self
     }
 
     pub fn with_cache_policy(mut self, cache_policy: CachePolicyConfig) -> Self {
-        self.cache_policy = cache_policy.normalized();
+        self.cache_policy = Arc::new(cache_policy.normalized());
         self
     }
 
     pub fn with_defined_cache_routes(mut self, routes: Vec<String>) -> Self {
-        self.defined_cache_routes = normalize_defined_cache_routes(&routes);
+        self.defined_cache_routes = Arc::new(normalize_defined_cache_routes(&routes));
         self
     }
 
@@ -501,7 +504,7 @@ impl AppState {
     }
 
     pub fn with_model_mapping(mut self, model_mapping: ModelMappingConfig) -> Self {
-        self.model_mapping = model_mapping.normalized();
+        self.model_mapping = Arc::new(model_mapping.normalized());
         self
     }
 
@@ -534,7 +537,7 @@ impl AppState {
         self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
         self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
         self.image_processing = image_processing.normalized();
-        self.body_conversion = body_conversion;
+        self.body_conversion = Arc::new(body_conversion);
         self.payload_shaping = payload_shaping;
         self
     }
@@ -559,7 +562,7 @@ impl AppState {
     }
 
     pub fn with_external_pools(mut self, external_pools: ExternalPoolsConfig) -> Self {
-        self.external_pools = external_pools;
+        self.external_pools = Arc::new(external_pools);
         self
     }
 }

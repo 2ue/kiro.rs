@@ -5190,6 +5190,13 @@ pub struct Config {
     #[serde(default = "default_kiro_upstream_stream_idle_timeout_secs")]
     pub kiro_upstream_stream_idle_timeout_secs: u64,
 
+    /// 单次上游响应正文的总时长上限秒数（默认 3600，0 关闭，最大 86400）。
+    ///
+    /// 静默超时只管"多久没有新数据"；上游以低于静默超时的间隔持续滴流时，一个请求会一直
+    /// 占着账号并发。超过该时长后结束本次响应并释放并发，流式以错误事件结束。
+    #[serde(default = "default_kiro_upstream_stream_max_duration_secs")]
+    pub kiro_upstream_stream_max_duration_secs: u64,
+
     /// 下游流式响应的保活心跳间隔秒数（1–300）。
     ///
     /// 上游暂时没有新内容时，按该间隔向客户端发送保活事件，防止客户端或中间代理
@@ -5821,6 +5828,13 @@ fn default_kiro_upstream_response_timeout_secs() -> u64 {
 
 fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
     180
+}
+
+pub const DEFAULT_KIRO_UPSTREAM_STREAM_MAX_DURATION_SECS: u64 = 3600;
+pub const KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS: u64 = 86_400;
+
+fn default_kiro_upstream_stream_max_duration_secs() -> u64 {
+    DEFAULT_KIRO_UPSTREAM_STREAM_MAX_DURATION_SECS
 }
 
 pub const STREAM_PRE_OUTPUT_HOLD_MAX_SECS: u64 = 60;
@@ -6842,6 +6856,8 @@ impl Default for Config {
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
             kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
             ),
+            kiro_upstream_stream_max_duration_secs: default_kiro_upstream_stream_max_duration_secs(
+            ),
             stream_keepalive_interval_secs: default_stream_keepalive_interval_secs(),
             stream_pre_output_hold_secs: default_stream_pre_output_hold_secs(),
             stream_first_output_timeout_secs: default_stream_first_output_timeout_secs(),
@@ -7742,6 +7758,7 @@ mod tests {
         assert_eq!(config.credential_dispatch_max_wait_secs, 5);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
+        assert_eq!(config.kiro_upstream_stream_max_duration_secs, 3600);
         assert_eq!(config.stream_keepalive_interval_secs, 5);
         assert_eq!(config.stream_pre_output_hold_secs, 15);
         assert_eq!(config.stream_first_output_timeout_secs, 0);

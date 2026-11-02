@@ -20,6 +20,11 @@ pub(super) fn entry_model_cooldown<'a>(
     entry: &'a CredentialEntry,
     model: Option<&str>,
 ) -> Option<&'a CredentialModelCooldown> {
+    // Checked for every account on every dispatch scan; most accounts have no model cooldown,
+    // so skip building the lowercase key for them.
+    if entry.model_cooldowns.is_empty() {
+        return None;
+    }
     model
         .map(model_state_key)
         .and_then(|key| entry.model_cooldowns.get(&key))
