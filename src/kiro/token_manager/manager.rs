@@ -1729,7 +1729,7 @@ enum PreparedInFlightSlot {
 /// that control-plane failure as `None` makes the caller believe that every credential is full,
 /// which is the false queueing symptom seen during Redis incidents.
 enum PreparedInFlightSlotResult {
-    Ready(PreparedInFlightSlot),
+    Ready(Box<PreparedInFlightSlot>),
     CapacityFull,
     RedisReleaseAdmissionUnavailable,
 }
@@ -5225,7 +5225,7 @@ impl MultiTokenManager {
             ) {
                 return PreparedInFlightSlotResult::CapacityFull;
             }
-            return PreparedInFlightSlotResult::Ready(PreparedInFlightSlot::Redis {
+            return PreparedInFlightSlotResult::Ready(Box::new(PreparedInFlightSlot::Redis {
                 guard: InFlightLeaseGuard::new(
                     self.entries.clone(),
                     self.redis_store.clone(),
@@ -5241,7 +5241,7 @@ impl MultiTokenManager {
                 global_max_concurrent_requests,
                 request_weight_units,
                 max_age: self.in_flight_lease_max_age(),
-            });
+            }));
         }
 
         if self.acquire_local_in_flight_slot_with_id(
@@ -5252,7 +5252,7 @@ impl MultiTokenManager {
             global_max_concurrent_requests,
             request_weight_units,
         ) {
-            return PreparedInFlightSlotResult::Ready(PreparedInFlightSlot::Local(
+            return PreparedInFlightSlotResult::Ready(Box::new(PreparedInFlightSlot::Local(
                 InFlightLeaseGuard::new(
                     self.entries.clone(),
                     None,
@@ -5264,7 +5264,7 @@ impl MultiTokenManager {
                     lease_id,
                     request_weight_units,
                 ),
-            ));
+            )));
         }
         PreparedInFlightSlotResult::CapacityFull
     }
@@ -5376,7 +5376,7 @@ impl MultiTokenManager {
     ) -> anyhow::Result<Option<InFlightLeaseGuard>> {
         self.cleanup_expired_in_flight_leases_local_first();
         let prepared = match self.prepare_in_flight_slot(id, request_weight_units) {
-            PreparedInFlightSlotResult::Ready(prepared) => prepared,
+            PreparedInFlightSlotResult::Ready(prepared) => *prepared,
             PreparedInFlightSlotResult::CapacityFull => return Ok(None),
             PreparedInFlightSlotResult::RedisReleaseAdmissionUnavailable => {
                 return Err(LocalSchedulerError::new(
@@ -7332,7 +7332,7 @@ impl MultiTokenManager {
             let prepared_slot = match &decision {
                 AcquireDecision::Selected(id, _, _, _) => {
                     match self.prepare_in_flight_slot(*id, request_weight_units) {
-                        PreparedInFlightSlotResult::Ready(prepared) => Some(prepared),
+                        PreparedInFlightSlotResult::Ready(prepared) => Some(*prepared),
                         PreparedInFlightSlotResult::CapacityFull => None,
                         PreparedInFlightSlotResult::RedisReleaseAdmissionUnavailable => {
                             local_scheduler_bail!(
