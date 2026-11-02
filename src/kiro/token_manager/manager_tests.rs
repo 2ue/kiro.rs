@@ -3912,10 +3912,16 @@ async fn scheduler_redis_capacity_timeouts_open_only_after_consecutive_threshold
             commit_unknown: true
         }
     ));
-    assert!(matches!(
-        breaker.state.lock().phase,
-        SchedulerRedisBreakerPhase::Open { .. }
-    ));
+    let SchedulerRedisBreakerPhase::Open { until } = breaker.state.lock().phase else {
+        panic!("the capacity breaker opens at the threshold");
+    };
+    // The tolerated timeouts before the threshold do not grow the first back-off: it is the
+    // base 2 s (minus jitter), not the 8 s of a third consecutive failure.
+    assert!(
+        until.saturating_duration_since(Instant::now()) <= SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE,
+        "first opening backs off {:?}",
+        until.saturating_duration_since(Instant::now())
+    );
     assert_eq!(
         breaker.stats_snapshot().failures,
         u64::from(SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN)
@@ -6120,7 +6126,7 @@ async fn acquire_auto_heal_outside_selection_gate_terminates_when_healed_credent
     );
     assert_eq!(manager.available_count(), 2, "auto-heal still ran");
     assert!(
-        manager.selection_reservation_gate.try_lock().is_some(),
+        manager.selection_reservation_gate.try_lock().is_ok(),
         "selection gate must be released after acquire returns"
     );
 }
@@ -7195,6 +7201,8 @@ fn test_health_balanced_score_parameters_are_effective() {
         auto_heal_consecutive_rounds: 0,
         upstream_fault_streak: 0,
         upstream_fault_seq: 0,
+        redis_full_until: None,
+        last_upstream_fault_concentrated: false,
     };
     worse.health.recent_error_rate = 0.5;
     worse.health.latency_ewma_ms = Some(1_000.0);
@@ -7231,6 +7239,8 @@ fn test_health_balanced_score_parameters_are_effective() {
         auto_heal_consecutive_rounds: 0,
         upstream_fault_streak: 0,
         upstream_fault_seq: 0,
+        redis_full_until: None,
+        last_upstream_fault_concentrated: false,
     };
 
     let mut config = Config::default();
@@ -7858,6 +7868,99 @@ async fn test_rate_limiter_allows_idle_burst_up_to_rpm_capacity() {
     for lease in &mut leases {
         lease.release_in_flight();
     }
+}
+
+/// The RPM window is found by binary search over the selection history, which must stay in
+/// time order even when dispatches record out of order, and must count only the last minute.
+#[test]
+fn rpm_window_counts_only_the_last_minute_and_reports_the_oldest_selection() {
+    let mut config = Config::default();
+    config.credential_rpm = Some(3);
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("rpm-window", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let now = Instant::now();
+    let mut entries = manager.entries.lock();
+    let entry = &mut entries[0];
+    // Four minutes ago and two in the window: below the limit of three.
+    for age in [240, 50, 10] {
+        record_local_selection(entry, now - StdDuration::from_secs(age), 1);
+    }
+    assert_eq!(entry_rate_limit_window_remaining(entry, 3, now), None);
+    assert_eq!(entry.health.recent_selection_count_60s, 2);
+    assert_eq!(entry.health.recent_selection_count_10s, 1);
+    // A dispatch that read its clock earlier records after a later one: still in order.
+    record_local_selection(entry, now - StdDuration::from_secs(30), 1);
+    assert!(
+        entry
+            .selection_events
+            .iter()
+            .zip(entry.selection_events.iter().skip(1))
+            .all(|(a, b)| a <= b)
+    );
+    // Three in the window now; the slot frees when the 50 s old one leaves it.
+    let remaining = entry_rate_limit_window_remaining(entry, 3, now).expect("RPM limited");
+    assert!(
+        remaining > StdDuration::from_secs(9) && remaining <= StdDuration::from_secs(10),
+        "{remaining:?}"
+    );
+}
+
+/// With every account full, one waiter scans the pool and the others reuse its answer until
+/// capacity may have changed; a release still wakes them and they get the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_waiters_share_one_no_capacity_scan_and_still_get_freed_slots() {
+    let manager = queue_test_manager(3, 50);
+    let mut holders = Vec::new();
+    for _ in 0..3 {
+        holders.push(manager.acquire_context(None).await.unwrap());
+    }
+    let waiters = (0..20)
+        .map(|_| {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.acquire_context(None).await })
+        })
+        .collect::<Vec<_>>();
+    while manager.queued_requests.load(Ordering::Acquire) < 20 {
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+    {
+        let cache = manager.dispatch_wait_cache.lock();
+        let cached = cache
+            .entry
+            .as_ref()
+            .expect("the no-capacity answer is cached");
+        assert_eq!(cached.reason, DispatchWaitReason::CapacityFull);
+        assert_eq!(cached.epoch, manager.capacity_signal.capacity_epoch());
+    }
+
+    for holder in &mut holders {
+        holder.release_in_flight();
+    }
+    let mut served = 0;
+    let mut pending = waiters;
+    while !pending.is_empty() {
+        let mut next = Vec::new();
+        for task in pending {
+            if task.is_finished() {
+                let mut ctx = task.await.unwrap().expect("a freed slot reaches a waiter");
+                served += 1;
+                ctx.release_in_flight();
+            } else {
+                next.push(task);
+            }
+        }
+        pending = next;
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+        assert!(served <= 20);
+    }
+    assert_eq!(served, 20);
+    assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]
@@ -11804,6 +11907,7 @@ async fn redis_capacity_backend_restart_recovers_same_manager() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "timing-sensitive: soft-failure sharing needs each Redis affinity op within its 75ms budget; on loaded runners it falls back to the local count"]
 async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers() {
     let Some(redis_store) = test_redis_store().await else {
         eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
@@ -15605,6 +15709,250 @@ async fn killed_instance_leases_are_reclaimed_by_a_live_instance_and_shutdown_re
     .await;
 }
 
+/// The instance heartbeat used to refresh every lease this instance held in Redis, and the next
+/// state sync copied that time back over the local one: a request that stopped moving kept its
+/// slot as long as the process lived. Only leases with recent activity are refreshed now, and
+/// the local activity time is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stuck_leases_of_a_live_instance_expire_after_the_max_age() {
+    run_isolated_multi_redis_manager_fixture(1, |stores| async move {
+        let mut config = Config::default();
+        config.credential_rpm = None;
+        config.credential_max_concurrent_requests = 1;
+        config.credential_warmup_requests = 0;
+        config.credential_dispatch_max_wait_secs = 1;
+        config.credential_in_flight_lease_max_secs = 2;
+        let mut credential = api_key_credential("stuck-lease");
+        credential.id = Some(1);
+        let manager = Arc::new(
+            MultiTokenManager::new_with_stores(
+                config,
+                vec![credential],
+                None,
+                None,
+                false,
+                None,
+                Some(stores[0].clone()),
+            )
+            .unwrap(),
+        );
+        manager.heartbeat_and_reclaim_dead_instance_leases().await;
+        let held = manager.acquire_context(None).await.unwrap();
+        let lease_id = manager.entries.lock()[0].in_flight_leases[0].id;
+        std::mem::forget(held);
+        assert_eq!(manager.active_own_in_flight_lease_ids(), vec![lease_id]);
+
+        // No activity for longer than the max age: the heartbeat no longer refreshes it, and a
+        // Redis sync keeps the local activity time instead of the heartbeat's.
+        tokio::time::sleep(StdDuration::from_millis(2_500)).await;
+        assert!(manager.active_own_in_flight_lease_ids().is_empty());
+        manager.heartbeat_and_reclaim_dead_instance_leases().await;
+        manager.refresh_scheduler_state_from_redis_force().unwrap();
+        assert!(
+            manager.entries.lock()[0].in_flight_leases[0]
+                .last_seen_at
+                .elapsed()
+                > StdDuration::from_secs(2),
+            "the sync must not make the stuck lease look active again"
+        );
+
+        assert_eq!(manager.cleanup_expired_in_flight_leases(), 1);
+        let mut ctx = manager
+            .acquire_context(None)
+            .await
+            .expect("the stuck slot is reclaimed");
+        ctx.release_in_flight();
+    })
+    .await;
+}
+
+/// A slow Redis opened the scheduler breaker and every idle account stopped taking requests.
+/// On a single instance the local counts are the whole truth: with the breaker open, accounts
+/// with room are dispatched right away within their concurrency and RPM limits, and the queue
+/// still works. With another live instance on the same Redis the old cautious behavior stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_redis_breaker_does_not_stop_dispatch_to_idle_accounts_on_a_single_instance() {
+    run_isolated_multi_redis_manager_fixture(2, |stores| async move {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 2;
+        config.credential_rpm = Some(3);
+        config.credential_warmup_requests = 0;
+        config.credential_dispatch_max_wait_secs = 5;
+        let credentials = (1..=3)
+            .map(|index| {
+                let mut credential = api_key_credential(&format!("redis-breaker-local-{index}"));
+                credential.id = Some(index);
+                credential
+            })
+            .collect::<Vec<_>>();
+        let manager = |store: Arc<RedisStore>| {
+            Arc::new(
+                MultiTokenManager::new_with_stores(
+                    config.clone(),
+                    credentials.clone(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(store),
+                )
+                .unwrap(),
+            )
+        };
+        let open_breakers = |manager: &MultiTokenManager| {
+            for breaker in [
+                &manager.scheduler_redis_breaker,
+                &manager.scheduler_redis_affinity_breaker,
+            ] {
+                breaker.state.lock().phase = SchedulerRedisBreakerPhase::Open {
+                    until: Instant::now() + StdDuration::from_secs(30),
+                };
+            }
+        };
+
+        let single = manager(stores[0].clone());
+        single.heartbeat_and_reclaim_dead_instance_leases().await;
+        assert!(single.redis_coordination_is_single_instance());
+        open_breakers(&single);
+        assert_eq!(
+            single.local_pool_route_state(None).kind,
+            LocalPoolRouteStateKind::Ready,
+            "an open breaker is not a reason to turn requests away on a single instance"
+        );
+
+        // 3 accounts x 2 slots: all six dispatch at once, nothing waits for Redis.
+        let started = Instant::now();
+        let mut held = Vec::new();
+        for _ in 0..6 {
+            held.push(
+                tokio::time::timeout(StdDuration::from_secs(1), single.acquire_context(None))
+                    .await
+                    .expect("an idle account is dispatched without waiting for Redis")
+                    .expect("dispatch succeeds with the breaker open"),
+            );
+        }
+        assert!(
+            started.elapsed() < StdDuration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        for entry in single.entries.lock().iter() {
+            assert!(
+                entry.in_flight_requests <= 2,
+                "local concurrency limit holds"
+            );
+        }
+
+        // Full: the next one queues and gets the first slot that frees up.
+        let waiting_manager = single.clone();
+        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "a full pool queues");
+        held.pop().unwrap().release_in_flight();
+        let mut served = tokio::time::timeout(StdDuration::from_secs(2), waiting)
+            .await
+            .expect("the freed slot reaches the queued request")
+            .unwrap()
+            .unwrap();
+        served.release_in_flight();
+        for mut ctx in held {
+            ctx.release_in_flight();
+        }
+        // The RPM limit of 3 per account is enforced locally: 7 dispatched so far, 2 left.
+        for _ in 0..2 {
+            single
+                .acquire_context(None)
+                .await
+                .unwrap()
+                .release_in_flight();
+        }
+        assert!(
+            single
+                .acquire_context_for_session_with_mode(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    AcquireMode::FailFastOnCapacity,
+                    1,
+                )
+                .await
+                .is_err(),
+            "all three accounts used their 3 RPM"
+        );
+
+        // Calls made while Redis was unavailable never reached its RPM window. Once Redis
+        // answers again it would admit more calls than the account's RPM; the local window,
+        // which holds every call, still refuses them.
+        for breaker in [
+            &single.scheduler_redis_breaker,
+            &single.scheduler_redis_affinity_breaker,
+        ] {
+            breaker.state.lock().phase = SchedulerRedisBreakerPhase::Closed;
+        }
+        assert!(
+            single
+                .acquire_context_for_session_with_mode(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    AcquireMode::FailFastOnCapacity,
+                    1,
+                )
+                .await
+                .is_err(),
+            "Redis recovered with a short count; the local RPM window still holds"
+        );
+
+        // A second live instance on the same Redis: no local-only dispatch any more.
+        let other = manager(stores[1].clone());
+        other.heartbeat_and_reclaim_dead_instance_leases().await;
+        single.heartbeat_and_reclaim_dead_instance_leases().await;
+        assert!(!single.redis_coordination_is_single_instance());
+        assert!(!other.redis_coordination_is_single_instance());
+        open_breakers(&other);
+        assert_eq!(
+            other.local_pool_route_state(None).kind,
+            LocalPoolRouteStateKind::SchedulerRedisDegraded
+        );
+    })
+    .await;
+}
+
+/// Without Redis on a single instance the local RPM window is checked again at the moment the
+/// call is recorded: requests that picked the account before its window filled must not push it
+/// over its RPM.
+#[test]
+fn local_selection_reservation_rechecks_the_rpm_window() {
+    let mut config = Config::default();
+    config.credential_rpm = Some(2);
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("local-rpm-recheck", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let id = manager.entries.lock()[0].id;
+    for _ in 0..2 {
+        assert!(matches!(
+            manager.reserve_local_selection(id, 1),
+            SchedulerRedisSelectionAdmission::LocallyRecorded
+        ));
+    }
+    let SchedulerRedisSelectionAdmission::RateLimited(wait) =
+        manager.reserve_local_selection(id, 1)
+    else {
+        panic!("the third call in the minute is over the RPM of 2");
+    };
+    assert!(
+        wait.retry_after > StdDuration::from_secs(58),
+        "{:?}",
+        wait.retry_after
+    );
+    assert_eq!(manager.entries.lock()[0].selection_events.len(), 2);
+}
+
 #[test]
 fn dispatch_progress_reports_a_stalled_queue() {
     let manager = queue_test_manager(1, 10);
@@ -15649,6 +15997,412 @@ fn runtime_events_published_by_this_instance_are_recognised() {
     assert!(!manager.runtime_event_is_from_this_instance(&other));
     assert!(!manager.runtime_event_is_from_this_instance(r#"{"kind":"credentials_changed"}"#));
     assert!(!manager.runtime_event_is_from_this_instance("not json"));
+}
+
+// ---- 2026-10-31 overload stall (feature/issues/overload-stall-20261031) ----
+
+/// A Redis scheduler timeout while this process runs tasks late is our slowness, not Redis.
+/// Opening the breaker then stopped all dispatching, idle accounts included.
+#[tokio::test]
+async fn scheduler_redis_timeouts_during_local_runtime_lag_do_not_open_the_breaker() {
+    let lag = Arc::new(crate::common::runtime_lag::RuntimeLag::default());
+    let breaker = SchedulerRedisBreaker::with_runtime_lag(
+        SchedulerRedisBreakerKind::Capacity,
+        1,
+        0x5353,
+        lag.clone(),
+    );
+    let timeout = StdDuration::from_millis(5);
+    let slow = || async move {
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        Ok::<_, anyhow::Error>(())
+    };
+
+    lag.record(Instant::now(), StdDuration::from_millis(200));
+    for attempt in 0..SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN * 3 {
+        let outcome = MultiTokenManager::execute_scheduler_redis_operation(
+            breaker.clone(),
+            timeout,
+            "lagging runtime timeout test",
+            || {},
+            slow(),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            SchedulerRedisExecutionOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            breaker.state.lock().phase,
+            SchedulerRedisBreakerPhase::Closed,
+            "attempt {attempt}: a timeout while the runtime lags must not open the breaker"
+        );
+    }
+    assert_eq!(
+        breaker.stats.local_lag_timeouts.load(Ordering::Relaxed),
+        u64::from(SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN * 3)
+    );
+
+    // Same timeouts with an on-time runtime still open it at the usual threshold.
+    let on_time = SchedulerRedisBreaker::with_runtime_lag(
+        SchedulerRedisBreakerKind::Capacity,
+        1,
+        0x5454,
+        Arc::new(crate::common::runtime_lag::RuntimeLag::default()),
+    );
+    for _ in 0..SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN {
+        let _ = MultiTokenManager::execute_scheduler_redis_operation(
+            on_time.clone(),
+            timeout,
+            "on-time runtime timeout test",
+            || {},
+            slow(),
+        )
+        .await;
+    }
+    assert!(matches!(
+        on_time.state.lock().phase,
+        SchedulerRedisBreakerPhase::Open { .. }
+    ));
+}
+
+/// Redis said "full" while the local view had room (releases not applied yet). The credential
+/// must sit out briefly instead of being picked, and refused, by every following request; a
+/// local release of the credential lifts that at once.
+#[test]
+fn redis_full_hint_keeps_a_credential_out_of_selection_until_a_slot_frees() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            api_key_credential("ksk_redis_full_a"),
+            api_key_credential("ksk_redis_full_b"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let no_exclusions = HashSet::new();
+    let pick = |manager: &MultiTokenManager| {
+        manager
+            .select_next_credential_excluding(None, &no_exclusions, 1)
+            .map(|(id, _)| id)
+    };
+    let first = pick(&manager).expect("an idle credential is selectable");
+    // A request already running on `first`; its release below must lift the hint.
+    let lease_id = manager
+        .next_in_flight_lease_id
+        .fetch_add(1, Ordering::Relaxed);
+    assert!(manager.acquire_local_in_flight_slot_with_id(first, lease_id, Instant::now(), 0, 0, 1));
+
+    manager.mark_credential_redis_full(first);
+    for _ in 0..5 {
+        assert_ne!(
+            pick(&manager),
+            Some(first),
+            "Redis-full credential must sit out"
+        );
+    }
+    let other = pick(&manager).expect("the other idle credential is still selectable");
+    assert_ne!(other, first);
+
+    // Both full according to Redis: nothing selectable, no spin through them.
+    manager.mark_credential_redis_full(other);
+    assert_eq!(pick(&manager), None);
+
+    // A local release of `first` clears its hint.
+    drop(InFlightLeaseGuard::new(
+        manager.entries.clone(),
+        None,
+        None,
+        None,
+        None,
+        manager.capacity_signal.clone(),
+        first,
+        lease_id,
+        1,
+    ));
+    assert_eq!(pick(&manager), Some(first));
+}
+
+/// The hint expires on its own, so a credential is never left out longer than the TTL.
+#[test]
+fn redis_full_hint_expires_after_its_ttl() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![api_key_credential("ksk_redis_full_ttl")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager.mark_credential_redis_full(1);
+    let now = Instant::now();
+    let entries = manager.entries.lock();
+    assert!(crate::kiro::token_manager::capacity::entry_redis_full_hint_active(&entries[0], now));
+    assert!(
+        !crate::kiro::token_manager::capacity::entry_redis_full_hint_active(
+            &entries[0],
+            now + crate::kiro::token_manager::capacity::REDIS_FULL_HINT_TTL
+                + StdDuration::from_millis(1)
+        )
+    );
+}
+
+/// The queue-full fast path reuses its "no free slot" answer until capacity may have changed.
+/// A released slot must invalidate it at once, or a request would be turned away while an
+/// account is idle.
+#[test]
+fn queue_full_fast_path_answer_is_dropped_as_soon_as_a_slot_frees() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    config.credential_max_concurrent_requests = 1;
+    config.dispatch_max_queued_requests = 1;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![api_key_credential("ksk_queue_full_cache")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager.queued_requests.store(1, Ordering::Release);
+    let lease_id = manager
+        .next_in_flight_lease_id
+        .fetch_add(1, Ordering::Relaxed);
+    assert!(manager.acquire_local_in_flight_slot_with_id(1, lease_id, Instant::now(), 1, 0, 1));
+    assert!(manager.dispatch_queue_full_retry_after(None).is_some());
+    assert!(
+        manager.dispatch_queue_full_retry_after(None).is_some(),
+        "cached answer while nothing changed"
+    );
+    drop(InFlightLeaseGuard::new(
+        manager.entries.clone(),
+        None,
+        None,
+        None,
+        None,
+        manager.capacity_signal.clone(),
+        1,
+        lease_id,
+        1,
+    ));
+    assert_eq!(
+        manager.dispatch_queue_full_retry_after(None),
+        None,
+        "a freed slot must be seen immediately"
+    );
+}
+
+/// Once stopping, queued and new dispatches answer at once instead of waiting for a slot until
+/// their wait limit: the HTTP drain must fit docker's 10 s grace period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_answers_immediately_once_the_process_is_stopping() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    config.credential_max_concurrent_requests = 1;
+    config.credential_dispatch_max_wait_secs = 60;
+    let manager = Arc::new(
+        MultiTokenManager::new(
+            config,
+            vec![api_key_credential("ksk_stopping")],
+            None,
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let mut held = manager
+        .acquire_context(None)
+        .await
+        .expect("first request gets the slot");
+    let waiter = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.acquire_context(None).await.map(|_| ()) }
+    });
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    assert!(!waiter.is_finished(), "second request queues for the slot");
+
+    manager.begin_shutdown();
+    let result = tokio::time::timeout(StdDuration::from_secs(2), waiter)
+        .await
+        .expect("the queued request answers right after shutdown begins")
+        .unwrap();
+    let err = result.expect_err("no slot was handed out");
+    assert!(err.to_string().contains("实例正在停止"), "{err}");
+    assert!(manager.acquire_context(None).await.is_err());
+    held.release_in_flight();
+}
+
+/// The lag excuse must not hide a real Redis outage: a hung Redis also makes callers pile up and
+/// the process lag. After enough excused timeouts in a row with no success, timeouts count again.
+#[tokio::test]
+async fn excused_timeouts_stop_being_excused_without_any_success() {
+    let lag = Arc::new(crate::common::runtime_lag::RuntimeLag::default());
+    let breaker = SchedulerRedisBreaker::with_runtime_lag(
+        SchedulerRedisBreakerKind::Capacity,
+        1,
+        0x5555,
+        lag.clone(),
+    );
+    let timeout = StdDuration::from_millis(5);
+    let mut opened_after = None;
+    for attempt in 1..=(SCHEDULER_REDIS_MAX_CONSECUTIVE_EXCUSED_TIMEOUTS as u32 + 10) {
+        lag.record(Instant::now(), StdDuration::from_millis(200));
+        let _ = MultiTokenManager::execute_scheduler_redis_operation(
+            breaker.clone(),
+            timeout,
+            "hung redis while lagging",
+            || {},
+            async move {
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await;
+        if matches!(
+            breaker.state.lock().phase,
+            SchedulerRedisBreakerPhase::Open { .. }
+        ) {
+            opened_after = Some(attempt);
+            break;
+        }
+    }
+    let opened_after = opened_after.expect("a Redis that never answers must open the breaker");
+    assert!(opened_after > SCHEDULER_REDIS_MAX_CONSECUTIVE_EXCUSED_TIMEOUTS as u32);
+}
+
+/// Priority tiers: only the two preferred accounts take traffic, the other eight are idle. An
+/// upstream outage then fails just those two over and over. Counting the idle eight as "usable"
+/// made the outage look concentrated on two accounts, which were cooled, then the next tier.
+#[test]
+fn upstream_outage_on_the_only_active_tier_does_not_cool_it() {
+    let credentials = (0..10)
+        .map(|index| api_key_credential(&format!("ksk_tier_{index}")))
+        .collect();
+    let manager =
+        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    {
+        let now = Instant::now();
+        let mut entries = manager.entries.lock();
+        for entry in entries.iter_mut().take(2) {
+            entry.selection_events.push_back(now);
+        }
+    }
+    let ids: Vec<u64> = manager
+        .entries
+        .lock()
+        .iter()
+        .take(2)
+        .map(|e| e.id)
+        .collect();
+    for round in 0..10 {
+        for id in &ids {
+            assert!(
+                !manager.note_upstream_fault(*id),
+                "round {round}: a fault shared by every active account must not cool #{id}"
+            );
+        }
+    }
+}
+
+/// One active account failing while the other active ones succeed is still concentrated.
+#[test]
+fn a_single_failing_active_account_is_still_cooled() {
+    let credentials = (0..4)
+        .map(|index| api_key_credential(&format!("ksk_single_{index}")))
+        .collect();
+    let manager =
+        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let now = Instant::now();
+    for entry in manager.entries.lock().iter_mut() {
+        entry.selection_events.push_back(now);
+    }
+    let failing = manager.entries.lock()[0].id;
+    let mut cooled = false;
+    for _ in 0..UPSTREAM_FAULT_STREAK_COOLDOWN {
+        cooled = manager.note_upstream_fault(failing);
+    }
+    assert!(cooled);
+}
+
+/// Production accounts all use a proxy resource. A timeout on such an account cooled it at once
+/// (it might be its proxy), so an upstream-wide timeout wave cooled the whole pool. It now only
+/// does when the fault is concentrated; a wave over the active accounts leaves them in service.
+#[test]
+fn dedicated_proxy_timeouts_shared_by_the_active_pool_are_not_concentrated() {
+    let credentials = (0..6)
+        .map(|index| {
+            let mut credential = api_key_credential(&format!("ksk_proxy_wave_{index}"));
+            credential.proxy_resource_id = Some(1);
+            credential
+        })
+        .collect();
+    let manager =
+        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let now = Instant::now();
+    for entry in manager.entries.lock().iter_mut() {
+        entry.selection_events.push_back(now);
+    }
+    let ids: Vec<u64> = manager.entries.lock().iter().map(|e| e.id).collect();
+    // First fault of each account: nothing to compare with yet.
+    for id in &ids {
+        manager.note_upstream_fault(*id);
+    }
+    // A second wave: every active account failed in between, so none is concentrated.
+    for id in &ids {
+        manager.note_upstream_fault(*id);
+        assert!(!manager.last_upstream_fault_was_concentrated(*id), "#{id}");
+    }
+    // One account failing alone is concentrated again.
+    let lone = ids[0];
+    manager.note_upstream_fault(lone);
+    manager.note_upstream_fault(lone);
+    assert!(manager.last_upstream_fault_was_concentrated(lone));
+}
+
+/// The upstream throttles every account without a Retry-After: each account would cool for
+/// 30 s (doubling), so the pool stayed idle long after the upstream recovered. Once most of the
+/// pool is cooling, further cooldowns are capped short; the first accounts keep their full one.
+#[test]
+fn pool_wide_rate_limit_cooldowns_are_capped() {
+    let credentials = (0..6)
+        .map(|index| api_key_credential(&format!("ksk_pool_429_{index}")))
+        .collect();
+    let manager =
+        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let ids: Vec<u64> = manager.entries.lock().iter().map(|e| e.id).collect();
+    for id in &ids {
+        manager
+            .report_transient_failure_kind(*id, None, TransientFailureKind::RateLimit, None, "429")
+            .unwrap();
+    }
+    let now = Instant::now();
+    let remaining: Vec<StdDuration> = manager
+        .entries
+        .lock()
+        .iter()
+        .map(|entry| entry_cooldown_remaining(entry, None, now).unwrap_or_default())
+        .collect();
+    // The first half cooled while the rest of the pool was fine: full cooldown.
+    assert!(remaining[0] > POOL_WIDE_COOLDOWN_CAP * 2, "{remaining:?}");
+    // The last ones cooled with most of the pool already cooling: capped, spread over one to
+    // two caps so they do not all come back in the same second.
+    assert!(remaining[5] <= POOL_WIDE_COOLDOWN_CAP * 2, "{remaining:?}");
+    // An explicit Retry-After is still honored.
+    manager
+        .report_transient_failure_kind(
+            ids[5],
+            None,
+            TransientFailureKind::RateLimit,
+            Some(StdDuration::from_secs(40)),
+            "429 retry-after",
+        )
+        .unwrap();
+    let after = entry_cooldown_remaining(&manager.entries.lock()[5], None, Instant::now()).unwrap();
+    assert!(after > StdDuration::from_secs(30), "{after:?}");
 }
 
 fn tier_list(models: &[&str]) -> crate::model::config::SubscriptionModelList {

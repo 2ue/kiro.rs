@@ -262,6 +262,26 @@ impl HttpSendError {
     }
 }
 
+/// The lowest-level cause of a send failure (for example "Connection reset by peer" or "Can't
+/// assign requested address"), without the request URL, for logs. The top-level reqwest message
+/// only says "error sending request", which cannot tell a local socket shortage from an
+/// upstream reset.
+pub fn send_error_cause(error: &HttpSendError) -> String {
+    let HttpSendError::Request(error) = error else {
+        return error.to_string();
+    };
+    let mut cause: &dyn std::error::Error = error;
+    while let Some(source) = cause.source() {
+        cause = source;
+    }
+    let text = cause.to_string();
+    if std::ptr::addr_eq(cause, error as &dyn std::error::Error) {
+        // No deeper cause: drop the URL reqwest appends to its own message.
+        return text.split(" for url (").next().unwrap_or(&text).to_string();
+    }
+    text
+}
+
 impl fmt::Display for HttpSendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

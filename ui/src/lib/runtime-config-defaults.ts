@@ -517,6 +517,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   credentialSessionMaxConcurrentRequests: 0,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
+  kiroUpstreamStreamMaxDurationSecs: 3600,
   streamKeepaliveIntervalSecs: 5,
   streamPreOutputHoldSecs: 15,
   streamFirstOutputTimeoutSecs: 0,

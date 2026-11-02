@@ -15,7 +15,7 @@ pub(super) async fn handle_messages_endpoint(
         .kiro_provider
         .as_ref()
         .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
+        .unwrap_or_else(|| Arc::new(RequestRuntimeConfig::from_app_state(&state)));
     let inference_attempt_budget = Arc::new(InferenceAttemptBudget::with_auxiliary_max_attempts(
         runtime_config.inference_upstream_max_attempts,
         runtime_config.auxiliary_upstream_max_attempts,
@@ -24,7 +24,11 @@ pub(super) async fn handle_messages_endpoint(
     let local_dispatch_max_wait_secs = state
         .kiro_provider
         .as_ref()
-        .map(|provider| provider.runtime_config().credential_dispatch_max_wait_secs)
+        .map(|provider| {
+            provider
+                .runtime_config_snapshot()
+                .credential_dispatch_max_wait_secs
+        })
         .unwrap_or(5);
     let shared_dispatch_max_wait_secs = local_dispatch_max_wait_secs
         .max(
@@ -312,7 +316,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
         .kiro_provider
         .as_ref()
         .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
+        .unwrap_or_else(|| Arc::new(RequestRuntimeConfig::from_app_state(&state)));
     if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
         &state,
         &runtime_config,
@@ -355,6 +359,11 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     .await
 }
 
+static EARLY_REJECTION_LOG_THROTTLE: std::sync::LazyLock<crate::common::log_throttle::LogThrottle> =
+    std::sync::LazyLock::new(|| {
+        crate::common::log_throttle::LogThrottle::new(std::time::Duration::from_secs(1))
+    });
+
 fn should_try_raw_external_routes(requires_normalized_body: bool) -> bool {
     !requires_normalized_body
 }
@@ -392,13 +401,17 @@ fn maybe_local_pool_unavailable_fast_fail_response(
             attribution.apply_local_temporary_backoff(retry_after_secs);
         }
         let request_id = envelope::request_id();
-        tracing::warn!(
-            request_id,
-            endpoint,
-            model,
-            retry_after_secs,
-            "local dispatch queue is full and no credential has a free slot; rejecting before body processing"
-        );
+        // Every arriving request takes this path while the queue is full: log one line a second.
+        if let Some(suppressed) = EARLY_REJECTION_LOG_THROTTLE.admit() {
+            tracing::warn!(
+                request_id,
+                endpoint,
+                model,
+                retry_after_secs,
+                suppressed_since_last = suppressed,
+                "local dispatch queue is full and no credential has a free slot; rejecting before body processing"
+            );
+        }
         let response = envelope::error_response_with_id_and_headers(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",

@@ -12,6 +12,9 @@ pub(crate) struct CapacitySignal {
     capacity_changed: Notify,
     state_generation: AtomicU64,
     state_changed: Notify,
+    /// Bumped whenever capacity may have become available (a slot released or the scheduler
+    /// state changed). Lets callers cache a "nothing is free" answer until this moves.
+    capacity_epoch: AtomicU64,
 }
 
 impl CapacitySignal {
@@ -28,6 +31,7 @@ impl CapacitySignal {
         if units == 0 {
             return;
         }
+        self.capacity_epoch.fetch_add(1, Ordering::AcqRel);
         let added = loop {
             let waiters = self.waiters.load(Ordering::Acquire);
             let current = self.credits.load(Ordering::Acquire);
@@ -52,8 +56,14 @@ impl CapacitySignal {
     }
 
     pub(crate) fn notify_state_changed(&self) {
+        self.capacity_epoch.fetch_add(1, Ordering::AcqRel);
         self.state_generation.fetch_add(1, Ordering::AcqRel);
         self.state_changed.notify_waiters();
+    }
+
+    /// See [`Self::capacity_epoch`]: changes whenever capacity may have been freed.
+    pub(crate) fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch.load(Ordering::Acquire)
     }
 
     fn consume_credit(&self) -> bool {

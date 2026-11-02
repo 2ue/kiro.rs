@@ -6886,6 +6886,59 @@ async fn run_non_stream_body_timeout_counts_silence_not_total_time() {
     );
 }
 
+/// A body that keeps trickling in under the idle limit is still cut at
+/// `kiroUpstreamStreamMaxDurationSecs`, streaming and not, so it cannot hold a credential slot
+/// forever.
+async fn run_trickling_body_is_cut_at_the_max_duration() {
+    for stream in [true, false] {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::SlowSteadyTextBody)
+                .await;
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+                config.kiro_upstream_stream_idle_timeout_secs = 1;
+                config.kiro_upstream_stream_max_duration_secs = 1;
+                config.stream_pre_output_hold_secs = 0;
+            });
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.oneshot(handler_eventstream_fault_request_for_path(
+                "/v1/messages",
+                stream,
+            )),
+        )
+        .await
+        .expect("response")
+        .expect("response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            started.elapsed() < Duration::from_millis(2_200),
+            "stream={stream}: the 2.4 s trickle is cut at 1 s: {:?}",
+            started.elapsed()
+        );
+        assert!(!body.contains("slow-done"), "stream={stream}: {body}");
+        if stream {
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("event: error"), "{body}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        }
+    }
+}
+
+#[test]
+fn trickling_body_is_cut_at_the_max_duration() {
+    run_handler_fixture_on_large_stack_thread(
+        "trickling-body-max-duration",
+        run_trickling_body_is_cut_at_the_max_duration,
+    );
+}
+
 #[test]
 fn non_stream_body_timeout_counts_silence_not_total_time() {
     run_handler_fixture_on_large_stack_thread(
@@ -8544,6 +8597,7 @@ fn runtime_config_for_payload_guard(
         kiro_cache_point_tools_only: true,
         kiro_cache_point_record_plan: true,
         kiro_upstream_stream_idle_timeout_secs: 180,
+        kiro_upstream_stream_max_duration_secs: 3600,
         stream_keepalive_interval_secs: 5,
         stream_pre_output_hold_secs: 15,
         stream_first_output_timeout_secs: 0,

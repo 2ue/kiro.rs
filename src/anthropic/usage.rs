@@ -389,6 +389,8 @@ pub enum StreamTerminalReason {
     UpstreamIdleTimeout,
     /// Upstream sent headers but no content event within the first-output limit.
     FirstOutputTimeout,
+    /// The response body ran longer than `kiroUpstreamStreamMaxDurationSecs`.
+    UpstreamMaxDuration,
     MalformedSse,
     ProtocolContamination,
     ClientDropped,
@@ -2205,6 +2207,13 @@ impl UsageWriterControl {
         self.task.lock().take()
     }
 
+    fn queue_more_than_half_full(&self) -> bool {
+        self.sender
+            .lock()
+            .as_ref()
+            .is_some_and(|sender| sender.capacity() < sender.max_capacity() / 2)
+    }
+
     fn queue_stats(&self) -> (bool, usize, usize) {
         self.sender
             .lock()
@@ -2246,8 +2255,70 @@ struct UsagePostgresCacheRevision {
     cleanup_watermark_micros: i64,
 }
 
+/// Most recent usage records kept in memory, oldest first, with an id index.
+///
+/// Every request (rejections included) appends here. A record recorded again under the same id
+/// (a late update) replaces the earlier one. The index keeps that check O(1); a linear scan over
+/// thousands of records under this lock on every request was a hot spot during overloads.
+#[derive(Debug, Default)]
+struct RecentUsageRecords {
+    records: VecDeque<UsageRecord>,
+    ids: HashSet<String>,
+}
+
+impl RecentUsageRecords {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            records: VecDeque::with_capacity(capacity),
+            ids: HashSet::with_capacity(capacity),
+        }
+    }
+
+    /// Appends `record`, replacing an earlier one with the same id, and returns the records
+    /// that fell out so the caller can drop them after releasing the lock.
+    #[must_use]
+    fn push_replacing(&mut self, record: UsageRecord, limit: usize) -> Vec<UsageRecord> {
+        let mut removed = Vec::new();
+        if !self.ids.insert(record.id.clone())
+            && let Some(index) = self
+                .records
+                .iter()
+                .position(|existing| existing.id == record.id)
+        {
+            removed.extend(self.records.remove(index));
+        }
+        self.records.push_back(record);
+        while self.records.len() > limit {
+            if let Some(evicted) = self.records.pop_front() {
+                self.ids.remove(&evicted.id);
+                removed.push(evicted);
+            }
+        }
+        removed
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&UsageRecord) -> bool) {
+        let ids = &mut self.ids;
+        self.records.retain(|record| {
+            let kept = keep(record);
+            if !kept {
+                ids.remove(&record.id);
+            }
+            kept
+        });
+    }
+}
+
+impl std::ops::Deref for RecentUsageRecords {
+    type Target = VecDeque<UsageRecord>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.records
+    }
+}
+
 pub struct UsageRecorder {
-    records: Mutex<VecDeque<UsageRecord>>,
+    records: Mutex<RecentUsageRecords>,
     limit: usize,
     postgres_store: Option<Arc<PostgresUsageStore>>,
     redis_store: Option<Arc<RedisStore>>,
@@ -2263,6 +2334,9 @@ pub struct UsageRecorder {
     cleanup_watermark_micros: AtomicI64,
     rejected_by_cleanup_watermark: AtomicU64,
     backpressured_persist_records: AtomicU64,
+    /// Local scheduler rejections not persisted because the queue was over half full.
+    sampled_out_rejection_records: AtomicU64,
+    rejection_persist_sampler: crate::common::log_throttle::LogThrottle,
     backpressured_redis_records: AtomicU64,
     dropped_persist_records: Arc<AtomicU64>,
     dropped_redis_records: Arc<AtomicU64>,
@@ -2514,7 +2588,7 @@ impl UsageRecorder {
     pub fn new(limit: usize) -> Self {
         let limit = limit.max(1);
         Self {
-            records: Mutex::new(VecDeque::with_capacity(limit.min(1024))),
+            records: Mutex::new(RecentUsageRecords::with_capacity(limit.min(1024))),
             limit,
             postgres_store: None,
             redis_store: None,
@@ -2530,6 +2604,10 @@ impl UsageRecorder {
             cleanup_watermark_micros: AtomicI64::new(0),
             rejected_by_cleanup_watermark: AtomicU64::new(0),
             backpressured_persist_records: AtomicU64::new(0),
+            sampled_out_rejection_records: AtomicU64::new(0),
+            rejection_persist_sampler: crate::common::log_throttle::LogThrottle::new(
+                StdDuration::from_secs(1),
+            ),
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
             dropped_redis_records: Arc::new(AtomicU64::new(0)),
@@ -2612,7 +2690,7 @@ impl UsageRecorder {
             }
         });
         Self {
-            records: Mutex::new(VecDeque::with_capacity(limit.max(1).min(1024))),
+            records: Mutex::new(RecentUsageRecords::with_capacity(limit.max(1).min(1024))),
             limit: limit.max(1),
             postgres_store: Some(postgres_store),
             redis_store,
@@ -2628,6 +2706,10 @@ impl UsageRecorder {
             cleanup_watermark_micros: AtomicI64::new(initial_cleanup_watermark_micros),
             rejected_by_cleanup_watermark: AtomicU64::new(0),
             backpressured_persist_records: AtomicU64::new(0),
+            sampled_out_rejection_records: AtomicU64::new(0),
+            rejection_persist_sampler: crate::common::log_throttle::LogThrottle::new(
+                StdDuration::from_secs(1),
+            ),
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records,
             dropped_redis_records,
@@ -2730,23 +2812,42 @@ impl UsageRecorder {
         self.add_key_usage(&record);
         self.record_usage_postgres(record.clone());
 
-        {
-            let mut records = self.records.lock();
-            if let Some(index) = records.iter().position(|existing| existing.id == record.id) {
-                records.remove(index);
-            }
-            records.push_back(record.clone());
-            while records.len() > self.limit {
-                records.pop_front();
-            }
-        }
+        // Clone and drop outside the lock: every request records here, and a record carries
+        // several strings and diagnostics.
+        let in_memory = record.clone();
+        let evicted = self.records.lock().push_replacing(in_memory, self.limit);
+        drop(evicted);
 
         self.record_usage_redis(record);
         UsageRecordOutcome::Accepted
     }
 
-    fn record_usage_postgres(&self, record: UsageRecord) {
+    fn record_usage_postgres(&self, mut record: UsageRecord) {
         if let Some(writer) = &self.writer {
+            // Under an overload most records are local scheduler rejections (queue full),
+            // multiplied by gateway retries. Once the persist queue is half full they would
+            // crowd out the records that matter (successes, billing) and keep the writer behind
+            // for minutes. Keep one rejection a second then, carrying how many it stands for.
+            if is_local_scheduler_rejection_record(&record) && writer.queue_more_than_half_full() {
+                match self.rejection_persist_sampler.admit() {
+                    Some(skipped) => {
+                        if skipped > 0 {
+                            let note = format!(
+                                " (persist sampled: {skipped} similar rejections not stored)"
+                            );
+                            match record.error_detail.as_mut() {
+                                Some(detail) => detail.push_str(&note),
+                                None => record.error_detail = Some(note.trim_start().to_string()),
+                            }
+                        }
+                    }
+                    None => {
+                        self.sampled_out_rejection_records
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
             match writer.enqueue(record) {
                 Ok(false) => {}
                 Ok(true) => {
@@ -4027,6 +4128,19 @@ async fn wait_usage_writer_task(
     true
 }
 
+/// A request the local scheduler turned away before any upstream call (queue full, queue
+/// timeout, capacity unavailable). Nothing was billed; see `record_usage_postgres`.
+fn is_local_scheduler_rejection_record(record: &UsageRecord) -> bool {
+    if record.status != UsageRecordStatus::Error || record.credential_id.is_some() {
+        return false;
+    }
+    record.error_detail.as_deref().is_some_and(|detail| {
+        detail.contains("账号调度等待队列已满")
+            || detail.contains("账号调度排队等待超时")
+            || detail.contains("本地账号调度容量暂不可用")
+    })
+}
+
 fn should_log_usage_counter(value: u64) -> bool {
     value == 1 || value.is_power_of_two()
 }
@@ -4922,7 +5036,7 @@ mod tests {
             }
         });
         let recorder = Arc::new(UsageRecorder {
-            records: Mutex::new(VecDeque::with_capacity(16)),
+            records: Mutex::new(RecentUsageRecords::with_capacity(16)),
             limit: 16,
             postgres_store: None,
             redis_store: None,
@@ -4938,6 +5052,10 @@ mod tests {
             cleanup_watermark_micros: AtomicI64::new(0),
             rejected_by_cleanup_watermark: AtomicU64::new(0),
             backpressured_persist_records: AtomicU64::new(0),
+            sampled_out_rejection_records: AtomicU64::new(0),
+            rejection_persist_sampler: crate::common::log_throttle::LogThrottle::new(
+                StdDuration::from_secs(1),
+            ),
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
             dropped_redis_records: Arc::new(AtomicU64::new(0)),
@@ -5057,7 +5175,7 @@ mod tests {
             redis.record_usage_summary(&usage).await.unwrap();
 
             let recorder = UsageRecorder {
-                records: Mutex::new(VecDeque::with_capacity(16)),
+                records: Mutex::new(RecentUsageRecords::with_capacity(16)),
                 limit: 16,
                 postgres_store: None,
                 redis_store: Some(redis.clone()),
@@ -5075,6 +5193,10 @@ mod tests {
                 cleanup_watermark_micros: AtomicI64::new(0),
                 rejected_by_cleanup_watermark: AtomicU64::new(0),
                 backpressured_persist_records: AtomicU64::new(0),
+                sampled_out_rejection_records: AtomicU64::new(0),
+                rejection_persist_sampler: crate::common::log_throttle::LogThrottle::new(
+                    StdDuration::from_secs(1),
+                ),
                 backpressured_redis_records: AtomicU64::new(0),
                 dropped_persist_records: Arc::new(AtomicU64::new(0)),
                 dropped_redis_records: Arc::new(AtomicU64::new(0)),
@@ -6041,5 +6163,113 @@ mod tests {
 
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.records[0].id, "new");
+    }
+
+    fn queue_full_rejection(id: &str) -> UsageRecord {
+        let mut rejection = record(id, 0, UsageSource::RequestEstimate);
+        rejection.credential_id = None;
+        rejection.status = UsageRecordStatus::Error;
+        rejection.error_detail = Some(
+            "api_error: 账号调度等待队列已满（max_queued_requests=200, queued=200, retry_after_secs=5）"
+                .to_string(),
+        );
+        rejection
+    }
+
+    #[test]
+    fn recent_usage_records_replace_by_id_and_evict_with_their_index() {
+        let mut recent = RecentUsageRecords::with_capacity(4);
+        for id in ["a", "b", "c"] {
+            assert!(
+                recent
+                    .push_replacing(record(id, 0, UsageSource::RequestEstimate), 3)
+                    .is_empty()
+            );
+        }
+        let mut updated = record("b", 7, UsageSource::RequestEstimate);
+        updated.model = "updated".to_string();
+        let removed = recent.push_replacing(updated, 3);
+        assert_eq!(
+            removed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert_eq!(
+            recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a", "c", "b"]
+        );
+        assert_eq!(recent.back().unwrap().model, "updated");
+
+        let evicted = recent.push_replacing(record("d", 0, UsageSource::RequestEstimate), 3);
+        assert_eq!(
+            evicted.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a"]
+        );
+        assert!(!recent.ids.contains("a"));
+        // An evicted id recorded again is a new entry, not a replacement.
+        assert!(
+            recent
+                .push_replacing(record("a", 0, UsageSource::RequestEstimate), 4)
+                .is_empty()
+        );
+        assert_eq!(recent.len(), 4);
+
+        recent.retain(|r| r.id != "c");
+        assert!(!recent.ids.contains("c"));
+        assert_eq!(recent.ids.len(), recent.len());
+    }
+
+    /// During an overload the persist queue fills with queue-full rejections multiplied by
+    /// gateway retries. Past half full only one a second is kept; successes are never dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejections_are_sampled_once_the_persist_queue_is_half_full() {
+        let (recorder, persisted, started, gate) = recorder_with_test_writer(8, true);
+        // Hold the writer on its first record so the queue fills up.
+        recorder.record(record("first", 0, UsageSource::RequestEstimate));
+        started.notified().await;
+        for index in 0..4 {
+            recorder.record(queue_full_rejection(&format!("early-{index}")));
+        }
+        // Queue now 4/8 used: more than half full is reached by the next records.
+        recorder.record(queue_full_rejection("over-half-kept"));
+        for index in 0..20 {
+            recorder.record(queue_full_rejection(&format!("over-half-{index}")));
+        }
+        recorder.record(record("success-after", 0, UsageSource::RequestEstimate));
+        gate.add_permits(1);
+        let drained = recorder.drain(StdDuration::from_secs(2)).await;
+        assert!(!drained.timed_out);
+
+        let ids = persisted.lock().clone();
+        assert!(
+            ids.contains(&"success-after".to_string()),
+            "successes are never sampled out"
+        );
+        let over_half_rejections = ids.iter().filter(|id| id.starts_with("over-half")).count();
+        assert!(
+            over_half_rejections <= 2,
+            "at most one rejection per second once over half full, got {over_half_rejections}: {ids:?}"
+        );
+        assert!(
+            recorder
+                .sampled_out_rejection_records
+                .load(Ordering::Relaxed)
+                >= 19
+        );
+    }
+
+    #[test]
+    fn only_local_scheduler_rejections_are_sampled() {
+        assert!(is_local_scheduler_rejection_record(&queue_full_rejection(
+            "q"
+        )));
+        let mut billed = queue_full_rejection("billed");
+        billed.credential_id = Some(3);
+        assert!(!is_local_scheduler_rejection_record(&billed));
+        let mut upstream = queue_full_rejection("upstream");
+        upstream.error_detail = Some("api_error: upstream_failure class=server_error".to_string());
+        assert!(!is_local_scheduler_rejection_record(&upstream));
+        let mut success = queue_full_rejection("success");
+        success.status = UsageRecordStatus::Success;
+        assert!(!is_local_scheduler_rejection_record(&success));
     }
 }

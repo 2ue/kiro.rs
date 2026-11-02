@@ -1564,7 +1564,7 @@ async fn call_mcp_api(
     let body = match response_bytes_with_limit_and_body_timeout(
         response,
         provider
-            .runtime_config()
+            .runtime_config_snapshot()
             .kiro_upstream_response_timeout_secs,
         MAX_MCP_RESPONSE_BYTES,
     )

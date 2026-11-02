@@ -21,6 +21,7 @@ use std::{
 };
 
 use anyhow::Context as _;
+use axum::serve::ListenerExt as _;
 use axum::{
     Json, Router,
     extract::State,
@@ -45,11 +46,28 @@ use storage::redis_cache::RedisStore;
 use storage::usage_demo_seed::seed_usage_demo;
 
 const STARTUP_DEPENDENCY_MAX_WAIT: StdDuration = StdDuration::from_secs(60);
-const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
-const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(15);
-const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
-const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+// `docker stop` sends SIGKILL 10 seconds after SIGTERM by default. Everything below has to fit
+// in that window, or the usage records still queued in memory are lost: by default at most 5 s
+// for HTTP connections to drain (queued requests answer at once, see `begin_shutdown`), then at
+// most 4 s for background work, with the usage writers drained first. Streams still running
+// when the drain ends are cut, so deployments with a longer grace period raise the drain with
+// `KIRO_RS_HTTP_DRAIN_SECS` (grace period minus about 10 s).
+const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const SERVER_GRACEFUL_SHUTDOWN_MAX: StdDuration = StdDuration::from_secs(600);
+
+fn server_graceful_shutdown_timeout() -> StdDuration {
+    std::env::var("KIRO_RS_HTTP_DRAIN_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(StdDuration::from_secs)
+        .map(|drain| drain.min(SERVER_GRACEFUL_SHUTDOWN_MAX))
+        .unwrap_or(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT)
+}
+const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
+const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(4);
 const SHUTDOWN_LEASE_RELEASE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
+const READYZ_DEPENDENCY_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 const MODEL_CAPABILITY_HEALTH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const MODEL_CAPABILITY_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(300);
@@ -560,6 +578,7 @@ async fn async_main() {
     });
     let token_manager = Arc::new(token_manager);
     let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
+    common::runtime_lag::spawn_probe();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
     let _kiro_version_sync_task = kiro::kiro_version::spawn_auto_sync(token_manager.clone());
     let scheduler_instance_heartbeat_worker =
@@ -807,9 +826,14 @@ async fn async_main() {
         tracing::info!("  GET  /ui");
     }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap()
+        .tap_io(enable_client_tcp_keepalive);
     let shutdown_token_manager = token_manager.clone();
     let server_result = serve_until_shutdown(listener, app, move || async move {
+        // Queued requests answer now instead of waiting for a slot until their wait limit.
+        shutdown_token_manager.begin_shutdown();
         // Give the concurrency slots back first: `docker stop` sends SIGKILL after 10 seconds
         // by default, long before in-flight requests finish draining, and leases left in Redis
         // would otherwise block the next instance.
@@ -834,12 +858,28 @@ async fn async_main() {
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 
-    let background_token_refresh_report = background_token_refresh_worker
-        .shutdown(remaining_shutdown_budget(
-            shutdown_deadline,
-            BACKGROUND_SHUTDOWN_TIMEOUT,
-        ))
-        .await;
+    // The stages below are independent; run them together so the usage drain gets the whole
+    // budget instead of what is left after the others (the budget fits docker's 10 s window).
+    let storage_stats = kiro::token_manager::best_effort_storage_task_stats();
+    let background_shutdown_timeout =
+        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
+    let drain_timeout = remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
+    let (
+        background_token_refresh_report,
+        stats_report,
+        (usage_drain, storage_drain, external_release_drain, scheduler_release_drained),
+    ) = tokio::join!(
+        background_token_refresh_worker.shutdown(background_shutdown_timeout),
+        stats_flush_worker.shutdown(background_shutdown_timeout),
+        async {
+            tokio::join!(
+                usage_recorder.drain(drain_timeout),
+                kiro::token_manager::drain_best_effort_storage_tasks(drain_timeout),
+                external_pool_manager.drain_release_intents(drain_timeout),
+                token_manager.drain_scheduler_redis_releases(drain_timeout),
+            )
+        },
+    );
     tracing::info!(
         signal_sent = background_token_refresh_report.signal_sent,
         completed = background_token_refresh_report.completed,
@@ -852,12 +892,6 @@ async fn async_main() {
         "后台 Token 主动刷新任务已停止"
     );
 
-    let stats_report = stats_flush_worker
-        .shutdown(remaining_shutdown_budget(
-            shutdown_deadline,
-            BACKGROUND_SHUTDOWN_TIMEOUT,
-        ))
-        .await;
     tracing::info!(
         signal_sent = stats_report.signal_sent,
         flushed = stats_report.flushed,
@@ -876,21 +910,6 @@ async fn async_main() {
         || stats_report.pending_stats_deltas > 0
         || stats_report.pending_runtime_mutations > 0;
 
-    let storage_stats = kiro::token_manager::best_effort_storage_task_stats();
-    let usage_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let storage_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let external_release_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let scheduler_release_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let (usage_drain, storage_drain, external_release_drain, scheduler_release_drained) = tokio::join!(
-        usage_recorder.drain(usage_drain_timeout),
-        kiro::token_manager::drain_best_effort_storage_tasks(storage_drain_timeout),
-        external_pool_manager.drain_release_intents(external_release_drain_timeout),
-        token_manager.drain_scheduler_redis_releases(scheduler_release_drain_timeout),
-    );
     tracing::info!(
         timed_out = usage_drain.timed_out,
         postgres_target = usage_drain.postgres.target,
@@ -1121,12 +1140,31 @@ async fn abort_task_with_timeout<T>(task_name: &'static str, task: tokio::task::
 
 /// `on_shutdown_signal` runs as soon as the stop signal arrives, before in-flight connections
 /// are drained: the container may be killed before draining finishes.
-async fn serve_until_shutdown<F, Fut>(
-    listener: tokio::net::TcpListener,
+/// Idle time before the first keepalive probe on a client connection, then the probe interval.
+const CLIENT_TCP_KEEPALIVE_TIME: StdDuration = StdDuration::from_secs(60);
+const CLIENT_TCP_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(10);
+
+/// A client that vanished without closing (network cut, host gone) is otherwise only noticed
+/// when a write fails. While its socket buffer is full nothing writes, the response body is not
+/// polled, and the request keeps its credential slot until the kernel gives up retransmitting
+/// (about 15 minutes on Linux) or forever. Keepalive probes surface the dead peer in minutes.
+fn enable_client_tcp_keepalive(stream: &mut tokio::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(CLIENT_TCP_KEEPALIVE_TIME)
+        .with_interval(CLIENT_TCP_KEEPALIVE_INTERVAL);
+    if let Err(err) = socket2::SockRef::from(&*stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!("设置客户端连接 TCP keepalive 失败: {}", err);
+    }
+}
+
+async fn serve_until_shutdown<L, F, Fut>(
+    listener: L,
     app: Router,
     on_shutdown_signal: F,
 ) -> std::io::Result<()>
 where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -1142,10 +1180,11 @@ where
         wait_for_shutdown_request(&mut graceful_receiver).await;
         tracing::info!("收到停止信号，停止接收新请求");
     };
+    let drain_timeout = server_graceful_shutdown_timeout();
     let mut deadline_receiver = shutdown_receiver;
     let shutdown_deadline = async move {
         wait_for_shutdown_request(&mut deadline_receiver).await;
-        tokio::time::sleep(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT).await;
+        tokio::time::sleep(drain_timeout).await;
     };
 
     let mut server = Box::pin(
@@ -1157,7 +1196,7 @@ where
         result = &mut server => result,
         _ = shutdown_deadline => {
             tracing::warn!(
-                timeout_secs = SERVER_GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                timeout_secs = drain_timeout.as_secs(),
                 "等待 HTTP 连接排空超时，停止剩余连接"
             );
             Ok(())
@@ -1356,8 +1395,20 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
-    let postgres_ok = state.postgres_store.ping().await.is_ok();
-    let redis_ok = state.redis_store.ping().await.is_ok();
+    // Bounded: a health check that hangs on a stuck pool or a half-open Redis connection looks
+    // like the whole process is down to the orchestrator.
+    let (postgres_ok, redis_ok) = tokio::join!(
+        async {
+            tokio::time::timeout(READYZ_DEPENDENCY_TIMEOUT, state.postgres_store.ping())
+                .await
+                .is_ok_and(|result| result.is_ok())
+        },
+        async {
+            tokio::time::timeout(READYZ_DEPENDENCY_TIMEOUT, state.redis_store.ping())
+                .await
+                .is_ok_and(|result| result.is_ok())
+        },
+    );
     let redis_events_connected = state
         .runtime_events
         .redis_events_connected
@@ -1383,6 +1434,7 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
                 "dispatchProgressing": dispatch.progressing
             },
             "dispatch": dispatch,
+            "runtimeLagMs": common::runtime_lag::global().recent_max().as_millis() as u64,
             "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),

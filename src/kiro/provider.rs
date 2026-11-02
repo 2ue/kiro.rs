@@ -948,6 +948,14 @@ impl KiroApiCompletion {
         }
     }
 
+    /// Marks the slot as still in use while the body is being read, like a stream chunk does:
+    /// a lease without activity for `credentialInFlightLeaseMaxSecs` is reclaimed.
+    pub fn touch(&self) {
+        if let Some(lease) = self.in_flight_lease.lock().as_ref() {
+            lease.touch();
+        }
+    }
+
     pub fn credential_id(&self) -> u64 {
         self.credential_id
     }
@@ -9245,7 +9253,7 @@ impl KiroProvider {
             "默认端点 {} 未在 endpoints 注册表中",
             default_endpoint
         );
-        let tls_backend = token_manager.runtime_config().tls_backend;
+        let tls_backend = token_manager.runtime_config_snapshot().tls_backend;
         // 预热：构建全局代理对应的 Client
         let initial_client =
             build_client(proxy.as_ref(), KIRO_CLIENT_TOTAL_TIMEOUT_SECS, tls_backend)
@@ -9351,9 +9359,20 @@ impl KiroProvider {
         self.token_manager.credential_display_label(id)
     }
 
-    /// 获取当前运行时配置快照。
+    /// 获取当前运行时配置的独立副本。热路径用 [`Self::runtime_config_snapshot`]。
+    #[cfg(test)]
     pub fn runtime_config(&self) -> Config {
         self.token_manager.runtime_config()
+    }
+
+    /// 当前运行时配置的共享快照，只克隆 `Arc`。
+    pub fn runtime_config_snapshot(&self) -> Arc<Config> {
+        self.token_manager.runtime_config_snapshot()
+    }
+
+    /// 共享快照和它的配置代数；代数在每次换配置时变化。
+    pub fn runtime_config_snapshot_with_generation(&self) -> (Arc<Config>, u64) {
+        self.token_manager.runtime_config_snapshot_with_generation()
     }
 
     /// 上游故障是否冷却账号（`credentialUpstreamFailureCooldownEnabled`，默认否）。
@@ -9377,11 +9396,17 @@ impl KiroProvider {
             return true;
         }
         let repeated = self.token_manager.note_upstream_fault(credential_id);
+        // A timeout or read failure on an account with its own proxy may be that proxy failing,
+        // so it cools the account at once, unless most active accounts fail the same way right
+        // now: then it is the upstream (or a shared proxy), and cooling would empty the pool.
         repeated
             || matches!(
                 failure_kind,
                 ApiUpstreamFailureKind::Timeout | ApiUpstreamFailureKind::BodyRead
             ) && credentials.uses_dedicated_proxy()
+                && self
+                    .token_manager
+                    .last_upstream_fault_was_concentrated(credential_id)
     }
 
     fn log_upstream_fault_without_cooldown(
@@ -11201,7 +11226,7 @@ impl KiroProvider {
         ctx.mark_in_flight_kind(InFlightKind::Test);
         let started_at = Instant::now();
 
-        let config = self.token_manager.runtime_config();
+        let config = self.token_manager.runtime_config_snapshot();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
         self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id, None)
             .await;
@@ -11615,7 +11640,7 @@ impl KiroProvider {
         mut ctx: CallContext,
         send_budget: &mut ModelDiscoverySendBudget,
     ) -> anyhow::Result<Vec<KiroAvailableModel>> {
-        let config = self.token_manager.runtime_config();
+        let config = self.token_manager.runtime_config_snapshot();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
         self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id, None)
             .await;
@@ -12088,9 +12113,11 @@ impl KiroProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<McpCallResponse> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries =
-            Self::max_retry_attempts(total_credentials, &self.token_manager.runtime_config())
-                .min(inference_attempt_budget.available_attempts(0) as usize);
+        let max_retries = Self::max_retry_attempts(
+            total_credentials,
+            &self.token_manager.runtime_config_snapshot(),
+        )
+        .min(inference_attempt_budget.available_attempts(0) as usize);
         if max_retries == 0 {
             let snapshot = inference_attempt_budget.snapshot();
             let rejection = if snapshot.downstream_committed {
@@ -12165,7 +12192,7 @@ impl KiroProvider {
             last_credential_id = Some(ctx.id);
             last_credential_label = Some(credential_label.clone());
 
-            let config = self.token_manager.runtime_config();
+            let config = self.token_manager.runtime_config_snapshot();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
             self.ensure_profile_arn_for_context(
                 &mut ctx,
@@ -13100,12 +13127,14 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         // 请求开始时拍一次配置快照：热重载不得在同一请求中途改变轮换语义，
         // 否则轮换计划会前后不一致。
-        let berserk_plan = BerserkPlan::from_config(&self.token_manager.runtime_config());
+        let berserk_plan = BerserkPlan::from_config(&self.token_manager.runtime_config_snapshot());
         let mut rotation_cursor = RotationCursor::new(&berserk_plan);
         // 仅在跨轮次推进时置位一次，用于在下一次重试前做轮次间隔退避。
         let mut berserk_round_delay: Option<Duration> = None;
-        let mut max_retries =
-            Self::max_retry_attempts(total_credentials, &self.token_manager.runtime_config());
+        let mut max_retries = Self::max_retry_attempts(
+            total_credentials,
+            &self.token_manager.runtime_config_snapshot(),
+        );
         if let Some(berserk_budget) = berserk_plan.attempt_budget(total_credentials) {
             // 狂暴模式接管尝试预算：账号数 × region数 × 轮数。
             max_retries = max_retries.max(berserk_budget);
@@ -13165,7 +13194,7 @@ impl KiroProvider {
             .unwrap_or_else(|| {
                 Arc::new(AuxiliaryAttemptBudget::new(
                     self.token_manager
-                        .runtime_config()
+                        .runtime_config_snapshot()
                         .auxiliary_upstream_max_attempts,
                 ))
             });
@@ -13245,7 +13274,7 @@ impl KiroProvider {
             let credential_context = format!("账号 {}", credential_label);
             let attempt_started_at = Instant::now();
 
-            let config = self.token_manager.runtime_config();
+            let config = self.token_manager.runtime_config_snapshot();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
             self.ensure_profile_arn_for_context(
                 &mut ctx,
@@ -13423,6 +13452,7 @@ impl KiroProvider {
                         failure_class = failure_kind.as_error_type(),
                         attempt = attempt + 1,
                         max_retries,
+                        cause = %crate::http_client::send_error_cause(&e),
                         "Kiro API upstream send failed"
                     );
                     // 网络错误通常是上游/链路瞬态问题，不禁用凭据；若本机内存态存在备选，

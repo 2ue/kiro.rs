@@ -1,5 +1,5 @@
 use chrono::Utc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -172,15 +172,23 @@ fn apply_scheduler_state_to_entry(
         })
         .map(|lease| {
             seen_lease_ids.insert(lease.id);
+            let local = previous_local_leases
+                .iter()
+                .find(|local| local.id == lease.id && local.locally_owned);
             InFlightLease {
                 id: lease.id,
                 acquired_at: instant_from_elapsed_epoch_ms(lease.acquired_at_ms, now_ms, now),
-                last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
+                // This process's own leases keep the activity it saw itself. Redis's last_seen
+                // is also refreshed by the instance heartbeat, so copying it back made every
+                // lease of a live instance look active forever, and a stream that stopped
+                // moving held its slot past `credentialInFlightLeaseMaxSecs`.
+                last_seen_at: local.map_or_else(
+                    || instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
+                    |local| local.last_seen_at,
+                ),
                 kind: InFlightKind::from_str(&lease.kind),
                 weight_units: lease.weight_units.max(1),
-                locally_owned: previous_local_leases
-                    .iter()
-                    .any(|local| local.id == lease.id && local.locally_owned),
+                locally_owned: local.is_some(),
             }
         })
         .collect();
@@ -194,15 +202,18 @@ fn apply_scheduler_state_to_entry(
     });
     entry.in_flight_leases = merged_in_flight_leases;
     entry.health = state.health;
+    // The local view now reflects Redis, so the short-lived "Redis says full" hint is no longer
+    // needed to keep the two from disagreeing.
+    entry.redis_full_until = None;
 }
 
 pub(super) fn apply_scheduler_states(
     entries: &Mutex<Vec<CredentialEntry>>,
-    config: &Mutex<Config>,
+    config: &RwLock<Arc<Config>>,
     states: HashMap<u64, SchedulerCredentialState>,
 ) {
     let (global_rpm, in_flight_max_age) = {
-        let config = config.lock();
+        let config = config.read();
         (
             config.credential_rpm.unwrap_or(0),
             (config.credential_in_flight_lease_max_secs > 0)
@@ -229,14 +240,14 @@ pub(super) fn apply_scheduler_states_with_global_rpm(
 
 pub(super) fn apply_scheduler_states_for_ids(
     entries: &Mutex<Vec<CredentialEntry>>,
-    config: &Mutex<Config>,
+    config: &RwLock<Arc<Config>>,
     states: HashMap<u64, SchedulerCredentialState>,
 ) {
     if states.is_empty() {
         return;
     }
     let (global_rpm, in_flight_max_age) = {
-        let config = config.lock();
+        let config = config.read();
         (
             config.credential_rpm.unwrap_or(0),
             (config.credential_in_flight_lease_max_secs > 0)
