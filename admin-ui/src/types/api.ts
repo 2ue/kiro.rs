@@ -48,6 +48,8 @@ export interface CredentialSummaryResponse {
   cooling: number
   quotaExhausted: number
   accountError: number
+  /** Disabled, quota-exhausted, or account-error credentials, counted once. */
+  unavailable: number
 }
 
 export interface SystemVersionResponse {
