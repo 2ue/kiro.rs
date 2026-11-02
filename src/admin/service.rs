@@ -5768,7 +5768,7 @@ impl AdminService {
                     .entries
                     .iter()
                     .find(|entry| entry.id == id)
-                    .ok_or_else(|| AdminServiceError::NotFound { id })?;
+                    .ok_or(AdminServiceError::NotFound { id })?;
                 let actual = crate::model::model_support::subscription_tier_key(
                     entry.subscription_title.as_deref(),
                 );

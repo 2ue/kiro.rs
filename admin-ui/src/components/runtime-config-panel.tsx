@@ -555,6 +555,7 @@ const emptyConfig: RuntimeConfig = {
   credentialSessionMaxConcurrentRequests: 0,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
+  kiroUpstreamStreamMaxDurationSecs: 3600,
   streamKeepaliveIntervalSecs: 5,
   streamPreOutputHoldSecs: 15,
   streamFirstOutputTimeoutSecs: 0,
@@ -3882,6 +3883,7 @@ export function RuntimeConfigPanel() {
       ),
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
+      kiroUpstreamStreamMaxDurationSecs: toWhole(draft.kiroUpstreamStreamMaxDurationSecs, 0, 86400),
       streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
       streamPreOutputHoldSecs: toWhole(draft.streamPreOutputHoldSecs, 0, 60),
       streamFirstOutputTimeoutSecs: toWhole(draft.streamFirstOutputTimeoutSecs, 0, 3600),
@@ -4216,6 +4218,17 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(kiroUpstreamStreamIdleTimeoutSecs) =>
                 setDraft((prev) => ({ ...prev, kiroUpstreamStreamIdleTimeoutSecs }))
+              }
+            />
+            <NumberField
+              title="单次响应总时长上限"
+              description="一次上游响应最多持续多久；上游持续慢慢输出、一直不结束时，到点结束本次响应并释放账号并发。0 表示不限制；默认 3600 秒。"
+              value={draft.kiroUpstreamStreamMaxDurationSecs}
+              min={0}
+              max={86400}
+              suffix="秒"
+              onChange={(kiroUpstreamStreamMaxDurationSecs) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamStreamMaxDurationSecs }))
               }
             />
             <NumberField

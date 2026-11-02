@@ -30,6 +30,9 @@ pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Opt
         && entry.credentials.supports_model(&[model])
 }
 
+// This helper is the shared hot-path predicate; keeping the independent scheduler inputs
+// explicit makes each capacity dimension visible at call sites.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn credential_is_dispatchable(
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
     entry: &CredentialEntry,
