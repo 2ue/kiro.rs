@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::model::config::SubscriptionModelLists;
+
 use super::account_state::{CredentialEntry, ProxyResourceRuntime};
 use super::capacity::{
     credential_is_dispatch_candidate, effective_max_concurrent_requests,
@@ -16,11 +18,12 @@ pub(super) fn min_dispatch_wait(
     excluded_ids: &HashSet<u64>,
     now: Instant,
     global_rpm: u32,
+    tiers: &SubscriptionModelLists,
 ) -> Option<StdDuration> {
     entries
         .iter()
         .filter(|entry| {
-            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids, tiers)
         })
         .filter_map(|entry| {
             match (
@@ -46,11 +49,12 @@ pub(super) fn concurrency_blocked_count(
     global_rpm: u32,
     global_has_capacity: bool,
     request_weight_units: u32,
+    tiers: &SubscriptionModelLists,
 ) -> usize {
     entries
         .iter()
         .filter(|entry| {
-            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids, tiers)
                 && entry_cooldown_remaining(entry, model, now).is_none()
                 && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
                 && (!global_has_capacity
@@ -70,11 +74,12 @@ pub(super) fn rate_limit_blocked_count(
     excluded_ids: &HashSet<u64>,
     now: Instant,
     global_rpm: u32,
+    tiers: &SubscriptionModelLists,
 ) -> usize {
     entries
         .iter()
         .filter(|entry| {
-            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids, tiers)
                 && entry_cooldown_remaining(entry, model, now).is_none()
                 && entry_rate_limit_remaining(entry, global_rpm, now).is_some()
         })
@@ -87,11 +92,12 @@ pub(super) fn effective_concurrency_range_for_candidates(
     model: Option<&str>,
     excluded_ids: &HashSet<u64>,
     global_max_concurrent_requests: u32,
+    tiers: &SubscriptionModelLists,
 ) -> Option<(u32, u32)> {
     entries
         .iter()
         .filter(|entry| {
-            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids, tiers)
         })
         .map(|entry| effective_max_concurrent_requests(entry, global_max_concurrent_requests))
         .fold(None, |range, value| {

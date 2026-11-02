@@ -22,6 +22,7 @@ import {
   PageHeader,
   Pagination,
   useConfirm,
+  PAGE_SIZE_OPTIONS,
 } from '@/components/patterns'
 import {
   Badge,
@@ -36,7 +37,6 @@ import {
 } from '@/components/ui'
 import { ProxyEditorModal, ProxyImportModal } from './proxy-components'
 
-const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 const DEFAULT_PAGE_SIZE = 20
 const DIRECT_PROXY_VALUE = '__direct__'
 type ReplaceProxyMode = 'single' | 'individual'

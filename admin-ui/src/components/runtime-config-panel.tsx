@@ -108,6 +108,9 @@ const writerSamplePolicy = (
   normalMaxMultiplier,
 })
 
+const STRICT_CACHE_ELIGIBILITY_RULE =
+  '官方条件：请求带 cache_control（某个内容块上，或请求顶层的自动缓存），且从开头到最后一个标记的内容达到模型最小缓存长度（opus 4.5~4.7、haiku 4.5 为 4096，haiku 3.5 为 2048，其余 1024 Token）。'
+
 const pathPolicy = (
   enabled = true,
   input: ReportedUsageFieldPolicy = rawFieldPolicy(),
@@ -115,6 +118,8 @@ const pathPolicy = (
 ): ReportedUsagePathPolicy => ({
   enabled,
   skipNonStreamUsageProjection: false,
+  strictCacheEligibilityStream: false,
+  strictCacheEligibilityNonStream: false,
   finalCacheReadMaxTokens: 700000,
   finalCacheReadJitterMinTokens: 0,
   finalCacheReadJitterMaxTokens: 0,
@@ -1768,7 +1773,7 @@ function ReportedUsagePathEditor({
               <div className="mt-1 text-xs leading-5 text-muted-foreground">
                 {value.skipNonStreamUsageProjection
                   ? '强制不缓存：命中此路径的非流式请求一律不改写返回 usage。这是上层拦截，后续外部池等配置不能重新开启本次整形。流式请求不受影响。'
-                  : '按场景：带 cache_control 且断点前内容达到模型最小缓存长度的非流式请求按路径策略整形，其余透传上游 usage。流式请求不受影响。'}
+                  : '按场景：非流式请求按路径策略整形；是否还要先满足官方缓存条件，由下面的"非流式按官方条件严格检查"决定。流式请求不受影响。'}
               </div>
             </div>
             <select
@@ -1782,6 +1787,23 @@ function ReportedUsagePathEditor({
               <option value="force_off">强制不缓存</option>
             </select>
           </label>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <ToggleField
+              title="流式按官方条件严格检查"
+              description={`默认关闭：流式请求不看有没有 cache_control，直接按本路径缓存策略整形，只有整条请求短于模型最小缓存长度时不算缓存。开启后，不满足官方条件的流式请求不做缓存模拟，usage 原样透传。${STRICT_CACHE_ELIGIBILITY_RULE}`}
+              checked={Boolean(value.strictCacheEligibilityStream)}
+              onCheckedChange={(strictCacheEligibilityStream) => onChange({ ...value, strictCacheEligibilityStream })}
+            />
+            <ToggleField
+              title="非流式按官方条件严格检查"
+              description={value.skipNonStreamUsageProjection
+                ? '"非流式缓存"已选强制不缓存，非流式请求一律透传，这里不生效。'
+                : `默认关闭：非流式请求不看有没有 cache_control，直接按本路径缓存策略整形，只有整条请求短于模型最小缓存长度时不算缓存。开启后，不满足官方条件的非流式请求不做缓存模拟，usage 原样透传。${STRICT_CACHE_ELIGIBILITY_RULE}`}
+              checked={Boolean(value.strictCacheEligibilityNonStream)}
+              disabled={value.skipNonStreamUsageProjection}
+              onCheckedChange={(strictCacheEligibilityNonStream) => onChange({ ...value, strictCacheEligibilityNonStream })}
+            />
+          </div>
           <div className="grid gap-4 lg:grid-cols-2">
             <ReportedUsageFieldEditor
               title="输入字段改写（input_tokens）"
@@ -2011,6 +2033,8 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
   return {
     ...policy,
     skipNonStreamUsageProjection: Boolean(policy.skipNonStreamUsageProjection),
+    strictCacheEligibilityStream: Boolean(policy.strictCacheEligibilityStream),
+    strictCacheEligibilityNonStream: Boolean(policy.strictCacheEligibilityNonStream),
     finalCacheReadMaxTokens,
     finalCacheReadJitterMinTokens,
     finalCacheReadJitterMaxTokens,

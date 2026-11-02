@@ -1045,12 +1045,26 @@ pub struct ReportedUsagePathPolicy {
     /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求不进入
     /// 本系统 usage 整形、input 采样和补偿，也不会读取或写入本地 prompt-cache 状态；
     /// 外部池非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
-    /// 关闭时按常规：只有 Anthropic 会返回缓存的非流式请求（带 cache_control，且断点前内容
-    /// 达到模型最小缓存长度）按路径策略整形，其余非流式请求同开启时一样透传。
+    /// 关闭时按路径策略整形；是否额外要求官方缓存条件见 `strict_cache_eligibility_non_stream`。
     /// 流式请求不受影响。
     /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
     #[serde(default)]
     pub skip_non_stream_usage_projection: bool,
+
+    /// 流式请求是否按官方缓存条件严格检查，默认关闭。
+    ///
+    /// 开启后，流式请求只有带 cache_control（块级或顶层自动缓存），且断点前内容达到模型最小
+    /// 缓存长度时才按路径策略整形，其余透传上游 usage、不读写本地缓存状态。关闭时不看有没有
+    /// cache_control，整条请求按已标记处理，直接按路径策略整形；只有整条请求都短于模型最小
+    /// 缓存长度时仍透传（官方也不会缓存这种请求）。
+    #[serde(default)]
+    pub strict_cache_eligibility_stream: bool,
+
+    /// 非流式请求是否按官方缓存条件严格检查，默认关闭。规则同
+    /// `strict_cache_eligibility_stream`；`skip_non_stream_usage_projection` 开启时非流式一律透传，
+    /// 不再看这个开关。
+    #[serde(default)]
+    pub strict_cache_eligibility_non_stream: bool,
 
     /// 最终下游上报的 cache_read_input_tokens 上限。
     ///
@@ -1132,6 +1146,8 @@ impl Default for ReportedUsagePathPolicy {
         Self {
             enabled: true,
             skip_non_stream_usage_projection: false,
+            strict_cache_eligibility_stream: false,
+            strict_cache_eligibility_non_stream: false,
             final_cache_read_max_tokens: default_final_cache_read_max_tokens(),
             final_cache_read_jitter_min_tokens: 0,
             final_cache_read_jitter_max_tokens: 0,
@@ -1159,6 +1175,16 @@ impl ReportedUsagePathPolicy {
         Self {
             enabled: false,
             ..Self::default()
+        }
+    }
+
+    /// Whether a request of this kind must meet the official cache conditions (a cache_control
+    /// breakpoint and a prefix at the model minimum) before the route strategy shapes it.
+    pub fn strict_cache_eligibility(&self, stream: bool) -> bool {
+        if stream {
+            self.strict_cache_eligibility_stream
+        } else {
+            self.strict_cache_eligibility_non_stream
         }
     }
 
@@ -1203,6 +1229,8 @@ impl ReportedUsagePathPolicy {
         Self {
             enabled: self.enabled,
             skip_non_stream_usage_projection: self.skip_non_stream_usage_projection,
+            strict_cache_eligibility_stream: self.strict_cache_eligibility_stream,
+            strict_cache_eligibility_non_stream: self.strict_cache_eligibility_non_stream,
             final_cache_read_max_tokens,
             final_cache_read_jitter_min_tokens,
             final_cache_read_jitter_max_tokens,
@@ -5414,6 +5442,11 @@ pub struct Config {
     #[serde(default)]
     pub claude_models_only: bool,
 
+    /// 按订阅等级统一设置的允许模型（key 为 `free`、`pro`、`power` 等订阅等级）。账号自己
+    /// 设置了支持模型时以账号为准；没设置时按所属等级的列表限制；等级没有列表时不限制。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscription_model_lists: SubscriptionModelLists,
+
     /// 旧配置字段，只用于迁移，加载后转换成上面三个字段。
     #[serde(default, skip_serializing)]
     pub prompt_steering: Option<serde_json::Value>,
@@ -5719,7 +5752,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 13;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 14;
 
 impl Config {
     /// 上游请求头里实际使用的 Kiro 客户端版本：开启自动同步且已读到官方版本时用读到的版本，
@@ -6796,6 +6829,24 @@ fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -
     normalized
 }
 
+/// 订阅等级 → 允许模型列表。
+pub type SubscriptionModelLists = BTreeMap<String, SubscriptionModelList>;
+
+/// 一个订阅等级允许的模型列表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionModelList {
+    pub models: Vec<String>,
+    /// `auto`：从该等级的账号自动获取；`manual`：在管理页手动设置或手动同步。
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// 自动获取时用的账号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_credential_id: Option<u64>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -6900,6 +6951,7 @@ impl Default for Config {
             prompt_injection: PromptInjectionConfig::default(),
             route_features: RouteFeaturesConfig::default(),
             claude_models_only: false,
+            subscription_model_lists: BTreeMap::new(),
             prompt_steering: None,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
@@ -7258,6 +7310,13 @@ impl Config {
         if self.runtime_config_migration_version < 13 {
             // v13：提示词配置改为 promptInjection / routeFeatures（见 migrate_legacy_prompt_fields）。
             self.runtime_config_migration_version = 13;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 14 {
+            // v14：任务质量和分块写入策略换了内置文本。保存下来的文本若等于旧内置文本，
+            // 说明运营者没改过，删掉后使用新内置文本；改过的文本保持不变。
+            self.prompt_injection.drop_previous_default_texts();
+            self.runtime_config_migration_version = 14;
             changed = true;
         }
         changed
@@ -10177,6 +10236,64 @@ mod tests {
         config.payload_guard_mode = PayloadGuardMode::Preemptive;
         assert!(!config.apply_runtime_config_migrations());
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
+    }
+
+    #[test]
+    fn runtime_config_migration_v14_replaces_unedited_task_quality_and_chunked_texts() {
+        use crate::model::prompt_injection::{TextKey, catalog};
+
+        let previous_task_quality = catalog::previous_default_texts(TextKey::TaskQuality)[0];
+        let previous_chunked = catalog::previous_default_texts(TextKey::ChunkedWritePolicy)[0];
+        let mut config = Config {
+            runtime_config_migration_version: 13,
+            ..Default::default()
+        };
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::ChunkedWritePolicy, previous_chunked.to_string());
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::Custom, "operator text".to_string());
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        let injection = &config.prompt_injection;
+        assert!(!injection.texts.contains_key(&TextKey::TaskQuality));
+        assert!(!injection.texts.contains_key(&TextKey::ChunkedWritePolicy));
+        assert_eq!(
+            injection.text(TextKey::TaskQuality),
+            catalog::DEFAULT_TASK_QUALITY_PROMPT
+        );
+        assert_eq!(injection.text(TextKey::Custom), "operator text");
+        // Route switches are untouched.
+        assert_eq!(
+            injection.path_overrides,
+            PromptInjectionConfig::default().path_overrides
+        );
+
+        // Runs once: a later operator choice of the old text is kept.
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
+        assert!(!config.apply_runtime_config_migrations());
+        assert_eq!(
+            config
+                .prompt_injection
+                .texts
+                .get(&TextKey::TaskQuality)
+                .map(String::as_str),
+            Some(previous_task_quality)
+        );
     }
 
     #[test]

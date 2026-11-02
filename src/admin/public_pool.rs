@@ -27,7 +27,7 @@ use super::types::{AdminErrorResponse, CredentialCooldown, CredentialStatusItem}
 /// viewers share one build for this long.
 const SNAPSHOT_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_PAGE_LIMIT: usize = 20;
-const MAX_PAGE_LIMIT: usize = 100;
+const MAX_PAGE_LIMIT: usize = 1000;
 
 /// The page's status tabs, with the account page's rules.
 const STATUS_FILTERS: [&str; 5] = [

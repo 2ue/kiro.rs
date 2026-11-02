@@ -47,6 +47,8 @@ export interface CredentialSummaryResponse {
   cooling: number
   quotaExhausted: number
   accountError: number
+  /** 已禁用、额度用尽或账号异常（去重）。 */
+  unavailable: number
 }
 
 export interface SystemVersionResponse {
@@ -1778,6 +1780,10 @@ export interface ReportedUsageFieldPolicy {
 export interface ReportedUsagePathPolicy {
   enabled: boolean
   skipNonStreamUsageProjection: boolean
+  /** Streaming requests must meet the official cache conditions before shaping; off by default. */
+  strictCacheEligibilityStream?: boolean
+  /** Non-streaming requests must meet the official cache conditions before shaping; off by default. */
+  strictCacheEligibilityNonStream?: boolean
   finalCacheReadMaxTokens: number
   finalCacheReadJitterMinTokens: number
   finalCacheReadJitterMaxTokens: number
@@ -2797,6 +2803,12 @@ export interface ManualModelResponse {
 
 export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'
 
+/** 导出时的账号筛选条件，含义与账号列表 `/credentials-paged` 相同（不含分页和排序）。 */
+export type CredentialExportFilter = Omit<CredentialsPageQuery, 'page' | 'limit' | 'sortBy' | 'sortOrder'>
+
+/** 导出范围：选中账号，或按筛选条件（空对象表示全部）。二者只能取其一。 */
+export type CredentialExportScope = { ids: number[] } | { filter: CredentialExportFilter }
+
 // ============ 路由场景 ============
 
 /** A route rule set, as used by every route policy. */
@@ -3144,4 +3156,24 @@ export interface PublicPoolResponse {
   totalPages: number
   filteredTotal: number
   items: PublicPoolAccount[]
+}
+
+// ============ 订阅等级模型列表 ============
+
+export interface SubscriptionModelListItem {
+  tier: string
+  label: string
+  /** 未设置列表时为空（不限制）。 */
+  models: string[]
+  /** auto：自动获取；manual：手动设置或手动同步。 */
+  source?: string | null
+  updatedAt?: string | null
+  sourceCredentialId?: number | null
+  credentialCount: number
+  /** 没有设置自身支持模型、因而按等级列表限制的账号数。 */
+  tierLimitedCount: number
+}
+
+export interface SubscriptionModelListsResponse {
+  items: SubscriptionModelListItem[]
 }

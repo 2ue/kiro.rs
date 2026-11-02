@@ -36,11 +36,9 @@ impl CapacitySignal {
             let waiters = self.waiters.load(Ordering::Acquire);
             let current = self.credits.load(Ordering::Acquire);
             let target = current.saturating_add(units).min(waiters);
-            // `waiters` and `credits` are read separately: waiters registering and being
-            // credited in between can leave `current` above this stale `waiters`. Never lower
-            // credits here (that drops wakeups; `unregister` trims surplus credits) and never
-            // compute `target - current` then: it would underflow, and in release builds the
-            // wrapped count spins `notify_one` forever on a runtime worker.
+            // `unregister` lowers `waiters` before it trims `credits`, so a release in between
+            // sees more credits than waiters and `target < current`. There is nothing to add
+            // then; the trim that follows brings the credits back in line.
             if target <= current {
                 return;
             }
@@ -268,15 +266,31 @@ mod tests {
         assert_eq!(signal.test_snapshot(), (0, 0, 0));
     }
 
-    /// Credits above the waiter count is the state a release can observe when other waiters
-    /// register and get credited between its two loads. It used to underflow `target - current`.
+    /// A release landing between `unregister`'s waiter decrement and its credit trim sees more
+    /// credits than waiters. It used to compute `target - current` with `target < current`:
+    /// a panic in debug builds, and a near-endless `notify_one` loop in release builds.
     #[test]
-    fn release_observing_more_credits_than_waiters_keeps_credits() {
+    fn release_between_unregister_steps_adds_nothing() {
         let signal = Arc::new(CapacitySignal::default());
-        let _waiters = (0..2).map(|_| signal.register()).collect::<Vec<_>>();
-        signal.credits.store(10, Ordering::Release);
+        let first = signal.register();
+        let second = signal.register();
+        signal.capacity_released(2);
+        assert_eq!(signal.test_snapshot(), (2, 2, 0));
+
+        // The state `unregister` passes through: waiter count already lowered, credits not yet.
+        signal.waiters.store(1, Ordering::Release);
         signal.capacity_released(1);
-        assert_eq!(signal.test_snapshot(), (2, 10, 0));
+        assert_eq!(
+            signal.test_snapshot(),
+            (1, 2, 0),
+            "a release adds no credits"
+        );
+
+        // Finishing the trim and dropping the rest leaves a clean signal.
+        signal.waiters.store(2, Ordering::Release);
+        drop(first);
+        drop(second);
+        assert_eq!(signal.test_snapshot(), (0, 0, 0));
     }
 
     #[test]
