@@ -24,7 +24,10 @@ jobs:
     uses: ./.github/workflows/build.yaml
     with:
       release_tag: ${{ github.ref_name }}
-      profile: release
+      # A tag release must carry the same full quality gate as a main release. The manifest job
+      # accepts this reusable workflow run directly, so branch-only fixes are publishable without
+      # requiring an impossible main push for the same commit.
+      profile: full
 
   # Image builds run in parallel with the quality gate. They only push by digest (no tags);
   # the manifest job below tags the release, and it waits for both quality and build, so a
@@ -148,53 +151,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Verify successful full Quality Gate
-        if: ${{ vars.ALLOW_RELEASE_WITHOUT_FULL_QUALITY != 'true' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            // The full Quality Gate on main takes much longer than the image builds, so wait for
-            // the push run of this commit to finish instead of failing while it is still running.
-            const listRuns = async () => {
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: "build.yaml",
-                head_sha: context.sha,
-                per_page: 100,
-              });
-              return data.workflow_runs.filter((run) => run.head_sha === context.sha);
-            };
-            const deadline = Date.now() + 80 * 60 * 1000;
-            let runs = await listRuns();
-            while (Date.now() < deadline) {
-              const pushRuns = runs.filter((run) => run.event === "push");
-              if (pushRuns.some((run) => run.conclusion === "success")) break;
-              if (!pushRuns.some((run) => run.status !== "completed")) break;
-              core.info("Full Quality Gate push run is still running; checking again in 60s.");
-              await new Promise((resolve) => setTimeout(resolve, 60 * 1000));
-              runs = await listRuns();
-            }
-            runs = runs.filter((run) => run.conclusion === "success");
-            const fullPushRun = runs.find((run) => run.event === "push");
-            if (fullPushRun) {
-              core.info(`Found successful full Quality Gate push run #${fullPushRun.run_number}.`);
-            } else {
-              const dispatchRun = runs.find((run) => run.event === "workflow_dispatch");
-              if (dispatchRun) {
-                core.warning(
-                  "A successful workflow_dispatch run exists for this commit, but GitHub does not expose its profile input in the runs list. Manually confirm it used profile=full before enabling the release escape hatch.",
-                );
-              }
-              core.setFailed(
-                `No successful full Quality Gate push run was found for ${context.sha}. Please wait for the Quality Gate run on main for this commit to finish and pass, or manually dispatch the full profile and confirm it completed successfully. Set ALLOW_RELEASE_WITHOUT_FULL_QUALITY=true only after that manual confirmation.`,
-              );
-            }
-
-      - name: Warn that the full Quality Gate check is bypassed
-        if: ${{ vars.ALLOW_RELEASE_WITHOUT_FULL_QUALITY == 'true' }}
-        run: echo "::warning::Release is proceeding without a successful full Quality Gate run because ALLOW_RELEASE_WITHOUT_FULL_QUALITY=true."
-
       - name: Checkout tags
         uses: actions/checkout@v4
         with:
