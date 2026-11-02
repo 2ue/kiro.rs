@@ -5702,16 +5702,6 @@ impl MultiTokenManager {
                 guard.confirm_redis_acquired();
                 Ok(Some(guard))
             }
-            SchedulerRedisHotOutcome::Completed(
-                DispatchLeaseOutcome::CredentialFull | DispatchLeaseOutcome::Refused,
-            ) if self.redis_coordination_is_single_instance() => {
-                // The local slot is reserved within the account's limit, and on a single
-                // instance the local count is the whole truth. Redis disagreeing means it still
-                // counts slots this process already gave back (releases on their way, or lost
-                // while it was unreachable): dispatch, just without a Redis lease.
-                guard.confirm_redis_not_acquired();
-                Ok(Some(guard))
-            }
             SchedulerRedisHotOutcome::Completed(DispatchLeaseOutcome::CredentialFull) => {
                 guard.confirm_redis_not_acquired();
                 drop(guard);
