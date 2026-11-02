@@ -41,7 +41,10 @@
 //
 // The client caps its connections (--max-sockets, default 300) and stops early when the host
 // runs short of local ports (TIME_WAIT above --max-time-wait, default 4000): a test must not
-// take the machine down with it.
+// take the machine down with it. Only TIME_WAIT sockets on ephemeral ports count: kiro-rs sends
+// `Connection: close` upstream, so the mock closes every upstream call first and its TIME_WAIT
+// sockets sit on the mock's own port, where they hold no local port. A second cap on all
+// TIME_WAIT sockets (4x the first) still bounds kernel state.
 
 import http from "node:http";
 
@@ -378,13 +381,19 @@ async function main() {
   let elapsed = 0;
   let abortedReason = null;
   const { execFileSync } = await import("node:child_process");
+  // [TIME_WAIT holding an ephemeral port, all TIME_WAIT].
   const timeWaitCount = () => {
     try {
-      return execFileSync("netstat", ["-an", "-p", "tcp"], { encoding: "utf8" })
+      const lines = execFileSync("netstat", ["-an", "-p", "tcp"], { encoding: "utf8" })
         .split("\n")
-        .filter((line) => line.includes("TIME_WAIT")).length;
+        .filter((line) => line.includes("TIME_WAIT"));
+      const ephemeral = lines.filter((line) => {
+        const port = Number(line.trim().split(/\s+/)[3]?.split(".").pop());
+        return port >= 49152;
+      }).length;
+      return [ephemeral, lines.length];
     } catch {
-      return 0;
+      return [0, 0];
     }
   };
   let lastPortCheck = 0;
@@ -403,9 +412,9 @@ async function main() {
     while (Date.now() - segmentStart < segment.secs * 1000) {
       if (Date.now() - lastPortCheck > 5000) {
         lastPortCheck = Date.now();
-        const timeWait = timeWaitCount();
-        if (timeWait > maxTimeWait) {
-          abortedReason = `TIME_WAIT ${timeWait} > ${maxTimeWait}, stopping to protect the host`;
+        const [timeWait, allTimeWait] = timeWaitCount();
+        if (timeWait > maxTimeWait || allTimeWait > maxTimeWait * 4) {
+          abortedReason = `TIME_WAIT ${timeWait} on ephemeral ports (${allTimeWait} in all) over ${maxTimeWait}/${maxTimeWait * 4}, stopping to protect the host`;
           break;
         }
       }

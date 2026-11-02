@@ -435,10 +435,13 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
   stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
   stats.recent = stats.recent.filter((at) => startedAt - at < 60000);
   stats.recent.push(startedAt);
-  // The peak uses a window one second short of a minute: kiro-rs counts a call when it picks
-  // the account, a few milliseconds before it arrives here, so a full 60 s window here would
-  // sometimes see the next minute's first call inside the previous minute.
-  stats.maxPerMinute = Math.max(stats.maxPerMinute, stats.recent.filter((at) => startedAt - at < 59000).length);
+  // The peak uses a window five seconds short of a minute. kiro-rs counts a call when it picks
+  // the account; the call arrives here after the token check, the Redis round trips and a new
+  // upstream connection (it sends `Connection: close`). An account at its RPM takes its next
+  // call the moment the oldest one leaves its window, so two calls a minute apart by kiro-rs's
+  // clock arrive here a minute plus or minus that delay apart, which on a host at load 90 is a
+  // few seconds. Two calls let through together still land within this window.
+  stats.maxPerMinute = Math.max(stats.maxPerMinute, stats.recent.filter((at) => startedAt - at < 55000).length);
   res.on("close", () => {
     stats.inFlight -= 1;
   });

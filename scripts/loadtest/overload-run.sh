@@ -232,7 +232,8 @@ for case_name in $CASES; do
   [ -z "$def" ] && { echo "unknown case $case_name"; continue; }
   mock_json=${def%%|*}; rest=${def#*|}; profile=${rest%%|*}; rest=${rest#*|}; flags=${rest%%|*}
   plan=""; [ "$rest" != "$flags" ] && plan=${rest#*|}
-  timewait=$(netstat -an -p tcp 2>/dev/null | grep -c TIME_WAIT)
+  # TIME_WAIT holding ephemeral ports (see overload-probe.mjs).
+  timewait=$(netstat -an -p tcp 2>/dev/null | awk '$6=="TIME_WAIT"{n=split($4,a,"."); if (a[n]+0>=49152) c++} END{print c+0}')
   if [ "$timewait" -gt 2000 ]; then echo "TIME_WAIT $timewait > 2000, waiting before $case_name"; sleep 60; fi
   # Rates in the case table are for the production pool (57 accounts x 4 = 228 slots); scale
   # them to the pool under test so every pool size sees the same relative load.

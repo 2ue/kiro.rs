@@ -1409,6 +1409,9 @@ struct SchedulerRedisRateLimitWait {
 #[derive(Debug, Clone, Copy)]
 enum SchedulerRedisSelectionAdmission {
     NotRequired,
+    /// Single instance: the local window was checked and the selection recorded there (see
+    /// `reserve_local_selection`).
+    LocallyRecorded,
     Recorded {
         rate_limit_available_at: Option<Instant>,
     },
@@ -5425,6 +5428,47 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// Checks the local RPM window and records the selection in one step. `LocallyRecorded` when
+    /// it fit; `RateLimited` when the window filled up since the account was picked.
+    fn reserve_local_selection(
+        &self,
+        id: u64,
+        request_weight_units: u32,
+    ) -> SchedulerRedisSelectionAdmission {
+        let request_weight_units = normalize_capacity_weight_units(request_weight_units);
+        let global_rpm = self.config.read().credential_rpm.unwrap_or(0);
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return SchedulerRedisSelectionAdmission::LocallyRecorded;
+        };
+        let rpm = effective_rpm(entry, global_rpm);
+        if rpm > 0 {
+            let first = entry.selection_events.partition_point(|selected_at| {
+                now.saturating_duration_since(*selected_at) > StdDuration::from_secs(60)
+            });
+            let in_window = entry.selection_events.len() - first;
+            let weight = effective_weight_for_limit(request_weight_units, rpm) as usize;
+            if in_window + weight > rpm as usize {
+                let available_at = entry_rate_limit_window_remaining(entry, global_rpm, now)
+                    .map_or(now + StdDuration::from_secs(1), |remaining| now + remaining);
+                entry.rate_limit_available_at = Some(
+                    entry
+                        .rate_limit_available_at
+                        .map_or(available_at, |current| current.max(available_at)),
+                );
+                return SchedulerRedisSelectionAdmission::RateLimited(
+                    SchedulerRedisRateLimitWait {
+                        retry_after: available_at.saturating_duration_since(now),
+                        available_at,
+                    },
+                );
+            }
+        }
+        record_local_selection(entry, now, request_weight_units);
+        SchedulerRedisSelectionAdmission::LocallyRecorded
+    }
+
     async fn reserve_scheduler_selection_for_request(
         &self,
         id: u64,
@@ -5443,6 +5487,14 @@ impl MultiTokenManager {
         };
         if rpm == 0 || self.redis_store.is_none() {
             return Ok(SchedulerRedisSelectionAdmission::NotRequired);
+        }
+        // A single instance holds every call in its local window. Counting the call in Redis
+        // as well made two ledgers disagree: Redis kept calls this process then refused, and
+        // missed calls made while it was unreachable; its rate-limit mark, merged back on each
+        // sync, then kept accounts with RPM left out of dispatch. The local window decides;
+        // Redis only mirrors it (`record_scheduler_selection_stats`).
+        if self.redis_coordination_is_single_instance() {
+            return Ok(self.reserve_local_selection(id, request_weight_units));
         }
 
         let Some(redis) = &self.redis_store else {
@@ -5466,12 +5518,9 @@ impl MultiTokenManager {
                 .into());
             }
             SchedulerRedisHotOutcome::Skipped | SchedulerRedisHotOutcome::Failed { .. } => {
-                // The account was picked under the local RPM window, which on a single instance
-                // is the whole count: record the call locally (and best-effort in Redis) instead
-                // of turning a slow Redis into a refused request.
+                // The instance count changed while this call was out; settle it locally.
                 if self.redis_coordination_is_single_instance() {
-                    self.note_local_dispatch_without_redis("原子记录 Redis 调度选中次数");
-                    return Ok(SchedulerRedisSelectionAdmission::NotRequired);
+                    return Ok(self.reserve_local_selection(id, request_weight_units));
                 }
                 return Err(SchedulerRedisUnavailableError {
                     retry_after_secs: self.scheduler_redis_retry_after_secs(),
@@ -5651,6 +5700,16 @@ impl MultiTokenManager {
             SchedulerRedisHotOutcome::Completed(DispatchLeaseOutcome::Acquired(_count)) => {
                 guard.configure_redis_touch_interval(max_age);
                 guard.confirm_redis_acquired();
+                Ok(Some(guard))
+            }
+            SchedulerRedisHotOutcome::Completed(
+                DispatchLeaseOutcome::CredentialFull | DispatchLeaseOutcome::Refused,
+            ) if self.redis_coordination_is_single_instance() => {
+                // The local slot is reserved within the account's limit, and on a single
+                // instance the local count is the whole truth. Redis disagreeing means it still
+                // counts slots this process already gave back (releases on their way, or lost
+                // while it was unreachable): dispatch, just without a Redis lease.
+                guard.confirm_redis_not_acquired();
                 Ok(Some(guard))
             }
             SchedulerRedisHotOutcome::Completed(DispatchLeaseOutcome::CredentialFull) => {
@@ -8201,6 +8260,13 @@ impl MultiTokenManager {
                     match selection_admission {
                         SchedulerRedisSelectionAdmission::NotRequired => {
                             self.record_scheduler_selection(ctx.id, request_weight_units, true);
+                            if let Err(err) = self.mark_rate_limited_at(ctx.id, Instant::now()) {
+                                drop(in_flight_lease);
+                                return Err(err);
+                            }
+                        }
+                        SchedulerRedisSelectionAdmission::LocallyRecorded => {
+                            self.record_scheduler_selection_stats(ctx.id, request_weight_units);
                             if let Err(err) = self.mark_rate_limited_at(ctx.id, Instant::now()) {
                                 drop(in_flight_lease);
                                 return Err(err);
@@ -12300,6 +12366,28 @@ impl MultiTokenManager {
                     Ok(())
                 });
             }
+        }
+        let mut pending = self.pending_stats_deltas.lock();
+        let entry = pending.entry(id).or_default();
+        entry.selection_delta = entry.selection_delta.saturating_add(1);
+        self.mark_stats_dirty();
+    }
+
+    /// The rest of [`Self::record_scheduler_selection`] for a selection already recorded in the
+    /// local window by [`Self::reserve_local_selection`]: selection stats, and a best-effort
+    /// Redis record that mirrors the window (for another instance that may start, and for the
+    /// health counts). It passes no RPM: Redis must not set its rate-limit mark from its own
+    /// count, which syncs merge back into local selection as a block.
+    fn record_scheduler_selection_stats(&self, id: u64, request_weight_units: u32) {
+        let request_weight_units = normalize_capacity_weight_units(request_weight_units);
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            spawn_best_effort_storage_task("记录 Redis 调度选中次数", async move {
+                redis
+                    .record_scheduler_selection(id, 0, request_weight_units)
+                    .await?;
+                Ok(())
+            });
         }
         let mut pending = self.pending_stats_deltas.lock();
         let entry = pending.entry(id).or_default();

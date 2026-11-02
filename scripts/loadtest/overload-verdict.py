@@ -19,6 +19,11 @@ min_slot_use = float(sys.argv[sys.argv.index("--min-slot-use") + 1]) if "--min-s
 # RPM-limited pools: the share of the pool's slots still free to dispatch (concurrency and RPM
 # window both allowing) while requests wait. Slots free up between samples, so 0 is not the bar.
 max_free = float(sys.argv[sys.argv.index("--max-free") + 1]) if "--max-free" in sys.argv else 0.1
+# After an upstream-down phase the accounts it cooled stay out until their cooldown ends: a
+# pool-wide cooldown without Retry-After is capped at 5-10 s. Accounts in cooldown are not
+# available (invariant A), and the probe cannot see them, so the free-slot check skips these
+# first seconds of the next phase.
+RECOVERY_GRACE_SECS = 10
 # Fewer waiting seconds than this in a phase is a blip between a release and the next dispatch.
 MIN_WAITING_SECS = 5
 
@@ -94,6 +99,23 @@ for path in sorted(glob.glob(os.path.join(result_dir, "*.json"))):
             if phase_index(sample["t"]) == index and ((sample["queued"] or 0) > 0 or sample["rejected"] > 0)
         )
         free = phase.get("freeWhileWaiting")
+        after_down = index - 1 in UPSTREAM_DOWN_PHASES.get(name, set())
+        if after_down:
+            start = segment_ends[index - 1]
+            waiting = [
+                sample
+                for sample in timeline
+                if phase_index(sample["t"]) == index
+                and sample["t"] >= start + RECOVERY_GRACE_SECS
+                and ((sample["queued"] or 0) > 0 or sample["rejected"] > 0)
+            ]
+            free = (
+                sum(sample.get("freeUnits", 0) for sample in waiting) / len(waiting) / capacity
+                if waiting
+                else None
+            )
+            use = sum(sample["slotUse"] for sample in waiting) / len(waiting) if waiting else None
+            waiting_secs = len(waiting)
         if waiting_secs >= MIN_WAITING_SECS and not down:
             if rpm_limited:
                 if free is not None and free > max_free:

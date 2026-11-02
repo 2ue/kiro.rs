@@ -15880,6 +15880,29 @@ async fn an_open_redis_breaker_does_not_stop_dispatch_to_idle_accounts_on_a_sing
             "all three accounts used their 3 RPM"
         );
 
+        // Calls made while Redis was unavailable never reached its RPM window. Once Redis
+        // answers again it would admit more calls than the account's RPM; the local window,
+        // which holds every call, still refuses them.
+        for breaker in [
+            &single.scheduler_redis_breaker,
+            &single.scheduler_redis_affinity_breaker,
+        ] {
+            breaker.state.lock().phase = SchedulerRedisBreakerPhase::Closed;
+        }
+        assert!(
+            single
+                .acquire_context_for_session_with_mode(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    AcquireMode::FailFastOnCapacity,
+                    1,
+                )
+                .await
+                .is_err(),
+            "Redis recovered with a short count; the local RPM window still holds"
+        );
+
         // A second live instance on the same Redis: no local-only dispatch any more.
         let other = manager(stores[1].clone());
         other.heartbeat_and_reclaim_dead_instance_leases().await;
@@ -15893,6 +15916,41 @@ async fn an_open_redis_breaker_does_not_stop_dispatch_to_idle_accounts_on_a_sing
         );
     })
     .await;
+}
+
+/// Without Redis on a single instance the local RPM window is checked again at the moment the
+/// call is recorded: requests that picked the account before its window filled must not push it
+/// over its RPM.
+#[test]
+fn local_selection_reservation_rechecks_the_rpm_window() {
+    let mut config = Config::default();
+    config.credential_rpm = Some(2);
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("local-rpm-recheck", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let id = manager.entries.lock()[0].id;
+    for _ in 0..2 {
+        assert!(matches!(
+            manager.reserve_local_selection(id, 1),
+            SchedulerRedisSelectionAdmission::LocallyRecorded
+        ));
+    }
+    let SchedulerRedisSelectionAdmission::RateLimited(wait) =
+        manager.reserve_local_selection(id, 1)
+    else {
+        panic!("the third call in the minute is over the RPM of 2");
+    };
+    assert!(
+        wait.retry_after > StdDuration::from_secs(58),
+        "{:?}",
+        wait.retry_after
+    );
+    assert_eq!(manager.entries.lock()[0].selection_events.len(), 2);
 }
 
 #[test]
