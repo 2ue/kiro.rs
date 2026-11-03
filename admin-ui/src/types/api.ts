@@ -48,6 +48,8 @@ export interface CredentialSummaryResponse {
   cooling: number
   quotaExhausted: number
   accountError: number
+  /** Disabled, quota-exhausted, or account-error credentials, counted once. */
+  unavailable: number
 }
 
 export interface SystemVersionResponse {
@@ -2180,6 +2182,7 @@ export interface RuntimeConfig {
   credentialSessionMaxConcurrentRequests: number
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
+  kiroUpstreamStreamMaxDurationSecs: number
   streamKeepaliveIntervalSecs: number
   streamPreOutputHoldSecs: number
   streamFirstOutputTimeoutSecs: number

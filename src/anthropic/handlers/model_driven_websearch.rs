@@ -33,7 +33,7 @@ pub(super) struct ModelDrivenWebSearchContext {
     pub(super) provider: Arc<KiroProvider>,
     pub(super) payload: MessagesRequest,
     pub(super) endpoint: String,
-    pub(super) runtime_config: RequestRuntimeConfig,
+    pub(super) runtime_config: Arc<RequestRuntimeConfig>,
     pub(super) cache_route: ResolvedCacheRoutePolicy,
     pub(super) model_resolution: ModelResolution,
     pub(super) usage_mapper: Option<websearch::SharedWebSearchUsageMapper>,
@@ -777,7 +777,7 @@ async fn call_model(
         .get(REQWEST_CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let runtime = ctx.provider.runtime_config();
+    let runtime = ctx.provider.runtime_config_snapshot();
     let processing_failure = |detail: String| {
         tracing::warn!(
             request_id = %ctx.request_id,
@@ -797,6 +797,10 @@ async fn call_model(
         runtime
             .stream_first_output_timeout_secs
             .min(crate::model::config::STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS),
+        runtime
+            .kiro_upstream_stream_max_duration_secs
+            .min(crate::model::config::KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS),
+        || completion.touch(),
     )
     .await
     {

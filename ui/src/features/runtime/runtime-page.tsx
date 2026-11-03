@@ -317,6 +317,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialSessionMaxConcurrentRequests: toWhole(draft.credentialSessionMaxConcurrentRequests),
     kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
     kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
+    kiroUpstreamStreamMaxDurationSecs: toWhole(draft.kiroUpstreamStreamMaxDurationSecs, 0, 86400),
     streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
     streamPreOutputHoldSecs: toWhole(draft.streamPreOutputHoldSecs, 0, 60),
     streamFirstOutputTimeoutSecs: toWhole(draft.streamFirstOutputTimeoutSecs, 0, 3600),
@@ -831,6 +832,7 @@ export function RuntimePage() {
                 <TogField label="对话改走 Kiro 新域名" desc="默认关闭。打开后 IDE 端点的对话和联网搜索改发到 runtime.{区域}.kiro.dev，请求头不变；模型列表、额度查询、令牌刷新不受影响。注意：实测 FREE 账号打开后对话全部被新域名限流（429），打开前请先用自己的账号小范围验证。" checked={draft.kiroRuntimeDomainEnabled} onChange={set('kiroRuntimeDomainEnabled')} />
                 <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
+                <NumField label="单次响应总时长上限" desc="一次上游响应最多持续多久；上游持续慢慢输出、一直不结束时，到点结束本次响应并释放账号并发。0 表示不限制；默认 3600 秒。" value={draft.kiroUpstreamStreamMaxDurationSecs} min={0} max={86400} suffix="秒" onChange={set('kiroUpstreamStreamMaxDurationSecs')} />
                 <NumField label="流式保活间隔" desc="上游暂时没有新内容时，每隔多久向客户端发一次保活心跳，防止客户端或中间代理因空闲断开；默认 5 秒。" value={draft.streamKeepaliveIntervalSecs} min={1} max={300} suffix="秒" onChange={set('streamKeepaliveIntervalSecs')} />
                 <NumField label="首输出前静默保留" desc="上游还没有输出时，最多多少秒内不向客户端写入，以便失败时无感换号；超过后开始下发并保活，不再换号。0 表示一直保留到首个输出；默认 15 秒。" value={draft.streamPreOutputHoldSecs} min={0} max={60} suffix="秒" onChange={set('streamPreOutputHoldSecs')} />
                 <NumField label="首输出等待上限" desc="上游返回响应头后最多等待多少秒出现首个内容；超时断开上游并释放账号，未写入时换号重试，已写入时返回过载错误让客户端重试。0 表示关闭（默认）。开启时应大于慢模型的首输出耗时，建议不低于 300 秒。" value={draft.streamFirstOutputTimeoutSecs} min={0} max={3600} suffix="秒" onChange={set('streamFirstOutputTimeoutSecs')} />

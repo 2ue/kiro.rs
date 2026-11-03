@@ -4380,6 +4380,41 @@ impl RedisStore {
         kind: &str,
         owner_instance_id: Option<&str>,
     ) -> anyhow::Result<Option<usize>> {
+        Ok(
+            match self
+                .acquire_dispatch_lease_owned_outcome(
+                    credential_id,
+                    lease_id,
+                    max_concurrent_requests,
+                    global_max_concurrent_requests,
+                    request_weight_units,
+                    max_age,
+                    kind,
+                    owner_instance_id,
+                )
+                .await?
+            {
+                DispatchLeaseOutcome::Acquired(count) => Some(count),
+                DispatchLeaseOutcome::CredentialFull | DispatchLeaseOutcome::Refused => None,
+            },
+        )
+    }
+
+    /// Like [`Self::acquire_dispatch_lease_owned`], telling a refusal because the credential is
+    /// at its own limit apart from the other refusals (global limit, dispatch block, a lease that
+    /// was already released). Only the first says anything about the credential's capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_dispatch_lease_owned_outcome(
+        &self,
+        credential_id: u64,
+        lease_id: u64,
+        max_concurrent_requests: u32,
+        global_max_concurrent_requests: u32,
+        request_weight_units: u32,
+        max_age: Option<StdDuration>,
+        kind: &str,
+        owner_instance_id: Option<&str>,
+    ) -> anyhow::Result<DispatchLeaseOutcome> {
         let request_weight_units = request_weight_units.clamp(1, 64);
         let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
         let ttl_secs = max_age
@@ -4459,7 +4494,7 @@ impl RedisStore {
             end
 
             if max_count > 0 and (count + effective_weight) > max_count then
-                return {0, count}
+                return {0, count, 1}
             end
 
             if global_max_count > 0 and (global_count + effective_weight) > global_max_count then
@@ -4544,11 +4579,13 @@ impl RedisStore {
             })
             .query_async(&mut manager)
             .await?;
-        if result.first().copied().unwrap_or(0) == 1 {
-            Ok(Some(result.get(1).copied().unwrap_or(1).max(0) as usize))
-        } else {
-            Ok(None)
-        }
+        Ok(match result.first().copied().unwrap_or(0) {
+            1 => {
+                DispatchLeaseOutcome::Acquired(result.get(1).copied().unwrap_or(1).max(0) as usize)
+            }
+            _ if result.get(2).copied() == Some(1) => DispatchLeaseOutcome::CredentialFull,
+            _ => DispatchLeaseOutcome::Refused,
+        })
     }
 
     /// External pool coordination uses atomic multi-key Lua scripts and is
@@ -5728,42 +5765,52 @@ impl RedisStore {
         Ok(())
     }
 
-    /// Marks every lease owned by `instance_id` as active now. Leases of a live instance never
-    /// expire from inactivity this way; a dead instance's leases are reclaimed by its expired
-    /// heartbeat instead. Returns the number of leases touched.
+    /// Marks the leases of `instance_id` listed in `active_lease_ids` as active now, and forgets
+    /// owner entries whose lease is gone. The caller lists the leases that still show activity,
+    /// so a stuck request stops being refreshed and expires after the lease max age like on a
+    /// dead instance; a dead instance's leases are reclaimed by its expired heartbeat instead.
+    /// Returns the number of leases touched.
     pub async fn touch_instance_in_flight_leases(
         &self,
         instance_id: &str,
+        active_lease_ids: &[u64],
     ) -> anyhow::Result<usize> {
         let script = r#"
             local redis_time = redis.call('TIME')
             local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
             local owned = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
             local prefix = ARGV[1]
+            local active = {}
+            for index = 2, #ARGV do
+                active[ARGV[index]] = true
+            end
             local touched = 0
             for index = 1, #owned, 2 do
                 local lease_id = owned[index]
                 local credential_id = owned[index + 1]
                 local acquired = prefix .. 'scheduler:inflight:' .. credential_id .. ':acquired'
-                if redis.call('ZSCORE', acquired, lease_id) then
+                if not redis.call('ZSCORE', acquired, lease_id) then
+                    redis.call('ZREM', KEYS[1], lease_id)
+                elseif active[lease_id] then
                     redis.call('ZADD', prefix .. 'scheduler:inflight:' .. credential_id .. ':last_seen', now, lease_id)
                     redis.call('ZADD', KEYS[2], now, lease_id)
                     touched = touched + 1
-                else
-                    redis.call('ZREM', KEYS[1], lease_id)
                 end
             end
             return touched
         "#;
         let mut manager = self.scheduler_capacity_manager();
-        let touched: i64 = redis::cmd("EVAL")
+        let mut command = redis::cmd("EVAL");
+        command
             .arg(script)
             .arg(2)
             .arg(self.key(scheduler_lease_owner_key(instance_id)))
             .arg(self.key(&global_in_flight_keys().last_seen))
-            .arg(self.key(""))
-            .query_async(&mut manager)
-            .await?;
+            .arg(self.key(""));
+        for lease_id in active_lease_ids {
+            command.arg(lease_id.to_string());
+        }
+        let touched: i64 = command.query_async(&mut manager).await?;
         Ok(touched.max(0) as usize)
     }
 
@@ -5825,10 +5872,11 @@ impl RedisStore {
 
     /// Releases the leases of every registered instance whose heartbeat key is gone, except
     /// `self_instance_id`. Returns (dead instances, leases released).
+    /// Returns (dead instances, leases released, other instances still alive).
     pub async fn reclaim_dead_instance_leases(
         &self,
         self_instance_id: &str,
-    ) -> anyhow::Result<(usize, usize)> {
+    ) -> anyhow::Result<(usize, usize, usize)> {
         let mut manager = self.scheduler_capacity_manager();
         let instances: Vec<String> = redis::cmd("SMEMBERS")
             .arg(self.key(SCHEDULER_LEASE_INSTANCES_KEY))
@@ -5836,6 +5884,7 @@ impl RedisStore {
             .await?;
         let mut dead = 0usize;
         let mut released = 0usize;
+        let mut alive_others = 0usize;
         for instance_id in instances {
             if instance_id == self_instance_id {
                 continue;
@@ -5845,12 +5894,13 @@ impl RedisStore {
                 .query_async(&mut manager)
                 .await?;
             if alive {
+                alive_others += 1;
                 continue;
             }
             dead += 1;
             released += self.release_instance_in_flight_leases(&instance_id).await?;
         }
-        Ok((dead, released))
+        Ok((dead, released, alive_others))
     }
 
     pub async fn touch_in_flight_lease(
@@ -7696,6 +7746,17 @@ fn scheduler_instance_alive_key(instance_id: &str) -> String {
 }
 
 /// ZSET of lease ids owned by an instance, scored by credential id.
+/// Result of a dispatch lease attempt; see [`RedisStore::acquire_dispatch_lease_owned_outcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchLeaseOutcome {
+    /// Acquired; the credential's weighted in-flight count after acquiring.
+    Acquired(usize),
+    /// The credential is at its own concurrency limit.
+    CredentialFull,
+    /// Refused for another reason: global limit, dispatch block, or a released lease.
+    Refused,
+}
+
 fn scheduler_lease_owner_key(instance_id: &str) -> String {
     format!("scheduler:lease_owner:{instance_id}")
 }
@@ -8090,7 +8151,7 @@ mod tests {
         acquire(8, 3, "killed").await;
         assert_eq!(
             store
-                .touch_instance_in_flight_leases("killed")
+                .touch_instance_in_flight_leases("killed", &[2, 3])
                 .await
                 .unwrap(),
             2
@@ -8098,8 +8159,9 @@ mod tests {
 
         // The killed instance's heartbeat expires; its leases go, the live instance's stay.
         tokio::time::sleep(StdDuration::from_millis(1200)).await;
-        let (dead, released) = store.reclaim_dead_instance_leases("alive").await.unwrap();
-        assert_eq!((dead, released), (1, 2));
+        let (dead, released, alive_others) =
+            store.reclaim_dead_instance_leases("alive").await.unwrap();
+        assert_eq!((dead, released, alive_others), (1, 2, 0));
         let states = store
             .scheduler_state_for_credentials(&[7, 8])
             .await
@@ -8113,7 +8175,7 @@ mod tests {
         );
         assert_eq!(
             store.reclaim_dead_instance_leases("alive").await.unwrap(),
-            (0, 0)
+            (0, 0, 0)
         );
 
         // A normal release also drops the ownership entry, so it is not released twice.

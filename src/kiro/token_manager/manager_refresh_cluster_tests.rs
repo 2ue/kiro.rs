@@ -244,7 +244,7 @@ fn refresh_identity_for_manager(manager: &MultiTokenManager, id: u64) -> Refresh
         .resolve_proxy_for_credential(credentials)
         .expect("cluster test credential proxy must resolve");
     let effective_proxy = credentials_for_proxy.effective_proxy(manager.proxy.as_ref());
-    let config = manager.config.lock();
+    let config = manager.config.read();
     RefreshAttemptIdentity::from_refresh_request(
         &credentials_for_proxy,
         &config,

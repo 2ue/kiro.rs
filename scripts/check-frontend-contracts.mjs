@@ -12,6 +12,12 @@ const adminContractPath = path.join(root, 'admin-ui/src/types/api.ts')
 const virtualCheckPath = path.join(root, 'scripts/.frontend-contract-check.ts')
 
 const intentionallyUiOnly = new Set([
+  // Credential export filters and subscription-tier model lists are implemented only in the new
+  // console; the legacy admin console keeps its older export API and has no model-list surface.
+  'CredentialExportFilter',
+  'CredentialExportScope',
+  'SubscriptionModelListItem',
+  'SubscriptionModelListsResponse',
   'UsageOverviewAccountRow',
   'UsageOverviewExternalResponse',
   'UsageOverviewLocalResponse',

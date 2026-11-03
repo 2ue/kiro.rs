@@ -101,6 +101,15 @@ pub(super) struct CredentialEntry {
     pub(super) upstream_fault_streak: u32,
     /// Pool-wide sequence number of this credential's last upstream fault.
     pub(super) upstream_fault_seq: u64,
+    /// Redis answered "full" for this credential at this moment although the local view had
+    /// room (releases of finished requests not yet applied in Redis, or another instance's
+    /// leases not yet synced). Until it expires or a slot of this credential is released, local
+    /// selection treats the credential as full instead of trying it again on every request; see
+    /// [`REDIS_FULL_HINT_TTL`](super::capacity::REDIS_FULL_HINT_TTL).
+    pub(super) redis_full_until: Option<Instant>,
+    /// Set by `note_upstream_fault`: the last upstream fault was not shared by most active
+    /// accounts.
+    pub(super) last_upstream_fault_concentrated: bool,
 }
 
 #[derive(Debug, Clone)]

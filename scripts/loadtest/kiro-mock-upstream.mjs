@@ -23,6 +23,10 @@ const DEFAULT_HEADER_DELAY_MS = Number.parseInt(process.env.KIRO_MOCK_HEADER_DEL
 // - errorStatus may also name a Kiro failure: tool_mismatch (500 TOOL_USE_RESULT_MISMATCH),
 //   gateway_timeout (524), image_count (400 IMAGE_COUNT_EXCEEDED), quota (402), auth (403).
 // - midStreamResetRate: share of long streams cut halfway, after output has started.
+// - hangRate / hangMs: share of calls that send response headers and one chunk, then nothing
+//   for hangMs (0 = until the caller closes), like an upstream stream that stops responding.
+// - trickleRate / trickleIntervalMs / trickleChunks: share of calls that stream trickleChunks
+//   chunks trickleIntervalMs apart, like a very long generation that keeps the slot busy.
 // `GET /__control` also returns the conversation identity of recent calls.
 const control = {
   errorRate: 0,
@@ -32,20 +36,36 @@ const control = {
   streamChunks: 0,
   chunkDelayMs: 0,
   midStreamResetRate: 0,
+  hangRate: 0,
+  hangMs: 0,
+  trickleRate: 0,
+  trickleIntervalMs: 30000,
+  trickleChunks: 20,
 };
 // - slowTokens / slowExtraMs: extra header delay for the listed tokens, to model slower accounts.
 // - jitterMs: random extra header delay 0..jitterMs on every call.
 // `GET /__control` also returns, per access token, the calls in flight right now and the highest
 // in-flight count and per-minute call count seen since the last reset (`perToken`).
-const emptyCounters = () => ({ requests: 0, failed: 0, ok: 0, midStreamResets: 0, byToken: {}, conversations: [] });
+const emptyCounters = () => ({ requests: 0, failed: 0, ok: 0, midStreamResets: 0, hangs: 0, trickles: 0, byToken: {}, conversations: [] });
 const counters = { ...emptyCounters(), inFlight: 0, maxInFlight: 0 };
+// How late this process runs its own timers. Arrival times and in-flight counts here are taken
+// when the event loop gets to a request or a closed socket; on a loaded host that can trail the
+// moment kiro-rs sent or closed it by seconds, which shows up as calls bunched into one minute
+// or a slot counted busy after kiro-rs already reused it.
+const LOOP_LAG_TICK_MS = 100;
+let loopLagExpectedAt = Date.now() + LOOP_LAG_TICK_MS;
+setInterval(() => {
+  const lag = Math.max(0, Date.now() - loopLagExpectedAt);
+  counters.loopLagMaxMs = Math.max(counters.loopLagMaxMs || 0, lag);
+  loopLagExpectedAt = Date.now() + LOOP_LAG_TICK_MS;
+}, LOOP_LAG_TICK_MS).unref();
 // token -> { inFlight, maxInFlight, recent: [call start ms], maxPerMinute }
 let perToken = new Map();
 
 function tokenStats(token) {
   let stats = perToken.get(token);
   if (!stats) {
-    stats = { inFlight: 0, maxInFlight: 0, recent: [], maxPerMinute: 0 };
+    stats = { inFlight: 0, maxInFlight: 0, recent: [], maxPerMinute: 0, calls: 0 };
     perToken.set(token, stats);
   }
   return stats;
@@ -56,7 +76,13 @@ function perTokenSnapshot() {
   const out = {};
   for (const [token, stats] of perToken) {
     stats.recent = stats.recent.filter((at) => now - at < 60000);
-    out[token] = { inFlight: stats.inFlight, maxInFlight: stats.maxInFlight, lastMinute: stats.recent.length, maxPerMinute: stats.maxPerMinute };
+    out[token] = {
+      inFlight: stats.inFlight,
+      maxInFlight: stats.maxInFlight,
+      lastMinute: stats.recent.length,
+      maxPerMinute: stats.maxPerMinute,
+      calls: stats.calls,
+    };
   }
   return out;
 }
@@ -314,14 +340,19 @@ function writeStream(req, res, frames, endDelayMs = 0, resetAtEnd = false) {
     connection: requestWantsConnectionClose(req) ? "close" : "keep-alive",
   });
   let index = 0;
+  // A hung or trickling call can wait minutes between frames: drop the pending timer as soon as
+  // the caller closes, so the mock does not keep timers for calls that are already gone.
+  let timer = null;
+  res.once("close", () => clearTimeout(timer));
   const writeNext = () => {
     if (index >= frames.length) {
-      setTimeout(() => (resetAtEnd ? res.socket?.destroy() : res.end()), endDelayMs);
+      timer = setTimeout(() => (resetAtEnd ? res.socket?.destroy() : res.end()), endDelayMs);
       return;
     }
     const { delayMs, frame } = frames[index++];
-    setTimeout(() => {
-      res.write(frame);
+    timer = setTimeout(() => {
+      if (res.destroyed) return;
+      if (frame) res.write(frame);
       writeNext();
     }, delayMs);
   };
@@ -382,7 +413,10 @@ function writeControlledFailure(res, status) {
   }
   const code = Number(status);
   if (code === 429) {
-    json(res, 429, { message: "rate limited", reason: "THROTTLED" }, { "retry-after": "1" });
+    // control.retryAfter: "1" by default; null or "" sends the 429 without the header, like an
+    // upstream throttle that does not say when to come back.
+    const retryAfter = control.retryAfter === undefined ? "1" : control.retryAfter;
+    json(res, 429, { message: "rate limited", reason: "THROTTLED" }, retryAfter ? { "retry-after": String(retryAfter) } : {});
   } else if (code === 403) {
     json(res, 403, { message: "Account temporarily suspended", reason: "TEMPORARILY_SUSPENDED" });
   } else {
@@ -416,9 +450,16 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
   const startedAt = Date.now();
   stats.inFlight += 1;
   stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
+  stats.calls += 1;
   stats.recent = stats.recent.filter((at) => startedAt - at < 60000);
   stats.recent.push(startedAt);
-  stats.maxPerMinute = Math.max(stats.maxPerMinute, stats.recent.length);
+  // The peak uses a window five seconds short of a minute. kiro-rs counts a call when it picks
+  // the account; the call arrives here after the token check, the Redis round trips and a new
+  // upstream connection (it sends `Connection: close`). An account at its RPM takes its next
+  // call the moment the oldest one leaves its window, so two calls a minute apart by kiro-rs's
+  // clock arrive here a minute plus or minus that delay apart, which on a host at load 90 is a
+  // few seconds. Two calls let through together still land within this window.
+  stats.maxPerMinute = Math.max(stats.maxPerMinute, stats.recent.filter((at) => startedAt - at < 55000).length);
   res.on("close", () => {
     stats.inFlight -= 1;
   });
@@ -449,6 +490,31 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
         delayMs: control.chunkDelayMs,
         frame: event({ eventType: "assistantResponseEvent" }, { content: `chunk-${index} ` }),
       });
+    }
+    if (control.hangRate > 0 && Math.random() < control.hangRate) {
+      counters.hangs += 1;
+      const hangMs = Number(control.hangMs) || 0;
+      // One chunk, then silence. With hangMs the connection is cut afterwards (no end of
+      // stream); without it the call is held until the caller gives up.
+      writeStream(req, res, [frames[0], { delayMs: hangMs > 0 ? hangMs : 2 ** 31 - 1, frame: null }], 0, true);
+      return;
+    }
+    if (control.trickleRate > 0 && Math.random() < control.trickleRate) {
+      counters.trickles += 1;
+      const chunks = Math.max(1, Number(control.trickleChunks) || 1);
+      const slow = [];
+      for (let index = 0; index < chunks; index += 1) {
+        slow.push({
+          delayMs: index === 0 ? 0 : Number(control.trickleIntervalMs) || 0,
+          frame: event({ eventType: "assistantResponseEvent" }, { content: `trickle-${index} ` }),
+        });
+      }
+      slow.push({
+        delayMs: 0,
+        frame: event({ eventType: "metadataEvent" }, { tokenUsage: tokenUsageForScenario(scenario, chunks * 3) }),
+      });
+      writeStream(req, res, slow);
+      return;
     }
     // midStreamResetRate: share of streams cut after half the chunks, once output has started.
     if (control.midStreamResetRate > 0 && Math.random() < control.midStreamResetRate) {
@@ -533,6 +599,7 @@ const server = http.createServer(async (req, res) => {
           for (const stats of perToken.values()) {
             stats.maxInFlight = stats.inFlight;
             stats.maxPerMinute = 0;
+            stats.calls = 0;
           }
         }
       }
@@ -573,6 +640,11 @@ server.on("clientError", (error, socket) => {
       JSON.stringify({ message: "bad request", reason: error.code || "CLIENT_ERROR" })
   );
 });
+
+// Keep idle upstream connections open well past Node's 5 s default, like a real upstream; with
+// the default, kiro-rs reconnects constantly under load and TIME_WAIT eats the local ports.
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;
 
 server.listen(DEFAULT_PORT, DEFAULT_HOST, () => {
   console.log(`kiro mock upstream listening on http://${DEFAULT_HOST}:${DEFAULT_PORT}`);

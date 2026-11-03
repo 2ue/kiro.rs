@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::model::config::Config;
@@ -15,6 +16,9 @@ pub(super) fn entry_effective_health<'a>(
     entry: &'a CredentialEntry,
     model: Option<&str>,
 ) -> &'a SchedulerHealthState {
+    if entry.model_health.is_empty() {
+        return &entry.health;
+    }
     model
         .map(model_state_key)
         .and_then(|key| entry.model_health.get(&key))
@@ -65,27 +69,32 @@ pub(super) fn prune_local_selection_events(entry: &mut CredentialEntry, now: Ins
     }) {
         entry.selection_events.pop_front();
     }
-    entry.health.recent_selection_count_10s = entry
-        .selection_events
-        .iter()
-        .filter(|selected_at| now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_10S)
-        .count()
-        .min(u32::MAX as usize) as u32;
-    entry.health.recent_selection_count_60s = entry
-        .selection_events
-        .iter()
-        .filter(|selected_at| now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_60S)
-        .count()
-        .min(u32::MAX as usize) as u32;
+    entry.health.recent_selection_count_10s =
+        selections_within(&entry.selection_events, now, SELECTION_WINDOW_10S);
+    entry.health.recent_selection_count_60s =
+        selections_within(&entry.selection_events, now, SELECTION_WINDOW_60S);
     entry.health.recent_selection_count_5m =
         entry.selection_events.len().min(u32::MAX as usize) as u32;
+}
+
+/// Selections in the last `window`; `events` is in time order.
+fn selections_within(events: &VecDeque<Instant>, now: Instant, window: StdDuration) -> u32 {
+    let first =
+        events.partition_point(|selected_at| now.saturating_duration_since(*selected_at) > window);
+    (events.len() - first).min(u32::MAX as usize) as u32
 }
 
 pub(super) fn record_local_selection(entry: &mut CredentialEntry, now: Instant, weight_units: u32) {
     entry.total_selection_count = entry.total_selection_count.saturating_add(1);
     entry.health.selection_count = entry.health.selection_count.saturating_add(1);
+    // Callers read `now` before taking the entries lock, so two dispatches can arrive here out
+    // of order. Keep the events sorted: the window checks binary-search them.
+    let at = entry
+        .selection_events
+        .back()
+        .map_or(now, |last| (*last).max(now));
     for _ in 0..weight_units.clamp(1, 64) {
-        entry.selection_events.push_back(now);
+        entry.selection_events.push_back(at);
     }
     prune_local_selection_events(entry, now);
 }

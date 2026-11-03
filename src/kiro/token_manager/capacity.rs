@@ -30,6 +30,9 @@ pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Opt
         && entry.credentials.supports_model(&[model])
 }
 
+// This helper is the shared hot-path predicate; keeping the independent scheduler inputs
+// explicit makes each capacity dimension visible at call sites.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn credential_is_dispatchable(
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
     entry: &CredentialEntry,
@@ -132,11 +135,24 @@ pub(super) fn effective_max_concurrent_requests(
         .unwrap_or(global_max_concurrent_requests)
 }
 
+/// How long a Redis "this credential is full" answer keeps the credential out of local
+/// selection when the local view disagrees. Short: it only has to outlast the gap until the
+/// pending releases reach Redis or the next state sync, and any local release of the credential
+/// clears it early.
+pub(super) const REDIS_FULL_HINT_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+pub(super) fn entry_redis_full_hint_active(entry: &CredentialEntry, now: Instant) -> bool {
+    entry.redis_full_until.is_some_and(|until| until > now)
+}
+
 pub(super) fn entry_has_concurrency_capacity(
     entry: &CredentialEntry,
     global_max_concurrent_requests: u32,
     request_weight_units: u32,
 ) -> bool {
+    if entry_redis_full_hint_active(entry, Instant::now()) {
+        return false;
+    }
     let max_concurrent_requests =
         effective_max_concurrent_requests(entry, global_max_concurrent_requests);
     let request_weight_units =
