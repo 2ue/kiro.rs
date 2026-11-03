@@ -3368,12 +3368,16 @@ impl RequestUsageContext {
     }
 
     fn mark_stream_events(&self, events: &[SseEvent]) {
-        self.mark_first_thinking_delta_if_output(events);
-        self.mark_first_visible_text_delta_if_output(events);
-        self.mark_first_token_if_output(events);
+        // All latency fields describe the same downstream batch. Sampling once prevents a
+        // millisecond boundary between these markers from making first thinking and first output
+        // disagree for a single event batch.
+        let elapsed_ms = self.elapsed_ms();
+        self.mark_first_thinking_delta_if_output(events, elapsed_ms);
+        self.mark_first_visible_text_delta_if_output(events, elapsed_ms);
+        self.mark_first_token_if_output(events, elapsed_ms);
     }
 
-    fn mark_first_thinking_delta_if_output(&self, events: &[SseEvent]) {
+    fn mark_first_thinking_delta_if_output(&self, events: &[SseEvent], elapsed_ms: u64) {
         if self
             .latency
             .first_thinking_delta_latency_ms
@@ -3383,15 +3387,14 @@ impl RequestUsageContext {
             return;
         }
         if events.iter().any(is_thinking_delta_output_event) {
-            let elapsed = self.elapsed_ms();
             let _ = self
                 .latency
                 .first_thinking_delta_latency_ms
-                .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire);
+                .compare_exchange(0, elapsed_ms, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 
-    fn mark_first_visible_text_delta_if_output(&self, events: &[SseEvent]) {
+    fn mark_first_visible_text_delta_if_output(&self, events: &[SseEvent], elapsed_ms: u64) {
         if self
             .latency
             .first_visible_text_delta_latency_ms
@@ -3401,11 +3404,10 @@ impl RequestUsageContext {
             return;
         }
         if events.iter().any(is_visible_text_delta_output_event) {
-            let elapsed = self.elapsed_ms();
             let _ = self
                 .latency
                 .first_visible_text_delta_latency_ms
-                .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire);
+                .compare_exchange(0, elapsed_ms, Ordering::AcqRel, Ordering::Acquire);
         }
     }
 
@@ -3588,7 +3590,7 @@ impl RequestUsageContext {
         self.mark_stream_terminal(StreamTerminalReason::ClientDropped);
     }
 
-    fn mark_first_token_if_output(&self, events: &[SseEvent]) {
+    fn mark_first_token_if_output(&self, events: &[SseEvent], elapsed_ms: u64) {
         if self.first_token_latency_ms.load(Ordering::Acquire) > 0 {
             return;
         }
@@ -3603,10 +3605,9 @@ impl RequestUsageContext {
             return;
         };
 
-        let elapsed = self.elapsed_ms();
         if self
             .first_token_latency_ms
-            .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, elapsed_ms, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             let chunks_before = self
