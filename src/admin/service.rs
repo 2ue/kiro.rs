@@ -2193,28 +2193,6 @@ impl AdminService {
         }
     }
 
-    /// Ids of the Fast accounts among `items` that still count as Fast for sorting. Needs the
-    /// runtime and quota state, so it is only loaded when some listed account has Fast set.
-    fn normal_fast_credential_ids(&self, items: &[CredentialListItem]) -> HashSet<u64> {
-        let fast_ids: HashSet<u64> = items
-            .iter()
-            .filter(|item| item.fast > 0)
-            .map(|item| item.id)
-            .collect();
-        if fast_ids.is_empty() {
-            return HashSet::new();
-        }
-        self.credential_status_items(CredentialStatusBuildOptions {
-            include_account_info: true,
-            include_cost_summary: false,
-        })
-        .7
-        .into_iter()
-        .filter(|credential| fast_ids.contains(&credential.id) && fast_counts_for_sort(credential))
-        .map(|credential| credential.id)
-        .collect()
-    }
-
     /// 轻量分页获取凭据基础字段。
     pub fn get_credentials_list(
         &self,
@@ -2248,16 +2226,7 @@ impl AdminService {
                 .filter(|entry| matching_ids.contains(&entry.id))
                 .map(|entry| credential_list_item_from_base(entry, &default_endpoint))
                 .collect();
-            let normal_fast_ids: HashSet<u64> = detailed
-                .iter()
-                .filter(|credential| credential.fast > 0 && fast_counts_for_sort(credential))
-                .map(|credential| credential.id)
-                .collect();
-            sort_credential_list_items_for_admin_display_with_query(
-                &mut filtered,
-                &query,
-                &normal_fast_ids,
-            );
+            sort_credential_list_items_for_admin_display_with_query(&mut filtered, &query);
             let filtered_total = filtered.len();
             let filtered_available = filtered
                 .iter()
@@ -2285,12 +2254,7 @@ impl AdminService {
             .map(|entry| credential_list_item_from_base(entry, &default_endpoint))
             .filter(|credential| credential_base_matches_query(credential, &query))
             .collect();
-        let normal_fast_ids = self.normal_fast_credential_ids(&filtered);
-        sort_credential_list_items_for_admin_display_with_query(
-            &mut filtered,
-            &query,
-            &normal_fast_ids,
-        );
+        sort_credential_list_items_for_admin_display_with_query(&mut filtered, &query);
         let filtered_total = filtered.len();
         let filtered_available = filtered
             .iter()
@@ -8952,35 +8916,25 @@ fn sort_credentials_for_admin_display_with_query(
 fn sort_credential_list_items_for_admin_display_with_query(
     credentials: &mut [CredentialListItem],
     query: &CredentialListQuery,
-    normal_fast_ids: &HashSet<u64>,
 ) {
     let sort_by = CredentialSortBy::parse(query.sort_by.as_deref());
     if sort_by == CredentialSortBy::Default {
-        credentials.sort_by(|a, b| compare_credential_list_default(a, b, normal_fast_ids));
+        credentials.sort_by(compare_credential_list_default);
         return;
     }
 
     let sort_order = CredentialSortOrder::parse(query.sort_order.as_deref(), sort_by);
     credentials.sort_by(|a, b| {
-        compare_credential_list_by(a, b, sort_by, sort_order, normal_fast_ids)
-            .then_with(|| compare_credential_list_default(a, b, normal_fast_ids))
+        compare_credential_list_by(a, b, sort_by, sort_order)
+            .then_with(|| compare_credential_list_default(a, b))
     });
 }
 
-/// List items carry no runtime state, so the caller passes the ids of the Fast accounts that are
-/// currently normal; Fast on any other account is ignored (see `compare_fast_first`).
 fn compare_credential_list_default(
     a: &CredentialListItem,
     b: &CredentialListItem,
-    normal_fast_ids: &HashSet<u64>,
 ) -> std::cmp::Ordering {
-    let fast = |item: &CredentialListItem| {
-        if normal_fast_ids.contains(&item.id) {
-            item.fast
-        } else {
-            0
-        }
-    };
+    let fast = |item: &CredentialListItem| fast_for_sort(item.fast, item.disabled);
     compare_fast_first(fast(a), fast(b))
         .then_with(|| a.disabled.cmp(&b.disabled))
         .then_with(|| {
@@ -8994,10 +8948,9 @@ fn compare_credential_list_by(
     b: &CredentialListItem,
     sort_by: CredentialSortBy,
     sort_order: CredentialSortOrder,
-    normal_fast_ids: &HashSet<u64>,
 ) -> std::cmp::Ordering {
     match sort_by {
-        CredentialSortBy::Default => compare_credential_list_default(a, b, normal_fast_ids),
+        CredentialSortBy::Default => compare_credential_list_default(a, b),
         CredentialSortBy::Id => sort_order.apply(a.id.cmp(&b.id)),
         CredentialSortBy::CreatedAt => {
             compare_option_ord_some_first(a.created_at.as_ref(), b.created_at.as_ref(), sort_order)
@@ -9006,27 +8959,24 @@ fn compare_credential_list_by(
             compare_option_ord_some_first(a.updated_at.as_ref(), b.updated_at.as_ref(), sort_order)
         }
         CredentialSortBy::Priority => sort_order.apply(a.priority.cmp(&b.priority)),
-        _ => compare_credential_list_default(a, b, normal_fast_ids),
+        _ => compare_credential_list_default(a, b),
     }
 }
 
-/// Normal Fast accounts lead the default list, higher Fast values first. Fast on an account that
-/// is not normal (the same test as the "正常" status filter) is ignored, so it sorts like any
-/// non-Fast account.
+/// Fast accounts lead the default list, higher Fast values first.
 fn compare_fast_first(a: u32, b: u32) -> std::cmp::Ordering {
     b.cmp(&a)
 }
 
-fn fast_counts_for_sort(credential: &CredentialStatusItem) -> bool {
-    is_normal_account(credential)
+/// Only a disabled account loses its Fast place. Cooling, rate limits, used-up quota and recent
+/// failures come and go, and moving the card each time they do reorders the page on every
+/// refresh.
+fn fast_for_sort(fast: u32, disabled: bool) -> u32 {
+    if disabled { 0 } else { fast }
 }
 
 fn effective_fast(credential: &CredentialStatusItem) -> u32 {
-    if fast_counts_for_sort(credential) {
-        credential.fast
-    } else {
-        0
-    }
+    fast_for_sort(credential.fast, credential.disabled)
 }
 
 fn compare_credentials_default(

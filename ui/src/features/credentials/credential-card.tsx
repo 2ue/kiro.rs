@@ -352,7 +352,11 @@ const EMPTY_SUPPORTED_MODELS: string[] = []
  * The responsive grid credential cards sit in; shared by the account page, the public pool page
  * and the preview. Pages fill the window, so wide screens get more columns instead of wider cards.
  */
-export const CREDENTIAL_CARD_GRID = 'grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6'
+/**
+ * Cards are left out of scroll anchoring: when a refresh reorders them, the browser would
+ * otherwise follow the card it anchored on to its new place and scroll the page with it.
+ */
+export const CREDENTIAL_CARD_GRID = 'grid gap-3 [overflow-anchor:none] md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6'
 
 export interface CredentialCardProps {
   credential: CredentialStatusItem

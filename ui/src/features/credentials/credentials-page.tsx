@@ -143,6 +143,22 @@ function CredentialFilterField({
   )
 }
 
+/**
+ * The latest item per id from `items`, falling back to the last one seen for ids the current
+ * response does not cover yet. Only ids in `keep` are held, so memory stays at one page.
+ */
+function useLastKnownById<T extends { id: number }>(items: T[] | undefined, keep: number[]): Map<number, T> {
+  const lastKnown = useRef<Map<number, T>>(new Map())
+  return useMemo(() => {
+    const keepIds = new Set(keep)
+    const next = new Map<number, T>()
+    for (const [id, item] of lastKnown.current) if (keepIds.has(id)) next.set(id, item)
+    for (const [id, item] of mapById(items)) if (keepIds.has(id)) next.set(id, item)
+    lastKnown.current = next
+    return next
+  }, [items, keep])
+}
+
 function numericQueryValue(value: string): number | undefined {
   const trimmed = value.trim().replace(/^#/, '')
   if (!trimmed) return undefined
@@ -352,14 +368,17 @@ export function CredentialsPage() {
     return Array.from(regions).sort((left, right) => left.localeCompare(right))
   }, [credentialCatalog.data?.items, credentials.data?.items, regionFilter])
 
+  // The detail queries are keyed by the page's ids, so a reorder starts new ones. Until they
+  // answer, a card keeps what was last known for its account instead of going blank, which would
+  // change its height and move the page.
+  const runtimeById = useLastKnownById(credentialRuntime.data?.items, currentIds)
+  const accountById = useLastKnownById(credentialAccountInfo.data?.items, currentIds)
+  const usageById = useLastKnownById(credentialUsage.data?.items, currentIds)
   const currentCredentials = useMemo(() => {
-    const runtimeById = mapById(credentialRuntime.data?.items)
-    const accountById = mapById(credentialAccountInfo.data?.items)
-    const usageById = mapById(credentialUsage.data?.items)
     return (credentials.data?.items || []).map((item) =>
       mergeCredentialPlanes(item, runtimeById.get(item.id), accountById.get(item.id), usageById.get(item.id))
     )
-  }, [credentials.data?.items, credentialRuntime.data?.items, credentialAccountInfo.data?.items, credentialUsage.data?.items])
+  }, [credentials.data?.items, runtimeById, accountById, usageById])
 
   const importDuplicateCheckCredentials = allCredentials.data?.credentials || currentCredentials
   const totalPages = credentials.data?.totalPages || 0
