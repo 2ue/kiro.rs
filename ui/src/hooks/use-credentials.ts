@@ -130,9 +130,16 @@ export function useCredentialSummary() {
   })
 }
 
+/**
+ * Detail queries are keyed by a page's ids, so every page, page size, filter or reorder leaves
+ * one behind. The page holds the last value per account itself, so old entries can go soon.
+ */
+const PAGE_DETAIL_GC_MS = 30_000
+
 export function useCredentialRuntime(ids: number[], options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-runtime', ids],
+    gcTime: PAGE_DETAIL_GC_MS,
     queryFn: () => getCredentialRuntime(ids),
     enabled: (options.enabled ?? true) && ids.length > 0,
     refetchInterval: options.refetchInterval ?? 5000,
@@ -153,6 +160,7 @@ export function useCredentialDiagnostics(id: number | null, page = 1, enabled = 
 export function useCredentialAccountInfo(ids: number[], options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-account-info', ids],
+    gcTime: PAGE_DETAIL_GC_MS,
     queryFn: () => getCredentialAccountInfo(ids),
     enabled: (options.enabled ?? true) && ids.length > 0,
     refetchInterval: options.refetchInterval ?? 60000,
@@ -164,6 +172,7 @@ export function useCredentialAccountInfo(ids: number[], options: QueryRefreshOpt
 export function useCredentialUsageSummary(ids: number[], options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-usage-summary', ids],
+    gcTime: PAGE_DETAIL_GC_MS,
     queryFn: () => getCredentialUsageSummary(ids),
     enabled: (options.enabled ?? true) && ids.length > 0,
     refetchInterval: options.refetchInterval ?? 30000,

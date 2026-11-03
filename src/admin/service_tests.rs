@@ -1075,27 +1075,111 @@ fn credential_default_sort_puts_fast_accounts_first() {
 }
 
 #[test]
-fn credential_default_sort_ignores_fast_on_accounts_that_are_not_normal() {
+fn credential_default_sort_keeps_fast_first_through_temporary_states() {
     let mut credentials = vec![
         credential_item(1, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None),
         credential_item(2, false, Some("2026-01-02T00:00:00Z"), 0, 0.0, Some(100.0)),
         credential_item(3, false, Some("2026-01-03T00:00:00Z"), 0, 0.0, None),
         credential_item(4, false, Some("2026-01-04T00:00:00Z"), 0, 0.0, None),
         credential_item(5, false, Some("2026-01-05T00:00:00Z"), 0, 0.0, None),
+        credential_item(6, false, Some("2026-01-06T00:00:00Z"), 0, 0.0, None),
+        credential_item(7, true, Some("2026-01-07T00:00:00Z"), 0, 0.0, None),
+        credential_item(8, false, Some("2026-01-08T00:00:00Z"), 0, 0.0, None),
     ];
     credentials[0].fast = 1; // #1 normal
-    credentials[1].fast = 9; // #2 quota exhausted
-    credentials[2].fast = 9; // #3 account error
+    credentials[1].fast = 2; // #2 quota used up, still enabled
+    credentials[2].fast = 2; // #3 recent auth failures
     credentials[2].last_error_kind = Some("auth".to_string());
     credentials[2].transient_failure_streak = 1;
     credentials[3].fast = 3; // #4 cooling
     credentials[3].cooled_down = true;
+    credentials[4].fast = 1; // #5 rate limited
+    credentials[4].rate_limited = true;
+    credentials[6].fast = 9; // #7 disabled (403): the only state that drops Fast
+    credentials[6].disabled_reason = Some("AccountSuspended".to_string());
 
     sort_credentials_for_admin_display(&mut credentials);
 
     let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
-    // Only the normal Fast account moves up; the others keep the newest-first order.
-    assert_eq!(ids, vec![1, 5, 4, 3, 2]);
+    // Fast high to low, equal Fast newest first. The disabled Fast account is not pinned; it
+    // sorts with the rest by the usual rule (enabled before disabled, then newest first).
+    assert_eq!(ids, vec![4, 3, 2, 5, 1, 8, 6, 7]);
+}
+
+#[test]
+fn credential_list_default_sort_matches_the_full_sort_without_runtime_state() {
+    let mut full: Vec<_> = (1..=6)
+        .map(|id| {
+            credential_item(
+                id,
+                id == 5,
+                Some(&format!("2026-01-0{id}T00:00:00Z")),
+                0,
+                0.0,
+                None,
+            )
+        })
+        .collect();
+    full[0].fast = 2;
+    full[2].fast = 1;
+    full[2].cooled_down = true;
+    full[4].fast = 3; // disabled
+    let mut list: Vec<CredentialListItem> = full
+        .iter()
+        .map(|credential| CredentialListItem {
+            id: credential.id,
+            created_at: credential.created_at.clone(),
+            updated_at: credential.updated_at.clone(),
+            priority: credential.priority,
+            fast: credential.fast,
+            route_mode: credential.route_mode,
+            route_rules: credential.route_rules.clone(),
+            disabled: credential.disabled,
+            disabled_reason: credential.disabled_reason.clone(),
+            auth_method: credential.auth_method.clone(),
+            provider: credential.provider.clone(),
+            region: credential.region.clone(),
+            auth_region: credential.auth_region.clone(),
+            api_region: credential.api_region.clone(),
+            effective_auth_region: credential.effective_auth_region.clone(),
+            effective_api_region: credential.effective_api_region.clone(),
+            has_profile_arn: credential.has_profile_arn,
+            identity: credential.identity.clone(),
+            refresh_token_hash: credential.refresh_token_hash.clone(),
+            api_key_hash: credential.api_key_hash.clone(),
+            masked_api_key: credential.masked_api_key.clone(),
+            email: credential.email.clone(),
+            subscription_title: credential.subscription_title.clone(),
+            tags: credential.tags.clone(),
+            supported_models: credential.supported_models.clone(),
+            has_proxy: credential.has_proxy,
+            proxy_url: credential.proxy_url.clone(),
+            proxy_username: credential.proxy_username.clone(),
+            proxy_password: credential.proxy_password.clone(),
+            proxy_resource_id: credential.proxy_resource_id,
+            proxy_resource_name: credential.proxy_resource_name.clone(),
+            effective_proxy_url: credential.effective_proxy_url.clone(),
+            effective_proxy_source: credential.effective_proxy_source.clone(),
+            endpoint: credential.endpoint.clone(),
+            max_concurrent_requests: credential.max_concurrent_requests,
+            max_concurrent_requests_override: credential.max_concurrent_requests_override,
+            rpm: credential.rpm,
+            rpm_override: credential.rpm_override,
+            rate_limit_auto_disable_enabled: credential.rate_limit_auto_disable_enabled,
+            warmup_remaining: credential.warmup_remaining,
+        })
+        .collect();
+
+    sort_credentials_for_admin_display(&mut full);
+    sort_credential_list_items_for_admin_display_with_query(
+        &mut list,
+        &CredentialListQuery::default(),
+    );
+
+    let full_ids: Vec<u64> = full.iter().map(|credential| credential.id).collect();
+    let list_ids: Vec<u64> = list.iter().map(|credential| credential.id).collect();
+    assert_eq!(full_ids, vec![1, 3, 6, 4, 2, 5]);
+    assert_eq!(list_ids, full_ids);
 }
 
 #[test]
