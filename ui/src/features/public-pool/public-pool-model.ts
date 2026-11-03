@@ -67,4 +67,3 @@ export function publicAttentionFlags(account: PublicPoolAccount): CredentialFlag
     hasProfileArn: false,
   }).filter((flag) => flag.kind === 'attention')
 }
-
