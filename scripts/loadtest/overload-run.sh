@@ -233,6 +233,13 @@ for case_name in $CASES; do
   mock_json=${def%%|*}; rest=${def#*|}; profile=${rest%%|*}; rest=${rest#*|}; flags=${rest%%|*}
   plan=""; [ "$rest" != "$flags" ] && plan=${rest#*|}
   # TIME_WAIT holding ephemeral ports (see overload-probe.mjs).
+  # The host runs other work. Above this load the mock and kiro-rs both run seconds late and a
+  # case measures the host, not the scheduler: wait (up to 20 min) for it to settle.
+  for _ in $(seq 1 40); do
+    load=$(uptime | awk -F'load averages: ' '{print $2}' | awk '{print int($1)}')
+    [ "$load" -le "${MAX_LOAD:-60}" ] && break
+    echo "host load $load > ${MAX_LOAD:-60}, waiting before $case_name"; sleep 30
+  done
   timewait=$(netstat -an -p tcp 2>/dev/null | awk '$6=="TIME_WAIT"{n=split($4,a,"."); if (a[n]+0>=49152) c++} END{print c+0}')
   if [ "$timewait" -gt 2000 ]; then echo "TIME_WAIT $timewait > 2000, waiting before $case_name"; sleep 60; fi
   # Rates in the case table are for the production pool (57 accounts x 4 = 228 slots); scale
