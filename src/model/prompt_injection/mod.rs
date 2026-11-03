@@ -806,6 +806,48 @@ mod tests {
     }
 
     #[test]
+    fn route_features_dfcache_websearch_override_covers_the_six_cctest_routes() {
+        let mut config = RouteFeaturesConfig::default();
+        assert!(!config.resolve("/v1/messages").model_driven_web_search);
+
+        config.path_overrides.insert(
+            "/dfcache".to_string(),
+            RouteFeatureOverride {
+                model_driven_web_search: Some(true),
+                ..RouteFeatureOverride::default()
+            },
+        );
+        config.path_overrides.insert(
+            "/dfcache/mine-hak".to_string(),
+            RouteFeatureOverride {
+                model_driven_web_search: Some(false),
+                ..RouteFeatureOverride::default()
+            },
+        );
+
+        for route in ["mine-haa", "naaa", "minea", "mineb", "mcc"] {
+            assert!(
+                config
+                    .resolve(&format!("/dfcache/{route}/v1/messages"))
+                    .model_driven_web_search,
+                "{route} should inherit the /dfcache model-driven WebSearch override"
+            );
+        }
+        assert!(
+            !config
+                .resolve("/dfcache/mine-hak/v1/messages")
+                .model_driven_web_search,
+            "the longest route override must be able to disable the feature"
+        );
+        assert!(
+            !config
+                .resolve("/dfcachex/v1/messages")
+                .model_driven_web_search,
+            "a non-boundary prefix must not match /dfcache"
+        );
+    }
+
+    #[test]
     fn validation_requires_reminder_tags_and_language_placeholder() {
         let mut config = PromptInjectionConfig::default();
         assert!(config.validate().is_ok());

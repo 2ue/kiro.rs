@@ -277,6 +277,13 @@ pub(super) fn prepare_with_plan(
         .as_ref()
         .map(|(request, _)| request)
         .unwrap_or(payload);
+    let integer_output_payload = crate::anthropic::integer_output::from_messages_request(payload)
+        .and_then(|constraint| {
+            let mut request = payload.clone();
+            crate::anthropic::integer_output::append_to_messages_request(&mut request, constraint)
+                .then_some(request)
+        });
+    let payload = integer_output_payload.as_ref().unwrap_or(payload);
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
     let discovered_reasoning_capability = matches!(
         &native_reasoning_capability,

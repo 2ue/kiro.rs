@@ -49,6 +49,7 @@ mod handlers;
 mod identity_guard;
 mod image_resize;
 pub(crate) mod inference_attempt_budget;
+pub(crate) mod integer_output;
 pub(crate) mod kiro_plus_shaping;
 pub(crate) mod language_preference;
 mod middleware;
