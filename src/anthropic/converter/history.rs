@@ -715,3 +715,157 @@ fn generated_thinking_prefix_len(msg: &AnthropicMessage, content: &str) -> Optio
         content.starts_with(&prefix).then_some(prefix.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::anthropic::converter::{ConverterOptions, ProxyWarnings};
+    use crate::anthropic::types::MessagesRequest;
+    use crate::kiro::model::requests::conversation::Message as KiroMessage;
+    use crate::model::config::CompatProfile;
+
+    fn captured_cli_tool_history() -> MessagesRequest {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": "帮我创建一个 test-golang 项目写几个算法"
+        })];
+
+        for round in 1..=10 {
+            let tool_id = format!("toolu_capture_{round}");
+            let mut assistant_content = Vec::new();
+            if round == 1 {
+                assistant_content.push(json!({
+                    "type": "thinking",
+                    "thinking": "先建立项目骨架，再逐步写入算法。",
+                    "signature": "opaque-capture-signature"
+                }));
+            }
+            assistant_content.push(json!({
+                "type": "text",
+                "text": format!("继续处理第 {round} 个文件。")
+            }));
+            assistant_content.push(json!({
+                "type": "tool_use",
+                "id": tool_id,
+                "name": "Bash",
+                "input": {"command": format!("printf round-{round}")}
+            }));
+            messages.push(json!({
+                "role": "assistant",
+                "content": assistant_content
+            }));
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": format!("round-{round} completed")
+                }]
+            }));
+        }
+
+        serde_json::from_value(json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 64000,
+            "stream": true,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+            "tools": [{
+                "name": "Bash",
+                "description": "run a shell command",
+                "input_schema": {"type": "object"}
+            }],
+            "messages": messages
+        }))
+        .expect("captured Claude Code history fixture")
+    }
+
+    #[test]
+    fn captured_cli_twenty_one_message_tool_history_keeps_pairs_and_reasoning() {
+        let request = captured_cli_tool_history();
+        assert_eq!(request.messages.len(), 21);
+
+        let mut tool_name_map = HashMap::new();
+        let mut warnings = ProxyWarnings::default();
+        let mut applied_injections = Vec::new();
+        let options = ConverterOptions {
+            compat_profile: CompatProfile::AnthropicStrict,
+            injections: crate::model::prompt_injection::ResolvedInjections::all_off(),
+            ..ConverterOptions::default()
+        };
+        let history = build_history(
+            &request,
+            &request.messages,
+            "claude-opus-5-5",
+            &mut tool_name_map,
+            &mut warnings,
+            &mut applied_injections,
+            options,
+        )
+        .expect("captured history should convert");
+
+        assert_eq!(history.len(), 20, "the final tool result is current input");
+        let mut assistant_tool_uses = Vec::new();
+        let mut user_tool_results = Vec::new();
+        let mut assistant_count = 0;
+        let mut user_count = 0;
+        for message in &history {
+            match message {
+                KiroMessage::Assistant(assistant) => {
+                    assistant_count += 1;
+                    let uses = assistant
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .expect("every captured assistant turn calls Bash");
+                    assert_eq!(uses.len(), 1);
+                    assistant_tool_uses.push(uses[0].tool_use_id.clone());
+                    assert_eq!(uses[0].name, "Bash");
+                    assert!(uses[0].input["command"].is_string());
+                    if assistant_count == 1 {
+                        assert!(
+                            assistant
+                                .assistant_response_message
+                                .reasoning_content
+                                .is_some(),
+                            "the first captured turn carries signed thinking"
+                        );
+                    }
+                }
+                KiroMessage::User(user) => {
+                    user_count += 1;
+                    let results = &user
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results;
+                    if !results.is_empty() {
+                        assert_eq!(results.len(), 1);
+                        user_tool_results.push(results[0].tool_use_id.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(assistant_count, 10);
+        assert_eq!(user_count, 10);
+        assert_eq!(assistant_tool_uses.len(), 10);
+        assert_eq!(user_tool_results.len(), 9);
+        assert_eq!(
+            assistant_tool_uses,
+            (1..=10)
+                .map(|round| format!("toolu_capture_{round}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            user_tool_results,
+            (1..=9)
+                .map(|round| format!("toolu_capture_{round}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(warnings, ProxyWarnings::default());
+    }
+}
