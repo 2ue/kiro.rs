@@ -11213,9 +11213,20 @@ impl AdminService {
         self.token_manager.public_pool_view_enabled()
     }
 
-    pub(super) fn set_public_pool_enabled(&self, enabled: bool) -> Result<(), AdminServiceError> {
+    pub(super) fn public_pool_free_accounts(&self) -> crate::model::config::PublicPoolFreeAccounts {
+        self.token_manager.public_pool_free_accounts()
+    }
+
+    pub(super) fn set_public_pool_config(
+        &self,
+        enabled: bool,
+        free_accounts: crate::model::config::PublicPoolFreeAccounts,
+    ) -> Result<(), AdminServiceError> {
         self.token_manager
-            .update_runtime_config(|config| config.public_pool_view_enabled = enabled)
+            .update_runtime_config(|config| {
+                config.public_pool_view_enabled = enabled;
+                config.public_pool_free_accounts = free_accounts;
+            })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         self.audit(
             "set_public_pool_view",
@@ -11223,7 +11234,7 @@ impl AdminService {
             Some("public_pool_view".to_string()),
             true,
             None,
-            json!({ "enabled": enabled }),
+            json!({ "enabled": enabled, "freeAccounts": free_accounts }),
         );
         Ok(())
     }

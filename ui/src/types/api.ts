@@ -3054,8 +3054,12 @@ export interface InventoryActionResponse {
 // ============ 只读号池（免登录） ============
 
 /** The admin switch for the public read-only pool page; off by default. */
+/** How the public page shows Free accounts: as a paid tier, or not at all. */
+export type PublicPoolFreeAccounts = 'power' | 'pro_max' | 'pro_plus' | 'hide'
+
 export interface PublicPoolConfig {
   enabled: boolean
+  freeAccounts: PublicPoolFreeAccounts
 }
 
 /** The account page's status tabs; the public view filters by these only. */
@@ -3144,7 +3148,6 @@ export interface PublicPoolAccount {
   warmupRemaining: number
   transientFailureStreak: number
   quota?: PublicPoolQuota
-  kiroMeteringUsage: number
   createdAt: string | null
   lastUsedAt: string | null
 }

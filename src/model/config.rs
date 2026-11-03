@@ -4947,6 +4947,21 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// How the public read-only pool page shows Free accounts. The page only; nothing else reads it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPoolFreeAccounts {
+    /// Shown as Kiro Power.
+    #[default]
+    Power,
+    /// Shown as Kiro Pro Max.
+    ProMax,
+    /// Shown as Kiro Pro+.
+    ProPlus,
+    /// Left out of the page and its counts.
+    Hide,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5730,6 +5745,10 @@ pub struct Config {
     /// 关闭时接口返回 404，升级后不会对外暴露任何账号信息。
     #[serde(default)]
     pub public_pool_view_enabled: bool,
+
+    /// 只读号池页面怎么展示 Free 账号：显示为某个付费档位，或者不展示。只影响该页面。
+    #[serde(default)]
+    pub public_pool_free_accounts: PublicPoolFreeAccounts,
 
     /// 外部备用号池和直连/预检 fallback 策略。
     #[serde(default)]
@@ -7009,6 +7028,7 @@ impl Default for Config {
             audit_log_retention_enabled: false,
             audit_log_retention_days: default_audit_log_retention_days(),
             public_pool_view_enabled: false,
+            public_pool_free_accounts: PublicPoolFreeAccounts::default(),
             external_pools: ExternalPoolsConfig::default(),
             config_path: None,
         }
@@ -7849,6 +7869,10 @@ mod tests {
         assert_eq!(config.audit_log_retention_days, 15);
         // The public pool page stays closed until an operator opens it.
         assert!(!config.public_pool_view_enabled);
+        assert_eq!(
+            config.public_pool_free_accounts,
+            PublicPoolFreeAccounts::Power
+        );
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
         assert!(config.payload_guard_enabled);

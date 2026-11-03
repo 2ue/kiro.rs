@@ -30,7 +30,6 @@ const account = (extra: Record<string, unknown> = {}) => ({
   probationRemainingSecs: 0,
   warmupRemaining: 0,
   transientFailureStreak: 0,
-  kiroMeteringUsage: 0,
   createdAt: null,
   lastUsedAt: null,
   ...extra,

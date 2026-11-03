@@ -2953,6 +2953,11 @@ impl MultiTokenManager {
         self.config.read().public_pool_view_enabled
     }
 
+    /// 只读号池页面对 Free 账号的展示方式。
+    pub fn public_pool_free_accounts(&self) -> crate::model::config::PublicPoolFreeAccounts {
+        self.config.read().public_pool_free_accounts
+    }
+
     fn runtime_capacity_change_should_reset_warmup(previous: &Config, current: &Config) -> bool {
         previous.credential_rpm != current.credential_rpm
             || previous.credential_max_concurrent_requests

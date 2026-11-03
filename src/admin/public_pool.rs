@@ -1,8 +1,11 @@
 //! 免登录的只读号池视图。
 //!
 //! `GET /api/public/pool` 只返回展示账号状态、额度和调度负载所需的字段：不含 token 及其哈希、
-//! 代理、完整邮箱、错误原文和任何美元费用。开关 `publicPoolViewEnabled` 默认关闭，关闭时返回
-//! 404；开关只能通过需要 Admin Key 的 `/api/admin/public-pool` 修改。现有管理接口不受影响。
+//! 代理、完整邮箱、错误原文、任何美元费用和单个账号的使用积分。开关 `publicPoolViewEnabled`
+//! 默认关闭，关闭时返回 404；开关只能通过需要 Admin Key 的 `/api/admin/public-pool` 修改。
+//!
+//! Free 账号按 `publicPoolFreeAccounts` 展示：显示成某个付费档位（默认 Power），或者整个不出现。
+//! 这些换算只在本模块里做，现有管理接口和调度不受影响。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +24,11 @@ use tokio::sync::Mutex;
 
 use super::middleware::AdminState;
 use super::service::{AdminService, credential_matches_status};
-use super::types::{AdminErrorResponse, CredentialCooldown, CredentialStatusItem};
+use super::types::{
+    AdminErrorResponse, CredentialAccountInfo, CredentialCooldown, CredentialStatusItem,
+};
+use crate::model::config::PublicPoolFreeAccounts;
+use crate::model::model_support::subscription_tier_key;
 
 /// A rebuild reads every account's quota snapshot and usage totals from PgSQL, so anonymous
 /// viewers share one build for this long.
@@ -139,7 +146,6 @@ pub struct PublicPoolAccount {
     pub transient_failure_streak: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<PublicPoolQuota>,
-    pub kiro_metering_usage: f64,
     pub created_at: Option<String>,
     pub last_used_at: Option<String>,
 }
@@ -172,10 +178,98 @@ pub struct PublicPoolQuery {
     pub status: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicPoolConfig {
     pub enabled: bool,
+    pub free_accounts: PublicPoolFreeAccounts,
+}
+
+/// `freeAccounts` may be left out to keep the current choice.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicPoolConfigUpdate {
+    pub enabled: bool,
+    #[serde(default)]
+    pub free_accounts: Option<PublicPoolFreeAccounts>,
+}
+
+// ============ Free 账号 ============
+
+/// The paid tier a Free account is shown as: its subscription title and its credits per period.
+fn disguise_tier(mode: PublicPoolFreeAccounts) -> Option<(&'static str, f64)> {
+    match mode {
+        PublicPoolFreeAccounts::Power => Some(("KIRO POWER", 10_000.0)),
+        PublicPoolFreeAccounts::ProMax => Some(("KIRO PRO MAX", 5_000.0)),
+        PublicPoolFreeAccounts::ProPlus => Some(("KIRO PRO+", 2_000.0)),
+        PublicPoolFreeAccounts::Hide => None,
+    }
+}
+
+fn is_free_account(credential: &CredentialStatusItem) -> bool {
+    let title = credential
+        .account_info
+        .as_ref()
+        .and_then(|info| info.subscription_title.as_deref())
+        .or(credential.subscription_title.as_deref());
+    subscription_tier_key(title) == "free"
+}
+
+/// A Free account as the page shows it: the paid tier's title and limit, used credits being the
+/// credits it has used here wrapped by that limit, no overage. Status tabs then follow the shown
+/// quota, so a Free account that ran out does not sit under "额度用尽" with a nearly empty bar.
+fn disguise_free_account(
+    mut credential: CredentialStatusItem,
+    title: &str,
+    limit: f64,
+) -> CredentialStatusItem {
+    let used = if credential.kiro_metering_usage.is_finite() {
+        credential.kiro_metering_usage.max(0.0) % limit
+    } else {
+        0.0
+    };
+    credential.subscription_title = Some(title.to_string());
+    if credential.disabled_reason.as_deref() == Some("QuotaExceeded") {
+        credential.disabled_reason = None;
+    }
+    if let Some(info) = credential.account_info.as_mut() {
+        *info = CredentialAccountInfo {
+            subscription_title: Some(title.to_string()),
+            current_usage: used,
+            usage_limit: limit,
+            remaining: limit - used,
+            usage_percentage: used / limit * 100.0,
+            credit_limit: limit,
+            credit_remaining: limit - used,
+            credit_base: limit,
+            credit_bonus: 0.0,
+            overage_status: Some("DISABLED".to_string()),
+            overage_capability: None,
+            overage_cap: 0.0,
+            overage_rate: 0.0,
+            current_overages: 0.0,
+            next_reset_at: None,
+            checked_at: info.checked_at.clone(),
+        };
+    }
+    credential
+}
+
+/// The accounts the page shows, Free ones hidden or disguised by `mode`.
+fn visible_credentials(
+    credentials: Vec<CredentialStatusItem>,
+    mode: PublicPoolFreeAccounts,
+) -> Vec<CredentialStatusItem> {
+    credentials
+        .into_iter()
+        .filter_map(|credential| {
+            if !is_free_account(&credential) {
+                return Some(credential);
+            }
+            disguise_tier(mode)
+                .map(|(title, limit)| disguise_free_account(credential, title, limit))
+        })
+        .collect()
 }
 
 // ============ 脱敏 ============
@@ -261,7 +355,6 @@ impl PublicPoolAccount {
                     .is_some_and(|status| status.eq_ignore_ascii_case("ENABLED")),
                 checked_at: info.checked_at.clone(),
             }),
-            kiro_metering_usage: credential.kiro_metering_usage,
             created_at: credential.created_at.clone(),
             last_used_at: credential.last_used_at.clone(),
         }
@@ -274,28 +367,38 @@ impl PublicPoolAccount {
 /// falls under.
 #[derive(Debug, Clone)]
 struct PublicPoolSnapshot {
+    free_accounts: PublicPoolFreeAccounts,
     overview: PublicPoolOverview,
     accounts: Vec<(PublicPoolAccount, Vec<&'static str>)>,
 }
 
 impl PublicPoolSnapshot {
-    fn build(service: &AdminService) -> Self {
+    fn build(service: &AdminService, free_accounts: PublicPoolFreeAccounts) -> Self {
         let credentials = service.public_pool_credentials();
         let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
         let cooldowns = service.public_pool_cooldowns(&ids);
         let summary = service.public_pool_dispatch_summary();
         let realtime = service.get_usage_summary().realtime;
         let mode = service.get_load_balancing_mode().mode;
-        Self::from_parts(credentials, &cooldowns, summary, realtime, mode)
+        Self::from_parts(
+            credentials,
+            free_accounts,
+            &cooldowns,
+            summary,
+            realtime,
+            mode,
+        )
     }
 
     fn from_parts(
         credentials: Vec<CredentialStatusItem>,
+        free_accounts: PublicPoolFreeAccounts,
         cooldowns: &HashMap<u64, Vec<CredentialCooldown>>,
         summary: crate::kiro::token_manager::ManagerSummarySnapshot,
         realtime: crate::anthropic::usage::UsageRealtimeStats,
         load_balancing_mode: String,
     ) -> Self {
+        let credentials = visible_credentials(credentials, free_accounts);
         let accounts: Vec<(PublicPoolAccount, Vec<&'static str>)> = credentials
             .iter()
             .map(|credential| {
@@ -320,19 +423,47 @@ impl PublicPoolSnapshot {
                 .filter(|(_, statuses)| statuses.contains(&status))
                 .count()
         };
+        // Counted over the shown accounts with the manager summary's rules, so hidden accounts
+        // leave no trace in the totals. Queue and limits are pool-wide and stay as they are.
+        let enabled: Vec<&CredentialStatusItem> = credentials
+            .iter()
+            .filter(|credential| !credential.disabled)
+            .collect();
+        let global_cooldown = |credential: &CredentialStatusItem| {
+            cooldowns
+                .get(&credential.id)
+                .is_some_and(|items| items.iter().any(|cooldown| cooldown.global))
+        };
         let overview = PublicPoolOverview {
-            total: summary.total,
-            enabled: summary.available,
-            disabled: summary.total.saturating_sub(summary.available),
-            schedulable: summary.account_states.schedulable,
-            cooling_down: summary.account_states.cooling_down,
-            in_use: summary.account_states.in_use,
-            failing: summary.account_states.failing,
+            total: credentials.len(),
+            enabled: enabled.len(),
+            disabled: credentials.len() - enabled.len(),
+            schedulable: enabled
+                .iter()
+                .filter(|credential| !global_cooldown(credential))
+                .count(),
+            cooling_down: enabled
+                .iter()
+                .filter(|credential| credential.cooled_down)
+                .count(),
+            in_use: enabled
+                .iter()
+                .filter(|credential| credential.in_flight_requests > 0)
+                .count(),
+            failing: enabled
+                .iter()
+                .filter(|credential| {
+                    credential.failure_count > 0 || credential.refresh_failure_count > 0
+                })
+                .count(),
             normal: count("normal"),
             cooling: count("cooling"),
             quota_exhausted: count("quota_exhausted"),
             account_error: count("account_error"),
-            global_in_flight_requests: summary.global_in_flight_requests,
+            global_in_flight_requests: credentials
+                .iter()
+                .map(|credential| credential.in_flight_requests)
+                .sum(),
             global_max_concurrent_requests: summary.global_max_concurrent_requests,
             queued_requests: summary.queued_requests,
             realtime: PublicPoolRealtime {
@@ -354,7 +485,11 @@ impl PublicPoolSnapshot {
             load_balancing_mode,
             updated_at: Utc::now().to_rfc3339(),
         };
-        Self { overview, accounts }
+        Self {
+            free_accounts,
+            overview,
+            accounts,
+        }
     }
 
     fn page(&self, query: &PublicPoolQuery) -> PublicPoolResponse {
@@ -404,16 +539,23 @@ struct PublicPoolState {
 
 impl PublicPoolState {
     /// Holding the lock across a rebuild makes concurrent viewers wait for one build instead of
-    /// each starting their own. A failed build serves the previous one while it exists.
+    /// each starting their own. A failed build serves the previous one while it exists. A change
+    /// of the Free account setting rebuilds at once, so a cached build never shows what was hidden.
     async fn snapshot(&self) -> Option<Arc<PublicPoolSnapshot>> {
+        let free_accounts = self.service.public_pool_free_accounts();
         let mut cache = self.cache.lock().await;
         if let Some((built_at, snapshot)) = &cache.built
             && built_at.elapsed() < SNAPSHOT_TTL
+            && snapshot.free_accounts == free_accounts
         {
             return Some(snapshot.clone());
         }
         let service = self.service.clone();
-        match tokio::task::spawn_blocking(move || PublicPoolSnapshot::build(&service)).await {
+        match tokio::task::spawn_blocking(move || {
+            PublicPoolSnapshot::build(&service, free_accounts)
+        })
+        .await
+        {
             Ok(snapshot) => {
                 let snapshot = Arc::new(snapshot);
                 cache.built = Some((Instant::now(), snapshot.clone()));
@@ -421,7 +563,11 @@ impl PublicPoolState {
             }
             Err(err) => {
                 tracing::warn!(error = %err, "构建只读号池快照失败");
-                cache.built.as_ref().map(|(_, snapshot)| snapshot.clone())
+                cache
+                    .built
+                    .as_ref()
+                    .map(|(_, snapshot)| snapshot.clone())
+                    .filter(|snapshot| snapshot.free_accounts == free_accounts)
             }
         }
     }
@@ -474,16 +620,26 @@ pub fn create_public_pool_router(service: Arc<AdminService>) -> Router {
 pub(super) async fn get_public_pool_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(PublicPoolConfig {
         enabled: state.service.public_pool_enabled(),
+        free_accounts: state.service.public_pool_free_accounts(),
     })
 }
 
 /// PUT /api/admin/public-pool
 pub(super) async fn set_public_pool_config(
     State(state): State<AdminState>,
-    Json(payload): Json<PublicPoolConfig>,
+    Json(payload): Json<PublicPoolConfigUpdate>,
 ) -> Response {
-    match state.service.set_public_pool_enabled(payload.enabled) {
-        Ok(()) => Json(payload).into_response(),
+    let config = PublicPoolConfig {
+        enabled: payload.enabled,
+        free_accounts: payload
+            .free_accounts
+            .unwrap_or_else(|| state.service.public_pool_free_accounts()),
+    };
+    match state
+        .service
+        .set_public_pool_config(config.enabled, config.free_accounts)
+    {
+        Ok(()) => Json(config).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -548,6 +704,13 @@ mod tests {
     }
 
     fn snapshot(credentials: Vec<CredentialStatusItem>) -> PublicPoolSnapshot {
+        snapshot_with(credentials, PublicPoolFreeAccounts::Power)
+    }
+
+    fn snapshot_with(
+        credentials: Vec<CredentialStatusItem>,
+        free_accounts: PublicPoolFreeAccounts,
+    ) -> PublicPoolSnapshot {
         let total = credentials.len();
         let available = credentials.iter().filter(|item| !item.disabled).count();
         let cooldowns = HashMap::from([(
@@ -561,6 +724,7 @@ mod tests {
         )]);
         PublicPoolSnapshot::from_parts(
             credentials,
+            free_accounts,
             &cooldowns,
             summary(total, available),
             UsageRealtimeStats::empty(60),
@@ -633,9 +797,10 @@ mod tests {
         ] {
             assert!(!json.contains(field), "{field} leaked: {json}");
         }
+        // Credits used per account are recorded by this system, not queried, so they stay out.
+        assert!(!json.contains("kiroMeteringUsage"), "{json}");
         let account = &response.items[0];
         assert_eq!(account.label.as_deref(), Some("al***@gmail.com"));
-        assert_eq!(account.kiro_metering_usage, 7.25);
         assert_eq!(response.overview.consumed_credits, 7.25);
         let quota = account.quota.as_ref().unwrap();
         assert_eq!((quota.current_usage, quota.usage_limit), (30.0, 100.0));
@@ -703,6 +868,142 @@ mod tests {
         assert_eq!(
             snapshot.page(&query(None, Some(0), None)).limit,
             DEFAULT_PAGE_LIMIT
+        );
+    }
+
+    /// A Free account whose real quota ran out: 50 of 50 queried, overage on, disabled for quota,
+    /// with `used` credits recorded here.
+    fn free_credential(id: u64, used: f64) -> CredentialStatusItem {
+        let mut item = credential_item(id, true, None, 0, 0.0, Some(50.0));
+        item.subscription_title = Some("KIRO FREE".to_string());
+        item.disabled_reason = Some("QuotaExceeded".to_string());
+        item.kiro_metering_usage = used;
+        let info = item.account_info.as_mut().unwrap();
+        info.subscription_title = Some("KIRO FREE".to_string());
+        info.usage_limit = 50.0;
+        info.current_overages = 120.0;
+        item
+    }
+
+    #[test]
+    fn free_accounts_show_as_the_chosen_tier_with_used_credits_wrapped_by_its_limit() {
+        for (mode, title, limit) in [
+            (PublicPoolFreeAccounts::Power, "KIRO POWER", 10_000.0),
+            (PublicPoolFreeAccounts::ProMax, "KIRO PRO MAX", 5_000.0),
+            (PublicPoolFreeAccounts::ProPlus, "KIRO PRO+", 2_000.0),
+        ] {
+            let paid = credential_item(1, false, None, 0, 0.0, Some(30.0));
+            let snapshot = snapshot_with(vec![paid, free_credential(2, 23_456.5)], mode);
+            let response = snapshot.page(&query(None, None, None));
+            let free = response.items.iter().find(|item| item.id == 2).unwrap();
+            assert_eq!(free.subscription_title.as_deref(), Some(title), "{mode:?}");
+            let quota = free.quota.as_ref().unwrap();
+            assert_eq!(quota.usage_limit, limit, "{mode:?}");
+            assert_eq!(quota.current_usage, 23_456.5 % limit, "{mode:?}");
+            assert_eq!(quota.current_overages, 0.0);
+            assert!(!quota.overage_enabled);
+            // The account stays disabled; only the quota reason goes with the Free quota.
+            assert!(free.disabled);
+            assert_eq!(free.disabled_reason, None);
+            assert_eq!(snapshot.overview.quota_exhausted, 0, "{mode:?}");
+            assert_eq!(snapshot.overview.total, 2);
+
+            // Paid accounts keep their own quota, overage and all.
+            let paid = response.items.iter().find(|item| item.id == 1).unwrap();
+            let quota = paid.quota.as_ref().unwrap();
+            assert_eq!((quota.current_usage, quota.usage_limit), (30.0, 100.0));
+            assert!(quota.overage_enabled);
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(!json.to_ascii_lowercase().contains("free"), "{json}");
+        }
+    }
+
+    #[test]
+    fn free_accounts_under_the_limit_show_their_credits_as_they_are() {
+        let mut free = free_credential(2, 1_234.0);
+        free.disabled = false;
+        free.disabled_reason = None;
+        let snapshot = snapshot_with(vec![free], PublicPoolFreeAccounts::Power);
+        let response = snapshot.page(&query(None, None, None));
+        let quota = response.items[0].quota.as_ref().unwrap();
+        assert_eq!(
+            (quota.current_usage, quota.usage_limit),
+            (1_234.0, 10_000.0)
+        );
+        assert_eq!(snapshot.overview.normal, 1);
+        assert_eq!(snapshot.overview.quota_exhausted, 0);
+    }
+
+    #[test]
+    fn hidden_free_accounts_leave_no_trace_in_items_or_counts() {
+        let mut busy_free = free_credential(3, 10.0);
+        busy_free.disabled = false;
+        busy_free.disabled_reason = None;
+        busy_free.in_flight_requests = 2;
+        busy_free.failure_count = 1;
+        // Not queried yet: tier unknown, so it shows.
+        let mut unqueried = credential_item(4, false, None, 0, 0.0, None);
+        unqueried.subscription_title = None;
+        let credentials = vec![
+            credential_item(1, false, None, 0, 0.0, Some(30.0)),
+            free_credential(2, 99.0),
+            busy_free,
+            unqueried,
+        ];
+        let snapshot = snapshot_with(credentials, PublicPoolFreeAccounts::Hide);
+        let overview = &snapshot.overview;
+        assert_eq!(
+            (overview.total, overview.enabled, overview.disabled),
+            (2, 2, 0)
+        );
+        assert_eq!(
+            (overview.schedulable, overview.in_use, overview.failing),
+            (2, 0, 0)
+        );
+        assert_eq!(overview.global_in_flight_requests, 0);
+        assert_eq!(overview.quota_exhausted, 0);
+        assert_eq!(overview.normal, 2);
+        assert_eq!(overview.consumed_credits, 0.0);
+
+        let response = snapshot.page(&query(None, None, None));
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(response.filtered_total, 2);
+        let disabled = snapshot.page(&query(None, None, Some("disabled")));
+        assert_eq!(disabled.filtered_total, 0);
+    }
+
+    #[test]
+    fn the_free_account_setting_defaults_to_power_and_parses_every_choice() {
+        let update: PublicPoolConfigUpdate = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(update.enabled && update.free_accounts.is_none());
+        for (raw, mode) in [
+            ("power", PublicPoolFreeAccounts::Power),
+            ("pro_max", PublicPoolFreeAccounts::ProMax),
+            ("pro_plus", PublicPoolFreeAccounts::ProPlus),
+            ("hide", PublicPoolFreeAccounts::Hide),
+        ] {
+            let update: PublicPoolConfigUpdate =
+                serde_json::from_str(&format!(r#"{{"enabled":false,"freeAccounts":"{raw}"}}"#))
+                    .unwrap();
+            assert_eq!(update.free_accounts, Some(mode));
+        }
+        assert!(
+            serde_json::from_str::<PublicPoolConfigUpdate>(
+                r#"{"enabled":true,"freeAccounts":"free"}"#
+            )
+            .is_err()
+        );
+        assert_eq!(
+            PublicPoolFreeAccounts::default(),
+            PublicPoolFreeAccounts::Power
         );
     }
 }

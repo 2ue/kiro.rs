@@ -89,6 +89,7 @@ const intentionallyUiOnly = new Set([
   'PublicPoolAccount',
   'PublicPoolConfig',
   'PublicPoolCooldown',
+  'PublicPoolFreeAccounts',
   'PublicPoolOverview',
   'PublicPoolQuery',
   'PublicPoolQuota',
