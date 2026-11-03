@@ -124,6 +124,7 @@ pub(crate) struct KiroConverterPlan {
     pub(crate) native_reasoning_fields: BodyStageState,
     pub(crate) tool_pairing_repair: BodyStageState,
     pub(crate) history_placeholder_tools: BodyStageState,
+    pub(crate) history_image_dedup: BodyStageState,
 }
 
 impl KiroConverterPlan {
@@ -140,6 +141,7 @@ impl KiroConverterPlan {
             native_reasoning_fields: BodyStageState::from(config.native_reasoning_fields),
             tool_pairing_repair: BodyStageState::from(config.tool_pairing_repair),
             history_placeholder_tools: BodyStageState::from(config.history_placeholder_tools),
+            history_image_dedup: BodyStageState::from(config.history_image_dedup),
         }
     }
 }

@@ -976,6 +976,116 @@ mod tests {
         assert_eq!(redacted.data.as_deref(), Some("opaque"));
     }
 
+    /// With `historyImageDedup` on, the same image repeated across history turns (also inside tool
+    /// results) is sent once; later copies become a text note. The current turn is untouched, and
+    /// with the switch off every copy is sent as before.
+    #[test]
+    fn history_image_dedup_sends_each_identical_history_image_once() {
+        use super::super::types::Message as AnthropicMessage;
+        const OTHER_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image = |data: &str| {
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": data}
+            })
+        };
+        let user = |content: serde_json::Value| AnthropicMessage {
+            role: "user".to_string(),
+            content,
+        };
+        let assistant = |content: serde_json::Value| AnthropicMessage {
+            role: "assistant".to_string(),
+            content,
+        };
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                user(
+                    serde_json::json!([{"type": "text", "text": "look"}, image(VALID_PNG_1X1_BASE64)]),
+                ),
+                assistant(serde_json::json!([
+                    {"type": "tool_use", "id": "toolu_shot", "name": "Screenshot", "input": {}}
+                ])),
+                user(serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_shot",
+                    "content": [image(VALID_PNG_1X1_BASE64), image(OTHER_PNG)]
+                }])),
+                assistant(serde_json::json!("seen")),
+                user(serde_json::json!([
+                    image(VALID_PNG_1X1_BASE64),
+                    image(OTHER_PNG)
+                ])),
+                assistant(serde_json::json!("again")),
+                user(
+                    serde_json::json!([{"type": "text", "text": "now"}, image(VALID_PNG_1X1_BASE64)]),
+                ),
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![
+                serde_json::from_value(serde_json::json!({
+                    "name": "Screenshot",
+                    "description": "take a screenshot",
+                    "input_schema": {"type": "object", "properties": {}}
+                }))
+                .unwrap(),
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            output_format: None,
+            metadata: None,
+            stop_sequences: None,
+        };
+        let convert = |dedup: bool| {
+            let mut options = ConverterOptions::default();
+            options.conversion.history_image_dedup =
+                crate::anthropic::body_capabilities::BodyStageState::from(dedup);
+            convert_request_with_options(&req, options).expect("request should convert")
+        };
+        let history_images = |result: &ConversionResult| -> Vec<usize> {
+            result
+                .conversation_state
+                .history
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(user) => Some(user.user_input_message.images.len()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let history_text = |result: &ConversionResult| -> String {
+            serde_json::to_string(&result.conversation_state.history).unwrap()
+        };
+
+        let plain = convert(false);
+        assert_eq!(history_images(&plain), vec![1, 2, 2]);
+        assert!(!history_text(&plain).contains("identical to an earlier image"));
+
+        let deduped = convert(true);
+        assert_eq!(history_images(&deduped), vec![1, 1, 0]);
+        assert_eq!(
+            history_text(&deduped)
+                .matches("identical to an earlier image")
+                .count(),
+            3
+        );
+        for result in [&plain, &deduped] {
+            assert_eq!(
+                result
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .images
+                    .len(),
+                1,
+                "the current turn always keeps its image"
+            );
+        }
+    }
+
     #[test]
     fn test_process_message_content_accepts_base64_image_source() {
         let content = serde_json::json!([
@@ -1069,6 +1179,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A broken image in history (bad base64 or a non-image payload) becomes a text note: it can
+    /// never be sent, and rejecting it would fail every later turn of the conversation.
+    #[test]
+    fn broken_history_image_is_replaced_with_a_note() {
+        let fake_png = BASE64_STANDARD.encode(b"not-an-image-at-all");
+        let content = serde_json::json!([
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": fake_png}}
+        ]);
+        let (text, images, _) = super::content::process_message_content_with_mode(
+            &content,
+            super::content::UserImageMode::History,
+        )
+        .expect("history image errors are absorbed");
+        assert!(images.is_empty());
+        assert!(text.starts_with("look\n[image omitted:"), "{text}");
+        assert!(
+            process_message_content(&content).is_err(),
+            "the current turn still reports the broken image"
+        );
     }
 
     #[test]

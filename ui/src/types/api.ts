@@ -47,6 +47,8 @@ export interface CredentialSummaryResponse {
   cooling: number
   quotaExhausted: number
   accountError: number
+  /** 已禁用、额度用尽或账号异常（去重）。 */
+  unavailable: number
 }
 
 export interface SystemVersionResponse {
@@ -1778,6 +1780,10 @@ export interface ReportedUsageFieldPolicy {
 export interface ReportedUsagePathPolicy {
   enabled: boolean
   skipNonStreamUsageProjection: boolean
+  /** Streaming requests must meet the official cache conditions before shaping; off by default. */
+  strictCacheEligibilityStream?: boolean
+  /** Non-streaming requests must meet the official cache conditions before shaping; off by default. */
+  strictCacheEligibilityNonStream?: boolean
   finalCacheReadMaxTokens: number
   finalCacheReadJitterMinTokens: number
   finalCacheReadJitterMaxTokens: number
@@ -1960,6 +1966,8 @@ export interface CacheHitShapingPolicyPatch {
   minCostRatio?: number
   maxReadMultiplier?: number
   minCreationRatio?: number
+  /** Count cache reads toward the cost floor; off keeps the original shaping. */
+  readAwareCostFloor?: boolean
 }
 
 export interface CachePolicyConfig {
@@ -1993,6 +2001,11 @@ export interface ImageProcessingConfig {
   safeMaterializeFileSources: boolean
   safeDownloadRemoteSources: boolean
   safeNormalizeBase64MediaTypes: boolean
+  /** 发往上游前压缩过大的图片（默认关闭）。 */
+  resizeEnabled: boolean
+  resizeMaxLongSide: number
+  resizeMaxBytes: number
+  resizeJpegQuality: number
 }
 
 export interface BodyConversionConfig {
@@ -2006,6 +2019,7 @@ export interface BodyConversionConfig {
   syntheticThinkingSignatures: boolean
   toolPairingRepair: boolean
   historyPlaceholderTools: boolean
+  historyImageDedup: boolean
   codeExecution: CodeExecutionConfig
 }
 
@@ -2249,7 +2263,9 @@ export interface ExternalPoolsConfig {
   localPoolCircuitWindowSecs: number
   localPoolCircuitOpenAfterFailures: number
   localPoolCircuitRequireDistinctCredentials: number
+  localPoolCircuitMinRatioPercent: number
   localPoolCircuitOpenSecs: number
+  localPoolCircuitHalfOpenProbes: number
   externalPoolAutoDisableEnabled: boolean
   externalPoolAutoDisableOnAuthError: boolean
   externalPoolAutoDisableOnSecurityLock: boolean
@@ -2519,6 +2535,15 @@ export interface RuntimeConfig {
   credentialStreamErrorCooldownSecs: number
   /** 空回（只有用量统计、零帧或空响应体）是否让账号冷却，默认关闭。 */
   credentialEmptyTurnCooldownEnabled: boolean
+  credentialUpstreamFailureCooldownEnabled: boolean
+  credentialAutoHealMinIntervalSecs: number
+  credentialAutoHealMaxConsecutiveRounds: number
+  /** 自动同步 Kiro 客户端版本号（默认关闭）。 */
+  kiroVersionAutoSyncEnabled: boolean
+  /** 最近一次自动同步读到的官方版本。 */
+  kiroVersionLatest?: string
+  /** IDE 端点的对话和联网搜索改走 runtime.{region}.kiro.dev（默认关闭）。 */
+  kiroRuntimeDomainEnabled: boolean
   credentialProtocolErrorCooldownSecs: number
   credentialAuthErrorCooldownSecs: number
   credentialCooldownBackoffMultiplier: number
@@ -2526,8 +2551,10 @@ export interface RuntimeConfig {
   credentialProbationSecs: number
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
+  credentialSessionMaxConcurrentRequests: number
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
+  kiroUpstreamStreamMaxDurationSecs: number
   streamKeepaliveIntervalSecs: number
   streamPreOutputHoldSecs: number
   streamFirstOutputTimeoutSecs: number
@@ -2776,6 +2803,12 @@ export interface ManualModelResponse {
 
 export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'
 
+/** 导出时的账号筛选条件，含义与账号列表 `/credentials-paged` 相同（不含分页和排序）。 */
+export type CredentialExportFilter = Omit<CredentialsPageQuery, 'page' | 'limit' | 'sortBy' | 'sortOrder'>
+
+/** 导出范围：选中账号，或按筛选条件（空对象表示全部）。二者只能取其一。 */
+export type CredentialExportScope = { ids: number[] } | { filter: CredentialExportFilter }
+
 // ============ 路由场景 ============
 
 /** A route rule set, as used by every route policy. */
@@ -3016,4 +3049,134 @@ export interface InventoryActionResponse {
   succeeded: number
   failed: number
   items: InventoryActionItem[]
+}
+
+// ============ 只读号池（免登录） ============
+
+/** The admin switch for the public read-only pool page; off by default. */
+/** How the public page shows Free accounts: as a paid tier, or not at all. */
+export type PublicPoolFreeAccounts = 'power' | 'pro_max' | 'pro_plus' | 'hide'
+
+export interface PublicPoolConfig {
+  enabled: boolean
+  freeAccounts: PublicPoolFreeAccounts
+}
+
+/** The account page's status tabs; the public view filters by these only. */
+export type PublicPoolStatus = 'normal' | 'cooling' | 'quota_exhausted' | 'account_error' | 'disabled'
+
+export interface PublicPoolQuery {
+  page?: number
+  limit?: number
+  status?: PublicPoolStatus
+}
+
+export interface PublicPoolRealtime {
+  windowSeconds: number
+  requests: number
+  errorRequests: number
+  rpm: number
+  totalTpm: number
+}
+
+export interface PublicPoolOverview {
+  total: number
+  enabled: number
+  disabled: number
+  schedulable: number
+  coolingDown: number
+  inUse: number
+  failing: number
+  normal: number
+  cooling: number
+  quotaExhausted: number
+  accountError: number
+  globalInFlightRequests: number
+  globalMaxConcurrentRequests: number
+  queuedRequests: number
+  realtime: PublicPoolRealtime
+  /** Credits used by all accounts over the recorded history. */
+  consumedCredits: number
+  lastCheckedAt?: string | null
+  loadBalancingMode: string
+  updatedAt: string
+}
+
+export interface PublicPoolCooldown {
+  model?: string
+  global: boolean
+  remainingSecs: number
+}
+
+/** The last quota snapshot, in credits. */
+export interface PublicPoolQuota {
+  currentUsage: number
+  usageLimit: number
+  currentOverages: number
+  overageEnabled: boolean
+  checkedAt: string
+}
+
+/**
+ * One account as the public page sees it: no token, hash, proxy, full email, raw error or cost.
+ * `label` is the email with the middle of its name masked; API Key accounts have none.
+ */
+export interface PublicPoolAccount {
+  id: number
+  label?: string
+  subscriptionTitle?: string
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
+  endpoint: string
+  fast: number
+  priority: number
+  disabled: boolean
+  disabledReason?: string
+  isCurrent: boolean
+  cooledDown: boolean
+  cooldownRemainingSecs: number
+  cooldowns?: PublicPoolCooldown[]
+  rateLimited: boolean
+  rateLimitRemainingSecs: number
+  inFlightRequests: number
+  maxConcurrentRequests: number
+  rpm: number
+  recentSchedulerSelectionCount60s: number
+  successCount: number
+  schedulerSelectionCount: number
+  inProbation: boolean
+  probationRemainingSecs: number
+  warmupRemaining: number
+  transientFailureStreak: number
+  quota?: PublicPoolQuota
+  createdAt: string | null
+  lastUsedAt: string | null
+}
+
+export interface PublicPoolResponse {
+  overview: PublicPoolOverview
+  page: number
+  limit: number
+  totalPages: number
+  filteredTotal: number
+  items: PublicPoolAccount[]
+}
+
+// ============ 订阅等级模型列表 ============
+
+export interface SubscriptionModelListItem {
+  tier: string
+  label: string
+  /** 未设置列表时为空（不限制）。 */
+  models: string[]
+  /** auto：自动获取；manual：手动设置或手动同步。 */
+  source?: string | null
+  updatedAt?: string | null
+  sourceCredentialId?: number | null
+  credentialCount: number
+  /** 没有设置自身支持模型、因而按等级列表限制的账号数。 */
+  tierLimitedCount: number
+}
+
+export interface SubscriptionModelListsResponse {
+  items: SubscriptionModelListItem[]
 }

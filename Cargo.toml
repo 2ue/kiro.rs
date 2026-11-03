@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "0.0.224"
+version = "0.0.235"
 edition = "2024"
 
 [features]
@@ -14,6 +14,8 @@ strip = true
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1.0", features = ["full"] }
+# Already in the tree through tokio and hyper-util; used directly to set TCP keepalive.
+socket2 = "=0.6.1"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset", "gzip"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
@@ -48,6 +50,7 @@ mime_guess = "2"      # MIME 类型推断
 pdf-extract = "0.7"   # PDF 文本抽取
 url = "2"             # URL 解析（SSRF 防护）
 zip = { version = "2.2", default-features = false, features = ["deflate"] }  # 诊断采集归档
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }  # 图片压缩开关（默认关闭）
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.178"     # killpg for code execution timeouts

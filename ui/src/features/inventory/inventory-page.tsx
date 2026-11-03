@@ -14,6 +14,7 @@ import {
   StatCard,
   StatGrid,
   useConfirm,
+  PAGE_SIZE_OPTIONS,
 } from '@/components/patterns'
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import { useCheckInventory, useDeleteInventory, useInventory } from '@/hooks/use-inventory'
@@ -25,7 +26,6 @@ import { QuotaBar } from '@/features/credentials/credential-card'
 import { authLabel, credentialSubscriptionLabel, disabledReasonLabel, quotaBarModel } from '@/features/credentials/credential-utils'
 import { InventoryEditModal, InventoryImportModal, InventoryPushModal } from './inventory-dialogs'
 
-const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100]
 
 const STATUS_META: Record<InventoryStatus, { label: string; tone: 'success' | 'error' | 'warning' | 'info'; dot: string }> = {
   stored: { label: '在库', tone: 'success', dot: 'bg-success' },
@@ -288,7 +288,7 @@ export function InventoryPage() {
               action={<Button size="sm" onClick={() => setImportOpen(true)}><Upload />导入到库存</Button>}
             />
           ) : (
-            <div className="grid items-start gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+            <div className="grid items-start gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6">
               {items.map((item) => (
                 <InventoryCard key={item.id} item={item} selected={selectedIds.has(item.id)} onToggle={() => toggle(item.id)} onEdit={() => setEditing(item)} />
               ))}

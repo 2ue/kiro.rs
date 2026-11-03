@@ -69,11 +69,12 @@ export function ToggleRow({ label, description, checked, disabled = false, onCha
 // NumberBox
 // ============================================================================
 
-export function NumberBox({ label, description, value, min = 0, disabled = false, suffix, onChange }: {
+export function NumberBox({ label, description, value, min = 0, max, disabled = false, suffix, onChange }: {
   label: string
   description?: string
   value: number
   min?: number
+  max?: number
   disabled?: boolean
   suffix?: string
   onChange: (v: number) => void
@@ -88,6 +89,7 @@ export function NumberBox({ label, description, value, min = 0, disabled = false
         <Input
           type="number"
           min={min}
+          max={max}
           inputMode="numeric"
           className="h-9 w-full text-sm"
           value={value}

@@ -5081,6 +5081,71 @@ async fn external_pool_authoritative_refresh_survives_leader_cancellation_for_fi
     postgres.drop_test_schema().await.unwrap();
 }
 
+/// Deterministic version of the CI failure of
+/// `external_pool_authoritative_refresh_survives_leader_cancellation_for_five_rounds` ("round 4:
+/// manager-owned PG refresh did not start"). The previous refresh has published and woken its
+/// waiters but its task has not returned yet, which a busy runtime can stretch out. A caller
+/// that arrives after the snapshot was invalidated must still start a new refresh at once. When
+/// the refresh woke waiters before releasing its lock, that caller found the lock taken and
+/// waited for a notification that had already been sent, until its wait timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_authoritative_refresh_starts_while_previous_refresh_task_finishes() {
+    let Some((manager, postgres)) = test_external_pool_manager_without_snapshot_timeouts().await
+    else {
+        return;
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("authoritative-lock-handoff", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=5 {
+        // One completed refresh, held at the end of its task.
+        manager.invalidate_static_pool_snapshot();
+        let gate = TestDispatchAfterPrepareGate::new();
+        manager.set_authoritative_refresh_end_gate(gate.clone());
+        let warm = manager.clone();
+        let warm = tokio::spawn(async move { warm.load_authoritative_pool_snapshot().await });
+        timeout(Duration::from_secs(10), gate.prepared.wait())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: first refresh never reached the gate"));
+        timeout(Duration::from_secs(5), warm)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: first caller was not woken"))
+            .unwrap()
+            .expect("first refresh publishes");
+
+        // The snapshot is invalidated and a new caller arrives while that task is still held.
+        manager.invalidate_static_pool_snapshot();
+        let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+        let caller_manager = manager.clone();
+        let caller =
+            tokio::spawn(async move { caller_manager.load_authoritative_pool_snapshot().await });
+        // Give the caller time to look for the refresh lock before the held task returns. If it
+        // is scheduled later, it finds the lock free either way and the round still passes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        timeout(Duration::from_secs(10), gate.resume.wait())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: gate release timed out"));
+
+        let snapshot = timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}: caller waited for a refresh that never started")
+            })
+            .unwrap()
+            .expect("caller gets the refreshed snapshot");
+        assert!(snapshot.iter().any(|candidate| candidate.id == pool.id));
+        assert_eq!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: the new caller must start exactly one refresh"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_authoritative_pg_timeout_c128_is_one_query_and_recovers_for_three_rounds() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
@@ -14790,7 +14855,8 @@ fn external_pool_auto_disable_window_has_own_default() {
     let config = ExternalPoolsConfig::default();
 
     assert_eq!(config.external_pool_auto_disable_window_secs, 60);
-    assert_eq!(config.local_pool_circuit_window_secs, 60);
+    // The local pool circuit uses its own, longer window since it counts distinct accounts.
+    assert_eq!(config.local_pool_circuit_window_secs, 300);
 }
 
 #[test]
@@ -15480,35 +15546,94 @@ fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
 /// A non-streaming request without any cache breakpoint, or whose marked prefix is below the
 /// model minimum, keeps the external upstream usage exactly as `skipNonStreamUsageProjection`
 /// would; streaming requests are still shaped.
+/// External pools follow the same switches as local requests: by default a request long enough as
+/// a whole is shaped by the path strategy whether or not it is marked; with the strict check on for
+/// a request kind, a request the Anthropic API would not cache (no breakpoint, or a prefix below
+/// the model minimum) keeps upstream usage.
 #[test]
-fn usage_projection_passes_through_non_stream_requests_anthropic_would_not_cache() {
+fn usage_projection_strict_cache_eligibility_is_switchable_per_stream_kind() {
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-
-    let mut unmarked = test_route("claude-sonnet-4-5");
-    if let Some(payload) = unmarked.payload.as_mut() {
-        payload.system.as_mut().unwrap()[0].cache_control = None;
-    }
-    assert!(projection_context(&unmarked, &pool, 0).is_none());
-
+    let strict = |route: &mut ExternalRouteRequest, stream: bool, non_stream: bool| {
+        route.reported_usage.default.strict_cache_eligibility_stream = stream;
+        route
+            .reported_usage
+            .default
+            .strict_cache_eligibility_non_stream = non_stream;
+        for policy in route.reported_usage.path_overrides.values_mut() {
+            policy.strict_cache_eligibility_stream = stream;
+            policy.strict_cache_eligibility_non_stream = non_stream;
+        }
+        route.reset_preparation_cache();
+    };
+    let unmarked = |stream: bool| {
+        let mut route = test_route("claude-sonnet-4-5");
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].cache_control = None;
+            payload.stream = stream;
+        }
+        route.reset_preparation_cache();
+        route
+    };
     // The 42-token haiku shape seen in production: marked, but far below Haiku 4.5's minimum.
-    let mut short = test_route("claude-haiku-4-5-20251001");
-    if let Some(payload) = short.payload.as_mut() {
-        payload.system.as_mut().unwrap()[0].text = "Reply with one word.".to_string();
-    }
-    short.request_input_tokens = 42;
-    assert!(projection_context(&short, &pool, 0).is_none());
+    let short = |stream: bool| {
+        let mut route = test_route("claude-haiku-4-5-20251001");
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].text = "Reply with one word.".to_string();
+            payload.stream = stream;
+        }
+        route.request_input_tokens = 42;
+        route.reset_preparation_cache();
+        route
+    };
 
-    // Streaming keeps the path policy whatever the request looks like (fresh route: the
-    // projection template is cached per route).
-    let mut unmarked_stream = test_route("claude-sonnet-4-5");
-    if let Some(payload) = unmarked_stream.payload.as_mut() {
-        payload.system.as_mut().unwrap()[0].cache_control = None;
-        payload.stream = true;
+    // Default: no strict check, unmarked requests are shaped too; a request shorter than the
+    // model minimum as a whole (the 42-token probe) still keeps upstream usage.
+    for stream in [true, false] {
+        assert!(
+            projection_context(&unmarked(stream), &pool, 0).is_some(),
+            "stream={stream}"
+        );
+        assert!(
+            projection_context(&short(stream), &pool, 0).is_none(),
+            "stream={stream}"
+        );
     }
-    assert!(projection_context(&unmarked_stream, &pool, 0).is_some());
 
-    // A raw body that only sets top-level cache_control (automatic caching) is shaped.
+    for stream in [true, false] {
+        for (strict_stream, strict_non_stream) in [(true, false), (false, true), (true, true)] {
+            let checked = if stream {
+                strict_stream
+            } else {
+                strict_non_stream
+            };
+            let label = format!("stream={stream} strict=({strict_stream},{strict_non_stream})");
+            let mut route = unmarked(stream);
+            strict(&mut route, strict_stream, strict_non_stream);
+            assert_eq!(
+                projection_context(&route, &pool, 0).is_none(),
+                checked,
+                "unmarked {label}"
+            );
+            let mut route = short(stream);
+            strict(&mut route, strict_stream, strict_non_stream);
+            assert!(
+                projection_context(&route, &pool, 0).is_none(),
+                "short {label}"
+            );
+            let mut marked = test_route("claude-sonnet-4-5");
+            if let Some(payload) = marked.payload.as_mut() {
+                payload.stream = stream;
+            }
+            strict(&mut marked, strict_stream, strict_non_stream);
+            assert!(
+                projection_context(&marked, &pool, 0).is_some(),
+                "marked {label}"
+            );
+        }
+    }
+
+    // A raw body that only sets top-level cache_control (automatic caching) passes the check.
     let raw = serde_json::json!({
         "model": "claude-sonnet-4-5",
         "max_tokens": 8,
@@ -15516,11 +15641,14 @@ fn usage_projection_passes_through_non_stream_requests_anthropic_would_not_cache
         "messages": [{"role": "user", "content": "hello"}],
         "stream": false
     });
-    let unmarked_raw = raw_test_route(raw.to_string().as_bytes());
+    let mut unmarked_raw = raw_test_route(raw.to_string().as_bytes());
+    assert!(projection_context(&unmarked_raw, &pool, 0).is_some());
+    strict(&mut unmarked_raw, false, true);
     assert!(projection_context(&unmarked_raw, &pool, 0).is_none());
     let mut automatic = raw.clone();
     automatic["cache_control"] = serde_json::json!({"type": "ephemeral"});
-    let automatic_raw = raw_test_route(automatic.to_string().as_bytes());
+    let mut automatic_raw = raw_test_route(automatic.to_string().as_bytes());
+    strict(&mut automatic_raw, false, true);
     assert!(projection_context(&automatic_raw, &pool, 0).is_some());
 }
 
@@ -16502,6 +16630,7 @@ fn bounded_high_cache_external_projection_never_leaves_bounds() {
         min_cost_ratio: 1.0,
         max_read_multiplier: 1.0,
         min_creation_ratio: 0.0,
+        read_aware_cost_floor: false,
     };
     route.prompt_cache_creation_control = PromptCacheCreationControlConfig {
         enabled: true,

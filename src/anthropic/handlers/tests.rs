@@ -3809,6 +3809,16 @@ enum HandlerEventStreamFault {
     EmptyStreamEveryAttempt,
     /// 每次都返回 200、content-type 为 JSON 且响应体为空（生产上的 json_stream_incomplete_body）。
     EmptyJsonBodyEveryAttempt,
+    /// 非流式长回答：每 400 毫秒一段正文，持续约 2.4 秒，总时长超过 1 秒的静默超时。
+    SlowSteadyTextBody,
+    /// 先回一段正文，然后静默 3 秒才继续。
+    TextThenLongSilence,
+    /// 每次都返回：工具调用 stop=true 但参数是截断的 JSON，随后上游报完成。
+    InvalidToolInputThenRecover,
+    /// 工具调用 stop=true，参数是合法 JSON 但末尾多了一个右括号。
+    RedundantToolInputTail,
+    /// 第一次：工具参数截断且无法修复；之后正常回答（用来验证非流式换号重试）。
+    BrokenToolInputThenNormal,
     CompleteToolWithoutStatus,
     /// Completed call to the Claude Code `StructuredOutput` client tool.
     StructuredOutputToolUse,
@@ -4136,6 +4146,49 @@ async fn handler_eventstream_fault_upstream(
         HandlerEventStreamFault::EmptyJsonBodyEveryAttempt => {
             handler_eventstream_json_labeled_bytes_response(Vec::new())
         }
+        HandlerEventStreamFault::SlowSteadyTextBody => {
+            let mut chunks = Vec::new();
+            for index in 0..6 {
+                chunks.push((
+                    Duration::from_millis(400),
+                    Ok(Bytes::from(eventstream_test_frame(
+                        "assistantResponseEvent",
+                        json!({"content": format!("slow-part-{index} ")}),
+                    ))),
+                ));
+            }
+            chunks.push((
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "assistantResponseEvent",
+                    json!({"content": "slow-done", "messageStatus": "COMPLETED"}),
+                ))),
+            ));
+            chunks.push((
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "contextUsageEvent",
+                    json!({"contextUsagePercentage": 0.01}),
+                ))),
+            ));
+            handler_eventstream_chunked_response(chunks)
+        }
+        HandlerEventStreamFault::TextThenLongSilence => handler_eventstream_chunked_response(vec![
+            (
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "assistantResponseEvent",
+                    json!({"content": "before-silence "}),
+                ))),
+            ),
+            (
+                Duration::from_secs(3),
+                Ok(Bytes::from(eventstream_test_frame(
+                    "assistantResponseEvent",
+                    json!({"content": "after-silence", "messageStatus": "COMPLETED"}),
+                ))),
+            ),
+        ]),
         HandlerEventStreamFault::UnknownEventOnly => {
             handler_eventstream_bytes_response(eventstream_test_frame(
                 "futureUnknownEvent",
@@ -4247,6 +4300,63 @@ async fn handler_eventstream_fault_upstream(
                     }),
                 ));
             }
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::InvalidToolInputThenRecover => {
+            let mut body = eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_invalid_input",
+                    "input":"{\"command\":\"printf broken",
+                    "stop":true
+                }),
+            );
+            body.extend(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"COMPLETED"}),
+            ));
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::BrokenToolInputThenNormal => {
+            let mut body = eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_broken_then_normal",
+                    "input":"{\"command\":\"printf broken",
+                    "stop":true
+                }),
+            );
+            body.extend(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"COMPLETED"}),
+            ));
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::RedundantToolInputTail => {
+            let mut body = eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_redundant_tail",
+                    "input":"{\"command\":\"printf tail-ok\"}",
+                    "stop":false
+                }),
+            );
+            body.extend(eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_redundant_tail",
+                    "input":"}",
+                    "stop":true
+                }),
+            ));
+            body.extend(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"COMPLETED"}),
+            ));
             handler_eventstream_bytes_response(body)
         }
         HandlerEventStreamFault::IncompleteToolWithoutStatus => {
@@ -5409,7 +5519,7 @@ async fn run_single_credential_precommit_retry_matrix() {
             1,
             "round={round} body={body}"
         );
-        assert!(body.contains(r#""type":"api_error""#));
+        assert!(body.contains(r#""type":"overloaded_error""#));
         assert!(!body.contains("event: message_stop"));
         assert!(!body.contains("recovered-ok"));
         assert!(!body.contains(&marker));
@@ -5515,7 +5625,7 @@ async fn run_handler_eventstream_postcommit_faults_matrix() {
                 "fault={fault:?} round={round} body={body}"
             );
             assert!(body.contains(r#""type":"error""#));
-            assert!(body.contains(r#""type":"api_error""#));
+            assert!(body.contains(r#""type":"overloaded_error""#));
             assert!(!body.contains("event: message_stop"));
             assert!(!body.contains("upstream stream read error"));
             assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
@@ -6652,6 +6762,189 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
         assert!(body.contains("recovered-ok"), "{label} body={body}");
         assert_eq!(upstream.hits(), 2, "{label}");
     }
+}
+
+/// A tool call the upstream marks complete with unrepairable input is never handed to the client
+/// as a finished tool_use, and it does not cool the account (the account answered fine). A tool
+/// call whose input only has a redundant tail is cleaned and completes normally.
+async fn run_completed_tool_input_is_cleaned_or_fails_without_cooldown() {
+    for round in 1..=3 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::InvalidToolInputThenRecover,
+        )
+        .await;
+        let (app, _usage_recorder, token_manager) =
+            handler_eventstream_fault_router_with_manager(&upstream.base_url, 2, 1, |_| {}, None);
+        let (status, _request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert_eq!(
+            body.matches("event: error").count(),
+            1,
+            "round={round} body={body}"
+        );
+        assert!(
+            !body.contains(r#""stop_reason":"tool_use""#),
+            "round={round}: a broken tool call is never reported as a finished tool_use: {body}"
+        );
+        assert!(
+            cooled_down_credentials(&token_manager).is_empty(),
+            "round={round}: broken tool input is not an account failure"
+        );
+        // The tool block was already streamed, so the turn ends with an error instead of a retry.
+        assert_eq!(upstream.hits(), 1, "round={round}");
+
+        for stream in [true, false] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::RedundantToolInputTail,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} body={body}"
+            );
+            assert!(
+                body.contains("printf tail-ok"),
+                "round={round} stream={stream} body={body}"
+            );
+            assert!(
+                body.contains("tool_use"),
+                "round={round} stream={stream} body={body}"
+            );
+            assert!(
+                !body.contains("event: error"),
+                "round={round} stream={stream} body={body}"
+            );
+            assert_eq!(upstream.hits(), 1, "round={round} stream={stream}");
+        }
+    }
+}
+
+#[test]
+fn completed_tool_input_is_cleaned_or_fails_without_cooldown() {
+    run_handler_fixture_on_large_stack_thread(
+        "completed-tool-input-cleaning",
+        run_completed_tool_input_is_cleaned_or_fails_without_cooldown,
+    );
+}
+
+/// A non-streaming answer that keeps producing output is never cut by a total-time limit: only
+/// silence ends the read. The old code capped the whole body at `kiroUpstreamResponseTimeoutSecs`
+/// (600 s in production), which threw away long answers that were still being written.
+async fn run_non_stream_body_timeout_counts_silence_not_total_time() {
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::SlowSteadyTextBody).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+            config.kiro_upstream_response_timeout_secs = 1;
+            config.kiro_upstream_stream_idle_timeout_secs = 1;
+        });
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.oneshot(handler_eventstream_fault_request_for_path(
+            "/v1/messages",
+            false,
+        )),
+    )
+    .await
+    .expect("slow answer response")
+    .expect("slow answer");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("slow answer body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("slow-part-5"), "{body}");
+    assert!(body.contains("slow-done"), "{body}");
+
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TextThenLongSilence).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+            config.kiro_upstream_response_timeout_secs = 30;
+            config.kiro_upstream_stream_idle_timeout_secs = 1;
+        });
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.oneshot(handler_eventstream_fault_request_for_path(
+            "/v1/messages",
+            false,
+        )),
+    )
+    .await
+    .expect("silent answer response")
+    .expect("silent answer");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        started.elapsed() < Duration::from_millis(2_800),
+        "a silent upstream is cut by the idle limit, not the 30 s header limit: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A body that keeps trickling in under the idle limit is still cut at
+/// `kiroUpstreamStreamMaxDurationSecs`, streaming and not, so it cannot hold a credential slot
+/// forever.
+async fn run_trickling_body_is_cut_at_the_max_duration() {
+    for stream in [true, false] {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::SlowSteadyTextBody)
+                .await;
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+                config.kiro_upstream_stream_idle_timeout_secs = 1;
+                config.kiro_upstream_stream_max_duration_secs = 1;
+                config.stream_pre_output_hold_secs = 0;
+            });
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.oneshot(handler_eventstream_fault_request_for_path(
+                "/v1/messages",
+                stream,
+            )),
+        )
+        .await
+        .expect("response")
+        .expect("response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            started.elapsed() < Duration::from_millis(2_200),
+            "stream={stream}: the 2.4 s trickle is cut at 1 s: {:?}",
+            started.elapsed()
+        );
+        assert!(!body.contains("slow-done"), "stream={stream}: {body}");
+        if stream {
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("event: error"), "{body}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        }
+    }
+}
+
+#[test]
+fn trickling_body_is_cut_at_the_max_duration() {
+    run_handler_fixture_on_large_stack_thread(
+        "trickling-body-max-duration",
+        run_trickling_body_is_cut_at_the_max_duration,
+    );
+}
+
+#[test]
+fn non_stream_body_timeout_counts_silence_not_total_time() {
+    run_handler_fixture_on_large_stack_thread(
+        "non-stream-idle-body-timeout",
+        run_non_stream_body_timeout_counts_silence_not_total_time,
+    );
 }
 
 #[test]
@@ -8304,6 +8597,7 @@ fn runtime_config_for_payload_guard(
         kiro_cache_point_tools_only: true,
         kiro_cache_point_record_plan: true,
         kiro_upstream_stream_idle_timeout_secs: 180,
+        kiro_upstream_stream_max_duration_secs: 3600,
         stream_keepalive_interval_secs: 5,
         stream_pre_output_hold_secs: 15,
         stream_first_output_timeout_secs: 0,
@@ -9750,10 +10044,14 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
     );
 }
 
-/// Non-streaming requests follow the route's cache strategy only when Anthropic could return
-/// cache usage for them; the others pass upstream usage through. Streaming is unchanged.
+/// Requests follow the route's cache strategy only when Anthropic could return cache usage for
+/// them; the others pass upstream usage through, streaming or not.
+/// The official cache conditions (a cache_control breakpoint and a prefix at the model minimum)
+/// are checked only when the route turns them on, separately for streaming and non-streaming
+/// requests. Both switches are off by default: a request follows the route strategy whether or not
+/// it is marked, and only a request shorter than the model minimum as a whole stays uncached.
 #[test]
-fn non_stream_cache_route_follows_the_request_not_only_the_route() {
+fn strict_cache_eligibility_is_off_by_default_and_switchable_per_stream_kind() {
     let state = AppState::new(
         Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
         true,
@@ -9771,6 +10069,13 @@ fn non_stream_cache_route_follows_the_request_not_only_the_route() {
     assert_eq!(
         route.policy.cache_type,
         PromptCacheStrategyType::CurrentHighCache
+    );
+    assert!(!route.policy.reported_usage.strict_cache_eligibility_stream);
+    assert!(
+        !route
+            .policy
+            .reported_usage
+            .strict_cache_eligibility_non_stream
     );
     let long = "You are a helpful coding assistant with deep knowledge of Go, Rust and Python. "
         .repeat(80);
@@ -9798,43 +10103,84 @@ fn non_stream_cache_route_follows_the_request_not_only_the_route() {
         route.policy.cache_type == PromptCacheStrategyType::CurrentHighCache
             && route.policy.reported_usage.enabled
     };
+    let passthrough = |route: &ResolvedCacheRoutePolicy| {
+        route.policy.cache_type == PromptCacheStrategyType::NoCache
+            && !route.policy.reported_usage.enabled
+            && !route.policy.simulation.enabled
+            && route.namespace.is_none()
+    };
     let model = "claude-sonnet-4-5";
+    // (label, marked, system text, top-level cache_control, passes the strict check,
+    //  long enough as a whole request)
+    let cases = [
+        ("marked", true, long.as_str(), false, true, true),
+        ("automatic", false, long.as_str(), true, true, true),
+        ("unmarked", false, long.as_str(), false, false, true),
+        // The marker sits on a short block; the request as a whole is long.
+        (
+            "short marker",
+            true,
+            "You are a classifier.",
+            false,
+            false,
+            true,
+        ),
+        ("tiny", false, "Reply with one word.", false, false, false),
+    ];
 
-    // Marked prefix above the minimum: shaped by the route strategy, like streaming.
-    let qualified =
-        cache_route_for_local_request(route.clone(), &request(false, true, &long), false, model);
-    assert!(shaped(&qualified));
-    // Top-level cache_control (automatic caching) qualifies an unmarked body.
-    let automatic =
-        cache_route_for_local_request(route.clone(), &request(false, false, &long), true, model);
-    assert!(shaped(&automatic));
-
-    // No cache_control, or a marked prefix below the minimum: upstream usage passes through.
-    for (label, req) in [
-        ("unmarked", request(false, false, &long)),
-        ("too short", request(false, true, "You are a classifier.")),
-    ] {
-        let passthrough = cache_route_for_local_request(route.clone(), &req, false, model);
-        assert_eq!(
-            passthrough.policy.cache_type,
-            PromptCacheStrategyType::NoCache,
-            "{label}"
-        );
-        assert!(!passthrough.policy.reported_usage.enabled, "{label}");
-        assert!(
-            passthrough
-                .policy
-                .reported_usage
-                .skip_non_stream_usage_projection,
-            "{label}"
-        );
-        assert!(passthrough.namespace.is_none(), "{label}");
+    // Default: marked or not, a request long enough as a whole follows the route strategy; a
+    // request shorter than the model minimum stays uncached either way.
+    for stream in [true, false] {
+        for (label, marked, text, top_level, _, long_enough) in cases {
+            let mut req = request(stream, marked, text);
+            if label == "short marker" {
+                req.messages[0].content = json!(long.as_str());
+            }
+            let resolved = cache_route_for_local_request(route.clone(), &req, top_level, model);
+            if long_enough {
+                assert!(shaped(&resolved), "default stream={stream} {label}");
+            } else {
+                assert!(passthrough(&resolved), "default stream={stream} {label}");
+            }
+        }
     }
 
-    // Streaming keeps the route strategy whatever the request looks like.
-    let stream =
-        cache_route_for_local_request(route.clone(), &request(true, false, "short"), false, model);
-    assert!(shaped(&stream));
+    // Each switch turns the strict check on for its own kind only.
+    for strict_stream in [false, true] {
+        for strict_non_stream in [false, true] {
+            let mut strict = route.clone();
+            strict.policy.reported_usage.strict_cache_eligibility_stream = strict_stream;
+            strict
+                .policy
+                .reported_usage
+                .strict_cache_eligibility_non_stream = strict_non_stream;
+            for stream in [true, false] {
+                let checked = if stream {
+                    strict_stream
+                } else {
+                    strict_non_stream
+                };
+                for (label, marked, text, top_level, qualifies, long_enough) in cases {
+                    let mut req = request(stream, marked, text);
+                    if label == "short marker" {
+                        req.messages[0].content = json!(long.as_str());
+                    }
+                    let resolved =
+                        cache_route_for_local_request(strict.clone(), &req, top_level, model);
+                    let label = format!(
+                        "strict stream={strict_stream} non_stream={strict_non_stream}, \
+                         request stream={stream} {label}"
+                    );
+                    let cached = if checked { qualifies } else { long_enough };
+                    if cached {
+                        assert!(shaped(&resolved), "{label}");
+                    } else {
+                        assert!(passthrough(&resolved), "{label}");
+                    }
+                }
+            }
+        }
+    }
 
     // The route-level switch still forces passthrough for every non-streaming request.
     let mut forced = route.clone();
@@ -9844,6 +10190,180 @@ fn non_stream_cache_route_follows_the_request_not_only_the_route() {
         .skip_non_stream_usage_projection = true;
     let forced = cache_route_for_local_request(forced, &request(false, true, &long), false, model);
     assert_eq!(forced.policy.cache_type, PromptCacheStrategyType::NoCache);
+}
+
+/// With the strict check off, an unmarked request still gets no cache below the model's minimum
+/// cacheable length: a short probe keeps its raw input and reports no cache read or write, while
+/// an unmarked request above the minimum is shaped by the route as before 0.0.226.
+#[test]
+fn route_strategy_without_strict_check_never_caches_requests_below_the_model_minimum() {
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/dfcache/gate".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.99),
+                token_scale: Some(2.05),
+                max_simulated_input_tokens: Some(300_000),
+                cap_jitter_min_tokens: Some(12_000),
+                cap_jitter_max_tokens: Some(24_000),
+                scale_min_input_tokens: Some(10_000),
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy {
+                    move_delta_to_cache_read: true,
+                    ..ReportedUsageFieldPolicy::sample_input_max(1_500)
+                },
+                cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(
+                    200_000, 1.5,
+                ),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
+                enabled: Some(true),
+            }),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(64)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.99,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy)
+    .with_defined_cache_routes(vec!["/dfcache/gate".to_string()]);
+    let endpoint = "/dfcache/gate/v1/messages";
+    let route = RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path(endpoint);
+    assert_eq!(
+        route.policy.cache_type,
+        PromptCacheStrategyType::CurrentHighCache
+    );
+
+    let run = |stream: bool, model: &str, system_text: String, session: &str| {
+        let payload = MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 64,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hi"),
+            }],
+            stream,
+            system: Some(vec![SystemMessage {
+                text: system_text,
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            output_format: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_test_account__session_{session}")),
+            }),
+            stop_sequences: None,
+        };
+        let raw_input = token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32;
+        let local_route = cache_route_for_local_request(route.clone(), &payload, false, model);
+        let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
+        let context = prepare_usage_context(
+            &state,
+            local_route,
+            endpoint,
+            stream,
+            &payload,
+            None,
+            Some(conversation_id.clone()),
+            Some(conversation_id),
+            raw_input,
+        );
+        let credential_usage = attach_test_credential_usage(context, 1);
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            raw_input,
+            8,
+            credential_usage.request.simulated_usage,
+            stream,
+        );
+        let source = credential_usage.usage_source(&body, None, false);
+        let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+        (raw_input, reported)
+    };
+
+    // Short unmarked probes (the 42-token haiku shape from production) stay cache-free on every
+    // model family minimum, streaming or not.
+    for (index, (model, text)) in [
+        (
+            "claude-haiku-4-5-20251001",
+            "Reply with one word.".to_string(),
+        ),
+        (
+            "claude-haiku-4-5-20251001",
+            "short system prompt ".repeat(120),
+        ),
+        ("claude-opus-4-6", "short system prompt ".repeat(120)),
+        ("claude-sonnet-4-5", "tiny".to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for stream in [true, false] {
+            let session = format!(
+                "5a1d4c3b-2e1f-4a0b-9c8d-7e6f5a4b3c{index}{}",
+                u8::from(stream)
+            );
+            let (raw_input, reported) = run(stream, model, text.clone(), &session);
+            assert_eq!(
+                reported.cache_read_input_tokens, 0,
+                "{model} stream={stream} raw {raw_input}: {reported:?}"
+            );
+            assert_eq!(
+                reported.cache_creation_input_tokens, 0,
+                "{model} stream={stream} raw {raw_input}: {reported:?}"
+            );
+            assert!(
+                reported.input_tokens <= raw_input.max(1),
+                "{model} stream={stream}: {reported:?}"
+            );
+        }
+    }
+
+    // An unmarked request above the minimum follows the route: the first turn reports a cache
+    // write and no read (cold request guard), as Claude Code sees on a marked first turn.
+    for stream in [true, false] {
+        let session = format!("6b2e5d4c-3f2a-4b1c-8d9e-0f1a2b3c4d5{}", u8::from(stream));
+        let (raw_input, reported) = run(
+            stream,
+            "claude-sonnet-4-5",
+            "You are a helpful coding assistant with deep knowledge of Go and Rust. ".repeat(600),
+            &session,
+        );
+        assert!(raw_input > 10_000, "raw {raw_input}");
+        assert_eq!(
+            reported.cache_read_input_tokens, 0,
+            "stream={stream}: {reported:?}"
+        );
+        assert!(
+            reported.cache_creation_input_tokens > 0,
+            "stream={stream}: an unmarked long request follows the route strategy {reported:?}"
+        );
+        assert!(
+            reported.input_tokens + reported.cache_creation_input_tokens <= raw_input.max(1) + 1,
+            "stream={stream}: cold request stays within the raw input {reported:?}"
+        );
+    }
 }
 
 #[test]
@@ -9953,6 +10473,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let usage = CacheUsage {
@@ -10068,6 +10589,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let usage = CacheUsage {
@@ -10174,6 +10696,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let raw_usage = CacheUsage {
@@ -10283,6 +10806,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let credential_usage =
@@ -10407,6 +10931,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let credential_usage = usage_context.attach_credential(Some(9), None, false, false, Vec::new());
@@ -10512,6 +11037,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
 
@@ -10647,6 +11173,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
 
@@ -10994,6 +11521,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let cc_context = RequestUsageContext {
@@ -11179,6 +11707,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     let credential_usage = usage_context.attach_credential(Some(1), None, false, false, Vec::new());
@@ -11282,6 +11811,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
     usage_context
@@ -11376,6 +11906,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     };
 
@@ -12239,6 +12770,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     }
     .attach_credential(Some(1), None, false, false, Vec::new());
@@ -12355,6 +12887,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     }
     .attach_credential(Some(1), None, false, false, Vec::new());
@@ -13556,6 +14089,16 @@ fn external_fallback_classifier_allows_capacity_and_transient_errors() {
             .as_deref(),
         Some("local_transient_exhausted")
     );
+    // A Cloudflare 524 fails fast locally but is still handed to an external pool.
+    assert_eq!(
+        classify_local_error_for_external_fallback(
+            "upstream_failure class=upstream_timeout upstream_status=524 public_status=524 body_bytes=21 retry_after_secs=unknown content_type=json reason=api_gateway_timeout",
+            &[],
+            &config,
+        )
+        .as_deref(),
+        Some("local_transient_exhausted")
+    );
 }
 
 #[test]
@@ -13888,6 +14431,30 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
             &config,
         ),
         None
+    );
+}
+
+/// Mock run 2026-10-30: every local 524 answered 504 although an external pool was ready. The
+/// 524 cools no account, so the fresh pool snapshot looked dispatchable and suppressed the
+/// fallback. The attempt outcome now decides; other transient errors still follow the snapshot.
+#[test]
+fn a_local_gateway_timeout_falls_back_even_while_the_pool_looks_dispatchable() {
+    let gateway_timeout = "upstream_failure class=upstream_timeout upstream_status=524 public_status=524 body_bytes=21 retry_after_secs=unknown content_type=json reason=api_gateway_timeout";
+    assert_eq!(
+        local_attempt_outcome_route_reason("local_transient_exhausted", gateway_timeout),
+        Some("local_transient_exhausted")
+    );
+    assert_eq!(
+        local_attempt_outcome_route_reason(
+            "local_transient_exhausted",
+            "upstream_failure class=server_error upstream_status=500 public_status=500 reason=api_server_error",
+        ),
+        None,
+        "an ordinary 5xx still lets a dispatchable pool retry locally first"
+    );
+    assert_eq!(
+        local_attempt_outcome_route_reason("local_scheduler_redis_degraded", gateway_timeout),
+        Some("local_scheduler_redis_degraded")
     );
 }
 
@@ -15406,6 +15973,7 @@ fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untou
                     min_creation_ratio: Some(2.0),
                     min_cache_read_tokens: Some(1_024),
                     min_cache_creation_tokens: Some(1_024),
+                    read_aware_cost_floor: None,
                 }),
                 ..CacheRoutePolicyPatch::default()
             },
@@ -15598,6 +16166,7 @@ fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
                 min_creation_ratio: Some(0.0),
                 min_cache_read_tokens: Some(1_024),
                 min_cache_creation_tokens: Some(1_024),
+                read_aware_cost_floor: None,
             }),
             cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
                 enabled: Some(true),
@@ -15905,6 +16474,221 @@ fn minea_like_route_keeps_target_hit_ratio_and_no_small_cache_values() {
     );
 }
 
+/// 现网 /dfcache/minea 的参数（2026-10-30）跑一个 Claude Code 会话，比较计费下限计入读取的开关：
+/// 第一条（没有历史）两边完全一样；之后每条命中率仍达标、计费不亏，上报的上下文从约 9 倍原始输入
+/// 降到约 5 倍以内；原始输入大到读取顶到 50 万上限的请求，读取两边一样。
+#[test]
+fn minea_prod_params_read_aware_floor_shrinks_small_context_and_keeps_large_ones() {
+    fn route(read_aware: Option<bool>) -> CacheRoutePolicyPatch {
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(true),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.99),
+                token_scale: Some(2.05),
+                max_simulated_input_tokens: Some(600_000),
+                cap_jitter_min_tokens: Some(12_000),
+                cap_jitter_max_tokens: Some(24_000),
+                scale_min_input_tokens: Some(3_000),
+            }),
+            creation_control: Some(PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode:
+                    crate::model::config::PromptCacheCreationControlScopeMode::ConversationModel,
+                min_successful_requests_between_creation: 0,
+                min_creation_interval_secs: 6,
+                min_creation_delta_tokens: 12_000,
+                max_creation_tokens_per_event: 300_000,
+                creation_budget_window_secs: 300,
+                max_creation_tokens_per_window: 600_000,
+                expire_after_idle_secs: 3_600,
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy {
+                    move_delta_to_cache_read: true,
+                    ..ReportedUsageFieldPolicy::sample_input_max(20_000)
+                },
+                output_uplift_min_tokens: 1_000,
+                output_uplift_percent: 70,
+                final_cache_read_max_tokens: 500_000,
+                final_cache_read_jitter_min_tokens: 23_456,
+                final_cache_read_jitter_max_tokens: 54_321,
+                final_cache_creation_max_tokens: 500_000,
+                final_cache_creation_jitter_min_tokens: 23_456,
+                final_cache_creation_jitter_max_tokens: 54_321,
+                ..ReportedUsagePathPolicy::default()
+            }),
+            hit_shaping: Some(crate::model::config::CacheHitShapingPolicyPatch {
+                enabled: Some(true),
+                target_hit_ratio: Some(0.9),
+                ratio_jitter: Some(0.03),
+                min_cost_ratio: Some(1.0),
+                max_read_multiplier: Some(0.0),
+                min_creation_ratio: Some(0.0),
+                min_cache_read_tokens: Some(1_024),
+                min_cache_creation_tokens: Some(1_024),
+                read_aware_cost_floor: read_aware,
+            }),
+            cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
+                enabled: Some(false),
+            }),
+            ..CacheRoutePolicyPatch::default()
+        }
+    }
+    fn run_session(read_aware: Option<bool>, raw_inputs: &[i32]) -> Vec<cache::CacheUsage> {
+        // Each request mixes a thread-local random seed into its shaping jitter; fixing it makes
+        // the three runs see the same seeds, so they differ only by the toggle under test.
+        fastrand::seed(0x006d_696e_6561);
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy
+            .path_overrides
+            .insert("/dfcache/minea".to_string(), route(read_aware));
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(64)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.99,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy);
+        let endpoint = "/dfcache/minea/v1/messages";
+        let cache_route =
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path(endpoint);
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": "你好" }]),
+        }];
+        let mut reported_rounds = Vec::new();
+        for (round, &raw_input) in raw_inputs.iter().enumerate() {
+            let payload = MessagesRequest {
+                model: "claude-opus-4-5".to_string(),
+                max_tokens: 32_000,
+                messages: messages.clone(),
+                stream: true,
+                system: Some(vec![SystemMessage {
+                    text: "stable claude code system prompt ".repeat(900),
+                    cache_control: Some(json!({"type": "ephemeral"})),
+                }]),
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                output_format: None,
+                metadata: Some(Metadata {
+                    user_id: Some(
+                        "user_test_account__session_7a1c2e3f-4b5d-4e6f-8a9b-0c1d2e3f4a5b"
+                            .to_string(),
+                    ),
+                }),
+                stop_sequences: None,
+            };
+            let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
+            let context = prepare_usage_context(
+                &state,
+                cache_route.clone(),
+                endpoint,
+                true,
+                &payload,
+                None,
+                Some(conversation_id.clone()),
+                Some(conversation_id),
+                raw_input,
+            );
+            let credential_usage = attach_test_credential_usage(context, 1);
+            let body = cache::build_usage_with_simulation_policy(
+                None,
+                raw_input,
+                40,
+                credential_usage.request.simulated_usage,
+                true,
+            );
+            let source = credential_usage.usage_source(&body, None, false);
+            let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+            credential_usage.record_success_reported(reported, source, Some(body));
+            reported_rounds.push(reported);
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: json!([{ "type": "text", "text": format!("answer {round} ") }]),
+            });
+            messages.push(Message {
+                role: "user".to_string(),
+                content: json!([{ "type": "text", "text": format!("next {round} ") }]),
+            });
+        }
+        reported_rounds
+    }
+
+    let pricing = PricingCatalog::new()
+        .model_pricing("claude-opus-4-5")
+        .expect("builtin opus pricing");
+    let total = |usage: &cache::CacheUsage| {
+        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    };
+    // Claude Code 干净会话的原始输入（本机实测约 2.8 万~3.3 万），之后上下文增长到读取顶到上限。
+    let raw_inputs = [
+        28_287, 28_388, 30_200, 33_300, 38_000, 45_000, 120_000, 200_000,
+    ];
+    let legacy = run_session(None, &raw_inputs);
+    let explicit_off = run_session(Some(false), &raw_inputs);
+    let read_aware = run_session(Some(true), &raw_inputs);
+    assert_eq!(
+        legacy, explicit_off,
+        "omitting the field keeps the old behavior"
+    );
+
+    assert_eq!(legacy[0], read_aware[0], "first request has no history");
+    assert_eq!(read_aware[0].cache_read_input_tokens, 0);
+    for (round, (&raw_input, (old, new))) in raw_inputs
+        .iter()
+        .zip(legacy.iter().zip(read_aware.iter()))
+        .enumerate()
+        .skip(1)
+    {
+        let raw_cost = pricing.estimate(cache::RawUsage::uncached(raw_input, 40).to_cache_usage());
+        assert!(
+            pricing.estimate(*new) >= raw_cost * (1.0 - 1e-9),
+            "round {round}: billed below raw {new:?}"
+        );
+        let ratio = new.cache_read_input_tokens as f64 / total(new) as f64;
+        let old_ratio = old.cache_read_input_tokens as f64 / total(old) as f64;
+        assert!(
+            ratio >= old_ratio.min(0.9) - 1e-6,
+            "round {round}: ratio {ratio} old {old_ratio}"
+        );
+        for value in [new.cache_read_input_tokens, new.cache_creation_input_tokens] {
+            assert!(value == 0 || value >= 1024, "round {round}: small {new:?}");
+        }
+        let old_ctx = total(old) as f64 / raw_input as f64;
+        let new_ctx = total(new) as f64 / raw_input as f64;
+        if raw_input <= 45_000 {
+            // 命中率 r、读取单价是 input 的 q 倍时，非读取全是 input 也只需要
+            // 原始输入 ÷ ((1 - r) + q·r) 的上下文；minea 的命中率在 0.90~0.93，约 5.3~6.1 倍。
+            let q = pricing.cache_read_input_token_cost / pricing.input_cost_per_token;
+            let minimum = 1.0 / ((1.0 - ratio) + q * ratio);
+            assert!(old_ctx > 7.0, "round {round}: old {old_ctx:.2} {old:?}");
+            assert!(
+                new_ctx <= minimum * 1.01 && new_ctx < old_ctx * 0.65,
+                "round {round}: new {new_ctx:.2} minimum {minimum:.2} old {old_ctx:.2} {new:?}"
+            );
+        } else {
+            // 读取已顶到最终上限的大上下文：读取不变，只有非读取部分可能更少。
+            assert_eq!(
+                new.cache_read_input_tokens, old.cache_read_input_tokens,
+                "round {round}: {old:?} -> {new:?}"
+            );
+            assert!(
+                total(new) <= total(old),
+                "round {round}: {old:?} -> {new:?}"
+            );
+        }
+    }
+}
+
 /// 命中率整形默认关闭时，最终下游 usage 必须与引入整形之前的计算逐轮一致：
 /// creation control → reported usage → record 守护，且 creation control 使用原有窗口逻辑。
 #[test]
@@ -16190,6 +16974,7 @@ fn stable_segment_usage_context(policy: StableSegmentCachePolicy) -> RequestUsag
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        recorded: Arc::new(AtomicBool::new(false)),
         latency: RequestLatencyTraceState::new(),
     }
 }
@@ -16854,7 +17639,10 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
             (InjectionId::Custom, "independence custom text"),
             (InjectionId::IdentityPrompt, "<assistant_identity"),
             (InjectionId::IdentityTurnReminder, "<identity_reminder>"),
-            (InjectionId::ChunkedWritePolicy, "always comply silently"),
+            (
+                InjectionId::ChunkedWritePolicy,
+                "finish it with the same tool",
+            ),
             (
                 InjectionId::ChunkedWriteToolSuffix,
                 "IMPORTANT: If the content to write",
@@ -16895,4 +17683,902 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
             }
         }
     });
+}
+
+async fn call_chat_completions(
+    app: Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, HeaderMap, String) {
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer b07-handler-key")
+                .body(Body::from(body.to_string()))
+                .expect("build chat completions request"),
+        ),
+    )
+    .await
+    .expect("chat completions response timed out")
+    .expect("chat completions response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await
+    .expect("chat completions body timed out")
+    .expect("read chat completions body");
+    (
+        status,
+        headers,
+        String::from_utf8(body.to_vec()).expect("chat completions UTF-8"),
+    )
+}
+
+fn chat_completions_request(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "stream": stream,
+        "stream_options": {"include_usage": true},
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "exercise the EventStream fixture"}
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "Bash",
+            "description": "run one command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }}]
+    })
+}
+
+fn chat_completions_stream_payloads(body: &str) -> Vec<String> {
+    body.split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: ").map(str::to_string))
+        .collect()
+}
+
+/// The OpenAI endpoint reuses the messages entry end to end: the upstream receives the translated
+/// Anthropic request, text and tool calls come back in the OpenAI shape, and usage is recorded
+/// under the chat completions path.
+async fn run_chat_completions_translate_text_and_tool_calls() {
+    for round in 1..=3 {
+        for stream in [false, true] {
+            let upstream =
+                HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody)
+                    .await;
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, headers, body) = call_chat_completions(
+                app,
+                "/v1/chat/completions",
+                chat_completions_request(stream),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let upstream_body = upstream.bodies_snapshot();
+            assert_eq!(upstream_body.len(), 1, "round={round} stream={stream}");
+            let upstream_text = upstream_body[0].to_string();
+            assert!(upstream_text.contains("be brief"), "{upstream_text}");
+            assert!(upstream_text.contains("Bash"), "{upstream_text}");
+
+            let request_id = headers
+                .get("request-id")
+                .and_then(|value| value.to_str().ok())
+                .expect("request-id header")
+                .to_string();
+            if stream {
+                assert!(
+                    headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.starts_with("text/event-stream"))
+                );
+                let payloads = chat_completions_stream_payloads(&body);
+                assert_eq!(
+                    payloads.last().map(String::as_str),
+                    Some("[DONE]"),
+                    "{body}"
+                );
+                let chunks: Vec<serde_json::Value> = payloads[..payloads.len() - 1]
+                    .iter()
+                    .map(|data| serde_json::from_str(data).expect("chunk json"))
+                    .collect();
+                let text: String = chunks
+                    .iter()
+                    .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+                    .collect();
+                assert_eq!(text, "recovered-ok", "{body}");
+                let finish = chunks
+                    .iter()
+                    .find_map(|chunk| chunk["choices"][0]["finish_reason"].as_str())
+                    .expect("finish chunk");
+                assert_eq!(finish, "stop");
+                let usage = &chunks.last().expect("usage chunk")["usage"];
+                assert!(
+                    usage["prompt_tokens"]
+                        .as_u64()
+                        .is_some_and(|tokens| tokens > 0)
+                );
+                assert!(!body.contains("event: "), "{body}");
+            } else {
+                let completion: serde_json::Value =
+                    serde_json::from_str(&body).expect("completion json");
+                assert_eq!(completion["object"], "chat.completion");
+                assert!(
+                    completion["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("chatcmpl-"))
+                );
+                assert_eq!(
+                    completion["choices"][0]["message"]["content"],
+                    "recovered-ok"
+                );
+                assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+                assert!(
+                    completion["usage"]["completion_tokens"]
+                        .as_u64()
+                        .is_some_and(|tokens| tokens > 0)
+                );
+            }
+            let records = usage_recorder.query(UsageRecordQuery {
+                request_id: Some(request_id.clone()),
+                ..UsageRecordQuery::default()
+            });
+            assert_eq!(records.records.len(), 1, "round={round} stream={stream}");
+            assert_eq!(records.records[0].endpoint, "/v1/chat/completions");
+            assert_eq!(records.records[0].status, UsageRecordStatus::Success);
+        }
+
+        for stream in [false, true] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::CompleteToolWithoutStatus,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, _headers, body) = call_chat_completions(
+                app,
+                "/cc/v1/chat/completions",
+                chat_completions_request(stream),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let (name, arguments, finish) = if stream {
+                let chunks: Vec<serde_json::Value> = chat_completions_stream_payloads(&body)
+                    .iter()
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).expect("chunk json"))
+                    .collect();
+                let calls: Vec<&serde_json::Value> = chunks
+                    .iter()
+                    .filter_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"].get(0))
+                    .collect();
+                assert!(calls.iter().all(|call| call["index"] == 0), "{body}");
+                let name = calls
+                    .iter()
+                    .find_map(|call| call["function"]["name"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments: String = calls
+                    .iter()
+                    .filter_map(|call| call["function"]["arguments"].as_str())
+                    .collect();
+                let finish = chunks
+                    .iter()
+                    .find_map(|chunk| chunk["choices"][0]["finish_reason"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (name, arguments, finish)
+            } else {
+                let completion: serde_json::Value =
+                    serde_json::from_str(&body).expect("completion json");
+                let call = &completion["choices"][0]["message"]["tool_calls"][0];
+                (
+                    call["function"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    call["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    completion["choices"][0]["finish_reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            };
+            assert_eq!(name, "Bash", "round={round} stream={stream} {body}");
+            let arguments: serde_json::Value =
+                serde_json::from_str(&arguments).expect("tool arguments json");
+            assert_eq!(arguments, json!({"command": "printf legacy-tool-ok"}));
+            assert_eq!(finish, "tool_calls", "round={round} stream={stream}");
+        }
+    }
+}
+
+#[test]
+fn chat_completions_translate_text_and_tool_calls() {
+    run_handler_fixture_on_large_stack_thread(
+        "chat-completions-translation",
+        run_chat_completions_translate_text_and_tool_calls,
+    );
+}
+
+/// Errors use the OpenAI envelope: bad requests never reach the upstream and are recorded as
+/// rejections, unknown dfcache routes stay 404, and a stream that fails after output starts ends
+/// with one error chunk and no `[DONE]`. (Auth and admission layers answer before the handler with
+/// the Anthropic envelope, which carries the same `error.type` / `error.message` fields.)
+async fn run_chat_completions_errors_use_the_openai_envelope() {
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody).await;
+    let (app, usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, headers, body) = call_chat_completions(
+        app.clone(),
+        "/v1/chat/completions",
+        json!({"model": "claude-sonnet-4-20250514", "n": 2, "messages": [
+            {"role": "user", "content": "hi"}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).expect("error json");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("n:"))
+    );
+    assert!(error.get("type").is_none(), "{body}");
+    assert!(headers.get("request-id").is_some());
+    assert_eq!(upstream.hits(), 0);
+    let request_id = headers["request-id"].to_str().unwrap().to_string();
+    let records = usage_recorder.query(UsageRecordQuery {
+        request_id: Some(request_id),
+        ..UsageRecordQuery::default()
+    });
+    assert_eq!(records.records.len(), 1);
+    assert_eq!(records.records[0].endpoint, "/v1/chat/completions");
+    assert_eq!(records.records[0].status, UsageRecordStatus::Error);
+
+    let (status, _headers, body) = call_chat_completions(
+        app.clone(),
+        "/dfcache/missing/v1/chat/completions",
+        chat_completions_request(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).expect("error json");
+    assert_eq!(error["error"]["type"], "not_found_error");
+    assert_eq!(upstream.hits(), 0);
+
+    let (status, _headers, body) = call_chat_completions(
+        app,
+        "/dfcache/demo/v1/chat/completions",
+        chat_completions_request(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream.hits(), 1);
+
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TextThenReadError).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, _headers, body) =
+        call_chat_completions(app, "/v1/chat/completions", chat_completions_request(true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payloads = chat_completions_stream_payloads(&body);
+    assert!(!payloads.iter().any(|data| data == "[DONE]"), "{body}");
+    let last: serde_json::Value =
+        serde_json::from_str(payloads.last().expect("error chunk")).expect("error json");
+    assert!(last["error"]["message"].is_string(), "{body}");
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|data| data.starts_with("{\"error\""))
+            .count(),
+        1,
+        "{body}"
+    );
+}
+
+#[test]
+fn chat_completions_errors_use_the_openai_envelope() {
+    run_handler_fixture_on_large_stack_thread(
+        "chat-completions-errors",
+        run_chat_completions_errors_use_the_openai_envelope,
+    );
+}
+
+/// Upstream faults before any output (exception/error events, broken frames, read errors) are not
+/// account faults: by default the pre-output retry moves to another account and nothing is cooled
+/// down. Switching `credentialUpstreamFailureCooldownEnabled` on restores the cooldown.
+async fn run_upstream_faults_switch_accounts_without_cooldown() {
+    for fault in [
+        HandlerEventStreamFault::ExceptionEventBeforeOutput,
+        HandlerEventStreamFault::ErrorEventBeforeOutput,
+        HandlerEventStreamFault::BadCrcBeforeOutput,
+        HandlerEventStreamFault::TruncatedFrameBeforeOutput,
+        HandlerEventStreamFault::ReadErrorBeforeOutput,
+    ] {
+        for stream in [true, false] {
+            for switch_on in [false, true] {
+                let label = format!("{fault:?} stream={stream} switch={switch_on}");
+                let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+                let (app, usage_recorder, token_manager) =
+                    handler_eventstream_fault_router_with_manager(
+                        &upstream.base_url,
+                        2,
+                        1,
+                        |config| config.credential_upstream_failure_cooldown_enabled = switch_on,
+                        None,
+                    );
+                let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+                let recovered = body.contains("recovered-ok");
+                if !recovered {
+                    // A non-stream body with a broken frame is answered 502 without a retry and
+                    // without touching the account (unchanged behaviour).
+                    assert!(!stream, "{label} status={status} body={body}");
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{label} body={body}");
+                    assert_eq!(upstream.hits(), 2, "{label}");
+                    let record = usage_record_for_request(&usage_recorder, &request_id);
+                    let accounts: HashSet<_> = record
+                        .credential_attempts
+                        .iter()
+                        .map(|attempt| attempt.credential_id)
+                        .collect();
+                    assert_eq!(
+                        accounts.len(),
+                        2,
+                        "{label}: the retry uses the other account"
+                    );
+                }
+                let cooled = cooled_down_credentials(&token_manager);
+                if switch_on && recovered {
+                    assert!(!cooled.is_empty(), "{label}: switch on cools the account");
+                } else if !switch_on {
+                    assert!(
+                        cooled.is_empty(),
+                        "{label}: upstream faults never cool {cooled:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn upstream_faults_switch_accounts_without_cooldown() {
+    run_handler_fixture_on_large_stack_thread(
+        "upstream-fault-no-cooldown",
+        run_upstream_faults_switch_accounts_without_cooldown,
+    );
+}
+
+#[test]
+fn gateway_timeout_is_reported_as_504() {
+    let diagnostic = "upstream_failure class=upstream_timeout upstream_status=524 public_status=524 body_bytes=21 retry_after_secs=unknown content_type=json reason=api_gateway_timeout";
+    let public = provider_public_error_for_message(diagnostic, Some("req_gateway"), None, None);
+    assert_eq!(public.status_code, 504);
+    assert_eq!(public.error_type, "api_error");
+    assert!(public.message.contains("req_gateway"), "{}", public.message);
+
+    // The response the client actually receives is 504 too, so Claude Code retries it.
+    let response = map_provider_error(
+        anyhow::anyhow!(diagnostic),
+        Some("req_gateway"),
+        Some("req_gateway"),
+        None,
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+}
+
+fn responses_request(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "stream": stream,
+        "instructions": "be brief",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "exercise the EventStream fixture"}
+        ]}],
+        "tools": [{
+            "type": "function",
+            "name": "Bash",
+            "description": "run one command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }]
+    })
+}
+
+/// `(event type, data)` pairs of a Responses SSE body.
+fn responses_stream_events(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter_map(|frame| {
+            let mut lines = frame.lines();
+            let event = lines.next()?.strip_prefix("event: ")?.to_string();
+            let data = lines.next()?.strip_prefix("data: ")?;
+            Some((
+                event,
+                serde_json::from_str(data).expect("responses event json"),
+            ))
+        })
+        .collect()
+}
+
+/// The Responses endpoint reuses the messages entry end to end: text and tool calls come back as
+/// Responses output items, streaming ends with `response.completed`, and usage is recorded under
+/// the responses path.
+async fn run_responses_translate_text_and_tool_calls() {
+    for round in 1..=3 {
+        for stream in [false, true] {
+            let upstream =
+                HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody)
+                    .await;
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, headers, body) =
+                call_chat_completions(app, "/v1/responses", responses_request(stream)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let upstream_text = upstream.bodies_snapshot()[0].to_string();
+            assert!(upstream_text.contains("be brief"), "{upstream_text}");
+            let response = if stream {
+                let events = responses_stream_events(&body);
+                assert_eq!(events[0].0, "response.created", "{body}");
+                let deltas: String = events
+                    .iter()
+                    .filter(|(event, _)| event == "response.output_text.delta")
+                    .filter_map(|(_, data)| data["delta"].as_str())
+                    .collect();
+                assert_eq!(deltas, "recovered-ok");
+                let (last, data) = events.last().expect("terminal event");
+                assert_eq!(last, "response.completed", "{body}");
+                data["response"].clone()
+            } else {
+                serde_json::from_str(&body).expect("response json")
+            };
+            assert_eq!(response["object"], "response");
+            assert_eq!(response["status"], "completed");
+            assert!(
+                response["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("resp_"))
+            );
+            assert_eq!(response["output"][0]["type"], "message");
+            assert_eq!(response["output"][0]["content"][0]["text"], "recovered-ok");
+            assert!(
+                response["usage"]["output_tokens"]
+                    .as_u64()
+                    .is_some_and(|tokens| tokens > 0)
+            );
+            let request_id = headers["request-id"].to_str().unwrap().to_string();
+            let records = usage_recorder.query(UsageRecordQuery {
+                request_id: Some(request_id),
+                ..UsageRecordQuery::default()
+            });
+            assert_eq!(records.records.len(), 1);
+            assert_eq!(records.records[0].endpoint, "/v1/responses");
+            assert_eq!(records.records[0].status, UsageRecordStatus::Success);
+        }
+
+        for stream in [false, true] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::CompleteToolWithoutStatus,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, _headers, body) =
+                call_chat_completions(app, "/cc/v1/responses", responses_request(stream)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let response = if stream {
+                let events = responses_stream_events(&body);
+                let arguments = events
+                    .iter()
+                    .find(|(event, _)| event == "response.function_call_arguments.done")
+                    .map(|(_, data)| data["arguments"].clone())
+                    .expect("arguments done event");
+                let arguments: serde_json::Value =
+                    serde_json::from_str(arguments.as_str().unwrap()).unwrap();
+                assert_eq!(arguments, json!({"command": "printf legacy-tool-ok"}));
+                events.last().unwrap().1["response"].clone()
+            } else {
+                serde_json::from_str(&body).expect("response json")
+            };
+            let call = response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "function_call")
+                .expect("function_call item")
+                .clone();
+            assert_eq!(call["name"], "Bash");
+            assert!(call["call_id"].as_str().is_some_and(|id| !id.is_empty()));
+            let arguments: serde_json::Value =
+                serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments, json!({"command": "printf legacy-tool-ok"}));
+            assert_eq!(response["status"], "completed");
+        }
+    }
+}
+
+#[test]
+fn responses_translate_text_and_tool_calls() {
+    run_handler_fixture_on_large_stack_thread(
+        "responses-translation",
+        run_responses_translate_text_and_tool_calls,
+    );
+}
+
+async fn run_responses_errors_use_the_openai_envelope() {
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, _headers, body) = call_chat_completions(
+        app.clone(),
+        "/v1/responses",
+        json!({"model": "claude-sonnet-4-20250514", "input": "hi", "previous_response_id": "resp_1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(upstream.hits(), 0);
+
+    let (status, _headers, body) =
+        call_chat_completions(app, "/dfcache/demo/v1/responses", responses_request(false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TextThenReadError).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, _headers, body) =
+        call_chat_completions(app, "/v1/responses", responses_request(true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = responses_stream_events(&body);
+    assert_eq!(events.last().unwrap().0, "response.failed", "{body}");
+    assert!(
+        !events
+            .iter()
+            .any(|(event, _)| event == "response.completed")
+    );
+}
+
+#[test]
+fn responses_errors_use_the_openai_envelope() {
+    run_handler_fixture_on_large_stack_thread(
+        "responses-errors",
+        run_responses_errors_use_the_openai_envelope,
+    );
+}
+
+/// A noisy PNG over the 5 MB inline limit (noise does not compress, so the PNG stays large).
+fn oversized_noise_png_base64() -> String {
+    let (width, height) = (1600u32, 1200u32);
+    let mut state = 0x2545_f491_u32;
+    let image = image::RgbImage::from_fn(width, height, |_, _| {
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        };
+        image::Rgb([next(), next(), next()])
+    });
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode noise png");
+    let encoded = BASE64_STANDARD.encode(png);
+    assert!(encoded.len() > 5 * 1024 * 1024, "fixture must exceed 5 MB");
+    encoded
+}
+
+/// With image resizing on, a current-turn image over the 5 MB limit is shrunk and sent instead
+/// of being rejected; with it off the request is still the official 400 and never reaches the
+/// upstream.
+async fn run_oversized_current_image_is_resized_when_switched_on() {
+    let data = oversized_noise_png_base64();
+    for resize in [false, true] {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody)
+                .await;
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+                config.image_processing.resize_enabled = resize;
+            });
+        let request = multimodal_handler_request(
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": data
+                    }}
+                ]}]
+            })
+            .to_string(),
+        );
+        let response = tokio::time::timeout(Duration::from_secs(60), app.oneshot(request))
+            .await
+            .expect("oversized image response timed out")
+            .expect("oversized image response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        if resize {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(upstream.hits(), 1);
+            let sent = upstream.bodies_snapshot()[0].to_string();
+            assert!(
+                sent.len() < 5 * 1024 * 1024,
+                "resized body is {} bytes",
+                sent.len()
+            );
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("image exceeds 5 MB maximum"), "{body}");
+            assert_eq!(upstream.hits(), 0);
+        }
+    }
+}
+
+#[test]
+fn oversized_current_image_is_resized_when_switched_on() {
+    run_handler_fixture_on_large_stack_thread(
+        "oversized-image-resize",
+        run_oversized_current_image_is_resized_when_switched_on,
+    );
+}
+
+/// Non-streaming: nothing has reached the client yet, so an unrepairable tool argument is retried
+/// on another account instead of answering 502. The broken account is not cooled down.
+async fn run_non_stream_broken_tool_input_is_retried_on_another_account() {
+    for round in 1..=3 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::BrokenToolInputThenNormal,
+        )
+        .await;
+        let (app, usage_recorder, token_manager) =
+            handler_eventstream_fault_router_with_manager(&upstream.base_url, 2, 1, |_| {}, None);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert!(body.contains("recovered-ok"), "round={round} body={body}");
+        assert_eq!(upstream.hits(), 2, "round={round}");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let accounts: HashSet<_> = record
+            .credential_attempts
+            .iter()
+            .map(|attempt| attempt.credential_id)
+            .collect();
+        assert_eq!(
+            accounts.len(),
+            2,
+            "round={round}: the retry uses the other account"
+        );
+        assert!(
+            cooled_down_credentials(&token_manager).is_empty(),
+            "round={round}: broken tool input is not an account failure"
+        );
+    }
+}
+
+#[test]
+fn non_stream_broken_tool_input_is_retried_on_another_account() {
+    run_handler_fixture_on_large_stack_thread(
+        "non-stream-broken-tool-input-retry",
+        run_non_stream_broken_tool_input_is_retried_on_another_account,
+    );
+}
+
+/// Only explicit rate-limit wording is classified as a rate limit: "rate" alone matches ordinary
+/// words such as "generate", which used to turn an upstream failure into a non-retryable 429.
+#[test]
+fn json_stream_error_rate_limit_needs_explicit_wording() {
+    let classify = |message: &str| {
+        let value = json!({"message": message});
+        classify_json_stream_error(
+            &value,
+            value.to_string().as_bytes(),
+            Some("application/json"),
+        )
+        .error_type
+    };
+    assert_eq!(classify("Failed to generate a response"), "api_error");
+    assert_eq!(classify("Moderate load, please retry"), "api_error");
+    assert_eq!(classify("Rate limit exceeded"), "rate_limit_error");
+    assert_eq!(
+        classify("ThrottlingException: slow down"),
+        "rate_limit_error"
+    );
+    assert_eq!(classify("Too many requests"), "rate_limit_error");
+    assert_eq!(
+        classify("ValidationException: bad field"),
+        "invalid_request_error"
+    );
+}
+
+/// A pre-output retry resends a turn the upstream already started processing, so it carries a new
+/// conversation identity: production saw 137 of 137 same-id resends after a 5xx rejected as
+/// "Improperly formed request". Stream and non-stream retries both do this.
+async fn run_pre_output_retry_uses_a_fresh_conversation_identity() {
+    for stream in [true, false] {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::ExceptionEventBeforeOutput,
+        )
+        .await;
+        let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
+        assert_eq!(status, StatusCode::OK, "stream={stream} body={body}");
+        assert!(body.contains("recovered-ok"), "stream={stream} body={body}");
+        let bodies = upstream.bodies_snapshot();
+        assert_eq!(bodies.len(), 2, "stream={stream}");
+        let ids: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                (
+                    body["conversationState"]["conversationId"].clone(),
+                    body["conversationState"]["agentContinuationId"].clone(),
+                )
+            })
+            .collect();
+        assert!(ids[0].0.is_string(), "stream={stream}: {:?}", ids[0]);
+        assert_ne!(
+            ids[0].0, ids[1].0,
+            "stream={stream}: conversationId must change"
+        );
+        assert_ne!(
+            ids[0].1, ids[1].1,
+            "stream={stream}: agentContinuationId must change"
+        );
+    }
+}
+
+#[test]
+fn pre_output_retry_uses_a_fresh_conversation_identity() {
+    run_handler_fixture_on_large_stack_thread(
+        "pre-output-retry-fresh-identity",
+        run_pre_output_retry_uses_a_fresh_conversation_identity,
+    );
+}
+async fn run_full_dispatch_queue_is_rejected_before_body_processing() {
+    // Nothing listens at this address: any request that got past the entry would fail with a
+    // connection error instead of the 429 asserted below.
+    let (app, usage_recorder, token_manager) = handler_eventstream_fault_router_with_manager(
+        "http://127.0.0.1:9",
+        1,
+        1,
+        |config| {
+            config.credential_max_concurrent_requests = 1;
+            config.dispatch_max_queued_requests = 3;
+        },
+        None,
+    );
+    let _held = token_manager
+        .acquire_in_flight_lease_for_test(1)
+        .expect("occupy the only slot");
+    token_manager.set_queued_requests_for_test(3);
+
+    let started = std::time::Instant::now();
+    let response = app
+        .clone()
+        .oneshot(handler_eventstream_fault_request_for_path(
+            "/cc/v1/messages",
+            false,
+        ))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("60"),
+        "no dispatch yet, so the longest wait is advertised"
+    );
+    let request_id = response_request_id(&response);
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    assert_eq!(record.status, UsageRecordStatus::Error);
+
+    // With room in the queue the request goes on to the scheduler as before.
+    token_manager.set_queued_requests_for_test(0);
+    assert_eq!(token_manager.dispatch_queue_full_retry_after(None), None);
+}
+
+#[test]
+fn full_dispatch_queue_is_rejected_before_body_processing() {
+    run_handler_fixture_on_large_stack_thread(
+        "full-dispatch-queue-entry-reject",
+        run_full_dispatch_queue_is_rejected_before_body_processing,
+    );
+}
+
+async fn run_request_cancelled_while_queued_records_client_dropped() {
+    for stream in [false, true] {
+        let (app, usage_recorder, token_manager) = handler_eventstream_fault_router_with_manager(
+            "http://127.0.0.1:9",
+            1,
+            1,
+            |config| {
+                config.credential_max_concurrent_requests = 1;
+                config.dispatch_max_queued_requests = 10;
+                config.credential_dispatch_max_wait_secs = 30;
+            },
+            None,
+        );
+        let _held = token_manager
+            .acquire_in_flight_lease_for_test(1)
+            .expect("occupy the only slot so the request queues");
+        let all_records = || usage_recorder.query(UsageRecordQuery::default()).records;
+        let before = all_records().len();
+        let request = handler_eventstream_fault_request_for_path("/cc/v1/messages", stream);
+        // The client gives up while the request waits in the dispatch queue.
+        let outcome = tokio::time::timeout(Duration::from_millis(300), app.oneshot(request)).await;
+        assert!(
+            outcome.is_err(),
+            "stream={stream}: the request was still queued"
+        );
+        let records = all_records();
+        assert_eq!(
+            records.len(),
+            before + 1,
+            "stream={stream}: exactly one record"
+        );
+        let record = &records[0];
+        assert_eq!(
+            record.status,
+            UsageRecordStatus::ClientDropped,
+            "stream={stream}"
+        );
+    }
+}
+
+#[test]
+fn request_cancelled_while_queued_records_client_dropped() {
+    run_handler_fixture_on_large_stack_thread(
+        "cancelled-while-queued-client-dropped",
+        run_request_cancelled_while_queued_records_client_dropped,
+    );
 }

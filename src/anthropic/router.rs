@@ -35,6 +35,11 @@ use super::{
     },
     middleware::{AppState, auth_middleware, capture_http_ingress, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
+    openai::{
+        post_chat_completions, post_chat_completions_cc, post_chat_completions_dfcache,
+        post_chat_completions_ha, post_chat_completions_na, post_responses, post_responses_cc,
+        post_responses_dfcache, post_responses_ha, post_responses_na,
+    },
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
@@ -151,6 +156,8 @@ impl AnthropicRouterConfig {
 /// - `GET /v1/models` - 获取可用模型列表
 /// - `POST /v1/messages` - 创建消息（对话）
 /// - `POST /v1/messages/count_tokens` - 计算 token 数量
+/// - `POST /v1/chat/completions` - OpenAI Chat Completions 兼容接口（各前缀下同名路径同样可用）
+/// - `POST /v1/responses` - OpenAI Responses 兼容接口（各前缀下同名路径同样可用）
 /// - `GET /na/v1/models` - 获取可用模型列表
 /// - `POST /na/v1/messages` - 创建消息
 /// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
@@ -297,6 +304,20 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens))
+        .route(
+            "/chat/completions",
+            post(post_chat_completions).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
+        .route(
+            "/responses",
+            post(post_responses).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -325,6 +346,20 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens_na))
+        .route(
+            "/chat/completions",
+            post(post_chat_completions_na).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
+        .route(
+            "/responses",
+            post(post_responses_na).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -353,6 +388,20 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens_cc))
+        .route(
+            "/chat/completions",
+            post(post_chat_completions_cc).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
+        .route(
+            "/responses",
+            post(post_responses_cc).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -381,6 +430,20 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens_ha))
+        .route(
+            "/chat/completions",
+            post(post_chat_completions_ha).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
+        .route(
+            "/responses",
+            post(post_responses_ha).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -411,6 +474,20 @@ pub fn create_router_with_provider(
         .route(
             "/{route}/v1/messages",
             post(post_messages_dfcache).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
+        .route(
+            "/{route}/v1/chat/completions",
+            post(post_chat_completions_dfcache).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
+        .route(
+            "/{route}/v1/responses",
+            post(post_responses_dfcache).layer(middleware::from_fn_with_state(
                 request_admission_state,
                 request_admission_middleware,
             )),

@@ -24,7 +24,7 @@ export function PageHeader({
   )
 }
 
-/** 页面容器:统一最大宽度与纵向间距 */
+/** 页面容器:统一纵向间距;宽度随窗口铺满,宽屏下不留两侧空白 */
 export function PageContainer({
   children,
   className,
@@ -32,5 +32,5 @@ export function PageContainer({
   children: React.ReactNode
   className?: string
 }) {
-  return <div className={cn('mx-auto flex w-full max-w-[1600px] flex-col gap-4', className)}>{children}</div>
+  return <div className={cn('flex w-full flex-col gap-4', className)}>{children}</div>
 }

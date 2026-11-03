@@ -587,6 +587,12 @@ impl ModelCapabilitiesCatalog {
         models.into_iter().find(|model| model.id == listing_id)
     }
 
+    /// Whether the catalog lists the upstream model id `model`.
+    pub fn contains_model(&self, model: &str) -> bool {
+        let model = normalize_model_id(model);
+        self.inner.read().models.contains_key(&model)
+    }
+
     pub fn max_input_tokens_for(&self, model: &str) -> Option<i32> {
         let model = normalize_model_id(model);
         self.inner

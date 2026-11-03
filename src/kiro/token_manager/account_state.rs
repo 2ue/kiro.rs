@@ -92,6 +92,24 @@ pub(super) struct CredentialEntry {
     pub(super) model_health: HashMap<String, SchedulerHealthState>,
     /// 本进程内的近期调度选中事件；无 Redis 时用于计算短窗口调度压力。
     pub(super) selection_events: VecDeque<Instant>,
+    /// 最近一次自愈的时间，用于自愈最小间隔。
+    pub(super) last_auto_heal_at: Option<Instant>,
+    /// 自愈后还没成功过就又被禁用的连续轮数；成功一次或管理员启用/重置后清零。
+    pub(super) auto_heal_consecutive_rounds: u32,
+    /// 连续几次上游故障（5xx、错误事件、读取失败等）之间没有一次成功。偶发故障不冷却账号，
+    /// 同一个账号连续出故障说明问题多半在它身上，达到阈值后按原规则冷却。成功一次清零。
+    pub(super) upstream_fault_streak: u32,
+    /// Pool-wide sequence number of this credential's last upstream fault.
+    pub(super) upstream_fault_seq: u64,
+    /// Redis answered "full" for this credential at this moment although the local view had
+    /// room (releases of finished requests not yet applied in Redis, or another instance's
+    /// leases not yet synced). Until it expires or a slot of this credential is released, local
+    /// selection treats the credential as full instead of trying it again on every request; see
+    /// [`REDIS_FULL_HINT_TTL`](super::capacity::REDIS_FULL_HINT_TTL).
+    pub(super) redis_full_until: Option<Instant>,
+    /// Set by `note_upstream_fault`: the last upstream fault was not shared by most active
+    /// accounts.
+    pub(super) last_upstream_fault_concentrated: bool,
 }
 
 #[derive(Debug, Clone)]

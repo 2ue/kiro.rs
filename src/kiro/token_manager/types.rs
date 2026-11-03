@@ -118,6 +118,18 @@ impl CallContext {
     }
 }
 
+/// Whether a dispatch is a request's first or a retry after an attempt it was admitted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchAdmission {
+    /// A new request: it waits in the dispatch queue only while the queue has room.
+    New,
+    /// The request already held a slot and gave it back after an upstream failure. Turning it
+    /// away now would hand the client an error the pool could still absorb, so it queues even
+    /// when the queue is full. At most one such retry exists per slot just released, so the
+    /// queue stays bounded by its limit plus the pool's slots.
+    Retry,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireMode {
     WaitForCapacity,
@@ -133,6 +145,11 @@ impl AcquireMode {
             self,
             Self::FailFastOnCapacity | Self::FailFastOnCapacityWaitForRedis(_)
         )
+    }
+
+    /// Whether a request in this mode queues for a busy credential instead of giving up.
+    pub(crate) fn waits_for_capacity(self) -> bool {
+        !self.is_fail_fast()
     }
 
     pub(super) fn is_redis_degraded_fail_fast(self) -> bool {

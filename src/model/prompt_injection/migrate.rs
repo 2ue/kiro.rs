@@ -199,13 +199,15 @@ pub(crate) fn migrate(legacy: LegacyPromptFields, profile: CompatProfile) -> Mig
         &identity.turn_reminder.prompt,
     );
 
-    let prompt_injection = PromptInjectionConfig {
+    let mut prompt_injection = PromptInjectionConfig {
         apply_to_count_tokens: steering.apply_to_count_tokens,
         defaults,
         texts,
         path_overrides: overrides,
     }
     .normalized();
+    // 旧结构里存着的内置文本可能是已被替换的旧版本，同样换成当前内置文本。
+    prompt_injection.drop_previous_default_texts();
 
     // 路由功能。
     let web_search = legacy.model_driven_web_search.unwrap_or_default();

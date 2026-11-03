@@ -1,9 +1,11 @@
+use std::collections::VecDeque;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::model::config::Config;
 use crate::storage::redis_cache::SchedulerHealthState;
 
 use super::account_state::CredentialEntry;
+use super::capacity::effective_max_concurrent_requests;
 use super::cooldown::model_state_key;
 
 const SELECTION_WINDOW_10S: StdDuration = StdDuration::from_secs(10);
@@ -14,6 +16,9 @@ pub(super) fn entry_effective_health<'a>(
     entry: &'a CredentialEntry,
     model: Option<&str>,
 ) -> &'a SchedulerHealthState {
+    if entry.model_health.is_empty() {
+        return &entry.health;
+    }
     model
         .map(model_state_key)
         .and_then(|key| entry.model_health.get(&key))
@@ -64,27 +69,32 @@ pub(super) fn prune_local_selection_events(entry: &mut CredentialEntry, now: Ins
     }) {
         entry.selection_events.pop_front();
     }
-    entry.health.recent_selection_count_10s = entry
-        .selection_events
-        .iter()
-        .filter(|selected_at| now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_10S)
-        .count()
-        .min(u32::MAX as usize) as u32;
-    entry.health.recent_selection_count_60s = entry
-        .selection_events
-        .iter()
-        .filter(|selected_at| now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_60S)
-        .count()
-        .min(u32::MAX as usize) as u32;
+    entry.health.recent_selection_count_10s =
+        selections_within(&entry.selection_events, now, SELECTION_WINDOW_10S);
+    entry.health.recent_selection_count_60s =
+        selections_within(&entry.selection_events, now, SELECTION_WINDOW_60S);
     entry.health.recent_selection_count_5m =
         entry.selection_events.len().min(u32::MAX as usize) as u32;
+}
+
+/// Selections in the last `window`; `events` is in time order.
+fn selections_within(events: &VecDeque<Instant>, now: Instant, window: StdDuration) -> u32 {
+    let first =
+        events.partition_point(|selected_at| now.saturating_duration_since(*selected_at) > window);
+    (events.len() - first).min(u32::MAX as usize) as u32
 }
 
 pub(super) fn record_local_selection(entry: &mut CredentialEntry, now: Instant, weight_units: u32) {
     entry.total_selection_count = entry.total_selection_count.saturating_add(1);
     entry.health.selection_count = entry.health.selection_count.saturating_add(1);
+    // Callers read `now` before taking the entries lock, so two dispatches can arrive here out
+    // of order. Keep the events sorted: the window checks binary-search them.
+    let at = entry
+        .selection_events
+        .back()
+        .map_or(now, |last| (*last).max(now));
     for _ in 0..weight_units.clamp(1, 64) {
-        entry.selection_events.push_back(now);
+        entry.selection_events.push_back(at);
     }
     prune_local_selection_events(entry, now);
 }
@@ -187,125 +197,4 @@ pub(super) fn select_health_weighted<'a>(
         }
     }
     top.last().map(|(entry, _)| *entry)
-}
-
-pub(super) fn select_weighted_least_inflight<'a>(
-    candidates: &[&'a CredentialEntry],
-    model: Option<&str>,
-    now_ms: i64,
-    config: &Config,
-) -> Option<&'a CredentialEntry> {
-    let candidate_count = candidates.len();
-    if candidate_count == 0 {
-        return None;
-    }
-    let total_recent: u64 = candidates
-        .iter()
-        .map(|candidate| candidate.health.recent_selection_count_60s as u64)
-        .sum();
-    let top_k = (config.scheduler_top_k.max(1) as usize).min(candidate_count);
-    let mut top: Vec<(&CredentialEntry, f64)> = Vec::with_capacity(top_k);
-    for entry in candidates.iter().copied() {
-        let score = weighted_least_inflight_score(
-            entry,
-            model,
-            now_ms,
-            selection_pressure_from_totals(entry, total_recent, candidate_count),
-            config,
-        );
-        let insert_at = top
-            .iter()
-            .position(|(existing_entry, existing_score)| {
-                score < *existing_score
-                    || (score == *existing_score && entry.id < existing_entry.id)
-            })
-            .unwrap_or(top.len());
-        if insert_at < top_k {
-            top.insert(insert_at, (entry, score));
-            if top.len() > top_k {
-                top.pop();
-            }
-        }
-    }
-
-    let worst_score = top.last()?.1;
-    let total_weight: f64 = top
-        .iter()
-        .map(|(_, score)| (worst_score - score + 1.0).max(0.01))
-        .sum();
-    let mut roll = fastrand::f64() * total_weight;
-    for (entry, score) in &top {
-        roll -= (worst_score - score + 1.0).max(0.01);
-        if roll <= 0.0 {
-            return Some(*entry);
-        }
-    }
-    top.last().map(|(entry, _)| *entry)
-}
-
-fn weighted_least_inflight_score(
-    entry: &CredentialEntry,
-    model: Option<&str>,
-    now_ms: i64,
-    selection_pressure: f64,
-    config: &Config,
-) -> f64 {
-    let max_concurrent =
-        effective_max_concurrent_requests(entry, config.credential_max_concurrent_requests);
-    let inflight_component = if max_concurrent > 0 {
-        entry.in_flight_requests as f64 / max_concurrent as f64
-    } else {
-        entry.in_flight_requests as f64
-    };
-    let health = entry_effective_health(entry, model);
-    let probation_component = health
-        .probation_until_ms
-        .is_some_and(|until_ms| until_ms > now_ms) as u8 as f64;
-
-    entry.credentials.priority as f64 * config.scheduler_priority_weight.max(0.0)
-        + inflight_component * config.scheduler_load_weight.max(0.0)
-        + health.recent_error_rate.clamp(0.0, 1.0) * config.scheduler_error_weight.max(0.0)
-        + health.latency_ewma_ms.unwrap_or(0.0).max(0.0) * config.scheduler_latency_weight.max(0.0)
-        + probation_component * config.scheduler_probation_weight.max(0.0)
-        + selection_pressure.max(0.0) * config.scheduler_selection_pressure_weight.max(0.0)
-        + (entry.total_selection_count as f64).ln_1p()
-            * config.scheduler_total_selection_weight.max(0.0)
-}
-
-pub(super) fn balanced_selection_key(
-    entry: &CredentialEntry,
-) -> (u32, u32, u32, u32, u64, u64, u64) {
-    (
-        entry.credentials.priority,
-        entry.in_flight_requests,
-        entry.health.recent_selection_count_10s,
-        entry.health.recent_selection_count_60s,
-        entry.success_count,
-        entry.total_selection_count,
-        entry.id,
-    )
-}
-
-pub(super) fn priority_selection_key(
-    entry: &CredentialEntry,
-) -> (u32, u32, u32, u32, u64, u64, u64) {
-    (
-        entry.credentials.priority,
-        entry.in_flight_requests,
-        entry.health.recent_selection_count_10s,
-        entry.health.recent_selection_count_60s,
-        entry.success_count,
-        entry.total_selection_count,
-        entry.id,
-    )
-}
-
-fn effective_max_concurrent_requests(
-    entry: &CredentialEntry,
-    global_max_concurrent_requests: u32,
-) -> u32 {
-    entry
-        .credentials
-        .max_concurrent_requests
-        .unwrap_or(global_max_concurrent_requests)
 }

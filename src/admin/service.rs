@@ -38,13 +38,15 @@ use super::types::{
     SetCredentialOverageRequest, SetCredentialProxyRequest,
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
     SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
-    SetSupportedModelsRequest, SetWarmupRequest, SupportedModelsResponse, TestCredentialRequest,
-    TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest,
-    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
-    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupResumeRequest,
-    UsageCleanupStatusResponse, UsageDashboardAccountItem, UsageDashboardAccountsResponse,
-    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+    SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
+    SubscriptionModelListItem, SubscriptionModelListsResponse, SupportedModelsResponse,
+    SyncSubscriptionModelListRequest, TestCredentialRequest, TestCredentialResponse,
+    TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
+    UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
+    UsageDashboardAccountItem, UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::request_key_limits::{
     KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
@@ -114,6 +116,8 @@ use crate::storage::redis_cache::{RedisPatternDeleteStats, RedisStore};
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
+/// 账号列表每页上限，与前端分页选项的最大值一致。
+const MAX_CREDENTIALS_LIST_PAGE_LIMIT: usize = 1000;
 const MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 1;
 const MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 16;
 const MAX_LOCAL_RATE_LIMIT_RETRIES: u32 = 20;
@@ -2333,6 +2337,10 @@ impl AdminService {
             .iter()
             .filter(|credential| is_normal_account(credential))
             .count();
+        let unavailable = detailed
+            .iter()
+            .filter(|credential| is_unavailable_account(credential))
+            .count();
         CredentialSummaryResponse {
             total: snapshot.total,
             available: snapshot.available,
@@ -2352,6 +2360,7 @@ impl AdminService {
             cooling,
             quota_exhausted,
             account_error,
+            unavailable,
         }
     }
 
@@ -4497,10 +4506,10 @@ impl AdminService {
                 "没有选择要修改的账号".to_string(),
             ));
         }
-        if req.ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+        if req.ids.len() > MAX_CREDENTIALS_LIST_PAGE_LIMIT {
             return Err(AdminServiceError::InvalidCredential(format!(
                 "单次最多修改 {} 个账号",
-                MAX_CREDENTIALS_PAGE_LIMIT
+                MAX_CREDENTIALS_LIST_PAGE_LIMIT
             )));
         }
         if req.priority.is_none()
@@ -5649,25 +5658,216 @@ impl AdminService {
         Ok(ManualModelResponse::new(model, "手动模型已删除"))
     }
 
+    /// 订阅等级模型列表：每个已知等级一行，附带该等级的账号数。
+    pub fn get_subscription_model_lists(&self) -> SubscriptionModelListsResponse {
+        const TIERS: [&str; 6] = ["free", "students", "pro", "pro_plus", "pro_max", "power"];
+        let config = self.token_manager.runtime_config();
+        let snapshot = self.token_manager.snapshot();
+        let mut counts: HashMap<&'static str, (usize, usize)> = HashMap::new();
+        for entry in &snapshot.entries {
+            let tier = crate::model::model_support::subscription_tier_key(
+                entry.subscription_title.as_deref(),
+            );
+            let count = counts.entry(tier).or_default();
+            count.0 += 1;
+            if entry.supported_models.is_empty() {
+                count.1 += 1;
+            }
+        }
+        let mut tiers: Vec<String> = TIERS.iter().map(|tier| tier.to_string()).collect();
+        for tier in config.subscription_model_lists.keys() {
+            if !tiers.contains(tier) {
+                tiers.push(tier.clone());
+            }
+        }
+        let items = tiers
+            .into_iter()
+            .map(|tier| {
+                let list = config.subscription_model_lists.get(&tier);
+                let (credential_count, tier_limited_count) =
+                    counts.get(tier.as_str()).copied().unwrap_or_default();
+                SubscriptionModelListItem {
+                    label: subscription_label(&tier).to_string(),
+                    models: list.map(|list| list.models.clone()).unwrap_or_default(),
+                    source: list.map(|list| list.source.clone()),
+                    updated_at: list.and_then(|list| list.updated_at.clone()),
+                    source_credential_id: list.and_then(|list| list.source_credential_id),
+                    credential_count,
+                    tier_limited_count,
+                    tier,
+                }
+            })
+            .collect();
+        SubscriptionModelListsResponse { items }
+    }
+
+    fn validate_subscription_tier(tier: &str) -> Result<String, AdminServiceError> {
+        let tier = tier.trim().to_ascii_lowercase();
+        if matches!(
+            tier.as_str(),
+            "free" | "students" | "pro" | "pro_plus" | "pro_max" | "power"
+        ) {
+            Ok(tier)
+        } else {
+            Err(AdminServiceError::InvalidCredential(format!(
+                "未知订阅等级: {tier}，可选 free、students、pro、pro_plus、pro_max、power"
+            )))
+        }
+    }
+
+    /// 手动设置一个等级的模型列表；空列表删除该等级的列表（不限制）。
+    pub fn set_subscription_model_list(
+        &self,
+        tier: &str,
+        req: SetSubscriptionModelListRequest,
+    ) -> Result<SubscriptionModelListsResponse, AdminServiceError> {
+        let tier = Self::validate_subscription_tier(tier)?;
+        let models = normalize_supported_models(req.models);
+        let removed = models.is_empty();
+        let count = models.len();
+        let list = crate::model::config::SubscriptionModelList {
+            models,
+            source: "manual".to_string(),
+            updated_at: Some(Utc::now().to_rfc3339()),
+            source_credential_id: None,
+        };
+        let key = tier.clone();
+        self.token_manager
+            .update_runtime_config(move |config| {
+                if removed {
+                    config.subscription_model_lists.remove(&key);
+                } else {
+                    config.subscription_model_lists.insert(key, list);
+                }
+            })
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("保存订阅等级模型列表失败: {e}"))
+            })?;
+        self.audit(
+            "set_subscription_model_list",
+            "subscription_model_list",
+            Some(tier.clone()),
+            true,
+            None,
+            json!({ "tier": tier, "count": count, "removed": removed }),
+        );
+        Ok(self.get_subscription_model_lists())
+    }
+
+    /// 用该等级的一个账号重新获取模型列表并覆盖保存（手动同步）。
+    pub async fn sync_subscription_model_list(
+        &self,
+        tier: &str,
+        req: SyncSubscriptionModelListRequest,
+    ) -> Result<SubscriptionModelListsResponse, AdminServiceError> {
+        let tier = Self::validate_subscription_tier(tier)?;
+        let snapshot = self.token_manager.snapshot();
+        let credential_id = match req.credential_id {
+            Some(id) => {
+                let entry = snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .ok_or(AdminServiceError::NotFound { id })?;
+                let actual = crate::model::model_support::subscription_tier_key(
+                    entry.subscription_title.as_deref(),
+                );
+                if actual != tier {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "账号 #{id} 的订阅等级是 {actual}，不是 {tier}"
+                    )));
+                }
+                id
+            }
+            None => snapshot
+                .entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .find(|entry| {
+                    crate::model::model_support::subscription_tier_key(
+                        entry.subscription_title.as_deref(),
+                    ) == tier
+                })
+                .map(|entry| entry.id)
+                .ok_or_else(|| {
+                    AdminServiceError::InvalidCredential(format!(
+                        "没有可用的 {} 账号可以获取模型列表",
+                        subscription_label(&tier)
+                    ))
+                })?,
+        };
+        let models = self
+            .discover_credential_supported_model_variants(credential_id)
+            .await?;
+        if models.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "账号 #{credential_id} 返回空模型列表，未保存"
+            )));
+        }
+        let count = models.len();
+        let list = crate::model::config::SubscriptionModelList {
+            models,
+            source: "manual".to_string(),
+            updated_at: Some(Utc::now().to_rfc3339()),
+            source_credential_id: Some(credential_id),
+        };
+        let key = tier.clone();
+        self.token_manager
+            .update_runtime_config(move |config| {
+                config.subscription_model_lists.insert(key, list);
+            })
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("保存订阅等级模型列表失败: {e}"))
+            })?;
+        self.audit(
+            "sync_subscription_model_list",
+            "subscription_model_list",
+            Some(tier.clone()),
+            true,
+            None,
+            json!({ "tier": tier, "count": count, "credentialId": credential_id }),
+        );
+        Ok(self.get_subscription_model_lists())
+    }
+
     /// 导出完整凭据。仅格式化当前内存快照，不修改凭据状态。
+    ///
+    /// `selected_ids` 和 `filter` 二选一：前者导出选中账号，后者按账号列表的筛选规则
+    /// 导出匹配账号；都为空时导出全部。导出内容只有凭据配置，不带运行状态。
     pub fn export_credentials(
         &self,
         format: &str,
         selected_ids: &[u64],
-        disabled_only: bool,
-    ) -> Result<(String, String), AdminServiceError> {
-        let mut credentials = self.token_manager.export_credentials();
-        if disabled_only {
-            credentials.retain(|credential| credential.disabled);
-            if credentials.is_empty() {
-                return Err(AdminServiceError::InvalidCredential(
-                    "没有可导出的已禁用凭据".to_string(),
-                ));
-            }
+        filter: Option<&CredentialListQuery>,
+    ) -> Result<(String, String, usize), AdminServiceError> {
+        if !selected_ids.is_empty() && filter.is_some() {
+            return Err(AdminServiceError::InvalidCredential(
+                "选中账号和筛选条件不能同时用于导出".to_string(),
+            ));
         }
+        let mut credentials = self.token_manager.export_credentials();
         let selected_id_set: HashSet<u64> = selected_ids.iter().copied().collect();
         let selected = !selected_id_set.is_empty();
         filter_export_credentials_by_ids(&mut credentials, &selected_id_set)?;
+        if let Some(filter) = filter {
+            let matching_ids: HashSet<u64> = self
+                .credential_status_items(CredentialStatusBuildOptions {
+                    include_account_info: true,
+                    include_cost_summary: false,
+                })
+                .7
+                .iter()
+                .filter(|credential| credential_matches_query(credential, filter))
+                .map(|credential| credential.id)
+                .collect();
+            credentials
+                .retain(|credential| credential.id.is_some_and(|id| matching_ids.contains(&id)));
+            if credentials.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "当前筛选条件下没有可导出的账号".to_string(),
+                ));
+            }
+        }
         let credential_count = credentials.len();
         let normalized = format.trim().to_ascii_lowercase();
         let result = match normalized.as_str() {
@@ -5675,7 +5875,7 @@ impl AdminService {
                 let body = serde_json::to_string_pretty(&credentials).map_err(|e| {
                     AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                 })?;
-                Ok((body, "kiro-credentials.json".to_string()))
+                Ok((body, "kiro-credentials.json".to_string(), credential_count))
             }
             "backup-json" | "wrapped-json" => {
                 let export = CredentialsBackupExport {
@@ -5686,7 +5886,11 @@ impl AdminService {
                 let body = serde_json::to_string_pretty(&export).map_err(|e| {
                     AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                 })?;
-                Ok((body, "kiro-credentials-backup.json".to_string()))
+                Ok((
+                    body,
+                    "kiro-credentials-backup.json".to_string(),
+                    credential_count,
+                ))
             }
             "jsonl" => {
                 let mut lines = Vec::with_capacity(credentials.len());
@@ -5695,7 +5899,11 @@ impl AdminService {
                         AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                     })?);
                 }
-                Ok((lines.join("\n"), "kiro-credentials.jsonl".to_string()))
+                Ok((
+                    lines.join("\n"),
+                    "kiro-credentials.jsonl".to_string(),
+                    credential_count,
+                ))
             }
             _ => Err(AdminServiceError::InvalidCredential(format!(
                 "不支持的导出格式: {}，可选 json、backup-json、jsonl",
@@ -5713,7 +5921,7 @@ impl AdminService {
                 "count": credential_count,
                 "selected": selected,
                 "requestedIds": selected_ids.len(),
-                "disabledOnly": disabled_only,
+                "filter": filter.map(export_filter_audit_detail),
             }),
         );
         result
@@ -6043,7 +6251,7 @@ impl AdminService {
             tracing::warn!("查询 Admin 审计日志失败: {}", err);
             AdminAuditLogPage {
                 page: page.max(1),
-                limit: if limit == 0 { 20 } else { limit.min(200) },
+                limit: if limit == 0 { 20 } else { limit.min(1000) },
                 has_next: false,
                 records: Vec::new(),
             }
@@ -6099,6 +6307,14 @@ impl AdminService {
             credential_network_error_cooldown_secs: config.credential_network_error_cooldown_secs,
             credential_stream_error_cooldown_secs: config.credential_stream_error_cooldown_secs,
             credential_empty_turn_cooldown_enabled: config.credential_empty_turn_cooldown_enabled,
+            credential_upstream_failure_cooldown_enabled: config
+                .credential_upstream_failure_cooldown_enabled,
+            credential_auto_heal_min_interval_secs: config.credential_auto_heal_min_interval_secs,
+            credential_auto_heal_max_consecutive_rounds: config
+                .credential_auto_heal_max_consecutive_rounds,
+            kiro_version_auto_sync_enabled: config.kiro_version_auto_sync_enabled,
+            kiro_version_latest: crate::kiro::kiro_version::latest(),
+            kiro_runtime_domain_enabled: config.kiro_runtime_domain_enabled,
             credential_protocol_error_cooldown_secs: config.credential_protocol_error_cooldown_secs,
             credential_auth_error_cooldown_secs: config.credential_auth_error_cooldown_secs,
             credential_cooldown_backoff_multiplier: config.credential_cooldown_backoff_multiplier,
@@ -6106,8 +6322,11 @@ impl AdminService {
             credential_probation_secs: config.credential_probation_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
+            credential_session_max_concurrent_requests: config
+                .credential_session_max_concurrent_requests,
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            kiro_upstream_stream_max_duration_secs: config.kiro_upstream_stream_max_duration_secs,
             stream_keepalive_interval_secs: config.stream_keepalive_interval_secs,
             stream_pre_output_hold_secs: config.stream_pre_output_hold_secs,
             stream_first_output_timeout_secs: config.stream_first_output_timeout_secs,
@@ -6288,12 +6507,18 @@ impl AdminService {
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
+        let credential_session_max_concurrent_requests = req
+            .credential_session_max_concurrent_requests
+            .unwrap_or(current_config.credential_session_max_concurrent_requests);
         let kiro_upstream_response_timeout_secs = req
             .kiro_upstream_response_timeout_secs
             .unwrap_or(current_config.kiro_upstream_response_timeout_secs);
         let kiro_upstream_stream_idle_timeout_secs = req
             .kiro_upstream_stream_idle_timeout_secs
             .unwrap_or(current_config.kiro_upstream_stream_idle_timeout_secs);
+        let kiro_upstream_stream_max_duration_secs = req
+            .kiro_upstream_stream_max_duration_secs
+            .unwrap_or(current_config.kiro_upstream_stream_max_duration_secs);
         let stream_keepalive_interval_secs = req
             .stream_keepalive_interval_secs
             .unwrap_or(current_config.stream_keepalive_interval_secs);
@@ -6381,6 +6606,23 @@ impl AdminService {
         let credential_empty_turn_cooldown_enabled = req
             .credential_empty_turn_cooldown_enabled
             .unwrap_or(current_config.credential_empty_turn_cooldown_enabled);
+        let credential_upstream_failure_cooldown_enabled = req
+            .credential_upstream_failure_cooldown_enabled
+            .unwrap_or(current_config.credential_upstream_failure_cooldown_enabled);
+        let credential_auto_heal_min_interval_secs = req
+            .credential_auto_heal_min_interval_secs
+            .unwrap_or(current_config.credential_auto_heal_min_interval_secs)
+            .min(86_400);
+        let credential_auto_heal_max_consecutive_rounds = req
+            .credential_auto_heal_max_consecutive_rounds
+            .unwrap_or(current_config.credential_auto_heal_max_consecutive_rounds)
+            .min(1_000);
+        let kiro_version_auto_sync_enabled = req
+            .kiro_version_auto_sync_enabled
+            .unwrap_or(current_config.kiro_version_auto_sync_enabled);
+        let kiro_runtime_domain_enabled = req
+            .kiro_runtime_domain_enabled
+            .unwrap_or(current_config.kiro_runtime_domain_enabled);
         let credential_protocol_error_cooldown_secs = req
             .credential_protocol_error_cooldown_secs
             .unwrap_or(current_config.credential_protocol_error_cooldown_secs);
@@ -6640,6 +6882,11 @@ impl AdminService {
                 "credentialCooldownBackoffMultiplier 必须在 1 到 10 之间".to_string(),
             ));
         }
+        if credential_session_max_concurrent_requests > 1_000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialSessionMaxConcurrentRequests 不能大于 1000".to_string(),
+            ));
+        }
         if credential_cooldown_jitter_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialCooldownJitterPercent 不能大于 100".to_string(),
@@ -6724,6 +6971,14 @@ impl AdminService {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamStreamIdleTimeoutSecs 不能大于 86400".to_string(),
             ));
+        }
+        if kiro_upstream_stream_max_duration_secs
+            > crate::model::config::KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "kiroUpstreamStreamMaxDurationSecs 不能大于 {}",
+                crate::model::config::KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS
+            )));
         }
         if !(crate::model::config::STREAM_KEEPALIVE_INTERVAL_MIN_SECS
             ..=crate::model::config::STREAM_KEEPALIVE_INTERVAL_MAX_SECS)
@@ -6930,6 +7185,14 @@ impl AdminService {
                     credential_stream_error_cooldown_secs;
                 config.credential_empty_turn_cooldown_enabled =
                     credential_empty_turn_cooldown_enabled;
+                config.credential_upstream_failure_cooldown_enabled =
+                    credential_upstream_failure_cooldown_enabled;
+                config.credential_auto_heal_min_interval_secs =
+                    credential_auto_heal_min_interval_secs;
+                config.credential_auto_heal_max_consecutive_rounds =
+                    credential_auto_heal_max_consecutive_rounds;
+                config.kiro_version_auto_sync_enabled = kiro_version_auto_sync_enabled;
+                config.kiro_runtime_domain_enabled = kiro_runtime_domain_enabled;
                 config.credential_protocol_error_cooldown_secs =
                     credential_protocol_error_cooldown_secs;
                 config.credential_auth_error_cooldown_secs = credential_auth_error_cooldown_secs;
@@ -6939,9 +7202,13 @@ impl AdminService {
                 config.credential_probation_secs = credential_probation_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
+                config.credential_session_max_concurrent_requests =
+                    credential_session_max_concurrent_requests;
                 config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
                 config.kiro_upstream_stream_idle_timeout_secs =
                     kiro_upstream_stream_idle_timeout_secs;
+                config.kiro_upstream_stream_max_duration_secs =
+                    kiro_upstream_stream_max_duration_secs;
                 config.stream_keepalive_interval_secs = stream_keepalive_interval_secs;
                 config.stream_pre_output_hold_secs = stream_pre_output_hold_secs;
                 config.stream_first_output_timeout_secs = stream_first_output_timeout_secs;
@@ -7110,16 +7377,9 @@ impl AdminService {
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if !matches!(
-            req.mode.as_str(),
-            "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-        ) {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority'、'balanced'、'health_balanced' 或 'weighted_least_inflight'"
-                    .to_string(),
-            ));
-        }
+        req.mode
+            .parse::<crate::kiro::token_manager::LoadBalancingMode>()
+            .map_err(AdminServiceError::InvalidCredential)?;
 
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())
@@ -7416,7 +7676,7 @@ fn normalize_credentials_limit(limit: usize) -> usize {
     if limit == 0 {
         DEFAULT_CREDENTIALS_PAGE_LIMIT
     } else {
-        limit.min(MAX_CREDENTIALS_PAGE_LIMIT)
+        limit.min(MAX_CREDENTIALS_LIST_PAGE_LIMIT)
     }
 }
 
@@ -8029,6 +8289,14 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
         || config.local_pool_circuit_open_secs > 24 * 60 * 60
     {
         return Err("localPoolCircuitOpenSecs 必须在 1 到 86400 之间".to_string());
+    }
+    if config.local_pool_circuit_min_ratio_percent > 100 {
+        return Err("localPoolCircuitMinRatioPercent 必须在 0 到 100 之间".to_string());
+    }
+    if config.local_pool_circuit_half_open_probes == 0
+        || config.local_pool_circuit_half_open_probes > 1_000
+    {
+        return Err("localPoolCircuitHalfOpenProbes 必须在 1 到 1000 之间".to_string());
     }
     if config.external_pool_auto_disable_failure_threshold == 0
         || config.external_pool_auto_disable_failure_threshold > 10_000
@@ -8966,6 +9234,7 @@ fn credential_matches_query(
             "quota_exhausted" | "quota-exhausted" => is_quota_exhausted(credential),
             "account_error" | "account-error" => is_account_error(credential),
             "normal" => is_normal_account(credential),
+            "unavailable" => is_unavailable_account(credential),
             "proxy_blocked" | "proxy-blocked" => matches!(
                 credential.effective_proxy_source.as_str(),
                 "resource_disabled" | "resource_missing"
@@ -9139,7 +9408,9 @@ fn credential_base_matches_query(
                 subscription_key(credential.subscription_title.as_deref()) == "unknown"
             }
             // Runtime-owned statuses are hydrated separately; keep the base list broad.
-            "current" | "cooldown" | "rate_limited" | "rate-limited" | "error" => true,
+            "current" | "cooldown" | "rate_limited" | "rate-limited" | "error" | "unavailable" => {
+                true
+            }
             _ => true,
         };
         if !matched {
@@ -9180,6 +9451,7 @@ fn status_requires_runtime_filter(status: &str) -> bool {
             | "account_error"
             | "account-error"
             | "normal"
+            | "unavailable"
             | "error"
     )
 }
@@ -9398,41 +9670,7 @@ fn compare_subscription_change(
 }
 
 fn subscription_key(title: Option<&str>) -> String {
-    let Some(title) = title else {
-        return "unknown".to_string();
-    };
-    let lower = title.trim().to_lowercase();
-    if lower.is_empty() {
-        return "unknown".to_string();
-    }
-    let compact: String = lower
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect();
-    if compact.contains("student") {
-        "students".to_string()
-    } else if compact.contains("power") {
-        "power".to_string()
-    } else if compact.contains("promax") {
-        "pro_max".to_string()
-    } else if lower.contains("pro+")
-        || lower.contains("pro plus")
-        || lower.contains("pro_plus")
-        || lower.contains("pro-plus")
-        || compact.contains("proplus")
-    {
-        "pro_plus".to_string()
-    } else if lower.contains("trial") || lower.contains("试用") {
-        // Kiro no longer publishes Trial as a subscription tier. Treat legacy
-        // trial labels as the current Free tier for filtering and display.
-        "free".to_string()
-    } else if lower.contains("free") || lower.contains("免费") {
-        "free".to_string()
-    } else if lower.contains("pro") {
-        "pro".to_string()
-    } else {
-        "unknown".to_string()
-    }
+    crate::model::model_support::subscription_tier_key(title).to_string()
 }
 
 fn subscription_rank(title: Option<&str>) -> u8 {
@@ -10567,6 +10805,30 @@ async fn persist_usage_cleanup_progress(
     Ok(cancel_requested)
 }
 
+/// 审计里只记录实际用到的筛选条件。
+fn export_filter_audit_detail(filter: &CredentialListQuery) -> serde_json::Value {
+    let mut detail = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            detail.insert(key.to_string(), value);
+        }
+    };
+    put("q", filter.q.clone().map(Into::into));
+    put("credentialId", filter.credential_id.map(Into::into));
+    put("account", filter.account.clone().map(Into::into));
+    put("region", filter.region.clone().map(Into::into));
+    put("model", filter.model.clone().map(Into::into));
+    put("endpoint", filter.endpoint.clone().map(Into::into));
+    put("priority", filter.priority.map(Into::into));
+    put("rpm", filter.rpm.map(Into::into));
+    put("concurrency", filter.concurrency.map(Into::into));
+    put("status", filter.status.clone().map(Into::into));
+    put("authMethod", filter.auth_method.clone().map(Into::into));
+    put("subscription", filter.subscription.clone().map(Into::into));
+    put("proxyResourceId", filter.proxy_resource_id.map(Into::into));
+    serde_json::Value::Object(detail)
+}
+
 fn filter_export_credentials_by_ids(
     credentials: &mut Vec<KiroCredentials>,
     selected_id_set: &HashSet<u64>,
@@ -10660,6 +10922,11 @@ fn is_cooling_account(credential: &CredentialStatusItem) -> bool {
         && !is_account_error(credential)
 }
 
+/// 不可用：已禁用、额度用尽或账号异常。冷却会自行恢复，不算在内。
+fn is_unavailable_account(credential: &CredentialStatusItem) -> bool {
+    credential.disabled || is_quota_exhausted(credential) || is_account_error(credential)
+}
+
 fn is_normal_account(credential: &CredentialStatusItem) -> bool {
     !credential.disabled
         && !credential.cooled_down
@@ -10734,7 +11001,7 @@ fn collect_model_id_item(value: &Value, out: &mut Vec<String>) {
 
 #[cfg(test)]
 #[path = "service_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 // ============ 路由场景辅助 ============
 
@@ -10937,6 +11204,81 @@ impl AdminService {
         .await;
         result.map(|response| response.credential_id)
     }
+}
+
+// Seams for the read-only public pool view (`public_pool.rs`). The view keeps its own router and
+// response types; it only borrows the account snapshot, the status rules and the runtime switch.
+impl AdminService {
+    pub(super) fn public_pool_enabled(&self) -> bool {
+        self.token_manager.public_pool_view_enabled()
+    }
+
+    pub(super) fn public_pool_free_accounts(&self) -> crate::model::config::PublicPoolFreeAccounts {
+        self.token_manager.public_pool_free_accounts()
+    }
+
+    pub(super) fn set_public_pool_config(
+        &self,
+        enabled: bool,
+        free_accounts: crate::model::config::PublicPoolFreeAccounts,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_runtime_config(|config| {
+                config.public_pool_view_enabled = enabled;
+                config.public_pool_free_accounts = free_accounts;
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.audit(
+            "set_public_pool_view",
+            "runtime_config",
+            Some("public_pool_view".to_string()),
+            true,
+            None,
+            json!({ "enabled": enabled, "freeAccounts": free_accounts }),
+        );
+        Ok(())
+    }
+
+    /// Every account with its quota snapshot and usage totals, in the account page's default order.
+    pub(super) fn public_pool_credentials(&self) -> Vec<CredentialStatusItem> {
+        self.credential_status_items(
+            CredentialStatusBuildOptions::WITH_ACCOUNT_INFO_AND_COST_SUMMARY,
+        )
+        .7
+    }
+
+    pub(super) fn public_pool_dispatch_summary(
+        &self,
+    ) -> crate::kiro::token_manager::ManagerSummarySnapshot {
+        self.token_manager.summary_snapshot()
+    }
+
+    /// Per-model cooldowns live only in the runtime plane, not on `CredentialStatusItem`.
+    pub(super) fn public_pool_cooldowns(
+        &self,
+        ids: &[u64],
+    ) -> HashMap<u64, Vec<CredentialCooldown>> {
+        let snapshot = self.token_manager.runtime_snapshot_for_ids(ids);
+        snapshot
+            .entries
+            .into_iter()
+            .map(|entry| credential_runtime_item_from_snapshot(entry, snapshot.current_id))
+            .filter(|item| !item.cooldowns.is_empty())
+            .map(|item| (item.id, item.cooldowns))
+            .collect()
+    }
+}
+
+/// Whether `credential` falls under the account page's status filter `status` (`normal`,
+/// `cooling`, `quota_exhausted`, `account_error`, `disabled`, ...), with the same rules.
+pub(super) fn credential_matches_status(credential: &CredentialStatusItem, status: &str) -> bool {
+    credential_matches_query(
+        credential,
+        &CredentialListQuery {
+            status: Some(status.to_string()),
+            ..CredentialListQuery::default()
+        },
+    )
 }
 
 pub(super) fn balance_response_from_usage_public(

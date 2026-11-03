@@ -21,6 +21,7 @@ mod error;
 mod handlers;
 mod inventory;
 mod middleware;
+mod public_pool;
 mod route_scenarios;
 mod router;
 mod service;
@@ -28,5 +29,6 @@ pub mod types;
 
 pub use inventory::spawn_inventory_renewal_worker;
 pub use middleware::{AdminApiKeyStore, AdminState};
+pub use public_pool::create_public_pool_router;
 pub use router::create_admin_router;
 pub use service::{AdminService, AdminServiceDependencies};

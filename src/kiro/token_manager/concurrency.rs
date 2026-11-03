@@ -5,8 +5,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::common::capacity_signal::CapacitySignal;
@@ -17,7 +17,6 @@ use super::storage_task::spawn_best_effort_storage_task;
 use super::types::InFlightKind;
 
 const RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL: StdDuration = StdDuration::from_secs(15 * 60);
-const RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_PRUNE_THRESHOLD: usize = 4096;
 const RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT: usize = 200_000;
 const REDIS_CRITICAL_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const REDIS_CRITICAL_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
@@ -25,10 +24,63 @@ const DISPATCH_QUEUE_LEASE_RENEW_INTERVAL_MAX_SECS: u64 = 20;
 const SCHEDULER_REDIS_RELEASE_CAPACITY: usize = 65_536;
 const SCHEDULER_REDIS_RELEASE_BATCH_SIZE: usize = 16;
 const SCHEDULER_REDIS_RELEASE_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(30);
+/// Back-off cap when releases only timed out. A timeout means this process was too slow to get
+/// the answer, not that Redis is down; every second releases stay unapplied, Redis keeps those
+/// slots counted as in flight and selection keeps seeing full credentials, so retry soon.
+const SCHEDULER_REDIS_RELEASE_TIMEOUT_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(1);
 const SCHEDULER_REDIS_LEASE_TOUCH_INTERVAL_MAX: StdDuration = StdDuration::from_secs(30);
 const SCHEDULER_REDIS_LEASE_TOUCH_INTERVAL_MIN: StdDuration = StdDuration::from_millis(250);
+const LOCAL_LEASE_TOUCH_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
-pub(super) type ReleasedInFlightLeaseTombstones = Arc<Mutex<HashMap<(u64, u64), Instant>>>;
+pub(super) type ReleasedInFlightLeaseTombstones = Arc<Mutex<ReleasedLeaseTombstoneSet>>;
+
+/// Leases released locally whose release may not have reached Redis yet, kept for
+/// `RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL` so a stale Redis snapshot does not bring them back.
+///
+/// Every release inserts here, under a lock shared with the scheduler state sync. Expired
+/// entries are dropped from the front of an insertion-ordered queue, so pruning costs only what
+/// expired; scanning the whole map on each release (it stays above thousands of entries during
+/// a busy hour) put an O(n) step on every finished request.
+#[derive(Debug, Default)]
+pub(super) struct ReleasedLeaseTombstoneSet {
+    released_at: HashMap<(u64, u64), Instant>,
+    order: VecDeque<((u64, u64), Instant)>,
+}
+
+impl ReleasedLeaseTombstoneSet {
+    pub(super) fn contains_key(&self, key: &(u64, u64)) -> bool {
+        self.released_at.contains_key(key)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.released_at.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.released_at.len()
+    }
+
+    fn insert(&mut self, key: (u64, u64), now: Instant) {
+        self.released_at.insert(key, now);
+        self.order.push_back((key, now));
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some((key, released_at)) = self.order.front().copied() {
+            if now.saturating_duration_since(released_at) <= RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL
+                && self.order.len() <= RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT
+            {
+                break;
+            }
+            self.order.pop_front();
+            // A key inserted again later has a newer timestamp; keep that one.
+            if self.released_at.get(&key) == Some(&released_at) {
+                self.released_at.remove(&key);
+            }
+        }
+    }
+}
 
 pub(super) async fn release_redis_in_flight_lease_and_wakeup(
     redis: Arc<RedisStore>,
@@ -56,6 +108,7 @@ pub(super) async fn release_redis_in_flight_lease_and_wakeup(
                 lease_id,
                 tombstone,
                 &payload,
+                Some(&source_instance_id),
             ),
         )
         .await
@@ -223,9 +276,19 @@ pub(super) struct SchedulerRedisReleaseDispatcher {
     work_notify: Notify,
     state: Mutex<SchedulerRedisReleaseDispatcherState>,
     stats: SchedulerRedisReleaseDispatcherStats,
+    /// Called after a batch of releases reached Redis. Local waiters were woken when the slot was
+    /// released locally, but a selection made since then may have been refused by Redis (it still
+    /// counted the slot) and marked the credential full; now that Redis agrees, wake them again.
+    /// The wakeup this instance publishes is ignored by its own subscriber, so this is the only
+    /// signal for it.
+    on_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl SchedulerRedisReleaseDispatcher {
+    pub(super) fn set_on_released(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_released.set(Box::new(callback));
+    }
+
     pub(super) fn new(redis: Arc<RedisStore>, source_instance_id: Arc<str>) -> Arc<Self> {
         Arc::new(Self {
             redis,
@@ -235,6 +298,7 @@ impl SchedulerRedisReleaseDispatcher {
             work_notify: Notify::new(),
             state: Mutex::new(SchedulerRedisReleaseDispatcherState::default()),
             stats: SchedulerRedisReleaseDispatcherStats::default(),
+            on_released: OnceLock::new(),
         })
     }
 
@@ -368,6 +432,8 @@ impl SchedulerRedisReleaseDispatcher {
             let mut completed = 0usize;
             let mut failed = 0usize;
             let mut system_failed = false;
+            let mut only_timeouts = true;
+            let mut last_error: Option<String> = None;
             {
                 let mut state = self.state.lock();
                 for (intent, result) in results {
@@ -378,6 +444,12 @@ impl SchedulerRedisReleaseDispatcher {
                         Ok(()) => {}
                         Err(error) => {
                             failed += 1;
+                            last_error = Some(format!("{error:#}"));
+                            if !scheduler_release_error_is_intent_scoped(&error) {
+                                // Only failures that trigger the system-wide back-off matter
+                                // for how long that back-off may be.
+                                only_timeouts &= scheduler_release_error_is_timeout(&error);
+                            }
                             if scheduler_release_error_is_intent_scoped(&error) {
                                 if let Some(pending) = state.pending.get_mut(&intent) {
                                     pending.failures = pending.failures.saturating_add(1);
@@ -392,8 +464,11 @@ impl SchedulerRedisReleaseDispatcher {
                 }
                 if system_failed {
                     state.system_failures = state.system_failures.saturating_add(1);
-                    state.system_retry_at =
-                        Some(Instant::now() + scheduler_release_retry_delay(state.system_failures));
+                    let mut delay = scheduler_release_retry_delay(state.system_failures);
+                    if only_timeouts {
+                        delay = delay.min(SCHEDULER_REDIS_RELEASE_TIMEOUT_RETRY_MAX_DELAY);
+                    }
+                    state.system_retry_at = Some(Instant::now() + delay);
                 } else if completed > 0 {
                     state.system_failures = 0;
                     state.system_retry_at = None;
@@ -403,6 +478,9 @@ impl SchedulerRedisReleaseDispatcher {
                 self.stats
                     .completed
                     .fetch_add(completed as u64, Ordering::Relaxed);
+                if let Some(on_released) = self.on_released.get() {
+                    on_released();
+                }
             }
             if failed == 0 {
                 tokio::task::yield_now().await;
@@ -417,6 +495,7 @@ impl SchedulerRedisReleaseDispatcher {
                     batch_size = batch.len(),
                     completed,
                     failed,
+                    last_error = last_error.as_deref().unwrap_or_default(),
                     "Redis scheduler release reconciliation 未完整完成，保留 intent 并重试"
                 );
             }
@@ -479,6 +558,12 @@ fn scheduler_release_retry_delay(failures: u32) -> StdDuration {
     stable_release_retry_jitter(base, u64::from(failures))
 }
 
+fn scheduler_release_error_is_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("timed out after"))
+}
+
 fn scheduler_release_error_is_intent_scoped(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -524,37 +609,19 @@ impl Drop for RedisTouchInFlightReset {
     }
 }
 
-fn prune_released_in_flight_lease_tombstones_locked(
-    tombstones: &mut HashMap<(u64, u64), Instant>,
-    now: Instant,
-) {
-    tombstones.retain(|_, released_at| {
-        now.saturating_duration_since(*released_at) <= RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL
-    });
-    if tombstones.len() > RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT {
-        tombstones.clear();
-        tracing::warn!(
-            hard_limit = RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT,
-            "本地已释放并发 lease tombstone 超过硬上限，已清空以避免内存增长"
-        );
-    }
-}
-
 pub(super) fn record_released_in_flight_lease_tombstone(
-    tombstones: &Mutex<HashMap<(u64, u64), Instant>>,
+    tombstones: &Mutex<ReleasedLeaseTombstoneSet>,
     credential_id: u64,
     lease_id: u64,
 ) {
     let now = Instant::now();
     let mut tombstones = tombstones.lock();
     tombstones.insert((credential_id, lease_id), now);
-    if tombstones.len() >= RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_PRUNE_THRESHOLD {
-        prune_released_in_flight_lease_tombstones_locked(&mut tombstones, now);
-    }
+    tombstones.prune(now);
 }
 
 pub(super) fn filter_released_in_flight_leases_from_scheduler_states(
-    tombstones: &Mutex<HashMap<(u64, u64), Instant>>,
+    tombstones: &Mutex<ReleasedLeaseTombstoneSet>,
     states: &mut HashMap<u64, SchedulerCredentialState>,
 ) {
     if states.is_empty() {
@@ -562,7 +629,7 @@ pub(super) fn filter_released_in_flight_leases_from_scheduler_states(
     }
     let now = Instant::now();
     let mut tombstones = tombstones.lock();
-    prune_released_in_flight_lease_tombstones_locked(&mut tombstones, now);
+    tombstones.prune(now);
     if tombstones.is_empty() {
         return;
     }
@@ -587,8 +654,62 @@ pub struct InFlightLeaseGuard {
     redis_touch_epoch: Instant,
     redis_touch_interval_millis: AtomicU64,
     next_redis_touch_at_millis: AtomicU64,
+    /// Next time (ms since `redis_touch_epoch`) the local lease's `last_seen_at` is refreshed.
+    /// Streams call `touch` on every chunk; taking the entries lock that often, for hundreds of
+    /// concurrent streams, contends with every dispatch.
+    next_local_touch_at_millis: AtomicU64,
     redis_touch_in_flight: Arc<AtomicBool>,
     released: AtomicBool,
+    session_slot: Mutex<Option<SessionConcurrencySlot>>,
+}
+
+/// Per-session in-flight counts on one credential, keyed by (session id, credential id).
+pub(super) type SessionConcurrency = Arc<Mutex<HashMap<(String, u64), u32>>>;
+
+/// One request's share of its session's in-flight count on a credential. Dropping it (when the
+/// owning lease is released on any path) gives the share back, so the count cannot leak.
+pub(super) struct SessionConcurrencySlot {
+    counts: SessionConcurrency,
+    key: (String, u64),
+}
+
+impl SessionConcurrencySlot {
+    pub(super) fn acquire(
+        counts: &SessionConcurrency,
+        session_id: &str,
+        credential_id: u64,
+    ) -> Self {
+        let key = (session_id.to_string(), credential_id);
+        *counts.lock().entry(key.clone()).or_insert(0) += 1;
+        Self {
+            counts: counts.clone(),
+            key,
+        }
+    }
+}
+
+impl Drop for SessionConcurrencySlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
+pub(super) fn session_in_flight_on(
+    counts: &SessionConcurrency,
+    session_id: &str,
+    credential_id: u64,
+) -> u32 {
+    counts
+        .lock()
+        .get(&(session_id.to_string(), credential_id))
+        .copied()
+        .unwrap_or(0)
 }
 
 impl fmt::Debug for InFlightLeaseGuard {
@@ -630,9 +751,15 @@ impl InFlightLeaseGuard {
             redis_touch_epoch: Instant::now(),
             redis_touch_interval_millis: AtomicU64::new(redis_touch_interval_millis),
             next_redis_touch_at_millis: AtomicU64::new(redis_touch_interval_millis),
+            next_local_touch_at_millis: AtomicU64::new(0),
             redis_touch_in_flight: Arc::new(AtomicBool::new(false)),
             released: AtomicBool::new(false),
+            session_slot: Mutex::new(None),
         }
+    }
+
+    pub(super) fn attach_session_slot(&self, slot: SessionConcurrencySlot) {
+        *self.session_slot.lock() = Some(slot);
     }
 
     pub(super) fn credential_id(&self) -> u64 {
@@ -681,6 +808,7 @@ impl InFlightLeaseGuard {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.session_slot.lock().take();
         let release_kind = match self.redis_acquisition_state {
             RedisLeaseAcquisitionState::NotStarted
             | RedisLeaseAcquisitionState::Definitive { acquired: false } => None,
@@ -719,15 +847,23 @@ impl InFlightLeaseGuard {
     }
 
     pub fn touch(&self) {
-        touch_in_flight_lease_from_entries(&self.entries, self.credential_id, self.lease_id);
-        let Some(redis) = &self.redis_store else {
-            return;
-        };
         let elapsed_millis = self
             .redis_touch_epoch
             .elapsed()
             .as_millis()
             .min(u64::MAX as u128) as u64;
+        // `last_seen_at` only has to beat `credentialInFlightLeaseMaxSecs` (minutes); once a
+        // second is plenty.
+        if reserve_periodic_work(
+            &self.next_local_touch_at_millis,
+            elapsed_millis,
+            LOCAL_LEASE_TOUCH_INTERVAL.as_millis() as u64,
+        ) {
+            touch_in_flight_lease_from_entries(&self.entries, self.credential_id, self.lease_id);
+        }
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
         let interval_millis = self.redis_touch_interval_millis.load(Ordering::Acquire);
         if !reserve_periodic_work(
             &self.next_redis_touch_at_millis,
@@ -940,6 +1076,9 @@ fn release_in_flight_lease_from_entries(
         .iter()
         .position(|lease| lease.id == lease_id)
     {
+        // A slot of this credential just freed up: a stale "Redis says full" hint must not keep
+        // it out of selection.
+        entry.redis_full_until = None;
         let lease = entry.in_flight_leases.remove(index);
         let weight_units = lease.weight_units.max(1);
         if entry.in_flight_requests >= weight_units {
@@ -999,6 +1138,39 @@ fn set_in_flight_lease_kind_from_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tombstones_expire_from_the_front_and_keep_a_reinserted_key() {
+        let start = Instant::now();
+        let mut set = ReleasedLeaseTombstoneSet::default();
+        set.insert((1, 1), start);
+        set.insert((1, 2), start + StdDuration::from_secs(10));
+        set.insert((1, 1), start + StdDuration::from_secs(20));
+        set.prune(start + RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL + StdDuration::from_secs(5));
+        // The first (1, 1) expired, but it was released again later: still a tombstone.
+        assert!(set.contains_key(&(1, 1)));
+        assert!(set.contains_key(&(1, 2)));
+        set.prune(start + RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL + StdDuration::from_secs(15));
+        assert!(!set.contains_key(&(1, 2)));
+        assert!(set.contains_key(&(1, 1)));
+        set.prune(start + RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL + StdDuration::from_secs(25));
+        assert!(set.is_empty());
+        assert!(set.order.is_empty());
+    }
+
+    #[test]
+    fn tombstones_stay_bounded_without_ever_clearing_everything() {
+        let start = Instant::now();
+        let mut set = ReleasedLeaseTombstoneSet::default();
+        for lease in 0..(RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT as u64 + 10) {
+            set.insert((1, lease), start);
+            set.prune(start);
+        }
+        assert_eq!(set.len(), RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT);
+        // The newest releases are the ones kept.
+        assert!(set.contains_key(&(1, RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT as u64 + 9)));
+        assert!(!set.contains_key(&(1, 0)));
+    }
 
     fn classification_guard(tombstones: ReleasedInFlightLeaseTombstones) -> InFlightLeaseGuard {
         InFlightLeaseGuard::new(
@@ -1075,17 +1247,18 @@ mod tests {
 
     #[test]
     fn redis_acquire_failure_cleanup_distinguishes_not_started_commit_unknown_and_definitive() {
-        let not_started_tombstones = Arc::new(Mutex::new(HashMap::new()));
+        let not_started_tombstones = Arc::new(Mutex::new(ReleasedLeaseTombstoneSet::default()));
         classification_guard(not_started_tombstones.clone()).release();
         assert!(not_started_tombstones.lock().is_empty());
 
-        let commit_unknown_tombstones = Arc::new(Mutex::new(HashMap::new()));
+        let commit_unknown_tombstones = Arc::new(Mutex::new(ReleasedLeaseTombstoneSet::default()));
         let mut commit_unknown = classification_guard(commit_unknown_tombstones.clone());
         commit_unknown.arm_redis_commit_unknown();
         commit_unknown.release();
         assert!(commit_unknown_tombstones.lock().contains_key(&(7, 11)));
 
-        let definitive_rejection_tombstones = Arc::new(Mutex::new(HashMap::new()));
+        let definitive_rejection_tombstones =
+            Arc::new(Mutex::new(ReleasedLeaseTombstoneSet::default()));
         let mut definitive_rejection =
             classification_guard(definitive_rejection_tombstones.clone());
         definitive_rejection.arm_redis_commit_unknown();

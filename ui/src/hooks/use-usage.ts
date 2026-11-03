@@ -30,8 +30,11 @@ import {
   previewUsageCleanup,
   resumeUsageCleanup,
   startUsageCleanup,
+  getSubscriptionModelLists,
+  setSubscriptionModelList,
   syncModelCapabilities,
   syncModelPricing,
+  syncSubscriptionModelList,
   upsertManualModel,
 } from '@/api/usage'
 import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageExternalPoolRiskQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
@@ -441,5 +444,29 @@ export function useDeleteManualModel() {
       queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
       queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
     },
+  })
+}
+
+export function useSubscriptionModelLists() {
+  return useQuery({
+    queryKey: ['subscription-model-lists'],
+    queryFn: getSubscriptionModelLists,
+    refetchInterval: 60000,
+  })
+}
+
+export function useSetSubscriptionModelList() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ tier, models }: { tier: string; models: string[] }) => setSubscriptionModelList(tier, models),
+    onSuccess: (data) => queryClient.setQueryData(['subscription-model-lists'], data),
+  })
+}
+
+export function useSyncSubscriptionModelList() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ tier, credentialId }: { tier: string; credentialId?: number }) => syncSubscriptionModelList(tier, credentialId),
+    onSuccess: (data) => queryClient.setQueryData(['subscription-model-lists'], data),
   })
 }

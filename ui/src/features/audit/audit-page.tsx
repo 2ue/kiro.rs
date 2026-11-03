@@ -21,6 +21,7 @@ import {
   ToolbarSearch,
   ToolbarActions,
   useConfirm,
+  PageSizeSelect,
 } from '@/components/patterns'
 import {
   Badge,
@@ -186,7 +187,7 @@ function detailText(value: unknown): string {
   return JSON.stringify(value, null, 2)
 }
 
-const PAGE_LIMIT = 20
+const DEFAULT_PAGE_LIMIT = 20
 
 // ─── 详情弹窗 ─────────────────────────────────────────────────────────────────
 
@@ -337,8 +338,9 @@ const DEFAULT_ACCOUNT_FILTER: AccountFilterState = { range: '24', kind: '__all__
 function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => void }) {
   const [filter, setFilter] = useState<AccountFilterState>(DEFAULT_ACCOUNT_FILTER)
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_LIMIT)
   // Recomputed only when the filter or page changes, so the time window doesn't move on every render.
-  const query = useMemo(() => accountEventQuery(filter, page, PAGE_LIMIT), [filter, page])
+  const query = useMemo(() => accountEventQuery(filter, page, pageSize), [filter, page, pageSize])
   const logs = useAuditLogsPage(query)
   const summaryHours = filter.range === 'all' ? 720 : Number(filter.range)
   const summary = useAccountEventSummary(summaryHours, filter.source === '__all__' ? undefined : filter.source)
@@ -473,7 +475,14 @@ function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) 
               </TableBody>
             </Table>
           </div>
-          <PageNav page={page} hasNext={Boolean(logs.data?.hasNext)} pending={pending} onChange={setPage} />
+          <PageNav
+            page={page}
+            pageSize={pageSize}
+            hasNext={Boolean(logs.data?.hasNext)}
+            pending={pending}
+            onChange={setPage}
+            onPageSizeChange={(next) => { setPageSize(next); setPage(1) }}
+          />
         </>
       )}
     </div>
@@ -484,6 +493,7 @@ function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) 
 
 function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => void }) {
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_LIMIT)
   const [q, setQ] = useState('')
   const [successFilter, setSuccessFilter] = useState<'__all__' | 'success' | 'failed'>('__all__')
   const [categoryFilter, setCategoryFilter] = useState('__all__')
@@ -491,10 +501,10 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
 
   const query = useMemo<AdminAuditLogPageQuery>(() => ({
     page,
-    limit: PAGE_LIMIT,
+    limit: pageSize,
     success: successFilter === '__all__' ? undefined : successFilter === 'success',
     objectType: categoryFilter === 'credential' || categoryFilter === 'external_pool' ? categoryFilter : undefined,
-  }), [page, successFilter, categoryFilter])
+  }), [page, pageSize, successFilter, categoryFilter])
   const logs = useAuditLogsPage(query)
   const pending = logs.isPlaceholderData || logs.isFetching
 
@@ -644,23 +654,38 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
               </TableBody>
             </Table>
           </div>
-          <PageNav page={page} hasNext={Boolean(logs.data?.hasNext)} pending={pending} onChange={setPage} />
+          <PageNav
+            page={page}
+            pageSize={pageSize}
+            hasNext={Boolean(logs.data?.hasNext)}
+            pending={pending}
+            onChange={setPage}
+            onPageSizeChange={(next) => { setPageSize(next); setPage(1) }}
+          />
         </>
       )}
     </div>
   )
 }
 
-function PageNav({ page, hasNext, pending, onChange }: { page: number; hasNext: boolean; pending: boolean; onChange: (page: number) => void }) {
+function PageNav({ page, pageSize, hasNext, pending, onChange, onPageSizeChange }: {
+  page: number
+  pageSize: number
+  hasNext: boolean
+  pending: boolean
+  onChange: (page: number) => void
+  onPageSizeChange: (pageSize: number) => void
+}) {
   return (
-    <div className="flex items-center justify-center gap-3 py-1">
+    <div className="flex flex-wrap items-center justify-center gap-3 py-1">
       <Button variant="outline" size="sm" disabled={page === 1 || pending} onClick={() => onChange(Math.max(1, page - 1))}>
         上一页
       </Button>
-      <span className="text-xs text-muted-foreground">第 {page} 页，每页 {PAGE_LIMIT} 条</span>
+      <span className="text-xs text-muted-foreground">第 {page} 页</span>
       <Button variant="outline" size="sm" disabled={!hasNext || pending} onClick={() => onChange(page + 1)}>
         下一页
       </Button>
+      <PageSizeSelect value={pageSize} onChange={onPageSizeChange} disabled={pending} />
     </div>
   )
 }

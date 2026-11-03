@@ -2,21 +2,23 @@ import { useLocation } from 'react-router-dom'
 import { LogOut, Menu, Moon, Sun } from 'lucide-react'
 import { Button } from '@/components/ui'
 import { getPageFromPathname, domainLabelOf } from '@/app/router-utils'
-import { pageMeta } from '@/types/ui'
+import { pageMeta, type PageKey } from '@/types/ui'
 import { useTheme } from '@/app/theme'
 
-export function Topbar({
+function TopbarView({
+  page,
   onLogout,
   onOpenMobileMenu,
+  onToggleTheme,
 }: {
-  onLogout: () => void
-  onOpenMobileMenu: () => void
+  page: PageKey
+  onLogout?: () => void
+  onOpenMobileMenu?: () => void
+  onToggleTheme?: () => void
 }) {
-  const location = useLocation()
-  const page = getPageFromPathname(location.pathname)
   const meta = pageMeta[page]
   const domainLabel = domainLabelOf(page)
-  const { theme, toggleTheme } = useTheme()
+  const { theme } = useTheme()
 
   return (
     <header className="sticky top-0 z-30 flex h-[var(--header-h)] shrink-0 items-center gap-4 bg-card/85 px-4 backdrop-blur-md lg:px-6">
@@ -46,7 +48,7 @@ export function Topbar({
       <Button
         variant="ghost"
         size="icon-sm"
-        onClick={toggleTheme}
+        onClick={onToggleTheme}
         aria-label={theme === 'dark' ? '切换到亮色' : '切换到暗色'}
         title={theme === 'dark' ? '切换到亮色' : '切换到暗色'}
       >
@@ -64,4 +66,28 @@ export function Topbar({
       </Button>
     </header>
   )
+}
+
+export function Topbar({
+  onLogout,
+  onOpenMobileMenu,
+}: {
+  onLogout: () => void
+  onOpenMobileMenu: () => void
+}) {
+  const location = useLocation()
+  const { toggleTheme } = useTheme()
+  return (
+    <TopbarView
+      page={getPageFromPathname(location.pathname)}
+      onLogout={onLogout}
+      onOpenMobileMenu={onOpenMobileMenu}
+      onToggleTheme={toggleTheme}
+    />
+  )
+}
+
+/** The same top bar for the public read-only pool page: every button is there and does nothing. */
+export function InertTopbar({ page }: { page: PageKey }) {
+  return <TopbarView page={page} />
 }

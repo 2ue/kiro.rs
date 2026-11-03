@@ -32,21 +32,20 @@ pub(super) fn entry_rate_limit_window_remaining(
         return None;
     }
 
-    let mut count = 0_u32;
-    let mut oldest: Option<Instant> = None;
-    for selected_at in &entry.selection_events {
-        if now.saturating_duration_since(*selected_at) > RPM_WINDOW {
-            continue;
-        }
-        count = count.saturating_add(1);
-        oldest = Some(oldest.map_or(*selected_at, |current| current.min(*selected_at)));
-    }
-
-    if count < rpm {
+    // `selection_events` is in time order (see `record_local_selection`), so the window is a
+    // suffix found by binary search. This runs for every account on every dispatch scan; a
+    // linear walk over five minutes of selections made a 300-account scan tens of thousands
+    // of comparisons under the entries lock.
+    let events = &entry.selection_events;
+    let first_in_window = events
+        .partition_point(|selected_at| now.saturating_duration_since(*selected_at) > RPM_WINDOW);
+    let count = events.len() - first_in_window;
+    if count < rpm as usize {
         return None;
     }
 
-    oldest
+    events
+        .get(first_in_window)
         .and_then(|selected_at| selected_at.checked_add(RPM_WINDOW))
         .and_then(|available_at| available_at.checked_duration_since(now))
 }

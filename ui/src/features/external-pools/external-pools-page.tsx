@@ -200,7 +200,9 @@ export function ExternalPoolsPage() {
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
           localPoolCircuitRequireDistinctCredentials: whole(configDraft.localPoolCircuitRequireDistinctCredentials),
+          localPoolCircuitMinRatioPercent: whole(configDraft.localPoolCircuitMinRatioPercent),
           localPoolCircuitOpenSecs: whole(configDraft.localPoolCircuitOpenSecs, 1),
+          localPoolCircuitHalfOpenProbes: whole(configDraft.localPoolCircuitHalfOpenProbes, 1),
           externalPoolAutoDisableFailureThreshold: whole(configDraft.externalPoolAutoDisableFailureThreshold, 1),
           externalPoolAutoDisableWindowSecs: whole(configDraft.externalPoolAutoDisableWindowSecs, 1),
           externalPoolAutoDisableDurationSecs: whole(configDraft.externalPoolAutoDisableDurationSecs),
@@ -481,9 +483,10 @@ export function ExternalPoolsPage() {
                 <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <ToggleRow label="启用本地保护统计" checked={configDraft.localPoolCircuitEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitEnabled: v }))} />
                   <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="统计窗口" suffix="秒" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitWindowSecs: v }))} />
-                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="失败阈值" suffix="次" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitOpenAfterFailures: v }))} />
-                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="涉及账号" suffix="个" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitRequireDistinctCredentials: v }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="至少被风控账号" suffix="个" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitRequireDistinctCredentials: v, localPoolCircuitOpenAfterFailures: v }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="且占可用账号" suffix="%" value={configDraft.localPoolCircuitMinRatioPercent} min={0} max={100} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitMinRatioPercent: v }))} />
                   <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="暂停时长" suffix="秒" value={configDraft.localPoolCircuitOpenSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitOpenSecs: v }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="恢复时探测请求" suffix="个" value={configDraft.localPoolCircuitHalfOpenProbes} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitHalfOpenProbes: v }))} />
                 </div>
               </FormSection>
             </div>

@@ -247,8 +247,61 @@ pub fn model_is_supported_by_list(models: &[String], candidates: &[Option<&str>]
     false
 }
 
+/// Subscription tier of a Kiro subscription title, the same keys the account page uses:
+/// `free`, `students`, `pro`, `pro_plus`, `pro_max`, `power`, or `unknown`.
+pub fn subscription_tier_key(title: Option<&str>) -> &'static str {
+    let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) else {
+        return "unknown";
+    };
+    let lower = title.to_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if compact.contains("student") {
+        "students"
+    } else if compact.contains("power") {
+        "power"
+    } else if compact.contains("promax") {
+        "pro_max"
+    } else if lower.contains("pro+")
+        || lower.contains("pro plus")
+        || lower.contains("pro_plus")
+        || lower.contains("pro-plus")
+        || compact.contains("proplus")
+    {
+        "pro_plus"
+    } else if lower.contains("trial") || lower.contains("试用") {
+        // Kiro no longer publishes Trial as a tier; legacy trial labels are Free.
+        "free"
+    } else if lower.contains("free") || lower.contains("免费") {
+        "free"
+    } else if lower.contains("pro") {
+        "pro"
+    } else {
+        "unknown"
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscription_tier_key_matches_kiro_titles() {
+        for (title, tier) in [
+            (Some("KIRO FREE"), "free"),
+            (Some("Kiro Free Trial"), "free"),
+            (Some("KIRO PRO"), "pro"),
+            (Some("KIRO PRO+"), "pro_plus"),
+            (Some("KIRO PRO MAX"), "pro_max"),
+            (Some("KIRO POWER"), "power"),
+            (Some("Kiro Students"), "students"),
+            (Some(""), "unknown"),
+            (None, "unknown"),
+        ] {
+            assert_eq!(super::subscription_tier_key(title), tier, "{title:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

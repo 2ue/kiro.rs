@@ -15,12 +15,13 @@ use std::{
     future::{Future, IntoFuture},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::Context as _;
+use axum::serve::ListenerExt as _;
 use axum::{
     Json, Router,
     extract::State,
@@ -45,10 +46,32 @@ use storage::redis_cache::RedisStore;
 use storage::usage_demo_seed::seed_usage_demo;
 
 const STARTUP_DEPENDENCY_MAX_WAIT: StdDuration = StdDuration::from_secs(60);
-const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
-const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(15);
-const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
-const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+// `docker stop` sends SIGKILL 10 seconds after SIGTERM by default. Everything below has to fit
+// in that window, or the usage records still queued in memory are lost: by default at most 5 s
+// for HTTP connections to drain (queued requests answer at once, see `begin_shutdown`), then at
+// most 4 s for background work, with the usage writers drained first. Streams still running
+// when the drain ends are cut, so deployments with a longer grace period raise the drain with
+// `KIRO_RS_HTTP_DRAIN_SECS` (grace period minus about 10 s).
+const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const SERVER_GRACEFUL_SHUTDOWN_MAX: StdDuration = StdDuration::from_secs(600);
+
+fn server_graceful_shutdown_timeout() -> StdDuration {
+    std::env::var("KIRO_RS_HTTP_DRAIN_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(StdDuration::from_secs)
+        .map(|drain| drain.min(SERVER_GRACEFUL_SHUTDOWN_MAX))
+        .unwrap_or(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT)
+}
+const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
+const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(4);
+const SHUTDOWN_LEASE_RELEASE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
+const READYZ_DEPENDENCY_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+/// A dependency check that misses its timeout is only reported as not ready once the dependency
+/// has had no successful check for this long. Under full load a ping waits behind the requests
+/// sharing its connection pool, and one slow answer is a busy dependency, not a down one.
+const READYZ_DEPENDENCY_GRACE: StdDuration = StdDuration::from_secs(10);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 const MODEL_CAPABILITY_HEALTH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const MODEL_CAPABILITY_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(300);
@@ -559,7 +582,11 @@ async fn async_main() {
     });
     let token_manager = Arc::new(token_manager);
     let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
+    common::runtime_lag::spawn_probe();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
+    let _kiro_version_sync_task = kiro::kiro_version::spawn_auto_sync(token_manager.clone());
+    let scheduler_instance_heartbeat_worker =
+        token_manager.spawn_scheduler_instance_heartbeat_worker();
     let external_pool_manager = Arc::new(ExternalPoolManager::new(
         postgres_store.clone(),
         redis_store.clone(),
@@ -583,6 +610,7 @@ async fn async_main() {
         config.default_endpoint.clone(),
     );
     let kiro_provider = Arc::new(kiro_provider);
+    kiro_provider.attach_runtime(model_capabilities.clone());
     let initial_capability_cohort_keys = kiro_provider.model_capability_cohort_keys();
     let initial_contract_match = model_capabilities
         .reasoning_capability_cohort_contract_match(&initial_capability_cohort_keys);
@@ -723,6 +751,8 @@ async fn async_main() {
             }
             let admin_state =
                 admin::AdminState::with_key_store(admin_api_key_store.clone(), admin_service);
+            // 只读号池视图免登录，默认关闭；它只借用 AdminService 的快照，不挂 Admin 中间件。
+            let public_pool_app = admin::create_public_pool_router(admin_state.service.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建管理后台 UI 路由
@@ -734,6 +764,7 @@ async fn async_main() {
             tracing::info!("New UI 已启用: /ui");
             anthropic_app
                 .nest("/api/admin", admin_app)
+                .nest("/api/public", public_pool_app)
                 .route("/admin/", get(admin_ui_index_redirect))
                 .route("/ui/", get(new_ui_index_redirect))
                 .nest("/admin", admin_ui_app)
@@ -746,6 +777,9 @@ async fn async_main() {
         postgres_store: postgres_store.clone(),
         redis_store: redis_store.clone(),
         runtime_events: runtime_event_health.clone(),
+        token_manager: token_manager.clone(),
+        postgres_health: DependencyHealth::new(),
+        redis_health: DependencyHealth::new(),
     });
     let app = app.merge(create_health_router(health_state));
 
@@ -791,13 +825,33 @@ async fn async_main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("Public API（默认关闭）:");
+        tracing::info!("  GET  /api/public/pool");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
         tracing::info!("  GET  /ui");
     }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    let server_result = serve_until_shutdown(listener, app).await;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap()
+        .tap_io(enable_client_tcp_keepalive);
+    let shutdown_token_manager = token_manager.clone();
+    let server_result = serve_until_shutdown(listener, app, move || async move {
+        // Queued requests answer now instead of waiting for a slot until their wait limit.
+        shutdown_token_manager.begin_shutdown();
+        // Give the concurrency slots back first: `docker stop` sends SIGKILL after 10 seconds
+        // by default, long before in-flight requests finish draining, and leases left in Redis
+        // would otherwise block the next instance.
+        let released = shutdown_token_manager
+            .release_own_in_flight_leases(SHUTDOWN_LEASE_RELEASE_TIMEOUT)
+            .await;
+        tracing::info!(released, "收到停止信号，已释放本实例 Redis 并发租约");
+    })
+    .await;
+    if let Some(worker) = scheduler_instance_heartbeat_worker {
+        worker.abort();
+    }
 
     let shutdown_started_at = Instant::now();
     let shutdown_deadline = shutdown_started_at + BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT;
@@ -810,12 +864,28 @@ async fn async_main() {
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 
-    let background_token_refresh_report = background_token_refresh_worker
-        .shutdown(remaining_shutdown_budget(
-            shutdown_deadline,
-            BACKGROUND_SHUTDOWN_TIMEOUT,
-        ))
-        .await;
+    // The stages below are independent; run them together so the usage drain gets the whole
+    // budget instead of what is left after the others (the budget fits docker's 10 s window).
+    let storage_stats = kiro::token_manager::best_effort_storage_task_stats();
+    let background_shutdown_timeout =
+        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
+    let drain_timeout = remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
+    let (
+        background_token_refresh_report,
+        stats_report,
+        (usage_drain, storage_drain, external_release_drain, scheduler_release_drained),
+    ) = tokio::join!(
+        background_token_refresh_worker.shutdown(background_shutdown_timeout),
+        stats_flush_worker.shutdown(background_shutdown_timeout),
+        async {
+            tokio::join!(
+                usage_recorder.drain(drain_timeout),
+                kiro::token_manager::drain_best_effort_storage_tasks(drain_timeout),
+                external_pool_manager.drain_release_intents(drain_timeout),
+                token_manager.drain_scheduler_redis_releases(drain_timeout),
+            )
+        },
+    );
     tracing::info!(
         signal_sent = background_token_refresh_report.signal_sent,
         completed = background_token_refresh_report.completed,
@@ -828,12 +898,6 @@ async fn async_main() {
         "后台 Token 主动刷新任务已停止"
     );
 
-    let stats_report = stats_flush_worker
-        .shutdown(remaining_shutdown_budget(
-            shutdown_deadline,
-            BACKGROUND_SHUTDOWN_TIMEOUT,
-        ))
-        .await;
     tracing::info!(
         signal_sent = stats_report.signal_sent,
         flushed = stats_report.flushed,
@@ -852,21 +916,6 @@ async fn async_main() {
         || stats_report.pending_stats_deltas > 0
         || stats_report.pending_runtime_mutations > 0;
 
-    let storage_stats = kiro::token_manager::best_effort_storage_task_stats();
-    let usage_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let storage_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let external_release_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let scheduler_release_drain_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let (usage_drain, storage_drain, external_release_drain, scheduler_release_drained) = tokio::join!(
-        usage_recorder.drain(usage_drain_timeout),
-        kiro::token_manager::drain_best_effort_storage_tasks(storage_drain_timeout),
-        external_pool_manager.drain_release_intents(external_release_drain_timeout),
-        token_manager.drain_scheduler_redis_releases(scheduler_release_drain_timeout),
-    );
     tracing::info!(
         timed_out = usage_drain.timed_out,
         postgres_target = usage_drain.postgres.target,
@@ -1095,14 +1144,41 @@ async fn abort_task_with_timeout<T>(task_name: &'static str, task: tokio::task::
     }
 }
 
-async fn serve_until_shutdown(
-    listener: tokio::net::TcpListener,
+/// `on_shutdown_signal` runs as soon as the stop signal arrives, before in-flight connections
+/// are drained: the container may be killed before draining finishes.
+/// Idle time before the first keepalive probe on a client connection, then the probe interval.
+const CLIENT_TCP_KEEPALIVE_TIME: StdDuration = StdDuration::from_secs(60);
+const CLIENT_TCP_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(10);
+
+/// A client that vanished without closing (network cut, host gone) is otherwise only noticed
+/// when a write fails. While its socket buffer is full nothing writes, the response body is not
+/// polled, and the request keeps its credential slot until the kernel gives up retransmitting
+/// (about 15 minutes on Linux) or forever. Keepalive probes surface the dead peer in minutes.
+fn enable_client_tcp_keepalive(stream: &mut tokio::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(CLIENT_TCP_KEEPALIVE_TIME)
+        .with_interval(CLIENT_TCP_KEEPALIVE_INTERVAL);
+    if let Err(err) = socket2::SockRef::from(&*stream).set_tcp_keepalive(&keepalive) {
+        tracing::debug!("设置客户端连接 TCP keepalive 失败: {}", err);
+    }
+}
+
+async fn serve_until_shutdown<L, F, Fut>(
+    listener: L,
     app: Router,
-) -> std::io::Result<()> {
+    on_shutdown_signal: F,
+) -> std::io::Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
         let _ = shutdown_sender.send(true);
+        on_shutdown_signal().await;
     });
 
     let mut graceful_receiver = shutdown_receiver.clone();
@@ -1110,10 +1186,11 @@ async fn serve_until_shutdown(
         wait_for_shutdown_request(&mut graceful_receiver).await;
         tracing::info!("收到停止信号，停止接收新请求");
     };
+    let drain_timeout = server_graceful_shutdown_timeout();
     let mut deadline_receiver = shutdown_receiver;
     let shutdown_deadline = async move {
         wait_for_shutdown_request(&mut deadline_receiver).await;
-        tokio::time::sleep(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT).await;
+        tokio::time::sleep(drain_timeout).await;
     };
 
     let mut server = Box::pin(
@@ -1125,7 +1202,7 @@ async fn serve_until_shutdown(
         result = &mut server => result,
         _ = shutdown_deadline => {
             tracing::warn!(
-                timeout_secs = SERVER_GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                timeout_secs = drain_timeout.as_secs(),
                 "等待 HTTP 连接排空超时，停止剩余连接"
             );
             Ok(())
@@ -1305,7 +1382,41 @@ struct AppHealthState {
     postgres_store: Arc<PostgresStore>,
     redis_store: Arc<RedisStore>,
     runtime_events: Arc<RuntimeEventHealth>,
+    token_manager: Arc<kiro::token_manager::MultiTokenManager>,
+    postgres_health: DependencyHealth,
+    redis_health: DependencyHealth,
 }
+
+/// Last successful readiness check of one dependency; see [`READYZ_DEPENDENCY_GRACE`].
+struct DependencyHealth {
+    origin: Instant,
+    /// Milliseconds since `origin` of the last successful check.
+    last_ok_ms: AtomicU64,
+}
+
+impl DependencyHealth {
+    /// Starts healthy: the process only gets here after connecting to the dependency.
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_ok_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Records one check and answers whether the dependency counts as ready.
+    fn observe(&self, ok: bool, now: Instant) -> bool {
+        let now_ms = now.saturating_duration_since(self.origin).as_millis() as u64;
+        if ok {
+            self.last_ok_ms.fetch_max(now_ms, Ordering::AcqRel);
+            return true;
+        }
+        let last_ok_ms = self.last_ok_ms.load(Ordering::Acquire);
+        now_ms.saturating_sub(last_ok_ms) < READYZ_DEPENDENCY_GRACE.as_millis() as u64
+    }
+}
+
+/// Queued requests with no dispatch for this long mean the scheduler is not moving.
+const DISPATCH_STALL_AFTER: StdDuration = StdDuration::from_secs(60);
 
 fn create_health_router(state: Arc<AppHealthState>) -> Router {
     Router::new()
@@ -1320,13 +1431,31 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
-    let postgres_ok = state.postgres_store.ping().await.is_ok();
-    let redis_ok = state.redis_store.ping().await.is_ok();
+    // Bounded: a health check that hangs on a stuck pool or a half-open Redis connection looks
+    // like the whole process is down to the orchestrator.
+    let (postgres_ok, redis_ok) = tokio::join!(
+        async {
+            tokio::time::timeout(READYZ_DEPENDENCY_TIMEOUT, state.postgres_store.ping())
+                .await
+                .is_ok_and(|result| result.is_ok())
+        },
+        async {
+            tokio::time::timeout(READYZ_DEPENDENCY_TIMEOUT, state.redis_store.ping())
+                .await
+                .is_ok_and(|result| result.is_ok())
+        },
+    );
+    let now = Instant::now();
+    let postgres_ok = state.postgres_health.observe(postgres_ok, now);
+    let redis_ok = state.redis_health.observe(redis_ok, now);
     let redis_events_connected = state
         .runtime_events
         .redis_events_connected
         .load(Ordering::Acquire);
-    let ready = postgres_ok && redis_ok && redis_events_connected;
+    let dispatch = state
+        .token_manager
+        .dispatch_is_progressing(DISPATCH_STALL_AFTER);
+    let ready = postgres_ok && redis_ok && redis_events_connected && dispatch.progressing;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1340,8 +1469,11 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
             "checks": {
                 "postgres": postgres_ok,
                 "redis": redis_ok,
-                "redisRuntimeEvents": redis_events_connected
+                "redisRuntimeEvents": redis_events_connected,
+                "dispatchProgressing": dispatch.progressing
             },
+            "dispatch": dispatch,
+            "runtimeLagMs": common::runtime_lag::global().recent_max().as_millis() as u64,
             "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),
@@ -1398,6 +1530,54 @@ fn apply_request_api_key_runtime(
     );
 }
 
+/// Runs credential reloads one at a time on a blocking thread and folds notifications that
+/// arrive while one is running into a single follow-up reload. A full reload reads every
+/// credential from PgSQL and rewrites the in-memory pool; running it inline on the event task,
+/// once per notification, kept async worker threads busy during notification bursts.
+#[derive(Clone, Default)]
+struct CredentialsReloadCoalescer {
+    state: Arc<parking_lot::Mutex<CredentialsReloadState>>,
+}
+
+#[derive(Default)]
+struct CredentialsReloadState {
+    running: bool,
+    pending: Option<String>,
+}
+
+impl CredentialsReloadCoalescer {
+    fn request(&self, token_manager: Arc<kiro::token_manager::MultiTokenManager>, reason: String) {
+        {
+            let mut state = self.state.lock();
+            if state.running {
+                state.pending = Some(reason);
+                return;
+            }
+            state.running = true;
+        }
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut reason = reason;
+            loop {
+                match token_manager.reload_credentials_from_postgres() {
+                    Ok(true) => tracing::info!(reason, "已根据 Redis 通知同步凭据快照"),
+                    Ok(false) => tracing::debug!(reason, "收到凭据通知，但凭据快照无变化"),
+                    Err(err) => tracing::warn!(reason, "同步凭据快照失败: {}", err),
+                }
+                token_manager.notify_dispatch_state_changed();
+                let mut guard = state.lock();
+                match guard.pending.take() {
+                    Some(next) => reason = next,
+                    None => {
+                        guard.running = false;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
@@ -1426,6 +1606,7 @@ fn spawn_redis_runtime_event_listener(
             tracing::info!("已订阅 Redis 运行时事件");
             let mut stream = pubsub.on_message();
             let mut periodic_reload = tokio::time::interval(std::time::Duration::from_secs(60));
+            let credentials_reload = CredentialsReloadCoalescer::default();
             loop {
                 tokio::select! {
                     message = stream.next() => {
@@ -1437,6 +1618,12 @@ fn spawn_redis_runtime_event_listener(
                             .get_payload::<String>()
                             .unwrap_or_else(|_| String::new());
                         health.mark_event();
+                        if (channel == config_channel || channel == credentials_channel)
+                            && token_manager.runtime_event_is_from_this_instance(&payload)
+                        {
+                            // Already applied locally when it was published.
+                            continue;
+                        }
                         if channel == config_channel {
                             let previous_external_pools =
                                 token_manager.runtime_config().external_pools;
@@ -1462,12 +1649,7 @@ fn spawn_redis_runtime_event_listener(
                                 Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
                             }
                         } else if channel == credentials_channel {
-                            match token_manager.reload_credentials_from_postgres() {
-                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知同步凭据快照"),
-                                Ok(false) => tracing::debug!(payload, "收到凭据通知，但凭据快照无变化"),
-                                Err(err) => tracing::warn!(payload, "同步凭据快照失败: {}", err),
-                            }
-                            token_manager.notify_dispatch_state_changed();
+                            credentials_reload.request(token_manager.clone(), payload);
                         } else if channel == wakeup_channel {
                             if !token_manager.notify_remote_dispatch_state_changed(&payload) {
                                 tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");
@@ -1503,9 +1685,7 @@ fn spawn_redis_runtime_event_listener(
                             Ok(false) => {}
                             Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),
                         }
-                        if let Err(err) = token_manager.reload_credentials_from_postgres() {
-                            tracing::warn!("定时同步凭据快照失败: {}", err);
-                        }
+                        credentials_reload.request(token_manager.clone(), "periodic".to_string());
                     }
                 }
             }
@@ -1641,14 +1821,11 @@ fn handle_credentials_command(
             if !is_multiple {
                 println!("warning: single credentials format cannot be rewritten by token refresh");
             }
-            if !matches!(
-                config.load_balancing_mode.as_str(),
-                "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-            ) {
-                println!(
-                    "error: invalid loadBalancingMode '{}', expected priority, balanced, health_balanced or weighted_least_inflight",
-                    config.load_balancing_mode
-                );
+            if let Err(err) = config
+                .load_balancing_mode
+                .parse::<kiro::token_manager::LoadBalancingMode>()
+            {
+                println!("error: loadBalancingMode: {err}");
             }
             let mut ids = std::collections::HashSet::new();
             for (index, credential) in credentials.iter().enumerate() {
@@ -1678,6 +1855,20 @@ fn handle_credentials_command(
 mod lifecycle_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A slow check right after a good one keeps the dependency ready; only failing for the
+    /// whole grace period makes it not ready, and one success brings it back.
+    #[test]
+    fn readiness_tolerates_a_slow_dependency_check_within_the_grace_period() {
+        let health = DependencyHealth::new();
+        let start = health.origin;
+        assert!(health.observe(true, start + StdDuration::from_secs(1)));
+        assert!(health.observe(false, start + StdDuration::from_secs(2)));
+        assert!(health.observe(false, start + StdDuration::from_millis(10_900)));
+        assert!(!health.observe(false, start + StdDuration::from_secs(11)));
+        assert!(health.observe(true, start + StdDuration::from_secs(12)));
+        assert!(health.observe(false, start + StdDuration::from_secs(13)));
+    }
 
     #[test]
     fn remaining_shutdown_budget_caps_each_stage_and_expires() {

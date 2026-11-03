@@ -28,7 +28,10 @@ import {
   Progress,
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
   Spinner,
@@ -51,7 +54,9 @@ import type {
   AddCredentialRequest,
   BatchCredentialImportDefaults,
   BatchUpdateCredentialsRequest,
+  CredentialExportFilter,
   CredentialExportFormat,
+  CredentialExportScope,
   CredentialStatusItem,
   ExternalPoolRouteMode,
   ProxyResource,
@@ -1690,29 +1695,68 @@ export function BatchVerifyModal({ open, verifying, progress, results, testModel
 // CredentialExportModal
 // ============================================================================
 
-export function CredentialExportModal({ open, onClose, selectedIds = [], totalCount, disabledCount }: {
+/** 状态快捷导出：按账号页顶部状态条的同一套规则筛选。 */
+export const CREDENTIAL_EXPORT_STATUS_SCOPES = [
+  { status: 'normal', label: '全部正常账号' },
+  { status: 'unavailable', label: '全部不可用账号（禁用 / 额度用尽 / 账号异常）' },
+  { status: 'account_error', label: '全部账号异常' },
+  { status: 'quota_exhausted', label: '全部额度用尽' },
+  { status: 'cooling', label: '全部冷却账号' },
+  { status: 'disabled', label: '全部已禁用账号' },
+] as const
+
+export type CredentialExportStatus = (typeof CREDENTIAL_EXPORT_STATUS_SCOPES)[number]['status']
+
+type ExportScopeValue = 'selected' | 'filtered' | 'all' | `status:${CredentialExportStatus}`
+
+export function CredentialExportModal({
+  open,
+  onClose,
+  selectedIds = [],
+  totalCount,
+  filter,
+  filteredCount,
+  statusCounts,
+}: {
   open: boolean
   onClose: () => void
   selectedIds?: number[]
   totalCount: number
-  disabledCount: number
+  /** 账号列表当前的筛选条件；没有筛选时不传。 */
+  filter?: CredentialExportFilter
+  filteredCount: number
+  statusCounts: Partial<Record<CredentialExportStatus, number>>
 }) {
   const [format, setFormat] = useState<CredentialExportFormat>('json')
-  const [scope, setScope] = useState<'selected' | 'all' | 'disabled'>('all')
+  const [scope, setScope] = useState<ExportScopeValue>('all')
   const [loading, setLoading] = useState(false)
   const selectedCount = selectedIds.length
 
   useEffect(() => {
-    if (open) setScope(selectedCount > 0 ? 'selected' : 'all')
-  }, [open, selectedCount])
+    if (open) setScope(selectedCount > 0 ? 'selected' : filter ? 'filtered' : 'all')
+  }, [open, selectedCount, filter])
+
+  const scopeLabel = (value: ExportScopeValue) => {
+    if (value === 'selected') return '选中账号'
+    if (value === 'filtered') return '当前筛选结果'
+    if (value === 'all') return '全部账号'
+    const status = value.slice('status:'.length)
+    return CREDENTIAL_EXPORT_STATUS_SCOPES.find((item) => item.status === status)?.label ?? value
+  }
 
   const handleExport = async () => {
     setLoading(true)
     try {
-      const exportIds = scope === 'selected' ? selectedIds : undefined
-      const blob = await exportCredentials(format, exportIds, scope === 'disabled')
+      const exportScope: CredentialExportScope = scope === 'selected'
+        ? { ids: selectedIds }
+        : scope === 'filtered'
+          ? { filter: filter ?? {} }
+          : scope === 'all'
+            ? { filter: {} }
+            : { filter: { status: scope.slice('status:'.length) } }
+      const { blob, count } = await exportCredentials(format, exportScope)
       downloadBlob(blob, exportFilename(format))
-      toast.success(scope === 'selected' ? `已导出选中账号 ${selectedCount} 个` : scope === 'disabled' ? '已导出全部已禁用账号' : '导出成功')
+      toast.success(count === null ? `已导出${scopeLabel(scope)}` : `已导出${scopeLabel(scope)} ${count} 个`)
       onClose()
     } catch (e) {
       toast.error(`导出失败: ${extractErrorMessage(e)}`)
@@ -1722,7 +1766,7 @@ export function CredentialExportModal({ open, onClose, selectedIds = [], totalCo
   }
 
   return (
-    <ModalShell open={open} title="导出账号" width="max-w-sm" onClose={onClose}>
+    <ModalShell open={open} title="导出账号" width="max-w-md" onClose={onClose}>
       <div className="space-y-4">
         <Field label="导出格式">
           <Select value={format} onValueChange={(v) => setFormat(v as CredentialExportFormat)} disabled={loading}>
@@ -1734,13 +1778,27 @@ export function CredentialExportModal({ open, onClose, selectedIds = [], totalCo
             </SelectContent>
           </Select>
         </Field>
-        <Field label="导出范围">
-          <Select value={scope} onValueChange={(v) => setScope(v as 'selected' | 'all' | 'disabled')} disabled={loading}>
+        <Field label="导出范围" description="只导出账号配置，不含运行状态；状态按点击导出时的实时结果计算。">
+          <Select value={scope} onValueChange={(v) => setScope(v as ExportScopeValue)} disabled={loading}>
             <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
-              {selectedCount > 0 && <SelectItem value="selected">导出选中账号（{selectedCount} 个）</SelectItem>}
-              <SelectItem value="all">导出全部账号（{totalCount} 个）</SelectItem>
-              <SelectItem value="disabled" disabled={disabledCount === 0}>导出全部已禁用账号（{disabledCount} 个）</SelectItem>
+              {selectedCount > 0 && <SelectItem value="selected">选中账号（{selectedCount} 个）</SelectItem>}
+              {filter && (
+                <SelectItem value="filtered" disabled={filteredCount === 0}>当前筛选结果（{filteredCount} 个）</SelectItem>
+              )}
+              <SelectItem value="all">全部账号（{totalCount} 个）</SelectItem>
+              <SelectSeparator />
+              <SelectGroup>
+                <SelectLabel>按状态</SelectLabel>
+                {CREDENTIAL_EXPORT_STATUS_SCOPES.map(({ status, label }) => {
+                  const count = statusCounts[status]
+                  return (
+                    <SelectItem key={status} value={`status:${status}`} disabled={count === 0}>
+                      {label}{count === undefined ? '' : `（${count} 个）`}
+                    </SelectItem>
+                  )
+                })}
+              </SelectGroup>
             </SelectContent>
           </Select>
         </Field>

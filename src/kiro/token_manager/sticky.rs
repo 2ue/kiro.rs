@@ -11,11 +11,29 @@ use super::account_state::SessionBinding;
 pub(super) const SESSION_BINDING_TTL_SECS: i64 = 6 * 60 * 60;
 /// 会话绑定表上限。
 const MAX_SESSION_BINDINGS: usize = 10_000;
+/// 过期会话绑定的清理间隔（秒）。
+const SESSION_BINDING_PRUNE_INTERVAL_SECS: i64 = 60;
 /// 同一会话绑定账号连续软失败达到该阈值后，本次请求允许临时 fallback。
 pub(super) const MAX_SESSION_SOFT_FAILURES: u32 = 2;
 
+/// Prunes expired bindings and enforces [`MAX_SESSION_BINDINGS`].
+///
+/// Called on every binding insert, which every sticky request does. Walking all bindings (up to
+/// 10 000) each time is an O(n) step under this lock per request; expiry is on a scale of hours,
+/// so the TTL sweep runs at most once per [`SESSION_BINDING_PRUNE_INTERVAL_SECS`] unless the
+/// table is over its size limit.
 pub(super) fn prune_session_bindings_locked(bindings: &mut HashMap<String, SessionBinding>) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_PRUNE_AT: AtomicI64 = AtomicI64::new(i64::MIN);
     let now = Utc::now();
+    let now_secs = now.timestamp();
+    let last = LAST_PRUNE_AT.load(Ordering::Relaxed);
+    if bindings.len() <= MAX_SESSION_BINDINGS
+        && now_secs.saturating_sub(last) < SESSION_BINDING_PRUNE_INTERVAL_SECS
+    {
+        return;
+    }
+    LAST_PRUNE_AT.store(now_secs, Ordering::Relaxed);
     bindings.retain(|_, binding| {
         now.signed_duration_since(binding.last_used_at)
             .num_seconds()

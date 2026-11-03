@@ -30,6 +30,7 @@ import {
   useRefreshUsageQueriesAfterCleanup,
   useModelPricing,
   useSyncModelPricing,
+  useUsageWriterStats,
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
 import { getCredentialList, getExternalPools } from '@/api/credentials'
@@ -47,6 +48,7 @@ import {
   LoadingState,
   ErrorState,
   Callout,
+  PageSizeSelect,
 } from '@/components/patterns'
 import {
   Badge,
@@ -90,7 +92,7 @@ import { RequestApiKeyIdDisplay } from './request-api-key-id'
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
 const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
-const PAGE_SIZE = 20
+const DEFAULT_PAGE_SIZE = 20
 const EXPORT_LIMIT = 10_000
 const ROUTE_OPTION_LIMIT = 50
 const REQUEST_ID_PATTERN = /req_[A-Za-z0-9_-]+/
@@ -585,6 +587,7 @@ function RecordsView({
 }) {
   const [searchParams] = useSearchParams()
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
   const [q, setQ] = useState('')
   const [requestId, setRequestId] = useState('')
   const [requestApiKeyId, setRequestApiKeyId] = useState('')
@@ -641,7 +644,7 @@ function RecordsView({
   const requestApiKeyIdInvalid = Boolean(requestApiKeyId.trim() && !normalizeRequestApiKeyId(requestApiKeyId))
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
-    const next: UsageRecordsPageQuery = { page, limit: PAGE_SIZE }
+    const next: UsageRecordsPageQuery = { page, limit: pageSize }
     const qValue = qD.trim()
     const requestIdInput = requestIdD.trim()
     const requestIdValue = extractRequestId(requestIdInput) || requestIdInput || extractRequestId(qValue)
@@ -676,6 +679,7 @@ function RecordsView({
     minFirstTokenLatencyMsD,
     modelD,
     page,
+    pageSize,
     qD,
     requestIdD,
     normalizedRequestApiKeyId,
@@ -1132,9 +1136,9 @@ function RecordsView({
                 </TableBody>
               </Table>
             </div>
-            {(page > 1 || hasNext) && (
+            {(page > 1 || hasNext || pageSize !== DEFAULT_PAGE_SIZE) && (
               <div className="px-4 py-3">
-                <div className="flex items-center justify-center gap-3">
+                <div className="flex flex-wrap items-center justify-center gap-3">
                   <Button
                     variant="outline"
                     size="sm"
@@ -1144,7 +1148,7 @@ function RecordsView({
                     上一页
                   </Button>
                   <span className="text-xs text-muted-foreground">
-                    第 {page} 页，每页 {PAGE_SIZE} 条{pageTransitionPending ? ' · 加载中' : ''}
+                    第 {page} 页{pageTransitionPending ? ' · 加载中' : ''}
                   </span>
                   <Button
                     variant="outline"
@@ -1154,6 +1158,11 @@ function RecordsView({
                   >
                     下一页
                   </Button>
+                  <PageSizeSelect
+                    value={pageSize}
+                    onChange={(next) => { setPageSize(next); setPage(1) }}
+                    disabled={pageTransitionPending}
+                  />
                 </div>
               </div>
             )}
@@ -1175,6 +1184,7 @@ export function UsagePage() {
   const summary = useUsageSummary(autoRefresh.refetchInterval)
   const cleanupStatus = useUsageCleanupStatus()
   const modelPricing = useModelPricing(autoRefresh.refetchInterval)
+  const writerStats = useUsageWriterStats(autoRefresh.refetchInterval)
   const syncPricing = useSyncModelPricing()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
@@ -1189,6 +1199,9 @@ export function UsagePage() {
     data?.localPromptCacheInputTokens ?? 0,
   )
   const pricingStatus = modelPricing.data
+  // Records the writer gave up on (queue full or PgSQL timing out). They are missing from the
+  // numbers on this page, so say how many instead of letting the page look complete.
+  const droppedRecords = (writerStats.data?.droppedPersistRecords ?? 0) + (writerStats.data?.droppedRedisRecords ?? 0)
 
   const handleSyncPricing = () => {
     syncPricing.mutate(undefined, {
@@ -1233,6 +1246,15 @@ export function UsagePage() {
         <span>· {formatNumber(pricingStatus?.modelCount ?? 0)} 模型</span>
         {pricingStatus?.lastError && <span className="max-w-40 truncate text-destructive" title={pricingStatus.lastError}>· {pricingStatus.lastError}</span>}
       </div>
+      {droppedRecords > 0 && (
+        <div
+          className="flex items-center gap-1 rounded-lg border bg-card px-2 py-1 text-xs text-muted-foreground"
+          title="写入数据库失败或排队已满而未保存的用量记录数，从本进程启动起累计；这部分请求不在本页统计里。"
+        >
+          <span className="font-medium text-foreground">未保存记录</span>
+          <span className="text-destructive">{formatNumber(droppedRecords)} 条</span>
+        </div>
+      )}
       <Button variant="outline" size="sm" onClick={handleSyncPricing} disabled={syncPricing.isPending}>
         {syncPricing.isPending ? <Spinner size="sm" /> : <DollarSign className="h-3.5 w-3.5" />}
         同步价格

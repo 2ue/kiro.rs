@@ -108,6 +108,42 @@ pub struct ImageProcessingConfig {
 
     #[serde(default = "default_true")]
     pub safe_normalize_base64_media_types: bool,
+
+    /// 是否在发给上游前压缩过大的图片（默认关闭）。打开后，长边超过 `resize_max_long_side` 或
+    /// base64 长度超过 `resize_max_bytes` 的 PNG/JPEG/WebP 图片会等比缩小并重新编码为 JPEG；
+    /// GIF 不处理，失败时保留原图。只在本地多模态预处理阶段执行：直接转发给外部池的请求
+    /// （原样转发路径）不经过这一步，保持原图。
+    #[serde(default)]
+    pub resize_enabled: bool,
+
+    /// 压缩后的长边上限（像素）。
+    #[serde(default = "default_image_resize_max_long_side")]
+    pub resize_max_long_side: u32,
+
+    /// 压缩目标：base64 编码后的字节数上限。
+    #[serde(default = "default_image_resize_max_bytes")]
+    pub resize_max_bytes: usize,
+
+    /// 重新编码为 JPEG 时的初始画质（1..=100）。
+    #[serde(default = "default_image_resize_jpeg_quality")]
+    pub resize_jpeg_quality: u8,
+}
+
+pub const IMAGE_RESIZE_MIN_LONG_SIDE: u32 = 256;
+pub const IMAGE_RESIZE_MAX_LONG_SIDE: u32 = 8000;
+pub const IMAGE_RESIZE_MIN_BYTES: usize = 32 * 1024;
+pub const IMAGE_RESIZE_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+fn default_image_resize_max_long_side() -> u32 {
+    1568
+}
+
+fn default_image_resize_max_bytes() -> usize {
+    400_000
+}
+
+fn default_image_resize_jpeg_quality() -> u8 {
+    85
 }
 
 impl Default for ImageProcessingConfig {
@@ -117,19 +153,34 @@ impl Default for ImageProcessingConfig {
             safe_materialize_file_sources: true,
             safe_download_remote_sources: true,
             safe_normalize_base64_media_types: true,
+            resize_enabled: false,
+            resize_max_long_side: default_image_resize_max_long_side(),
+            resize_max_bytes: default_image_resize_max_bytes(),
+            resize_jpeg_quality: default_image_resize_jpeg_quality(),
         }
     }
 }
 
 impl ImageProcessingConfig {
     pub fn normalized(self) -> Self {
-        match self.mode {
-            ImageProcessingMode::Safe => self,
+        let resize = Self {
+            resize_max_long_side: self
+                .resize_max_long_side
+                .clamp(IMAGE_RESIZE_MIN_LONG_SIDE, IMAGE_RESIZE_MAX_LONG_SIDE),
+            resize_max_bytes: self
+                .resize_max_bytes
+                .clamp(IMAGE_RESIZE_MIN_BYTES, IMAGE_RESIZE_MAX_BYTES),
+            resize_jpeg_quality: self.resize_jpeg_quality.clamp(40, 100),
+            ..self
+        };
+        match resize.mode {
+            ImageProcessingMode::Safe => resize,
             ImageProcessingMode::Light => Self {
                 mode: ImageProcessingMode::Light,
                 safe_materialize_file_sources: false,
                 safe_download_remote_sources: false,
                 safe_normalize_base64_media_types: false,
+                ..resize
             },
         }
     }
@@ -218,6 +269,14 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub history_placeholder_tools: bool,
 
+    /// 历史里重复出现的同一张图片只发第一次（默认关闭）。
+    ///
+    /// Claude Code 反复截同一个屏、或工具结果里多次返回同一张图时，历史会带上很多份完全相同的
+    /// base64。打开后从第二份起换成一行文字说明，减少请求体积和输入 token；当前这一轮的图片
+    /// 总是原样发送。只按图片数据完全相同判断，内容稍有不同就不算重复。
+    #[serde(default)]
+    pub history_image_dedup: bool,
+
     /// Anthropic `code_execution_*` 服务端工具的本地受限执行配置。
     ///
     /// 默认关闭。关闭时保持普通 `tool_use` 透传，避免在未配置执行环境时
@@ -257,6 +316,7 @@ impl Default for BodyConversionConfig {
             synthetic_thinking_signatures: true,
             tool_pairing_repair: true,
             history_placeholder_tools: true,
+            history_image_dedup: false,
             code_execution: CodeExecutionConfig::default(),
             model_driven_web_search: None,
         }
@@ -985,12 +1045,26 @@ pub struct ReportedUsagePathPolicy {
     /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求不进入
     /// 本系统 usage 整形、input 采样和补偿，也不会读取或写入本地 prompt-cache 状态；
     /// 外部池非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
-    /// 关闭时按常规：只有 Anthropic 会返回缓存的非流式请求（带 cache_control，且断点前内容
-    /// 达到模型最小缓存长度）按路径策略整形，其余非流式请求同开启时一样透传。
+    /// 关闭时按路径策略整形；是否额外要求官方缓存条件见 `strict_cache_eligibility_non_stream`。
     /// 流式请求不受影响。
     /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
     #[serde(default)]
     pub skip_non_stream_usage_projection: bool,
+
+    /// 流式请求是否按官方缓存条件严格检查，默认关闭。
+    ///
+    /// 开启后，流式请求只有带 cache_control（块级或顶层自动缓存），且断点前内容达到模型最小
+    /// 缓存长度时才按路径策略整形，其余透传上游 usage、不读写本地缓存状态。关闭时不看有没有
+    /// cache_control，整条请求按已标记处理，直接按路径策略整形；只有整条请求都短于模型最小
+    /// 缓存长度时仍透传（官方也不会缓存这种请求）。
+    #[serde(default)]
+    pub strict_cache_eligibility_stream: bool,
+
+    /// 非流式请求是否按官方缓存条件严格检查，默认关闭。规则同
+    /// `strict_cache_eligibility_stream`；`skip_non_stream_usage_projection` 开启时非流式一律透传，
+    /// 不再看这个开关。
+    #[serde(default)]
+    pub strict_cache_eligibility_non_stream: bool,
 
     /// 最终下游上报的 cache_read_input_tokens 上限。
     ///
@@ -1072,6 +1146,8 @@ impl Default for ReportedUsagePathPolicy {
         Self {
             enabled: true,
             skip_non_stream_usage_projection: false,
+            strict_cache_eligibility_stream: false,
+            strict_cache_eligibility_non_stream: false,
             final_cache_read_max_tokens: default_final_cache_read_max_tokens(),
             final_cache_read_jitter_min_tokens: 0,
             final_cache_read_jitter_max_tokens: 0,
@@ -1099,6 +1175,16 @@ impl ReportedUsagePathPolicy {
         Self {
             enabled: false,
             ..Self::default()
+        }
+    }
+
+    /// Whether a request of this kind must meet the official cache conditions (a cache_control
+    /// breakpoint and a prefix at the model minimum) before the route strategy shapes it.
+    pub fn strict_cache_eligibility(&self, stream: bool) -> bool {
+        if stream {
+            self.strict_cache_eligibility_stream
+        } else {
+            self.strict_cache_eligibility_non_stream
         }
     }
 
@@ -1143,6 +1229,8 @@ impl ReportedUsagePathPolicy {
         Self {
             enabled: self.enabled,
             skip_non_stream_usage_projection: self.skip_non_stream_usage_projection,
+            strict_cache_eligibility_stream: self.strict_cache_eligibility_stream,
+            strict_cache_eligibility_non_stream: self.strict_cache_eligibility_non_stream,
             final_cache_read_max_tokens,
             final_cache_read_jitter_min_tokens,
             final_cache_read_jitter_max_tokens,
@@ -1683,6 +1771,7 @@ impl CachePointPolicyPatch {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheBoundsPolicy {
+    /// 每个会话 scope（conversation_id + 路由命名空间）最多保留的条目数；字段名为兼容保留。
     #[serde(default = "default_prompt_cache_max_entries_per_account")]
     pub max_entries_per_account: usize,
     #[serde(default = "default_prompt_cache_max_entries_global")]
@@ -1808,6 +1897,13 @@ pub struct CacheHitShapingPolicy {
     /// 最小写入：放行写入时，写入不低于原始输入的这个比例，范围 0~5，0 表示不限制。
     #[serde(default)]
     pub min_creation_ratio: f64,
+
+    /// 计费下限计入读取，默认关闭。开启后，计费达不到下限时按目标命中率同时增加读取和
+    /// 非读取部分，读取的费用也算进下限，同样的命中率下上报的上下文更小。关闭时非读取部分
+    /// 先单独满足下限，再在总量之外追加读取到目标命中率（原有行为）。
+    /// 只作用于本地链路的命中率整形；上下限优先策略不使用这个开关。
+    #[serde(default)]
+    pub read_aware_cost_floor: bool,
 }
 
 impl Default for CacheHitShapingPolicy {
@@ -1821,6 +1917,7 @@ impl Default for CacheHitShapingPolicy {
             min_cost_ratio: default_cache_hit_min_cost_ratio(),
             max_read_multiplier: 0.0,
             min_creation_ratio: 0.0,
+            read_aware_cost_floor: false,
         }
     }
 }
@@ -2054,6 +2151,8 @@ pub struct CacheHitShapingPolicyPatch {
     pub max_read_multiplier: Option<f64>,
     #[serde(default)]
     pub min_creation_ratio: Option<f64>,
+    #[serde(default)]
+    pub read_aware_cost_floor: Option<bool>,
 }
 
 impl CacheHitShapingPolicyPatch {
@@ -2082,6 +2181,9 @@ impl CacheHitShapingPolicyPatch {
         if let Some(value) = self.min_creation_ratio {
             policy.min_creation_ratio = value;
         }
+        if let Some(value) = self.read_aware_cost_floor {
+            policy.read_aware_cost_floor = value;
+        }
         policy.normalized()
     }
 
@@ -2094,6 +2196,7 @@ impl CacheHitShapingPolicyPatch {
             && self.min_cost_ratio.is_none()
             && self.max_read_multiplier.is_none()
             && self.min_creation_ratio.is_none()
+            && self.read_aware_cost_floor.is_none()
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {
@@ -4275,16 +4378,29 @@ pub struct ExternalPoolsConfig {
     pub external_pool_local_rescue_on_capacity: bool,
     #[serde(default = "default_external_pool_local_rescue_max_wait_secs")]
     pub external_pool_local_rescue_max_wait_secs: u64,
+    /// 本地账号池风险保护（全池熔断），默认关闭：被风控的账号只禁用它自己，其余账号照常调度。
+    /// 打开后只统计曾经成功过的账号被上游风控（暂停、封禁、锁定），同一账号在窗口内只计一次；
+    /// 从未成功过的账号（新导入、预热中）被风控只禁用它自己。
     #[serde(default)]
     pub local_pool_circuit_enabled: bool,
     #[serde(default = "default_local_pool_circuit_window_secs")]
     pub local_pool_circuit_window_secs: u64,
+    /// 兼容字段：旧版本按"失败次数"计数。现在每个账号在窗口内只计一次，所以该值只作为
+    /// `local_pool_circuit_require_distinct_credentials` 的下限参与判断。
     #[serde(default = "default_local_pool_circuit_open_after_failures")]
     pub local_pool_circuit_open_after_failures: u32,
+    /// 窗口内至少有多少个不同账号被风控才打开。
     #[serde(default = "default_local_pool_circuit_require_distinct_credentials")]
     pub local_pool_circuit_require_distinct_credentials: u32,
+    /// 被风控的账号还需占"被风控账号 + 当前可调度账号"的这个百分比以上才打开，
+    /// 避免大池子里几个账号出问题就挡住全部请求。0 表示只看账号数。
+    #[serde(default = "default_local_pool_circuit_min_ratio_percent")]
+    pub local_pool_circuit_min_ratio_percent: u32,
     #[serde(default = "default_local_pool_circuit_open_secs")]
     pub local_pool_circuit_open_secs: u64,
+    /// 打开期满后进入半开状态，最多放行这么多个探测请求；探测成功即关闭，再次被风控就重新打开。
+    #[serde(default = "default_local_pool_circuit_half_open_probes")]
+    pub local_pool_circuit_half_open_probes: u32,
     #[serde(default)]
     pub external_pool_auto_disable_enabled: bool,
     #[serde(default = "default_true")]
@@ -4437,13 +4553,15 @@ impl Default for ExternalPoolsConfig {
             external_pool_local_rescue_on_capacity: true,
             external_pool_local_rescue_max_wait_secs:
                 default_external_pool_local_rescue_max_wait_secs(),
-            local_pool_circuit_enabled: true,
+            local_pool_circuit_enabled: false,
             local_pool_circuit_window_secs: default_local_pool_circuit_window_secs(),
             local_pool_circuit_open_after_failures: default_local_pool_circuit_open_after_failures(
             ),
             local_pool_circuit_require_distinct_credentials:
                 default_local_pool_circuit_require_distinct_credentials(),
             local_pool_circuit_open_secs: default_local_pool_circuit_open_secs(),
+            local_pool_circuit_min_ratio_percent: default_local_pool_circuit_min_ratio_percent(),
+            local_pool_circuit_half_open_probes: default_local_pool_circuit_half_open_probes(),
             external_pool_auto_disable_enabled: false,
             external_pool_auto_disable_on_auth_error: true,
             external_pool_auto_disable_on_security_lock: true,
@@ -4829,6 +4947,21 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// How the public read-only pool page shows Free accounts. The page only; nothing else reads it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPoolFreeAccounts {
+    /// Shown as Kiro Power.
+    #[default]
+    Power,
+    /// Shown as Kiro Pro Max.
+    ProMax,
+    /// Shown as Kiro Pro+.
+    ProPlus,
+    /// Left out of the page and its counts.
+    Hide,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4878,6 +5011,23 @@ pub struct Config {
 
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
+
+    /// 是否自动同步 Kiro 客户端版本号（默认关闭）。
+    ///
+    /// 打开后，后台每 12 小时从官方发布元数据读取当前版本，所有上游请求头里的 `KiroIDE-{版本}`
+    /// 改用读到的版本；读取失败或尚未读到时继续使用 `kiro_version`。版本号是上游身份的一部分，
+    /// 会同时影响所有账号，所以默认关闭。
+    #[serde(default)]
+    pub kiro_version_auto_sync_enabled: bool,
+
+    /// IDE 端点的对话和联网搜索请求是否改走新版 Kiro 域名 `runtime.{region}.kiro.dev`（默认关闭，
+    /// 走 `q.{region}.amazonaws.com`）。只换地址，请求头仍是 IDE 那一套；模型列表、用量查询、
+    /// token 刷新不受影响。命令行端点本来就走新域名。
+    ///
+    /// 2026-10-30 用 FREE 账号实测：同一批账号走旧域名正常，打开后对话请求每次都被新域名以 429
+    /// 拒绝（命令行端点走新域名正常），所以生产上不要打开，除非先用自己的账号验证过。
+    #[serde(default)]
+    pub kiro_runtime_domain_enabled: bool,
 
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -5007,6 +5157,29 @@ pub struct Config {
     #[serde(default)]
     pub credential_empty_turn_cooldown_enabled: bool,
 
+    /// 上游故障是否让账号进入冷却（默认关闭）。
+    ///
+    /// 上游故障指换任何账号都可能遇到、与账号本身无关的错误：上游 5xx、上游在响应里发出的
+    /// 异常/错误事件、EventStream 解码或读取失败、网络发送失败。关闭时账号不冷却、不记会话失败，
+    /// 只在当次请求内排除并换号；开启时按各自的冷却秒数冷却（0.0.225 及之前的行为）。
+    /// 限流、鉴权、额度、风控等账号问题不受这个开关影响，照常冷却。
+    #[serde(default)]
+    pub credential_upstream_failure_cooldown_enabled: bool,
+
+    /// 自愈最小间隔秒数（默认 300，0 表示不限）。
+    ///
+    /// 所有可调度账号都失效时，调度器会自动重新启用因连续失败被禁用的账号。同一个账号两次自愈
+    /// 之间至少隔这么久，避免坏账号在"禁用→自愈→再禁用"之间来回打转、每轮都消耗请求。
+    #[serde(default = "default_credential_auto_heal_min_interval_secs")]
+    pub credential_auto_heal_min_interval_secs: u64,
+
+    /// 同一个账号最多连续自愈几轮（默认 5，0 表示不限）。
+    ///
+    /// 自愈后还没有成功过一次就又被禁用，算连续一轮；有一次调用成功或管理员手动启用/重置后清零。
+    /// 达到上限后不再自动恢复，等管理员处理。
+    #[serde(default = "default_credential_auto_heal_max_consecutive_rounds")]
+    pub credential_auto_heal_max_consecutive_rounds: u32,
+
     /// 可重试协议异常或无法分类错误的基础冷却秒数。
     #[serde(default = "default_credential_protocol_error_cooldown_secs")]
     pub credential_protocol_error_cooldown_secs: u64,
@@ -5038,6 +5211,13 @@ pub struct Config {
     #[serde(default = "default_credential_dispatch_max_wait_secs")]
     pub credential_dispatch_max_wait_secs: u64,
 
+    /// 同一会话在单个凭据上的最大并发请求数。
+    ///
+    /// `0` 表示等于该凭据自身的并发上限（同一会话的并发全部叠在绑定账号上，对上游缓存最友好）；
+    /// `>0` 时，同一会话在绑定账号上的并发达到该值后，后续并发请求临时借用其他账号，不改绑。
+    #[serde(default)]
+    pub credential_session_max_concurrent_requests: u32,
+
     /// Kiro 上游响应头最长等待秒数。
     ///
     /// 只限制请求发出到拿到响应头的阶段；响应头之后的流式 body 读取仍由
@@ -5052,6 +5232,13 @@ pub struct Config {
     /// stream idle 处理并释放并发占用。`0` 表示使用默认值，避免错误关闭保护。
     #[serde(default = "default_kiro_upstream_stream_idle_timeout_secs")]
     pub kiro_upstream_stream_idle_timeout_secs: u64,
+
+    /// 单次上游响应正文的总时长上限秒数（默认 3600，0 关闭，最大 86400）。
+    ///
+    /// 静默超时只管"多久没有新数据"；上游以低于静默超时的间隔持续滴流时，一个请求会一直
+    /// 占着账号并发。超过该时长后结束本次响应并释放并发，流式以错误事件结束。
+    #[serde(default = "default_kiro_upstream_stream_max_duration_secs")]
+    pub kiro_upstream_stream_max_duration_secs: u64,
 
     /// 下游流式响应的保活心跳间隔秒数（1–300）。
     ///
@@ -5270,6 +5457,11 @@ pub struct Config {
     #[serde(default)]
     pub claude_models_only: bool,
 
+    /// 按订阅等级统一设置的允许模型（key 为 `free`、`pro`、`power` 等订阅等级）。账号自己
+    /// 设置了支持模型时以账号为准；没设置时按所属等级的列表限制；等级没有列表时不限制。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscription_model_lists: SubscriptionModelLists,
+
     /// 旧配置字段，只用于迁移，加载后转换成上面三个字段。
     #[serde(default, skip_serializing)]
     pub prompt_steering: Option<serde_json::Value>,
@@ -5466,7 +5658,8 @@ pub struct Config {
     #[serde(default)]
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
 
-    /// 本地 prompt-cache 每个账号最多保留的 fingerprint 条目。
+    /// 本地 prompt-cache 每个会话 scope（conversation_id + 路由命名空间）最多保留的 fingerprint
+    /// 条目。scope 不含账号，同一会话换号后仍命中同一组条目；键名里的 PerAccount 只为兼容保留。
     #[serde(default = "default_prompt_cache_max_entries_per_account")]
     pub prompt_cache_max_entries_per_account: usize,
 
@@ -5548,6 +5741,15 @@ pub struct Config {
     #[serde(default = "default_audit_log_retention_days")]
     pub audit_log_retention_days: u32,
 
+    /// 是否开放免登录的只读号池页面（`/ui/pool`，接口 `/api/public/pool`）。默认关闭：
+    /// 关闭时接口返回 404，升级后不会对外暴露任何账号信息。
+    #[serde(default)]
+    pub public_pool_view_enabled: bool,
+
+    /// 只读号池页面怎么展示 Free 账号：显示为某个付费档位，或者不展示。只影响该页面。
+    #[serde(default)]
+    pub public_pool_free_accounts: PublicPoolFreeAccounts,
+
     /// 外部备用号池和直连/预检 fallback 策略。
     #[serde(default)]
     pub external_pools: ExternalPoolsConfig,
@@ -5569,7 +5771,20 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 13;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 14;
+
+impl Config {
+    /// 上游请求头里实际使用的 Kiro 客户端版本：开启自动同步且已读到官方版本时用读到的版本，
+    /// 否则用配置的 `kiro_version`。
+    pub fn effective_kiro_version(&self) -> String {
+        if self.kiro_version_auto_sync_enabled
+            && let Some(version) = crate::kiro::kiro_version::latest()
+        {
+            return version;
+        }
+        self.kiro_version.clone()
+    }
+}
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -5667,8 +5882,23 @@ fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
     180
 }
 
+pub const DEFAULT_KIRO_UPSTREAM_STREAM_MAX_DURATION_SECS: u64 = 3600;
+pub const KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS: u64 = 86_400;
+
+fn default_kiro_upstream_stream_max_duration_secs() -> u64 {
+    DEFAULT_KIRO_UPSTREAM_STREAM_MAX_DURATION_SECS
+}
+
 pub const STREAM_PRE_OUTPUT_HOLD_MAX_SECS: u64 = 60;
 pub const STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS: u64 = 3600;
+
+fn default_credential_auto_heal_min_interval_secs() -> u64 {
+    300
+}
+
+fn default_credential_auto_heal_max_consecutive_rounds() -> u32 {
+    5
+}
 
 fn default_stream_pre_output_hold_secs() -> u64 {
     15
@@ -6212,15 +6442,23 @@ fn default_audit_log_retention_days() -> u32 {
 }
 
 fn default_local_pool_circuit_window_secs() -> u64 {
-    60
+    300
 }
 
 fn default_local_pool_circuit_open_after_failures() -> u32 {
-    3
+    5
 }
 
 fn default_local_pool_circuit_require_distinct_credentials() -> u32 {
-    2
+    5
+}
+
+fn default_local_pool_circuit_min_ratio_percent() -> u32 {
+    30
+}
+
+fn default_local_pool_circuit_half_open_probes() -> u32 {
+    3
 }
 
 fn default_local_pool_circuit_open_secs() -> u64 {
@@ -6610,6 +6848,24 @@ fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -
     normalized
 }
 
+/// 订阅等级 → 允许模型列表。
+pub type SubscriptionModelLists = BTreeMap<String, SubscriptionModelList>;
+
+/// 一个订阅等级允许的模型列表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionModelList {
+    pub models: Vec<String>,
+    /// `auto`：从该等级的账号自动获取；`manual`：在管理页手动设置或手动同步。
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// 自动获取时用的账号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_credential_id: Option<u64>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -6623,6 +6879,8 @@ impl Default for Config {
             auth_region: None,
             api_region: None,
             kiro_version: default_kiro_version(),
+            kiro_version_auto_sync_enabled: false,
+            kiro_runtime_domain_enabled: false,
             machine_id: None,
             global_machine_id_fallback_enabled: false,
             api_key: None,
@@ -6650,6 +6908,11 @@ impl Default for Config {
             ),
             credential_stream_error_cooldown_secs: default_credential_stream_error_cooldown_secs(),
             credential_empty_turn_cooldown_enabled: false,
+            credential_upstream_failure_cooldown_enabled: false,
+            credential_auto_heal_min_interval_secs: default_credential_auto_heal_min_interval_secs(
+            ),
+            credential_auto_heal_max_consecutive_rounds:
+                default_credential_auto_heal_max_consecutive_rounds(),
             credential_protocol_error_cooldown_secs:
                 default_credential_protocol_error_cooldown_secs(),
             credential_auth_error_cooldown_secs: default_credential_auth_error_cooldown_secs(),
@@ -6659,8 +6922,11 @@ impl Default for Config {
             credential_probation_secs: default_credential_probation_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
+            credential_session_max_concurrent_requests: 0,
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
             kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
+            ),
+            kiro_upstream_stream_max_duration_secs: default_kiro_upstream_stream_max_duration_secs(
             ),
             stream_keepalive_interval_secs: default_stream_keepalive_interval_secs(),
             stream_pre_output_hold_secs: default_stream_pre_output_hold_secs(),
@@ -6704,6 +6970,7 @@ impl Default for Config {
             prompt_injection: PromptInjectionConfig::default(),
             route_features: RouteFeaturesConfig::default(),
             claude_models_only: false,
+            subscription_model_lists: BTreeMap::new(),
             prompt_steering: None,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
@@ -6760,6 +7027,8 @@ impl Default for Config {
             expose_proxy_warnings: default_expose_proxy_warnings(),
             audit_log_retention_enabled: false,
             audit_log_retention_days: default_audit_log_retention_days(),
+            public_pool_view_enabled: false,
+            public_pool_free_accounts: PublicPoolFreeAccounts::default(),
             external_pools: ExternalPoolsConfig::default(),
             config_path: None,
         }
@@ -7021,10 +7290,9 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 8 {
-            // Risk-control bursts must fail safe. Older persisted runtime configs materialized
-            // this field as false because the original circuit only fed external direct policy;
-            // v8 makes it a local-account safety circuit as well.
-            self.external_pools.local_pool_circuit_enabled = true;
+            // v8 used to switch the local pool circuit on. It is off by default now: a
+            // risk-controlled account disables only itself and the rest of the pool keeps
+            // serving. The persisted value is left as it is.
             self.runtime_config_migration_version = 8;
             changed = true;
         }
@@ -7062,6 +7330,13 @@ impl Config {
         if self.runtime_config_migration_version < 13 {
             // v13：提示词配置改为 promptInjection / routeFeatures（见 migrate_legacy_prompt_fields）。
             self.runtime_config_migration_version = 13;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 14 {
+            // v14：任务质量和分块写入策略换了内置文本。保存下来的文本若等于旧内置文本，
+            // 说明运营者没改过，删掉后使用新内置文本；改过的文本保持不变。
+            self.prompt_injection.drop_previous_default_texts();
+            self.runtime_config_migration_version = 14;
             changed = true;
         }
         changed
@@ -7544,10 +7819,25 @@ mod tests {
             !config.credential_empty_turn_cooldown_enabled,
             "空回默认不让账号冷却"
         );
+        assert!(
+            !config.credential_upstream_failure_cooldown_enabled,
+            "上游故障默认不让账号冷却"
+        );
+        assert_eq!(config.credential_auto_heal_min_interval_secs, 300);
+        assert_eq!(config.credential_auto_heal_max_consecutive_rounds, 5);
+        assert!(
+            !config.kiro_version_auto_sync_enabled,
+            "版本号自动同步默认关闭"
+        );
+        assert!(
+            !config.kiro_runtime_domain_enabled,
+            "新版 Kiro 域名默认关闭"
+        );
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 5);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
+        assert_eq!(config.kiro_upstream_stream_max_duration_secs, 3600);
         assert_eq!(config.stream_keepalive_interval_secs, 5);
         assert_eq!(config.stream_pre_output_hold_secs, 15);
         assert_eq!(config.stream_first_output_timeout_secs, 0);
@@ -7577,6 +7867,12 @@ mod tests {
         // Audit cleanup stays off until an operator turns it on, so upgrades delete nothing.
         assert!(!config.audit_log_retention_enabled);
         assert_eq!(config.audit_log_retention_days, 15);
+        // The public pool page stays closed until an operator opens it.
+        assert!(!config.public_pool_view_enabled);
+        assert_eq!(
+            config.public_pool_free_accounts,
+            PublicPoolFreeAccounts::Power
+        );
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
         assert!(config.payload_guard_enabled);
@@ -9967,6 +10263,64 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_migration_v14_replaces_unedited_task_quality_and_chunked_texts() {
+        use crate::model::prompt_injection::{TextKey, catalog};
+
+        let previous_task_quality = catalog::previous_default_texts(TextKey::TaskQuality)[0];
+        let previous_chunked = catalog::previous_default_texts(TextKey::ChunkedWritePolicy)[0];
+        let mut config = Config {
+            runtime_config_migration_version: 13,
+            ..Default::default()
+        };
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::ChunkedWritePolicy, previous_chunked.to_string());
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::Custom, "operator text".to_string());
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        let injection = &config.prompt_injection;
+        assert!(!injection.texts.contains_key(&TextKey::TaskQuality));
+        assert!(!injection.texts.contains_key(&TextKey::ChunkedWritePolicy));
+        assert_eq!(
+            injection.text(TextKey::TaskQuality),
+            catalog::DEFAULT_TASK_QUALITY_PROMPT
+        );
+        assert_eq!(injection.text(TextKey::Custom), "operator text");
+        // Route switches are untouched.
+        assert_eq!(
+            injection.path_overrides,
+            PromptInjectionConfig::default().path_overrides
+        );
+
+        // Runs once: a later operator choice of the old text is kept.
+        config
+            .prompt_injection
+            .texts
+            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
+        assert!(!config.apply_runtime_config_migrations());
+        assert_eq!(
+            config
+                .prompt_injection
+                .texts
+                .get(&TextKey::TaskQuality)
+                .map(String::as_str),
+            Some(previous_task_quality)
+        );
+    }
+
+    #[test]
     fn runtime_config_migration_disables_online_usage_rollup_compression_once() {
         let mut config = Config {
             runtime_config_migration_version: 6,
@@ -9984,6 +10338,40 @@ mod tests {
         config.postgres.compress_usage_rollups_on_start = true;
         assert!(!config.apply_runtime_config_migrations());
         assert!(config.postgres.compress_usage_rollups_on_start);
+    }
+
+    #[test]
+    fn runtime_config_migrations_never_change_the_pool_circuit() {
+        for enabled in [false, true] {
+            let mut config = Config {
+                runtime_config_migration_version: 0,
+                external_pools: ExternalPoolsConfig {
+                    local_pool_circuit_enabled: enabled,
+                    local_pool_circuit_window_secs: 60,
+                    local_pool_circuit_open_after_failures: 3,
+                    local_pool_circuit_require_distinct_credentials: 2,
+                    ..ExternalPoolsConfig::default()
+                },
+                ..Config::default()
+            };
+            config.apply_runtime_config_migrations();
+            let pools = &config.external_pools;
+            assert_eq!(
+                pools.local_pool_circuit_enabled, enabled,
+                "the switch is left as it is"
+            );
+            assert_eq!(pools.local_pool_circuit_window_secs, 60);
+            assert_eq!(pools.local_pool_circuit_open_after_failures, 3);
+            assert_eq!(pools.local_pool_circuit_require_distinct_credentials, 2);
+        }
+    }
+
+    #[test]
+    fn pool_circuit_is_off_by_default() {
+        let pools: ExternalPoolsConfig = serde_json::from_str("{}").unwrap();
+        assert!(!pools.local_pool_circuit_enabled);
+        assert!(!ExternalPoolsConfig::default().local_pool_circuit_enabled);
+        assert!(!Config::default().external_pools.local_pool_circuit_enabled);
     }
 
     #[test]

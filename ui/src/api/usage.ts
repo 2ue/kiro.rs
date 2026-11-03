@@ -1,5 +1,6 @@
 import { api } from '@/api/http'
 import type {
+  SubscriptionModelListsResponse,
   AdminAuditLogPage,
   AccountEventSummaryResponse,
   AdminAuditLogPageQuery,
@@ -276,5 +277,25 @@ export async function upsertManualModel(payload: UpsertManualModelRequest): Prom
 
 export async function deleteManualModel(model: string): Promise<ManualModelResponse> {
   const { data } = await api.delete<ManualModelResponse>(`/model-capabilities/manual/${encodeURIComponent(model)}`)
+  return data
+}
+
+// ============ 订阅等级模型列表 ============
+
+export async function getSubscriptionModelLists(): Promise<SubscriptionModelListsResponse> {
+  const { data } = await api.get<SubscriptionModelListsResponse>('/subscription-model-lists')
+  return data
+}
+
+export async function setSubscriptionModelList(tier: string, models: string[]): Promise<SubscriptionModelListsResponse> {
+  const { data } = await api.put<SubscriptionModelListsResponse>(`/subscription-model-lists/${encodeURIComponent(tier)}`, { models })
+  return data
+}
+
+export async function syncSubscriptionModelList(tier: string, credentialId?: number): Promise<SubscriptionModelListsResponse> {
+  const { data } = await api.post<SubscriptionModelListsResponse>(
+    `/subscription-model-lists/${encodeURIComponent(tier)}/sync`,
+    credentialId === undefined ? {} : { credentialId },
+  )
   return data
 }

@@ -2,39 +2,37 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::model::config::SubscriptionModelLists;
 
 use super::account_state::{CredentialEntry, ProxyResourceAvailability, ProxyResourceRuntime};
 use super::cooldown::entry_cooldown_remaining;
 use super::rpm::entry_rate_limit_remaining;
 
-pub(super) fn is_opus_model(model: Option<&str>) -> bool {
-    model
-        .map(|m| m.to_lowercase().contains("opus"))
-        .unwrap_or(false)
+pub(super) fn credential_is_usable_for_model(
+    entry: &CredentialEntry,
+    model: Option<&str>,
+    tiers: &SubscriptionModelLists,
+) -> bool {
+    !entry.disabled
+        && !entry.account_quota_blocked
+        && entry
+            .credentials
+            .supports_model_with_tier_lists(&[model], tiers)
 }
 
-pub(super) fn credential_is_usable_for_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
-    if entry.disabled || entry.account_quota_blocked {
-        return false;
-    }
-    if !entry.credentials.supports_model(&[model]) {
-        return false;
-    }
-    if is_opus_model(model) && !entry.credentials.supports_opus() {
-        return false;
-    }
-    true
-}
-
-/// Whether the credential's discovered model catalog explicitly lists `model`. An empty
-/// catalog (discovery never ran or failed) only passes `supports_model` as "unknown", so it
-/// is not a known supporter.
+/// Whether the credential's own model catalog explicitly lists `model`. Only the account's list
+/// counts: subscription-tier lists filter accounts but don't make them preferred, otherwise every
+/// account of a listed tier would take the traffic ahead of unlisted ones. An empty catalog only
+/// passes the usable check as "unknown".
 pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
     model.is_some_and(|model| !model.trim().is_empty())
         && !entry.credentials.supported_models.is_empty()
         && entry.credentials.supports_model(&[model])
 }
 
+// This helper is the shared hot-path predicate; keeping the independent scheduler inputs
+// explicit makes each capacity dimension visible at call sites.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn credential_is_dispatchable(
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
     entry: &CredentialEntry,
@@ -43,8 +41,9 @@ pub(super) fn credential_is_dispatchable(
     max_concurrent_requests: u32,
     global_rpm: u32,
     request_weight_units: u32,
+    tiers: &SubscriptionModelLists,
 ) -> bool {
-    credential_is_usable_for_model(entry, model)
+    credential_is_usable_for_model(entry, model, tiers)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
         && entry_cooldown_remaining(entry, model, now).is_none()
         && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
@@ -57,8 +56,9 @@ pub(super) fn credential_is_temporarily_available(
     model: Option<&str>,
     now: Instant,
     global_rpm: u32,
+    tiers: &SubscriptionModelLists,
 ) -> bool {
-    credential_is_usable_for_model(entry, model)
+    credential_is_usable_for_model(entry, model, tiers)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
         && entry_cooldown_remaining(entry, model, now).is_none()
         && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
@@ -69,9 +69,10 @@ pub(super) fn credential_is_dispatch_candidate(
     entry: &CredentialEntry,
     model: Option<&str>,
     excluded_ids: &HashSet<u64>,
+    tiers: &SubscriptionModelLists,
 ) -> bool {
     !excluded_ids.contains(&entry.id)
-        && credential_is_usable_for_model(entry, model)
+        && credential_is_usable_for_model(entry, model, tiers)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
 }
 
@@ -134,11 +135,24 @@ pub(super) fn effective_max_concurrent_requests(
         .unwrap_or(global_max_concurrent_requests)
 }
 
+/// How long a Redis "this credential is full" answer keeps the credential out of local
+/// selection when the local view disagrees. Short: it only has to outlast the gap until the
+/// pending releases reach Redis or the next state sync, and any local release of the credential
+/// clears it early.
+pub(super) const REDIS_FULL_HINT_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+pub(super) fn entry_redis_full_hint_active(entry: &CredentialEntry, now: Instant) -> bool {
+    entry.redis_full_until.is_some_and(|until| until > now)
+}
+
 pub(super) fn entry_has_concurrency_capacity(
     entry: &CredentialEntry,
     global_max_concurrent_requests: u32,
     request_weight_units: u32,
 ) -> bool {
+    if entry_redis_full_hint_active(entry, Instant::now()) {
+        return false;
+    }
     let max_concurrent_requests =
         effective_max_concurrent_requests(entry, global_max_concurrent_requests);
     let request_weight_units =

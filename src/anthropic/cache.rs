@@ -1212,10 +1212,21 @@ pub fn shape_cache_hit_usage(usage: CacheUsage, input: CacheHitShapingInput) -> 
         if let (Some(floor), Some(pricing)) = (floor, input.pricing)
             && !meets_floor(pricing, &shaped, floor)
         {
-            shaped = lossless_split(
-                &usage, total, target, &bounds, policy, &input, pricing, floor,
-            )
-            .unwrap_or(shaped);
+            shaped = if policy.read_aware_cost_floor {
+                raise_cost_at_ratio(
+                    shaped,
+                    pricing,
+                    floor,
+                    target,
+                    &bounds,
+                    input.creation_allowed,
+                )
+            } else {
+                lossless_split(
+                    &usage, total, target, &bounds, policy, &input, pricing, floor,
+                )
+                .unwrap_or(shaped)
+            };
         }
     }
 
@@ -1454,6 +1465,81 @@ fn lossless_split(
         }
         Some(split(low))
     }
+}
+
+/// 计费下限计入读取（`readAwareCostFloor`）：计费不足时保持目标命中率，按比例同时增加
+/// 非读取部分和读取，直到计费达到下限。
+///
+/// 每增加 1 个非读取 token 同时增加 `ratio / (1 - ratio)` 个读取，读取的费用也算进下限，
+/// 所以达到同样的计费需要的总量比"非读取单独满足下限、再在外面追加读取"小得多。
+/// 非读取部分放行写入时先记为写入（到写入上限为止），之后记为 input（与 [`raise_cost_to_floor`]
+/// 一致，不受 input 上限约束）；读取到上限后只增加非读取部分，命中率可以低于目标。
+fn raise_cost_at_ratio(
+    mut usage: CacheUsage,
+    pricing: ModelPricing,
+    floor: f64,
+    ratio: f64,
+    bounds: &ShapingBounds,
+    creation_allowed: bool,
+) -> CacheUsage {
+    let ratio = ratio.clamp(0.0, CacheHitShapingPolicy::MAX_TARGET_HIT_RATIO);
+    let reads_per_non_read = ratio / (1.0 - ratio);
+    // 每轮要么补足计费，要么用完写入上限，要么用完读取上限（含把读取补到上限的一轮），
+    // 最多四轮；多留几轮余量。
+    for _ in 0..8 {
+        let gap = floor - pricing.estimate(usage);
+        if gap <= 0.0 {
+            break;
+        }
+        let creation_room = if creation_allowed && pricing.cache_creation_input_token_cost > 0.0 {
+            (i64::from(bounds.creation_cap) - i64::from(usage.cache_creation_input_tokens.max(0)))
+                .max(0)
+        } else {
+            0
+        };
+        let (unit_cost, room) = if creation_room > 0 {
+            (pricing.cache_creation_input_token_cost, creation_room)
+        } else {
+            (pricing.input_cost_per_token, i64::from(i32::MAX))
+        };
+        let read_room =
+            (i64::from(bounds.read_cap) - i64::from(usage.cache_read_input_tokens.max(0))).max(0);
+        let read_share = if read_room > 0 {
+            reads_per_non_read
+        } else {
+            0.0
+        };
+        let cost_per_non_read = unit_cost + read_share * pricing.cache_read_input_token_cost;
+        if cost_per_non_read <= 0.0 {
+            break;
+        }
+        let mut non_read = (gap / cost_per_non_read).ceil().clamp(0.0, i32::MAX as f64) as i64;
+        non_read = non_read.min(room);
+        if read_share > 0.0 {
+            non_read = non_read.min((read_room as f64 / read_share).floor() as i64);
+        }
+        if non_read <= 0 {
+            // 剩余的读取空间不够再加 1 个非读取 token：不再增加读取，下一轮只补非读取部分。
+            if read_share > 0.0 {
+                usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(0)
+                    + read_room.min(i64::from(i32::MAX)) as i32;
+                continue;
+            }
+            break;
+        }
+        let read = ((non_read as f64) * read_share).round() as i64;
+        let read = read.min(read_room);
+        if creation_room > 0 {
+            usage.cache_creation_input_tokens =
+                (i64::from(usage.cache_creation_input_tokens.max(0)) + non_read)
+                    .min(i64::from(i32::MAX)) as i32;
+        } else {
+            usage.input_tokens = usage.input_tokens.saturating_add(non_read as i32);
+        }
+        usage.cache_read_input_tokens = (i64::from(usage.cache_read_input_tokens.max(0)) + read)
+            .min(i64::from(i32::MAX)) as i32;
+    }
+    usage
 }
 
 /// 增加 read 使 read / (input + read + creation) >= ratio。
@@ -3955,6 +4041,7 @@ mod tests {
             min_cost_ratio,
             max_read_multiplier: 0.0,
             min_creation_ratio: 0.0,
+            read_aware_cost_floor: false,
         }
     }
 
@@ -4246,6 +4333,235 @@ mod tests {
             }
             assert_eq!(shaped.cache_read_input_tokens, 0, "{shaped:?}");
         }
+    }
+
+    fn read_aware(policy: CacheHitShapingPolicy) -> CacheHitShapingPolicy {
+        CacheHitShapingPolicy {
+            read_aware_cost_floor: true,
+            ..policy
+        }
+    }
+
+    fn opus_pricing() -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: 0.00000625,
+            cache_creation_1h_input_token_cost: 0.0,
+            cache_read_input_token_cost: 0.0000005,
+        }
+    }
+
+    /// 现网 /dfcache/minea 的 Claude Code 新会话第二条请求（2026-10-30 实测，原始输入约 2.8 万、
+    /// 写入被 6 秒间隔拦下）：旧算法上报约 9.6 倍原始输入，计入读取后约 5 倍，命中率和
+    /// 计费下限不变。
+    #[test]
+    fn read_aware_cost_floor_keeps_target_with_about_half_the_context() {
+        let opus = opus_pricing();
+        let policy = CacheHitShapingPolicy {
+            ratio_jitter: 0.03,
+            ..shaping(0.9, 1024, 1.0)
+        };
+        // 放大 2.05 倍后的本地模拟 usage：读取约等于放大后的前缀，写入被拦下。
+        let base = usage(4_310, 53_870, 0, 27);
+        for (raw_tokens, creation_allowed) in [(28_388, false), (28_359, false), (33_309, true)] {
+            let raw = raw_input(raw_tokens, 27);
+            let floor = opus.estimate(raw);
+            for seed in 0..32 {
+                let request = CacheHitShapingInput {
+                    creation_allowed,
+                    pricing: Some(opus),
+                    seed,
+                    ..input(policy, raw)
+                };
+                let old = shape_cache_hit_usage(base, request);
+                let new = shape_cache_hit_usage(
+                    base,
+                    CacheHitShapingInput {
+                        policy: read_aware(policy),
+                        ..request
+                    },
+                );
+                let label = format!("raw {raw_tokens} allowed {creation_allowed} seed {seed}");
+                assert!(
+                    opus.estimate(new) >= floor * (1.0 - 1e-9),
+                    "{label}: {new:?}"
+                );
+                assert!(hit_ratio(new) >= 0.9 - 1e-6, "{label}: {new:?}");
+                if !creation_allowed {
+                    assert_eq!(new.cache_creation_input_tokens, 0, "{label}: {new:?}");
+                }
+                let old_ctx = f64::from(sum(old)) / f64::from(raw_tokens);
+                let new_ctx = f64::from(sum(new)) / f64::from(raw_tokens);
+                // 旧算法：非读取部分单独满足下限，再追加读取到目标命中率，上下文约为
+                // 非读取部分的 1 / (1 - 命中率) 倍。拦写时非读取部分全是 input（约等于原始输入），
+                // 放行时一部分是单价 1.25 倍的写入，非读取部分少一些。
+                let old_min = if creation_allowed { 7.0 } else { 8.0 };
+                assert!(old_ctx > old_min, "{label}: old {old_ctx:.2} {old:?}");
+                // 命中率 r、读取单价是 input 的 q 倍时，只用 input 补足计费的最小上下文是
+                // 原始输入 ÷ ((1 - r) + q·r)；放行写入时一部分记为写入（单价更高），上下文更小。
+                let r = hit_ratio(new);
+                let q = opus.cache_read_input_token_cost / opus.input_cost_per_token;
+                let input_only_ctx = 1.0 / ((1.0 - r) + q * r);
+                assert!(
+                    new_ctx <= input_only_ctx * 1.01,
+                    "{label}: new {new_ctx:.2} > minimum {input_only_ctx:.2} {new:?}"
+                );
+                assert!(
+                    new_ctx < old_ctx * 0.65,
+                    "{label}: new {new_ctx:.2} old {old_ctx:.2}"
+                );
+                // 没有多补：计费贴着下限，也不比旧算法多（旧算法多出的读取全是额外计费）。
+                assert!(opus.estimate(new) <= floor * 1.005, "{label}: {new:?}");
+                assert!(opus.estimate(new) <= opus.estimate(old) + 1e-9, "{label}");
+            }
+        }
+    }
+
+    /// 计入读取只改变计费不足时怎么补：计费本来就够、没有可复用前缀、整形关闭时结果和原来一样。
+    #[test]
+    fn read_aware_cost_floor_changes_nothing_when_the_floor_already_holds() {
+        let opus = opus_pricing();
+        let cases = [
+            // 放大后总量足够：总量内按目标分配就不亏。
+            (
+                usage(1_114, 223_463, 148_773, 78),
+                raw_input(24_650, 78),
+                true,
+            ),
+            // 新会话第一条：没有可复用前缀，不做命中率整形。
+            (usage(4_513, 0, 91_940, 64), raw_input(32_361, 64), false),
+            // 计费下限关闭。
+            (usage(3_000, 20_000, 7_000, 10), raw_input(30_000, 10), true),
+        ];
+        for (index, (base, raw, reusable)) in cases.into_iter().enumerate() {
+            let min_cost = if index == 2 { 0.0 } else { 1.0 };
+            for seed in 0..16 {
+                let request = CacheHitShapingInput {
+                    has_reusable_prefix: reusable,
+                    pricing: Some(opus),
+                    seed,
+                    ..input(shaping(0.9, 1024, min_cost), raw)
+                };
+                let old = shape_cache_hit_usage(base, request);
+                let new = shape_cache_hit_usage(
+                    base,
+                    CacheHitShapingInput {
+                        policy: read_aware(request.policy),
+                        ..request
+                    },
+                );
+                assert_eq!(old, new, "case {index} seed {seed}");
+            }
+        }
+    }
+
+    /// 读取或写入顶到上限时：读取不超过上限，计费下限仍然成立，补不上的部分记为 input；
+    /// 写入被拦下的请求永远不产生写入。随机输入覆盖各种组合。
+    #[test]
+    fn read_aware_cost_floor_holds_floor_and_caps_for_random_inputs() {
+        let pricing = opus_pricing();
+        let mut state = 0x5eed_u64;
+        let mut checked = 0;
+        for _ in 0..5_000 {
+            state = splitmix64(state);
+            let raw_tokens = ((splitmix64(state ^ 3) % 400_000) + 2) as i32;
+            let scale = 1.0 + (state % 205) as f64 / 100.0;
+            let total = ((raw_tokens as f64) * scale) as i32;
+            let read = (splitmix64(state ^ 1) % (total as u64 + 1)) as i32;
+            let creation = (splitmix64(state ^ 2) % ((total - read) as u64 + 1)) as i32;
+            let base = usage(total - read - creation, read, creation, 1);
+            let raw = raw_input(raw_tokens, 1);
+            let read_cap = [0, 500_000, 120_000][(state % 3) as usize];
+            let creation_cap = [0, 500_000, 40_000][((state >> 3) % 3) as usize];
+            let multiplier = [0.0, 3.0, 5.0][((state >> 5) % 3) as usize];
+            let creation_allowed = !state.is_multiple_of(4);
+            let target = 0.5 + (state % 45) as f64 / 100.0;
+            let request = CacheHitShapingInput {
+                creation_allowed,
+                pricing: Some(pricing),
+                max_cache_read_tokens: read_cap,
+                max_cache_creation_tokens: creation_cap,
+                seed: state,
+                ..input(
+                    CacheHitShapingPolicy {
+                        max_read_multiplier: multiplier,
+                        ..shaping(target, 1024, 1.0)
+                    },
+                    raw,
+                )
+            };
+            let old = shape_cache_hit_usage(base, request);
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    policy: read_aware(request.policy),
+                    ..request
+                },
+            );
+            let label = format!("{base:?} raw {raw_tokens} -> {shaped:?}");
+            assert!(
+                pricing.estimate(shaped) >= pricing.estimate(raw) * (1.0 - 1e-6),
+                "loss: {label}"
+            );
+            let mut effective_read_cap = if read_cap > 0 { read_cap } else { i32::MAX };
+            if multiplier > 0.0 {
+                effective_read_cap =
+                    effective_read_cap.min((f64::from(raw_tokens) * multiplier).round() as i32);
+            }
+            // 原始 usage 本身已超过上限时不压低，只检查整形没有把读取加到上限之外。
+            if base.cache_read_input_tokens <= effective_read_cap {
+                assert!(
+                    shaped.cache_read_input_tokens <= effective_read_cap.max(1024),
+                    "read cap {effective_read_cap}: {label}"
+                );
+                checked += 1;
+            }
+            if !creation_allowed {
+                assert_eq!(shaped.cache_creation_input_tokens, 0, "suppressed: {label}");
+            }
+            // 读写最小值 1024 让位于更小的上限（例如原始输入只有 100 多 token、读取上限 3 倍），
+            // 这是原有行为；新算法不能在旧算法之外多产生过小的值。
+            let small = |value: i32| value > 0 && value < 1024;
+            if small(shaped.cache_read_input_tokens) {
+                assert!(
+                    effective_read_cap < 1024 || small(old.cache_read_input_tokens),
+                    "small read: {label}"
+                );
+            }
+            if small(shaped.cache_creation_input_tokens) {
+                assert!(
+                    small(old.cache_creation_input_tokens),
+                    "small creation: {label}"
+                );
+            }
+        }
+        assert!(checked > 1_000, "checked {checked}");
+    }
+
+    #[test]
+    fn read_aware_cost_floor_round_trips_and_defaults_off() {
+        let policy: CacheHitShapingPolicy = serde_json::from_value(serde_json::json!({
+            "enabled": true
+        }))
+        .expect("old config without the field");
+        assert!(!policy.read_aware_cost_floor);
+        let policy: CacheHitShapingPolicy = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "readAwareCostFloor": true
+        }))
+        .expect("new config");
+        assert!(policy.read_aware_cost_floor);
+        assert_eq!(
+            serde_json::to_value(policy).unwrap()["readAwareCostFloor"],
+            serde_json::json!(true)
+        );
+        assert!(
+            serde_json::from_value::<CacheHitShapingPolicy>(serde_json::json!({
+                "readAwareCostFloor": "yes"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

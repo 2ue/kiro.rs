@@ -868,7 +868,7 @@ async fn refresh_social_token(
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let kiro_version = &config.effective_kiro_version();
 
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
@@ -961,7 +961,10 @@ async fn refresh_external_idp_token(
     let request = client
         .post(token_endpoint)
         .header("Accept", "application/json")
-        .header("User-Agent", format!("KiroIDE-{}", config.kiro_version))
+        .header(
+            "User-Agent",
+            format!("KiroIDE-{}", config.effective_kiro_version()),
+        )
         .header("Connection", "close")
         .form(&form);
     let request = build_token_refresh_request(request)?;
@@ -1100,7 +1103,7 @@ pub(crate) async fn get_usage_limits(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let kiro_version = &config.effective_kiro_version();
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -1183,7 +1186,7 @@ pub(crate) async fn set_overage_status(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let kiro_version = &config.effective_kiro_version();
     let os_name = &config.system_version;
     let node_version = &config.node_version;
     let status = if enabled { "ENABLED" } else { "DISABLED" };

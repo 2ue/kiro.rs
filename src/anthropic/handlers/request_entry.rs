@@ -15,7 +15,7 @@ pub(super) async fn handle_messages_endpoint(
         .kiro_provider
         .as_ref()
         .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
+        .unwrap_or_else(|| Arc::new(RequestRuntimeConfig::from_app_state(&state)));
     let inference_attempt_budget = Arc::new(InferenceAttemptBudget::with_auxiliary_max_attempts(
         runtime_config.inference_upstream_max_attempts,
         runtime_config.auxiliary_upstream_max_attempts,
@@ -24,7 +24,11 @@ pub(super) async fn handle_messages_endpoint(
     let local_dispatch_max_wait_secs = state
         .kiro_provider
         .as_ref()
-        .map(|provider| provider.runtime_config().credential_dispatch_max_wait_secs)
+        .map(|provider| {
+            provider
+                .runtime_config_snapshot()
+                .credential_dispatch_max_wait_secs
+        })
         .unwrap_or(5);
     let shared_dispatch_max_wait_secs = local_dispatch_max_wait_secs
         .max(
@@ -312,7 +316,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
         .kiro_provider
         .as_ref()
         .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
+        .unwrap_or_else(|| Arc::new(RequestRuntimeConfig::from_app_state(&state)));
     if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
         &state,
         &runtime_config,
@@ -355,6 +359,11 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     .await
 }
 
+static EARLY_REJECTION_LOG_THROTTLE: std::sync::LazyLock<crate::common::log_throttle::LogThrottle> =
+    std::sync::LazyLock::new(|| {
+        crate::common::log_throttle::LogThrottle::new(std::time::Duration::from_secs(1))
+    });
+
 fn should_try_raw_external_routes(requires_normalized_body: bool) -> bool {
     !requires_normalized_body
 }
@@ -372,6 +381,54 @@ fn maybe_local_pool_unavailable_fast_fail_response(
         .as_deref()
         .map(str::trim)
         .filter(|model| !model.is_empty())?;
+
+    // The dispatch queue is full and no credential has a free slot: the scheduler would turn
+    // this request away anyway, so answer before parsing the body. During an overload this is
+    // the bulk of incoming requests, and the cheaper the rejection the faster the queued ones
+    // drain.
+    let external_can_take_route = runtime_config.external_pools.external_pools_enabled
+        && state.external_pool_manager.as_ref().is_some_and(|manager| {
+            manager.has_cached_eligible_pool_for_route_and_model(
+                &runtime_config.external_pools,
+                endpoint,
+                model,
+            )
+        });
+    if !external_can_take_route
+        && let Some(retry_after_secs) = provider.dispatch_queue_full_retry_after(Some(model))
+    {
+        if let Some(attribution) = attribution {
+            attribution.apply_local_temporary_backoff(retry_after_secs);
+        }
+        let request_id = envelope::request_id();
+        // Every arriving request takes this path while the queue is full: log one line a second.
+        if let Some(suppressed) = EARLY_REJECTION_LOG_THROTTLE.admit() {
+            tracing::warn!(
+                request_id,
+                endpoint,
+                model,
+                retry_after_secs,
+                suppressed_since_last = suppressed,
+                "local dispatch queue is full and no credential has a free slot; rejecting before body processing"
+            );
+        }
+        let response = envelope::error_response_with_id_and_headers(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            envelope::public_rate_limit_message(Some(retry_after_secs)),
+            &request_id,
+            [("retry-after", retry_after_secs.to_string())],
+        );
+        record_pre_usage_rejection_with_metadata_and_context(
+            attribution,
+            RequestRejectionReason::LocalPoolTemporaryUnavailable,
+            endpoint,
+            &response,
+            Some(serde_json::json!({ "localState": "dispatch_queue_full" })),
+            request_rejection_usage_context_from_probe(raw_probe),
+        );
+        return Some(response);
+    }
 
     // If external pools are globally enabled and wired, the normalized external fallback path may
     // still be eligible after typed parsing. Do not preempt it with a local-only response.
@@ -442,16 +499,6 @@ fn local_pool_fast_fail_response_parts(
             RequestRejectionReason::LocalPoolUnavailable,
             None,
         ),
-        LocalPoolRouteStateKind::SchedulerRedisDegraded => {
-            let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                envelope::public_rate_limit_message(Some(retry_after_secs)),
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
-                Some(retry_after_secs),
-            )
-        }
         LocalPoolRouteStateKind::RiskCircuitOpen => {
             let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
             (
@@ -462,10 +509,15 @@ fn local_pool_fast_fail_response_parts(
                 Some(retry_after_secs),
             )
         }
+        // A Redis scheduler breaker that opened on a few slow Redis calls says nothing about the
+        // accounts: the dispatch path still serves them from local state with a bounded wait.
+        // Rejecting here turned every Redis hiccup into seconds of 429s for the whole pool while
+        // every account was idle (mock 2026-10-31: 52,605 rejections at 120-180 of 300 slots).
         LocalPoolRouteStateKind::Ready
         | LocalPoolRouteStateKind::NoModelCompatible
         | LocalPoolRouteStateKind::AllCoolingDown
-        | LocalPoolRouteStateKind::CapacityFull => return None,
+        | LocalPoolRouteStateKind::CapacityFull
+        | LocalPoolRouteStateKind::SchedulerRedisDegraded => return None,
     })
 }
 
@@ -1481,24 +1533,16 @@ mod tests {
                 assert_eq!(retry_after, None, "round {round}");
             }
 
-            let (status, error_type, message, reason, retry_after) =
+            // A degraded Redis scheduler is served from local state by the dispatch path, so the
+            // entry must not turn it into a pool-wide rejection.
+            assert!(
                 local_pool_fast_fail_response_parts(
                     LocalPoolRouteStateKind::SchedulerRedisDegraded,
                     Some(4),
                 )
-                .expect("scheduler degraded should fast-fail");
-            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "round {round}");
-            assert_eq!(error_type, "rate_limit_error", "round {round}");
-            assert!(
-                message.contains("Retry after 4 seconds."),
-                "round {round}: {message}"
+                .is_none(),
+                "round {round}: a degraded Redis scheduler is not a reason to reject at the entry"
             );
-            assert_eq!(
-                reason,
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
-                "round {round}"
-            );
-            assert_eq!(retry_after, Some(4), "round {round}");
 
             let (status, error_type, message, reason, retry_after) =
                 local_pool_fast_fail_response_parts(LocalPoolRouteStateKind::RiskCircuitOpen, None)

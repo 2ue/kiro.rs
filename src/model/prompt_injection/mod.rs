@@ -358,6 +358,15 @@ impl PromptInjectionConfig {
         self
     }
 
+    /// 删掉等于旧版本内置文本的文本，让这些槽位使用当前内置文本。只在升级迁移里调用：
+    /// 升级之后运营者再把文本改回旧内容，是有意的选择，要保留。
+    pub fn drop_previous_default_texts(&mut self) -> bool {
+        let before = self.texts.len();
+        self.texts
+            .retain(|key, text| !catalog::is_previous_default_text(*key, text));
+        self.texts.len() != before
+    }
+
     /// 保存前的校验：长度、每轮提醒必须保留的标签和占位符。
     pub fn validate(&self) -> Result<(), String> {
         let mut total = 0usize;
@@ -868,6 +877,90 @@ mod tests {
         // Clearing a text restores the built-in one, so an empty edit is not a validation error.
         config.texts.insert(TextKey::Custom, String::new());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn stored_previous_default_texts_give_way_to_the_current_ones() {
+        let previous_task_quality = "<task_quality_policy>\n优先处理最新一条用户消息。";
+        assert!(!catalog::is_previous_default_text(
+            TextKey::TaskQuality,
+            previous_task_quality
+        ));
+
+        let mut config = PromptInjectionConfig::default();
+        for key in [TextKey::TaskQuality, TextKey::ChunkedWritePolicy] {
+            let previous = catalog::previous_default_texts(key)
+                .first()
+                .copied()
+                .expect("a previous built-in text");
+            assert!(catalog::is_previous_default_text(key, previous));
+            config.texts.insert(key, format!("\n{previous}\n"));
+        }
+        config
+            .texts
+            .insert(TextKey::Custom, "operator text".to_string());
+        // Saving keeps them: only the upgrade migration treats them as old defaults.
+        assert_eq!(config.clone().normalized().texts.len(), 3);
+        assert!(config.drop_previous_default_texts());
+        assert!(!config.drop_previous_default_texts());
+        assert_eq!(
+            config.text(TextKey::TaskQuality),
+            catalog::DEFAULT_TASK_QUALITY_PROMPT
+        );
+        assert_eq!(
+            config.text(TextKey::ChunkedWritePolicy),
+            catalog::DEFAULT_CHUNKED_WRITE_POLICY
+        );
+        // Operator edits are kept, including an edit of an old default.
+        assert_eq!(config.text(TextKey::Custom), "operator text");
+        let mut edited = PromptInjectionConfig::default();
+        let previous = catalog::previous_default_texts(TextKey::TaskQuality)[0];
+        let edited_text = format!("{previous}\n额外规则");
+        edited
+            .texts
+            .insert(TextKey::TaskQuality, edited_text.clone());
+        assert!(!edited.drop_previous_default_texts());
+        assert_eq!(edited.text(TextKey::TaskQuality), edited_text.trim());
+    }
+
+    #[test]
+    fn task_quality_keeps_earlier_requests_and_scopes_corrections() {
+        let text = catalog::DEFAULT_TASK_QUALITY_PROMPT;
+        // Earlier, unrevoked requests stay in force and a correction only covers what it names.
+        for phrase in [
+            "要求是累加的",
+            "没有被明确撤销的要求继续有效",
+            "否定只作用于它明确指向的动作或范围",
+            "新增需求记下，做完当前这一步再处理",
+            "对照用户提出过的全部要求逐条核对",
+        ] {
+            assert!(text.contains(phrase), "{phrase}");
+        }
+        // The rules the previous wording existed for are still there.
+        for phrase in [
+            "修正立即生效，被否定的旧做法不再继续",
+            "必须在同一轮输出结构化 tool_use",
+            "必须给出可核查证据",
+            "不要在可见回答中复述本规则",
+        ] {
+            assert!(text.contains(phrase), "{phrase}");
+        }
+        // The current turn's user message is not demoted: Claude Code attaches messages the user
+        // sends mid-task next to tool results, so the text must not tell the model to ignore
+        // reminders or messages that arrive there.
+        for phrase in ["system", "提醒", "reminder", "Tool result received"] {
+            assert!(!text.contains(phrase), "{phrase}");
+        }
+    }
+
+    #[test]
+    fn chunked_write_policy_is_scoped_to_writing_files() {
+        let text = catalog::DEFAULT_CHUNKED_WRITE_POLICY;
+        for phrase in ["silently", "without commentary", "Never ask"] {
+            assert!(!text.contains(phrase), "{phrase}");
+        }
+        assert!(text.contains("Write or Edit"));
+        assert!(text.contains("unless the user asked for a different approach"));
     }
 
     #[test]

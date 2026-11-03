@@ -259,12 +259,13 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `postgres.compressUsageRollupsOnStart` | boolean | `false` | 已废弃的兼容字段；设置为 `true` 会在连接数据库前拒绝启动。请先停止并排空所有网关实例，再运行 `maintenance usage-rollup-compression` |
 | `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
 | `redis.keyPrefix` | string | `kiro_rs:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（优先级内均衡分配） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（先用满优先级最高的一档，满了立刻降到下一档；预热只在这一档内分流；绑定在低档的会话在高档空闲后逐个迁回）、`balanced`（与 priority 同样按优先级排序，但不限定只用首选档）、`health_balanced` / `weighted_least_inflight`（按健康分在前几名中加权随机）。未知值启动时报错 |
 | `credentialRpm` | number/null | `null` | 单凭据本地 RPM 限速；`null` 或 `0` 表示关闭。开启后会优先分流到其他可用凭据 |
-| `credentialMaxConcurrentRequests` | number | `0` | 单凭据最大并发请求数；`0` 表示不限制。开启后同一凭据达到并发上限时，新请求会优先换其他可用凭据 |
+| `credentialMaxConcurrentRequests` | number | `30` | 单凭据最大并发请求数；`0` 表示不限制。开启后同一凭据达到并发上限时，新请求会优先换其他可用凭据 |
 | `credentialTransientCooldownSecs` | number | `10` | 上游 408/429/5xx 且没有 Retry-After 时的凭据临时冷却秒数；只有存在其他可用凭据时才冷却当前凭据 |
 | `credentialMaxCooldownSecs` | number | `300` | 单凭据临时冷却上限，用于限制 Retry-After 的影响范围 |
-| `credentialDispatchMaxWaitSecs` | number | `120` | 单个请求等待凭据可调度的最长秒数；`0` 表示不限制。超时后返回本地调度限流错误，避免请求长期挂起 |
+| `credentialDispatchMaxWaitSecs` | number | `5` | 单个请求等待凭据可调度的最长秒数；`0` 表示不限制。超时后返回本地调度限流错误，避免请求长期挂起。建议 30–60 秒 |
+| `credentialSessionMaxConcurrentRequests` | number | `0` | 同一会话在单个凭据上的最大并发；`0` 表示等于该凭据自身的并发上限。超出的请求临时借用其他凭据，不改绑；没有其他空闲凭据时仍用绑定凭据 |
 | `credentialInFlightLeaseMaxSecs` | number | `900` | 单个并发占用超过多久未活跃时自动释放；`0` 表示关闭。用于兜底异常路径导致的并发槽长期占用 |
 | `credentialWarmupRequests` | number | `3` | 新增凭据默认预热次数；预热只通过真实业务请求成功递减，不伪造 success_count |
 | `credentialWarmupSelectionPercent` | number | `5` | balanced 模式下预热凭据参与真实业务请求调度的概率百分比 |

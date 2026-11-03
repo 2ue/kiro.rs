@@ -916,7 +916,7 @@ fn persisted_credit_snapshot_only_infers_fixed_overage_bonus() {
     assert_eq!(trial_like_extra_limit.bonus, 0.0);
 }
 
-fn credential_item(
+pub(in crate::admin) fn credential_item(
     id: u64,
     disabled: bool,
     created_at: Option<&str>,
@@ -1153,6 +1153,43 @@ fn credential_status_filters_keep_quota_and_account_errors_separate() {
     manual.disabled_reason = Some("Manual".to_string());
     assert!(!is_account_error(&manual));
     assert!(!is_quota_exhausted(&manual));
+}
+
+#[test]
+fn unavailable_status_covers_disabled_quota_and_account_errors_but_not_cooling() {
+    let unavailable = |credential: &CredentialStatusItem| {
+        credential_matches_query(
+            credential,
+            &CredentialListQuery {
+                status: Some("unavailable".to_string()),
+                ..Default::default()
+            },
+        )
+    };
+
+    let mut manual = credential_item(1, true, None, 0, 0.0, None);
+    manual.disabled_reason = Some("Manual".to_string());
+    assert!(unavailable(&manual));
+
+    let quota = credential_item(2, false, None, 0, 0.0, Some(100.0));
+    assert!(unavailable(&quota));
+
+    let mut auth_failing = credential_item(3, false, None, 0, 0.0, None);
+    auth_failing.last_error_kind = Some("auth".to_string());
+    auth_failing.transient_failure_streak = 1;
+    assert!(unavailable(&auth_failing));
+
+    // Cooling and rate limiting recover on their own.
+    let mut cooling = credential_item(4, false, None, 0, 0.0, None);
+    cooling.cooled_down = true;
+    assert!(!unavailable(&cooling));
+    let mut rate_limited = credential_item(5, false, None, 0, 0.0, None);
+    rate_limited.rate_limited = true;
+    assert!(!unavailable(&rate_limited));
+
+    let normal = credential_item(6, false, None, 0, 0.0, None);
+    assert!(!unavailable(&normal));
+    assert!(status_requires_runtime_filter("unavailable"));
 }
 
 #[test]

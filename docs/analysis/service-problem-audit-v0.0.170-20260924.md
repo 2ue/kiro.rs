@@ -266,7 +266,7 @@ Some(key) if auth::constant_time_eq(&key, &state.current_admin_api_key()) => nex
 
 ### 缓存有界
 
-- `prompt_cache.rs`：单账号 200 条、全局 20,000 条、24h TTL、256MB 估算上限，具备 `prune_expired_locked`
+- `prompt_cache.rs`：单会话 scope 200 条、全局 20,000 条、24h TTL、256MB 估算上限，具备 `prune_expired_locked`
 - `files.rs`：单文件 50MB、最多 128 文件、总量 256MB、并发上传 2
 
 ### 凭据保护到位

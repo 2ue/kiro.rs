@@ -4,6 +4,7 @@ mod auxiliary;
 mod capacity;
 mod concurrency;
 mod cooldown;
+mod dispatch_progress;
 mod manager;
 mod queue;
 mod redis_runtime;
@@ -11,6 +12,7 @@ mod refresh;
 mod route_state;
 mod rpm;
 mod scheduler_error;
+mod selection;
 mod sticky;
 pub(crate) mod storage_task;
 mod strategy;
@@ -28,17 +30,20 @@ pub(crate) use auxiliary::{
 };
 pub use concurrency::InFlightLeaseGuard;
 pub(crate) use manager::AutomaticTokenRecoveryOutcome;
+#[cfg(test)]
+pub(crate) use manager::UPSTREAM_FAULT_STREAK_COOLDOWN;
 #[allow(unused_imports)]
 pub use manager::{
     BackgroundTokenRefreshPassReport, BackgroundTokenRefreshShutdownReport,
-    BackgroundTokenRefreshWorkerHandle, MultiTokenManager, StatsFlushShutdownReport,
-    StatsFlushWorkerHandle,
+    BackgroundTokenRefreshWorkerHandle, DispatchProgressStatus, MultiTokenManager,
+    StatsFlushShutdownReport, StatsFlushWorkerHandle,
 };
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 #[allow(unused_imports)]
 pub use scheduler_error::{
     LocalSchedulerError, LocalSchedulerErrorKind, local_scheduler_error_kind,
 };
+pub(crate) use selection::LoadBalancingMode;
 #[allow(unused_imports)]
 pub use storage_task::{
     StorageTaskDrainReport, StorageTaskShutdownReport, StorageTaskStats,
@@ -46,8 +51,8 @@ pub use storage_task::{
     shutdown_best_effort_storage_tasks,
 };
 pub use types::{
-    AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID,
-    TransientFailureKind,
+    AcquireMode, CallContext, CredentialAuthUpdate, DispatchAdmission,
+    EXTERNAL_CREDENTIAL_CONTEXT_ID, TransientFailureKind,
 };
 
 #[allow(unused_imports)]

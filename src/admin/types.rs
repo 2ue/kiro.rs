@@ -438,6 +438,8 @@ pub struct CredentialSummaryResponse {
     pub cooling: usize,
     pub quota_exhausted: usize,
     pub account_error: usize,
+    /// 不可用：已禁用、额度用尽或账号异常（去重计数）。
+    pub unavailable: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -629,8 +631,24 @@ pub struct ExportCredentialsQuery {
     pub format: Option<String>,
     /// Comma-separated credential ids to export. Empty or absent means export all credentials.
     pub ids: Option<String>,
-    /// Export only disabled credentials when true.
+    /// Export only disabled credentials when true. Same as `status=disabled`.
     pub disabled: Option<bool>,
+    // The account list filters, with the same meaning as on `/credentials-paged`.
+    pub q: Option<String>,
+    #[serde(alias = "id")]
+    pub credential_id: Option<u64>,
+    #[serde(alias = "email")]
+    pub account: Option<String>,
+    pub region: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<u32>,
+    pub rpm: Option<u32>,
+    pub concurrency: Option<u32>,
+    pub status: Option<String>,
+    pub auth_method: Option<String>,
+    pub subscription: Option<String>,
+    pub proxy_resource_id: Option<u64>,
 }
 
 // ============ 操作请求 ============
@@ -1859,6 +1877,14 @@ pub struct RuntimeConfigResponse {
     pub credential_network_error_cooldown_secs: u64,
     pub credential_stream_error_cooldown_secs: u64,
     pub credential_empty_turn_cooldown_enabled: bool,
+    pub credential_upstream_failure_cooldown_enabled: bool,
+    pub credential_auto_heal_min_interval_secs: u64,
+    pub credential_auto_heal_max_consecutive_rounds: u32,
+    pub kiro_version_auto_sync_enabled: bool,
+    /// 最近一次自动同步读到的官方版本；未开启或尚未读到时为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_version_latest: Option<String>,
+    pub kiro_runtime_domain_enabled: bool,
     pub credential_protocol_error_cooldown_secs: u64,
     pub credential_auth_error_cooldown_secs: u64,
     pub credential_cooldown_backoff_multiplier: f64,
@@ -1866,8 +1892,10 @@ pub struct RuntimeConfigResponse {
     pub credential_probation_secs: u64,
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
+    pub credential_session_max_concurrent_requests: u32,
     pub kiro_upstream_response_timeout_secs: u64,
     pub kiro_upstream_stream_idle_timeout_secs: u64,
+    pub kiro_upstream_stream_max_duration_secs: u64,
     pub stream_keepalive_interval_secs: u64,
     pub stream_pre_output_hold_secs: u64,
     pub stream_first_output_timeout_secs: u64,
@@ -2011,6 +2039,16 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub credential_empty_turn_cooldown_enabled: Option<bool>,
     #[serde(default)]
+    pub credential_upstream_failure_cooldown_enabled: Option<bool>,
+    #[serde(default)]
+    pub credential_auto_heal_min_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_auto_heal_max_consecutive_rounds: Option<u32>,
+    #[serde(default)]
+    pub kiro_version_auto_sync_enabled: Option<bool>,
+    #[serde(default)]
+    pub kiro_runtime_domain_enabled: Option<bool>,
+    #[serde(default)]
     pub credential_protocol_error_cooldown_secs: Option<u64>,
     #[serde(default)]
     pub credential_auth_error_cooldown_secs: Option<u64>,
@@ -2024,9 +2062,13 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
     #[serde(default)]
+    pub credential_session_max_concurrent_requests: Option<u32>,
+    #[serde(default)]
     pub kiro_upstream_response_timeout_secs: Option<u64>,
     #[serde(default)]
     pub kiro_upstream_stream_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub kiro_upstream_stream_max_duration_secs: Option<u64>,
     #[serde(default)]
     pub stream_keepalive_interval_secs: Option<u64>,
     #[serde(default)]
@@ -2635,4 +2677,44 @@ mod tests {
         assert_eq!(req.ids, vec![7, 3, 7]);
         assert!(!req.disable_first);
     }
+}
+
+// ============ 订阅等级模型列表 ============
+
+/// 一个订阅等级的模型列表与账号统计。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionModelListItem {
+    pub tier: String,
+    pub label: String,
+    /// 未设置列表时为空。
+    pub models: Vec<String>,
+    pub source: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_credential_id: Option<u64>,
+    /// 该等级的账号数。
+    pub credential_count: usize,
+    /// 其中没有设置自身支持模型、因而按等级列表限制的账号数。
+    pub tier_limited_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionModelListsResponse {
+    pub items: Vec<SubscriptionModelListItem>,
+}
+
+/// 手动设置一个等级的列表；`models` 为空表示删除（不限制）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSubscriptionModelListRequest {
+    pub models: Vec<String>,
+}
+
+/// 从该等级的一个账号重新获取模型列表；不指定账号时自动选一个可用账号。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSubscriptionModelListRequest {
+    #[serde(default)]
+    pub credential_id: Option<u64>,
 }
