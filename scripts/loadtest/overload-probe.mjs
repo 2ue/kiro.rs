@@ -344,6 +344,13 @@ async function main() {
         openArrivals,
         ready: ready.status,
         readyMs: Math.round(ready.ms),
+        // Which readiness checks failed when /readyz was not ready.
+        readyFailed:
+          ready.status === 200 || !ready.body?.checks
+            ? null
+            : Object.entries(ready.body.checks)
+                .filter(([, ok]) => !ok)
+                .map(([name]) => name),
         queued,
         runtimeLagMs: ready.body?.runtimeLagMs ?? null,
         pendingReleases: ready.body?.dispatch?.pendingRedisReleases ?? null,
@@ -397,8 +404,13 @@ async function main() {
     }
   };
   let lastPortCheck = 0;
+  // When each segment actually started, in sample seconds. On a loaded host the sampler falls
+  // behind wall time, so phases cut by nominal durations put a phase's first seconds (an
+  // upstream outage, say) into the previous one.
+  const segmentStartSecs = [];
   for (const [segmentIndex, segment] of segments.entries()) {
     if (abortedReason) break;
+    segmentStartSecs.push(nowSec());
     const patch = upstreamPlan[segmentIndex];
     if (patch) {
       await fetch(`${kiroMock}/__control`, {
@@ -435,6 +447,7 @@ async function main() {
   }
   currentRate = 0;
   // Drain: let open arrivals finish (bounded), keep sampling to see recovery.
+  const drainStartSec = nowSec();
   const drainUntil = Date.now() + Number(args.drainSecs || 90) * 1000;
   while (openArrivals > 0 && Date.now() < drainUntil) await sleep(500);
   await sleep(3000);
@@ -442,12 +455,11 @@ async function main() {
   await sampler;
 
   const phaseOf = (t) => {
-    let acc = 0;
-    for (let i = 0; i < segments.length; i += 1) {
-      acc += segments[i].secs;
-      if (t < acc) return i;
+    if (t >= drainStartSec) return segments.length;
+    for (let i = segmentStartSecs.length - 1; i >= 0; i -= 1) {
+      if (t >= segmentStartSecs[i]) return i;
     }
-    return segments.length;
+    return 0;
   };
   const phases = [...segments.map((segment, index) => ({ index, ...segment })), { index: segments.length, kind: "drain" }].map(
     (segment) => {
@@ -500,6 +512,21 @@ async function main() {
   );
   const finalMock = await getJson(`${kiroMock}/__control`);
   const perToken = finalMock.body?.counters?.perToken || {};
+  // kiro-rs's own count of calls it let through per account, to tell a real RPM overrun from
+  // calls that only arrived at the mock bunched together (arrival delay on a loaded host).
+  const tokenIds = Object.keys(perToken)
+    .map((token) => token.replace("mock-access-", ""))
+    .filter((id) => /^[0-9]+$/.test(id));
+  const runtime =
+    adminKey && tokenIds.length
+      ? await getJson(`${baseUrl.origin}/api/admin/credentials/runtime?ids=${tokenIds.join(",")}`, {
+          "x-api-key": adminKey,
+        })
+      : { body: null };
+  const dispatchedByToken = {};
+  for (const item of runtime.body?.items || []) {
+    dispatchedByToken[`mock-access-${item.id}`] = item.schedulerSelectionCount ?? null;
+  }
   const maxInFlights = Object.values(perToken).map((stats) => stats.maxInFlight);
   const overConcurrency = Object.entries(perToken).filter(([token, stats]) => stats.maxInFlight > limitOf(token).conc);
   const overRpm = Object.entries(perToken).filter(([token, stats]) => limitOf(token).rpm > 0 && stats.maxPerMinute > limitOf(token).rpm);
@@ -508,6 +535,8 @@ async function main() {
     accounts,
     perConcurrency,
     perRpm,
+    segmentStartSecs,
+    drainStartSec,
     capacity,
     accountSlots,
     globalMax,
@@ -518,8 +547,20 @@ async function main() {
     accountsUsed: Object.keys(perToken).length,
     accountMaxInFlight: Math.max(0, ...maxInFlights),
     accountsOverConcurrency: overConcurrency.length,
+    accountsOverConcurrencyDetail: overConcurrency
+      .slice(0, 5)
+      .map(([token, stats]) => ({ token, maxInFlight: stats.maxInFlight, limit: limitOf(token).conc })),
+    // Event-loop lag of the mock over the run: its arrival and close times trail kiro-rs by up
+    // to this much, so RPM and concurrency peaks within it are measurement, not dispatch.
+    mockLoopLagMaxMs: finalMock.body?.counters?.loopLagMaxMs ?? null,
     accountsOverRpm: overRpm.length,
-    accountsOverRpmDetail: overRpm.slice(0, 5).map(([token, stats]) => ({ token, maxPerMinute: stats.maxPerMinute, rpm: limitOf(token).rpm })),
+    accountsOverRpmDetail: overRpm.slice(0, 5).map(([token, stats]) => ({
+      token,
+      maxPerMinute: stats.maxPerMinute,
+      rpm: limitOf(token).rpm,
+      upstreamCalls: stats.calls,
+      dispatched: dispatchedByToken[token] ?? null,
+    })),
     unfinishedArrivals: openArrivals,
     timeline,
   };

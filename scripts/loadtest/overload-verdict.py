@@ -65,7 +65,15 @@ for path in sorted(glob.glob(os.path.join(result_dir, "*.json"))):
         acc += phase["secs"]
         segment_ends.append(acc)
 
+    # Newer reports carry when each phase actually started (the sampler can fall behind wall
+    # time on a loaded host); older ones only the nominal durations.
+    starts = report.get("segmentStartSecs")
+    if starts:
+        segment_ends = starts[1:] + [report["drainStartSec"]]
+
     def phase_index(t):
+        if starts and t >= report["drainStartSec"]:
+            return len(phases) - 1
         for index, end in enumerate(segment_ends):
             if t < end:
                 return index

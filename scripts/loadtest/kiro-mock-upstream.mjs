@@ -48,13 +48,24 @@ const control = {
 // in-flight count and per-minute call count seen since the last reset (`perToken`).
 const emptyCounters = () => ({ requests: 0, failed: 0, ok: 0, midStreamResets: 0, hangs: 0, trickles: 0, byToken: {}, conversations: [] });
 const counters = { ...emptyCounters(), inFlight: 0, maxInFlight: 0 };
+// How late this process runs its own timers. Arrival times and in-flight counts here are taken
+// when the event loop gets to a request or a closed socket; on a loaded host that can trail the
+// moment kiro-rs sent or closed it by seconds, which shows up as calls bunched into one minute
+// or a slot counted busy after kiro-rs already reused it.
+const LOOP_LAG_TICK_MS = 100;
+let loopLagExpectedAt = Date.now() + LOOP_LAG_TICK_MS;
+setInterval(() => {
+  const lag = Math.max(0, Date.now() - loopLagExpectedAt);
+  counters.loopLagMaxMs = Math.max(counters.loopLagMaxMs || 0, lag);
+  loopLagExpectedAt = Date.now() + LOOP_LAG_TICK_MS;
+}, LOOP_LAG_TICK_MS).unref();
 // token -> { inFlight, maxInFlight, recent: [call start ms], maxPerMinute }
 let perToken = new Map();
 
 function tokenStats(token) {
   let stats = perToken.get(token);
   if (!stats) {
-    stats = { inFlight: 0, maxInFlight: 0, recent: [], maxPerMinute: 0 };
+    stats = { inFlight: 0, maxInFlight: 0, recent: [], maxPerMinute: 0, calls: 0 };
     perToken.set(token, stats);
   }
   return stats;
@@ -65,7 +76,13 @@ function perTokenSnapshot() {
   const out = {};
   for (const [token, stats] of perToken) {
     stats.recent = stats.recent.filter((at) => now - at < 60000);
-    out[token] = { inFlight: stats.inFlight, maxInFlight: stats.maxInFlight, lastMinute: stats.recent.length, maxPerMinute: stats.maxPerMinute };
+    out[token] = {
+      inFlight: stats.inFlight,
+      maxInFlight: stats.maxInFlight,
+      lastMinute: stats.recent.length,
+      maxPerMinute: stats.maxPerMinute,
+      calls: stats.calls,
+    };
   }
   return out;
 }
@@ -433,6 +450,7 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
   const startedAt = Date.now();
   stats.inFlight += 1;
   stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
+  stats.calls += 1;
   stats.recent = stats.recent.filter((at) => startedAt - at < 60000);
   stats.recent.push(startedAt);
   // The peak uses a window five seconds short of a minute. kiro-rs counts a call when it picks
@@ -581,6 +599,7 @@ const server = http.createServer(async (req, res) => {
           for (const stats of perToken.values()) {
             stats.maxInFlight = stats.inFlight;
             stats.maxPerMinute = 0;
+            stats.calls = 0;
           }
         }
       }

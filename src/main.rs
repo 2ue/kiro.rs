@@ -15,7 +15,7 @@ use std::{
     future::{Future, IntoFuture},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -68,6 +68,10 @@ const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(4);
 const SHUTDOWN_LEASE_RELEASE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const READYZ_DEPENDENCY_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+/// A dependency check that misses its timeout is only reported as not ready once the dependency
+/// has had no successful check for this long. Under full load a ping waits behind the requests
+/// sharing its connection pool, and one slow answer is a busy dependency, not a down one.
+const READYZ_DEPENDENCY_GRACE: StdDuration = StdDuration::from_secs(10);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 const MODEL_CAPABILITY_HEALTH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const MODEL_CAPABILITY_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(300);
@@ -774,6 +778,8 @@ async fn async_main() {
         redis_store: redis_store.clone(),
         runtime_events: runtime_event_health.clone(),
         token_manager: token_manager.clone(),
+        postgres_health: DependencyHealth::new(),
+        redis_health: DependencyHealth::new(),
     });
     let app = app.merge(create_health_router(health_state));
 
@@ -1377,6 +1383,36 @@ struct AppHealthState {
     redis_store: Arc<RedisStore>,
     runtime_events: Arc<RuntimeEventHealth>,
     token_manager: Arc<kiro::token_manager::MultiTokenManager>,
+    postgres_health: DependencyHealth,
+    redis_health: DependencyHealth,
+}
+
+/// Last successful readiness check of one dependency; see [`READYZ_DEPENDENCY_GRACE`].
+struct DependencyHealth {
+    origin: Instant,
+    /// Milliseconds since `origin` of the last successful check.
+    last_ok_ms: AtomicU64,
+}
+
+impl DependencyHealth {
+    /// Starts healthy: the process only gets here after connecting to the dependency.
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_ok_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Records one check and answers whether the dependency counts as ready.
+    fn observe(&self, ok: bool, now: Instant) -> bool {
+        let now_ms = now.saturating_duration_since(self.origin).as_millis() as u64;
+        if ok {
+            self.last_ok_ms.fetch_max(now_ms, Ordering::AcqRel);
+            return true;
+        }
+        let last_ok_ms = self.last_ok_ms.load(Ordering::Acquire);
+        now_ms.saturating_sub(last_ok_ms) < READYZ_DEPENDENCY_GRACE.as_millis() as u64
+    }
 }
 
 /// Queued requests with no dispatch for this long mean the scheduler is not moving.
@@ -1409,6 +1445,9 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
                 .is_ok_and(|result| result.is_ok())
         },
     );
+    let now = Instant::now();
+    let postgres_ok = state.postgres_health.observe(postgres_ok, now);
+    let redis_ok = state.redis_health.observe(redis_ok, now);
     let redis_events_connected = state
         .runtime_events
         .redis_events_connected
@@ -1816,6 +1855,20 @@ fn handle_credentials_command(
 mod lifecycle_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A slow check right after a good one keeps the dependency ready; only failing for the
+    /// whole grace period makes it not ready, and one success brings it back.
+    #[test]
+    fn readiness_tolerates_a_slow_dependency_check_within_the_grace_period() {
+        let health = DependencyHealth::new();
+        let start = health.origin;
+        assert!(health.observe(true, start + StdDuration::from_secs(1)));
+        assert!(health.observe(false, start + StdDuration::from_secs(2)));
+        assert!(health.observe(false, start + StdDuration::from_millis(10_900)));
+        assert!(!health.observe(false, start + StdDuration::from_secs(11)));
+        assert!(health.observe(true, start + StdDuration::from_secs(12)));
+        assert!(health.observe(false, start + StdDuration::from_secs(13)));
+    }
 
     #[test]
     fn remaining_shutdown_budget_caps_each_stage_and_expires() {
