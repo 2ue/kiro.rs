@@ -1,7 +1,7 @@
 import { Activity, ChevronRight, Coins, Ellipsis, FlaskConical, Wallet, Zap } from 'lucide-react'
 import { Badge, Button, Checkbox, Switch, Tooltip } from '@/components/ui'
 import { MiddleTruncate } from '@/components/patterns'
-import { formatCompact, formatDateTime, formatFullDate, formatMeteringUsage, formatNumber, formatPercent } from '@/lib/format'
+import { formatCompact, formatDateTime, formatFullDate, formatNumber, formatPercent } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import type { PublicPoolAccount } from '@/types/api'
 import {
@@ -26,7 +26,8 @@ import { publicAccountLabel, publicAttentionFlags, publicStatusMeta } from './pu
 
 /**
  * The account card as the public read-only page shows it: the same layout as the account page,
- * with every control drawn but wired to nothing, and no cost figures.
+ * with every control drawn but wired to nothing. The credits and costs the account page lists
+ * under the quota bar are left out; the bar and its reading stay.
  */
 export function PublicPoolCard({ account }: { account: PublicPoolAccount }) {
   const label = publicAccountLabel(account)
@@ -113,16 +114,6 @@ export function PublicPoolCard({ account }: { account: PublicPoolAccount }) {
         </div>
         <QuotaBar model={quotaBar} />
       </div>
-
-      {/* Credits used are fine to show; the dollar figures next to them on the account page are not. */}
-      <dl className={cn('grid grid-cols-3 gap-3 px-4 pt-3', dim)}>
-        <div className="min-w-0">
-          <dt className="text-[0.7rem] leading-4 text-muted-foreground">使用积分</dt>
-          <dd className="tabular mt-0.5 truncate text-xs font-semibold leading-4 text-foreground" title={formatMeteringUsage(account.kiroMeteringUsage)}>
-            {formatMeteringUsage(account.kiroMeteringUsage)}
-          </dd>
-        </div>
-      </dl>
 
       <div className={cn('grid grid-cols-[1fr_1fr_0.7fr_1.6fr] items-start gap-x-2 px-4 pt-3.5', dim)}>
         <Meter label="并发" value={concurrencyText}
