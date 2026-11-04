@@ -6856,7 +6856,7 @@ impl MultiTokenManager {
         let bound_is_degraded = entries
             .iter()
             .find(|entry| entry.id == bound_id)
-            .is_some_and(|entry| is_degraded(entry));
+            .is_some_and(&is_degraded);
         if bound_is_degraded {
             let has_healthy_alternative = entries.iter().any(|entry| {
                 entry.id != bound_id

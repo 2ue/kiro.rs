@@ -85,7 +85,7 @@ pub(super) fn add_failure(
     half_life_ms: f64,
     suspend_score: f64,
 ) {
-    if !(weight > 0.0) {
+    if weight.is_nan() || weight <= 0.0 {
         return;
     }
     let key = model_key(model);
