@@ -336,10 +336,8 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
         // 按字节截 36 个字符：`user_id` 来自客户端，截断点可能落在多字节字符中间，
         // 直接切片会 panic 并让这个请求的连接直接断掉。`get` 在那种情况下返回 None。
-        if let Some(uuid_str) = session_part.get(..36) {
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
+        if let Some(uuid_str) = session_part.get(..36).filter(|s| is_valid_uuid(s)) {
+            return Some(uuid_str.to_string());
         }
     }
     None

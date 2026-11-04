@@ -8537,7 +8537,8 @@ mod tests {
         }
 
         // 正文里出现同一个字符串不算冲突：只匹配完整片段 `"conversationId":"<id>"`。
-        let echo = r#"{"conversationState":{"conversationId":"dup"},"history":[{"content":"dup"}]}"#;
+        let echo =
+            r#"{"conversationState":{"conversationId":"dup"},"history":[{"content":"dup"}]}"#;
         assert!(super::refresh_kiro_request_identity(echo).is_some());
 
         // 完整片段出现两次时无法确定改哪个，按原样重发，让上游裁决。
