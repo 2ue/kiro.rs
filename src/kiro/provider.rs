@@ -8519,6 +8519,43 @@ mod tests {
         assert!(super::refresh_kiro_request_identity("not json").is_none());
     }
 
+    /// conversationId 不一定是 36 位 UUID：客户端可以通过 `metadata.user_id` 换出别的形状。
+    /// 换身份必须对任意长度都成立，不能假设 UUID 的定长。
+    #[test]
+    fn refresh_kiro_request_identity_accepts_any_conversation_id_length() {
+        for id in ["", "a", "conv-1", &"x".repeat(2000)] {
+            let body =
+                format!(r#"{{"conversationState":{{"conversationId":"{id}","history":[]}}}}"#);
+            let refreshed = super::refresh_kiro_request_identity(&body).expect("located");
+            let value: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
+            let conversation = value["conversationState"]["conversationId"]
+                .as_str()
+                .unwrap();
+            assert_eq!(conversation.len(), 36);
+            let restored = refreshed.replacen(conversation, id, 1);
+            assert_eq!(restored, body);
+        }
+
+        // 正文里出现同一个字符串不算冲突：只匹配完整片段 `"conversationId":"<id>"`。
+        let echo = r#"{"conversationState":{"conversationId":"dup"},"history":[{"content":"dup"}]}"#;
+        assert!(super::refresh_kiro_request_identity(echo).is_some());
+
+        // 完整片段出现两次时无法确定改哪个，按原样重发，让上游裁决。
+        let ambiguous = r#"{"conversationState":{"conversationId":"dup","agentContinuationId":"a"},"history":[{"conversationId":"dup"}]}"#;
+        assert!(super::refresh_kiro_request_identity(ambiguous).is_none());
+
+        // conversationId 是空字符串时同样可以定位（形如 `"conversationId":""`）。
+        let empty = r#"{"conversationState":{"conversationId":""}}"#;
+        let refreshed = super::refresh_kiro_request_identity(empty).expect("empty id located");
+        assert!(!refreshed.contains(r#""conversationId":"""#));
+
+        // 非字符串类型不换身份，交给上游裁决，和 `Value::as_str` 的语义一致。
+        assert!(
+            super::refresh_kiro_request_identity(r#"{"conversationState":{"conversationId":7}}"#)
+                .is_none()
+        );
+    }
+
     #[test]
     fn refresh_kiro_request_identity_keeps_value_semantics_for_five_rounds() {
         for round in 0..5 {
