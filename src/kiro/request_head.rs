@@ -488,7 +488,10 @@ mod tests {
         }
     }
 
+    // 分配计数器是进程级的：并行跑的其他测试会把自己的分配算进来，比值断言在 CI 上会随机失败。
+    // 这个探针和 `http_client` 里同类探针一样，只在隔离运行时有意义。
     #[test]
+    #[ignore = "run in isolation: allocation counters are process-wide"]
     fn borrows_unescaped_strings_and_skips_large_history_without_allocating() {
         let mut body =
             String::from(r#"{"conversationState":{"conversationId":"conv-1","history":["#);
