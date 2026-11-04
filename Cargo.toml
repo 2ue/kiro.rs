@@ -51,6 +51,8 @@ pdf-extract = "0.7"   # PDF 文本抽取
 url = "2"             # URL 解析（SSRF 防护）
 zip = { version = "2.2", default-features = false, features = ["deflate"] }  # 诊断采集归档
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }  # 图片压缩开关（默认关闭）
+# musl 自带 malloc 是一把全局锁，多 worker 并发处理大请求体时 CPU 大量耗在 futex 上。
+mimalloc = "=0.1.52"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.178"     # killpg for code execution timeouts
