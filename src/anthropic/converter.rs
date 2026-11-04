@@ -334,8 +334,9 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     // 回退到字符串格式: 查找 "session_" 后面的内容
     if let Some(pos) = user_id.find("session_") {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
+        // 按字节截 36 个字符：`user_id` 来自客户端，截断点可能落在多字节字符中间，
+        // 直接切片会 panic 并让这个请求的连接直接断掉。`get` 在那种情况下返回 None。
+        if let Some(uuid_str) = session_part.get(..36) {
             if is_valid_uuid(uuid_str) {
                 return Some(uuid_str.to_string());
             }
@@ -2979,6 +2980,23 @@ mod tests {
         let user_id = "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd";
         let session_id = extract_session_id(user_id);
         assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn test_extract_session_id_never_panics_on_multibyte_user_ids() {
+        // 客户端可以随便构造 metadata.user_id；截断点落在多字节字符中间时不能崩溃。
+        let cases = [
+            format!("session_a{}", "中".repeat(20)),
+            format!("user_x_session_{}", "é".repeat(40)),
+            format!("session_{}", "🙂".repeat(20)),
+            format!("session_{}", "x".repeat(35)),
+            format!("session_é{}", "x".repeat(60)),
+            "session_".to_string(),
+            "session_".repeat(3),
+        ];
+        for user_id in cases {
+            let _ = extract_session_id(&user_id);
+        }
     }
 
     #[test]
