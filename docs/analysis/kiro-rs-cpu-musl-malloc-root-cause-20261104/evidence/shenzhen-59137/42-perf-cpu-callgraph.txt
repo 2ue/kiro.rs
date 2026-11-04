@@ -1,0 +1,72 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cycles:P'
+# Event count (approx.): 18107817707
+#
+# Overhead  Shared Object      Symbol                                       
+# ........  .................  .............................................
+#
+    13.05%  kiro-rs            [.] 0x00000000022964ba
+            |
+            ---0x7fbada0794ba
+               |          
+                --2.48%--0x7fbad806b802
+                          |          
+                          |--1.42%--0x7fbada082fe3
+                          |          |          
+                          |           --1.12%--0x7fbada08957f
+                          |                     0x7fbada08325c
+                          |          
+                           --1.06%--0x7fbada082eef
+                                     0x7fbada08957f
+                                     0x7fbada08325c
+                                     0x7fbad96445e5
+
+    11.30%  kiro-rs            [.] 0x000000000228dc5b
+            |
+            ---0x7fbada070c5b
+               |          
+                --2.36%--0
+
+    10.14%  kiro-rs            [.] 0x000000000228d55c
+            |
+            ---0x7fbada07055c
+
+     4.49%  kiro-rs            [.] 0x000000000228dbb2
+            |
+            ---0x7fbada070bb2
+               |          
+                --1.28%--0
+
+     3.66%  kiro-rs            [.] 0x0000000002296561
+            |
+            ---0x7fbada079561
+
+     1.45%  [kernel.kallsyms]  [k] __irqentry_text_start
+            |
+            ---__irqentry_text_start
+
+     1.26%  kiro-rs            [.] 0x00000000017dd0ba
+            |
+            ---0x7fbad95c00ba
+
+     1.11%  kiro-rs            [.] 0x000000000229636a
+            |
+            ---0x7fbada07936a
+
+     1.02%  kiro-rs            [.] 0x0000000002296373
+            |
+            ---0x7fbada079373
+
+     1.01%  kiro-rs            [.] 0x000000000228d08b
+            |
+            ---0x7fbada07008b
+
+
+
+#
+# (Tip: To record callchains for each sample: perf record -g)
+#

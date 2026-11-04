@@ -1,0 +1,32 @@
+collected_at=2026-11-04T01:05:05-08:00
+host=v2202601333039428646
+kernel=6.12.107+deb13-amd64
+nproc=8
+               total        used        free      shared  buff/cache   available
+Mem:           15991        6008        1001         366        9550        9982
+Swap:          20479        6436       14043
+ 01:05:05 up 17 days, 22:44,  6 users,  load average: 2.22, 2.40, 2.51
+container=/kiro-rs-2ue-59138-app image=ghcr.io/2ue/kiro-rs:latest image_id=sha256:8e80bf819d908123eb1b57d581bd145575e8315bbfe25c51778da42b7746f349 version=0.0.237 nano_cpus=0 mem_limit=0 started=2026-11-04T07:52:15.071927414Z
+pid=1463562 binary_sha256=2520521ffbd9760df354f79466188434f659b3adbed89ed85eac10eff0ee33cb
+VmHWM:	 1468960 kB
+VmRSS:	  679112 kB
+Threads:	22
+--- docker stats
+kiro-rs-2ue-59138-app 19.01% 492.8MiB / 15.62GiB
+kiro-rs-2ue-59138-redis 0.83% 24.72MiB / 15.62GiB
+kiro-rs-2ue-59138-postgres 1.97% 166.6MiB / 15.62GiB
+kiro-rs-ff-kiro-rs-1 0.06% 460.9MiB / 15.62GiB
+caddy-caddy-1 0.05% 17.64MiB / 15.62GiB
+github-trends-worker-1 0.19% 1.66GiB / 15.62GiB
+github-trends-api-1 0.78% 645.8MiB / 15.62GiB
+kiro-rs-2ue-59137-app 0.00% 19.11MiB / 15.62GiB
+kiro-rs-2ue-59137-redis 0.31% 9.676MiB / 15.62GiB
+github-trends-gateway-1 0.03% 66.98MiB / 15.62GiB
+sub2api-pg-receivewal 0.06% 6.785MiB / 15.62GiB
+sub2api-max 0.95% 193.8MiB / 15.62GiB
+sub2api-max-postgres 0.44% 163.9MiB / 15.62GiB
+sub2api-max-redis 0.32% 11.27MiB / 15.62GiB
+kiro-rs-2ue-59137-postgres 0.00% 30.51MiB / 15.62GiB
+sub2api-postgres 0.32% 165.1MiB / 15.62GiB
+sub2api-redis 0.35% 8.152MiB / 15.62GiB
+done 2026-11-04T01:08:17-08:00

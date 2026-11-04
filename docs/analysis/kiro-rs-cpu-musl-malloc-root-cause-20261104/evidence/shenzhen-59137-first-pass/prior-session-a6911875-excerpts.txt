@@ -1,0 +1,615 @@
+# 前一个分析会话 a6911875（2026-11-04 16:02-16:13 +08:00）中的命令和原始输出，逐字摘录，供第 3 节核对时引用；邮箱已脱敏。
+
+
+======== @ 2026-11-04T08:03:23.861Z
+$ cd /tmp; docker logs --since 3m kiro-rs-2ue-59137-app 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' > /tmp/kiro3m.log; wc -l /tmp/kiro3m.log
+echo "== upstream requests (3m) =="; grep -c 'Kiro upstream request body size' /tmp/kiro3m.log
+echo "== attempt=1 (distinct first tries) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -c ' attempt=1 '
+echo "== retry warnings =="; grep -c '准备换号重试' /tmp/kiro3m.log
+echo "== retry reasons =="; grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'reason="[^"]+"' | sort | uniq -c | sort -rn
+echo "== body size buckets (MB) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'upstream_body_bytes=[0-9]+' | cut -d= -f2 | awk '{b=int($1/500000); c[b]++; s+=$1} END{for(k in c) printf "%.1f-%.1fMB: %d\n", k*0.5,(k+1)*0.5,c[k]; printf "total GB: %.2f\n", s/1e9}' | sort -n
+echo "== by endpoint =="; grep 'prompt injections applied' /tmp/kiro3m.log | grep -oE 'endpoint="[^"]+"' | sort | uniq -c | sort -rn | head
+echo "== by model =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'model="[^"]+"' | sort | uniq -c | sort -rn
+-------- output
+4250 /tmp/kiro3m.log
+== upstream requests (3m) ==
+926
+== attempt=1 (distinct first tries) ==
+877
+== retry warnings ==
+317
+== retry reasons ==
+    317 reason="protocol_error"
+== body size buckets (MB) ==
+0.0-0.5MB: 581
+total GB: 0.80
+0.5-1.0MB: 166
+1.0-1.5MB: 61
+1.5-2.0MB: 26
+2.0-2.5MB: 6
+2.5-3.0MB: 14
+3.0-3.5MB: 21
+3.5-4.0MB: 15
+4.0-4.5MB: 8
+4.5-5.0MB: 9
+5.0-5.5MB: 6
+6.5-7.0MB: 1
+7.0-7.5MB: 2
+8.5-9.0MB: 1
+14.5-15.0MB: 2
+15.0-15.5MB: 1
+18.5-19.0MB: 6
+== by endpoint ==
+    157 endpoint="/dfcache/onlylocal/v1/messages"
+    134 endpoint="/dfcache/mine-haa/v1/messages"
+    109 endpoint="/dfcache/minea/v1/messages"
+     90 endpoint="/dfcache/mcc/v1/messages"
+      8 endpoint="/dfcache/mine-hh/v1/messages"
+      6 endpoint="/dfcache/cc/v1/messages"
+      1 endpoint="/dfcache/minerst/v1/messages"
+== by model ==
+    677 model="claude-opus-5-5"
+     89 model="claude-sonnet-5"
+     38 model="claude-sonnet-5-5"
+     35 model="claude-opus-4-6"
+     22 model="claude-opus-5"
+     19 model="claude-sonnet-4-6"
+     18 model="claude-opus-4-8"
+      9 model="claude-opus-5.5"
+      7 model="claude-haiku-4-5-20251001"
+      6 model="claude-3-5-haiku-20241022"
+      5 model="claude-opus-4-7"
+      1 model="claude-haiku-5-5"
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:03:23.861Z
+$ cd /tmp; docker logs --since 3m kiro-rs-2ue-59137-app 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' > /tmp/kiro3m.log; wc -l /tmp/kiro3m.log
+echo "== upstream requests (3m) =="; grep -c 'Kiro upstream request body size' /tmp/kiro3m.log
+echo "== attempt=1 (distinct first tries) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -c ' attempt=1 '
+echo "== retry warnings =="; grep -c '准备换号重试' /tmp/kiro3m.log
+echo "== retry reasons =="; grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'reason="[^"]+"' | sort | uniq -c | sort -rn
+echo "== body size buckets (MB) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'upstream_body_bytes=[0-9]+' | cut -d= -f2 | awk '{b=int($1/500000); c[b]++; s+=$1} END{for(k in c) printf "%.1f-%.1fMB: %d\n", k*0.5,(k+1)*0.5,c[k]; printf "total GB: %.2f\n", s/1e9}' | sort -n
+echo "== by endpoint =="; grep 'prompt injections applied' /tmp/kiro3m.log | grep -oE 'endpoint="[^"]+"' | sort | uniq -c | sort -rn | head
+echo "== by model =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'model="[^"]+"' | sort | uniq -c | sort -rn
+-------- output
+4250 /tmp/kiro3m.log
+== upstream requests (3m) ==
+926
+== attempt=1 (distinct first tries) ==
+877
+== retry warnings ==
+317
+== retry reasons ==
+    317 reason="protocol_error"
+== body size buckets (MB) ==
+0.0-0.5MB: 581
+total GB: 0.80
+0.5-1.0MB: 166
+1.0-1.5MB: 61
+1.5-2.0MB: 26
+2.0-2.5MB: 6
+2.5-3.0MB: 14
+3.0-3.5MB: 21
+3.5-4.0MB: 15
+4.0-4.5MB: 8
+4.5-5.0MB: 9
+5.0-5.5MB: 6
+6.5-7.0MB: 1
+7.0-7.5MB: 2
+8.5-9.0MB: 1
+14.5-15.0MB: 2
+15.0-15.5MB: 1
+18.5-19.0MB: 6
+== by endpoint ==
+    157 endpoint="/dfcache/onlylocal/v1/messages"
+    134 endpoint="/dfcache/mine-haa/v1/messages"
+    109 endpoint="/dfcache/minea/v1/messages"
+     90 endpoint="/dfcache/mcc/v1/messages"
+      8 endpoint="/dfcache/mine-hh/v1/messages"
+      6 endpoint="/dfcache/cc/v1/messages"
+      1 endpoint="/dfcache/minerst/v1/messages"
+== by model ==
+    677 model="claude-opus-5-5"
+     89 model="claude-sonnet-5"
+     38 model="claude-sonnet-5-5"
+     35 model="claude-opus-4-6"
+     22 model="claude-opus-5"
+     19 model="claude-sonnet-4-6"
+     18 model="claude-opus-4-8"
+      9 model="claude-opus-5.5"
+      7 model="claude-haiku-4-5-20251001"
+      6 model="claude-3-5-haiku-20241022"
+      5 model="claude-opus-4-7"
+      1 model="claude-haiku-5-5"
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:03:40.996Z
+$ PID=$(pgrep -x kiro-rs | head -1); T0=$(date +%s)
+docker logs -f --since 0s kiro-rs-2ue-59137-app 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' > /tmp/kiro_live.log &
+LP=$!
+prev=$(awk '{print $14+$15}' /proc/$PID/stat)
+for i in $(seq 1 40); do sleep 1; cur=$(awk '{print $14+$15}' /proc/$PID/stat); echo "$(date +%s) $((cur-prev))"; prev=$cur; done > /tmp/cpu_ticks.txt
+kill $LP 2>/dev/null
+echo "sec cpu% reqs big(>1MB) retries"
+awk -v t0=$T0 'NR==FNR{cpu[$1]=$2;next} END{}' /tmp/cpu_ticks.txt /dev/null
+# per-second log counts: logs have ISO timestamps, convert to epoch
+while read ts ticks; do
+  hms=$(date -u -d @$ts +%H:%M:%S)
+  reqs=$(grep -c "T$hms\.[0-9]*Z.*Kiro upstream request body size" /tmp/kiro_live.log)
+  big=$(grep "T$hms\.[0-9]*Z.*Kiro upstream request body size" /tmp/kiro_live.log | grep -oE 'upstream_body_bytes=[0-9]+' | cut -d= -f2 | awk '$1>1000000{n++} END{print n+0}')
+  rt=$(grep -c "T$hms\.[0-9]*Z.*准备换号重试" /tmp/kiro_live.log)
+  echo "$hms $ticks $reqs $big $rt"
+done < /tmp/cpu_ticks.txt | awk '{printf "%s cpu=%d%% reqs=%d big=%d retries=%d\n",$1,$2,$3,$4,$5; s+=$2; if($2>m)m=$2; if(n==0||$2<mn)mn=$2; n++} END{printf "avg=%.0f%% min=%d%% max=%d%%\n",s/n,mn,m}'
+rm -f /tmp/kiro_live.log /tmp/cpu_ticks.txt
+-------- output
+sec cpu% reqs big(>1MB) retries
+08:03:42 cpu=1% reqs=11 big=3 retries=6
+08:03:43 cpu=1% reqs=4 big=1 retries=1
+08:03:44 cpu=0% reqs=11 big=0 retries=5
+08:03:45 cpu=0% reqs=6 big=2 retries=0
+08:03:46 cpu=0% reqs=9 big=1 retries=4
+08:03:47 cpu=0% reqs=6 big=0 retries=3
+08:03:48 cpu=0% reqs=8 big=1 retries=3
+08:03:49 cpu=1% reqs=3 big=1 retries=0
+08:03:50 cpu=0% reqs=10 big=4 retries=2
+08:03:51 cpu=1% reqs=8 big=1 retries=0
+08:03:52 cpu=0% reqs=5 big=1 retries=0
+08:03:53 cpu=0% reqs=6 big=2 retries=0
+08:03:54 cpu=1% reqs=9 big=3 retries=7
+08:03:55 cpu=0% reqs=10 big=1 retries=6
+08:03:56 cpu=0% reqs=12 big=2 retries=5
+08:03:57 cpu=0% reqs=8 big=3 retries=2
+08:03:58 cpu=1% reqs=8 big=3 retries=0
+08:03:59 cpu=0% reqs=17 big=4 retries=5
+08:04:00 cpu=0% reqs=5 big=4 retries=1
+08:04:01 cpu=0% reqs=15 big=9 retries=8
+08:04:02 cpu=1% reqs=2 big=1 retries=0
+08:04:03 cpu=0% reqs=9 big=5 retries=4
+08:04:04 cpu=1% reqs=6 big=3 retries=1
+08:04:05 cpu=0% reqs=8 big=1 retries=3
+08:04:06 cpu=1% reqs=5 big=0 retries=0
+08:04:07 cpu=0% reqs=12 big=0 retries=9
+08:04:08 cpu=0% reqs=1 big=0 retries=1
+08:04:09 cpu=1% reqs=1 big=0 retries=0
+08:04:10 cpu=0% reqs=2 big=0 retries=0
+08:04:11 cpu=0% reqs=10 big=0 retries=6
+08:04:12 cpu=1% reqs=9 big=0 retries=1
+08:04:13 cpu=0% reqs=1 big=0 retries=0
+08:04:14 cpu=1% reqs=3 big=1 retries=0
+08:04:15 cpu=0% reqs=2 big=1 retries=0
+08:04:16 cpu=0% reqs=9 big=2 retries=1
+08:04:17 cpu=0% reqs=13 big=2 retries=5
+08:04:18 cpu=0% reqs=11 big=2 retries=2
+08:04:19 cpu=1% reqs=6 big=1 retries=0
+08:04:20 cpu=0% reqs=6 big=4 retries=0
+08:04:21 cpu=0% reqs=0 big=0 retries=0
+avg=0% min=0% max=1%
+
+
+======== @ 2026-11-04T08:03:40.996Z
+$ PID=$(pgrep -x kiro-rs | head -1); T0=$(date +%s)
+docker logs -f --since 0s kiro-rs-2ue-59137-app 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' > /tmp/kiro_live.log &
+LP=$!
+prev=$(awk '{print $14+$15}' /proc/$PID/stat)
+for i in $(seq 1 40); do sleep 1; cur=$(awk '{print $14+$15}' /proc/$PID/stat); echo "$(date +%s) $((cur-prev))"; prev=$cur; done > /tmp/cpu_ticks.txt
+kill $LP 2>/dev/null
+echo "sec cpu% reqs big(>1MB) retries"
+awk -v t0=$T0 'NR==FNR{cpu[$1]=$2;next} END{}' /tmp/cpu_ticks.txt /dev/null
+# per-second log counts: logs have ISO timestamps, convert to epoch
+while read ts ticks; do
+  hms=$(date -u -d @$ts +%H:%M:%S)
+  reqs=$(grep -c "T$hms\.[0-9]*Z.*Kiro upstream request body size" /tmp/kiro_live.log)
+  big=$(grep "T$hms\.[0-9]*Z.*Kiro upstream request body size" /tmp/kiro_live.log | grep -oE 'upstream_body_bytes=[0-9]+' | cut -d= -f2 | awk '$1>1000000{n++} END{print n+0}')
+  rt=$(grep -c "T$hms\.[0-9]*Z.*准备换号重试" /tmp/kiro_live.log)
+  echo "$hms $ticks $reqs $big $rt"
+done < /tmp/cpu_ticks.txt | awk '{printf "%s cpu=%d%% reqs=%d big=%d retries=%d\n",$1,$2,$3,$4,$5; s+=$2; if($2>m)m=$2; if(n==0||$2<mn)mn=$2; n++} END{printf "avg=%.0f%% min=%d%% max=%d%%\n",s/n,mn,m}'
+rm -f /tmp/kiro_live.log /tmp/cpu_ticks.txt
+-------- output
+sec cpu% reqs big(>1MB) retries
+08:03:42 cpu=1% reqs=11 big=3 retries=6
+08:03:43 cpu=1% reqs=4 big=1 retries=1
+08:03:44 cpu=0% reqs=11 big=0 retries=5
+08:03:45 cpu=0% reqs=6 big=2 retries=0
+08:03:46 cpu=0% reqs=9 big=1 retries=4
+08:03:47 cpu=0% reqs=6 big=0 retries=3
+08:03:48 cpu=0% reqs=8 big=1 retries=3
+08:03:49 cpu=1% reqs=3 big=1 retries=0
+08:03:50 cpu=0% reqs=10 big=4 retries=2
+08:03:51 cpu=1% reqs=8 big=1 retries=0
+08:03:52 cpu=0% reqs=5 big=1 retries=0
+08:03:53 cpu=0% reqs=6 big=2 retries=0
+08:03:54 cpu=1% reqs=9 big=3 retries=7
+08:03:55 cpu=0% reqs=10 big=1 retries=6
+08:03:56 cpu=0% reqs=12 big=2 retries=5
+08:03:57 cpu=0% reqs=8 big=3 retries=2
+08:03:58 cpu=1% reqs=8 big=3 retries=0
+08:03:59 cpu=0% reqs=17 big=4 retries=5
+08:04:00 cpu=0% reqs=5 big=4 retries=1
+08:04:01 cpu=0% reqs=15 big=9 retries=8
+08:04:02 cpu=1% reqs=2 big=1 retries=0
+08:04:03 cpu=0% reqs=9 big=5 retries=4
+08:04:04 cpu=1% reqs=6 big=3 retries=1
+08:04:05 cpu=0% reqs=8 big=1 retries=3
+08:04:06 cpu=1% reqs=5 big=0 retries=0
+08:04:07 cpu=0% reqs=12 big=0 retries=9
+08:04:08 cpu=0% reqs=1 big=0 retries=1
+08:04:09 cpu=1% reqs=1 big=0 retries=0
+08:04:10 cpu=0% reqs=2 big=0 retries=0
+08:04:11 cpu=0% reqs=10 big=0 retries=6
+08:04:12 cpu=1% reqs=9 big=0 retries=1
+08:04:13 cpu=0% reqs=1 big=0 retries=0
+08:04:14 cpu=1% reqs=3 big=1 retries=0
+08:04:15 cpu=0% reqs=2 big=1 retries=0
+08:04:16 cpu=0% reqs=9 big=2 retries=1
+08:04:17 cpu=0% reqs=13 big=2 retries=5
+08:04:18 cpu=0% reqs=11 big=2 retries=2
+08:04:19 cpu=1% reqs=6 big=1 retries=0
+08:04:20 cpu=0% reqs=6 big=4 retries=0
+08:04:21 cpu=0% reqs=0 big=0 retries=0
+avg=0% min=0% max=1%
+
+
+======== @ 2026-11-04T08:04:36.561Z
+$ PID=$(docker inspect -f '{{.State.Pid}}' kiro-rs-2ue-59137-app); echo "pid=$PID comm=$(cat /proc/$PID/comm) cgroup=$(head -c 80 /proc/$PID/cgroup | tr '\n' ' ')"
+docker logs -f --since 0s kiro-rs-2ue-59137-app 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' > /tmp/kiro_live.log &
+LP=$!
+prev=$(awk '{print $14+$15}' /proc/$PID/stat)
+for i in $(seq 1 40); do sleep 1; cur=$(awk '{print $14+$15}' /proc/$PID/stat); echo "$(date +%s) $((cur-prev))"; prev=$cur; done > /tmp/cpu_ticks.txt
+kill $LP 2>/dev/null
+while read ts ticks; do
+  hms=$(date -u -d @$ts +%H:%M:%S)
+  L=$(grep "T$hms\.[0-9]*Z" /tmp/kiro_live.log)
+  reqs=$(echo "$L" | grep -c 'Kiro upstream request body size')
+  mb=$(echo "$L" | grep 'Kiro upstream request body size' | grep -oE 'upstream_body_bytes=[0-9]+' | cut -d= -f2 | awk '{s+=$1} END{printf "%.1f", s/1e6}')
+  rt=$(echo "$L" | grep -c '准备换号重试')
+  echo "$hms $ticks $reqs $mb $rt"
+done < /tmp/cpu_ticks.txt | awk '{printf "%s cpu=%d%% reqs=%d body=%sMB retries=%d\n",$1,$2,$3,$4,$5; s+=$2; if($2>m)m=$2; if(n==0||$2<mn)mn=$2; n++} END{printf "avg=%.0f%% min=%d%% max=%d%%\n",s/n,mn,m}'
+rm -f /tmp/kiro_live.log /tmp/cpu_ticks.txt
+-------- output
+pid=982133 comm=kiro-rs cgroup=0::/system.slice/docker-ca30c18da6ee4e112fa5d0dd2f4cd23b94e52a306985b0e9432fea6b
+08:04:37 cpu=16% reqs=8 body=1.8MB retries=6
+08:04:38 cpu=42% reqs=9 body=11.0MB retries=5
+08:04:39 cpu=61% reqs=8 body=11.0MB retries=1
+08:04:40 cpu=41% reqs=6 body=6.2MB retries=0
+08:04:41 cpu=16% reqs=2 body=0.6MB retries=0
+08:04:42 cpu=32% reqs=12 body=4.5MB retries=3
+08:04:43 cpu=83% reqs=10 body=2.3MB retries=2
+08:04:44 cpu=17% reqs=5 body=0.3MB retries=2
+08:04:45 cpu=10% reqs=1 body=0.0MB retries=0
+08:04:46 cpu=5% reqs=1 body=0.0MB retries=0
+08:04:47 cpu=13% reqs=5 body=4.3MB retries=1
+08:04:48 cpu=39% reqs=5 body=5.0MB retries=3
+08:04:49 cpu=39% reqs=2 body=7.1MB retries=2
+08:04:50 cpu=260% reqs=6 body=8.5MB retries=5
+08:04:51 cpu=239% reqs=10 body=4.7MB retries=5
+08:04:52 cpu=197% reqs=6 body=4.7MB retries=2
+08:04:53 cpu=37% reqs=2 body=0.9MB retries=0
+08:04:54 cpu=14% reqs=6 body=2.6MB retries=0
+08:04:55 cpu=213% reqs=7 body=1.4MB retries=5
+08:04:56 cpu=120% reqs=7 body=1.3MB retries=1
+08:04:57 cpu=106% reqs=3 body=19.5MB retries=0
+08:04:58 cpu=6% reqs=2 body=0.3MB retries=0
+08:04:59 cpu=51% reqs=4 body=11.3MB retries=1
+08:05:00 cpu=29% reqs=12 body=9.2MB retries=10
+08:05:01 cpu=41% reqs=4 body=0.5MB retries=1
+08:05:02 cpu=88% reqs=10 body=18.9MB retries=7
+08:05:03 cpu=35% reqs=9 body=30.0MB retries=6
+08:05:04 cpu=44% reqs=8 body=13.6MB retries=2
+08:05:05 cpu=41% reqs=8 body=6.1MB retries=2
+08:05:06 cpu=19% reqs=3 body=11.2MB retries=2
+08:05:07 cpu=38% reqs=4 body=4.0MB retries=2
+08:05:08 cpu=34% reqs=11 body=18.1MB retries=3
+08:05:09 cpu=19% reqs=3 body=0.3MB retries=0
+08:05:10 cpu=21% reqs=3 body=3.6MB retries=0
+08:05:11 cpu=48% reqs=3 body=19.8MB retries=1
+08:05:12 cpu=15% reqs=4 body=4.1MB retries=0
+08:05:13 cpu=11% reqs=2 body=0.2MB retries=0
+08:05:14 cpu=54% reqs=4 body=2.5MB retries=0
+08:05:15 cpu=111% reqs=13 body=10.8MB retries=0
+08:05:16 cpu=83% reqs=6 body=18.1MB retries=0
+avg=60% min=5% max=260%
+
+
+======== @ 2026-11-04T08:04:36.561Z
+$ PID=$(docker inspect -f '{{.State.Pid}}' kiro-rs-2ue-59137-app); echo "pid=$PID comm=$(cat /proc/$PID/comm) cgroup=$(head -c 80 /proc/$PID/cgroup | tr '\n' ' ')"
+docker logs -f --since 0s kiro-rs-2ue-59137-app 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' > /tmp/kiro_live.log &
+LP=$!
+prev=$(awk '{print $14+$15}' /proc/$PID/stat)
+for i in $(seq 1 40); do sleep 1; cur=$(awk '{print $14+$15}' /proc/$PID/stat); echo "$(date +%s) $((cur-prev))"; prev=$cur; done > /tmp/cpu_ticks.txt
+kill $LP 2>/dev/null
+while read ts ticks; do
+  hms=$(date -u -d @$ts +%H:%M:%S)
+  L=$(grep "T$hms\.[0-9]*Z" /tmp/kiro_live.log)
+  reqs=$(echo "$L" | grep -c 'Kiro upstream request body size')
+  mb=$(echo "$L" | grep 'Kiro upstream request body size' | grep -oE 'upstream_body_bytes=[0-9]+' | cut -d= -f2 | awk '{s+=$1} END{printf "%.1f", s/1e6}')
+  rt=$(echo "$L" | grep -c '准备换号重试')
+  echo "$hms $ticks $reqs $mb $rt"
+done < /tmp/cpu_ticks.txt | awk '{printf "%s cpu=%d%% reqs=%d body=%sMB retries=%d\n",$1,$2,$3,$4,$5; s+=$2; if($2>m)m=$2; if(n==0||$2<mn)mn=$2; n++} END{printf "avg=%.0f%% min=%d%% max=%d%%\n",s/n,mn,m}'
+rm -f /tmp/kiro_live.log /tmp/cpu_ticks.txt
+-------- output
+pid=982133 comm=kiro-rs cgroup=0::/system.slice/docker-ca30c18da6ee4e112fa5d0dd2f4cd23b94e52a306985b0e9432fea6b
+08:04:37 cpu=16% reqs=8 body=1.8MB retries=6
+08:04:38 cpu=42% reqs=9 body=11.0MB retries=5
+08:04:39 cpu=61% reqs=8 body=11.0MB retries=1
+08:04:40 cpu=41% reqs=6 body=6.2MB retries=0
+08:04:41 cpu=16% reqs=2 body=0.6MB retries=0
+08:04:42 cpu=32% reqs=12 body=4.5MB retries=3
+08:04:43 cpu=83% reqs=10 body=2.3MB retries=2
+08:04:44 cpu=17% reqs=5 body=0.3MB retries=2
+08:04:45 cpu=10% reqs=1 body=0.0MB retries=0
+08:04:46 cpu=5% reqs=1 body=0.0MB retries=0
+08:04:47 cpu=13% reqs=5 body=4.3MB retries=1
+08:04:48 cpu=39% reqs=5 body=5.0MB retries=3
+08:04:49 cpu=39% reqs=2 body=7.1MB retries=2
+08:04:50 cpu=260% reqs=6 body=8.5MB retries=5
+08:04:51 cpu=239% reqs=10 body=4.7MB retries=5
+08:04:52 cpu=197% reqs=6 body=4.7MB retries=2
+08:04:53 cpu=37% reqs=2 body=0.9MB retries=0
+08:04:54 cpu=14% reqs=6 body=2.6MB retries=0
+08:04:55 cpu=213% reqs=7 body=1.4MB retries=5
+08:04:56 cpu=120% reqs=7 body=1.3MB retries=1
+08:04:57 cpu=106% reqs=3 body=19.5MB retries=0
+08:04:58 cpu=6% reqs=2 body=0.3MB retries=0
+08:04:59 cpu=51% reqs=4 body=11.3MB retries=1
+08:05:00 cpu=29% reqs=12 body=9.2MB retries=10
+08:05:01 cpu=41% reqs=4 body=0.5MB retries=1
+08:05:02 cpu=88% reqs=10 body=18.9MB retries=7
+08:05:03 cpu=35% reqs=9 body=30.0MB retries=6
+08:05:04 cpu=44% reqs=8 body=13.6MB retries=2
+08:05:05 cpu=41% reqs=8 body=6.1MB retries=2
+08:05:06 cpu=19% reqs=3 body=11.2MB retries=2
+08:05:07 cpu=38% reqs=4 body=4.0MB retries=2
+08:05:08 cpu=34% reqs=11 body=18.1MB retries=3
+08:05:09 cpu=19% reqs=3 body=0.3MB retries=0
+08:05:10 cpu=21% reqs=3 body=3.6MB retries=0
+08:05:11 cpu=48% reqs=3 body=19.8MB retries=1
+08:05:12 cpu=15% reqs=4 body=4.1MB retries=0
+08:05:13 cpu=11% reqs=2 body=0.2MB retries=0
+08:05:14 cpu=54% reqs=4 body=2.5MB retries=0
+08:05:15 cpu=111% reqs=13 body=10.8MB retries=0
+08:05:16 cpu=83% reqs=6 body=18.1MB retries=0
+avg=60% min=5% max=260%
+
+
+======== @ 2026-11-04T08:05:50.469Z
+$ cd /tmp; echo "== no-frames failures by request: attempts distribution =="; grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'attempt=[0-9]+ ' | sort | uniq -c
+echo "== distinct requests retried =="; grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'request_id=[^ ]+' | sort -u | wc -l
+echo "== upstream sends per credential (3m) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'credential_id=[0-9]+' | sort | uniq -c | sort -rn | head -12
+echo "== body size of retried requests vs all (avg MB) =="
+grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'request_id=[^ ]+' | sort -u | sed 's/request_id=//' > /tmp/retried_ids.txt
+grep 'Kiro upstream request body size' /tmp/kiro3m.log | awk 'NR==FNR{r[$1]=1;next}{match($0,/request_id="[^"]+"/); id=substr($0,RSTART+12,RLENGTH-13); match($0,/upstream_body_bytes=[0-9]+/); b=substr($0,RSTART+20,RLENGTH-20); if(id in r){rs+=b;rn++}else{as+=b;an++}} END{printf "retried reqs sends: n=%d avg=%.2fMB total=%.0fMB\nother sends: n=%d avg=%.2fMB total=%.0fMB\n",rn,rs/rn/1e6,rs/1e6,an,as/an/1e6,as/1e6}' /tmp/retried_ids.txt -
+rm -f /tmp/retried_ids.txt
+-------- output
+== no-frames failures by request: attempts distribution ==
+     75 attempt=1 
+    148 attempt=2 
+    139 attempt=3 
+    131 attempt=4 
+    103 attempt=5 
+     38 attempt=6 
+== distinct requests retried ==
+75
+== upstream sends per credential (3m) ==
+    114 credential_id=2388
+    104 credential_id=2386
+    102 credential_id=2387
+    101 credential_id=2389
+     99 credential_id=2385
+     75 credential_id=2378
+     72 credential_id=2379
+     65 credential_id=2380
+     63 credential_id=2377
+     46 credential_id=2384
+     44 credential_id=2383
+     35 credential_id=2382
+== body size of retried requests vs all (avg MB) ==
+retried reqs sends: n=395 avg=1.06MB total=417MB
+other sends: n=531 avg=0.72MB total=385MB
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 
+$ cd /tmp; echo "== no-frames failures by request: attempts distribution =="; grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'attempt=[0-9]+ ' | sort | uniq -c
+echo "== distinct requests retried =="; grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'request_id=[^ ]+' | sort -u | wc -l
+echo "== upstream sends per credential (3m) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'credential_id=[0-9]+' | sort | uniq -c | sort -rn | head -12
+echo "== body size of retried requests vs all (avg MB) =="
+grep '准备换号重试' /tmp/kiro3m.log | grep -oE 'request_id=[^ ]+' | sort -u | sed 's/request_id=//' > /tmp/retried_ids.txt
+grep 'Kiro upstream request body size' /tmp/kiro3m.log | awk 'NR==FNR{r[$1]=1;next}{match($0,/request_id="[^"]+"/); id=substr($0,RSTART+12,RLENGTH-13); match($0,/upstream_body_bytes=[0-9]+/); b=substr($0,RSTART+20,RLENGTH-20); if(id in r){rs+=b;rn++}else{as+=b;an++}} END{printf "retried reqs sends: n=%d avg=%.2fMB total=%.0fMB\nother sends: n=%d avg=%.2fMB total=%.0fMB\n",rn,rs/rn/1e6,rs/1e6,an,as/an/1e6,as/1e6}' /tmp/retried_ids.txt -
+rm -f /tmp/retried_ids.txt
+-------- output
+== no-frames failures by request: attempts distribution ==
+     75 attempt=1 
+    148 attempt=2 
+    139 attempt=3 
+    131 attempt=4 
+    103 attempt=5 
+     38 attempt=6 
+== distinct requests retried ==
+75
+== upstream sends per credential (3m) ==
+    114 credential_id=2388
+    104 credential_id=2386
+    102 credential_id=2387
+    101 credential_id=2389
+     99 credential_id=2385
+     75 credential_id=2378
+     72 credential_id=2379
+     65 credential_id=2380
+     63 credential_id=2377
+     46 credential_id=2384
+     44 credential_id=2383
+     35 credential_id=2382
+== body size of retried requests vs all (avg MB) ==
+retried reqs sends: n=395 avg=1.06MB total=417MB
+other sends: n=531 avg=0.72MB total=385MB
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:07:29.971Z
+$ PID=982133
+docker logs -f --since 0s kiro-rs-2ue-59137-app 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' > /tmp/kiro_live2.log &
+LP=$!
+for i in $(seq 1 45); do sleep 1; echo "$(date +%s) $(awk '/VmRSS/{print int($2/1024)}' /proc/$PID/status) $(awk '/VmHWM/{print int($2/1024)}' /proc/$PID/status)"; done > /tmp/rss.txt
+kill $LP 2>/dev/null
+while read ts rss hwm; do
+  hms=$(date -u -d @$ts +%H:%M:%S)
+  L=$(grep "T$hms\.[0-9]*Z" /tmp/kiro_live2.log)
+  mb=$(echo "$L" | grep 'Kiro upstream request body size' | grep -oE 'upstream_body_bytes=[0-9]+' | cut -d= -f2 | awk '{s+=$1; if($1>m)m=$1} END{printf "%.1f/%.1f", s/1e6, m/1e6}')
+  rt=$(echo "$L" | grep -c '准备换号重试')
+  echo "$hms rss=${rss}MB hwm=${hwm}MB body_sum/max=${mb}MB retries=$rt"
+done < /tmp/rss.txt
+rm -f /tmp/kiro_live2.log /tmp/rss.txt
+-------- output
+08:07:31 rss=974MB hwm=2175MB body_sum/max=3.5/1.6MB retries=0
+08:07:32 rss=979MB hwm=2175MB body_sum/max=13.0/9.2MB retries=3
+08:07:33 rss=961MB hwm=2175MB body_sum/max=0.0/0.0MB retries=0
+08:07:34 rss=955MB hwm=2175MB body_sum/max=2.4/2.3MB retries=2
+08:07:35 rss=932MB hwm=2175MB body_sum/max=31.7/17.4MB retries=0
+08:07:36 rss=909MB hwm=2175MB body_sum/max=1.6/1.6MB retries=1
+08:07:37 rss=910MB hwm=2175MB body_sum/max=10.2/9.2MB retries=4
+08:07:38 rss=928MB hwm=2175MB body_sum/max=29.9/19.4MB retries=2
+08:07:39 rss=947MB hwm=2175MB body_sum/max=0.0/0.0MB retries=1
+08:07:40 rss=945MB hwm=2175MB body_sum/max=0.4/0.4MB retries=0
+08:07:41 rss=949MB hwm=2175MB body_sum/max=6.2/4.2MB retries=0
+08:07:42 rss=955MB hwm=2175MB body_sum/max=10.0/1.4MB retries=4
+08:07:43 rss=965MB hwm=2175MB body_sum/max=26.0/17.4MB retries=3
+08:07:44 rss=935MB hwm=2175MB body_sum/max=0.4/0.3MB retries=0
+08:07:45 rss=930MB hwm=2175MB body_sum/max=4.2/4.2MB retries=0
+08:07:46 rss=850MB hwm=2175MB body_sum/max=2.2/1.6MB retries=6
+08:07:47 rss=853MB hwm=2175MB body_sum/max=14.6/9.2MB retries=1
+08:07:48 rss=849MB hwm=2175MB body_sum/max=6.4/4.0MB retries=0
+08:07:49 rss=845MB hwm=2175MB body_sum/max=1.0/0.7MB retries=0
+08:07:50 rss=838MB hwm=2175MB body_sum/max=1.5/0.7MB retries=0
+08:07:51 rss=837MB hwm=2175MB body_sum/max=10.7/9.2MB retries=1
+08:07:52 rss=848MB hwm=2175MB body_sum/max=19.4/17.4MB retries=0
+08:07:53 rss=851MB hwm=2175MB body_sum/max=4.4/3.1MB retries=0
+08:07:54 rss=863MB hwm=2175MB body_sum/max=0.0/0.0MB retries=0
+08:07:55 rss=867MB hwm=2175MB body_sum/max=2.4/1.1MB retries=0
+08:07:56 rss=863MB hwm=2175MB body_sum/max=1.1/1.1MB retries=0
+08:07:57 rss=860MB hwm=2175MB body_sum/max=3.1/1.6MB retries=0
+08:07:58 rss=868MB hwm=2175MB body_sum/max=0.6/0.6MB retries=0
+08:07:59 rss=863MB hwm=2175MB body_sum/max=12.9/7.2MB retries=0
+08:08:00 rss=910MB hwm=2175MB body_sum/max=5.1/5.0MB retries=0
+08:08:01 rss=900MB hwm=2175MB body_sum/max=7.7/7.2MB retries=0
+08:08:02 rss=895MB hwm=2175MB body_sum/max=0.6/0.3MB retries=0
+08:08:03 rss=900MB hwm=2175MB body_sum/max=0.3/0.2MB retries=0
+08:08:04 rss=930MB hwm=2175MB body_sum/max=3.9/1.4MB retries=1
+08:08:05 rss=934MB hwm=2175MB body_sum/max=5.7/2.3MB retries=4
+08:08:06 rss=937MB hwm=2175MB body_sum/max=5.7/1.9MB retries=2
+08:08:07 rss=909MB hwm=2175MB body_sum/max=5.5/3.4MB retries=1
+08:08:08 rss=920MB hwm=2175MB body_sum/max=0.0/0.0MB retries=0
+08:08:09 rss=921MB hwm=2175MB body_sum/max=0.0/0.0MB retries=0
+08:08:10 rss=855MB hwm=2175MB body_sum/max=5.4/3.4MB retries=1
+08:08:11 rss=857MB hwm=2175MB body_sum/max=2.6/1.2MB retries=0
+08:08:12 rss=854MB hwm=2175MB body_sum/max=9.9/3.4MB retries=11
+08:08:13 rss=829MB hwm=2175MB body_sum/max=15.1/3.4MB retries=8
+08:08:14 rss=828MB hwm=2175MB body_sum/max=3.7/1.6MB retries=2
+08:08:15 rss=832MB hwm=2175MB body_sum/max=0.0/0.0MB retries=0
+
+
+======== @ 2026-11-04T08:07:31.473Z
+$ sed -E 's/\x1b\[[0-9;]*m//g' /tmp/kiro3m.log > /dev/null
+echo "== payload guard / shaping log lines (3m) =="; grep -ciE 'payload.?guard|still_oversized|history trim|trimmed' /tmp/kiro3m.log
+grep -iE 'payload.?guard|still_oversized|oversized' /tmp/kiro3m.log | head -5 | cut -c1-400
+echo "== sends with weight > limit 1.3M =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | awk '{match($0,/upstream_body_weight=[0-9]+/); w=substr($0,RSTART+19,RLENGTH-19); n++; if(w>1300000)o++} END{print o"/"n}'
+echo "== top 10 bodies (MB), model, endpoint credential =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'upstream_body_bytes=[0-9]+ .*model="[^"]+"' | awk '{split($1,a,"=");print a[2], $NF}' | sort -rn | head -10 | awk '{printf "%.1fMB %s\n",$1/1e6,$2}'
+echo "== same conversation re-sent (conversation_id count>=3, 3m) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'conversation_id="[^"]+"' | sort | uniq -c | sort -rn | head -5
+-------- output
+== payload guard / shaping log lines (3m) ==
+0
+== sends with weight > limit 1.3M ==
+926/926
+== top 10 bodies (MB), model, endpoint credential ==
+19.0MB model="claude-opus-5-5"
+19.0MB model="claude-opus-5-5"
+19.0MB model="claude-opus-5-5"
+19.0MB model="claude-opus-5-5"
+19.0MB model="claude-opus-5-5"
+19.0MB model="claude-opus-5-5"
+15.4MB model="claude-opus-5-5"
+14.6MB model="claude-opus-5-5"
+14.6MB model="claude-opus-5-5"
+8.8MB model="claude-opus-5-5"
+== same conversation re-sent (conversation_id count>=3, 3m) ==
+     17 conversation_id="5d824afd-3832-4471-96d6-32034d885921"
+     16 conversation_id="da99335a-09ee-4d9f-a0ba-be4bc4dcc78b"
+     14 conversation_id="5f9ef653-65a4-40f8-ab6d-b3bbaf99ac40"
+     13 conversation_id="afc5db96-dc91-4169-aeb6-e8a030eecdc3"
+     13 conversation_id="20ea54d8-d079-4a90-8be2-668866330522"
+
+
+======== @ 2026-11-04T08:08:35.303Z
+$ echo "== weight > 1.3M (numeric) =="; grep 'Kiro upstream request body size' /tmp/kiro3m.log | grep -oE 'upstream_body_weight=[0-9]+' | cut -d= -f2 | awk '{n++; if($1+0>1300000)o++; if($1+0>460800)g++} END{printf "over 1.3M: %d/%d, over 460800: %d/%d\n", o,n,g,n}'
+cd ~/code/kiro.rs
+echo "== allocator crates =="; grep -nE 'jemalloc|mimalloc|tikv|global_allocator' Cargo.toml src/main.rs src/http_client.rs | head
+echo "== target / runtime =="; grep -nE 'musl|target' Dockerfile | head; grep -n 'Builder::new_multi_thread\|worker_threads\|max_blocking_threads\|#\[tokio::main' -r src | grep -v tests | head
+echo "== container libc =="; docker exec kiro-rs-2ue-59137-app sh -c 'ls /lib/ld-musl* 2>/dev/null; nproc'
+-------- output
+== weight > 1.3M (numeric) ==
+over 1.3M: 155/926, over 460800: 414/926
+== allocator crates ==
+src/http_client.rs:34:    #[global_allocator]
+== target / runtime ==
+20:RUN apk add --no-cache musl-dev perl make
+53:    && rm -rf src target/release/kiro-rs target/release/kiro-rs.d \
+54:        target/release/kiro_loadtest target/release/kiro_loadtest.d \
+55:        target/release/deps/kiro_rs-* target/release/deps/kiro_loadtest-* \
+56:        target/release/.fingerprint/kiro-rs-* target/release/incremental
+65:    && ./target/release/kiro-rs --version
+72:COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
+src/http_client.rs:924:    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+src/main.rs:147:    let runtime = tokio::runtime::Builder::new_multi_thread()
+src/anthropic/body_processing.rs:1506:    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+src/anthropic/handlers/local_body_pipeline.rs:778:        let runtime = tokio::runtime::Builder::new_multi_thread()
+src/anthropic/handlers/local_body_pipeline.rs:779:            .worker_threads(2)
+src/anthropic/usage.rs:4427:        tokio::runtime::Builder::new_multi_thread()
+src/anthropic/usage.rs:4428:            .worker_threads(2)
+src/anthropic/usage.rs:5078:    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+src/anthropic/usage.rs:5090:    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+src/anthropic/usage.rs:5152:    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+== container libc ==
+/lib/ld-musl-x86_64.so.1
+8
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:12:30.208Z
+$ cd /tmp; grep '准备换号重试' kiro3m.log | grep -oE 'request_id=[^ ]+' | sed 's/request_id=//' | sort -u > ids_retried.txt
+grep 'Kiro upstream request body size' kiro3m.log | awk 'NR==FNR{r[$1]=1;next}
+{match($0,/request_id="[^"]+"/); id=substr($0,RSTART+12,RLENGTH-13); match($0,/upstream_body_weight=[0-9]+/); w=substr($0,RSTART+19,RLENGTH-19)+0; if(!(id in mw)||w>mw[id])mw[id]=w}
+END{for(id in mw){w=mw[id]; b=(w<200000)?"1: <200K":(w<460800)?"2: 200K-460K":(w<1300000)?"3: 460K-1.3M":(w<3000000)?"4: 1.3M-3M":"5: >3M"; n[b]++; if(id in r)f[b]++}
+for(b in n) printf "%-14s requests=%4d  with_zero_frame_retry=%3d  rate=%.0f%%\n",b,n[b],f[b],100*f[b]/n[b]}' ids_retried.txt - | sort
+rm -f ids_retried.txt
+-------- output
+1: <200K       requests= 500  with_zero_frame_retry= 75  rate=15%
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:12:30.208Z
+$ cd /tmp; grep '准备换号重试' kiro3m.log | grep -oE 'request_id=[^ ]+' | sed 's/request_id=//' | sort -u > ids_retried.txt
+grep 'Kiro upstream request body size' kiro3m.log | awk 'NR==FNR{r[$1]=1;next}
+{match($0,/request_id="[^"]+"/); id=substr($0,RSTART+12,RLENGTH-13); match($0,/upstream_body_weight=[0-9]+/); w=substr($0,RSTART+19,RLENGTH-19)+0; if(!(id in mw)||w>mw[id])mw[id]=w}
+END{for(id in mw){w=mw[id]; b=(w<200000)?"1: <200K":(w<460800)?"2: 200K-460K":(w<1300000)?"3: 460K-1.3M":(w<3000000)?"4: 1.3M-3M":"5: >3M"; n[b]++; if(id in r)f[b]++}
+for(b in n) printf "%-14s requests=%4d  with_zero_frame_retry=%3d  rate=%.0f%%\n",b,n[b],f[b],100*f[b]/n[b]}' ids_retried.txt - | sort
+rm -f ids_retried.txt
+-------- output
+1: <200K       requests= 500  with_zero_frame_retry= 75  rate=15%
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:12:47.988Z
+$ cd /tmp; grep '准备换号重试' kiro3m.log | grep -oE 'request_id=[^ ]+' | sed 's/request_id=//' | sort -u > ids_retried.txt
+grep 'Kiro upstream request body size' kiro3m.log | awk 'NR==FNR{r[$1]=1;next}
+{match($0,/request_id="[^"]+"/); id=substr($0,RSTART+12,RLENGTH-13); match($0,/upstream_body_weight=[0-9]+/); w=substr($0,RSTART+21,RLENGTH-21)+0; if(!(id in mw)||w>mw[id])mw[id]=w}
+END{for(id in mw){w=mw[id]; b=(w<200000)?"1: <200K":(w<460800)?"2: 200K-460K":(w<1300000)?"3: 460K-1.3M":(w<3000000)?"4: 1.3M-3M":"5: >3M"; n[b]++; if(id in r)f[b]++}
+for(b in n) printf "%-14s requests=%4d  zero_frame_retry=%3d  rate=%.0f%%\n",b,n[b],f[b]+0,100*f[b]/n[b]}' ids_retried.txt - | sort
+rm -f ids_retried.txt
+-------- output
+1: <200K       requests= 173  zero_frame_retry= 22  rate=13%
+2: 200K-460K   requests= 123  zero_frame_retry=  9  rate=7%
+3: 460K-1.3M   requests= 122  zero_frame_retry= 28  rate=23%
+4: 1.3M-3M     requests=  40  zero_frame_retry=  7  rate=18%
+5: >3M         requests=  42  zero_frame_retry=  9  rate=21%
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137

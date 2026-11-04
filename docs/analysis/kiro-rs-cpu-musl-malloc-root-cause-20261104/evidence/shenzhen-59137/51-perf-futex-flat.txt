@@ -1,0 +1,19 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 106K of event 'syscalls:sys_enter_futex'
+# Event count (approx.): 106682
+#
+# Overhead       Samples  Shared Object     Symbol                
+# ........  ............  ................  ......................
+#
+    73.29%         78192  kiro-rs           [.] 0x000000000229657d
+    22.38%         23875  kiro-rs           [.] 0x0000000002296526
+     4.33%          4615  kiro-rs           [.] 0x000000000228fb48
+
+
+#
+# (Tip: To show context switches in perf report sample context add --switch-events to perf record.)
+#

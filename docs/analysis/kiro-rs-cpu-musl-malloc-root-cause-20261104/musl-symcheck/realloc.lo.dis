@@ -1,0 +1,312 @@
+
+realloc.lo:     file format elf64-x86-64
+
+
+Disassembly of section .text.set_size:
+
+0000000000000000 <set_size>:
+   0:	mov    %rsi,%rax
+   3:	sub    %rdi,%rax
+   6:	sub    %edx,%eax
+   8:	je     26 <set_size+0x26>
+   a:	mov    %eax,%edx
+   c:	neg    %edx
+   e:	movslq %edx,%rdx
+  11:	movb   $0x0,(%rsi,%rdx,1)
+  15:	cmp    $0x4,%eax
+  18:	jle    26 <set_size+0x26>
+  1a:	movb   $0x0,-0x5(%rsi)
+  1e:	mov    %eax,-0x4(%rsi)
+  21:	mov    $0x5,%eax
+  26:	mov    -0x3(%rdi),%dl
+  29:	shl    $0x5,%eax
+  2c:	and    $0x1f,%edx
+  2f:	add    %edx,%eax
+  31:	mov    %al,-0x3(%rdi)
+  34:	ret
+
+Disassembly of section .text.__libc_realloc:
+
+0000000000000000 <__libc_realloc>:
+   0:	push   %r15
+   2:	push   %r14
+   4:	push   %r13
+   6:	mov    %rsi,%r13
+   9:	push   %r12
+   b:	push   %rbp
+   c:	push   %rbx
+   d:	sub    $0x18,%rsp
+  11:	test   %rdi,%rdi
+  14:	jne    2c <__libc_realloc+0x2c>
+  16:	add    $0x18,%rsp
+  1a:	mov    %rsi,%rdi
+  1d:	pop    %rbx
+  1e:	pop    %rbp
+  1f:	pop    %r12
+  21:	pop    %r13
+  23:	pop    %r14
+  25:	pop    %r15
+  27:	jmp    2c <__libc_realloc+0x2c>
+  2c:	movabs $0x7fffffffffffeffe,%rax
+  36:	cmp    %rax,%rsi
+  39:	ja     47 <__libc_realloc+0x47>
+  3b:	mov    %rdi,%rbp
+  3e:	test   $0xf,%dil
+  42:	je     5a <__libc_realloc+0x5a>
+  44:	hlt
+  45:	jmp    5a <__libc_realloc+0x5a>
+  47:	call   4c <__libc_realloc+0x4c>
+  4c:	xor    %r14d,%r14d
+  4f:	movl   $0xc,(%rax)
+  55:	jmp    379 <__libc_realloc+0x379>
+  5a:	mov    -0x3(%rbp),%dl
+  5d:	movzwl -0x2(%rbp),%eax
+  61:	mov    %edx,%esi
+  63:	and    $0x1f,%edx
+  66:	and    $0x1f,%esi
+  69:	cmpb   $0x0,-0x4(%rbp)
+  6d:	je     80 <__libc_realloc+0x80>
+  6f:	test   %eax,%eax
+  71:	je     74 <__libc_realloc+0x74>
+  73:	hlt
+  74:	movslq -0x8(%rbp),%rax
+  78:	cmp    $0xffff,%eax
+  7d:	jg     80 <__libc_realloc+0x80>
+  7f:	hlt
+  80:	mov    %eax,%ecx
+  82:	mov    %rbp,%rbx
+  85:	shl    $0x4,%ecx
+  88:	movslq %ecx,%rcx
+  8b:	sub    %rcx,%rbx
+  8e:	mov    %rbx,%rcx
+  91:	mov    -0x10(%rbx),%rbx
+  95:	sub    $0x10,%rcx
+  99:	cmp    0x10(%rbx),%rcx
+  9d:	je     a0 <__libc_realloc+0xa0>
+  9f:	hlt
+  a0:	mov    0x20(%rbx),%cl
+  a3:	and    $0x1f,%ecx
+  a6:	cmp    %ecx,%edx
+  a8:	jle    ab <__libc_realloc+0xab>
+  aa:	hlt
+  ab:	mov    0x18(%rbx),%ecx
+  ae:	bt     %esi,%ecx
+  b1:	jae    b4 <__libc_realloc+0xb4>
+  b3:	hlt
+  b4:	mov    0x1c(%rbx),%ecx
+  b7:	bt     %esi,%ecx
+  ba:	jae    bd <__libc_realloc+0xbd>
+  bc:	hlt
+  bd:	mov    %rbx,%rcx
+  c0:	mov    0x0(%rip),%rdi        # c7 <__libc_realloc+0xc7>
+  c7:	and    $0xfffffffffffff000,%rcx
+  ce:	cmp    %rdi,(%rcx)
+  d1:	je     d4 <__libc_realloc+0xd4>
+  d3:	hlt
+  d4:	mov    0x20(%rbx),%esi
+  d7:	mov    %esi,%ecx
+  d9:	shr    $0x6,%cx
+  dd:	and    $0x3f,%ecx
+  e0:	cmp    $0x2f,%cl
+  e3:	ja     114 <__libc_realloc+0x114>
+  e5:	lea    0x0(%rip),%rsi        # ec <__libc_realloc+0xec>
+  ec:	and    $0x3f,%ecx
+  ef:	movzwl (%rsi,%rcx,2),%ecx
+  f3:	imul   %edx,%ecx
+  f6:	cmp    %ecx,%eax
+  f8:	jge    fb <__libc_realloc+0xfb>
+  fa:	hlt
+  fb:	mov    0x20(%rbx),%ecx
+  fe:	inc    %edx
+ 100:	shr    $0x6,%cx
+ 104:	and    $0x3f,%ecx
+ 107:	movzwl (%rsi,%rcx,2),%ecx
+ 10b:	imul   %ecx,%edx
+ 10e:	cmp    %edx,%eax
+ 110:	jl     121 <__libc_realloc+0x121>
+ 112:	jmp    120 <__libc_realloc+0x120>
+ 114:	and    $0xfc0,%si
+ 119:	cmp    $0xfc0,%si
+ 11e:	je     121 <__libc_realloc+0x121>
+ 120:	hlt
+ 121:	mov    0x20(%rbx),%rdx
+ 125:	test   $0xfffffffffffff000,%rdx
+ 12c:	je     142 <__libc_realloc+0x142>
+ 12e:	and    $0xfffffffffffff000,%rdx
+ 135:	shr    $0x4,%rdx
+ 139:	dec    %rdx
+ 13c:	cmp    %rdx,%rax
+ 13f:	jbe    142 <__libc_realloc+0x142>
+ 141:	hlt
+ 142:	mov    -0x3(%rbp),%dl
+ 145:	mov    %edx,%ecx
+ 147:	and    $0x1f,%ecx
+ 14a:	testb  $0x1f,0x20(%rbx)
+ 14e:	jne    168 <__libc_realloc+0x168>
+ 150:	mov    0x20(%rbx),%rax
+ 154:	test   $0xfffffffffffff000,%rax
+ 15a:	je     168 <__libc_realloc+0x168>
+ 15c:	and    $0xfffffffffffff000,%rax
+ 162:	sub    $0x10,%rax
+ 166:	jmp    182 <__libc_realloc+0x182>
+ 168:	mov    0x20(%rbx),%eax
+ 16b:	lea    0x0(%rip),%rsi        # 172 <__libc_realloc+0x172>
+ 172:	shr    $0x6,%ax
+ 176:	and    $0x3f,%eax
+ 179:	movzwl (%rsi,%rax,2),%eax
+ 17d:	shl    $0x4,%eax
+ 180:	cltq
+ 182:	movzbl %cl,%ecx
+ 185:	mov    0x10(%rbx),%rsi
+ 189:	imul   %rax,%rcx
+ 18d:	lea    0x10(%rsi,%rcx,1),%rdi
+ 192:	lea    -0x4(%rdi,%rax,1),%rsi
+ 197:	mov    %edx,%eax
+ 199:	shr    $0x5,%al
+ 19c:	movzbl %al,%edx
+ 19f:	cmp    $0x4,%al
+ 1a1:	jbe    1b9 <__libc_realloc+0x1b9>
+ 1a3:	cmp    $0x5,%al
+ 1a5:	je     1a8 <__libc_realloc+0x1a8>
+ 1a7:	hlt
+ 1a8:	mov    -0x4(%rsi),%edx
+ 1ab:	cmp    $0x4,%rdx
+ 1af:	ja     1b2 <__libc_realloc+0x1b2>
+ 1b1:	hlt
+ 1b2:	cmpb   $0x0,-0x5(%rsi)
+ 1b6:	je     1b9 <__libc_realloc+0x1b9>
+ 1b8:	hlt
+ 1b9:	mov    %rsi,%rax
+ 1bc:	sub    %rbp,%rax
+ 1bf:	cmp    %rdx,%rax
+ 1c2:	jae    1c5 <__libc_realloc+0x1c5>
+ 1c4:	hlt
+ 1c5:	mov    %rsi,%r12
+ 1c8:	sub    %rdx,%r12
+ 1cb:	cmpb   $0x0,(%r12)
+ 1d0:	je     1d3 <__libc_realloc+0x1d3>
+ 1d2:	hlt
+ 1d3:	cmpb   $0x0,(%rsi)
+ 1d6:	je     1d9 <__libc_realloc+0x1d9>
+ 1d8:	hlt
+ 1d9:	mov    0x20(%rbx),%ecx
+ 1dc:	mov    $0x1ffeb,%r8d
+ 1e2:	mov    %ecx,%edx
+ 1e4:	shr    $0x6,%dx
+ 1e8:	and    $0x3f,%edx
+ 1eb:	cmp    $0x1ffeb,%rax
+ 1f1:	cmova  %r8,%rax
+ 1f5:	cmp    %rax,%r13
+ 1f8:	ja     2a1 <__libc_realloc+0x2a1>
+ 1fe:	lea    0x3(%r13),%rcx
+ 202:	mov    %rcx,%rax
+ 205:	shr    $0x4,%rax
+ 209:	cmp    $0x9f,%rcx
+ 210:	jbe    281 <__libc_realloc+0x281>
+ 212:	lea    0x1(%rax),%rdi
+ 216:	mov    %edi,%ecx
+ 218:	mov    %edi,%eax
+ 21a:	shr    $1,%ecx
+ 21c:	shr    $0x2,%eax
+ 21f:	or     %ecx,%eax
+ 221:	mov    %eax,%ecx
+ 223:	shr    $0x2,%ecx
+ 226:	or     %ecx,%eax
+ 228:	mov    %eax,%ecx
+ 22a:	shr    $0x4,%ecx
+ 22d:	or     %ecx,%eax
+ 22f:	mov    %eax,%ecx
+ 231:	shr    $0x8,%ecx
+ 234:	or     %ecx,%eax
+ 236:	lea    0x1(%rax),%ecx
+ 239:	not    %eax
+ 23b:	and    %ecx,%eax
+ 23d:	imul   $0x76be629,%eax,%ecx
+ 243:	lea    0x0(%rip),%rax        # 24a <__libc_realloc+0x24a>
+ 24a:	shr    $0x1b,%ecx
+ 24d:	movsbl (%rax,%rcx,1),%eax
+ 251:	lea    0x0(%rip),%rcx        # 258 <__libc_realloc+0x258>
+ 258:	lea    -0x4(,%rax,4),%eax
+ 25f:	lea    0x1(%rax),%r8d
+ 263:	movslq %r8d,%r8
+ 266:	movzwl (%rcx,%r8,2),%r8d
+ 26b:	cmp    %r8,%rdi
+ 26e:	jbe    273 <__libc_realloc+0x273>
+ 270:	add    $0x2,%eax
+ 273:	movslq %eax,%r8
+ 276:	movzwl (%rcx,%r8,2),%ecx
+ 27b:	cmp    %rdi,%rcx
+ 27e:	adc    $0x0,%eax
+ 281:	inc    %eax
+ 283:	movzbl %dl,%edx
+ 286:	cmp    %edx,%eax
+ 288:	jl     349 <__libc_realloc+0x349>
+ 28e:	mov    %r13,%rdx
+ 291:	mov    %rbp,%rdi
+ 294:	mov    %rbp,%r14
+ 297:	call   29c <__libc_realloc+0x29c>
+ 29c:	jmp    379 <__libc_realloc+0x379>
+ 2a1:	cmp    $0x2f,%dl
+ 2a4:	jbe    349 <__libc_realloc+0x349>
+ 2aa:	cmp    $0x1ffeb,%r13
+ 2b1:	jbe    349 <__libc_realloc+0x349>
+ 2b7:	and    $0xfc0,%cx
+ 2bc:	cmp    $0xfc0,%cx
+ 2c1:	je     2c4 <__libc_realloc+0x2c4>
+ 2c3:	hlt
+ 2c4:	mov    %rbp,%r14
+ 2c7:	mov    0x20(%rbx),%rsi
+ 2cb:	sub    %rdi,%r14
+ 2ce:	mov    0x10(%rbx),%rdi
+ 2d2:	lea    0x1013(%r14,%r13,1),%r8
+ 2da:	and    $0xfffffffffffff000,%rsi
+ 2e1:	mov    %r8,%r15
+ 2e4:	and    $0xfffffffffffff000,%r15
+ 2eb:	cmp    %r15,%rsi
+ 2ee:	je     30c <__libc_realloc+0x30c>
+ 2f0:	mov    $0x1,%ecx
+ 2f5:	mov    %r15,%rdx
+ 2f8:	xor    %eax,%eax
+ 2fa:	mov    %r8,0x8(%rsp)
+ 2ff:	call   304 <__libc_realloc+0x304>
+ 304:	mov    0x8(%rsp),%r8
+ 309:	mov    %rax,%rdi
+ 30c:	cmp    $0xffffffffffffffff,%rdi
+ 310:	je     349 <__libc_realloc+0x349>
+ 312:	mov    0x20(%rbx),%rax
+ 316:	mov    %rdi,0x10(%rbx)
+ 31a:	and    $0xfffffffffffff000,%r8
+ 321:	mov    %r13,%rdx
+ 324:	add    $0x10,%rdi
+ 328:	and    $0xfff,%eax
+ 32d:	lea    -0x14(%rdi,%r15,1),%rsi
+ 332:	add    %rdi,%r14
+ 335:	or     %r8,%rax
+ 338:	mov    %r14,%rdi
+ 33b:	mov    %rax,0x20(%rbx)
+ 33f:	movb   $0x0,(%rsi)
+ 342:	call   347 <__libc_realloc+0x347>
+ 347:	jmp    379 <__libc_realloc+0x379>
+ 349:	mov    %r13,%rdi
+ 34c:	call   351 <__libc_realloc+0x351>
+ 351:	mov    %rax,%r14
+ 354:	test   %rax,%rax
+ 357:	je     379 <__libc_realloc+0x379>
+ 359:	sub    %rbp,%r12
+ 35c:	mov    %r13,%rdx
+ 35f:	mov    %rax,%rdi
+ 362:	mov    %rbp,%rsi
+ 365:	cmp    %r13,%r12
+ 368:	cmovbe %r12,%rdx
+ 36c:	call   371 <__libc_realloc+0x371>
+ 371:	mov    %rbp,%rdi
+ 374:	call   379 <__libc_realloc+0x379>
+ 379:	add    $0x18,%rsp
+ 37d:	mov    %r14,%rax
+ 380:	pop    %rbx
+ 381:	pop    %rbp
+ 382:	pop    %r12
+ 384:	pop    %r13
+ 386:	pop    %r14
+ 388:	pop    %r15
+ 38a:	ret

@@ -1,0 +1,41 @@
+# libc.a 函数 1222 个，在二进制中唯一定位 337 个
+# 已定位 musl 函数地址范围: 0x2891b0 - 0x229fd76
+#   __lock                 0x22964a0-0x2296552 (__lock.lo)
+#   __unlock               0x2296552-0x229658c (__lock.lo)
+#   __libc_malloc_impl     未唯一定位
+#   free                   未唯一定位
+#   __libc_realloc         未唯一定位
+#   __syscall_cp_c         0x229658c-0x22965a6 (__syscall_cp.lo)
+#   memcpy                 0x2296346-0x2296378 (memcpy.lo)
+#   memmove                0x2296378-0x229639d (memmove.lo)
+
+## /root/kiro-cpu-pkg/evidence/87-59138/41-perf-cpu-flat.txt
+合计 101.2%
+   41.6%  kernel
+   37.6%  musl libc
+   22.0%  应用 + Rust 依赖库
+    0.1%  其他(__vdso_clock_gettime)
+  musl 函数明细:
+     10.4%  __lock
+      6.9%  alloc_slot
+      5.1%  __libc_free
+      4.0%  get_meta
+      4.0%  __unlock
+      3.7%  memcpy
+      2.2%  enframe
+      0.6%  memcmp
+      0.3%  nontrivial_free
+      0.2%  size_to_class
+      0.1%  memmove
+      0.1%  __syscall_ret
+      0.0%  __clock_gettime
+      0.0%  memset
+      0.0%  __syscall_cp_c
+
+## /root/kiro-cpu-pkg/evidence/87-59138/51-perf-futex-flat.txt
+合计 100.0%
+  100.0%  musl libc
+  musl 函数明细:
+     75.9%  __unlock
+     24.0%  __lock
+      0.1%  syscall

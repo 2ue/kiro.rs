@@ -1,0 +1,17 @@
+
+ Performance counter stats for process id '982133':
+
+           118,814      syscalls:sys_enter_futex                                              
+            14,961      syscalls:sys_enter_madvise                                            
+             2,751      syscalls:sys_enter_mmap                                               
+             2,485      syscalls:sys_enter_munmap                                             
+               134      syscalls:sys_enter_mremap                                             
+               553      syscalls:sys_enter_sendto                                             
+             1,036      syscalls:sys_enter_write                                              
+                 0      syscalls:sys_enter_read                                               
+            69,505      page-faults                                                           
+            13,591      context-switches                                                      
+            29,594      tlb:tlb_flush                                                         
+
+      10.003141249 seconds time elapsed
+

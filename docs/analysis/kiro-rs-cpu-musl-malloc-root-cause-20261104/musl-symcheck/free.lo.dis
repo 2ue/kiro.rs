@@ -1,0 +1,8 @@
+
+free.lo:     file format elf64-x86-64
+
+
+Disassembly of section .text.free:
+
+0000000000000000 <free>:
+   0:	jmp    5 <free+0x5>

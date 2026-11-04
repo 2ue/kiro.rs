@@ -1,0 +1,111 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 12K of event 'cycles:P'
+# Event count (approx.): 136750697054
+#
+# Overhead  Shared Object      Symbol                                       
+# ........  .................  .............................................
+#
+     9.65%  [kernel.kallsyms]  [k] __pv_queued_spin_lock_slowpath
+            |
+            ---__pv_queued_spin_lock_slowpath
+               |          
+                --9.64%--_raw_spin_lock
+                          |          
+                          |--5.89%--__task_rq_lock
+                          |          try_to_wake_up
+                          |          |          
+                          |           --5.88%--wake_up_q
+                          |                     futex_wake
+                          |                     do_futex
+                          |                     __x64_sys_futex
+                          |                     do_syscall_64
+                          |                     entry_SYSCALL_64_after_hwframe
+                          |                     |          
+                          |                      --5.87%--0x7f6c1003657d
+                          |          
+                           --2.87%--futex_wake
+                                     do_futex
+                                     __x64_sys_futex
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     0x7f6c1003657d
+
+     6.03%  kiro-rs            [.] 0x00000000022964ba
+            |          
+             --6.02%--0x7f6c100364ba
+
+     4.69%  kiro-rs            [.] 0x000000000228dc5b
+            |
+            ---0x7f6c1002dc5b
+
+     3.62%  kiro-rs            [.] 0x00000000022964ec
+            |
+            ---0x7f6c100364ec
+
+     3.58%  kiro-rs            [.] 0x000000000228d55c
+            |
+            ---0x7f6c1002d55c
+
+     3.15%  [kernel.kallsyms]  [k] asm_sysvec_call_function
+            |          
+             --3.13%--asm_sysvec_call_function
+                       |          
+                        --1.66%--0x7f6c1003657d
+
+     2.44%  kiro-rs            [.] 0x0000000002296561
+            |
+            ---0x7f6c10036561
+
+     2.15%  [kernel.kallsyms]  [k] futex_wake
+            |
+            ---futex_wake
+               do_futex
+               __x64_sys_futex
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               0x7f6c1003657d
+
+     1.87%  [kernel.kallsyms]  [k] __raw_callee_save___pv_queued_spin_unlock
+            |          
+             --1.85%--__raw_callee_save___pv_queued_spin_unlock
+                       |          
+                        --1.49%--_raw_spin_unlock
+
+     1.71%  kiro-rs            [.] 0x000000000228dbb2
+            |
+            ---0x7f6c1002dbb2
+
+     1.68%  [kernel.kallsyms]  [k] _raw_spin_lock
+            |
+            ---_raw_spin_lock
+
+     1.30%  kiro-rs            [.] 0x0000000002296373
+            |
+            ---0x7f6c10036373
+
+     1.19%  [kernel.kallsyms]  [k] asm_sysvec_call_function_single
+            |
+            ---asm_sysvec_call_function_single
+
+     1.13%  kiro-rs            [.] 0x000000000229636d
+            |
+            ---0x7f6c1003636d
+
+     1.05%  [kernel.kallsyms]  [k] native_write_msr
+            |
+            ---native_write_msr
+
+     1.02%  [kernel.kallsyms]  [k] __irqentry_text_start
+            |
+            ---__irqentry_text_start
+
+     1.00%  kiro-rs            [.] 0x000000000228d093
+
+
+#
+# (Tip: Show current config key-value pairs: perf config --list)
+#

@@ -1,0 +1,35 @@
+collected_at=2026-11-04T17:05:05+08:00
+host=v2202607350025477794
+kernel=6.12.94+deb13-amd64
+nproc=8
+               total        used        free      shared  buff/cache   available
+Mem:           15996        4318        1103         366       11163       11677
+Swap:          20479         836       19643
+ 17:05:05 up 17 days, 22:33,  3 users,  load average: 2.02, 1.64, 1.76
+container=/kiro-rs-2ue-59137-app image=ghcr.io/2ue/kiro-rs:latest image_id=sha256:8e80bf819d908123eb1b57d581bd145575e8315bbfe25c51778da42b7746f349 version=0.0.237 nano_cpus=0 mem_limit=0 started=2026-11-03T16:22:31.381533197Z
+pid=982133 binary_sha256=2520521ffbd9760df354f79466188434f659b3adbed89ed85eac10eff0ee33cb
+VmHWM:	 2227968 kB
+VmRSS:	  489988 kB
+Threads:	17
+--- docker stats
+kiro-rs-2ue-59137-app 4.07% 393.9MiB / 15.62GiB
+kiro-rs-2ue-59139-app 0.27% 62.23MiB / 15.62GiB
+kiro-rs-2ue-59137-postgres 0.45% 420.3MiB / 15.62GiB
+kiro-rs-2ue-59137-redis 0.30% 27.03MiB / 15.62GiB
+kiro-rs-2ue-59139-postgres 0.06% 79.59MiB / 15.62GiB
+kiro-rs-2ue-59139-redis 0.21% 8.648MiB / 15.62GiB
+temp-email-smtp-proxy 0.00% 23.92MiB / 15.62GiB
+sub2api 13.60% 1.013GiB / 15.62GiB
+sub2api-postgres 3.67% 371.7MiB / 15.62GiB
+sub2api-redis 0.82% 44.93MiB / 15.62GiB
+sub2api-remote 0.65% 63.33MiB / 15.62GiB
+sub2api-remote-postgres 0.33% 46.14MiB / 15.62GiB
+sub2api-remote-redis 0.25% 3.559MiB / 15.62GiB
+sub2api-local-redis 0.20% 5.086MiB / 15.62GiB
+sub2api-ops-web 0.07% 123.4MiB / 15.62GiB
+sub2api-ops-api 0.00% 6.645MiB / 15.62GiB
+caddy 4.64% 212.8MiB / 15.62GiB
+sub2api-new 0.66% 48.98MiB / 15.62GiB
+sub2api-new-postgres 0.31% 53.14MiB / 15.62GiB
+sub2api-new-redis 0.22% 10.84MiB / 15.62GiB
+done 2026-11-04T17:08:10+08:00

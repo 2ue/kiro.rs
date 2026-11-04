@@ -1,0 +1,267 @@
+# 深圳机器首轮测量（2026-11-04 16:17-16:31 +08:00）的命令和原始输出，逐字摘自 Claude Code 会话 489edd24 记录。
+# 当时的原始文件在清理时已删除，此处为副本；邮箱已脱敏。
+
+
+======== @ 2026-11-04T08:20:56.489Z
+$ cd /tmp/kiroanalysis && python3 -I - <<'EOF'
+import re,datetime,collections
+bytes_=collections.Counter(); sends=collections.Counter(); retr=collections.Counter(); zf=0; reasons=collections.Counter()
+reqs=set(); retried=set()
+for l in open('live.log'):
+    m=re.match(r'(\S+?)\.\d+Z',l)
+    if not m: continue
+    t=int(datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc).timestamp())
+    if 'Kiro upstream request body size' in l:
+        b=re.search(r'upstream_body_bytes=(\d+)',l) or re.search(r'body_bytes=(\d+)',l)
+        if b: bytes_[t]+=int(b.group(1))
+        sends[t]+=1
+        r=re.search(r'request_id="?([^" ]+)',l); reqs.add(r and r.group(1))
+    if '准备换号重试' in l:
+        retr[t]+=1
+        r=re.search(r'reason="?([^" ]+)',l); reasons[r and r.group(1)]+=1
+        r=re.search(r'request_id=([^ ]+)',l); retried.add(r and r.group(1))
+rows=[]
+for l in open('samples.txt'):
+    ts,u,s,f,rss=map(int,l.split())
+    t=ts-1
+    rows.append((t,u,s,f,rss,bytes_[t]+bytes_[t-1],sends[t],retr[t]))
+import statistics as st
+cpu=[r[1]+r[2] for r in rows]; mb=[r[5]/1e6 for r in rows]
+def corr(a,b):
+    ma,mb_=st.mean(a),st.mean(b); 
+    num=sum((x-ma)*(y-mb_) for x,y in zip(a,b)); den=(sum((x-ma)**2 for x in a)*sum((y-mb_)**2 for y in b))**.5
+    return num/den if den else 0
+print("samples",len(rows),"cpu% mean",st.mean(cpu),"max",max(cpu),"user share",sum(r[1] for r in rows)/max(1,sum(cpu)))
+print("sends",sum(sends.values()),"distinct reqs",len(reqs),"retries",sum(retr.values()),"retried reqs",len(retried),reasons)
+print("corr cpu~MB(t,t-1)",round(corr(cpu,mb),2),"corr cpu~sends",round(corr(cpu,[r[6] for r in rows]),2),"corr cpu~retries",round(corr(cpu,[r[7] for r in rows]),2),"corr cpu~minflt",round(corr(cpu,[r[3] for r in rows]),2))
+print("total MB sent",round(sum(bytes_.values())/1e6,1))
+for r in sorted(rows,key=lambda r:-(r[1]+r[2]))[:8]: print("top",r)
+EOF
+grep -m2 'Kiro upstream request body size' live.log | cut -c1-700
+-------- output
+samples 120 cpu% mean 117.925 max 654 user share 0.6055402445056887
+sends 590 distinct reqs 279 retries 167 retried reqs 65 Counter({'protocol_error': 167})
+corr cpu~MB(t,t-1) 0.04 corr cpu~sends -0.05 corr cpu~retries -0.04 corr cpu~minflt 0.1
+total MB sent 554.7
+top (1793780379, 173, 481, 17444, 798, 2909035, 4, 1)
+top (1793780380, 140, 438, 19395, 766, 6134076, 3, 2)
+top (1793780373, 178, 298, 30597, 778, 11712461, 4, 3)
+top (1793780374, 195, 271, 42508, 804, 15617996, 4, 1)
+top (1793780381, 183, 258, 29642, 789, 20333202, 6, 1)
+top (1793780378, 169, 262, 8457, 793, 1988424, 4, 1)
+top (1793780377, 190, 222, 8623, 788, 10051842, 3, 0)
+top (1793780328, 176, 220, 7766, 724, 9182556, 5, 2)
+2026-11-04T08:17:58.039072Z  INFO kiro_rs::kiro::provider: Kiro upstream request body size request_id="req_012MqBmcYj5tfuzz7c3FGTZ9" api_type="流式" endpoint="ide" credential_id=2382 credential_label=#2382 <email> attempt=1 max_retries=3 upstream_body_bytes=802807 upstream_body_weight=920163 upstream_body_weight_limit=1300000 model="claude-opus-5-5" conversation_id="ab17520b-d1e0-483f-b213-c7f22d2182ef" pre_endpoint_body_bytes=802726 compression_enabled=true
+2026-11-04T08:17:58.193874Z  INFO kiro_rs::kiro::provider: Kiro upstream request body size request_id="req_01TZQAsdfcPSGfk5wvN1wkuB" api_type="非流式" endpoint="ide" credential_id=2379 credential_label=#2379 <email> attempt=1 max_retries=6 upstream_body_bytes=148295 upstream_body_weight=154815 upstream_body_weight_limit=1300000 model="claude-sonnet-5" conversation_id="54182707-31ea-47b9-8693-d155187e2a76" pre_endpoint_body_bytes=148214 compression_enabled=true
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:21:44.676Z
+$ join <(sort /tmp/kiroanalysis/t0) <(sort /tmp/kiroanalysis/t1) | awk '{du=$6-$3; ds=$7-$4; tu+=du; ts+=ds; if(du+ds>5) printf "%s %-18s user=%d%% sys=%d%%\n",$1,$2,du/10,ds/10} END{printf "TOTAL user=%d%% sys=%d%%\n",tu/10,ts/10}' | sort -k3 -t= -rn
+-------- output
+TOTAL user=88% sys=32%
+2371706 tokio-runtime-w    user=27% sys=8%
+2257357 tokio-runtime-w    user=23% sys=5%
+2192013 tokio-runtime-w    user=8% sys=3%
+2291832 tokio-runtime-w    user=4% sys=2%
+2199174 tokio-runtime-w    user=3% sys=2%
+2371707 tokio-runtime-w    user=2% sys=1%
+2322211 tokio-runtime-w    user=3% sys=1%
+2291851 tokio-runtime-w    user=2% sys=1%
+2192012 tokio-runtime-w    user=1% sys=1%
+2352996 tokio-runtime-w    user=0% sys=0%
+2291850 tokio-runtime-w    user=0% sys=0%
+2220136 tokio-runtime-w    user=1% sys=0%
+2217981 tokio-runtime-w    user=1% sys=0%
+2201545 tokio-runtime-w    user=3% sys=0%
+2197472 tokio-runtime-w    user=2% sys=0%
+
+
+======== @ 2026-11-04T08:22:02.804Z
+$ cd /tmp/kiroanalysis && python3 -I - <<'EOF'
+import re,datetime,collections,statistics as st
+B=collections.Counter(); S=collections.Counter(); R=collections.Counter()
+for l in open('live.log'):
+    m=re.match(r'(\S+?)\.\d+Z',l)
+    if not m: continue
+    t=int(datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc).timestamp())//10
+    if 'Kiro upstream request body size' in l:
+        B[t]+=int(re.search(r'upstream_body_bytes=(\d+)',l).group(1)); S[t]+=1
+    if '准备换号重试' in l: R[t]+=1
+C=collections.Counter(); SY=collections.Counter(); F=collections.Counter()
+for l in open('samples.txt'):
+    ts,u,s,f,rss=map(int,l.split()); t=(ts-1)//10; C[t]+=u+s; SY[t]+=s; F[t]+=f
+ks=sorted(C)[1:-1]
+def corr(a,b):
+    ma,mb=st.mean(a),st.mean(b);n=sum((x-ma)*(y-mb) for x,y in zip(a,b));d=(sum((x-ma)**2 for x in a)*sum((y-mb)**2 for y in b))**.5;return round(n/d,2) if d else 0
+print("10s  cpu%  sys%  MB  sends retries minflt")
+for k in ks: print(k%1000, C[k]//10, SY[k]//10, round(B[k]/1e6,1), S[k], R[k], F[k])
+print("corr cpu~MB",corr([C[k] for k in ks],[B[k] for k in ks]),"cpu~sends",corr([C[k] for k in ks],[S[k] for k in ks]),"cpu~retries",corr([C[k] for k in ks],[R[k] for k in ks]),"cpu~minflt",corr([C[k] for k in ks],[F[k] for k in ks]))
+EOF
+docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -iE "^rust|perf|alpine" | head
+-------- output
+10s  cpu%  sys%  MB  sends retries minflt
+28 33 6 40.0 69 8 124172
+29 81 22 48.1 36 5 120424
+30 68 12 47.2 52 31 133605
+31 114 29 43.4 36 11 187466
+32 171 85 43.1 49 16 118246
+33 135 49 42.0 59 26 96978
+34 46 7 46.5 54 17 125780
+35 32 6 38.6 32 7 142713
+36 91 20 41.1 38 7 193014
+37 383 214 42.4 37 8 208908
+38 212 93 78.1 53 14 193791
+corr cpu~MB 0.26 cpu~sends -0.2 cpu~retries -0.08 cpu~minflt 0.56
+redis:8-alpine
+postgres:18-alpine
+node:22-alpine
+caddy:2-alpine
+rust:1.92-alpine
+rust:1.92.0-alpine3.23
+golang:1.23-alpine
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:24:34.502Z
+$ cd /tmp/kiroanalysis; objdump -d --no-show-raw-insn --start-address=0x22964a0 --stop-address=0x2296580 kiro-rs.bin | tail -n +7 | head -70; echo ==== callers; objdump -d --no-show-raw-insn kiro-rs.bin > dis.txt; grep -c "call   0x22964a0" dis.txt; grep -n "syscall" dis.txt | wc -l
+-------- output
+00000000022964a0 <.text+0x206f460>:
+ 22964a0:	movsbl 0xd65dfc(%rip),%ecx        # 0x2ffc2a3
+ 22964a7:	test   %ecx,%ecx
+ 22964a9:	je     0x2296551
+ 22964af:	xor    %eax,%eax
+ 22964b1:	mov    $0x80000001,%edx
+ 22964b6:	lock cmpxchg %edx,(%rdi)
+ 22964ba:	mov    %eax,%edx
+ 22964bc:	test   %ecx,%ecx
+ 22964be:	jns    0x22964c7
+ 22964c0:	movb   $0x0,0xd65ddc(%rip)        # 0x2ffc2a3
+ 22964c7:	test   %eax,%eax
+ 22964c9:	je     0x2296551
+ 22964cf:	mov    $0xa,%esi
+ 22964d4:	mov    %edx,%ecx
+ 22964d6:	test   %edx,%edx
+ 22964d8:	jns    0x22964e0
+ 22964da:	add    $0x7fffffff,%ecx
+ 22964e0:	lea    -0x7fffffff(%rcx),%edx
+ 22964e6:	mov    %ecx,%eax
+ 22964e8:	lock cmpxchg %edx,(%rdi)
+ 22964ec:	mov    %eax,%edx
+ 22964ee:	cmp    %eax,%ecx
+ 22964f0:	je     0x2296551
+ 22964f2:	dec    %esi
+ 22964f4:	jne    0x22964d4
+ 22964f6:	push   %rbx
+ 22964f7:	mov    $0x1,%r8d
+ 22964fd:	lock xadd %r8d,(%rdi)
+ 2296502:	mov    $0xca,%r9d
+ 2296508:	inc    %r8d
+ 229650b:	mov    $0x80,%ebx
+ 2296510:	mov    %r8d,%edx
+ 2296513:	test   %r8d,%r8d
+ 2296516:	jns    0x229653a
+ 2296518:	movslq %r8d,%rdx
+ 229651b:	xor    %r10d,%r10d
+ 229651e:	mov    %r9,%rax
+ 2296521:	mov    %rbx,%rsi
+ 2296524:	syscall
+ 2296526:	cmp    $0xffffffffffffffda,%rax
+ 229652a:	jne    0x2296533
+ 229652c:	xor    %esi,%esi
+ 229652e:	mov    %r9,%rax
+ 2296531:	syscall
+ 2296533:	lea    0x7fffffff(%r8),%edx
+ 229653a:	lea    -0x80000000(%rdx),%r8d
+ 2296541:	mov    %edx,%eax
+ 2296543:	lock cmpxchg %r8d,(%rdi)
+ 2296548:	mov    %eax,%r8d
+ 229654b:	cmp    %eax,%edx
+ 229654d:	jne    0x2296510
+ 229654f:	pop    %rbx
+ 2296550:	ret
+ 2296551:	ret
+ 2296552:	mov    (%rdi),%eax
+ 2296554:	test   %eax,%eax
+ 2296556:	jns    0x229658b
+ 2296558:	mov    $0x7fffffff,%eax
+ 229655d:	lock xadd %eax,(%rdi)
+ 2296561:	cmp    $0x80000001,%eax
+ 2296566:	je     0x229658b
+ 2296568:	mov    $0xca,%r8d
+ 229656e:	mov    $0x1,%edx
+ 2296573:	mov    $0x81,%esi
+ 2296578:	mov    %r8,%rax
+ 229657b:	syscall
+ 229657d:	rex.W
+ 229657e:	.byte 0x83
+ 229657f:	clc
+==== callers
+16
+218
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:26:11.702Z
+$ cd /tmp/kiroanalysis; perf report -i perf.data --no-children --sort dso,sym --stdio -g none 2>/dev/null | grep -E '^\s+[0-9.]+%' > rep.txt; python3 -I - <<'EOF'
+import re,collections
+c=collections.Counter()
+for l in open('/tmp/kiroanalysis/rep.txt'):
+    m=re.match(r'\s+([0-9.]+)%\s+(\S+)\s+\[(.)\]\s+(\S+)',l)
+    if not m: continue
+    pct=float(m.group(1)); dso=m.group(2); sym=m.group(4)
+    if dso.startswith('[kernel'): c['kernel']+=pct; continue
+    try: ip=int(sym,16)
+    except: c['other:'+sym]+=pct; continue
+    if 0x2280000<=ip<0x22b0000: c['musl libc region (malloc + __lock)']+=pct
+    else: c['app/rust code']+=pct
+for k,v in c.most_common(8): print(f"{v:5.1f}%  {k}")
+EOF
+-------- output
+ 52.5%  musl libc region (malloc + __lock)
+ 24.3%  app/rust code
+ 23.3%  kernel
+  0.0%  other:__vdso_clock_gettime
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137
+
+
+======== @ 2026-11-04T08:27:39.378Z
+$ PID=$(docker inspect -f '{{.State.Pid}}' kiro-rs-2ue-59137-app)
+perf stat -p $PID -e 'syscalls:sys_enter_futex,syscalls:sys_enter_mmap,syscalls:sys_enter_munmap,syscalls:sys_enter_madvise,syscalls:sys_enter_mremap,syscalls:sys_enter_brk,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_sendto,syscalls:sys_enter_write,page-faults,context-switches,tlb:tlb_flush' -- sleep 10 2>&1 | grep -vE "^\s*$|Performance|seconds"
+-------- output
+         2,658,648      syscalls:sys_enter_futex                                              
+             2,999      syscalls:sys_enter_mmap                                               
+             2,948      syscalls:sys_enter_munmap                                             
+            25,401      syscalls:sys_enter_madvise                                            
+               433      syscalls:sys_enter_mremap                                             
+                 0      syscalls:sys_enter_brk                                                
+                 0      syscalls:sys_enter_epoll_wait                                         
+               767      syscalls:sys_enter_sendto                                             
+             1,789      syscalls:sys_enter_write                                              
+           187,766      page-faults                                                           
+           155,872      context-switches                                                      
+            67,510      tlb:tlb_flush
+
+
+======== @ 2026-11-04T08:28:01.500Z
+$ cd /tmp/kiroanalysis; PID=$(docker inspect -f '{{.State.Pid}}' kiro-rs-2ue-59137-app)
+perf record -e syscalls:sys_enter_futex -c 200 -g -p $PID -o futex.data -- sleep 5 2>&1 | tail -1
+perf report -i futex.data --no-children --sort sym --stdio -G 2>/dev/null | grep -E "[0-9.]+%" | head -25
+grep -E "^ *2296524:|^ *229657b:|^ *2296531:" dis.txt
+-------- output
+[ perf record: Captured and wrote 5.975 MB futex.data (10767 samples) ]
+    45.22%  [.] 0x000000000229657d
+             --4.05%--0x7fbada07957d
+    29.06%  [.] 0x0000000002296526
+            |--7.18%--0x7fbada079526
+             --3.00%--0
+                        --2.99%--0x7fbada079526
+    25.66%  [.] 0x000000000228fb48
+             --25.45%--0x7fbada072b48
+     0.02%  [.] 0x00000000022965a5
+     0.02%  [.] 0x0000000002297075
+     0.02%  [.] 0x000000000229d737
+ 2296524:	syscall
+ 2296531:	syscall
+ 229657b:	syscall
+Shell cwd was reset to /root/docker-compose/kiro-rs-2ue-59137

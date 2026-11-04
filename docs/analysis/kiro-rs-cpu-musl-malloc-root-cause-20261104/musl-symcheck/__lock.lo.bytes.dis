@@ -1,0 +1,83 @@
+
+__lock.lo:     file format elf64-x86-64
+
+
+Disassembly of section .text.__lock:
+
+0000000000000000 <__lock>:
+   0:	0f be 0d 00 00 00 00 	movsbl 0x0(%rip),%ecx        # 7 <__lock+0x7>
+   7:	85 c9                	test   %ecx,%ecx
+   9:	0f 84 a2 00 00 00    	je     b1 <__lock+0xb1>
+   f:	31 c0                	xor    %eax,%eax
+  11:	ba 01 00 00 80       	mov    $0x80000001,%edx
+  16:	f0 0f b1 17          	lock cmpxchg %edx,(%rdi)
+  1a:	89 c2                	mov    %eax,%edx
+  1c:	85 c9                	test   %ecx,%ecx
+  1e:	79 07                	jns    27 <__lock+0x27>
+  20:	c6 05 00 00 00 00 00 	movb   $0x0,0x0(%rip)        # 27 <__lock+0x27>
+  27:	85 c0                	test   %eax,%eax
+  29:	0f 84 82 00 00 00    	je     b1 <__lock+0xb1>
+  2f:	be 0a 00 00 00       	mov    $0xa,%esi
+  34:	89 d1                	mov    %edx,%ecx
+  36:	85 d2                	test   %edx,%edx
+  38:	79 06                	jns    40 <__lock+0x40>
+  3a:	81 c1 ff ff ff 7f    	add    $0x7fffffff,%ecx
+  40:	8d 91 01 00 00 80    	lea    -0x7fffffff(%rcx),%edx
+  46:	89 c8                	mov    %ecx,%eax
+  48:	f0 0f b1 17          	lock cmpxchg %edx,(%rdi)
+  4c:	89 c2                	mov    %eax,%edx
+  4e:	39 c1                	cmp    %eax,%ecx
+  50:	74 5f                	je     b1 <__lock+0xb1>
+  52:	ff ce                	dec    %esi
+  54:	75 de                	jne    34 <__lock+0x34>
+  56:	53                   	push   %rbx
+  57:	41 b8 01 00 00 00    	mov    $0x1,%r8d
+  5d:	f0 44 0f c1 07       	lock xadd %r8d,(%rdi)
+  62:	41 b9 ca 00 00 00    	mov    $0xca,%r9d
+  68:	41 ff c0             	inc    %r8d
+  6b:	bb 80 00 00 00       	mov    $0x80,%ebx
+  70:	44 89 c2             	mov    %r8d,%edx
+  73:	45 85 c0             	test   %r8d,%r8d
+  76:	79 22                	jns    9a <__lock+0x9a>
+  78:	49 63 d0             	movslq %r8d,%rdx
+  7b:	45 31 d2             	xor    %r10d,%r10d
+  7e:	4c 89 c8             	mov    %r9,%rax
+  81:	48 89 de             	mov    %rbx,%rsi
+  84:	0f 05                	syscall
+  86:	48 83 f8 da          	cmp    $0xffffffffffffffda,%rax
+  8a:	75 07                	jne    93 <__lock+0x93>
+  8c:	31 f6                	xor    %esi,%esi
+  8e:	4c 89 c8             	mov    %r9,%rax
+  91:	0f 05                	syscall
+  93:	41 8d 90 ff ff ff 7f 	lea    0x7fffffff(%r8),%edx
+  9a:	44 8d 82 00 00 00 80 	lea    -0x80000000(%rdx),%r8d
+  a1:	89 d0                	mov    %edx,%eax
+  a3:	f0 44 0f b1 07       	lock cmpxchg %r8d,(%rdi)
+  a8:	41 89 c0             	mov    %eax,%r8d
+  ab:	39 c2                	cmp    %eax,%edx
+  ad:	75 c1                	jne    70 <__lock+0x70>
+  af:	5b                   	pop    %rbx
+  b0:	c3                   	ret
+  b1:	c3                   	ret
+
+Disassembly of section .text.__unlock:
+
+0000000000000000 <__unlock>:
+   0:	8b 07                	mov    (%rdi),%eax
+   2:	85 c0                	test   %eax,%eax
+   4:	79 33                	jns    39 <__unlock+0x39>
+   6:	b8 ff ff ff 7f       	mov    $0x7fffffff,%eax
+   b:	f0 0f c1 07          	lock xadd %eax,(%rdi)
+   f:	3d 01 00 00 80       	cmp    $0x80000001,%eax
+  14:	74 23                	je     39 <__unlock+0x39>
+  16:	41 b8 ca 00 00 00    	mov    $0xca,%r8d
+  1c:	ba 01 00 00 00       	mov    $0x1,%edx
+  21:	be 81 00 00 00       	mov    $0x81,%esi
+  26:	4c 89 c0             	mov    %r8,%rax
+  29:	0f 05                	syscall
+  2b:	48 83 f8 da          	cmp    $0xffffffffffffffda,%rax
+  2f:	75 08                	jne    39 <__unlock+0x39>
+  31:	4c 89 c0             	mov    %r8,%rax
+  34:	48 89 d6             	mov    %rdx,%rsi
+  37:	0f 05                	syscall
+  39:	c3                   	ret

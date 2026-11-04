@@ -1,0 +1,1030 @@
+
+malloc.lo:     file format elf64-x86-64
+
+
+Disassembly of section .text.queue:
+
+0000000000000000 <queue>:
+   0:	cmpq   $0x0,0x8(%rsi)
+   5:	je     8 <queue+0x8>
+   7:	hlt
+   8:	cmpq   $0x0,(%rsi)
+   c:	je     f <queue+0xf>
+   e:	hlt
+   f:	mov    (%rdi),%rax
+  12:	test   %rax,%rax
+  15:	je     2d <queue+0x2d>
+  17:	mov    %rax,0x8(%rsi)
+  1b:	mov    (%rax),%rax
+  1e:	mov    %rax,(%rsi)
+  21:	mov    %rsi,0x8(%rax)
+  25:	mov    0x8(%rsi),%rax
+  29:	mov    %rsi,(%rax)
+  2c:	ret
+  2d:	mov    %rsi,0x8(%rsi)
+  31:	mov    %rsi,(%rsi)
+  34:	mov    %rsi,(%rdi)
+  37:	ret
+
+Disassembly of section .text.get_stride:
+
+0000000000000000 <get_stride>:
+   0:	testb  $0x1f,0x20(%rdi)
+   4:	jne    1d <get_stride+0x1d>
+   6:	mov    0x20(%rdi),%rax
+   a:	test   $0xfffffffffffff000,%rax
+  10:	je     1d <get_stride+0x1d>
+  12:	and    $0xfffffffffffff000,%rax
+  18:	sub    $0x10,%rax
+  1c:	ret
+  1d:	mov    0x20(%rdi),%eax
+  20:	lea    0x0(%rip),%rdx        # 27 <get_stride+0x27>
+  27:	shr    $0x6,%ax
+  2b:	and    $0x3f,%eax
+  2e:	movzwl (%rdx,%rax,2),%eax
+  32:	shl    $0x4,%eax
+  35:	cltq
+  37:	ret
+
+Disassembly of section .text.enframe:
+
+0000000000000000 <enframe>:
+   0:	mov    %rdx,%r9
+   3:	call   8 <enframe+0x8>
+   8:	mov    %rax,%r10
+   b:	sub    %r9,%rax
+   e:	mov    0x10(%rdi),%r11
+  12:	movzbl %cl,%ecx
+  15:	lea    -0x4(%rax),%r8
+  19:	movslq %esi,%rax
+  1c:	imul   %r10,%rax
+  20:	mov    %r8,%rdx
+  23:	shr    $0x4,%rdx
+  27:	lea    0x10(%r11,%rax,1),%rax
+  2c:	cmpb   $0x0,-0x3(%rax)
+  30:	lea    -0x4(%rax,%r10,1),%r10
+  35:	je     40 <enframe+0x40>
+  37:	movzwl -0x2(%rax),%ecx
+  3b:	inc    %ecx
+  3d:	movzbl %cl,%ecx
+  40:	cmpb   $0x0,-0x4(%rax)
+  44:	je     47 <enframe+0x47>
+  46:	hlt
+  47:	movslq %ecx,%r11
+  4a:	cmp    %rdx,%r11
+  4d:	jbe    87 <enframe+0x87>
+  4f:	shr    $0x5,%r8
+  53:	or     %rdx,%r8
+  56:	mov    %r8,%r11
+  59:	shr    $0x2,%r11
+  5d:	or     %r8,%r11
+  60:	mov    %r11,%r8
+  63:	shr    $0x4,%r8
+  67:	or     %r11,%r8
+  6a:	and    %r8d,%ecx
+  6d:	mov    %ecx,%r8d
+  70:	cmp    %rdx,%r8
+  73:	jbe    7e <enframe+0x7e>
+  75:	mov    %edx,%r8d
+  78:	not    %r8d
+  7b:	add    %r8d,%ecx
+  7e:	movslq %ecx,%r8
+  81:	cmp    %rdx,%r8
+  84:	jbe    87 <enframe+0x87>
+  86:	hlt
+  87:	test   %ecx,%ecx
+  89:	je     a0 <enframe+0xa0>
+  8b:	mov    %cx,-0x2(%rax)
+  8f:	shl    $0x4,%ecx
+  92:	movslq %ecx,%rcx
+  95:	movb   $0xe0,-0x3(%rax)
+  99:	add    %rcx,%rax
+  9c:	movb   $0x0,-0x4(%rax)
+  a0:	mov    %rax,%rdx
+  a3:	sub    0x10(%rdi),%rdx
+  a7:	mov    %sil,-0x3(%rax)
+  ab:	sub    $0x10,%rdx
+  af:	shr    $0x4,%rdx
+  b3:	mov    %dx,-0x2(%rax)
+  b7:	mov    %r10,%rdx
+  ba:	sub    %rax,%rdx
+  bd:	sub    %r9d,%edx
+  c0:	je     e1 <enframe+0xe1>
+  c2:	mov    %edx,%ecx
+  c4:	neg    %ecx
+  c6:	movslq %ecx,%rcx
+  c9:	movb   $0x0,(%r10,%rcx,1)
+  ce:	cmp    $0x4,%edx
+  d1:	jle    e1 <enframe+0xe1>
+  d3:	movb   $0x0,-0x5(%r10)
+  d8:	mov    %edx,-0x4(%r10)
+  dc:	mov    $0x5,%edx
+  e1:	mov    -0x3(%rax),%cl
+  e4:	shl    $0x5,%edx
+  e7:	and    $0x1f,%ecx
+  ea:	add    %ecx,%edx
+  ec:	mov    %dl,-0x3(%rax)
+  ef:	ret
+
+Disassembly of section .text.rdlock:
+
+0000000000000000 <rdlock>:
+   0:	mov    0x0(%rip),%al        # 6 <rdlock+0x6>
+   6:	test   %al,%al
+   8:	je     16 <rdlock+0x16>
+   a:	lea    0x0(%rip),%rdi        # 11 <rdlock+0x11>
+  11:	jmp    16 <rdlock+0x16>
+  16:	ret
+
+Disassembly of section .text.step_seq:
+
+0000000000000000 <step_seq>:
+   0:	mov    0x0(%rip),%al        # 6 <step_seq+0x6>
+   6:	cmp    $0xff,%al
+   8:	jne    2c <step_seq+0x2c>
+   a:	lea    0x0(%rip),%rax        # 11 <step_seq+0x11>
+  11:	lea    0x20(%rax),%rdx
+  15:	movb   $0x0,0x350(%rax)
+  1c:	inc    %rax
+  1f:	cmp    %rdx,%rax
+  22:	jne    15 <step_seq+0x15>
+  24:	movb   $0x1,0x0(%rip)        # 2b <step_seq+0x2b>
+  2b:	ret
+  2c:	inc    %eax
+  2e:	mov    %al,0x0(%rip)        # 34 <step_seq+0x34>
+  34:	ret
+
+Disassembly of section .text.size_to_class:
+
+0000000000000000 <size_to_class>:
+   0:	add    $0x3,%rdi
+   4:	mov    %rdi,%rax
+   7:	shr    $0x4,%rax
+   b:	cmp    $0x9f,%rdi
+  12:	jbe    87 <size_to_class+0x87>
+  14:	lea    0x1(%rax),%rsi
+  18:	mov    %esi,%eax
+  1a:	mov    %esi,%edx
+  1c:	shr    $1,%eax
+  1e:	shr    $0x2,%edx
+  21:	or     %eax,%edx
+  23:	mov    %edx,%eax
+  25:	shr    $0x2,%eax
+  28:	or     %eax,%edx
+  2a:	mov    %edx,%eax
+  2c:	shr    $0x4,%eax
+  2f:	or     %eax,%edx
+  31:	mov    %edx,%eax
+  33:	shr    $0x8,%eax
+  36:	or     %eax,%edx
+  38:	mov    %edx,%eax
+  3a:	shr    $0x10,%eax
+  3d:	or     %eax,%edx
+  3f:	lea    0x0(%rip),%rax        # 46 <size_to_class+0x46>
+  46:	lea    0x1(%rdx),%ecx
+  49:	not    %edx
+  4b:	and    %ecx,%edx
+  4d:	imul   $0x76be629,%edx,%edx
+  53:	shr    $0x1b,%edx
+  56:	movsbl (%rax,%rdx,1),%eax
+  5a:	lea    0x0(%rip),%rdx        # 61 <size_to_class+0x61>
+  61:	lea    -0x4(,%rax,4),%eax
+  68:	lea    0x1(%rax),%ecx
+  6b:	movslq %ecx,%rcx
+  6e:	movzwl (%rdx,%rcx,2),%ecx
+  72:	cmp    %rsi,%rcx
+  75:	jae    7a <size_to_class+0x7a>
+  77:	add    $0x2,%eax
+  7a:	movslq %eax,%rcx
+  7d:	movzwl (%rdx,%rcx,2),%edx
+  81:	cmp    %rsi,%rdx
+  84:	adc    $0x0,%eax
+  87:	ret
+
+Disassembly of section .text.__malloc_atfork:
+
+0000000000000000 <__malloc_atfork>:
+   0:	test   %edi,%edi
+   2:	jns    b <__malloc_atfork+0xb>
+   4:	xor    %eax,%eax
+   6:	jmp    b <__malloc_atfork+0xb>
+   b:	je     18 <__malloc_atfork+0x18>
+   d:	movl   $0x0,0x0(%rip)        # 17 <__malloc_atfork+0x17>
+  17:	ret
+  18:	lea    0x0(%rip),%rdi        # 1f <__malloc_atfork+0x1f>
+  1f:	jmp    24 <__malloc_atfork+0x24>
+
+Disassembly of section .text.__malloc_alloc_meta:
+
+0000000000000000 <__malloc_alloc_meta>:
+   0:	push   %r12
+   2:	push   %rbp
+   3:	push   %rbx
+   4:	sub    $0x10,%rsp
+   8:	cmpl   $0x0,0x0(%rip)        # f <__malloc_alloc_meta+0xf>
+   f:	jne    6c <__malloc_alloc_meta+0x6c>
+  11:	lea    0x8(%rsp),%rbp
+  16:	xor    %ebx,%ebx
+  18:	imul   $0x41c64e6d,%rbp,%rax
+  1f:	mov    %rax,0x8(%rsp)
+  24:	mov    0x0(%rip),%rdx        # 2b <__malloc_alloc_meta+0x2b>
+  2b:	mov    (%rdx,%rbx,1),%rax
+  2f:	test   %rax,%rax
+  32:	je     56 <__malloc_alloc_meta+0x56>
+  34:	cmp    $0x19,%rax
+  38:	jne    50 <__malloc_alloc_meta+0x50>
+  3a:	mov    0x8(%rdx,%rbx,1),%rsi
+  3f:	mov    %rbp,%rdi
+  42:	mov    $0x8,%edx
+  47:	add    $0x8,%rsi
+  4b:	call   50 <__malloc_alloc_meta+0x50>
+  50:	add    $0x10,%rbx
+  54:	jmp    24 <__malloc_alloc_meta+0x24>
+  56:	movl   $0x1,0x0(%rip)        # 60 <__malloc_alloc_meta+0x60>
+  60:	mov    0x8(%rsp),%rax
+  65:	mov    %rax,0x0(%rip)        # 6c <__malloc_alloc_meta+0x6c>
+  6c:	mov    0x0(%rip),%r12        # 73 <__malloc_alloc_meta+0x73>
+  73:	test   %r12,%r12
+  76:	je     b6 <__malloc_alloc_meta+0xb6>
+  78:	mov    0x8(%r12),%rax
+  7d:	cmp    %rax,%r12
+  80:	je     a6 <__malloc_alloc_meta+0xa6>
+  82:	mov    (%r12),%rdx
+  86:	mov    %rax,0x8(%rdx)
+  8a:	mov    %rdx,(%rax)
+  8d:	cmp    0x0(%rip),%r12        # 94 <__malloc_alloc_meta+0x94>
+  94:	jne    16a <__malloc_alloc_meta+0x16a>
+  9a:	mov    %rax,0x0(%rip)        # a1 <__malloc_alloc_meta+0xa1>
+  a1:	jmp    16a <__malloc_alloc_meta+0x16a>
+  a6:	movq   $0x0,0x0(%rip)        # b1 <__malloc_alloc_meta+0xb1>
+  b1:	jmp    16a <__malloc_alloc_meta+0x16a>
+  b6:	cmpq   $0x0,0x0(%rip)        # be <__malloc_alloc_meta+0xbe>
+  be:	jne    150 <__malloc_alloc_meta+0x150>
+  c4:	cmpq   $0x0,0x0(%rip)        # cc <__malloc_alloc_meta+0xcc>
+  cc:	mov    $0x1,%ebp
+  d1:	je     180 <__malloc_alloc_meta+0x180>
+  d7:	cmpq   $0x0,0x0(%rip)        # df <__malloc_alloc_meta+0xdf>
+  df:	je     23b <__malloc_alloc_meta+0x23b>
+  e5:	mov    0x0(%rip),%rbx        # ec <__malloc_alloc_meta+0xec>
+  ec:	test   $0xfff,%ebx
+  f2:	je     28f <__malloc_alloc_meta+0x28f>
+  f8:	lea    0x1000(%rbx),%rax
+  ff:	decq   0x0(%rip)        # 106 <__malloc_alloc_meta+0x106>
+ 106:	mov    %rax,0x0(%rip)        # 10d <__malloc_alloc_meta+0x10d>
+ 10d:	mov    0x0(%rip),%rax        # 114 <__malloc_alloc_meta+0x114>
+ 114:	test   %rax,%rax
+ 117:	je     2c1 <__malloc_alloc_meta+0x2c1>
+ 11d:	mov    %rbx,0x8(%rax)
+ 121:	mov    0x0(%rip),%rax        # 128 <__malloc_alloc_meta+0x128>
+ 128:	mov    %rbx,0x0(%rip)        # 12f <__malloc_alloc_meta+0x12f>
+ 12f:	add    $0x18,%rbx
+ 133:	movl   $0x65,-0x8(%rbx)
+ 13a:	mov    %rax,-0x18(%rbx)
+ 13e:	movq   $0x65,0x0(%rip)        # 149 <__malloc_alloc_meta+0x149>
+ 149:	mov    %rbx,0x0(%rip)        # 150 <__malloc_alloc_meta+0x150>
+ 150:	mov    0x0(%rip),%r12        # 157 <__malloc_alloc_meta+0x157>
+ 157:	decq   0x0(%rip)        # 15e <__malloc_alloc_meta+0x15e>
+ 15e:	lea    0x28(%r12),%rax
+ 163:	mov    %rax,0x0(%rip)        # 16a <__malloc_alloc_meta+0x16a>
+ 16a:	movq   $0x0,0x8(%r12)
+ 173:	movq   $0x0,(%r12)
+ 17b:	jmp    2cd <__malloc_alloc_meta+0x2cd>
+ 180:	mov    0x0(%rip),%rbx        # 187 <__malloc_alloc_meta+0x187>
+ 187:	cmp    $0xffffffffffffffff,%rbx
+ 18b:	je     d7 <__malloc_alloc_meta+0xd7>
+ 191:	test   %rbx,%rbx
+ 194:	je     1a1 <__malloc_alloc_meta+0x1a1>
+ 196:	add    $0x1000,%rbx
+ 19d:	xor    %edx,%edx
+ 19f:	jmp    1cd <__malloc_alloc_meta+0x1cd>
+ 1a1:	mov    $0xc,%eax
+ 1a6:	mov    %r12,%rdi
+ 1a9:	syscall
+ 1ab:	mov    %rax,%rbx
+ 1ae:	mov    $0x1,%edx
+ 1b3:	neg    %rbx
+ 1b6:	and    $0xfff,%ebx
+ 1bc:	add    %rax,%rbx
+ 1bf:	mov    %rbx,0x0(%rip)        # 1c6 <__malloc_alloc_meta+0x1c6>
+ 1c6:	add    $0x2000,%rbx
+ 1cd:	mov    $0xc,%eax
+ 1d2:	mov    %rbx,%rdi
+ 1d5:	syscall
+ 1d7:	cmp    %rax,%rbx
+ 1da:	je     1f1 <__malloc_alloc_meta+0x1f1>
+ 1dc:	movq   $0xffffffffffffffff,0x0(%rip)        # 1e7 <__malloc_alloc_meta+0x1e7>
+ 1e7:	mov    $0x1,%ebp
+ 1ec:	jmp    d7 <__malloc_alloc_meta+0xd7>
+ 1f1:	test   %edx,%edx
+ 1f3:	je     214 <__malloc_alloc_meta+0x214>
+ 1f5:	mov    0x0(%rip),%rdi        # 1fc <__malloc_alloc_meta+0x1fc>
+ 1fc:	xor    %r9d,%r9d
+ 1ff:	or     $0xffffffff,%r8d
+ 203:	xor    %edx,%edx
+ 205:	mov    $0x32,%ecx
+ 20a:	mov    $0x1000,%esi
+ 20f:	call   214 <__malloc_alloc_meta+0x214>
+ 214:	mov    %rbx,0x0(%rip)        # 21b <__malloc_alloc_meta+0x21b>
+ 21b:	sub    $0x1000,%rbx
+ 222:	xor    %ebp,%ebp
+ 224:	mov    %rbx,0x0(%rip)        # 22b <__malloc_alloc_meta+0x22b>
+ 22b:	movq   $0x1,0x0(%rip)        # 236 <__malloc_alloc_meta+0x236>
+ 236:	jmp    d7 <__malloc_alloc_meta+0xd7>
+ 23b:	mov    0x0(%rip),%rcx        # 242 <__malloc_alloc_meta+0x242>
+ 242:	mov    $0x2,%ebx
+ 247:	xor    %edx,%edx
+ 249:	xor    %edi,%edi
+ 24b:	xor    %r9d,%r9d
+ 24e:	or     $0xffffffff,%r8d
+ 252:	shl    %cl,%rbx
+ 255:	mov    $0x22,%ecx
+ 25a:	mov    %rbx,%rsi
+ 25d:	shl    $0xc,%rsi
+ 261:	call   266 <__malloc_alloc_meta+0x266>
+ 266:	cmp    $0xffffffffffffffff,%rax
+ 26a:	je     2cd <__malloc_alloc_meta+0x2cd>
+ 26c:	add    $0x1000,%rax
+ 272:	dec    %rbx
+ 275:	incq   0x0(%rip)        # 27c <__malloc_alloc_meta+0x27c>
+ 27c:	mov    %rax,0x0(%rip)        # 283 <__malloc_alloc_meta+0x283>
+ 283:	mov    %rbx,0x0(%rip)        # 28a <__malloc_alloc_meta+0x28a>
+ 28a:	jmp    e5 <__malloc_alloc_meta+0xe5>
+ 28f:	test   %ebp,%ebp
+ 291:	je     f8 <__malloc_alloc_meta+0xf8>
+ 297:	mov    $0x3,%edx
+ 29c:	mov    $0x1000,%esi
+ 2a1:	mov    %rbx,%rdi
+ 2a4:	call   2a9 <__malloc_alloc_meta+0x2a9>
+ 2a9:	test   %eax,%eax
+ 2ab:	je     f8 <__malloc_alloc_meta+0xf8>
+ 2b1:	call   2b6 <__malloc_alloc_meta+0x2b6>
+ 2b6:	cmpl   $0x26,(%rax)
+ 2b9:	je     f8 <__malloc_alloc_meta+0xf8>
+ 2bf:	jmp    2cd <__malloc_alloc_meta+0x2cd>
+ 2c1:	mov    %rbx,0x0(%rip)        # 2c8 <__malloc_alloc_meta+0x2c8>
+ 2c8:	jmp    121 <__malloc_alloc_meta+0x121>
+ 2cd:	add    $0x10,%rsp
+ 2d1:	mov    %r12,%rax
+ 2d4:	pop    %rbx
+ 2d5:	pop    %rbp
+ 2d6:	pop    %r12
+ 2d8:	ret
+
+Disassembly of section .text.alloc_slot:
+
+0000000000000000 <alloc_slot>:
+   0:	push   %r15
+   2:	movslq %edi,%r15
+   5:	push   %r14
+   7:	lea    0xa(%r15),%rcx
+   b:	push   %r13
+   d:	mov    %r15,%r13
+  10:	push   %r12
+  12:	lea    0x0(%rip),%r12        # 19 <alloc_slot+0x19>
+  19:	push   %rbp
+  1a:	push   %rbx
+  1b:	sub    $0x18,%rsp
+  1f:	mov    (%r12,%rcx,8),%rdx
+  23:	mov    %rsi,0x8(%rsp)
+  28:	test   %rdx,%rdx
+  2b:	je     1ce <alloc_slot+0x1ce>
+  31:	mov    0x18(%rdx),%eax
+  34:	test   %eax,%eax
+  36:	jne    1a0 <alloc_slot+0x1a0>
+  3c:	mov    0x1c(%rdx),%eax
+  3f:	mov    0x8(%rdx),%rsi
+  43:	test   %eax,%eax
+  45:	jne    86 <alloc_slot+0x86>
+  47:	cmp    %rsi,%rdx
+  4a:	je     60 <alloc_slot+0x60>
+  4c:	mov    (%rdx),%rdi
+  4f:	mov    %rsi,0x8(%rdi)
+  53:	mov    0x8(%rdx),%rax
+  57:	mov    %rdi,(%rax)
+  5a:	mov    %rax,(%r12,%rcx,8)
+  5e:	jmp    68 <alloc_slot+0x68>
+  60:	movq   $0x0,(%r12,%rcx,8)
+  68:	mov    0x50(%r12,%r15,8),%rsi
+  6d:	movq   $0x0,0x8(%rdx)
+  75:	movq   $0x0,(%rdx)
+  7c:	test   %rsi,%rsi
+  7f:	jne    8a <alloc_slot+0x8a>
+  81:	jmp    1ce <alloc_slot+0x1ce>
+  86:	mov    %rsi,(%r12,%rcx,8)
+  8a:	mov    0x20(%rsi),%cl
+  8d:	mov    $0x2,%eax
+  92:	mov    0x1c(%rsi),%r8d
+  96:	shl    %cl,%eax
+  98:	dec    %eax
+  9a:	cmp    %eax,%r8d
+  9d:	jne    b1 <alloc_slot+0xb1>
+  9f:	and    $0x20,%cl
+  a2:	je     b1 <alloc_slot+0xb1>
+  a4:	mov    0x8(%rsi),%rsi
+  a8:	mov    %rsi,0x50(%r12,%r15,8)
+  ad:	mov    0x1c(%rsi),%r8d
+  b1:	mov    0x10(%rsi),%rdi
+  b5:	mov    $0x2,%edx
+  ba:	mov    0x8(%rdi),%cl
+  bd:	shl    %cl,%edx
+  bf:	mov    %ecx,%eax
+  c1:	lea    -0x1(%rdx),%ecx
+  c4:	and    $0x1f,%eax
+  c7:	mov    %rsi,%rdx
+  ca:	test   %r8d,%ecx
+  cd:	jne    138 <alloc_slot+0x138>
+  cf:	mov    0x8(%rsi),%rdx
+  d3:	cmp    %rdx,%rsi
+  d6:	je     df <alloc_slot+0xdf>
+  d8:	mov    %rdx,0x50(%r12,%r15,8)
+  dd:	jmp    138 <alloc_slot+0x138>
+  df:	lea    0x2(%rax),%ecx
+  e2:	mov    0x20(%rdx),%eax
+  e5:	lea    0x0(%rip),%rsi        # ec <alloc_slot+0xec>
+  ec:	shr    $0x6,%ax
+  f0:	and    $0x3f,%eax
+  f3:	movzwl (%rsi,%rax,2),%esi
+  f7:	mov    %ecx,%eax
+  f9:	shl    $0x4,%esi
+  fc:	imul   %esi,%eax
+  ff:	add    $0x10,%eax
+ 102:	lea    (%rsi,%rax,1),%r9d
+ 106:	lea    -0x1(%r9),%r8d
+ 10a:	xor    %r8d,%eax
+ 10d:	cmp    $0xfff,%eax
+ 112:	jg     11b <alloc_slot+0x11b>
+ 114:	inc    %ecx
+ 116:	mov    %r9d,%eax
+ 119:	jmp    102 <alloc_slot+0x102>
+ 11b:	mov    0x20(%rdx),%al
+ 11e:	and    $0x1f,%eax
+ 121:	inc    %eax
+ 123:	cmp    %ecx,%eax
+ 125:	cmovg  %ecx,%eax
+ 128:	mov    0x8(%rdi),%cl
+ 12b:	dec    %eax
+ 12d:	and    $0xffffffe0,%ecx
+ 130:	and    $0x1f,%eax
+ 133:	or     %ecx,%eax
+ 135:	mov    %al,0x8(%rdi)
+ 138:	mov    0x18(%rdx),%eax
+ 13b:	test   %eax,%eax
+ 13d:	je     140 <alloc_slot+0x140>
+ 13f:	hlt
+ 140:	mov    0x10(%rdx),%rax
+ 144:	mov    0x8(%rax),%cl
+ 147:	mov    $0x2,%eax
+ 14c:	shl    %cl,%eax
+ 14e:	lea    -0x1(%rax),%ecx
+ 151:	neg    %eax
+ 153:	mov    %eax,%esi
+ 155:	mov    0x1c(%rdx),%edi
+ 158:	mov    %esi,%r8d
+ 15b:	and    %edi,%r8d
+ 15e:	mov    %edi,%eax
+ 160:	lock cmpxchg %r8d,0x1c(%rdx)
+ 166:	cmp    %eax,%edi
+ 168:	jne    155 <alloc_slot+0x155>
+ 16a:	mov    %ecx,%eax
+ 16c:	and    %edi,%eax
+ 16e:	mov    %eax,0x18(%rdx)
+ 171:	jne    174 <alloc_slot+0x174>
+ 173:	hlt
+ 174:	mov    0x20(%rdx),%ecx
+ 177:	shr    $0x6,%cx
+ 17b:	and    $0x3f,%ecx
+ 17e:	sub    $0x7,%ecx
+ 181:	cmp    $0x1f,%ecx
+ 184:	ja     1a0 <alloc_slot+0x1a0>
+ 186:	movslq %ecx,%rcx
+ 189:	mov    0x370(%r12,%rcx,1),%sil
+ 191:	test   %sil,%sil
+ 194:	je     1a0 <alloc_slot+0x1a0>
+ 196:	dec    %esi
+ 198:	mov    %sil,0x370(%r12,%rcx,1)
+ 1a0:	mov    %eax,%ecx
+ 1a2:	neg    %ecx
+ 1a4:	and    %eax,%ecx
+ 1a6:	sub    %ecx,%eax
+ 1a8:	mov    %eax,0x18(%rdx)
+ 1ab:	test   %ecx,%ecx
+ 1ad:	je     1ce <alloc_slot+0x1ce>
+ 1af:	mov    %ecx,%eax
+ 1b1:	lea    0x0(%rip),%rdx        # 1b8 <alloc_slot+0x1b8>
+ 1b8:	neg    %eax
+ 1ba:	and    %ecx,%eax
+ 1bc:	imul   $0x76be629,%eax,%eax
+ 1c2:	shr    $0x1b,%eax
+ 1c5:	movsbl (%rdx,%rax,1),%eax
+ 1c9:	jmp    570 <alloc_slot+0x570>
+ 1ce:	lea    0x0(%rip),%rbx        # 1d5 <alloc_slot+0x1d5>
+ 1d5:	movzwl (%rbx,%r15,2),%r14d
+ 1da:	call   1df <alloc_slot+0x1df>
+ 1df:	shl    $0x4,%r14d
+ 1e3:	mov    %rax,%rbp
+ 1e6:	or     $0xffffffff,%eax
+ 1e9:	movslq %r14d,%r14
+ 1ec:	test   %rbp,%rbp
+ 1ef:	je     570 <alloc_slot+0x570>
+ 1f5:	mov    0x1d0(%r12,%r15,8),%rcx
+ 1fd:	cmp    $0x8,%r13d
+ 201:	jg     243 <alloc_slot+0x243>
+ 203:	lea    0x0(%rip),%r8        # 20a <alloc_slot+0x20a>
+ 20a:	lea    (%r15,%r15,2),%rdi
+ 20e:	xor    %eax,%eax
+ 210:	add    %r8,%rdi
+ 213:	movzbl (%rdi),%esi
+ 216:	shl    $0x2,%esi
+ 219:	movslq %esi,%rsi
+ 21c:	cmp    %rcx,%rsi
+ 21f:	jbe    234 <alloc_slot+0x234>
+ 221:	movzbl 0x1(%rdi),%eax
+ 225:	shl    $0x2,%eax
+ 228:	cltq
+ 22a:	cmp    %rax,%rcx
+ 22d:	sbb    %eax,%eax
+ 22f:	not    %eax
+ 231:	add    $0x2,%eax
+ 234:	lea    (%r15,%r15,2),%rsi
+ 238:	cltq
+ 23a:	add    %r8,%rsi
+ 23d:	movzbl (%rsi,%rax,1),%ebx
+ 241:	jmp    27e <alloc_slot+0x27e>
+ 243:	mov    %r13d,%eax
+ 246:	lea    0x0(%rip),%rsi        # 24d <alloc_slot+0x24d>
+ 24d:	and    $0x3,%eax
+ 250:	movzbl (%rsi,%rax,1),%ebx
+ 254:	test   $0x1,%bl
+ 257:	jne    26b <alloc_slot+0x26b>
+ 259:	lea    0x0(,%rbx,4),%eax
+ 260:	cltq
+ 262:	cmp    %rax,%rcx
+ 265:	jae    26b <alloc_slot+0x26b>
+ 267:	sar    $1,%ebx
+ 269:	jmp    254 <alloc_slot+0x254>
+ 26b:	movslq %ebx,%rax
+ 26e:	imul   %r14,%rax
+ 272:	cmp    $0xfffff,%rax
+ 278:	jbe    27e <alloc_slot+0x27e>
+ 27a:	sar    $1,%ebx
+ 27c:	jmp    26b <alloc_slot+0x26b>
+ 27e:	cmp    $0x1,%ebx
+ 281:	jne    295 <alloc_slot+0x295>
+ 283:	lea    0x10(%r14),%rax
+ 287:	cmp    $0x800,%rax
+ 28d:	mov    $0x2,%eax
+ 292:	cmovbe %eax,%ebx
+ 295:	movslq %ebx,%r8
+ 298:	imul   %r14,%r8
+ 29c:	lea    0x10(%r8),%rax
+ 2a0:	cmp    $0x800,%rax
+ 2a6:	jbe    45c <alloc_slot+0x45c>
+ 2ac:	lea    -0x7(%r13),%eax
+ 2b0:	xor    %esi,%esi
+ 2b2:	cmp    $0x1f,%eax
+ 2b5:	ja     2fd <alloc_slot+0x2fd>
+ 2b7:	cltq
+ 2b9:	xor    %esi,%esi
+ 2bb:	mov    0x370(%r12,%rax,1),%dil
+ 2c3:	movzbl 0x350(%r12,%rax,1),%r9d
+ 2cc:	cmp    $0x63,%dil
+ 2d0:	seta   %sil
+ 2d4:	test   %r9d,%r9d
+ 2d7:	je     2fd <alloc_slot+0x2fd>
+ 2d9:	movzbl 0x0(%rip),%edx        # 2e0 <alloc_slot+0x2e0>
+ 2e0:	sub    %r9d,%edx
+ 2e3:	cmp    $0x9,%edx
+ 2e6:	jg     2fd <alloc_slot+0x2fd>
+ 2e8:	lea    0x1(%rdi),%edx
+ 2eb:	cmp    $0x63,%dil
+ 2ef:	mov    $0x96,%dil
+ 2f2:	cmovae %edi,%edx
+ 2f5:	mov    %dl,0x370(%r12,%rax,1)
+ 2fd:	call   302 <alloc_slot+0x302>
+ 302:	test   $0x1,%r13b
+ 306:	jne    31c <alloc_slot+0x31c>
+ 308:	cmp    $0x1f,%r13d
+ 30c:	jg     31c <alloc_slot+0x31c>
+ 30e:	lea    0x1(%r13),%eax
+ 312:	cltq
+ 314:	add    0x1d0(%r12,%rax,8),%rcx
+ 31c:	lea    0x0(,%rbx,4),%eax
+ 323:	cltq
+ 325:	cmp    %rcx,%rax
+ 328:	jbe    37d <alloc_slot+0x37d>
+ 32a:	test   %esi,%esi
+ 32c:	jne    37d <alloc_slot+0x37d>
+ 32e:	mov    %r13d,%eax
+ 331:	and    $0x3,%eax
+ 334:	cmp    $0x1,%eax
+ 337:	jne    347 <alloc_slot+0x347>
+ 339:	cmp    $0x8001,%r8
+ 340:	mov    $0x2,%eax
+ 345:	jmp    373 <alloc_slot+0x373>
+ 347:	cmp    $0x2,%eax
+ 34a:	jne    35a <alloc_slot+0x35a>
+ 34c:	cmp    $0x4001,%r8
+ 353:	mov    $0x3,%eax
+ 358:	jmp    373 <alloc_slot+0x373>
+ 35a:	test   %eax,%eax
+ 35c:	jne    37d <alloc_slot+0x37d>
+ 35e:	cmp    $0x8000,%r8
+ 365:	ja     378 <alloc_slot+0x378>
+ 367:	cmp    $0x2001,%r8
+ 36e:	mov    $0x5,%eax
+ 373:	cmovae %eax,%ebx
+ 376:	jmp    37d <alloc_slot+0x37d>
+ 378:	mov    $0x3,%ebx
+ 37d:	movslq %ebx,%rdx
+ 380:	mov    $0xfffffffffffffff0,%rax
+ 387:	imul   %r14,%rdx
+ 38b:	sub    %rdx,%rax
+ 38e:	and    $0xfff,%eax
+ 393:	lea    0x10(%rdx,%rax,1),%r11
+ 398:	test   %esi,%esi
+ 39a:	jne    3ec <alloc_slot+0x3ec>
+ 39c:	cmp    $0x7,%ebx
+ 39f:	jg     3ec <alloc_slot+0x3ec>
+ 3a1:	mov    0x8(%rsp),%rdi
+ 3a6:	mov    $0xffffffffffffffec,%rax
+ 3ad:	lea    0x10(%r14),%rdx
+ 3b1:	sub    0x8(%rsp),%rax
+ 3b6:	and    $0xfff,%eax
+ 3bb:	lea    0x14(%rdi,%rax,1),%rax
+ 3c0:	cmp    %rdx,%rax
+ 3c3:	jb     3e4 <alloc_slot+0x3e4>
+ 3c5:	cmp    $0x3fff,%rax
+ 3cb:	jbe    3ec <alloc_slot+0x3ec>
+ 3cd:	lea    (%rbx,%rbx,1),%edx
+ 3d0:	movslq %edx,%rdx
+ 3d3:	cmp    %rdx,%rcx
+ 3d6:	cmovb  %rax,%r11
+ 3da:	mov    $0x1,%eax
+ 3df:	cmovb  %eax,%ebx
+ 3e2:	jmp    3ec <alloc_slot+0x3ec>
+ 3e4:	mov    %rax,%r11
+ 3e7:	mov    $0x1,%ebx
+ 3ec:	mov    %r11,%rsi
+ 3ef:	xor    %r9d,%r9d
+ 3f2:	or     $0xffffffff,%r8d
+ 3f6:	xor    %edi,%edi
+ 3f8:	mov    $0x22,%ecx
+ 3fd:	mov    $0x3,%edx
+ 402:	mov    %r11,0x8(%rsp)
+ 407:	call   40c <alloc_slot+0x40c>
+ 40c:	mov    0x8(%rsp),%r11
+ 411:	cmp    $0xffffffffffffffff,%rax
+ 415:	mov    %rax,%rsi
+ 418:	je     487 <alloc_slot+0x487>
+ 41a:	mov    0x20(%rbp),%rdx
+ 41e:	mov    %r11,%rax
+ 421:	and    $0xfffffffffffff000,%rax
+ 427:	and    $0xfff,%edx
+ 42d:	or     %rdx,%rax
+ 430:	xor    %edx,%edx
+ 432:	mov    %rax,0x20(%rbp)
+ 436:	mov    $0xff0,%eax
+ 43b:	div    %r14
+ 43e:	incl   0x0(%rip)        # 444 <alloc_slot+0x444>
+ 444:	dec    %eax
+ 446:	cmp    %ebx,%eax
+ 448:	jl     44d <alloc_slot+0x44d>
+ 44a:	lea    -0x1(%rbx),%eax
+ 44d:	test   %eax,%eax
+ 44f:	mov    $0x0,%edx
+ 454:	cmovs  %edx,%eax
+ 457:	jmp    4f7 <alloc_slot+0x4f7>
+ 45c:	add    $0xc,%r8
+ 460:	mov    %r8,%rdi
+ 463:	call   468 <alloc_slot+0x468>
+ 468:	mov    %r8,%rsi
+ 46b:	mov    %eax,%edi
+ 46d:	mov    %eax,0x8(%rsp)
+ 471:	call   0 <alloc_slot>
+ 476:	mov    0x8(%rsp),%edx
+ 47a:	lea    0x0(%rip),%r9        # 481 <alloc_slot+0x481>
+ 481:	test   %eax,%eax
+ 483:	mov    %eax,%esi
+ 485:	jns    4aa <alloc_slot+0x4aa>
+ 487:	xor    %eax,%eax
+ 489:	mov    $0xa,%ecx
+ 48e:	mov    %rbp,%rdi
+ 491:	mov    %rbp,%rsi
+ 494:	rep stos %eax,(%rdi)
+ 496:	lea    0x0(%rip),%rdi        # 49d <alloc_slot+0x49d>
+ 49d:	call   4a2 <alloc_slot+0x4a2>
+ 4a2:	or     $0xffffffff,%eax
+ 4a5:	jmp    570 <alloc_slot+0x570>
+ 4aa:	movslq %edx,%rax
+ 4ad:	mov    0x0(%rip),%ecx        # 4b3 <alloc_slot+0x4b3>
+ 4b3:	movzwl (%r9,%rax,2),%edx
+ 4b8:	mov    0x50(%r12,%rax,8),%rdi
+ 4bd:	shl    $0x4,%edx
+ 4c0:	sub    $0x4,%edx
+ 4c3:	movslq %edx,%rdx
+ 4c6:	call   4cb <alloc_slot+0x4cb>
+ 4cb:	andq   $0xfff,0x20(%rbp)
+ 4d3:	mov    %rax,%rsi
+ 4d6:	mov    -0x3(%rax),%al
+ 4d9:	lea    0xc(%rsi),%rdx
+ 4dd:	and    $0x1f,%eax
+ 4e0:	or     $0xffffffc0,%eax
+ 4e3:	mov    %al,-0x3(%rsi)
+ 4e6:	xor    %eax,%eax
+ 4e8:	inc    %eax
+ 4ea:	movb   $0x0,(%rdx)
+ 4ed:	add    %r14,%rdx
+ 4f0:	cmp    %eax,%ebx
+ 4f2:	jge    4e8 <alloc_slot+0x4e8>
+ 4f4:	lea    -0x1(%rbx),%eax
+ 4f7:	movslq %ebx,%rdx
+ 4fa:	add    %rdx,0x1d0(%r12,%r15,8)
+ 502:	mov    $0x2,%edx
+ 507:	mov    %eax,%ecx
+ 509:	mov    %edx,%edi
+ 50b:	and    $0x1f,%eax
+ 50e:	and    $0x3f,%r13d
+ 512:	mov    %rsi,0x10(%rbp)
+ 516:	shl    %cl,%edi
+ 518:	shl    $0x6,%r13d
+ 51c:	mov    %edi,%ecx
+ 51e:	dec    %ecx
+ 520:	mov    %ecx,0x18(%rbp)
+ 523:	lea    -0x1(%rbx),%ecx
+ 526:	mov    0x18(%rbp),%edi
+ 529:	dec    %ebx
+ 52b:	shl    %cl,%edx
+ 52d:	mov    0x8(%rsi),%cl
+ 530:	and    $0x1f,%ebx
+ 533:	not    %edi
+ 535:	or     $0x20,%ebx
+ 538:	and    $0xffffffe0,%ecx
+ 53b:	add    %edi,%edx
+ 53d:	mov    0x20(%rbp),%edi
+ 540:	or     %r13d,%ebx
+ 543:	or     %ecx,%eax
+ 545:	mov    %edx,0x1c(%rbp)
+ 548:	mov    %al,0x8(%rsi)
+ 54b:	mov    0x18(%rbp),%eax
+ 54e:	and    $0xf000,%di
+ 553:	or     %edi,%ebx
+ 555:	mov    %rbp,(%rsi)
+ 558:	lea    0x50(%r12,%r15,8),%rdi
+ 55d:	mov    %rbp,%rsi
+ 560:	dec    %eax
+ 562:	mov    %bx,0x20(%rbp)
+ 566:	mov    %eax,0x18(%rbp)
+ 569:	call   56e <alloc_slot+0x56e>
+ 56e:	xor    %eax,%eax
+ 570:	add    $0x18,%rsp
+ 574:	pop    %rbx
+ 575:	pop    %rbp
+ 576:	pop    %r12
+ 578:	pop    %r13
+ 57a:	pop    %r14
+ 57c:	pop    %r15
+ 57e:	ret
+
+Disassembly of section .text.__libc_malloc_impl:
+
+0000000000000000 <__libc_malloc_impl>:
+   0:	movabs $0x7fffffffffffeffe,%rax
+   a:	push   %r14
+   c:	push   %r13
+   e:	push   %r12
+  10:	push   %rbp
+  11:	push   %rbx
+  12:	cmp    %rax,%rdi
+  15:	ja     28 <__libc_malloc_impl+0x28>
+  17:	mov    %rdi,%r12
+  1a:	cmp    $0x1ffeb,%rdi
+  21:	ja     38 <__libc_malloc_impl+0x38>
+  23:	jmp    d5 <__libc_malloc_impl+0xd5>
+  28:	call   2d <__libc_malloc_impl+0x2d>
+  2d:	movl   $0xc,(%rax)
+  33:	jmp    1de <__libc_malloc_impl+0x1de>
+  38:	lea    0x14(%rdi),%r14
+  3c:	xor    %r9d,%r9d
+  3f:	or     $0xffffffff,%r8d
+  43:	mov    $0x22,%ecx
+  48:	mov    $0x3,%edx
+  4d:	mov    %r14,%rsi
+  50:	xor    %edi,%edi
+  52:	call   57 <__libc_malloc_impl+0x57>
+  57:	mov    %rax,%r13
+  5a:	cmp    $0xffffffffffffffff,%rax
+  5e:	je     1de <__libc_malloc_impl+0x1de>
+  64:	xor    %eax,%eax
+  66:	call   6b <__libc_malloc_impl+0x6b>
+  6b:	call   70 <__libc_malloc_impl+0x70>
+  70:	call   75 <__libc_malloc_impl+0x75>
+  75:	mov    %rax,%rbp
+  78:	test   %rax,%rax
+  7b:	jne    99 <__libc_malloc_impl+0x99>
+  7d:	lea    0x0(%rip),%rdi        # 84 <__libc_malloc_impl+0x84>
+  84:	call   89 <__libc_malloc_impl+0x89>
+  89:	mov    %r14,%rsi
+  8c:	mov    %r13,%rdi
+  8f:	call   94 <__libc_malloc_impl+0x94>
+  94:	jmp    1de <__libc_malloc_impl+0x1de>
+  99:	mov    %r13,0x10(%rax)
+  9d:	xor    %r14d,%r14d
+  a0:	mov    %rax,0x0(%r13)
+  a4:	lea    0x1013(%r12),%rax
+  ac:	and    $0xfffffffffffff000,%rax
+  b2:	movl   $0x0,0x1c(%rbp)
+  b9:	or     $0xfe0,%rax
+  bf:	incl   0x0(%rip)        # c5 <__libc_malloc_impl+0xc5>
+  c5:	mov    %rax,0x20(%rbp)
+  c9:	movl   $0x0,0x18(%rbp)
+  d0:	jmp    1b2 <__libc_malloc_impl+0x1b2>
+  d5:	call   da <__libc_malloc_impl+0xda>
+  da:	lea    0x0(%rip),%r13        # e1 <__libc_malloc_impl+0xe1>
+  e1:	mov    %eax,%ebx
+  e3:	xor    %eax,%eax
+  e5:	call   ea <__libc_malloc_impl+0xea>
+  ea:	movslq %ebx,%rax
+  ed:	mov    0x50(%r13,%rax,8),%rbp
+  f2:	test   %rbp,%rbp
+  f5:	jne    151 <__libc_malloc_impl+0x151>
+  f7:	cmp    $0x3,%ebx
+  fa:	jle    151 <__libc_malloc_impl+0x151>
+  fc:	cmp    $0x1f,%ebx
+  ff:	jg     15d <__libc_malloc_impl+0x15d>
+ 101:	cmp    $0x6,%ebx
+ 104:	je     15d <__libc_malloc_impl+0x15d>
+ 106:	test   $0x1,%bl
+ 109:	jne    15d <__libc_malloc_impl+0x15d>
+ 10b:	cmpq   $0x0,0x1d0(%r13,%rax,8)
+ 114:	jne    15d <__libc_malloc_impl+0x15d>
+ 116:	mov    %ebx,%ecx
+ 118:	or     $0x1,%ecx
+ 11b:	movslq %ecx,%rdx
+ 11e:	mov    0x1d0(%r13,%rdx,8),%rax
+ 126:	mov    0x50(%r13,%rdx,8),%rdx
+ 12b:	test   %rdx,%rdx
+ 12e:	je     13e <__libc_malloc_impl+0x13e>
+ 130:	mov    0x18(%rdx),%esi
+ 133:	test   %esi,%esi
+ 135:	jne    142 <__libc_malloc_impl+0x142>
+ 137:	mov    0x1c(%rdx),%edx
+ 13a:	test   %edx,%edx
+ 13c:	jne    142 <__libc_malloc_impl+0x142>
+ 13e:	add    $0x3,%rax
+ 142:	cmp    $0xc,%rax
+ 146:	cmovbe %ecx,%ebx
+ 149:	movslq %ebx,%rax
+ 14c:	mov    0x50(%r13,%rax,8),%rbp
+ 151:	xor    %eax,%eax
+ 153:	test   %rbp,%rbp
+ 156:	je     161 <__libc_malloc_impl+0x161>
+ 158:	mov    0x18(%rbp),%eax
+ 15b:	jmp    161 <__libc_malloc_impl+0x161>
+ 15d:	xor    %ebp,%ebp
+ 15f:	xor    %eax,%eax
+ 161:	mov    %eax,%edx
+ 163:	neg    %edx
+ 165:	and    %eax,%edx
+ 167:	je     18b <__libc_malloc_impl+0x18b>
+ 169:	sub    %edx,%eax
+ 16b:	mov    %eax,0x18(%rbp)
+ 16e:	mov    %edx,%eax
+ 170:	neg    %eax
+ 172:	and    %edx,%eax
+ 174:	lea    0x0(%rip),%rdx        # 17b <__libc_malloc_impl+0x17b>
+ 17b:	imul   $0x76be629,%eax,%eax
+ 181:	shr    $0x1b,%eax
+ 184:	movsbl (%rdx,%rax,1),%r14d
+ 189:	jmp    1b2 <__libc_malloc_impl+0x1b2>
+ 18b:	mov    %r12,%rsi
+ 18e:	mov    %ebx,%edi
+ 190:	call   195 <__libc_malloc_impl+0x195>
+ 195:	mov    %eax,%r14d
+ 198:	test   %eax,%eax
+ 19a:	jns    1aa <__libc_malloc_impl+0x1aa>
+ 19c:	lea    0x0(%rip),%rdi        # 1a3 <__libc_malloc_impl+0x1a3>
+ 1a3:	call   1a8 <__libc_malloc_impl+0x1a8>
+ 1a8:	jmp    1de <__libc_malloc_impl+0x1de>
+ 1aa:	movslq %ebx,%rbx
+ 1ad:	mov    0x50(%r13,%rbx,8),%rbp
+ 1b2:	mov    0x0(%rip),%r13d        # 1b9 <__libc_malloc_impl+0x1b9>
+ 1b9:	lea    0x0(%rip),%rdi        # 1c0 <__libc_malloc_impl+0x1c0>
+ 1c0:	call   1c5 <__libc_malloc_impl+0x1c5>
+ 1c5:	pop    %rbx
+ 1c6:	mov    %r12,%rdx
+ 1c9:	mov    %r14d,%esi
+ 1cc:	mov    %r13d,%ecx
+ 1cf:	mov    %rbp,%rdi
+ 1d2:	pop    %rbp
+ 1d3:	pop    %r12
+ 1d5:	pop    %r13
+ 1d7:	pop    %r14
+ 1d9:	jmp    1de <__libc_malloc_impl+0x1de>
+ 1de:	pop    %rbx
+ 1df:	xor    %eax,%eax
+ 1e1:	pop    %rbp
+ 1e2:	pop    %r12
+ 1e4:	pop    %r13
+ 1e6:	pop    %r14
+ 1e8:	ret
+
+Disassembly of section .text.__malloc_allzerop:
+
+0000000000000000 <__malloc_allzerop>:
+   0:	test   $0xf,%dil
+   4:	je     7 <__malloc_allzerop+0x7>
+   6:	hlt
+   7:	mov    -0x3(%rdi),%dl
+   a:	movzwl -0x2(%rdi),%eax
+   e:	mov    %edx,%esi
+  10:	and    $0x1f,%edx
+  13:	and    $0x1f,%esi
+  16:	cmpb   $0x0,-0x4(%rdi)
+  1a:	je     2d <__malloc_allzerop+0x2d>
+  1c:	test   %eax,%eax
+  1e:	je     21 <__malloc_allzerop+0x21>
+  20:	hlt
+  21:	movslq -0x8(%rdi),%rax
+  25:	cmp    $0xffff,%eax
+  2a:	jg     2d <__malloc_allzerop+0x2d>
+  2c:	hlt
+  2d:	mov    %eax,%ecx
+  2f:	shl    $0x4,%ecx
+  32:	movslq %ecx,%rcx
+  35:	sub    %rcx,%rdi
+  38:	lea    -0x10(%rdi),%rcx
+  3c:	mov    -0x10(%rdi),%rdi
+  40:	cmp    0x10(%rdi),%rcx
+  44:	je     47 <__malloc_allzerop+0x47>
+  46:	hlt
+  47:	mov    0x20(%rdi),%cl
+  4a:	and    $0x1f,%ecx
+  4d:	cmp    %ecx,%edx
+  4f:	jle    52 <__malloc_allzerop+0x52>
+  51:	hlt
+  52:	mov    0x18(%rdi),%ecx
+  55:	bt     %esi,%ecx
+  58:	jae    5b <__malloc_allzerop+0x5b>
+  5a:	hlt
+  5b:	mov    0x1c(%rdi),%ecx
+  5e:	bt     %esi,%ecx
+  61:	jae    64 <__malloc_allzerop+0x64>
+  63:	hlt
+  64:	mov    %rdi,%rcx
+  67:	mov    0x0(%rip),%rsi        # 6e <__malloc_allzerop+0x6e>
+  6e:	and    $0xfffffffffffff000,%rcx
+  75:	cmp    %rsi,(%rcx)
+  78:	je     7b <__malloc_allzerop+0x7b>
+  7a:	hlt
+  7b:	mov    0x20(%rdi),%esi
+  7e:	mov    %esi,%ecx
+  80:	shr    $0x6,%cx
+  84:	and    $0x3f,%ecx
+  87:	cmp    $0x2f,%cl
+  8a:	ja     bb <__malloc_allzerop+0xbb>
+  8c:	lea    0x0(%rip),%rsi        # 93 <__malloc_allzerop+0x93>
+  93:	and    $0x3f,%ecx
+  96:	movzwl (%rsi,%rcx,2),%ecx
+  9a:	imul   %edx,%ecx
+  9d:	cmp    %ecx,%eax
+  9f:	jge    a2 <__malloc_allzerop+0xa2>
+  a1:	hlt
+  a2:	mov    0x20(%rdi),%ecx
+  a5:	inc    %edx
+  a7:	shr    $0x6,%cx
+  ab:	and    $0x3f,%ecx
+  ae:	movzwl (%rsi,%rcx,2),%ecx
+  b2:	imul   %ecx,%edx
+  b5:	cmp    %edx,%eax
+  b7:	jl     c8 <__malloc_allzerop+0xc8>
+  b9:	jmp    c7 <__malloc_allzerop+0xc7>
+  bb:	and    $0xfc0,%si
+  c0:	cmp    $0xfc0,%si
+  c5:	je     c8 <__malloc_allzerop+0xc8>
+  c7:	hlt
+  c8:	mov    0x20(%rdi),%rdx
+  cc:	test   $0xfffffffffffff000,%rdx
+  d3:	je     e9 <__malloc_allzerop+0xe9>
+  d5:	and    $0xfffffffffffff000,%rdx
+  dc:	shr    $0x4,%rdx
+  e0:	dec    %rdx
+  e3:	cmp    %rdx,%rax
+  e6:	jbe    e9 <__malloc_allzerop+0xe9>
+  e8:	hlt
+  e9:	mov    0x20(%rdi),%ecx
+  ec:	mov    $0x1,%eax
+  f1:	shr    $0x6,%cx
+  f5:	and    $0x3f,%ecx
+  f8:	cmp    $0x2f,%cl
+  fb:	ja     121 <__malloc_allzerop+0x121>
+  fd:	call   102 <__malloc_allzerop+0x102>
+ 102:	mov    %rax,%r8
+ 105:	and    $0x3f,%ecx
+ 108:	lea    0x0(%rip),%rax        # 10f <__malloc_allzerop+0x10f>
+ 10f:	movzwl (%rax,%rcx,2),%eax
+ 113:	shl    $0x4,%eax
+ 116:	cltq
+ 118:	cmp    %rax,%r8
+ 11b:	setb   %al
+ 11e:	movzbl %al,%eax
+ 121:	ret

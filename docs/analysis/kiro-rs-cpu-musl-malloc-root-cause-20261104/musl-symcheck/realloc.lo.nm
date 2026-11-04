@@ -1,0 +1,11 @@
+                 U _GLOBAL_OFFSET_TABLE_
+                 U ___errno_location
+                 U __libc_free
+                 U __libc_malloc_impl
+0000000000000000 T __libc_realloc
+                 U __malloc_context
+                 U __malloc_size_classes
+                 U __mremap
+0000000000000000 r debruijn32.3474
+                 U memcpy
+0000000000000000 t set_size

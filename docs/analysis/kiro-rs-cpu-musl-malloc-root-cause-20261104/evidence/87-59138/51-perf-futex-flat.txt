@@ -1,0 +1,19 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 7M of event 'syscalls:sys_enter_futex'
+# Event count (approx.): 7078086
+#
+# Overhead       Samples  Shared Object     Symbol                
+# ........  ............  ................  ......................
+#
+    75.89%       5371749  kiro-rs           [.] 0x000000000229657d
+    23.96%       1695932  kiro-rs           [.] 0x0000000002296526
+     0.15%         10405  kiro-rs           [.] 0x000000000228fb48
+
+
+#
+# (Tip: For tracepoint events, try: perf report -s trace_fields)
+#

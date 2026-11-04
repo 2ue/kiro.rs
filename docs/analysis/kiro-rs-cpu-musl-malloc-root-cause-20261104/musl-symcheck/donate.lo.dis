@@ -1,0 +1,85 @@
+
+donate.lo:     file format elf64-x86-64
+
+
+Disassembly of section .text.__malloc_donate:
+
+0000000000000000 <__malloc_donate>:
+   0:	push   %r15
+   2:	lea    0x0(%rip),%r15        # 9 <__malloc_donate+0x9>
+   9:	push   %r14
+   b:	push   %r13
+   d:	push   %r12
+   f:	mov    $0x2f,%r12d
+  15:	push   %rbp
+  16:	push   %rbx
+  17:	mov    %rdi,%rbx
+  1a:	push   %rdx
+  1b:	neg    %rbx
+  1e:	mov    %rsi,%rdx
+  21:	and    $0xfffffffffffffff0,%rsi
+  25:	sub    %rdi,%rdx
+  28:	and    $0xf,%ebx
+  2b:	mov    %rsi,%r13
+  2e:	xor    %esi,%esi
+  30:	add    %rdi,%rbx
+  33:	call   38 <__malloc_donate+0x38>
+  38:	test   %r12d,%r12d
+  3b:	jle    f9 <__malloc_donate+0xf9>
+  41:	cmp    %rbx,%r13
+  44:	jbe    f9 <__malloc_donate+0xf9>
+  4a:	movzwl (%r15,%r12,2),%ebp
+  4f:	mov    %r13,%rax
+  52:	sub    %rbx,%rax
+  55:	inc    %ebp
+  57:	shl    $0x4,%ebp
+  5a:	movslq %ebp,%r14
+  5d:	cmp    %r14,%rax
+  60:	jb     f0 <__malloc_donate+0xf0>
+  66:	call   6b <__malloc_donate+0x6b>
+  6b:	mov    %r12,%rdx
+  6e:	sub    $0x14,%ebp
+  71:	shl    $0x6,%rdx
+  75:	mov    %rbx,0x10(%rax)
+  79:	movslq %ebp,%rbp
+  7c:	and    $0xfc0,%edx
+  82:	movl   $0x0,0x18(%rax)
+  89:	movl   $0x1,0x1c(%rax)
+  90:	mov    %rax,(%rbx)
+  93:	mov    %rdx,0x20(%rax)
+  97:	movb   $0x0,0xc(%rbx)
+  9b:	mov    0x10(%rax),%rdx
+  9f:	movb   $0xff,0xd(%rdx)
+  a3:	mov    0x10(%rax),%rdx
+  a7:	movb   $0x0,0x10(%rdx,%rbp,1)
+  ac:	cmpq   $0x0,0x8(%rax)
+  b1:	je     b4 <__malloc_donate+0xb4>
+  b3:	hlt
+  b4:	cmpq   $0x0,(%rax)
+  b8:	je     bb <__malloc_donate+0xbb>
+  ba:	hlt
+  bb:	lea    0x0(%rip),%rcx        # c2 <__malloc_donate+0xc2>
+  c2:	mov    (%rcx,%r12,8),%rdx
+  c6:	test   %rdx,%rdx
+  c9:	je     e2 <__malloc_donate+0xe2>
+  cb:	mov    %rdx,0x8(%rax)
+  cf:	mov    (%rdx),%rdx
+  d2:	mov    %rdx,(%rax)
+  d5:	mov    %rax,0x8(%rdx)
+  d9:	mov    0x8(%rax),%rdx
+  dd:	mov    %rax,(%rdx)
+  e0:	jmp    ed <__malloc_donate+0xed>
+  e2:	mov    %rax,0x8(%rax)
+  e6:	mov    %rax,(%rax)
+  e9:	mov    %rax,(%rcx,%r12,8)
+  ed:	add    %r14,%rbx
+  f0:	sub    $0x4,%r12
+  f4:	jmp    38 <__malloc_donate+0x38>
+  f9:	pop    %rax
+  fa:	pop    %rbx
+  fb:	pop    %rbp
+  fc:	pop    %r12
+  fe:	pop    %r13
+ 100:	pop    %r14
+ 102:	pop    %r15
+ 104:	ret

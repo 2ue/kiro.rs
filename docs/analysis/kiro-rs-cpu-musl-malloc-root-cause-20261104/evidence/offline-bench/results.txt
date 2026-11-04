@@ -1,0 +1,82 @@
+# 离线对照实验原始输出  2026-11-04T17:15:45+08:00  host=v2202607350025477794 nproc=8
+# 二进制由 rust:1.92.0-alpine3.23 编译，以 nice -n 19 运行
+## musl threads=1
+threads=1 body=4MB sends=10 wall=0.74s sends/s=13.5 out=40MB
+
+real	0m0.747s
+user	0m0.370s
+sys	0m0.343s
+## musl threads=2
+threads=2 body=4MB sends=20 wall=0.98s sends/s=20.4 out=80MB
+
+real	0m0.990s
+user	0m1.072s
+sys	0m0.695s
+## musl threads=4
+threads=4 body=4MB sends=40 wall=3.10s sends/s=12.9 out=160MB
+
+real	0m3.109s
+user	0m5.180s
+sys	0m4.156s
+## musl threads=8
+threads=8 body=4MB sends=80 wall=4.26s sends/s=18.8 out=320MB
+
+real	0m4.274s
+user	0m11.802s
+sys	0m10.113s
+## mimalloc threads=1
+threads=1 body=4MB sends=10 wall=0.33s sends/s=29.9 out=40MB
+
+real	0m0.369s
+user	0m0.247s
+sys	0m0.112s
+## mimalloc threads=2
+threads=2 body=4MB sends=20 wall=0.43s sends/s=46.1 out=80MB
+
+real	0m0.445s
+user	0m0.468s
+sys	0m0.392s
+## mimalloc threads=4
+threads=4 body=4MB sends=40 wall=0.53s sends/s=75.2 out=160MB
+
+real	0m0.547s
+user	0m1.079s
+sys	0m0.924s
+## mimalloc threads=8
+threads=8 body=4MB sends=80 wall=0.75s sends/s=106.4 out=320MB
+
+real	0m0.778s
+user	0m1.977s
+sys	0m2.268s
+## perf stat: musl 4 threads
+threads=4 body=4MB sends=40 wall=3.83s sends/s=10.4 out=160MB
+
+ Performance counter stats for 'nice -n 19 /tmp/kbench/bench-musl 4 4 10':
+
+         5,928,829      syscalls:sys_enter_futex                                              
+                80      syscalls:sys_enter_madvise                                            
+            34,784      syscalls:sys_enter_munmap                                             
+           305,958      tlb:tlb_flush                                                         
+
+       3.841576610 seconds time elapsed
+
+       5.865969000 seconds user
+       5.735515000 seconds sys
+
+
+## perf stat: mimalloc 4 threads
+threads=4 body=4MB sends=40 wall=0.42s sends/s=95.1 out=160MB
+
+ Performance counter stats for 'nice -n 19 /tmp/kbench/bench-mimalloc 4 4 10':
+
+                 6      syscalls:sys_enter_futex                                              
+                99      syscalls:sys_enter_madvise                                            
+                10      syscalls:sys_enter_munmap                                             
+             2,183      tlb:tlb_flush                                                         
+
+       0.430678972 seconds time elapsed
+
+       1.040949000 seconds user
+       0.474957000 seconds sys
+
+

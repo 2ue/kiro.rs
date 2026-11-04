@@ -1,0 +1,17 @@
+
+ Performance counter stats for process id '1463562':
+
+          13535600      syscalls:sys_enter_futex                                              
+             32139      syscalls:sys_enter_madvise                                            
+              2274      syscalls:sys_enter_mmap                                               
+              2258      syscalls:sys_enter_munmap                                             
+               562      syscalls:sys_enter_mremap                                             
+              1838      syscalls:sys_enter_sendto                                             
+              2725      syscalls:sys_enter_write                                              
+                10      syscalls:sys_enter_read                                               
+            188124      page-faults                                                           
+            932942      context-switches                                                      
+            126524      tlb:tlb_flush                                                         
+
+      10.003406921 seconds time elapsed
+

@@ -1,0 +1,6 @@
+                 U _GLOBAL_OFFSET_TABLE_
+                 U __malloc_alloc_meta
+                 U __malloc_context
+0000000000000000 T __malloc_donate
+                 U __malloc_size_classes
+                 U memset

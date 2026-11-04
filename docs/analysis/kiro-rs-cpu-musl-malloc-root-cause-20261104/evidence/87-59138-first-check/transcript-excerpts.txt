@@ -1,0 +1,85 @@
+# 87 机器首次复核（2026-11-04 16:38-16:41 +08:00）的命令和原始输出，逐字摘自 Claude Code 会话 489edd24 记录。
+# 87 上的临时原始文件当时已删除；ssh 包装脚本里的密码不在这些命令中出现；邮箱已脱敏。
+
+
+======== @ 2026-11-04T08:38:30.067Z
+$ R=/root/.kiro87/r; $R 'docker inspect -f "{{.Config.Image}} {{index .Config.Labels \"org.opencontainers.image.version\"}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}" kiro-rs-2ue-59138-app; docker image inspect ghcr.io/2ue/kiro-rs:latest -f "{{.Id}}"; which perf; cat /proc/sys/kernel/perf_event_paranoid
+docker logs --since 60s kiro-rs-2ue-59138-app 2>&1 | sed -E "s/\x1b\[[0-9;]*m//g" > /tmp/k60.log; echo sends=$(grep -c "Kiro upstream request body size" /tmp/k60.log) retries=$(grep -c "准备换号重试" /tmp/k60.log) firsts=$(grep "Kiro upstream request body size" /tmp/k60.log | grep -c "attempt=1 ")
+PID=$(docker inspect -f "{{.State.Pid}}" kiro-rs-2ue-59138-app); grep -E "Threads|VmRSS|VmHWM" /proc/$PID/status'; docker image inspect ghcr.io/2ue/kiro-rs:latest -f '{{.Id}}'
+-------- output
+ghcr.io/2ue/kiro-rs:latest 0.0.237 0 0
+sha256:8e80bf819d908123eb1b57d581bd145575e8315bbfe25c51778da42b7746f349
+perf not found
+3
+sends=648 retries=137 firsts=477
+VmHWM:	 1468960 kB
+VmRSS:	  713044 kB
+Threads:	22
+sha256:8e80bf819d908123eb1b57d581bd145575e8315bbfe25c51778da42b7746f349
+
+
+======== @ 2026-11-04T08:38:59.793Z
+$ /root/.kiro87/r 'PID=$(docker inspect -f "{{.State.Pid}}" kiro-rs-2ue-59138-app); mkdir -p /tmp/ka; cd /tmp/ka
+read u0 s0 < <(awk "{print \$14,\$15}" /proc/$PID/stat) 2>/dev/null || true
+bash -c "read u0 s0 < <(awk \"{print \\\$14,\\\$15}\" /proc/$PID/stat); for i in \$(seq 1 30); do sleep 1; read u s < <(awk \"{print \\\$14,\\\$15}\" /proc/$PID/stat); echo \$((u-u0)) \$((s-s0)); u0=\$u; s0=\$s; done" > cpu.txt &
+perf stat -p $PID -e "syscalls:sys_enter_futex,syscalls:sys_enter_madvise,syscalls:sys_enter_mmap,syscalls:sys_enter_munmap,syscalls:sys_enter_sendto,syscalls:sys_enter_write,page-faults,context-switches,tlb:tlb_flush" -- sleep 10 2>&1 | grep -E "sys_enter|faults|switches|tlb"
+perf record -F 199 -g -p $PID -o cpu.data -- sleep 15 2>&1 | tail -1
+perf record -e syscalls:sys_enter_futex -c 200 -p $PID -o futex.data -- sleep 5 2>&1 | tail -1
+wait
+awk "{u+=\$1; s+=\$2; if(\$1+\$2>m) m=\$1+\$2} END{printf \"30s avg user=%d%% sys=%d%% peak=%d%%\n\", u/NR, s/NR, m}" cpu.txt
+cp /proc/$PID/exe kiro.bin; sha256sum kiro.bin | cut -c1-16'
+-------- output
+           9066048      syscalls:sys_enter_futex                                              
+             31293      syscalls:sys_enter_madvise                                            
+              2193      syscalls:sys_enter_mmap                                               
+              2144      syscalls:sys_enter_munmap                                             
+              1761      syscalls:sys_enter_sendto                                             
+              2877      syscalls:sys_enter_write                                              
+            209381      page-faults                                                           
+            669460      context-switches                                                      
+            117842      tlb:tlb_flush                                                         
+[ perf record: Captured and wrote 2.771 MB cpu.data (6416 samples) ]
+[ perf record: Captured and wrote 1485.144 MB futex.data (12962318 samples) ]
+30s avg user=113% sys=118% peak=510%
+2520521ffbd9760d
+
+
+======== @ 2026-11-04T08:39:50.643Z
+$ /root/.kiro87/r 'cd /tmp/ka && rm -f futex.data && df -h /tmp | tail -1
+perf report -i cpu.data --no-children --sort dso,sym --stdio -g none 2>/dev/null | grep -E "^\s+[0-9.]+%" > rep.txt
+head -12 rep.txt
+python3 -I - <<EOF
+import re,collections
+c=collections.Counter()
+for l in open("/tmp/ka/rep.txt"):
+    m=re.match(r"\s+([0-9.]+)%\s+(\S+)\s+\[(.)\]\s+(\S+)",l)
+    if not m: continue
+    p=float(m.group(1)); d=m.group(2); s=m.group(4)
+    if d.startswith("[kernel"): c["kernel"]+=p; continue
+    try: ip=int(s,16)
+    except: c["other"]+=p; continue
+    c["musl libc region" if 0x2280000<=ip<0x22b0000 else "app"]+=p
+for k,v in c.most_common(): print(f"{v:5.1f}%  {k}")
+EOF
+objdump --version >/dev/null 2>&1 && objdump -d --no-show-raw-insn --start-address=0x22964a0 --stop-address=0x22964f8 kiro.bin | grep -cE "lock cmpxchg" || echo no-objdump'
+sha256sum /proc/$(docker inspect -f '{{.State.Pid}}' kiro-rs-2ue-59137-app)/exe | cut -c1-16
+-------- output
+tmpfs           7.9G  4.6G  3.3G  59% /tmp
+    10.40%  [kernel.kallsyms]  [k] __pv_queued_spin_lock_slowpath
+     5.22%  kiro-rs            [.] 0x00000000022964ec
+     4.93%  kiro-rs            [.] 0x00000000022964ba
+     3.63%  kiro-rs            [.] 0x000000000228dc5b
+     3.53%  [kernel.kallsyms]  [k] asm_sysvec_call_function
+     3.07%  kiro-rs            [.] 0x0000000002296561
+     3.05%  kiro-rs            [.] 0x000000000228d55c
+     2.70%  [kernel.kallsyms]  [k] futex_wake
+     1.73%  [kernel.kallsyms]  [k] _raw_spin_lock
+     1.72%  kiro-rs            [.] 0x0000000002296373
+     1.68%  [kernel.kallsyms]  [k] __raw_callee_save___pv_queued_spin_unlock
+     1.56%  kiro-rs            [.] 0x000000000228dbb2
+ 43.3%  kernel
+ 40.7%  musl libc region
+ 15.8%  app
+  0.1%  other
+2
+2520521ffbd9760d

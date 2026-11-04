@@ -1,0 +1,83 @@
+
+__lock.lo:     file format elf64-x86-64
+
+
+Disassembly of section .text.__lock:
+
+0000000000000000 <__lock>:
+   0:	movsbl 0x0(%rip),%ecx        # 7 <__lock+0x7>
+   7:	test   %ecx,%ecx
+   9:	je     b1 <__lock+0xb1>
+   f:	xor    %eax,%eax
+  11:	mov    $0x80000001,%edx
+  16:	lock cmpxchg %edx,(%rdi)
+  1a:	mov    %eax,%edx
+  1c:	test   %ecx,%ecx
+  1e:	jns    27 <__lock+0x27>
+  20:	movb   $0x0,0x0(%rip)        # 27 <__lock+0x27>
+  27:	test   %eax,%eax
+  29:	je     b1 <__lock+0xb1>
+  2f:	mov    $0xa,%esi
+  34:	mov    %edx,%ecx
+  36:	test   %edx,%edx
+  38:	jns    40 <__lock+0x40>
+  3a:	add    $0x7fffffff,%ecx
+  40:	lea    -0x7fffffff(%rcx),%edx
+  46:	mov    %ecx,%eax
+  48:	lock cmpxchg %edx,(%rdi)
+  4c:	mov    %eax,%edx
+  4e:	cmp    %eax,%ecx
+  50:	je     b1 <__lock+0xb1>
+  52:	dec    %esi
+  54:	jne    34 <__lock+0x34>
+  56:	push   %rbx
+  57:	mov    $0x1,%r8d
+  5d:	lock xadd %r8d,(%rdi)
+  62:	mov    $0xca,%r9d
+  68:	inc    %r8d
+  6b:	mov    $0x80,%ebx
+  70:	mov    %r8d,%edx
+  73:	test   %r8d,%r8d
+  76:	jns    9a <__lock+0x9a>
+  78:	movslq %r8d,%rdx
+  7b:	xor    %r10d,%r10d
+  7e:	mov    %r9,%rax
+  81:	mov    %rbx,%rsi
+  84:	syscall
+  86:	cmp    $0xffffffffffffffda,%rax
+  8a:	jne    93 <__lock+0x93>
+  8c:	xor    %esi,%esi
+  8e:	mov    %r9,%rax
+  91:	syscall
+  93:	lea    0x7fffffff(%r8),%edx
+  9a:	lea    -0x80000000(%rdx),%r8d
+  a1:	mov    %edx,%eax
+  a3:	lock cmpxchg %r8d,(%rdi)
+  a8:	mov    %eax,%r8d
+  ab:	cmp    %eax,%edx
+  ad:	jne    70 <__lock+0x70>
+  af:	pop    %rbx
+  b0:	ret
+  b1:	ret
+
+Disassembly of section .text.__unlock:
+
+0000000000000000 <__unlock>:
+   0:	mov    (%rdi),%eax
+   2:	test   %eax,%eax
+   4:	jns    39 <__unlock+0x39>
+   6:	mov    $0x7fffffff,%eax
+   b:	lock xadd %eax,(%rdi)
+   f:	cmp    $0x80000001,%eax
+  14:	je     39 <__unlock+0x39>
+  16:	mov    $0xca,%r8d
+  1c:	mov    $0x1,%edx
+  21:	mov    $0x81,%esi
+  26:	mov    %r8,%rax
+  29:	syscall
+  2b:	cmp    $0xffffffffffffffda,%rax
+  2f:	jne    39 <__unlock+0x39>
+  31:	mov    %r8,%rax
+  34:	mov    %rdx,%rsi
+  37:	syscall
+  39:	ret
