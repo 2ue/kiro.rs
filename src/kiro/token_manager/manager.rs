@@ -89,6 +89,7 @@ use super::cooldown::{
     entry_any_cooldown_remaining, entry_cooldown_remaining, entry_global_cooldown_remaining,
     model_state_key,
 };
+use super::degrade;
 use super::dispatch_progress::DispatchProgress;
 use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
@@ -2620,6 +2621,7 @@ impl MultiTokenManager {
                     upstream_fault_seq: 0,
                     redis_full_until: None,
                     last_upstream_fault_concentrated: false,
+                    degrade_scores: HashMap::new(),
                 }
             })
             .collect();
@@ -2946,6 +2948,52 @@ impl MultiTokenManager {
         self.config
             .read()
             .credential_upstream_failure_cooldown_enabled
+    }
+
+    /// 记一次「值得怀疑账号、但不值得冷却」的失败（空轮次、流截断等）。
+    ///
+    /// 只是在本进程里给该账号当前模型加一点劣化分，不冷却、不写 Redis、不写 PgSQL：
+    /// 调度热路径上不能因为记账多一次存储往返（59137 曾因调度侧 Redis 操作超过 250ms
+    /// 触发熔断，把整个队列卡住）。
+    pub fn record_degrade_failure(&self, id: u64, model: Option<&str>, weight: f64) {
+        if !(weight > 0.0) {
+            return;
+        }
+        let (enabled, threshold, half_life_ms) = {
+            let config = self.config.read();
+            (
+                config.credential_degrade_enabled,
+                config.credential_degrade_suspend_score,
+                (config.credential_degrade_half_life_secs.max(1) as f64) * 1000.0,
+            )
+        };
+        if !enabled {
+            return;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        let before = degrade::effective_score(&entry.degrade_scores, model, now_ms, half_life_ms);
+        degrade::add_failure(
+            &mut entry.degrade_scores,
+            model,
+            weight,
+            now_ms,
+            half_life_ms,
+            threshold,
+        );
+        let after = degrade::effective_score(&entry.degrade_scores, model, now_ms, half_life_ms);
+        if threshold > 0.0 && before < threshold && after >= threshold {
+            tracing::info!(
+                credential_id = id,
+                model = model.unwrap_or("(未指定)"),
+                degrade_score = after,
+                threshold,
+                "账号劣化分达到阈值，调度中暂时摘除（成功或衰减后自动恢复）"
+            );
+        }
     }
 
     /// 是否开放免登录的只读号池页面（默认关闭）。
@@ -6775,6 +6823,60 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
+        let (
+            max_concurrent_requests,
+            degrade_enabled,
+            degrade_resume_score,
+            degrade_half_life_ms,
+        ) = {
+            let config = self.config.read();
+            (
+                config.credential_max_concurrent_requests,
+                config.credential_degrade_enabled,
+                (config.credential_degrade_suspend_score
+                    * config.credential_degrade_resume_ratio.clamp(0.0, 1.0))
+                .max(0.0),
+                (config.credential_degrade_half_life_secs.max(1) as f64) * 1000.0,
+            )
+        };
+        let now_ms = Utc::now().timestamp_millis();
+        let is_degraded = |entry: &CredentialEntry| {
+            degrade_enabled
+                && degrade_resume_score > 0.0
+                && degrade::is_suspended(
+                    &entry.degrade_scores,
+                    model,
+                    now_ms,
+                    degrade_half_life_ms,
+                    degrade_resume_score,
+                )
+        };
+        // 绑定的账号已经劣化：只有当别处确实有健康且可调度的账号时才换出去。
+        // 没有健康候选时继续用绑定的账号，避免为了质量把会话推进排队。
+        let bound_is_degraded = entries
+            .iter()
+            .find(|entry| entry.id == bound_id)
+            .is_some_and(|entry| is_degraded(entry));
+        if bound_is_degraded {
+            let has_healthy_alternative = entries.iter().any(|entry| {
+                entry.id != bound_id
+                    && !excluded_ids.contains(&entry.id)
+                    && !is_degraded(entry)
+                    && credential_is_dispatchable(
+                        &proxy_resources,
+                        entry,
+                        model,
+                        now,
+                        max_concurrent_requests,
+                        global_rpm,
+                        1,
+                        &tiers,
+                    )
+            });
+            if has_healthy_alternative {
+                return None;
+            }
+        }
         entries
             .iter()
             .find(|e| {
@@ -10451,6 +10553,7 @@ impl MultiTokenManager {
                 upstream_fault_seq: 0,
                 redis_full_until: None,
                 last_upstream_fault_concentrated: false,
+                degrade_scores: HashMap::new(),
             };
             if let Some(state) = runtime_states.get(&id) {
                 Self::apply_runtime_state_if_newer(&mut entry, state);
@@ -12547,11 +12650,19 @@ impl MultiTokenManager {
         model: Option<&str>,
         latency: Option<StdDuration>,
     ) -> Option<SuccessReportOutcome> {
-        let alpha = self
-            .config
-            .read()
-            .scheduler_error_ewma_alpha
-            .clamp(0.01, 1.0);
+        let (alpha, degrade_enabled, degrade_decay, degrade_half_life_ms, degrade_resume_score) = {
+            let config = self.config.read();
+            (
+                config.scheduler_error_ewma_alpha.clamp(0.01, 1.0),
+                config.credential_degrade_enabled,
+                config.credential_degrade_success_decay,
+                (config.credential_degrade_half_life_secs.max(1) as f64) * 1000.0,
+                (config.credential_degrade_suspend_score
+                    * config.credential_degrade_resume_ratio.clamp(0.0, 1.0))
+                .max(0.0),
+            )
+        };
+        let now_ms = Utc::now().timestamp_millis();
         let mut entries = self.entries.lock();
         let entry = entries.iter_mut().find(|e| e.id == id)?;
         let runtime_state_changed = entry.failure_count > 0
@@ -12583,6 +12694,16 @@ impl MultiTokenManager {
                         .unwrap_or(latency_ms),
                 );
             }
+        }
+        if degrade_enabled {
+            degrade::apply_success(
+                &mut entry.degrade_scores,
+                model,
+                degrade_decay,
+                now_ms,
+                degrade_half_life_ms,
+                degrade_resume_score,
+            );
         }
         tracing::debug!(
             "凭据 #{} API 调用成功（累计 {} 次）",
@@ -15202,6 +15323,7 @@ impl MultiTokenManager {
                 upstream_fault_seq: 0,
                 redis_full_until: None,
                 last_upstream_fault_concentrated: false,
+                degrade_scores: HashMap::new(),
             });
         }
 

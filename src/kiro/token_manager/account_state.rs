@@ -110,6 +110,12 @@ pub(super) struct CredentialEntry {
     /// Set by `note_upstream_fault`: the last upstream fault was not shared by most active
     /// accounts.
     pub(super) last_upstream_fault_concentrated: bool,
+    /// 按模型累积的劣化分（空轮次、流截断等「不冷却但指向账号」的失败）。
+    ///
+    /// 只存在本进程：不写 Redis、不写 PgSQL，因此不增加调度热路径的存储往返。
+    /// 达到阈值后该账号在调度中暂时摘除，实际调度仍按档位与优先级进行，
+    /// 流量自然溢出到其他账号。详见 [`degrade`](super::degrade)。
+    pub(super) degrade_scores: HashMap<String, super::degrade::DegradeScore>,
 }
 
 #[derive(Debug, Clone)]

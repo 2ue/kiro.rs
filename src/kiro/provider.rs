@@ -899,8 +899,18 @@ impl KiroApiCompletion {
     pub fn report_empty_turn(&self, reason: impl Into<String>) {
         if self.token_manager.empty_turn_cooldown_enabled() {
             self.report_body_status_failure(reason.into(), true);
-        } else {
-            self.release();
+            return;
+        }
+        // 不冷却，但要留下劣化信号：一个账号如果反复空回，它会在调度里被暂时摘除，
+        // 流量自然溢出到同档位或其他档位的健康账号。只记账，不阻塞请求路径。
+        if !self.reported.swap(true, Ordering::AcqRel) {
+            self.in_flight_lease.lock().take();
+            let weight = self
+                .token_manager
+                .runtime_config_snapshot()
+                .credential_degrade_empty_turn_weight;
+            self.token_manager
+                .record_degrade_failure(self.credential_id, self.model.as_deref(), weight);
         }
     }
 
@@ -1106,6 +1116,15 @@ impl KiroStreamCompletion {
     pub fn report_upstream_stream_failure(&self, reason: impl Into<String>) {
         let cool_down = self.token_manager.upstream_failure_cooldown_enabled()
             || self.token_manager.note_upstream_fault(self.credential_id);
+        if !cool_down {
+            // 不冷却时仍记劣化分（权重低于空轮次：流截断更偏上游）。
+            let weight = self
+                .token_manager
+                .runtime_config_snapshot()
+                .credential_degrade_stream_weight;
+            self.token_manager
+                .record_degrade_failure(self.credential_id, self.model.as_deref(), weight);
+        }
         self.report_stream_failure(reason.into(), cool_down);
     }
 

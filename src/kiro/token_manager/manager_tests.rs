@@ -7203,6 +7203,7 @@ fn test_health_balanced_score_parameters_are_effective() {
         upstream_fault_seq: 0,
         redis_full_until: None,
         last_upstream_fault_concentrated: false,
+        degrade_scores: HashMap::new(),
     };
     worse.health.recent_error_rate = 0.5;
     worse.health.latency_ewma_ms = Some(1_000.0);
@@ -7241,6 +7242,7 @@ fn test_health_balanced_score_parameters_are_effective() {
         upstream_fault_seq: 0,
         redis_full_until: None,
         last_upstream_fault_concentrated: false,
+        degrade_scores: HashMap::new(),
     };
 
     let mut config = Config::default();
