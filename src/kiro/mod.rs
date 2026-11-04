@@ -9,5 +9,6 @@ pub mod model;
 pub mod parser;
 pub mod protocol;
 pub mod provider;
+pub(crate) mod request_head;
 pub mod retry_pipeline;
 pub mod token_manager;

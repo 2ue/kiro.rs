@@ -17,6 +17,7 @@ use crate::kiro::protocol::{
     is_external_idp_credentials, resolve_agent_mode, resolve_profile_arn,
     resolve_streaming_profile_arn,
 };
+use crate::kiro::request_head::KiroRequestHead;
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
@@ -211,6 +212,29 @@ fn transform_ide_api_body(body: &str, profile_arn: &Option<String>) -> String {
     if profile_arn.is_none() && !normalize_reasoning_fields {
         return body.to_string();
     }
+    // 常见情况只需在根对象上补一个 profileArn：先只读几个字段，能直接拼接就不建 DOM。
+    // 请求体常有几 MB，每次发送、每次换号都会走到这里。
+    let Some(head) = KiroRequestHead::parse(body) else {
+        return body.to_string();
+    };
+    if !head.is_object {
+        return body.to_string();
+    }
+    if !head.reasoning_fields_need_normalization {
+        let Some(profile_arn) = profile_arn.as_deref() else {
+            return body.to_string();
+        };
+        match &head.profile_arn {
+            Some(Some(current)) if current == profile_arn => return body.to_string(),
+            None => {
+                if let Some(spliced) = append_root_string_member(body, "profileArn", profile_arn) {
+                    return spliced;
+                }
+            }
+            // 已有 profileArn 但值不同：要替换原值，交给下面的 DOM 路径。
+            Some(_) => {}
+        }
+    }
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
         return body.to_string();
     };
@@ -227,6 +251,28 @@ fn transform_ide_api_body(body: &str, profile_arn: &Option<String>) -> String {
         .saturating_add(profile_allowance)
         .saturating_add(32);
     serialize_json_with_capacity(&json, minimum_capacity).unwrap_or_else(|| body.to_string())
+}
+
+/// 在根对象末尾追加一个字符串成员，其余字节原样保留。`body` 必须已确认是 JSON 对象。
+fn append_root_string_member(body: &str, key: &str, value: &str) -> Option<String> {
+    let close = body.trim_end().len().checked_sub(1)?;
+    if body.as_bytes()[close] != b'}' {
+        return None;
+    }
+    let open = body.len() - body.trim_start().len();
+    let is_empty = body[open + 1..close].trim().is_empty();
+    let value = serde_json::to_string(value).ok()?;
+    let mut output = String::with_capacity(body.len() + key.len() + value.len() + 4);
+    output.push_str(&body[..close]);
+    if !is_empty {
+        output.push(',');
+    }
+    output.push('"');
+    output.push_str(key);
+    output.push_str("\":");
+    output.push_str(&value);
+    output.push_str(&body[close..]);
+    Some(output)
 }
 
 fn set_profile_arn(json: &mut serde_json::Value, profile_arn: &Option<String>) -> bool {
@@ -443,6 +489,45 @@ mod tests {
                 nested_no_op,
                 "round {round}: an escaped target-shaped nested schema key must remain exact when no declared path changes"
             );
+        }
+    }
+
+    #[test]
+    fn ide_profile_injection_matches_dom_semantics_without_reordering_for_five_rounds() {
+        let profile = Some("arn:test:profile/\"quoted\"".to_string());
+        let cases = [
+            r#"{"conversationState":{"z":1.0,"a":1e+02}}"#,
+            "{}",
+            " {\n} \n",
+            " {\n  \"b\" : [1, 2],\n  \"a\" : {\"x\":null}\n}\n",
+            r#"{"profileArn":"other"}"#,
+            r#"{"profileArn":null,"k":1}"#,
+            r#"{"profile\u0041rn":"other"}"#,
+            r#"{"profileArn":"arn:test:profile/\"quoted\""}"#,
+            r#"{"additionalModelRequestFields":{"output_config":{"effort":"low"},"thinking":{"type":"disabled"}}}"#,
+            r#"{"additionalModelRequestFields":{"output_config":{"effort":"low"},"thinking":{"type":"adaptive"}}}"#,
+        ];
+        for round in 0..5 {
+            for body in cases {
+                let transformed = transform_ide_api_body(body, &profile);
+                let mut expected: Value = serde_json::from_str(body).unwrap();
+                super::set_profile_arn(&mut expected, &profile);
+                crate::kiro::endpoint::normalize_output_config_thinking_compatibility_json(
+                    &mut expected,
+                );
+                let actual: Value = serde_json::from_str(&transformed).unwrap();
+                assert_eq!(actual, expected, "round {round}: {body}");
+            }
+            // 只缺 profileArn 时只在末尾追加，原有字节（键顺序、数字写法、空白）不变。
+            let body = " {\n  \"b\" : 1.0,\n  \"a\" : 1e+02\n} \n";
+            let transformed = transform_ide_api_body(body, &profile);
+            assert_eq!(
+                transformed,
+                " {\n  \"b\" : 1.0,\n  \"a\" : 1e+02\n,\"profileArn\":\"arn:test:profile/\\\"quoted\\\"\"} \n",
+                "round {round}"
+            );
+            assert_eq!(transform_ide_api_body("[1]", &profile), "[1]");
+            assert_eq!(transform_ide_api_body("\"s\"", &profile), "\"s\"");
         }
     }
 
