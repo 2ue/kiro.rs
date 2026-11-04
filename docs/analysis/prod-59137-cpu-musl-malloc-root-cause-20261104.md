@@ -128,7 +128,48 @@ time ./bench-mimalloc 4 4 10
 
 结论相同：musl 下并发越高，吞吐越低；4 线程时 mimalloc 的吞吐是 musl 的 12.7 倍。
 
-## 6. 解决方案
+### 5.3 大 body 为什么越过 payload guard
+
+结论：默认配置下 `payloadGuardMode` 是 `on_too_long`，首发请求根本不做按大小裁剪，只有上游真的返回"输入过长"之后才裁剪重试。这是有意设计，不是 guard 失效。
+
+代码依据（提交 `73bae2e7`）：
+
+- `RequestRuntimeConfig::initial_payload_guard_config`（`src/anthropic/handlers.rs`）：`OnTooLong` 下把 `max_bytes` 和 `max_kiro_weight` 都置 0、`trim_history` 置 false，只保留协议修复和轻量整形。`payload_guard_config()` 里仍保留 460800 / 130 万，供"上游报过长之后的重试"使用。
+- `apply_runtime_config_migrations`（`src/model/config.rs`）在 `runtime_config_migration_version < 1` 时会把旧的 `preemptive` 一次性改成 `on_too_long`。所以线上 dump 配置里即使写着 `payloadGuardMode = preemptive`，实际运行的是 `on_too_long`。
+- `too_long_retry_enabled_for`：默认 `payload_too_long_handling = client_compaction`，只有 Claude Code 自己的压缩请求才由服务端裁剪重试，其余请求按官方协议返回 `prompt is too long` 让客户端压缩。
+- 上游对这些请求确实返回了 200（证据见分析包的 `evidence/87-59138/10-app.log`，19MB 那类请求 `outcome="response_headers_received"`），所以不存在"越过了本该拦住的限制"。真正的风险是超大请求把上游拒绝、白跑一次重试，属于重试放大（第 2 条），不是 guard 漏洞。
+
+要恢复按大小预裁剪，把 `payloadGuardMode` 设成 `preemptive` 即可；代价是每个请求都多一次裁剪判断和可能的历史裁剪，与"减少放大因素"的方向相反，建议先用数据决定。
+
+## 6. 端到端对照（同一台机器、同一份负载、新旧二进制）
+
+2026-11-04 晚在开发机的 colima 虚拟机（aarch64、6 核）上用 `rust:1.92.0-alpine3.23` 编译了两份 musl 静态二进制：
+
+- `old`：提交 `73bae2e7`，即线上 0.0.237，musl malloc。二进制里没有 mimalloc 字符串。
+- `new`：`perf/mimalloc-hot-path` 分支，mimalloc 全局分配器 + 去掉热路径 DOM 解析。
+
+环境：`alpine:3.23` 容器，PostgreSQL 17.5 + Redis 7.4 各一个容器，上游用仓库里的 `scripts/loadtest/kiro-mock-upstream.mjs`（同时模拟 8 个账号，16 并发/账号）。压测客户端按 24 或 48 路并发持续发带多轮 history 的 `/v1/messages` 请求，每个 worker 一个独立会话。CPU 取自容器内 `/proc/1/stat` 的 utime+stime，`voluntary_ctx_switches` 取自所有线程之和。
+
+| 场景 | 版本 | 成功/失败 | 吞吐（req/s） | CPU 合计 | user / sys | 自愿上下文切换/s | CPU 毫秒/成功请求 | p50 / p95 (ms) |
+|---|---|---|---|---|---|---|---|---|
+| 1.27MB body，24 并发 | old | 109 / 0 | 2.7 | 594.8% | 215 / 380 | 270,327 | 2182.8 | 9054 / 12852 |
+| 1.27MB body，24 并发 | new | 1234 / 0 | 30.9 | 263.7% | 252 / 12 | 4,457 | 85.5 | 785 / 921 |
+| 61KB body，48 并发 | old | 1489 / 0 | 49.6 | 341.3% | 140 / 201 | 112,659 | 68.8 | 962 / 1380 |
+| 61KB body，48 并发 | new | 2201 / 0 | 73.4 | 51.7% | 42 / 10 | 4,579 | 7.0 | 658 / 801 |
+| 1.27MB body，40% 上游 5xx | old | 101 / 5 | 2.5 | 600.4% | 216 / 385 | 272,760 | 2377.8 | 9160 / 14900 |
+| 1.27MB body，40% 上游 5xx | new | 584 / 669 † | 14.6 | 274.5% | 264 / 11 | 4,460 | 188.0 | 730 / 1760 |
+
+† 这一组 669 个失败里 511 个是本地返回的 429「所有可用账号均处于上游临时冷却」。8 个账号在上游持续 40% 失败时全部进入瞬态冷却，新版吞吐高 5.8 倍、把同样的失败放大成更多冷却窗口，旧版只是被自身的 CPU 瓶颈挡在冷却之前。同一种调度策略在两种负载强度下的结果，不是新版引入的行为差异。
+
+要点：
+
+- sys 时间从 380% 降到 12%，自愿上下文切换下降 60 倍，与"futex 和锁竞争消失"一致。
+- 相同的成功请求，CPU 成本从 2.2 秒降到 85 毫秒（大 body）、从 69 毫秒降到 7 毫秒（小 body）。
+- 大 body 场景吞吐提升约 11 倍，小 body 约 1.5 倍。小 body 的提升来自分配量少、DOM 解析本来就占比不高，但也仍未触及 mock 上游的上限。
+
+**RSS 是这次唯一的倒退。** 同样 1.27MB 场景，old 结束时 110MB、峰值 587MB；new 结束时 688MB、峰值 925MB。mimalloc 按线程缓存内存、归还懒。加 `MIMALLOC_PURGE_DELAY=0` 后峰值从 976MB 降到 630MB、结束时从 786MB 降到 211MB，代价是 sys 从 7% 升到 31%、CPU 合计从 148% 升到 173%（吞吐不变）。建议上线时先用默认值并给容器设 `mem_limit`（例如 3g，历史峰值约 2.1GB），观察一两天再决定要不要开这个变量。
+
+## 7. 解决方案
 
 按收益排序。第 1 条针对根因，2~4 条减少放大因素。
 
@@ -158,13 +199,15 @@ time ./bench-mimalloc 4 4 10
 
    这一条直接减少分配次数，换了分配器之后同样有收益。
 
-4. **查清大 body 为什么越过了 payload guard。** 日志里有 19MB 的上游 body。注意，Kiro 本地路径比较的不是 `payloadGuardMaxBytes`（460800）：它只要大于 0 就打开按大小整形，实际阈值是 `payloadGuardKiroMaxWeight`，默认 1,300,000，按加权计算，ASCII 字符计 1，非 ASCII 字符计 8（`guard_kiro_request`）。所以"414/926 次发送超过 `payloadGuardMaxBytes`"不能说明 guard 失效。但 19MB 远超 130 万加权，仍然需要查：裁剪不动时会标记 `still_oversized` 继续透传，原因可能在当前轮（当前轮整形开关默认都关）、图片或别的地方。需要按 `still_oversized` 和加权口径重新统计，这一项还没查。
+4. **大 body 为什么越过了 payload guard：已查清，是当前设计，不是故障。** 见 [§5.3](#53-大-body-为什么越过-payload-guard)。日志里有 19MB 的上游 body，Kiro 本地路径比较的不是 `payloadGuardMaxBytes`（460800），而是 `payloadGuardKiroMaxWeight`（默认 1,300,000，ASCII 计 1、非 ASCII 计 8）。
 
 5. **部署侧兜底。** 给 kiro-rs 容器加 `cpus` 和 `mem_limit`，避免它冲高时拖垮同机的 sub2api 和 postgres。这只能限制影响范围，不解决问题。
 
-## 7. 未验证或遗留的点
+## 8. 未验证或遗留的点
 
-- 线上换分配器后的实际收益还没测，需要在 59138 灰度时补数据。
+- 线上换分配器后的实际收益还没测，需要在 59138 灰度时补数据。开发机上的对照见第 6 节，量级可以参考，比例不代表线上。
+- 端到端对照是单机、mock 上游、aarch64 虚拟机，CPU 时长取的是容器进程；线上是 x86_64 物理机、真实上游、与其它容器争抢 8 核，绝对值会不同。
 - 零帧 `protocol_error` 本身的上游原因没有分析。
 - 二进制是 strip 的，musl 函数是根据反汇编模式认的（`__lock` 的自旋 + futex 结构），没有符号表佐证。
+- 更完整的证据包（逐秒 CPU、perf 原始数据、按线程统计、日志、采集脚本、离线 bench 源码）在分支 `docs/cpu-musl-malloc-root-cause-20261104` 的 `docs/analysis/kiro-rs-cpu-musl-malloc-root-cause-20261104/` 下。该分支包含生产主机地址和实例路径，没有合入公开仓库。
 - 本次排查在深圳和 59138 两台宿主机都装了 `linux-perf`，用完可以 `apt-get remove linux-perf` 卸掉。
