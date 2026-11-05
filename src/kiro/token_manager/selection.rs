@@ -14,7 +14,7 @@ use crate::model::config::Config;
 
 use super::account_state::CredentialEntry;
 use super::capacity::{credential_catalog_lists_model, effective_max_concurrent_requests};
-use super::degrade::is_suspended;
+use super::degrade::{effective_score, is_suspended};
 use super::strategy::{select_health_weighted, should_select_warming_from_totals};
 
 /// Load-balancing mode. Persisted as its snake_case name; unknown names are rejected when the
@@ -117,7 +117,8 @@ pub(crate) fn select_candidate<'a>(
         retain_preferred_priority_tier(&mut available);
     }
     let candidates = warmup_group(available, config);
-    order_by_mode(mode, &candidates, model, now_ms, config, bound_sessions)
+    let picked = order_by_mode(mode, &candidates, model, now_ms, config, bound_sessions);
+    picked
 }
 
 /// Sessions count as active on a credential for this long after their last request.

@@ -23,6 +23,13 @@ pub(super) const MAX_MODELS_PER_CREDENTIAL: usize = 8;
 /// 衰减到这个分数以下时直接删除，避免留下无意义的空条目。
 const SCORE_EPSILON: f64 = 0.01;
 
+/// 阈值比较的相对容差。
+///
+/// 累加时的基数已经过时间衰减，`2.0 × 3` 这种「正好等于阈值」的组合会算出
+/// `5.99999… < 6.0`，导致默认配置下永远不摘除。容差按阈值比例缩放，避免
+/// 把临界比较建立在浮点精确相等上。
+const THRESHOLD_EPSILON: f64 = 1e-6;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DegradeScore {
     score: f64,
@@ -61,7 +68,8 @@ pub(super) fn is_suspended(
     let Some(score) = scores.get(&model_key(model)) else {
         return false;
     };
-    score.suspended && score.effective(now_ms, half_life_ms) >= resume_score
+    score.suspended
+        && score.effective(now_ms, half_life_ms) + resume_score * THRESHOLD_EPSILON >= resume_score
 }
 
 /// 该账号在 `model` 上当前的劣化分。
@@ -102,7 +110,8 @@ pub(super) fn add_failure(
         DegradeScore {
             score: next,
             updated_at_ms: now_ms,
-            suspended: was_suspended || (suspend_score > 0.0 && next >= suspend_score),
+            suspended: was_suspended
+                || (suspend_score > 0.0 && next + suspend_score * THRESHOLD_EPSILON >= suspend_score),
         },
     );
 }

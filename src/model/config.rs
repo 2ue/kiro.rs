@@ -5896,10 +5896,13 @@ fn default_credential_degrade_enabled() -> bool {
     true
 }
 
-/// 6.0 = 三次空轮次（权重 2.0）且中间没有成功。阈值刻意高于单次抖动：
-/// 偶发一次空轮次不应让账号摘除。
+/// 5.0：两次空轮次（2.0 × 2 = 4.0）不够，三到四次之间就会触发。
+///
+/// 阈值必须和「N × 权重」留出余量，不能正好相等：累加基数按半衰期做时间衰减，
+/// 三次失败之间只要隔几毫秒，2.0 × 3 就会算出 5.9999 而不是 6.0，
+/// 阈值正好设成 6.0 时判定会时好时坏。这里取 5.0，留出 1.0 的余量。
 fn default_credential_degrade_suspend_score() -> f64 {
-    6.0
+    5.0
 }
 
 fn default_credential_degrade_half_life_secs() -> u64 {
