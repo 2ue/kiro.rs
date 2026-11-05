@@ -13387,8 +13387,10 @@ fn kiro_rs_tool_plus_route_amplifies_bounds_and_limits_creation_frequency() {
 fn kiro_rs_tool_plus_full_coverage_never_reports_zero_input() {
     let prompt_cache = Arc::new(PromptCacheTracker::default());
     let usage_recorder = Arc::new(UsageRecorder::new(10));
-    let mut plus = crate::model::config::KiroRsToolPlusCachePolicy::default();
-    plus.coverage_ratio = 1.0;
+    let plus = crate::model::config::KiroRsToolPlusCachePolicy {
+        coverage_ratio: 1.0,
+        ..Default::default()
+    };
     let mut cache_policy = CachePolicyConfig::default();
     cache_policy.path_overrides.insert(
         "/plus-full/v1/messages".to_string(),
