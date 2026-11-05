@@ -16612,3 +16612,198 @@ fn config_with_free_tier_without_opus() -> Config {
     );
     config
 }
+
+// ============ 劣化分摘除：真实调度链路（acquire_context）============
+
+fn degrade_test_manager(fast15: usize, fast10: usize) -> MultiTokenManager {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 4;
+    config.credential_warmup_requests = 0;
+    // 探测比例置 0，测试里要确定性：不抽样放行被摘除的账号
+    config.credential_degrade_probe_percent = 0;
+    let mut credentials = Vec::new();
+    for index in 0..fast15 {
+        credentials.push(fast_test_credential(&format!("fast15-{index}"), 15));
+    }
+    for index in 0..fast10 {
+        credentials.push(fast_test_credential(&format!("fast10-{index}"), 10));
+    }
+    MultiTokenManager::new(config, credentials, None, None, false).unwrap()
+}
+
+/// 让指定账号在当前模型上越过摘除阈值（默认 6.0，空轮次权重 2.0 → 3 次）。
+fn degrade_credential(manager: &MultiTokenManager, id: u64, model: Option<&str>) {
+    for _ in 0..3 {
+        manager.record_degrade_failure(id, model, 2.0);
+    }
+}
+
+/// 2026-11-04 生产 59137 的真实场景：整档 fast 15 劣化后，真实调度必须把流量交给 fast 10，
+/// 而不是继续被坏号独占。这条走完整 acquire 链路（拿锁、选号、租约），不是纯函数。
+#[tokio::test]
+async fn degraded_fast_tier_hands_traffic_to_the_next_tier_in_real_dispatch() {
+    let manager = degrade_test_manager(2, 2);
+    degrade_credential(&manager, 1, None);
+    degrade_credential(&manager, 2, None);
+
+    let mut picked = Vec::new();
+    for _ in 0..4 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        picked.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    picked.sort_unstable();
+    assert_eq!(
+        picked,
+        vec![3, 3, 4, 4],
+        "fast 15 全部劣化后，fast 10 必须接手全部流量"
+    );
+}
+
+/// 只劣化一个号时，同档位的健康号不受影响，被摘除的那个不再被选中。
+#[tokio::test]
+async fn degrading_one_credential_only_removes_that_one_in_real_dispatch() {
+    let manager = degrade_test_manager(2, 0);
+    degrade_credential(&manager, 1, None);
+
+    let mut picked = Vec::new();
+    for _ in 0..4 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        picked.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert!(
+        !picked.contains(&1),
+        "被摘除的账号不该再被选中: {picked:?}"
+    );
+    assert!(
+        picked.contains(&2),
+        "同档位健康账号必须继续服务: {picked:?}"
+    );
+}
+
+/// 全部账号都劣化时必须全部放行：摘除不能把候选集清空，否则请求会去排队，
+/// 把「质量劣化」变成「容量不足」。这里用超时断言它没有挂住。
+#[tokio::test]
+async fn degrading_every_credential_never_starves_dispatch() {
+    let manager = degrade_test_manager(2, 2);
+    for id in 1..=4 {
+        degrade_credential(&manager, id, None);
+    }
+
+    for _ in 0..6 {
+        let mut ctx = tokio::time::timeout(StdDuration::from_secs(2), manager.acquire_context(None))
+            .await
+            .expect("全部账号劣化时不允许排队或阻塞")
+            .unwrap();
+        ctx.release_in_flight();
+    }
+}
+
+/// 恢复：连续成功后劣化分衰减到恢复线以下，账号重新进入候选集。
+#[tokio::test]
+async fn successive_successes_restore_a_degraded_credential_in_real_dispatch() {
+    let manager = degrade_test_manager(1, 1);
+    degrade_credential(&manager, 1, None);
+
+    // 已被摘除：流量全在 fast 10
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2);
+    ctx.release_in_flight();
+
+    // 6.0 → 3.0（仍高于恢复线 2.4）→ 1.5（低于恢复线）
+    manager.report_success(1);
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2, "一次成功不足以复权");
+    ctx.release_in_flight();
+
+    manager.report_success(1);
+    let mut picked = Vec::new();
+    for _ in 0..6 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        picked.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert!(
+        picked.contains(&1),
+        "降到恢复线以下后必须回到调度: {picked:?}"
+    );
+}
+
+/// 模型隔离：在 opus 上劣化，不该影响 sonnet 的调度。
+#[tokio::test]
+async fn degrade_is_scoped_to_the_model_that_failed() {
+    let manager = degrade_test_manager(1, 1);
+    degrade_credential(&manager, 1, Some("claude-opus-5-5"));
+
+    let mut opus = manager
+        .acquire_context_for_session(Some("claude-opus-5-5"), None, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(opus.id, 2, "劣化模型上应让出给健康账号");
+    opus.release_in_flight();
+
+    let mut sonnet = manager
+        .acquire_context_for_session(Some("claude-sonnet-5"), None, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(sonnet.id, 1, "其他模型不受影响，仍优先用 fast 15");
+    sonnet.release_in_flight();
+}
+
+/// 会话粘性：会话绑定的账号劣化且存在健康替代时，请求必须让出；
+/// 但不能因此丢掉绑定关系（恢复后会话应回到原账号，保住缓存）。
+#[tokio::test]
+async fn sticky_session_moves_off_a_degraded_binding() {
+    let manager = degrade_test_manager(1, 1);
+    let excluded = HashSet::new();
+
+    let first = manager
+        .acquire_context_for_session(None, Some("session-degrade"), &excluded)
+        .await
+        .unwrap();
+    assert_eq!(first.id, 1, "初始绑定到 fast 15");
+    manager.report_success_for_session(first.id, Some("session-degrade"));
+
+    degrade_credential(&manager, 1, None);
+
+    let second = manager
+        .acquire_context_for_session(None, Some("session-degrade"), &excluded)
+        .await
+        .unwrap();
+    assert_eq!(second.id, 2, "绑定账号劣化后必须让出");
+
+    // 恢复后会话回到原绑定账号
+    manager.report_success(1);
+    manager.report_success(1);
+    let third = manager
+        .acquire_context_for_session(None, Some("session-degrade"), &excluded)
+        .await
+        .unwrap();
+    assert_eq!(third.id, 1, "恢复后会话应回到原账号");
+}
+
+/// 关闭开关后行为与改动前完全一致：劣化分照常累积但不摘除。
+#[tokio::test]
+async fn disabling_degrade_keeps_the_old_dispatch_behaviour() {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 4;
+    config.credential_warmup_requests = 0;
+    config.credential_degrade_enabled = false;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            fast_test_credential("fast15", 15),
+            fast_test_credential("fast10", 10),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    degrade_credential(&manager, 1, None);
+
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 1, "开关关闭时 fast 15 仍然独占");
+    ctx.release_in_flight();
+}
