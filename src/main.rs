@@ -10,6 +10,13 @@ mod model;
 mod storage;
 pub mod token;
 
+// 发布镜像静态链接 musl，它自带的 malloc 对所有线程共用一把锁；并发处理多 MB 请求体时
+// CPU 大量耗在锁竞争、futex 和反复还页上（见 docs/analysis/prod-59137-cpu-musl-malloc-root-cause-20261104.md）。
+// 测试构建保留 `http_client::allocation_probe` 的计数分配器。
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{
     collections::HashMap,
     future::{Future, IntoFuture},

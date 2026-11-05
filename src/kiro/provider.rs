@@ -432,13 +432,12 @@ impl std::fmt::Display for McpCallError {
 
 impl std::error::Error for McpCallError {}
 
-fn should_log_upstream_body_size_at_info(body: &str, config: &Config) -> bool {
+fn should_log_upstream_body_size_at_info(body_weight: usize, config: &Config) -> bool {
     let payload_guard_limit = if config.payload_guard_max_bytes > 0 {
         config.payload_guard_kiro_max_weight
     } else {
         0
     };
-    let body_weight = kiro_payload_weight(body);
     let near_payload_guard_limit =
         payload_guard_limit > 0 && body_weight > payload_guard_limit.saturating_mul(70) / 100;
     let compression_enabled =
@@ -1209,23 +1208,36 @@ impl KiroStreamResponse {
 /// 上游已经开始处理过这一轮之后的重发：换掉 `conversationId` 和 `agentContinuationId`。
 /// 线上 2026-09-30 统计，5xx 之后用原标识重发 137 次全部返回 400 Improperly formed request。
 pub(crate) fn refresh_kiro_request_identity(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let state = value.get("conversationState")?;
-    let mut refreshed = body.to_string();
-    let mut replaced_conversation = false;
-    for key in ["conversationId", "agentContinuationId"] {
-        let Some(old) = state.get(key).and_then(serde_json::Value::as_str) else {
+    // 只读出两个标识，不把整个请求体解析成 DOM；重试时请求体常有几 MB。
+    let head = crate::kiro::request_head::KiroRequestHead::parse(body)?;
+    head.conversation_id.as_ref()?;
+    let mut replacements: Vec<(usize, usize, String)> = Vec::with_capacity(2);
+    for (key, old) in [
+        ("conversationId", &head.conversation_id),
+        ("agentContinuationId", &head.agent_continuation_id),
+    ] {
+        let Some(old) = old.as_deref() else {
             continue;
         };
         let old_pair = format!("\"{key}\":{}", serde_json::to_string(old).ok()?);
-        if refreshed.matches(&old_pair).count() != 1 {
+        let mut matches = body.match_indices(old_pair.as_str());
+        let (start, _) = matches.next()?;
+        if matches.next().is_some() {
             return None;
         }
         let new_pair = format!("\"{key}\":\"{}\"", uuid::Uuid::new_v4());
-        refreshed = refreshed.replacen(&old_pair, &new_pair, 1);
-        replaced_conversation |= key == "conversationId";
+        replacements.push((start, start + old_pair.len(), new_pair));
     }
-    replaced_conversation.then_some(refreshed)
+    replacements.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut refreshed = String::with_capacity(body.len() + 64);
+    let mut copied = 0;
+    for (start, end, new_pair) in &replacements {
+        refreshed.push_str(&body[copied..*start]);
+        refreshed.push_str(new_pair);
+        copied = *end;
+    }
+    refreshed.push_str(&body[copied..]);
+    Some(refreshed)
 }
 
 #[cfg(test)]
@@ -3330,18 +3342,33 @@ mod tests {
             },
             "unknownRoot": {"z":1.0,"a":1e+02}
         }"#;
-        let mut expected_ide: serde_json::Value = serde_json::from_str(ide_mutation_body).unwrap();
-        expected_ide["profileArn"] = serde_json::json!(PROFILE_ARN);
-        let expected_ide = serde_json::to_string(&expected_ide).unwrap();
+        // IDE 只缺 profileArn 时直接追加到根对象末尾，其余字节原样保留，不经过 DOM 重排。
+        let ide_close = ide_mutation_body.rfind('}').unwrap();
+        let expected_ide = format!(
+            "{},\"profileArn\":\"{PROFILE_ARN}\"{}",
+            &ide_mutation_body[..ide_close],
+            &ide_mutation_body[ide_close..]
+        );
+        let expected_ide_compressed =
+            crate::http_client::maybe_compress_json_whitespace(expected_ide.clone(), true);
 
         let mut capture_index = 0;
-        for (endpoint_name, path, content_type, profile_arn, body, mutation_expected) in [
+        for (
+            endpoint_name,
+            path,
+            content_type,
+            profile_arn,
+            body,
+            mutation_expected,
+            compressed_expected,
+        ) in [
             (
                 "cli",
                 "/",
                 "application/x-amz-json-1.0",
                 None,
                 no_op_body,
+                None,
                 None,
             ),
             (
@@ -3351,6 +3378,7 @@ mod tests {
                 Some(PROFILE_ARN),
                 cli_mutation_body,
                 Some(expected_cli.as_str()),
+                Some(expected_cli.as_str()),
             ),
             (
                 "ide",
@@ -3358,6 +3386,7 @@ mod tests {
                 "application/json",
                 None,
                 no_op_body,
+                None,
                 None,
             ),
             (
@@ -3367,6 +3396,7 @@ mod tests {
                 Some(PROFILE_ARN),
                 ide_mutation_body,
                 Some(expected_ide.as_str()),
+                Some(expected_ide_compressed.as_str()),
             ),
         ] {
             for compression_enabled in [false, true] {
@@ -3376,11 +3406,11 @@ mod tests {
                     profile_arn,
                     compression_enabled,
                 );
-                let expected = mutation_expected.unwrap_or(if compression_enabled {
-                    compressed_no_op_body
+                let expected = if compression_enabled {
+                    compressed_expected.unwrap_or(compressed_no_op_body)
                 } else {
-                    no_op_body
-                });
+                    mutation_expected.unwrap_or(no_op_body)
+                };
                 for is_stream in [false, true] {
                     for round in 0..5 {
                         call_body_capture_provider(&provider, body, is_stream).await;
@@ -8508,6 +8538,83 @@ mod tests {
         assert!(super::refresh_kiro_request_identity("not json").is_none());
     }
 
+    /// conversationId 不一定是 36 位 UUID：客户端可以通过 `metadata.user_id` 换出别的形状。
+    /// 换身份必须对任意长度都成立，不能假设 UUID 的定长。
+    #[test]
+    fn refresh_kiro_request_identity_accepts_any_conversation_id_length() {
+        for id in ["", "a", "conv-1", &"x".repeat(2000)] {
+            let body =
+                format!(r#"{{"conversationState":{{"conversationId":"{id}","history":[]}}}}"#);
+            let refreshed = super::refresh_kiro_request_identity(&body).expect("located");
+            let value: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
+            let conversation = value["conversationState"]["conversationId"]
+                .as_str()
+                .unwrap();
+            assert_eq!(conversation.len(), 36);
+            let restored = refreshed.replacen(conversation, id, 1);
+            assert_eq!(restored, body);
+        }
+
+        // 正文里出现同一个字符串不算冲突：只匹配完整片段 `"conversationId":"<id>"`。
+        let echo =
+            r#"{"conversationState":{"conversationId":"dup"},"history":[{"content":"dup"}]}"#;
+        assert!(super::refresh_kiro_request_identity(echo).is_some());
+
+        // 完整片段出现两次时无法确定改哪个，按原样重发，让上游裁决。
+        let ambiguous = r#"{"conversationState":{"conversationId":"dup","agentContinuationId":"a"},"history":[{"conversationId":"dup"}]}"#;
+        assert!(super::refresh_kiro_request_identity(ambiguous).is_none());
+
+        // conversationId 是空字符串时同样可以定位（形如 `"conversationId":""`）。
+        let empty = r#"{"conversationState":{"conversationId":""}}"#;
+        let refreshed = super::refresh_kiro_request_identity(empty).expect("empty id located");
+        assert!(!refreshed.contains(r#""conversationId":"""#));
+
+        // 非字符串类型不换身份，交给上游裁决，和 `Value::as_str` 的语义一致。
+        assert!(
+            super::refresh_kiro_request_identity(r#"{"conversationState":{"conversationId":7}}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn refresh_kiro_request_identity_keeps_value_semantics_for_five_rounds() {
+        for round in 0..5 {
+            // 只有 conversationId 时只换它。
+            let body = r#"{"conversationState":{"conversationId":"conv-1","history":[]}}"#;
+            let refreshed = super::refresh_kiro_request_identity(body).expect("located");
+            let value: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
+            let conversation = value["conversationState"]["conversationId"]
+                .as_str()
+                .unwrap();
+            assert!(uuid::Uuid::parse_str(conversation).is_ok(), "round {round}");
+            assert_eq!(refreshed.replace(conversation, "conv-1"), body);
+
+            // 带转义的旧值也能定位。
+            let body = r#"{"conversationState":{"agentContinuationId":"c\"1","conversationId":"a/b\u00e9"}}"#;
+            let refreshed = super::refresh_kiro_request_identity(body);
+            // serde_json 重新编码时 `\u00e9` 写成 é，和原文不一致，定位失败就按原样重发。
+            assert!(refreshed.is_none(), "round {round}");
+            let body =
+                r#"{"conversationState":{"agentContinuationId":"c\"1","conversationId":"conv"}}"#;
+            let refreshed = super::refresh_kiro_request_identity(body).expect("escaped located");
+            assert!(!refreshed.contains(r#""c\"1""#), "round {round}");
+            assert!(!refreshed.contains(r#""conv""#), "round {round}");
+
+            // conversationId 不是字符串、或者出现不止一次（无法确定改哪个）时不改。
+            for body in [
+                r#"{"conversationState":{"conversationId":7}}"#,
+                r#"{"conversationState":{"conversationId":"x"},"history":[{"conversationId":"x"}]}"#,
+                r#"{"conversationState":"x"}"#,
+                r#"[]"#,
+            ] {
+                assert!(
+                    super::refresh_kiro_request_identity(body).is_none(),
+                    "round {round}: {body}"
+                );
+            }
+        }
+    }
+
     /// S7 补充：500 与 429 混合 —— 5xx 同属可重试类，也应参与轮换并被账号覆盖。
     #[tokio::test]
     async fn s7_server_errors_participate_in_rotation_alongside_rate_limits() {
@@ -11271,13 +11378,14 @@ impl KiroProvider {
             endpoint.transform_api_body(request_body, &rctx),
             config.compression.enabled && config.compression.whitespace_compression,
         );
-        if should_log_upstream_body_size_at_info(&body, &config) {
+        let body_weight = kiro_payload_weight(&body);
+        if should_log_upstream_body_size_at_info(body_weight, &config) {
             tracing::info!(
                 endpoint = endpoint.name(),
                 credential_id = ctx.id,
                 credential_label = %credential_label,
                 upstream_body_bytes = body.len(),
-                upstream_body_weight = kiro_payload_weight(&body),
+                upstream_body_weight = body_weight,
                 upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                 pre_endpoint_body_bytes = request_body.len(),
                 compression_enabled = config.compression.enabled
@@ -11290,7 +11398,7 @@ impl KiroProvider {
                 credential_id = ctx.id,
                 credential_label = %credential_label,
                 upstream_body_bytes = body.len(),
-                upstream_body_weight = kiro_payload_weight(&body),
+                upstream_body_weight = body_weight,
                 upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                 pre_endpoint_body_bytes = request_body.len(),
                 compression_enabled = config.compression.enabled
@@ -13197,10 +13305,9 @@ impl KiroProvider {
         let api_type = if is_stream { "流式" } else { "非流式" };
         let mut attempts: Vec<KiroCredentialAttempt> = Vec::new();
 
-        let model = dispatch_model_filter
-            .map(str::to_string)
-            .or_else(|| Self::extract_model_from_request(request_body));
-        let conversation_id = Self::extract_conversation_id_from_request(request_body);
+        let (request_model, conversation_id) =
+            Self::extract_dispatch_keys_from_request(request_body);
+        let model = dispatch_model_filter.map(str::to_string).or(request_model);
         // Credentials whose route rules reject this request route never take it; excluding them
         // up front keeps every later retry, sticky and alternate check route-aware.
         let mut excluded_ids: HashSet<u64> =
@@ -13362,7 +13469,8 @@ impl KiroProvider {
                 ),
                 config.compression.enabled && config.compression.whitespace_compression,
             );
-            if should_log_upstream_body_size_at_info(&body, &config) {
+            let body_weight = kiro_payload_weight(&body);
+            if should_log_upstream_body_size_at_info(body_weight, &config) {
                 tracing::info!(
                     request_id,
                     api_type,
@@ -13372,7 +13480,7 @@ impl KiroProvider {
                     attempt = attempt + 1,
                     max_retries,
                     upstream_body_bytes = body.len(),
-                    upstream_body_weight = kiro_payload_weight(&body),
+                    upstream_body_weight = body_weight,
                     upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                     model = model.as_deref(),
                     conversation_id = conversation_id.as_deref(),
@@ -13391,7 +13499,7 @@ impl KiroProvider {
                     attempt = attempt + 1,
                     max_retries,
                     upstream_body_bytes = body.len(),
-                    upstream_body_weight = kiro_payload_weight(&body),
+                    upstream_body_weight = body_weight,
                     upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                     model = model.as_deref(),
                     conversation_id = conversation_id.as_deref(),
@@ -15641,23 +15749,22 @@ impl KiroProvider {
         )
     }
 
-    /// 从请求体中提取模型信息
-    ///
-    /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
-    fn extract_model_from_request(request_body: &str) -> Option<String> {
-        use serde_json::Value;
-
-        let json: Value = serde_json::from_str(request_body).ok()?;
-
-        json.get("conversationState")?
-            .get("currentMessage")?
-            .get("userInputMessage")?
-            .get("modelId")?
-            .as_str()
-            .map(|s| s.to_string())
+    /// 从请求体中一次读出调度用的模型（`conversationState.currentMessage.userInputMessage.modelId`）
+    /// 和 Kiro conversationId（用于账号粘性调度，空白视为缺失）。不把请求体解析成 DOM。
+    fn extract_dispatch_keys_from_request(request_body: &str) -> (Option<String>, Option<String>) {
+        let Some(head) = crate::kiro::request_head::KiroRequestHead::parse(request_body) else {
+            return (None, None);
+        };
+        let model = head.model_id.map(std::borrow::Cow::into_owned);
+        let conversation_id = head
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        (model, conversation_id)
     }
 
-    /// 从请求体中提取 Kiro conversationId，用于账号粘性调度。
     /// Replaces the request identity before retrying an attempt the upstream had already
     /// started processing (5xx, timeout, broken response body). Kiro answers every resend of
     /// such a turn with "Improperly formed request" while the same ids are reused; retries
@@ -15683,27 +15790,14 @@ impl KiroProvider {
         }
     }
 
-    fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
-        use serde_json::Value;
-
-        let json: Value = serde_json::from_str(request_body).ok()?;
-
-        json.get("conversationState")?
-            .get("conversationId")?
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    }
-
     #[cfg(test)]
     pub(crate) fn test_extract_model_from_request(request_body: &str) -> Option<String> {
-        Self::extract_model_from_request(request_body)
+        Self::extract_dispatch_keys_from_request(request_body).0
     }
 
     #[cfg(test)]
     pub(crate) fn test_extract_conversation_id_from_request(request_body: &str) -> Option<String> {
-        Self::extract_conversation_id_from_request(request_body)
+        Self::extract_dispatch_keys_from_request(request_body).1
     }
 
     /// 上游返回 `MODEL_TEMPORARILY_UNAVAILABLE`：模型容量不足（"unexpectedly high load"），

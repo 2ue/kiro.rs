@@ -255,12 +255,48 @@ for case_name in $CASES; do
     -d "$(echo "$mock_json" | python3 -c 'import json,sys;d=json.load(sys.stdin);d["resetCounters"]=True;print(json.dumps(d))')" >/dev/null
   (cd "$D" && RUST_LOG=info nohup ./kiro-rs -c config.json --credentials credentials.json > "$D/server-$case_name.log" 2>&1 < /dev/null &)
   wait_port $PORT || { tail -20 "$D/server-$case_name.log"; stop_all; continue; }
+  # Process CPU and RSS of the server for the whole case: a fault must not pin CPU, and the
+  # pool must come back to idle CPU after it. One line per second: epoch utime stime rss_kb.
+  (
+    pid=$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
+    [ -z "$pid" ] && exit 0
+    while kill -0 "$pid" 2>/dev/null; do
+      # macOS 没有 /proc；ps 的 utime/stime 是「[[dd-]hh:]mm:ss.ff」，统一转成秒。
+      read -r u s rss < <(ps -o utime=,stime=,rss= -p "$pid" 2>/dev/null)
+      secs() { python3 -c 'import sys;v=sys.argv[1].split(":");t=0.0
+for p in v: t=t*60+float(p)
+print(t)' "$1" 2>/dev/null || echo 0; }
+      echo "$(date +%s) $(secs "${u:-0}") $(secs "${s:-0}") ${rss:-0}"
+      sleep 1
+    done
+  ) > "$OUT_DIR/$case_name.cpu.txt" 2>/dev/null &
+  SAMPLER=$!
   sleep 3
   # shellcheck disable=SC2086
   $NODE "$REPO/scripts/loadtest/overload-probe.mjs" --base-url "http://127.0.0.1:$PORT" --api-key "$API_KEY" --admin-key "$ADMIN_KEY" \
     --kiro-mock "http://127.0.0.1:$MOCK_PORT" --accounts "$ACCOUNTS" --account-limits "$D/limits.json" \
     --profile "$profile" --max-sockets "${MAX_SOCKETS:-300}" --global-max "$GLOBAL_MAX" $flags ${plan:+--upstream-plan "$plan"} --out "$OUT_DIR/$case_name.json" 2>&1 | tail -12
   echo "load: $(uptime | awk -F'load averages: ' '{print $2}')  rss_mb: $(ps -o rss= -p "$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t | head -1)" 2>/dev/null | awk '{print int($1/1024)}')"
+  kill "$SAMPLER" 2>/dev/null || true
+  python3 - "$OUT_DIR/$case_name.cpu.txt" <<'PY'
+import sys
+rows = [l.split() for l in open(sys.argv[1]) if l.strip()]
+if len(rows) > 2:
+    t0 = int(rows[0][0])
+    prev = [float(rows[0][1]), float(rows[0][2])]
+    cpu = []
+    for row in rows[1:]:
+        t, u, s = int(row[0]), float(row[1]), float(row[2])
+        if t > t0:
+            cpu.append((u - prev[0] + s - prev[1]) * 100.0 / (t - t0))
+        prev = [u, s]
+        t0 = t
+    rss = [int(row[3]) // 1024 for row in rows]
+    cpu.sort()
+    n = len(cpu)
+    print(f"cpu_total_pct: p50={cpu[n//2]:.0f} p95={cpu[int(n*0.95) if int(n*0.95) < n else n-1]:.0f} max={cpu[-1]:.0f} "
+          f"secs_over_400={sum(1 for c in cpu if c > 400)}/{n} rss_end_mb={rss[-1]} rss_peak_mb={max(rss)}")
+PY
   echo "redis leases after: $(docker exec kiro-rs-redis-local redis-cli -n $REDIS_DB GET kiro-overload-probe:scheduler:global:inflight:weighted_count)"
   sed -E 's/\x1b\[[0-9;]*m//g' "$D/server-$case_name.log" | grep -E " (WARN|ERROR) " \
     | grep -vE "machine_id|native reasoning|capability cohort|slow interaction diagnostic" \

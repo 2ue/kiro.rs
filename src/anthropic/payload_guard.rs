@@ -1582,6 +1582,10 @@ fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
 }
 
 pub fn kiro_payload_weight(payload: &str) -> usize {
+    // 绝大多数请求体是纯 ASCII（JSON 里的中文按 UTF-8 存也是非 ASCII 字节，所以这里只覆盖真 ASCII）。
+    if payload.is_ascii() {
+        return payload.len();
+    }
     payload
         .chars()
         .map(|ch| {
@@ -5494,6 +5498,43 @@ mod tests {
         assert_eq!(ascii.len(), chinese.len());
         assert_eq!(kiro_payload_weight(&ascii), 300);
         assert_eq!(kiro_payload_weight(&chinese), 800);
+    }
+
+    #[test]
+    fn kiro_payload_weight_fast_path_matches_the_character_sum_for_five_rounds() {
+        let reference = |payload: &str| {
+            payload
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii() {
+                        1
+                    } else {
+                        KIRO_NON_ASCII_PAYLOAD_WEIGHT
+                    }
+                })
+                .sum::<usize>()
+        };
+        let mixed = format!(
+            r#"{{"conversationState":{{"history":["{}","中文","🙂é","\u00e9","\n"]}}}}"#,
+            "x".repeat(50_000)
+        );
+        let cases = [
+            "",
+            "hello",
+            &mixed,
+            "全部非 ASCII：中文内容",
+            "\\u0041 is still ASCII in the JSON text",
+            "line\nbreak\t",
+        ];
+        for round in 0..5 {
+            for case in cases {
+                assert_eq!(
+                    kiro_payload_weight(case),
+                    reference(case),
+                    "round {round}: {case:.40}"
+                );
+            }
+        }
     }
 
     #[test]
