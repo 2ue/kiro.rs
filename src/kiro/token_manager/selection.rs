@@ -14,7 +14,7 @@ use crate::model::config::Config;
 
 use super::account_state::CredentialEntry;
 use super::capacity::{credential_catalog_lists_model, effective_max_concurrent_requests};
-use super::degrade::{effective_score, is_suspended};
+use super::degrade::is_suspended;
 use super::strategy::{select_health_weighted, should_select_warming_from_totals};
 
 /// Load-balancing mode. Persisted as its snake_case name; unknown names are rejected when the
@@ -117,8 +117,7 @@ pub(crate) fn select_candidate<'a>(
         retain_preferred_priority_tier(&mut available);
     }
     let candidates = warmup_group(available, config);
-    let picked = order_by_mode(mode, &candidates, model, now_ms, config, bound_sessions);
-    picked
+    order_by_mode(mode, &candidates, model, now_ms, config, bound_sessions)
 }
 
 /// Sessions count as active on a credential for this long after their last request.
@@ -204,7 +203,8 @@ fn retain_non_degraded(
 ) {
     let threshold = config.credential_degrade_suspend_score;
     // 恢复线低于摘除线，两者之间的滞回带防止账号在「恢复—吃满流量—再失败—摘除」之间横跳。
-    let resume_score = (threshold * config.credential_degrade_resume_ratio.clamp(0.0, 1.0)).max(0.0);
+    let resume_score =
+        (threshold * config.credential_degrade_resume_ratio.clamp(0.0, 1.0)).max(0.0);
     if !config.credential_degrade_enabled || resume_score <= 0.0 || available.len() <= 1 {
         return;
     }
@@ -323,8 +323,8 @@ fn spread_key(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::degrade;
+    use super::*;
 
     #[test]
     fn mode_names_round_trip_and_unknown_names_are_rejected() {

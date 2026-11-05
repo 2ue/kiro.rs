@@ -7010,8 +7010,7 @@ impl Default for Config {
             credential_degrade_success_decay: default_credential_degrade_success_decay(),
             credential_degrade_resume_ratio: default_credential_degrade_resume_ratio(),
             credential_degrade_probe_percent: default_credential_degrade_probe_percent(),
-            credential_degrade_empty_turn_weight:
-                default_credential_degrade_empty_turn_weight(),
+            credential_degrade_empty_turn_weight: default_credential_degrade_empty_turn_weight(),
             credential_degrade_stream_weight: default_credential_degrade_stream_weight(),
             credential_auto_heal_min_interval_secs: default_credential_auto_heal_min_interval_secs(
             ),

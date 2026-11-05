@@ -908,8 +908,11 @@ impl KiroApiCompletion {
                 .token_manager
                 .runtime_config_snapshot()
                 .credential_degrade_empty_turn_weight;
-            self.token_manager
-                .record_degrade_failure(self.credential_id, self.model.as_deref(), weight);
+            self.token_manager.record_degrade_failure(
+                self.credential_id,
+                self.model.as_deref(),
+                weight,
+            );
         }
     }
 
@@ -1106,6 +1109,16 @@ impl KiroStreamCompletion {
             return;
         }
         self.in_flight_lease.lock().take();
+        // 不冷却，但留下劣化信号：反复空回的账号会在调度里被暂时摘除。
+        let weight = self
+            .token_manager
+            .runtime_config_snapshot()
+            .credential_degrade_empty_turn_weight;
+        self.token_manager.record_degrade_failure(
+            self.credential_id,
+            self.model.as_deref(),
+            weight,
+        );
     }
 
     /// 上游流读取错误、idle timeout 或上游错误事件时调用。
@@ -1115,23 +1128,31 @@ impl KiroStreamCompletion {
     pub fn report_upstream_stream_failure(&self, reason: impl Into<String>) {
         let cool_down = self.token_manager.upstream_failure_cooldown_enabled()
             || self.token_manager.note_upstream_fault(self.credential_id);
-        if !cool_down {
-            // 不冷却时仍记劣化分（权重低于空轮次：流截断更偏上游）。
-            let weight = self
-                .token_manager
-                .runtime_config_snapshot()
-                .credential_degrade_stream_weight;
-            self.token_manager
-                .record_degrade_failure(self.credential_id, self.model.as_deref(), weight);
-        }
-        self.report_stream_failure(reason.into(), cool_down);
+        self.report_stream_failure_inner(reason.into(), cool_down, true);
     }
 
     fn report_stream_failure(&self, reason: String, cool_down: bool) {
+        self.report_stream_failure_inner(reason, cool_down, false);
+    }
+
+    fn report_stream_failure_inner(&self, reason: String, cool_down: bool, degrade: bool) {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
         self.in_flight_lease.lock().take();
+        if degrade && !cool_down {
+            // 不冷却时仍记劣化分（权重低于空轮次：流截断更偏上游）。放在去重之后，
+            // 同一个请求重复上报不会被放大成多次失败。
+            let weight = self
+                .token_manager
+                .runtime_config_snapshot()
+                .credential_degrade_stream_weight;
+            self.token_manager.record_degrade_failure(
+                self.credential_id,
+                self.model.as_deref(),
+                weight,
+            );
+        }
         if cool_down {
             if let Err(err) = self.token_manager.report_transient_failure_kind(
                 self.credential_id,
@@ -7838,6 +7859,121 @@ mod tests {
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.entries[0].in_flight_requests, 0);
         assert_eq!(snapshot.entries[0].success_count, 0);
+    }
+
+    fn degrade_test_credential() -> KiroCredentials {
+        KiroCredentials {
+            access_token: Some("token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        }
+    }
+
+    fn degrade_test_manager() -> Arc<MultiTokenManager> {
+        Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![degrade_test_credential()],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    const DEGRADE_MODEL: &str = "claude-sonnet-4.5";
+
+    fn degrade_stream_completion(manager: &Arc<MultiTokenManager>) -> KiroStreamCompletion {
+        KiroStreamCompletion::new(
+            manager.clone(),
+            1,
+            None,
+            None,
+            Some(DEGRADE_MODEL.into()),
+            false,
+            false,
+            Vec::new(),
+            Instant::now(),
+        )
+    }
+
+    /// 端到端：流式空回 → 劣化分累积，且不冷却账号（默认 credentialEmptyTurnCooldownEnabled=false）。
+    #[test]
+    fn stream_empty_turn_feeds_the_degrade_score_without_cooling() {
+        let manager = degrade_test_manager();
+        let weight = Config::default().credential_degrade_empty_turn_weight;
+        degrade_stream_completion(&manager).report_empty_turn("only usage");
+        assert!((manager.degrade_score_for_test(1, Some(DEGRADE_MODEL)) - weight).abs() < 1e-3);
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.entries[0].cooled_down, "空回默认不冷却");
+        assert_eq!(
+            snapshot.entries[0].in_flight_requests, 0,
+            "空回必须释放并发占用"
+        );
+    }
+
+    /// 端到端：非流式空回同样累积劣化分。
+    #[test]
+    fn api_empty_turn_feeds_the_degrade_score() {
+        let manager = degrade_test_manager();
+        let lease = manager.acquire_in_flight_lease_for_test(1);
+        let completion = super::KiroApiCompletion::new(
+            manager.clone(),
+            1,
+            lease,
+            None,
+            Some(DEGRADE_MODEL.into()),
+            false,
+            false,
+            Vec::new(),
+            Instant::now(),
+        );
+        completion.report_empty_turn("json_stream_incomplete_body");
+        drop(completion);
+        assert!(manager.degrade_score_for_test(1, Some(DEGRADE_MODEL)) > 0.0);
+        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+    }
+
+    /// 端到端：上游流故障（不冷却时）累积较低权重的劣化分；成功按系数衰减。
+    #[test]
+    fn upstream_stream_failure_and_success_move_the_degrade_score() {
+        let manager = degrade_test_manager();
+        let config = Config::default();
+        degrade_stream_completion(&manager).report_upstream_stream_failure("read error");
+        let after_failure = manager.degrade_score_for_test(1, Some(DEGRADE_MODEL));
+        assert!((after_failure - config.credential_degrade_stream_weight).abs() < 1e-3);
+
+        degrade_stream_completion(&manager).report_success();
+        let after_success = manager.degrade_score_for_test(1, Some(DEGRADE_MODEL));
+        assert!(
+            (after_success - after_failure * config.credential_degrade_success_decay).abs() < 1e-3,
+            "成功按 successDecay 衰减: {after_failure} -> {after_success}"
+        );
+    }
+
+    /// 同一个完成对象重复上报只记一次，不会把单次空回放大成多次。
+    #[test]
+    fn repeated_reports_on_one_completion_count_once() {
+        let manager = degrade_test_manager();
+        let completion = degrade_stream_completion(&manager);
+        completion.report_empty_turn("only usage");
+        completion.report_empty_turn("only usage");
+        completion.report_upstream_stream_failure("read error");
+        drop(completion);
+        let weight = Config::default().credential_degrade_empty_turn_weight;
+        assert!((manager.degrade_score_for_test(1, Some(DEGRADE_MODEL)) - weight).abs() < 1e-3);
+    }
+
+    /// 开关关闭：完全不记劣化分。
+    #[test]
+    fn disabled_degrade_records_nothing() {
+        let manager = degrade_test_manager();
+        manager
+            .update_runtime_config(|config| config.credential_degrade_enabled = false)
+            .unwrap();
+        degrade_stream_completion(&manager).report_empty_turn("only usage");
+        assert_eq!(manager.degrade_score_for_test(1, Some(DEGRADE_MODEL)), 0.0);
     }
 
     #[test]

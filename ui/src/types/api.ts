@@ -2538,6 +2538,14 @@ export interface RuntimeConfig {
   credentialUpstreamFailureCooldownEnabled: boolean
   credentialAutoHealMinIntervalSecs: number
   credentialAutoHealMaxConsecutiveRounds: number
+  credentialDegradeEnabled: boolean
+  credentialDegradeSuspendScore: number
+  credentialDegradeResumeRatio: number
+  credentialDegradeHalfLifeSecs: number
+  credentialDegradeSuccessDecay: number
+  credentialDegradeProbePercent: number
+  credentialDegradeEmptyTurnWeight: number
+  credentialDegradeStreamWeight: number
   /** 自动同步 Kiro 客户端版本号（默认关闭）。 */
   kiroVersionAutoSyncEnabled: boolean
   /** 最近一次自动同步读到的官方版本。 */

@@ -1960,3 +1960,48 @@ fn batch_update_accepts_route_policy_alone() {
     );
     assert_eq!(policy.route_rules, vec!["/cc".to_string()]);
 }
+
+#[test]
+fn degrade_settings_keep_current_values_and_clamp_bad_input() {
+    let current = crate::model::config::Config::default();
+
+    let required = serde_json::json!({
+        "credentialRpm": 0,
+        "credentialTransientCooldownSecs": 10,
+        "credentialMaxCooldownSecs": 300,
+        "credentialWarmupRequests": 0,
+        "compressionEnabled": false,
+    });
+    let empty: UpdateRuntimeConfigRequest = serde_json::from_value(required.clone()).unwrap();
+    let kept = resolve_degrade_settings(&empty, &current);
+    assert!(kept.enabled);
+    assert_eq!(kept.suspend_score, current.credential_degrade_suspend_score);
+    assert_eq!(kept.probe_percent, current.credential_degrade_probe_percent);
+
+    let mut bad = required;
+    bad.as_object_mut().unwrap().extend(
+        serde_json::json!({
+        "credentialDegradeEnabled": false,
+        "credentialDegradeSuspendScore": -3.0,
+        "credentialDegradeResumeRatio": 4.0,
+        "credentialDegradeHalfLifeSecs": 0,
+        "credentialDegradeSuccessDecay": 2.0,
+        "credentialDegradeProbePercent": 500,
+        "credentialDegradeEmptyTurnWeight": 1e9,
+        "credentialDegradeStreamWeight": -1.0
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let bad: UpdateRuntimeConfigRequest = serde_json::from_value(bad).unwrap();
+    let clamped = resolve_degrade_settings(&bad, &current);
+    assert!(!clamped.enabled);
+    assert_eq!(clamped.suspend_score, 0.0);
+    assert_eq!(clamped.resume_ratio, 1.0);
+    assert_eq!(clamped.half_life_secs, 1);
+    assert_eq!(clamped.success_decay, 1.0);
+    assert_eq!(clamped.probe_percent, 100);
+    assert_eq!(clamped.empty_turn_weight, 100.0);
+    assert_eq!(clamped.stream_weight, 0.0);
+}

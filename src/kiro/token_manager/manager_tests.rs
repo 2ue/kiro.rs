@@ -16672,10 +16672,7 @@ async fn degrading_one_credential_only_removes_that_one_in_real_dispatch() {
         picked.push(ctx.id);
         ctx.release_in_flight();
     }
-    assert!(
-        !picked.contains(&1),
-        "被摘除的账号不该再被选中: {picked:?}"
-    );
+    assert!(!picked.contains(&1), "被摘除的账号不该再被选中: {picked:?}");
     assert!(
         picked.contains(&2),
         "同档位健康账号必须继续服务: {picked:?}"
@@ -16692,10 +16689,11 @@ async fn degrading_every_credential_never_starves_dispatch() {
     }
 
     for _ in 0..6 {
-        let mut ctx = tokio::time::timeout(StdDuration::from_secs(2), manager.acquire_context(None))
-            .await
-            .expect("全部账号劣化时不允许排队或阻塞")
-            .unwrap();
+        let mut ctx =
+            tokio::time::timeout(StdDuration::from_secs(2), manager.acquire_context(None))
+                .await
+                .expect("全部账号劣化时不允许排队或阻塞")
+                .unwrap();
         ctx.release_in_flight();
     }
 }
@@ -16808,6 +16806,93 @@ async fn disabling_degrade_keeps_the_old_dispatch_behaviour() {
     ctx.release_in_flight();
 }
 
+/// 设计契约：劣化分只在本进程内，不跨实例同步。
+///
+/// 两个实例共享同一批账号时，一个实例看到的空回不会让另一个实例摘除该账号。
+/// 这是刻意的：同步劣化分需要在每次失败时多一次 Redis 往返，而 59137 曾因调度侧
+/// Redis 操作超时触发熔断、整个队列被卡住。想改成跨实例同步前，先想清楚这个代价。
+#[tokio::test]
+async fn degrade_score_is_local_to_one_instance() {
+    let instance_a = degrade_test_manager(1, 1);
+    let instance_b = degrade_test_manager(1, 1);
+    degrade_credential(&instance_a, 1, None);
 
+    let mut on_a = instance_a.acquire_context(None).await.unwrap();
+    assert_eq!(on_a.id, 2, "看到空回的实例摘除该账号");
+    on_a.release_in_flight();
 
+    let mut on_b = instance_b.acquire_context(None).await.unwrap();
+    assert_eq!(on_b.id, 1, "另一实例不受影响，仍按档位优先 fast 15");
+    on_b.release_in_flight();
+    assert_eq!(instance_b.degrade_score_for_test(1, None), 0.0);
+}
 
+/// 运行时关闭开关立即生效：已累积的劣化分不再摘除账号。
+#[tokio::test]
+async fn disabling_degrade_at_runtime_restores_dispatch_immediately() {
+    let manager = degrade_test_manager(1, 1);
+    degrade_credential(&manager, 1, None);
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2);
+    ctx.release_in_flight();
+
+    manager
+        .update_runtime_config(|config| config.credential_degrade_enabled = false)
+        .unwrap();
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 1, "关闭后立即回到改动前行为");
+    ctx.release_in_flight();
+}
+
+/// 高并发：16 个并发请求同时抢 fast 10 档，劣化的 fast 15 号不被选中，也不出现排队。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_dispatch_respects_degrade_and_never_queues() {
+    let manager = Arc::new(degrade_test_manager(2, 4));
+    degrade_credential(&manager, 1, None);
+    degrade_credential(&manager, 2, None);
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let manager = manager.clone();
+        handles.push(tokio::spawn(async move {
+            tokio::time::timeout(StdDuration::from_secs(3), manager.acquire_context(None))
+                .await
+                .expect("4 个 fast 10 号 × 并发 4 = 16，足够容纳，不应排队")
+                .unwrap()
+        }));
+    }
+    let mut held = Vec::new();
+    for handle in handles {
+        held.push(handle.await.unwrap());
+    }
+    assert!(
+        held.iter().all(|ctx| ctx.id >= 3),
+        "劣化的 fast 15 号不应在健康号有容量时被选中: {:?}",
+        held.iter().map(|ctx| ctx.id).collect::<Vec<_>>()
+    );
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+}
+
+/// 健康号打满后溢出到劣化号：可用性优先于质量，不排队。
+#[tokio::test]
+async fn degraded_credential_takes_overflow_when_healthy_ones_are_full() {
+    let manager = degrade_test_manager(1, 1);
+    degrade_credential(&manager, 1, None);
+
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(
+            tokio::time::timeout(StdDuration::from_secs(2), manager.acquire_context(None))
+                .await
+                .expect("健康号满后应溢出到劣化号，而不是排队")
+                .unwrap(),
+        );
+    }
+    let on_degraded = held.iter().filter(|ctx| ctx.id == 1).count();
+    assert_eq!(on_degraded, 4, "健康号 4 并发打满后，剩余流量落到劣化号");
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+}

@@ -2956,7 +2956,7 @@ impl MultiTokenManager {
     /// 调度热路径上不能因为记账多一次存储往返（59137 曾因调度侧 Redis 操作超过 250ms
     /// 触发熔断，把整个队列卡住）。
     pub fn record_degrade_failure(&self, id: u64, model: Option<&str>, weight: f64) {
-        if !(weight > 0.0) {
+        if weight.is_nan() || weight <= 0.0 {
             return;
         }
         let (enabled, threshold, half_life_ms) = {
@@ -2994,6 +2994,21 @@ impl MultiTokenManager {
                 "账号劣化分达到阈值，调度中暂时摘除（成功或衰减后自动恢复）"
             );
         }
+    }
+
+    /// 测试用：读取某账号某模型当前的劣化分。
+    #[cfg(test)]
+    pub(crate) fn degrade_score_for_test(&self, id: u64, model: Option<&str>) -> f64 {
+        let half_life_ms =
+            (self.config.read().credential_degrade_half_life_secs.max(1) as f64) * 1000.0;
+        let now_ms = Utc::now().timestamp_millis();
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map_or(0.0, |entry| {
+                degrade::effective_score(&entry.degrade_scores, model, now_ms, half_life_ms)
+            })
     }
 
     /// 是否开放免登录的只读号池页面（默认关闭）。
@@ -6823,12 +6838,7 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
-        let (
-            max_concurrent_requests,
-            degrade_enabled,
-            degrade_resume_score,
-            degrade_half_life_ms,
-        ) = {
+        let (max_concurrent_requests, degrade_enabled, degrade_resume_score, degrade_half_life_ms) = {
             let config = self.config.read();
             (
                 config.credential_max_concurrent_requests,

@@ -305,6 +305,14 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialAutoHealMaxConsecutiveRounds: toWhole(draft.credentialAutoHealMaxConsecutiveRounds, 0),
     credentialEmptyTurnCooldownEnabled: Boolean(draft.credentialEmptyTurnCooldownEnabled),
     credentialUpstreamFailureCooldownEnabled: Boolean(draft.credentialUpstreamFailureCooldownEnabled),
+    credentialDegradeEnabled: Boolean(draft.credentialDegradeEnabled),
+    credentialDegradeSuspendScore: Math.min(1000, Math.max(0, Number(draft.credentialDegradeSuspendScore) || 0)),
+    credentialDegradeResumeRatio: Math.min(1, Math.max(0, Number(draft.credentialDegradeResumeRatio) || 0)),
+    credentialDegradeHalfLifeSecs: Math.min(86400, Math.max(1, Math.round(Number(draft.credentialDegradeHalfLifeSecs) || 1))),
+    credentialDegradeSuccessDecay: Math.min(1, Math.max(0, Number(draft.credentialDegradeSuccessDecay) || 0)),
+    credentialDegradeProbePercent: Math.min(100, Math.max(0, Math.round(Number(draft.credentialDegradeProbePercent) || 0))),
+    credentialDegradeEmptyTurnWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeEmptyTurnWeight) || 0)),
+    credentialDegradeStreamWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeStreamWeight) || 0)),
     kiroVersionAutoSyncEnabled: Boolean(draft.kiroVersionAutoSyncEnabled),
     kiroRuntimeDomainEnabled: Boolean(draft.kiroRuntimeDomainEnabled),
     credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
@@ -1288,6 +1296,14 @@ export function RuntimePage() {
                 <NumField label="流式中断后暂停" desc="流式响应中途中断后的冷却" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
                 <TogField label="空回也让账号冷却" desc="空回指上游返回成功但没有任何内容：只有用量统计、一帧数据都没有、或响应体为空。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求。打开后按「流式中断后暂停」冷却该账号。" checked={draft.credentialEmptyTurnCooldownEnabled} onChange={set('credentialEmptyTurnCooldownEnabled')} />
                 <TogField label="上游故障也让账号冷却" desc="上游故障指换任何账号都可能遇到的错误：上游 5xx、响应里的异常或错误事件、数据流解码或读取失败、网络超时。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求；账号走自己的代理时，网络超时仍会冷却。限流、鉴权、额度、风控这类账号问题不受影响，照常冷却。打开后恢复旧行为：上游故障也按各自的暂停时长冷却。" checked={draft.credentialUpstreamFailureCooldownEnabled} onChange={set('credentialUpstreamFailureCooldownEnabled')} />
+                <TogField label="反复出错的账号自动让流量" desc="账号反复空回（上游返回成功但没有内容）或流被截断时，累计一个「劣化分」。分数到线后，这个账号暂时不接新请求，流量自动转给同档或下一档的健康账号；它仍保留少量试探流量，连续成功后自动回来。不会冷却账号，也不改账号的 Fast 和优先级。所有账号都劣化时照常全部使用，不会因此排队。" checked={draft.credentialDegradeEnabled} onChange={set('credentialDegradeEnabled')} />
+                <NumField label="让出流量的分数线" desc="分数到这条线就让出流量。默认 5：空回记 2 分、流截断记 1 分，大约连续三次空回触发。0 表示只记分不让出。" value={draft.credentialDegradeSuspendScore} min={0} max={1000} step={0.5} suffix="分" onChange={set('credentialDegradeSuspendScore')} />
+                <NumField label="恢复线比例" desc="分数降到「分数线 × 这个比例」以下才恢复接流量。比例越小越不容易来回切换。默认 0.4，即 5 分要降到 2 分以下。" value={draft.credentialDegradeResumeRatio} min={0} max={1} step={0.05} suffix="倍" onChange={set('credentialDegradeResumeRatio')} />
+                <NumField label="分数自然减半时间" desc="没有新请求时，分数每过这么久减一半，长时间没出错的账号会自己恢复。" value={draft.credentialDegradeHalfLifeSecs} min={1} max={86400} suffix="秒" onChange={set('credentialDegradeHalfLifeSecs')} />
+                <NumField label="每次成功保留比例" desc="每成功一次，分数乘以这个比例。默认 0.5：两次成功基本恢复。" value={draft.credentialDegradeSuccessDecay} min={0} max={1} step={0.05} suffix="倍" onChange={set('credentialDegradeSuccessDecay')} />
+                <NumField label="让出期间试探比例" desc="让出流量的账号仍接这个比例的请求，用来判断它是否恢复。设 0 会让它永远回不来，不建议。" value={draft.credentialDegradeProbePercent} min={0} max={100} suffix="%" onChange={set('credentialDegradeProbePercent')} />
+                <NumField label="空回记分" desc="一次空回加多少分。" value={draft.credentialDegradeEmptyTurnWeight} min={0} max={100} step={0.5} suffix="分" onChange={set('credentialDegradeEmptyTurnWeight')} />
+                <NumField label="流截断记分" desc="一次流被截断或读取失败加多少分。这类错误更偏上游，默认比空回低。" value={draft.credentialDegradeStreamWeight} min={0} max={100} step={0.5} suffix="分" onChange={set('credentialDegradeStreamWeight')} />
                 <NumField label="自愈最小间隔" desc="所有账号都不可用时，因连续失败被禁用的账号会自动恢复。同一个账号两次自愈至少隔这么久；0 表示不限。" value={draft.credentialAutoHealMinIntervalSecs} min={0} max={86400} suffix="秒" onChange={set('credentialAutoHealMinIntervalSecs')} />
                 <NumField label="最多连续自愈" desc="自愈后一次都没成功就又被禁用，算连续一轮；达到上限后不再自动恢复，等人工处理。成功一次或手动启用后清零；0 表示不限。" value={draft.credentialAutoHealMaxConsecutiveRounds} min={0} max={1000} suffix="轮" onChange={set('credentialAutoHealMaxConsecutiveRounds')} />
                 <NumField label="格式异常后暂停" desc="响应格式/协议异常后的冷却" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />

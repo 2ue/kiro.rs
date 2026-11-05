@@ -6273,6 +6273,14 @@ impl AdminService {
             credential_empty_turn_cooldown_enabled: config.credential_empty_turn_cooldown_enabled,
             credential_upstream_failure_cooldown_enabled: config
                 .credential_upstream_failure_cooldown_enabled,
+            credential_degrade_enabled: config.credential_degrade_enabled,
+            credential_degrade_suspend_score: config.credential_degrade_suspend_score,
+            credential_degrade_resume_ratio: config.credential_degrade_resume_ratio,
+            credential_degrade_half_life_secs: config.credential_degrade_half_life_secs,
+            credential_degrade_success_decay: config.credential_degrade_success_decay,
+            credential_degrade_probe_percent: config.credential_degrade_probe_percent,
+            credential_degrade_empty_turn_weight: config.credential_degrade_empty_turn_weight,
+            credential_degrade_stream_weight: config.credential_degrade_stream_weight,
             credential_auto_heal_min_interval_secs: config.credential_auto_heal_min_interval_secs,
             credential_auto_heal_max_consecutive_rounds: config
                 .credential_auto_heal_max_consecutive_rounds,
@@ -6573,6 +6581,16 @@ impl AdminService {
         let credential_upstream_failure_cooldown_enabled = req
             .credential_upstream_failure_cooldown_enabled
             .unwrap_or(current_config.credential_upstream_failure_cooldown_enabled);
+        let DegradeSettings {
+            enabled: credential_degrade_enabled,
+            suspend_score: credential_degrade_suspend_score,
+            resume_ratio: credential_degrade_resume_ratio,
+            half_life_secs: credential_degrade_half_life_secs,
+            success_decay: credential_degrade_success_decay,
+            probe_percent: credential_degrade_probe_percent,
+            empty_turn_weight: credential_degrade_empty_turn_weight,
+            stream_weight: credential_degrade_stream_weight,
+        } = resolve_degrade_settings(&req, &current_config);
         let credential_auto_heal_min_interval_secs = req
             .credential_auto_heal_min_interval_secs
             .unwrap_or(current_config.credential_auto_heal_min_interval_secs)
@@ -7151,6 +7169,14 @@ impl AdminService {
                     credential_empty_turn_cooldown_enabled;
                 config.credential_upstream_failure_cooldown_enabled =
                     credential_upstream_failure_cooldown_enabled;
+                config.credential_degrade_enabled = credential_degrade_enabled;
+                config.credential_degrade_suspend_score = credential_degrade_suspend_score;
+                config.credential_degrade_resume_ratio = credential_degrade_resume_ratio;
+                config.credential_degrade_half_life_secs = credential_degrade_half_life_secs;
+                config.credential_degrade_success_decay = credential_degrade_success_decay;
+                config.credential_degrade_probe_percent = credential_degrade_probe_percent;
+                config.credential_degrade_empty_turn_weight = credential_degrade_empty_turn_weight;
+                config.credential_degrade_stream_weight = credential_degrade_stream_weight;
                 config.credential_auto_heal_min_interval_secs =
                     credential_auto_heal_min_interval_secs;
                 config.credential_auto_heal_max_consecutive_rounds =
@@ -11244,4 +11270,64 @@ pub(super) fn apply_batch_import_defaults_public(
     round_robin_proxy_resource_id: Option<u64>,
 ) -> AddCredentialRequest {
     apply_batch_import_defaults(credential, defaults, round_robin_proxy_resource_id)
+}
+
+/// 劣化分配置的生效值：请求里没给的沿用当前值，非有限数回退到当前值，其余夹到合法区间。
+/// 这样一次误填（负数、NaN、比例大于 1）不会把调度弄坏。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct DegradeSettings {
+    pub(super) enabled: bool,
+    pub(super) suspend_score: f64,
+    pub(super) resume_ratio: f64,
+    pub(super) half_life_secs: u64,
+    pub(super) success_decay: f64,
+    pub(super) probe_percent: u32,
+    pub(super) empty_turn_weight: f64,
+    pub(super) stream_weight: f64,
+}
+
+pub(super) fn resolve_degrade_settings(
+    req: &UpdateRuntimeConfigRequest,
+    current: &crate::model::config::Config,
+) -> DegradeSettings {
+    let finite_or =
+        |value: Option<f64>, current: f64| value.filter(|v| v.is_finite()).unwrap_or(current);
+    DegradeSettings {
+        enabled: req
+            .credential_degrade_enabled
+            .unwrap_or(current.credential_degrade_enabled),
+        suspend_score: finite_or(
+            req.credential_degrade_suspend_score,
+            current.credential_degrade_suspend_score,
+        )
+        .clamp(0.0, 1000.0),
+        resume_ratio: finite_or(
+            req.credential_degrade_resume_ratio,
+            current.credential_degrade_resume_ratio,
+        )
+        .clamp(0.0, 1.0),
+        half_life_secs: req
+            .credential_degrade_half_life_secs
+            .unwrap_or(current.credential_degrade_half_life_secs)
+            .clamp(1, 86_400),
+        success_decay: finite_or(
+            req.credential_degrade_success_decay,
+            current.credential_degrade_success_decay,
+        )
+        .clamp(0.0, 1.0),
+        probe_percent: req
+            .credential_degrade_probe_percent
+            .unwrap_or(current.credential_degrade_probe_percent)
+            .min(100),
+        empty_turn_weight: finite_or(
+            req.credential_degrade_empty_turn_weight,
+            current.credential_degrade_empty_turn_weight,
+        )
+        .clamp(0.0, 100.0),
+        stream_weight: finite_or(
+            req.credential_degrade_stream_weight,
+            current.credential_degrade_stream_weight,
+        )
+        .clamp(0.0, 100.0),
+    }
 }

@@ -50,7 +50,9 @@ impl DegradeScore {
 
 /// 模型名归一化；`None`（未指定模型）用空串作为键。
 pub(super) fn model_key(model: Option<&str>) -> String {
-    model.map(|value| value.trim().to_ascii_lowercase()).unwrap_or_default()
+    model
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// 该账号在 `model` 上是否应被摘除。
@@ -111,7 +113,8 @@ pub(super) fn add_failure(
             score: next,
             updated_at_ms: now_ms,
             suspended: was_suspended
-                || (suspend_score > 0.0 && next + suspend_score * THRESHOLD_EPSILON >= suspend_score),
+                || (suspend_score > 0.0
+                    && next + suspend_score * THRESHOLD_EPSILON >= suspend_score),
         },
     );
 }
@@ -144,11 +147,7 @@ pub(super) fn apply_success(
     }
 }
 
-fn evict_lowest(
-    scores: &mut HashMap<String, DegradeScore>,
-    now_ms: i64,
-    half_life_ms: f64,
-) {
+fn evict_lowest(scores: &mut HashMap<String, DegradeScore>, now_ms: i64, half_life_ms: f64) {
     let mut lowest: Option<(String, f64)> = None;
     for (key, score) in scores.iter() {
         let effective = score.effective(now_ms, half_life_ms);
@@ -214,7 +213,14 @@ mod tests {
     fn model_map_is_bounded() {
         let mut map = scores();
         for index in 0..(MAX_MODELS_PER_CREDENTIAL + 5) {
-            add_failure(&mut map, Some(&format!("model-{index}")), 1.0, 0, HALF_LIFE_MS, 6.0);
+            add_failure(
+                &mut map,
+                Some(&format!("model-{index}")),
+                1.0,
+                0,
+                HALF_LIFE_MS,
+                6.0,
+            );
         }
         assert_eq!(map.len(), MAX_MODELS_PER_CREDENTIAL);
     }
@@ -224,7 +230,14 @@ mod tests {
         let mut map = scores();
         add_failure(&mut map, Some("bad"), 9.0, 0, HALF_LIFE_MS, 6.0);
         for index in 0..MAX_MODELS_PER_CREDENTIAL {
-            add_failure(&mut map, Some(&format!("ok-{index}")), 0.1, 0, HALF_LIFE_MS, 6.0);
+            add_failure(
+                &mut map,
+                Some(&format!("ok-{index}")),
+                0.1,
+                0,
+                HALF_LIFE_MS,
+                6.0,
+            );
         }
         assert!(effective_score(&map, Some("bad"), 0, HALF_LIFE_MS) > 0.0);
     }
