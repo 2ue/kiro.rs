@@ -1886,6 +1886,11 @@ pub struct RuntimeConfigResponse {
     pub credential_degrade_probe_percent: u32,
     pub credential_degrade_empty_turn_weight: f64,
     pub credential_degrade_stream_weight: f64,
+    pub empty_turn_error_status_code: u16,
+    pub empty_turn_retry_backoff_mode: String,
+    pub empty_turn_retry_base_delay_ms: u64,
+    pub empty_turn_retry_max_delay_ms: u64,
+    pub empty_turn_retry_jitter_percent: u32,
     pub credential_auto_heal_min_interval_secs: u64,
     pub credential_auto_heal_max_consecutive_rounds: u32,
     pub kiro_version_auto_sync_enabled: bool,
@@ -2064,6 +2069,16 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_degrade_empty_turn_weight: Option<f64>,
     #[serde(default)]
     pub credential_degrade_stream_weight: Option<f64>,
+    #[serde(default)]
+    pub empty_turn_error_status_code: Option<u16>,
+    #[serde(default)]
+    pub empty_turn_retry_backoff_mode: Option<String>,
+    #[serde(default)]
+    pub empty_turn_retry_base_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub empty_turn_retry_max_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub empty_turn_retry_jitter_percent: Option<u32>,
     #[serde(default)]
     pub credential_auto_heal_min_interval_secs: Option<u64>,
     #[serde(default)]

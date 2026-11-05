@@ -2247,6 +2247,11 @@ impl StreamContext {
         if self.invalid_completed_tool_input {
             return Some(UPSTREAM_INVALID_TOOL_INPUT_DETAIL);
         }
+        // 上游报了 COMPLETED 但整条流从头到尾没有文本、推理或工具调用：仍是空回。
+        // 判定只在 EOF 执行一次，且「有输出」是累积标志，中途的空帧不影响长流。
+        if self.saw_upstream_completed && !self.has_meaningful_upstream_response() {
+            return Some(UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL);
+        }
         if self.saw_upstream_completed {
             return None;
         }
@@ -3009,6 +3014,15 @@ impl StreamContext {
         let public_message = match error_type {
             "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
             "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+            // 流里的错误事件意味着响应头已经发出：有内容输出过就是中途中断，否则是空回。
+            _ if self.has_meaningful_upstream_response() => {
+                envelope::PUBLIC_STREAM_INTERRUPTED_MESSAGE
+            }
+            _ if raw_message == UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
+                || raw_message == "upstream eventstream ended without any frames" =>
+            {
+                envelope::PUBLIC_EMPTY_RESPONSE_MESSAGE
+            }
             _ => envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
         };
         envelope::public_message_with_error_id(public_message, error_id)
@@ -7276,7 +7290,7 @@ mod tests {
             .as_str()
             .expect("message should be string");
         assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
-        assert!(message.contains("error ID: req_01masked_stream"));
+        assert!(message.contains("request id: req_01masked_stream"));
         assert!(!message.contains("upstream"));
         assert!(!message.contains("billing"));
         assert!(!message.contains("routing"));

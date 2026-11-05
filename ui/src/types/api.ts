@@ -2538,8 +2538,6 @@ export interface RuntimeConfig {
   /** 空回（只有用量统计、零帧或空响应体）是否让账号冷却，默认关闭。 */
   credentialEmptyTurnCooldownEnabled: boolean
   credentialUpstreamFailureCooldownEnabled: boolean
-  credentialAutoHealMinIntervalSecs: number
-  credentialAutoHealMaxConsecutiveRounds: number
   credentialDegradeEnabled: boolean
   credentialDegradeSuspendScore: number
   credentialDegradeResumeRatio: number
@@ -2548,6 +2546,13 @@ export interface RuntimeConfig {
   credentialDegradeProbePercent: number
   credentialDegradeEmptyTurnWeight: number
   credentialDegradeStreamWeight: number
+  emptyTurnErrorStatusCode: number
+  emptyTurnRetryBackoffMode: 'none' | 'fixed' | 'exponential'
+  emptyTurnRetryBaseDelayMs: number
+  emptyTurnRetryMaxDelayMs: number
+  emptyTurnRetryJitterPercent: number
+  credentialAutoHealMinIntervalSecs: number
+  credentialAutoHealMaxConsecutiveRounds: number
   /** 自动同步 Kiro 客户端版本号（默认关闭）。 */
   kiroVersionAutoSyncEnabled: boolean
   /** 最近一次自动同步读到的官方版本。 */

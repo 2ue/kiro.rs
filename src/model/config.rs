@@ -5190,6 +5190,30 @@ pub struct Config {
     #[serde(default = "default_credential_degrade_enabled")]
     pub credential_degrade_enabled: bool,
 
+    /// 空回（上游 200 但整条响应没有任何内容，换号重试用尽）对外返回的 HTTP 状态码。
+    ///
+    /// 只允许 502 / 503 / 529，其它值按 502 处理。默认 502：下游网关（如 sub2api）收到 529
+    /// 通常会把账号标成过载、暂停调度。流式请求在首个输出前失败同样使用该状态码；
+    /// 已经开始输出后才失败的，流内 error 事件的 type 随之变化（529→overloaded_error）。
+    #[serde(default = "default_empty_turn_error_status_code")]
+    pub empty_turn_error_status_code: u16,
+
+    /// 空回换号重试之间的等待方式：none（不等待）、fixed（固定间隔）、exponential（指数递增）。
+    #[serde(default = "default_empty_turn_retry_backoff_mode")]
+    pub empty_turn_retry_backoff_mode: String,
+
+    /// 空回重试的首次等待毫秒数（0~10000）。
+    #[serde(default = "default_empty_turn_retry_base_delay_ms")]
+    pub empty_turn_retry_base_delay_ms: u64,
+
+    /// 指数模式下空回重试等待的上限毫秒数（0~30000）。
+    #[serde(default = "default_empty_turn_retry_max_delay_ms")]
+    pub empty_turn_retry_max_delay_ms: u64,
+
+    /// 空回重试等待的随机抖动比例（0~100），避免一批请求同时打到上游。
+    #[serde(default = "default_empty_turn_retry_jitter_percent")]
+    pub empty_turn_retry_jitter_percent: u32,
+
     /// 劣化分摘除阈值；<= 0 时视为关闭摘除。
     #[serde(default = "default_credential_degrade_suspend_score")]
     pub credential_degrade_suspend_score: f64,
@@ -5894,6 +5918,26 @@ fn default_credential_stream_error_cooldown_secs() -> u64 {
 
 fn default_credential_degrade_enabled() -> bool {
     true
+}
+
+fn default_empty_turn_error_status_code() -> u16 {
+    502
+}
+
+fn default_empty_turn_retry_backoff_mode() -> String {
+    "none".to_string()
+}
+
+fn default_empty_turn_retry_base_delay_ms() -> u64 {
+    100
+}
+
+fn default_empty_turn_retry_max_delay_ms() -> u64 {
+    2000
+}
+
+fn default_empty_turn_retry_jitter_percent() -> u32 {
+    20
 }
 
 /// 5.0：两次空轮次（2.0 × 2 = 4.0）不够，三到四次之间就会触发。
@@ -7005,6 +7049,11 @@ impl Default for Config {
             credential_empty_turn_cooldown_enabled: false,
             credential_upstream_failure_cooldown_enabled: false,
             credential_degrade_enabled: default_credential_degrade_enabled(),
+            empty_turn_error_status_code: default_empty_turn_error_status_code(),
+            empty_turn_retry_backoff_mode: default_empty_turn_retry_backoff_mode(),
+            empty_turn_retry_base_delay_ms: default_empty_turn_retry_base_delay_ms(),
+            empty_turn_retry_max_delay_ms: default_empty_turn_retry_max_delay_ms(),
+            empty_turn_retry_jitter_percent: default_empty_turn_retry_jitter_percent(),
             credential_degrade_suspend_score: default_credential_degrade_suspend_score(),
             credential_degrade_half_life_secs: default_credential_degrade_half_life_secs(),
             credential_degrade_success_decay: default_credential_degrade_success_decay(),

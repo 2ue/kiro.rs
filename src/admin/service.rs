@@ -6281,6 +6281,11 @@ impl AdminService {
             credential_degrade_probe_percent: config.credential_degrade_probe_percent,
             credential_degrade_empty_turn_weight: config.credential_degrade_empty_turn_weight,
             credential_degrade_stream_weight: config.credential_degrade_stream_weight,
+            empty_turn_error_status_code: config.empty_turn_error_status_code,
+            empty_turn_retry_backoff_mode: config.empty_turn_retry_backoff_mode.clone(),
+            empty_turn_retry_base_delay_ms: config.empty_turn_retry_base_delay_ms,
+            empty_turn_retry_max_delay_ms: config.empty_turn_retry_max_delay_ms,
+            empty_turn_retry_jitter_percent: config.empty_turn_retry_jitter_percent,
             credential_auto_heal_min_interval_secs: config.credential_auto_heal_min_interval_secs,
             credential_auto_heal_max_consecutive_rounds: config
                 .credential_auto_heal_max_consecutive_rounds,
@@ -6591,6 +6596,13 @@ impl AdminService {
             empty_turn_weight: credential_degrade_empty_turn_weight,
             stream_weight: credential_degrade_stream_weight,
         } = resolve_degrade_settings(&req, &current_config);
+        let EmptyTurnSettings {
+            status_code: empty_turn_error_status_code,
+            backoff_mode: empty_turn_retry_backoff_mode,
+            base_delay_ms: empty_turn_retry_base_delay_ms,
+            max_delay_ms: empty_turn_retry_max_delay_ms,
+            jitter_percent: empty_turn_retry_jitter_percent,
+        } = resolve_empty_turn_settings(&req, &current_config);
         let credential_auto_heal_min_interval_secs = req
             .credential_auto_heal_min_interval_secs
             .unwrap_or(current_config.credential_auto_heal_min_interval_secs)
@@ -7177,6 +7189,11 @@ impl AdminService {
                 config.credential_degrade_probe_percent = credential_degrade_probe_percent;
                 config.credential_degrade_empty_turn_weight = credential_degrade_empty_turn_weight;
                 config.credential_degrade_stream_weight = credential_degrade_stream_weight;
+                config.empty_turn_error_status_code = empty_turn_error_status_code;
+                config.empty_turn_retry_backoff_mode = empty_turn_retry_backoff_mode.clone();
+                config.empty_turn_retry_base_delay_ms = empty_turn_retry_base_delay_ms;
+                config.empty_turn_retry_max_delay_ms = empty_turn_retry_max_delay_ms;
+                config.empty_turn_retry_jitter_percent = empty_turn_retry_jitter_percent;
                 config.credential_auto_heal_min_interval_secs =
                     credential_auto_heal_min_interval_secs;
                 config.credential_auto_heal_max_consecutive_rounds =
@@ -11329,5 +11346,56 @@ pub(super) fn resolve_degrade_settings(
             current.credential_degrade_stream_weight,
         )
         .clamp(0.0, 100.0),
+    }
+}
+
+/// 空回状态码与重试节奏的生效值：状态码只允许 502/503/529；等待方式只允许
+/// none/fixed/exponential；毫秒数与抖动夹到合法区间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EmptyTurnSettings {
+    pub(super) status_code: u16,
+    pub(super) backoff_mode: String,
+    pub(super) base_delay_ms: u64,
+    pub(super) max_delay_ms: u64,
+    pub(super) jitter_percent: u32,
+}
+
+pub(super) fn resolve_empty_turn_settings(
+    req: &UpdateRuntimeConfigRequest,
+    current: &crate::model::config::Config,
+) -> EmptyTurnSettings {
+    let status_code = req
+        .empty_turn_error_status_code
+        .unwrap_or(current.empty_turn_error_status_code);
+    let status_code = if matches!(status_code, 502 | 503 | 529) {
+        status_code
+    } else {
+        502
+    };
+    let backoff_mode = req
+        .empty_turn_retry_backoff_mode
+        .as_deref()
+        .unwrap_or(current.empty_turn_retry_backoff_mode.as_str())
+        .trim()
+        .to_ascii_lowercase();
+    let backoff_mode = match backoff_mode.as_str() {
+        "fixed" | "exponential" => backoff_mode,
+        _ => "none".to_string(),
+    };
+    EmptyTurnSettings {
+        status_code,
+        backoff_mode,
+        base_delay_ms: req
+            .empty_turn_retry_base_delay_ms
+            .unwrap_or(current.empty_turn_retry_base_delay_ms)
+            .min(10_000),
+        max_delay_ms: req
+            .empty_turn_retry_max_delay_ms
+            .unwrap_or(current.empty_turn_retry_max_delay_ms)
+            .min(30_000),
+        jitter_percent: req
+            .empty_turn_retry_jitter_percent
+            .unwrap_or(current.empty_turn_retry_jitter_percent)
+            .min(100),
     }
 }

@@ -549,6 +549,11 @@ const emptyConfig: RuntimeConfig = {
   credentialDegradeProbePercent: 2,
   credentialDegradeEmptyTurnWeight: 2,
   credentialDegradeStreamWeight: 1,
+  emptyTurnErrorStatusCode: 502,
+  emptyTurnRetryBackoffMode: 'none',
+  emptyTurnRetryBaseDelayMs: 100,
+  emptyTurnRetryMaxDelayMs: 2000,
+  emptyTurnRetryJitterPercent: 20,
   credentialAutoHealMinIntervalSecs: 300,
   credentialAutoHealMaxConsecutiveRounds: 5,
   kiroVersionAutoSyncEnabled: false,
@@ -3887,6 +3892,19 @@ export function RuntimeConfigPanel() {
       credentialAutoHealMaxConsecutiveRounds: toWhole(draft.credentialAutoHealMaxConsecutiveRounds, 0),
       credentialEmptyTurnCooldownEnabled: Boolean(draft.credentialEmptyTurnCooldownEnabled),
       credentialUpstreamFailureCooldownEnabled: Boolean(draft.credentialUpstreamFailureCooldownEnabled),
+      credentialDegradeEnabled: Boolean(draft.credentialDegradeEnabled),
+      credentialDegradeSuspendScore: Math.min(1000, Math.max(0, Number(draft.credentialDegradeSuspendScore) || 0)),
+      credentialDegradeResumeRatio: Math.min(1, Math.max(0, Number(draft.credentialDegradeResumeRatio) || 0)),
+      credentialDegradeHalfLifeSecs: Math.min(86400, Math.max(1, Math.round(Number(draft.credentialDegradeHalfLifeSecs) || 1))),
+      credentialDegradeSuccessDecay: Math.min(1, Math.max(0, Number(draft.credentialDegradeSuccessDecay) || 0)),
+      credentialDegradeProbePercent: Math.min(100, Math.max(0, Math.round(Number(draft.credentialDegradeProbePercent) || 0))),
+      credentialDegradeEmptyTurnWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeEmptyTurnWeight) || 0)),
+      credentialDegradeStreamWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeStreamWeight) || 0)),
+      emptyTurnErrorStatusCode: [502, 503, 529].includes(Number(draft.emptyTurnErrorStatusCode)) ? Number(draft.emptyTurnErrorStatusCode) : 502,
+      emptyTurnRetryBackoffMode: (['none', 'fixed', 'exponential'] as const).includes(draft.emptyTurnRetryBackoffMode) ? draft.emptyTurnRetryBackoffMode : 'none',
+      emptyTurnRetryBaseDelayMs: Math.min(10000, Math.max(0, Math.round(Number(draft.emptyTurnRetryBaseDelayMs) || 0))),
+      emptyTurnRetryMaxDelayMs: Math.min(30000, Math.max(0, Math.round(Number(draft.emptyTurnRetryMaxDelayMs) || 0))),
+      emptyTurnRetryJitterPercent: Math.min(100, Math.max(0, Math.round(Number(draft.emptyTurnRetryJitterPercent) || 0))),
       kiroVersionAutoSyncEnabled: Boolean(draft.kiroVersionAutoSyncEnabled),
       kiroRuntimeDomainEnabled: Boolean(draft.kiroRuntimeDomainEnabled),
       credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
@@ -3897,14 +3915,6 @@ export function RuntimeConfigPanel() {
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
       credentialSessionMaxConcurrentRequests: toWhole(
-      credentialDegradeEnabled: Boolean(draft.credentialDegradeEnabled),
-      credentialDegradeSuspendScore: Math.min(1000, Math.max(0, Number(draft.credentialDegradeSuspendScore) || 0)),
-      credentialDegradeResumeRatio: Math.min(1, Math.max(0, Number(draft.credentialDegradeResumeRatio) || 0)),
-      credentialDegradeHalfLifeSecs: Math.min(86400, Math.max(1, Math.round(Number(draft.credentialDegradeHalfLifeSecs) || 1))),
-      credentialDegradeSuccessDecay: Math.min(1, Math.max(0, Number(draft.credentialDegradeSuccessDecay) || 0)),
-      credentialDegradeProbePercent: Math.min(100, Math.max(0, Math.round(Number(draft.credentialDegradeProbePercent) || 0))),
-      credentialDegradeEmptyTurnWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeEmptyTurnWeight) || 0)),
-      credentialDegradeStreamWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeStreamWeight) || 0)),
         draft.credentialSessionMaxConcurrentRequests,
       ),
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
@@ -4189,6 +4199,39 @@ export function RuntimeConfigPanel() {
             <NumberField title="流读取错误基础冷却" description="流读取错误或上游 idle timeout 首次触发的冷却时长。" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialStreamErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialStreamErrorCooldownSecs }))} />
             <ToggleField title="空回也让账号冷却" description="空回指上游返回成功但没有任何内容：只有用量统计、一帧数据都没有、或响应体为空。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求。打开后按流读取错误基础冷却该账号。" checked={draft.credentialEmptyTurnCooldownEnabled} onCheckedChange={(credentialEmptyTurnCooldownEnabled) => setDraft((prev) => ({ ...prev, credentialEmptyTurnCooldownEnabled }))} />
             <ToggleField title="上游故障也让账号冷却" description="上游故障指换任何账号都可能遇到的错误：上游 5xx、响应里的异常或错误事件、数据流解码或读取失败、网络超时。默认关闭：只在当次请求里换号，不冷却账号；账号走自己的代理时，网络超时仍会冷却。限流、鉴权、额度、风控照常冷却。" checked={draft.credentialUpstreamFailureCooldownEnabled} onCheckedChange={(credentialUpstreamFailureCooldownEnabled) => setDraft((prev) => ({ ...prev, credentialUpstreamFailureCooldownEnabled }))} />
+            <ToggleField title="空回时暂时摘除账号" description="账号反复空回（上游返回成功但没有内容）或流被截断时，累计一个「劣化分」。分数到线后，这个账号暂时不接新请求，流量自动转给同档或下一档的健康账号；它仍保留少量试探流量，连续成功后自动回来。不会冷却账号，也不改账号的 Fast 和优先级。所有账号都劣化时照常全部使用，不会因此排队。" checked={draft.credentialDegradeEnabled} onCheckedChange={(credentialDegradeEnabled) => setDraft((prev) => ({ ...prev, credentialDegradeEnabled }))} />
+            <NumberField title="让出流量的分数线" description="分数到这条线就让出流量。默认 5：空回记 2 分、流截断记 1 分，大约连续三次空回触发。0 表示只记分不让出。" value={draft.credentialDegradeSuspendScore} min={0} max={1000} step={0.5} suffix="分" onChange={(credentialDegradeSuspendScore) => setDraft((prev) => ({ ...prev, credentialDegradeSuspendScore }))} />
+            <NumberField title="恢复线比例" description="分数降到「分数线 × 这个比例」以下才恢复接流量。比例越小越不容易来回切换。默认 0.4，即 5 分要降到 2 分以下。" value={draft.credentialDegradeResumeRatio} min={0} max={1} step={0.05} suffix="倍" onChange={(credentialDegradeResumeRatio) => setDraft((prev) => ({ ...prev, credentialDegradeResumeRatio }))} />
+            <NumberField title="分数自然减半时间" description="没有新请求时，分数每过这么久减一半，长时间没出错的账号会自己恢复。" value={draft.credentialDegradeHalfLifeSecs} min={1} max={86400} suffix="秒" onChange={(credentialDegradeHalfLifeSecs) => setDraft((prev) => ({ ...prev, credentialDegradeHalfLifeSecs }))} />
+            <NumberField title="每次成功保留比例" description="每成功一次，分数乘以这个比例。默认 0.5：两次成功基本恢复。" value={draft.credentialDegradeSuccessDecay} min={0} max={1} step={0.05} suffix="倍" onChange={(credentialDegradeSuccessDecay) => setDraft((prev) => ({ ...prev, credentialDegradeSuccessDecay }))} />
+            <NumberField title="让出期间试探比例" description="让出流量的账号仍接这个比例的请求，用来判断它是否恢复。设 0 会让它永远回不来，不建议。" value={draft.credentialDegradeProbePercent} min={0} max={100} suffix="%" onChange={(credentialDegradeProbePercent) => setDraft((prev) => ({ ...prev, credentialDegradeProbePercent }))} />
+            <NumberField title="空回记分" description="一次空回加多少分。" value={draft.credentialDegradeEmptyTurnWeight} min={0} max={100} step={0.5} suffix="分" onChange={(credentialDegradeEmptyTurnWeight) => setDraft((prev) => ({ ...prev, credentialDegradeEmptyTurnWeight }))} />
+            <NumberField title="流截断记分" description="一次流被截断或读取失败加多少分。这类错误更偏上游，默认比空回低。" value={draft.credentialDegradeStreamWeight} min={0} max={100} step={0.5} suffix="分" onChange={(credentialDegradeStreamWeight) => setDraft((prev) => ({ ...prev, credentialDegradeStreamWeight }))} />
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">空回对外状态码</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">空回指上游返回成功、但整条回复从头到尾没有任何文字、思考或工具调用（回复过程中某一帧为空不算）。换号重试用尽仍为空时，按这个状态码返回错误，不会返回 200，也不计费。默认 502；529 会让 Claude Code 自动静默重试，但部分下游网关收到 529 会把账号标成过载。</div>
+              </div>
+              <select className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2" value={String(draft.emptyTurnErrorStatusCode)} onChange={(event) => setDraft((prev) => ({ ...prev, emptyTurnErrorStatusCode: Number(event.target.value) }))}>
+                <option value="502">502（默认）</option>
+                <option value="503">503</option>
+                <option value="529">529（客户端自动重试）</option>
+              </select>
+            </label>
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">空回重试等待方式</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">空回后换号重试之前等多久。不等待：立即换号（默认）；固定：每次等同样的时间；指数：每次翻倍直到上限。等待时不占用账号，且不会超过首个输出前的静默保留时间。</div>
+              </div>
+              <select className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2" value={draft.emptyTurnRetryBackoffMode} onChange={(event) => setDraft((prev) => ({ ...prev, emptyTurnRetryBackoffMode: event.target.value as 'none' | 'fixed' | 'exponential' }))}>
+                <option value="none">不等待（默认）</option>
+                <option value="fixed">固定间隔</option>
+                <option value="exponential">指数递增</option>
+              </select>
+            </label>
+            <NumberField title="空回重试首次等待" description="固定模式下每次都等这么久；指数模式下这是第一次的等待。" value={draft.emptyTurnRetryBaseDelayMs} min={0} max={10000} suffix="毫秒" onChange={(emptyTurnRetryBaseDelayMs) => setDraft((prev) => ({ ...prev, emptyTurnRetryBaseDelayMs }))} />
+            <NumberField title="空回重试最长等待" description="指数模式下单次等待的上限。" value={draft.emptyTurnRetryMaxDelayMs} min={0} max={30000} suffix="毫秒" onChange={(emptyTurnRetryMaxDelayMs) => setDraft((prev) => ({ ...prev, emptyTurnRetryMaxDelayMs }))} />
+            <NumberField title="空回重试随机抖动" description="在等待时间上下浮动的比例，避免一批请求同时重发。" value={draft.emptyTurnRetryJitterPercent} min={0} max={100} suffix="%" onChange={(emptyTurnRetryJitterPercent) => setDraft((prev) => ({ ...prev, emptyTurnRetryJitterPercent }))} />
             <NumberField title="自愈最小间隔" description="所有账号都不可用时，因连续失败被禁用的账号会自动恢复。同一个账号两次自愈至少隔这么久；0 表示不限。" value={draft.credentialAutoHealMinIntervalSecs} min={0} max={86400} suffix="秒" onChange={(credentialAutoHealMinIntervalSecs) => setDraft((prev) => ({ ...prev, credentialAutoHealMinIntervalSecs }))} />
             <NumberField title="最多连续自愈" description="自愈后一次都没成功就又被禁用算连续一轮，达到上限后不再自动恢复；成功一次或手动启用后清零；0 表示不限。" value={draft.credentialAutoHealMaxConsecutiveRounds} min={0} max={1000} suffix="轮" onChange={(credentialAutoHealMaxConsecutiveRounds) => setDraft((prev) => ({ ...prev, credentialAutoHealMaxConsecutiveRounds }))} />
             <NumberField title="协议异常基础冷却" description="可重试协议不匹配和未分类瞬态错误首次触发的冷却时长。" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialProtocolErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialProtocolErrorCooldownSecs }))} />
@@ -4199,14 +4242,6 @@ export function RuntimeConfigPanel() {
             <NumberField
               title="最大冷却秒数"
               description="控制单个凭据最长冷却时间，用来限制 Retry-After 或连续临时错误带来的影响。"
-            <ToggleField title="反复出错的账号自动让流量" description="账号反复空回（上游返回成功但没有内容）或流被截断时，累计一个「劣化分」。分数到线后，这个账号暂时不接新请求，流量自动转给同档或下一档的健康账号；它仍保留少量试探流量，连续成功后自动回来。不会冷却账号，也不改账号的 Fast 和优先级。所有账号都劣化时照常全部使用，不会因此排队。" checked={draft.credentialDegradeEnabled} onCheckedChange={(credentialDegradeEnabled) => setDraft((prev) => ({ ...prev, credentialDegradeEnabled }))} />
-            <NumberField title="让出流量的分数线" description="分数到这条线就让出流量。默认 5：空回记 2 分、流截断记 1 分，大约连续三次空回触发。0 表示只记分不让出。" value={draft.credentialDegradeSuspendScore} min={0} max={1000} step={0.5} suffix="分" onChange={(credentialDegradeSuspendScore) => setDraft((prev) => ({ ...prev, credentialDegradeSuspendScore }))} />
-            <NumberField title="恢复线比例" description="分数降到「分数线 × 这个比例」以下才恢复接流量。比例越小越不容易来回切换。默认 0.4，即 5 分要降到 2 分以下。" value={draft.credentialDegradeResumeRatio} min={0} max={1} step={0.05} suffix="倍" onChange={(credentialDegradeResumeRatio) => setDraft((prev) => ({ ...prev, credentialDegradeResumeRatio }))} />
-            <NumberField title="分数自然减半时间" description="没有新请求时，分数每过这么久减一半，长时间没出错的账号会自己恢复。" value={draft.credentialDegradeHalfLifeSecs} min={1} max={86400} suffix="秒" onChange={(credentialDegradeHalfLifeSecs) => setDraft((prev) => ({ ...prev, credentialDegradeHalfLifeSecs }))} />
-            <NumberField title="每次成功保留比例" description="每成功一次，分数乘以这个比例。默认 0.5：两次成功基本恢复。" value={draft.credentialDegradeSuccessDecay} min={0} max={1} step={0.05} suffix="倍" onChange={(credentialDegradeSuccessDecay) => setDraft((prev) => ({ ...prev, credentialDegradeSuccessDecay }))} />
-            <NumberField title="让出期间试探比例" description="让出流量的账号仍接这个比例的请求，用来判断它是否恢复。设 0 会让它永远回不来，不建议。" value={draft.credentialDegradeProbePercent} min={0} max={100} suffix="%" onChange={(credentialDegradeProbePercent) => setDraft((prev) => ({ ...prev, credentialDegradeProbePercent }))} />
-            <NumberField title="空回记分" description="一次空回加多少分。" value={draft.credentialDegradeEmptyTurnWeight} min={0} max={100} step={0.5} suffix="分" onChange={(credentialDegradeEmptyTurnWeight) => setDraft((prev) => ({ ...prev, credentialDegradeEmptyTurnWeight }))} />
-            <NumberField title="流截断记分" description="一次流被截断或读取失败加多少分。这类错误更偏上游，默认比空回低。" value={draft.credentialDegradeStreamWeight} min={0} max={100} step={0.5} suffix="分" onChange={(credentialDegradeStreamWeight) => setDraft((prev) => ({ ...prev, credentialDegradeStreamWeight }))} />
               value={draft.credentialMaxCooldownSecs}
               min={1}
               suffix="秒"

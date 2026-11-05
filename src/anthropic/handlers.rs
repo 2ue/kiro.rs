@@ -421,6 +421,9 @@ struct RequestUsageContext {
 #[derive(Clone)]
 struct RequestLatencyTraceState {
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    /// HTTP status this request answers with when it ends as an empty turn before any byte was
+    /// sent (`emptyTurnErrorStatusCode`); only used to label the usage record.
+    empty_turn_status: Arc<std::sync::atomic::AtomicU16>,
     payload_guard_ms: Option<u64>,
     upstream_header_latency_ms: Arc<AtomicU64>,
     first_upstream_chunk_latency_ms: Arc<AtomicU64>,
@@ -484,6 +487,7 @@ impl RequestLatencyTraceState {
     ) -> Self {
         Self {
             inference_attempt_budget,
+            empty_turn_status: Arc::new(std::sync::atomic::AtomicU16::new(502)),
             payload_guard_ms: None,
             upstream_header_latency_ms: Arc::new(AtomicU64::new(0)),
             first_upstream_chunk_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -4806,6 +4810,9 @@ impl CredentialUsageContext {
         let (Some(floor_usd), Some(pricing)) = (input.cost_floor_usd(), input.pricing) else {
             return;
         };
+        if !input.carries_cost_deficit() {
+            return;
+        }
         let scope = self.scope();
         let credential_key = self.creation_control_credential_key();
         self.request
@@ -5130,13 +5137,39 @@ impl CredentialUsageContext {
             )
         });
         let error_detail = format!("{}: {}", error_type, error_message);
+        let empty_turn = is_empty_turn_detail(&error_message);
         let public_error_message = match error_type.as_str() {
             "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
             "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+            _ if empty_turn => envelope::PUBLIC_EMPTY_RESPONSE_MESSAGE,
             _ => envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
         };
+        // 首个字节发出之前失败时，对外实际返回的是 5xx JSON，不是 200 流。
+        let committed = self
+            .request
+            .latency
+            .inference_attempt_budget
+            .snapshot()
+            .downstream_committed;
+        let public_status = if committed {
+            StatusCode::OK
+        } else if empty_turn {
+            StatusCode::from_u16(
+                self.request
+                    .latency
+                    .empty_turn_status
+                    .load(Ordering::Acquire),
+            )
+            .unwrap_or(StatusCode::BAD_GATEWAY)
+        } else {
+            match error_type.as_str() {
+                "invalid_request_error" => StatusCode::BAD_REQUEST,
+                "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::BAD_GATEWAY,
+            }
+        };
         let public_error = Some(usage_public_error(
-            StatusCode::OK,
+            public_status,
             error_type.clone(),
             public_error_message,
             Some(&self.request.error_id),
@@ -6950,6 +6983,18 @@ fn map_provider_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+            request_id,
+            error_id,
+            [("x-should-retry", "false".to_string())],
+        );
+    }
+
+    if err_str.contains("IMAGE_FORMAT_UNSUPPORTED") {
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：图片格式不被上游支持", error_id);
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::PUBLIC_IMAGE_FORMAT_UNSUPPORTED_MESSAGE,
             request_id,
             error_id,
             [("x-should-retry", "false".to_string())],
@@ -9574,6 +9619,18 @@ struct SseStreamState {
     /// Set once a pre-output retry hands the request to the external pool. From then on the
     /// external SSE body is forwarded as-is and the external manager owns the usage record.
     external_passthrough: Option<BoxStream<'static, Result<Bytes, axum::Error>>>,
+    /// Set when the stream fails before any byte reached the client. The HTTP response headers
+    /// are still unsent then, so the caller answers with a JSON error and a 5xx status instead
+    /// of a 200 stream carrying an error event.
+    precommit_failure: Arc<std::sync::Mutex<Option<PrecommitStreamFailure>>>,
+}
+
+/// A stream failure that happened before anything was sent downstream.
+#[derive(Debug, Clone)]
+struct PrecommitStreamFailure {
+    error_type: String,
+    detail: String,
+    empty_turn: bool,
 }
 
 impl SseStreamState {
@@ -9623,6 +9680,7 @@ impl SseStreamState {
             attempt_number: 1,
             prior_attempts: Vec::new(),
             external_passthrough: None,
+            precommit_failure: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -10390,7 +10448,14 @@ async fn handle_stream_request(
 
     // 创建 SSE 流
     let response_request_id = credential_usage.request.request_id.clone();
-    let stream = create_sse_stream(
+    let empty_turn_config = provider.runtime_config_snapshot();
+    credential_usage.request.latency.empty_turn_status.store(
+        super::empty_turn_policy::empty_turn_status(&empty_turn_config)
+            .0
+            .as_u16(),
+        Ordering::Release,
+    );
+    let (stream, precommit_failure) = create_sse_stream(
         response,
         ctx,
         initial_events,
@@ -10409,17 +10474,103 @@ async fn handle_stream_request(
         .with_max_duration(stream_max_duration_secs),
     );
 
+    // 先拿到第一段要发给客户端的字节，再决定响应头：
+    // - 有字节（message_start、内容或保活）→ 200 + 流；
+    // - 一个字节都没有就结束且记录了失败 → 直接返回 JSON 错误与 5xx，不发 200。
+    // 首输出前的保留窗口内本来就不写字节，这里只是让响应头和首字节一起发出，
+    // 正常请求拿到首字节的时间不变。
+    Box::pin(respond_after_first_stream_bytes(
+        stream.boxed(),
+        precommit_failure,
+        empty_turn_config,
+        response_request_id,
+        warnings_header,
+    ))
+    .await
+}
+
+/// 拉取 SSE 流的首段字节后才决定响应：放在独立、装箱的 future 里，避免把等待逻辑内联进
+/// `handle_stream_request` 的大 future（生产与测试线程栈都是 8 MB）。
+async fn respond_after_first_stream_bytes(
+    mut stream: BoxStream<'static, Result<Bytes, Infallible>>,
+    precommit_failure: Arc<std::sync::Mutex<Option<PrecommitStreamFailure>>>,
+    config: Arc<Config>,
+    request_id: String,
+    warnings_header: Option<String>,
+) -> Response {
+    let mut first = None;
+    while let Some(item) = stream.next().await {
+        if matches!(&item, Ok(chunk) if chunk.is_empty()) {
+            continue;
+        }
+        first = Some(item);
+        break;
+    }
+    let Some(first) = first else {
+        let failure = precommit_failure
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or(PrecommitStreamFailure {
+                error_type: "api_error".to_string(),
+                detail: String::new(),
+                empty_turn: false,
+            });
+        return precommit_stream_error_response(&config, &request_id, &failure);
+    };
+    let stream = stream::once(async move { first }).chain(stream);
+
     // 返回 SSE 响应
-    let mut builder = envelope::sse_builder_with_id(&response_request_id);
+    let mut builder = envelope::sse_builder_with_id(&request_id);
     if let Some(warnings) = warnings_header {
         builder = builder.header("x-kiro-rs-warnings", warnings);
     }
     if crate::diagnostics::capture::is_active() {
-        let stream =
-            crate::diagnostics::capture::tap_client_stream(response_request_id, "local", stream);
+        let stream = crate::diagnostics::capture::tap_client_stream(request_id, "local", stream);
         return builder.body(Body::from_stream(stream)).unwrap();
     }
     builder.body(Body::from_stream(stream)).unwrap()
+}
+
+/// 流式请求在发出任何字节之前失败时的对外响应。空回按 `emptyTurnErrorStatusCode`；
+/// 请求本身的问题（invalid_request / rate_limit）保持原状态码；其余上游故障 502。
+fn precommit_stream_error_response(
+    config: &Config,
+    request_id: &str,
+    failure: &PrecommitStreamFailure,
+) -> Response {
+    if failure.empty_turn {
+        return empty_turn_error_response(config, request_id);
+    }
+    let (status, error_type, message) = match failure.error_type.as_str() {
+        "invalid_request_error" => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::kiro_official_upstream_message(&failure.detail)
+                .unwrap_or_else(|| envelope::PUBLIC_INVALID_REQUEST_MESSAGE.to_string()),
+        ),
+        "rate_limit_error" => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            envelope::PUBLIC_RATE_LIMIT_MESSAGE.to_string(),
+        ),
+        _ if failure.detail == "websearch_model_call_failed" => (
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_WEB_SEARCH_FAILED_MESSAGE.to_string(),
+        ),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE.to_string(),
+        ),
+    };
+    envelope::error_response_with_id(
+        status,
+        error_type,
+        envelope::public_message_with_error_id(&message, request_id),
+        request_id,
+    )
 }
 
 /// Ping 事件间隔。Claude Code 的插件 UI 在长 thinking/tool_use 阶段可能没有可见正文；
@@ -11180,6 +11331,16 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
             | Event::MessageMetadata(_)
             | Event::Metering(_)
             | Event::ContextUsage(_) => saw_side_channel = true,
+            // 只带 messageStatus=COMPLETED 的空 assistantResponseEvent：上游声称完成但没有内容，
+            // 与只有侧信道事件一样是空回，应换号重试。
+            Event::AssistantResponse(resp)
+                if resp
+                    .message_status
+                    .as_deref()
+                    .is_some_and(|status| status.trim().eq_ignore_ascii_case("COMPLETED")) =>
+            {
+                saw_side_channel = true
+            }
             _ => {}
         }
     }
@@ -11308,6 +11469,42 @@ fn non_stream_status_error_before_first_output(events: &[Event]) -> Option<Strin
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+/// Ends the stream on an error. Before anything reached the client the response headers are
+/// still unsent, so the failure is handed to the caller (which answers with a JSON error and a
+/// 5xx status) and no bytes are emitted; afterwards the error goes out as an SSE `error` event.
+fn finish_stream_error(
+    state: &mut SseStreamState,
+    status: UsageRecordStatus,
+    terminal_reason: StreamTerminalReason,
+) -> Vec<Result<Bytes, Infallible>> {
+    let detail = state.ctx.stream_error_detail();
+    let committed = state.downstream_committed;
+    let bytes = finish_stream_with_recorded_error(
+        &mut state.ctx,
+        &state.usage_guard,
+        status,
+        terminal_reason,
+        &state.decoder,
+        state.attempt_number,
+        committed,
+    );
+    state.finished = true;
+    if !committed {
+        let (error_type, detail) =
+            detail.unwrap_or_else(|| ("api_error".to_string(), String::new()));
+        let empty_turn = is_empty_turn_detail(&detail);
+        if let Ok(mut slot) = state.precommit_failure.lock() {
+            *slot = Some(PrecommitStreamFailure {
+                error_type,
+                detail,
+                empty_turn,
+            });
+        }
+        return Vec::new();
+    }
+    prepend_initial_bytes_if_needed(state, bytes, true)
 }
 
 fn finish_stream_with_recorded_error(
@@ -11494,6 +11691,21 @@ fn retry_body_with_fresh_identity(request_body: &str) -> std::borrow::Cow<'_, st
         .unwrap_or(std::borrow::Cow::Borrowed(request_body))
 }
 
+/// 非流式空回重试前的等待（原账号并发已释放，不占账号）。
+async fn wait_before_empty_turn_retry(
+    provider: &crate::kiro::provider::KiroProvider,
+    retry_index: u32,
+) {
+    let delay = super::empty_turn_policy::empty_turn_retry_delay(
+        &provider.runtime_config_snapshot(),
+        retry_index,
+        fastrand::f64(),
+    );
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
+
 async fn retry_non_stream_empty_turn(
     retry: NonStreamEmptyTurnRetry<'_>,
     completion: &crate::kiro::provider::KiroApiCompletion,
@@ -11517,6 +11729,7 @@ async fn retry_non_stream_empty_turn(
     let attempt_budget = retry.usage_context.latency.inference_attempt_budget.clone();
     attempt_budget.exclude_empty_turn_credential(completion.credential_id());
     completion.report_empty_turn(detail);
+    wait_before_empty_turn_retry(retry.provider, retry.attempt.max(1)).await;
     let consumed_before = attempt_budget.snapshot().consumed;
     let retry_body = retry_body_with_fresh_identity(retry.request_body);
     let retry_dispatch = call_api_maybe_fail_fast(
@@ -11558,6 +11771,17 @@ async fn retry_non_stream_empty_turn(
 
 /// 流式空轮次：把重试计划替换为 [`usage_only_retry_request`]。返回是否替换成功。
 /// Captures a request whose upstream stayed usage-only until the pre-output retries ran out.
+/// 空回（重试用尽仍没有任何内容）的对外错误响应：状态码按 `emptyTurnErrorStatusCode`，默认 502。
+fn empty_turn_error_response(config: &Config, request_id: &str) -> Response {
+    let (status, error_type) = super::empty_turn_policy::empty_turn_status(config);
+    envelope::error_response_with_id(
+        status,
+        error_type,
+        envelope::public_message_with_error_id(envelope::PUBLIC_EMPTY_RESPONSE_MESSAGE, request_id),
+        request_id,
+    )
+}
+
 fn record_usage_only_capture(credential_usage: &CredentialUsageContext, attempts: u32) {
     let request = &credential_usage.request;
     if let Some(capture) = request.request_capture.as_ref() {
@@ -11578,7 +11802,19 @@ fn prepare_usage_only_stream_retry_plan(plan: &mut StreamRetryPlan) -> bool {
     true
 }
 
-async fn retry_stream_before_downstream_commit(
+/// Boxed so the large retry future is not inlined into every call site of the SSE unfold closure
+/// (there are about a dozen); inlining them overflows the 8 MB runtime thread stack in debug builds.
+fn retry_stream_before_downstream_commit(
+    state: SseStreamState,
+    reason: StreamRetryReason,
+    detail: String,
+) -> futures::future::BoxFuture<'static, StreamRetryOutcome> {
+    Box::pin(retry_stream_before_downstream_commit_inner(
+        state, reason, detail,
+    ))
+}
+
+async fn retry_stream_before_downstream_commit_inner(
     mut state: SseStreamState,
     reason: StreamRetryReason,
     detail: String,
@@ -11636,6 +11872,30 @@ async fn retry_stream_before_downstream_commit(
     let retry_body = crate::kiro::provider::refresh_kiro_request_identity(&plan.request_body)
         .map(Arc::<str>::from)
         .unwrap_or_else(|| plan.request_body.clone());
+    if reason == StreamRetryReason::UsageOnly || is_empty_turn_detail(&detail) {
+        // 空回重试的等待：原账号的并发已经释放，等待期间不占账号。等待不能越过首输出前的
+        // 保留窗口——窗口一到就要开始给客户端发字节，之后不能再换号。
+        let config = plan.provider.runtime_config_snapshot();
+        let delay = super::empty_turn_policy::empty_turn_retry_delay(
+            &config,
+            state.attempt_number,
+            fastrand::f64(),
+        );
+        if !delay.is_zero() {
+            let remaining = state
+                .pre_output_hold_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if remaining.is_some_and(|remaining| remaining <= delay) {
+                tracing::info!(
+                    request_id = %plan.request_id,
+                    delay_ms = delay.as_millis() as u64,
+                    "空回重试等待会越过首输出前保留窗口，不再重试"
+                );
+                return StreamRetryOutcome::NotRetried(state);
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
     let consumed_before = attempt_budget.snapshot().consumed;
     let retry_dispatch = call_api_stream_maybe_fail_fast(
         &plan.provider,
@@ -11893,7 +12153,10 @@ fn create_sse_stream(
     usage_context: CredentialUsageContext,
     retry_plan: Option<StreamRetryPlan>,
     keepalive: StreamKeepalivePolicy,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
+) -> (
+    impl Stream<Item = Result<Bytes, Infallible>>,
+    Arc<std::sync::Mutex<Option<PrecommitStreamFailure>>>,
+) {
     let usage_guard = StreamUsageGuard::new(usage_context);
     let state = SseStreamState::from_attempt(
         response,
@@ -11904,8 +12167,9 @@ fn create_sse_stream(
         retry_plan,
         keepalive,
     );
+    let precommit_failure = state.precommit_failure.clone();
 
-    stream::unfold(
+    let stream = stream::unfold(
         state,
         move |mut state| async move {
             if state.finished {
@@ -12040,17 +12304,7 @@ fn create_sse_stream(
                                         }),
                                     );
                                     state.ctx.record_stream_error(error.error_type, error.internal_detail);
-                                    let bytes = finish_stream_with_recorded_error(
-                                        &mut state.ctx,
-                                        &state.usage_guard,
-                                        UsageRecordStatus::StreamError,
-                                        StreamTerminalReason::UpstreamJsonException,
-                                        &state.decoder,
-                                        state.attempt_number,
-                                        state.downstream_committed,
-                                    );
-                                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                                    state.finished = true;
+                                    let bytes = finish_stream_error(&mut state, UsageRecordStatus::StreamError, StreamTerminalReason::UpstreamJsonException);
                                     return Some((stream::iter(bytes), state));
                                 }
                             };
@@ -12084,18 +12338,7 @@ fn create_sse_stream(
                                     .completion
                                     .report_upstream_stream_failure(detail.clone());
                                 state.ctx.record_stream_error("api_error", detail);
-                                let bytes = finish_stream_with_recorded_error(
-                                    &mut state.ctx,
-                                    &state.usage_guard,
-                                    UsageRecordStatus::StreamError,
-                                    StreamTerminalReason::InternalError,
-                                    &state.decoder,
-                                    state.attempt_number,
-                                    state.downstream_committed,
-                                );
-                                let bytes =
-                                    prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                                state.finished = true;
+                                let bytes = finish_stream_error(&mut state, UsageRecordStatus::StreamError, StreamTerminalReason::InternalError);
                                 return Some((stream::iter(bytes), state));
                             }
 
@@ -12264,22 +12507,11 @@ fn create_sse_stream(
                                     .completion
                                     .report_upstream_stream_failure(detail.clone());
                                 state.ctx.record_stream_error("api_error", detail);
-                                let bytes = finish_stream_with_recorded_error(
-                                    &mut state.ctx,
-                                    &state.usage_guard,
-                                    UsageRecordStatus::StreamError,
-                                    if protocol_contamination {
+                                let bytes = finish_stream_error(&mut state, UsageRecordStatus::StreamError, if protocol_contamination {
                                         StreamTerminalReason::ProtocolContamination
                                     } else {
                                         StreamTerminalReason::InternalError
-                                    },
-                                    &state.decoder,
-                                    state.attempt_number,
-                                    state.downstream_committed,
-                                );
-                                let bytes =
-                                    prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                                state.finished = true;
+                                    });
                                 return Some((stream::iter(bytes), state));
                             }
                             if !first_output_reached_in_chunk
@@ -12331,17 +12563,7 @@ fn create_sse_stream(
                             state.completion.report_upstream_stream_failure(detail.clone());
                             // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
                             state.ctx.record_stream_error("api_error", detail);
-                            let bytes = finish_stream_with_recorded_error(
-                                &mut state.ctx,
-                                &state.usage_guard,
-                                UsageRecordStatus::StreamError,
-                                StreamTerminalReason::InternalError,
-                                &state.decoder,
-                                state.attempt_number,
-                                state.downstream_committed,
-                            );
-                            let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                            state.finished = true;
+                            let bytes = finish_stream_error(&mut state, UsageRecordStatus::StreamError, StreamTerminalReason::InternalError);
                             Some((stream::iter(bytes), state))
                         }
                         None => {
@@ -12385,17 +12607,7 @@ fn create_sse_stream(
                                     }),
                                 );
                                 state.ctx.record_stream_error(error.error_type, error.internal_detail);
-                                let bytes = finish_stream_with_recorded_error(
-                                    &mut state.ctx,
-                                    &state.usage_guard,
-                                    UsageRecordStatus::StreamError,
-                                    StreamTerminalReason::UpstreamJsonException,
-                                    &state.decoder,
-                                    state.attempt_number,
-                                    state.downstream_committed,
-                                );
-                                let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                                state.finished = true;
+                                let bytes = finish_stream_error(&mut state, UsageRecordStatus::StreamError, StreamTerminalReason::UpstreamJsonException);
                                 return Some((stream::iter(bytes), state));
                             }
 
@@ -12510,18 +12722,7 @@ fn create_sse_stream(
                                         .report_upstream_stream_failure(detail.clone());
                                 }
                                 state.ctx.record_stream_error("api_error", detail);
-                                let bytes = finish_stream_with_recorded_error(
-                                    &mut state.ctx,
-                                    &state.usage_guard,
-                                    UsageRecordStatus::StreamError,
-                                    StreamTerminalReason::InternalError,
-                                    &state.decoder,
-                                    state.attempt_number,
-                                    state.downstream_committed,
-                                );
-                                let bytes =
-                                    prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                                state.finished = true;
+                                let bytes = finish_stream_error(&mut state, UsageRecordStatus::StreamError, StreamTerminalReason::InternalError);
                                 return Some((stream::iter(bytes), state));
                             }
 
@@ -12594,18 +12795,7 @@ fn create_sse_stream(
                                     }
                                 }
                                 if state.ctx.has_stream_error() {
-                                    let bytes = finish_stream_with_recorded_error(
-                                        &mut state.ctx,
-                                        &state.usage_guard,
-                                        UsageRecordStatus::StreamError,
-                                        StreamTerminalReason::ProtocolContamination,
-                                        &state.decoder,
-                                        state.attempt_number,
-                                        state.downstream_committed,
-                                    );
-                                    let bytes =
-                                        prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                                    state.finished = true;
+                                    let bytes = finish_stream_error(&mut state, UsageRecordStatus::StreamError, StreamTerminalReason::ProtocolContamination);
                                     return Some((stream::iter(bytes), state));
                                 }
                             }
@@ -12661,12 +12851,28 @@ fn create_sse_stream(
                                 state.usage_guard.context().record_success_from_stream(&state.ctx);
                             }
                             state.usage_guard.complete();
+                            state.finished = true;
+                            if had_stream_error && !state.downstream_committed {
+                                // 还没有任何字节发给客户端：交给外层返回 5xx JSON，而不是 200 + error 事件。
+                                if let Some((error_type, detail)) = state.ctx.stream_error_detail()
+                                {
+                                    let empty_turn = is_empty_turn_detail(&detail);
+                                    if let Ok(mut slot) = state.precommit_failure.lock() {
+                                        *slot = Some(PrecommitStreamFailure {
+                                            error_type,
+                                            detail,
+                                            empty_turn,
+                                        });
+                                    }
+                                    let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                    return Some((stream::iter(bytes), state));
+                                }
+                            }
                             let bytes = sse_bytes_from_events_with_initial(
                                 &mut state,
                                 final_events,
                                 true,
                             );
-                            state.finished = true;
                             Some((stream::iter(bytes), state))
                         }
                     }
@@ -12696,17 +12902,7 @@ fn create_sse_stream(
                     }
                     state.completion.report_upstream_stream_failure(detail.clone());
                     state.ctx.record_stream_error("api_error", detail);
-                    let bytes = finish_stream_with_recorded_error(
-                        &mut state.ctx,
-                        &state.usage_guard,
-                        UsageRecordStatus::UpstreamTimeout,
-                        StreamTerminalReason::UpstreamIdleTimeout,
-                        &state.decoder,
-                        state.attempt_number,
-                        state.downstream_committed,
-                    );
-                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                    state.finished = true;
+                    let bytes = finish_stream_error(&mut state, UsageRecordStatus::UpstreamTimeout, StreamTerminalReason::UpstreamIdleTimeout);
                     Some((stream::iter(bytes), state))
                 }
                 _ = &mut max_duration_sleep => {
@@ -12722,17 +12918,7 @@ fn create_sse_stream(
                     state.max_duration_deadline = None;
                     state.completion.report_upstream_stream_failure(detail.clone());
                     state.ctx.record_stream_error("api_error", detail);
-                    let bytes = finish_stream_with_recorded_error(
-                        &mut state.ctx,
-                        &state.usage_guard,
-                        UsageRecordStatus::UpstreamTimeout,
-                        StreamTerminalReason::UpstreamMaxDuration,
-                        &state.decoder,
-                        state.attempt_number,
-                        state.downstream_committed,
-                    );
-                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                    state.finished = true;
+                    let bytes = finish_stream_error(&mut state, UsageRecordStatus::UpstreamTimeout, StreamTerminalReason::UpstreamMaxDuration);
                     Some((stream::iter(bytes), state))
                 }
                 _ = &mut first_output_sleep => {
@@ -12766,17 +12952,7 @@ fn create_sse_stream(
                     state.completion.report_upstream_stream_failure(detail.clone());
                     // overloaded_error lets Claude Code retry the turn on its own.
                     state.ctx.record_stream_error("overloaded_error", detail);
-                    let bytes = finish_stream_with_recorded_error(
-                        &mut state.ctx,
-                        &state.usage_guard,
-                        UsageRecordStatus::UpstreamTimeout,
-                        StreamTerminalReason::FirstOutputTimeout,
-                        &state.decoder,
-                        state.attempt_number,
-                        state.downstream_committed,
-                    );
-                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
-                    state.finished = true;
+                    let bytes = finish_stream_error(&mut state, UsageRecordStatus::UpstreamTimeout, StreamTerminalReason::FirstOutputTimeout);
                     Some((stream::iter(bytes), state))
                 }
                 _ = state.ping_interval.tick() => {
@@ -12808,7 +12984,8 @@ fn create_sse_stream(
             }
         },
     )
-    .flatten()
+    .flatten();
+    (stream, precommit_failure)
 }
 
 fn normalize_stream_idle_timeout_secs(value: u64) -> u64 {
@@ -13747,6 +13924,15 @@ async fn handle_non_stream_request(
                             }
                             None => completion.report_empty_turn(error.internal_detail.clone()),
                         }
+                        credential_usage.record_failure(
+                            UsageRecordStatus::Error,
+                            "api_error",
+                            error.internal_detail,
+                        );
+                        return empty_turn_error_response(
+                            &provider.runtime_config_snapshot(),
+                            &credential_usage.request.request_id,
+                        );
                     } else {
                         completion.release();
                     }
@@ -13808,9 +13994,17 @@ async fn handle_non_stream_request(
                             }
                             None => completion.report_empty_turn(detail.clone()),
                         }
-                    } else {
-                        completion.release();
+                        credential_usage.record_failure(
+                            UsageRecordStatus::Error,
+                            "api_error",
+                            detail,
+                        );
+                        return empty_turn_error_response(
+                            &provider.runtime_config_snapshot(),
+                            &credential_usage.request.request_id,
+                        );
                     }
+                    completion.release();
                     credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
                     return envelope::error_response_with_id(
                         StatusCode::BAD_GATEWAY,
@@ -13974,6 +14168,8 @@ async fn handle_non_stream_request(
                 // 空回：本请求内排除该账号换号；是否冷却由全局开关决定（默认不冷却）。
                 attempt_budget.exclude_empty_turn_credential(completion.credential_id());
                 completion.report_empty_turn(super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL);
+                wait_before_empty_turn_retry(&provider, non_stream_status_retry_attempt.max(1))
+                    .await;
                 let consumed_before = attempt_budget.snapshot().consumed;
                 let retry_dispatch = call_api_maybe_fail_fast(
                     &provider,
@@ -14480,6 +14676,21 @@ async fn handle_non_stream_request(
             }
         }
     }
+    // 上游报了 COMPLETED 但整条响应没有任何文本、推理或工具调用：仍是空回，不能当成功计费。
+    if !missing_explicit_status && !saw_meaningful_upstream_response {
+        let detail = super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL;
+        tracing::warn!(
+            error = detail,
+            "非流式响应上游报完成但没有任何输出，按空回失败"
+        );
+        record_usage_only_capture(&credential_usage, non_stream_status_retry_attempt);
+        completion.report_empty_turn(detail);
+        credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+        return empty_turn_error_response(
+            &provider.runtime_config_snapshot(),
+            &credential_usage.request.request_id,
+        );
+    }
     if missing_explicit_status {
         let has_trusted_upstream_completion_signal =
             saw_upstream_metadata || saw_upstream_context_usage || saw_upstream_metering;
@@ -14503,9 +14714,13 @@ async fn handle_non_stream_request(
             if detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL {
                 record_usage_only_capture(&credential_usage, non_stream_status_retry_attempt);
                 completion.report_empty_turn(detail);
-            } else {
-                completion.release();
+                credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+                return empty_turn_error_response(
+                    &provider.runtime_config_snapshot(),
+                    &credential_usage.request.request_id,
+                );
             }
+            completion.release();
             credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
             return envelope::error_response_with_id(
                 StatusCode::BAD_GATEWAY,

@@ -11,32 +11,53 @@ use super::types::ErrorResponse;
 const ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const ID_RANDOM_LEN: usize = 22;
 
-pub(crate) const PUBLIC_TEMPORARY_FAILURE_MESSAGE: &str =
-    "The request could not be completed right now. Please retry shortly.";
-pub(crate) const PUBLIC_PROCESSING_FAILED_MESSAGE: &str =
-    "The request could not be completed. Please retry shortly.";
-pub(crate) const PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE: &str =
-    "No account is ready for this request right now. Please retry shortly.";
-pub(crate) const PUBLIC_PROVIDER_NOT_READY_MESSAGE: &str =
-    "The request could not be started right now. Please retry shortly.";
-pub(crate) const PUBLIC_MODEL_UNAVAILABLE_MESSAGE: &str =
-    "The requested model is not available for this endpoint.";
-pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "The request body is invalid. Simplify the message, tools, tool results, files, or images and retry.";
-pub(crate) const PUBLIC_IMAGE_TOO_LARGE_MESSAGE: &str = "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.";
-pub(crate) const PUBLIC_IMAGE_COUNT_EXCEEDED_MESSAGE: &str = "This request carries more than 100 images, the upstream limit per request. Start a new conversation or send fewer screenshots.";
-pub(crate) const PUBLIC_RATE_LIMIT_MESSAGE: &str =
-    "No account is ready for this request right now. Please retry shortly.";
+// ============ 对外错误文案（唯一来源） ============
+//
+// 所有返回给调用方的错误文案都在这里定义，不做成配置。每条都说清楚三件事：发生了什么、
+// 是不是调用方要处理、能不能直接重试。文案不提及内部组件、账号、渠道或服务链路；排查编号
+// 由 `public_message_with_error_id` 统一附在末尾。对外说明见 docs/errors.md。
 
+/// 临时失败（网络、超时、连接中断），重试通常能成功。
+pub(crate) const PUBLIC_TEMPORARY_FAILURE_MESSAGE: &str =
+    "模型服务暂时没有响应，请稍后重试。The model service did not respond in time. Please retry.";
+/// 请求已发出但没有完成，原因不属于调用方。
+pub(crate) const PUBLIC_PROCESSING_FAILED_MESSAGE: &str =
+    "本次请求处理失败，请稍后重试。The request failed to complete. Please retry.";
+/// 空回：模型这次没有返回任何内容，已自动重试仍失败。
+pub(crate) const PUBLIC_EMPTY_RESPONSE_MESSAGE: &str = "模型这次没有返回任何内容，已自动重试仍未成功，请重试本轮对话。The model returned no content for this turn even after automatic retries. Please retry.";
+/// 输出过程中连接中断（已有部分内容）。
+pub(crate) const PUBLIC_STREAM_INTERRUPTED_MESSAGE: &str = "回复在输出过程中中断，请重试本轮对话。The response was interrupted before it finished. Please retry this turn.";
+/// 当前没有空闲的处理容量。
+pub(crate) const PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE: &str = "当前请求较多，暂时没有可用的处理容量，请稍后重试。The service is busy right now. Please retry shortly.";
+/// 服务刚启动或正在准备，暂时无法开始处理。
+pub(crate) const PUBLIC_PROVIDER_NOT_READY_MESSAGE: &str = "服务正在准备中，暂时无法处理请求，请稍后重试。The service is still starting up. Please retry shortly.";
+/// 请求的模型在这个接口不可用。
+pub(crate) const PUBLIC_MODEL_UNAVAILABLE_MESSAGE: &str = "请求的模型在当前接口不可用，请更换模型。The requested model is not available on this endpoint. Choose another model.";
+/// 请求体格式不被接受，需要调用方调整。
+pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "请求内容无法被模型接受，常见原因是历史消息、工具调用结果或附件格式有误。请精简内容或新开对话后重试。The request content was rejected. Check the message history, tool results, files, or images, or start a new conversation.";
+/// 单张图片过大。
+pub(crate) const PUBLIC_IMAGE_TOO_LARGE_MESSAGE: &str = "有图片超过 5 MB 的大小上限，请压缩或移除后重试。One or more images exceed the 5 MB size limit. Resize or remove them and retry.";
+/// 图片数量过多。
+pub(crate) const PUBLIC_IMAGE_COUNT_EXCEEDED_MESSAGE: &str = "本次请求携带的图片超过 100 张的上限，请新开对话或减少截图后重试。This request carries more than 100 images. Start a new conversation or send fewer images.";
+/// 图片格式不支持。
+pub(crate) const PUBLIC_IMAGE_FORMAT_UNSUPPORTED_MESSAGE: &str = "有图片的格式无法识别，请转换为 PNG、JPEG、GIF 或 WebP 后重试。An image format is not supported. Convert it to PNG, JPEG, GIF, or WebP and retry.";
+/// 联网搜索工具失败。
+pub(crate) const PUBLIC_WEB_SEARCH_FAILED_MESSAGE: &str = "联网搜索没有成功，请稍后重试，或关闭联网搜索后再试。Web search failed. Retry later or disable web search.";
+/// 请求频率过高。
+pub(crate) const PUBLIC_RATE_LIMIT_MESSAGE: &str =
+    "当前请求较多，请稍后重试。Too many requests right now. Please retry shortly.";
+
+/// 文案末尾附上排查编号。编号只用于定位日志，不暗示调用方需要联系谁。
 pub(crate) fn public_message_with_error_id(message: &str, error_id: &str) -> String {
-    format!("{message} If this continues, contact the administrator with error ID: {error_id}")
+    format!("{message}（请求编号 request id: {error_id}）")
 }
 
 pub(crate) fn public_rate_limit_message(retry_after_secs: Option<u64>) -> String {
     match retry_after_secs {
-        Some(seconds) if seconds > 0 => {
-            let unit = if seconds == 1 { "second" } else { "seconds" };
-            format!("No account is ready for this request right now. Retry after {seconds} {unit}.")
-        }
+        Some(seconds) if seconds > 0 => format!(
+            "当前请求较多，请 {seconds} 秒后重试。Too many requests right now. Retry after {seconds} second{}.",
+            if seconds == 1 { "" } else { "s" }
+        ),
         _ => PUBLIC_RATE_LIMIT_MESSAGE.to_string(),
     }
 }
