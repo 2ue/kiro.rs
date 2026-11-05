@@ -347,6 +347,7 @@ export function defaultCacheHitShaping(): Required<CacheHitShapingPolicyPatch> {
     maxReadMultiplier: 0,
     minCreationRatio: 0,
     readAwareCostFloor: false,
+    costFloorTopUpInput: true,
   }
 }
 

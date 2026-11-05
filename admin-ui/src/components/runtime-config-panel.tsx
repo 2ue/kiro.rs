@@ -2146,6 +2146,7 @@ const defaultCacheHitShaping = (): Required<CacheHitShapingPatch> => ({
   maxReadMultiplier: 0,
   minCreationRatio: 0,
   readAwareCostFloor: false,
+  costFloorTopUpInput: true,
 })
 type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
 
@@ -2645,6 +2646,15 @@ function CacheHitShapingForm({
             onCheckedChange={set('readAwareCostFloor')}
           />
         )}
+        <ToggleField
+          title="计费差额补入输入"
+          description={bounded
+            ? '默认开启，与原来一致：写入、读取补完仍低于计费下限时，在输入上限内用输入补，补不上的差额累计到之后的请求。关闭后不再用输入补，补不上的差额直接舍弃，也不累计，计费可以低于下限。'
+            : '默认开启，与原来一致：写入补到上限（或本次不允许写入）后仍低于计费下限时，差额记入输入。关闭后先照常按计费下限分配读写，补不齐的差额直接舍弃，不再记入输入，计费可以低于下限。'}
+          checked={merged.costFloorTopUpInput}
+          disabled={!merged.enabled}
+          onCheckedChange={set('costFloorTopUpInput')}
+        />
       </div>
     </div>
   )

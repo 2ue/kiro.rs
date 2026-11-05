@@ -14,6 +14,8 @@
 //!
 //! 本次在范围内补不上的差额由调用方记账（见
 //! `PromptCacheCreationController::record_cost_outcome`），留到之后放行写入的请求上补。
+//! `costFloorTopUpInput` 关闭时只抬高写入、读取，不抬高 input，补不上的差额直接舍弃，
+//! 不记账也不在之后的请求上补。
 //! `hitShaping.enabled` 为 false 时只按上限收口，不做命中率、小值和计费整形。
 
 use crate::model::config::CacheHitShapingPolicy;
@@ -50,6 +52,11 @@ pub(crate) struct BoundedShapingInput {
 impl BoundedShapingInput {
     fn shaping_enabled(&self) -> bool {
         self.policy.normalized().enabled
+    }
+
+    /// 补不上的计费差额是否跨请求累计（`costFloorTopUpInput` 关闭时舍弃差额）。
+    pub(crate) fn carries_cost_deficit(&self) -> bool {
+        self.policy.normalized().cost_floor_top_up_input
     }
 
     /// 计费下限（原始计费 × `min_cost_ratio`）；未开启整形或没有单价时为 None。
@@ -98,10 +105,20 @@ pub(crate) fn shape_bounded_usage(usage: CacheUsage, input: BoundedShapingInput)
     raise_creation_to_min(&mut shaped, &input, policy, &bounds);
     if let (Some(pricing), Some(floor)) = (input.pricing, input.cost_floor_usd()) {
         let mut target_cost = floor;
-        if input.creation_allowed && input.carried_cost_deficit_usd.is_finite() {
+        if input.creation_allowed
+            && input.carries_cost_deficit()
+            && input.carried_cost_deficit_usd.is_finite()
+        {
             target_cost += input.carried_cost_deficit_usd.max(0.0);
         }
-        raise_cost_within_bounds(&mut shaped, pricing, target_cost, &bounds, shape_ratio);
+        raise_cost_within_bounds(
+            &mut shaped,
+            pricing,
+            target_cost,
+            &bounds,
+            shape_ratio,
+            policy.cost_floor_top_up_input,
+        );
     }
     if shape_ratio {
         raise_read_to_ratio(&mut shaped, target, bounds.read_max);
@@ -300,12 +317,14 @@ fn raise_read_to_ratio(usage: &mut CacheUsage, ratio: f64, read_max: i32) {
 
 /// 计费低于 `target_cost` 时在范围内补足：依次抬高写入（已放行）、读取（有可复用前缀）、
 /// input，每个字段都不超过自己的上限。范围内补不上时保留差额，由调用方记账。
+/// `top_up_input` 为 false 时不抬高 input。
 fn raise_cost_within_bounds(
     usage: &mut CacheUsage,
     pricing: ModelPricing,
     target_cost: f64,
     bounds: &FinalUsageBounds,
     allow_read: bool,
+    top_up_input: bool,
 ) {
     let gap = |usage: &CacheUsage| target_cost - pricing.estimate(*usage);
     let tokens_for = |gap: f64, unit_cost: f64| -> i64 {
@@ -341,8 +360,10 @@ fn raise_cost_within_bounds(
             bounds.read_max,
         );
     }
-    let tokens = tokens_for(gap(usage), pricing.input_cost_per_token);
-    usage.input_tokens = raise(usage.input_tokens, tokens, 1, bounds.input_max);
+    if top_up_input {
+        let tokens = tokens_for(gap(usage), pricing.input_cost_per_token);
+        usage.input_tokens = raise(usage.input_tokens, tokens, 1, bounds.input_max);
+    }
 }
 
 fn raw_total(raw: &CacheUsage) -> i32 {
@@ -404,6 +425,7 @@ mod tests {
             max_read_multiplier: 0.0,
             min_creation_ratio: 0.0,
             read_aware_cost_floor: false,
+            cost_floor_top_up_input: true,
         }
     }
 
@@ -533,6 +555,36 @@ mod tests {
         );
         assert!(opus55().estimate(shaped) >= opus55().estimate(raw) * (1.0 - 1e-9));
         assert!(shaped.input_tokens <= 20_000);
+    }
+
+    #[test]
+    fn cost_floor_without_input_top_up_keeps_input_and_ignores_carried_deficit() {
+        // 写入、读取都到上限后仍不足：关闭"计费差额补入输入"时 input 保持原值，
+        // 累计差额也不参与本次补偿。
+        let raw = raw(40_000, 100);
+        let base = usage(100, 150_000, 20_000, 100);
+        let shaping_input = |top_up: bool, carried: f64| BoundedShapingInput {
+            input_max_tokens: 5_000,
+            max_cache_read_tokens: 150_000,
+            max_creation_event_tokens: 20_000,
+            carried_cost_deficit_usd: carried,
+            seed: 7,
+            ..input(
+                CacheHitShapingPolicy {
+                    cost_floor_top_up_input: top_up,
+                    ..shaping(0.95, 1.0)
+                },
+                raw,
+            )
+        };
+        let on = shape_bounded_usage(base, shaping_input(true, 0.0));
+        let off = shape_bounded_usage(base, shaping_input(false, 0.0));
+        let off_carried = shape_bounded_usage(base, shaping_input(false, 0.5));
+        assert!(on.input_tokens > off.input_tokens, "{on:?} {off:?}");
+        assert_eq!(off.input_tokens, 100, "{off:?}");
+        assert_eq!(off, off_carried);
+        assert!(!shaping_input(false, 0.0).carries_cost_deficit());
+        assert!(shaping_input(true, 0.0).carries_cost_deficit());
     }
 
     #[test]

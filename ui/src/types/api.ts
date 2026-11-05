@@ -1968,6 +1968,8 @@ export interface CacheHitShapingPolicyPatch {
   minCreationRatio?: number
   /** Count cache reads toward the cost floor; off keeps the original shaping. */
   readAwareCostFloor?: boolean
+  /** Top up the remaining cost gap with input tokens; off drops the gap instead. */
+  costFloorTopUpInput?: boolean
 }
 
 export interface CachePolicyConfig {

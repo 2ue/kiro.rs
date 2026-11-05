@@ -15974,6 +15974,7 @@ fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untou
                     min_cache_read_tokens: Some(1_024),
                     min_cache_creation_tokens: Some(1_024),
                     read_aware_cost_floor: None,
+                    cost_floor_top_up_input: None,
                 }),
                 ..CacheRoutePolicyPatch::default()
             },
@@ -16167,6 +16168,7 @@ fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
                 min_cache_read_tokens: Some(1_024),
                 min_cache_creation_tokens: Some(1_024),
                 read_aware_cost_floor: None,
+                cost_floor_top_up_input: None,
             }),
             cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
                 enabled: Some(true),
@@ -16529,6 +16531,7 @@ fn minea_prod_params_read_aware_floor_shrinks_small_context_and_keeps_large_ones
                 min_cache_read_tokens: Some(1_024),
                 min_cache_creation_tokens: Some(1_024),
                 read_aware_cost_floor: read_aware,
+                cost_floor_top_up_input: None,
             }),
             cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
                 enabled: Some(false),

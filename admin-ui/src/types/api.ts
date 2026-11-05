@@ -1595,6 +1595,7 @@ export interface CacheHitShapingPolicyPatch {
   minCreationRatio?: number
   /** Count cache reads toward the cost floor; off keeps the original shaping. */
   readAwareCostFloor?: boolean
+  costFloorTopUpInput?: boolean
 }
 
 export interface CachePolicyConfig {
