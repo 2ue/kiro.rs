@@ -137,11 +137,28 @@ impl KiroPlusShaper {
                 .saturating_add(creation_overflow);
         }
 
+        // input 为 0 时 minTokens 也要生效：缺的部分从读取（不够时从写入）挪过来，总输入不变。
+        if usage.input_tokens <= 0 && profile.input.min_tokens > 0 {
+            let wanted = profile.input.min_tokens;
+            let from_read = wanted.min(usage.cache_read_input_tokens.max(0));
+            usage.cache_read_input_tokens -= from_read;
+            let from_creation = (wanted - from_read).min(usage.cache_creation_input_tokens.max(0));
+            if from_creation > 0 {
+                let before = usage.cache_creation_input_tokens;
+                usage.cache_creation_input_tokens -= from_creation;
+                rescale_creation_breakdown(&mut usage, before);
+            }
+            usage.input_tokens = from_read + from_creation;
+        }
         bound_field(
             &mut usage.input_tokens,
             profile.input,
             self.seed ^ SALT_INPUT ^ SALT_CAP,
         );
+        // output 为 0 时 minTokens 同样生效（下游已有可见输出时不应是 0）。
+        if usage.output_tokens <= 0 && profile.output.min_tokens > 0 {
+            usage.output_tokens = profile.output.min_tokens;
+        }
         bound_field(
             &mut usage.output_tokens,
             profile.output,

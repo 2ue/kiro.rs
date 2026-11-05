@@ -347,6 +347,7 @@ export function defaultCacheHitShaping(): Required<CacheHitShapingPolicyPatch> {
     maxReadMultiplier: 0,
     minCreationRatio: 0,
     readAwareCostFloor: false,
+    costFloorTopUpInput: true,
   }
 }
 
@@ -503,6 +504,19 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   credentialStreamErrorCooldownSecs: 5,
   credentialEmptyTurnCooldownEnabled: false,
   credentialUpstreamFailureCooldownEnabled: false,
+  credentialDegradeEnabled: true,
+  credentialDegradeSuspendScore: 5,
+  credentialDegradeResumeRatio: 0.4,
+  credentialDegradeHalfLifeSecs: 120,
+  credentialDegradeSuccessDecay: 0.5,
+  credentialDegradeProbePercent: 2,
+  credentialDegradeEmptyTurnWeight: 2,
+  credentialDegradeStreamWeight: 1,
+  emptyTurnErrorStatusCode: 502,
+  emptyTurnRetryBackoffMode: 'none',
+  emptyTurnRetryBaseDelayMs: 100,
+  emptyTurnRetryMaxDelayMs: 2000,
+  emptyTurnRetryJitterPercent: 20,
   credentialAutoHealMinIntervalSecs: 300,
   credentialAutoHealMaxConsecutiveRounds: 5,
   kiroVersionAutoSyncEnabled: false,

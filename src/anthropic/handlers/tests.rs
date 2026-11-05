@@ -3805,6 +3805,12 @@ enum HandlerEventStreamFault {
     TextWithMeteringNoStatus,
     UsageOnlyMeteringNoStatus,
     UsageOnlyEveryAttempt,
+    /// Every attempt: an empty assistantResponseEvent with messageStatus=COMPLETED plus usage.
+    CompletedWithoutContentEveryAttempt,
+    /// Several blank assistant frames, then real text and COMPLETED. Must not count as empty.
+    BlankFramesThenText,
+    /// Only heartbeat events for about 2.5 seconds, then real text and COMPLETED.
+    HeartbeatsThenText,
     /// 200 with an empty EventStream body on every attempt ("ended without any frames").
     EmptyStreamEveryAttempt,
     /// 每次都返回 200、content-type 为 JSON 且响应体为空（生产上的 json_stream_incomplete_body）。
@@ -3985,6 +3991,27 @@ fn handler_eventstream_chunked_response(
         .expect("build EventStream chunked response")
 }
 
+fn handler_eventstream_completed_without_content_body() -> Vec<u8> {
+    let mut body = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"","messageStatus":"COMPLETED"}),
+    );
+    body.extend(handler_eventstream_usage_only_body());
+    body
+}
+
+fn handler_eventstream_blank_frames_then_text_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    for _ in 0..5 {
+        body.extend(eventstream_test_frame(
+            "assistantResponseEvent",
+            json!({"content":""}),
+        ));
+    }
+    body.extend(handler_eventstream_normal_body());
+    body
+}
+
 fn handler_eventstream_usage_only_body() -> Vec<u8> {
     let mut body =
         eventstream_test_frame("contextUsageEvent", json!({"contextUsagePercentage":0.01}));
@@ -4035,6 +4062,14 @@ async fn handler_eventstream_fault_upstream(
                 .into_response(),
             HandlerEventStreamFault::UsageOnlyEveryAttempt => {
                 handler_eventstream_bytes_response(handler_eventstream_usage_only_body())
+            }
+            HandlerEventStreamFault::CompletedWithoutContentEveryAttempt => {
+                handler_eventstream_bytes_response(
+                    handler_eventstream_completed_without_content_body(),
+                )
+            }
+            HandlerEventStreamFault::BlankFramesThenText => {
+                handler_eventstream_bytes_response(handler_eventstream_blank_frames_then_text_body())
             }
             HandlerEventStreamFault::EmptyStreamEveryAttempt => {
                 handler_eventstream_bytes_response(Vec::new())
@@ -4239,6 +4274,12 @@ async fn handler_eventstream_fault_upstream(
         | HandlerEventStreamFault::UsageOnlyEveryAttempt => {
             handler_eventstream_bytes_response(handler_eventstream_usage_only_body())
         }
+        HandlerEventStreamFault::CompletedWithoutContentEveryAttempt => {
+            handler_eventstream_bytes_response(handler_eventstream_completed_without_content_body())
+        }
+        HandlerEventStreamFault::BlankFramesThenText => {
+            handler_eventstream_bytes_response(handler_eventstream_blank_frames_then_text_body())
+        }
         HandlerEventStreamFault::ReasoningOnlyNoStatus => {
             let mut body = eventstream_test_frame(
                 "reasoningContentEvent",
@@ -4372,6 +4413,24 @@ async fn handler_eventstream_fault_upstream(
         }
         // Headers and periodic contextUsage frames keep the connection busy, but no content
         // event ever arrives (the production opus-5.5 silent-first-output shape).
+        HandlerEventStreamFault::HeartbeatsThenText => {
+            let mut chunks: Vec<(Duration, Result<Bytes, std::io::Error>)> = (0..10)
+                .map(|_| {
+                    (
+                        Duration::from_millis(250),
+                        Ok(Bytes::from(eventstream_test_frame(
+                            "contextUsageEvent",
+                            json!({"contextUsagePercentage": 1.0}),
+                        ))),
+                    )
+                })
+                .collect();
+            chunks.push((
+                Duration::ZERO,
+                Ok(Bytes::from(handler_eventstream_normal_body())),
+            ));
+            handler_eventstream_chunked_response(chunks)
+        }
         HandlerEventStreamFault::NoContentHeartbeats => handler_eventstream_chunked_response(
             (0..40)
                 .map(|_| {
@@ -4853,9 +4912,10 @@ async fn run_handler_thinking_signature_retry_rejects_json_error_envelope_for_fi
                 call_handler_thinking_signature_retry(app, stream).await;
 
             if stream {
+                // 首个字节前失败：沿用错误自身的状态码（这里是限流 429），不发 200。
                 assert_eq!(
                     status,
-                    StatusCode::OK,
+                    StatusCode::TOO_MANY_REQUESTS,
                     "stream={stream} round={round} body={body}"
                 );
                 assert!(
@@ -5346,19 +5406,13 @@ async fn run_provider_json_exception_retry_and_single_credential_failure_are_pri
             handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
         let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
 
-        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
         assert_eq!(
-            body.matches("event: message_start").count(),
-            1,
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
             "round={round} body={body}"
         );
-        assert_eq!(
-            body.matches("event: error").count(),
-            1,
-            "round={round} body={body}"
-        );
+        assert!(!body.contains("event: "), "round={round} body={body}");
         assert!(body.contains(r#""type":"rate_limit_error""#));
-        assert!(!body.contains("event: message_stop"));
         assert!(!body.contains("recovered-ok"));
         assert!(!body.contains(&marker));
         assert_eq!(upstream.hits(), 1, "round={round}");
@@ -5508,19 +5562,13 @@ async fn run_single_credential_precommit_retry_matrix() {
             handler_eventstream_fault_router_with_credential_count(&upstream.base_url, 1);
         let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
 
-        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
-        assert_eq!(
-            body.matches("event: message_start").count(),
-            1,
+        // 首个字节前失败：返回 5xx JSON，不发 200 流。
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "round={round} body={body}");
+        assert!(!body.contains("event: "), "round={round} body={body}");
+        assert!(
+            body.contains(r#""type":"error""#),
             "round={round} body={body}"
         );
-        assert_eq!(
-            body.matches("event: error").count(),
-            1,
-            "round={round} body={body}"
-        );
-        assert!(body.contains(r#""type":"overloaded_error""#));
-        assert!(!body.contains("event: message_stop"));
         assert!(!body.contains("recovered-ok"));
         assert!(!body.contains(&marker));
         assert_eq!(upstream.hits(), 1, "round={round} body={body}");
@@ -6439,9 +6487,13 @@ async fn run_handler_usage_only_eof_matrix() {
                 .await;
         let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
         let (status, _request_id, body) = call_handler_eventstream_fault(app, true).await;
-        assert_eq!(status, StatusCode::OK, "usage-only twice round={round}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "usage-only twice round={round}"
+        );
         assert!(
-            body.contains("event: error"),
+            body.contains(envelope::PUBLIC_EMPTY_RESPONSE_MESSAGE),
             "usage-only twice round={round} body={body}"
         );
         assert!(
@@ -6569,12 +6621,8 @@ async fn run_stream_precommit_retry_without_external_pool_reports_error() {
                 config.inference_upstream_max_attempts = 10;
             });
         let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
-        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
-        assert_eq!(
-            body.matches("event: error").count(),
-            1,
-            "round={round} body={body}"
-        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "round={round} body={body}");
+        assert!(!body.contains("event: "), "round={round} body={body}");
         assert_eq!(upstream.hits(), 2, "round={round}");
         let record = usage_record_for_request(&usage_recorder, &request_id);
         assert_eq!(
@@ -6647,7 +6695,7 @@ async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
         let (status, _request_id, body) = call_handler_eventstream_fault(app, false).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "round={round} body={body}");
         assert!(
-            body.contains("request could not be completed"),
+            body.contains(envelope::PUBLIC_EMPTY_RESPONSE_MESSAGE),
             "round={round} body={body}"
         );
         assert_eq!(upstream.hits(), 2, "round={round}");
@@ -6697,17 +6745,8 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
             6,
             "{label}: six attempts in total, first call included"
         );
-        if stream {
-            assert_eq!(status, StatusCode::OK, "{label} body={body}");
-            assert_eq!(
-                body.matches("event: error").count(),
-                1,
-                "{label} body={body}"
-            );
-            assert!(!body.contains(r#""stop_reason":"end_turn""#), "{label}");
-        } else {
-            assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} body={body}");
-        }
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} body={body}");
+        assert!(!body.contains(r#""stop_reason":"end_turn""#), "{label}");
         let record = usage_record_for_request(&usage_recorder, &request_id);
         let accounts: HashSet<_> = record
             .credential_attempts
@@ -6991,16 +7030,9 @@ async fn run_empty_turn_cooldown_follows_global_switch() {
                         None,
                     );
                 let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
-                if stream {
-                    assert_eq!(status, StatusCode::OK, "{label} body={body}");
-                    assert_eq!(
-                        body.matches("event: error").count(),
-                        1,
-                        "{label} body={body}"
-                    );
-                } else {
-                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} body={body}");
-                }
+                // 空回在首个字节前失败：流式和非流式都返回 5xx JSON，不发 200。
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} body={body}");
+                assert!(!body.contains("event: "), "{label} body={body}");
                 assert_eq!(upstream.hits(), 3, "{label}: 首次调用加两次重试");
                 let record = usage_record_for_request(&usage_recorder, &request_id);
                 let accounts: HashSet<_> = record
@@ -12276,7 +12308,7 @@ async fn official_kiro_upstream_400_message_is_exposed_without_internal_prefix()
     assert!(message.contains("Invalid tool use format."));
     // Upstream reason codes are channel-specific and stay in the logs.
     assert!(!message.contains("REQUEST_BODY_INVALID"));
-    assert!(message.contains("error ID: req_01official"));
+    assert!(message.contains("request id: req_01official"));
     assert!(!message.contains("账号"));
     assert!(!message.contains("secret-user"));
 }
@@ -12338,10 +12370,11 @@ async fn official_kiro_bad_request_message_is_exposed_when_safe() {
         .and_then(|v| v.as_str())
         .expect("error message");
 
-    assert!(message.starts_with("Could not process image"));
+    // 图片格式不支持：按原因给出明确的处理建议，不透传上游原文。
+    assert!(message.starts_with(envelope::PUBLIC_IMAGE_FORMAT_UNSUPPORTED_MESSAGE));
     assert!(!message.to_ascii_lowercase().contains("bedrock"));
     assert!(!message.contains("IMAGE_FORMAT_UNSUPPORTED"));
-    assert!(message.contains("error ID: req_01official_bad_request"));
+    assert!(message.contains("request id: req_01official_bad_request"));
     assert!(!message.contains("hidden@example.com"));
     assert!(!message.contains("凭据"));
 }
@@ -12417,7 +12450,7 @@ async fn official_kiro_high_load_message_is_exposed_when_safe() {
 
     assert!(message.contains("Encountered unexpectedly high load"));
     assert!(!message.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
-    assert!(message.contains("error ID: req_01official_high_load"));
+    assert!(message.contains("request id: req_01official_high_load"));
     assert!(!message.contains("账号 #157"));
     assert!(!message.contains("hidden"));
 }
@@ -12450,7 +12483,7 @@ async fn official_kiro_upstream_message_with_kiro_term_is_masked() {
         .expect("error message");
 
     assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
-    assert!(message.contains("error ID: req_01official_term"));
+    assert!(message.contains("request id: req_01official_term"));
     assert_public_error_message_is_normalized(message);
 }
 
@@ -12588,7 +12621,6 @@ async fn no_available_credentials_error_uses_public_account_message() {
         .expect("error message");
     assert_eq!(message, envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE);
     assert_public_error_message_is_normalized(message);
-    assert!(message.contains("account"));
     assert!(!message.contains("0/26"));
     assert_eq!(value["request_id"], "req_no_account");
 }
@@ -12657,7 +12689,7 @@ async fn provider_error_response_exposes_matching_public_error_id() {
         .and_then(|v| v.as_str())
         .expect("error message");
     assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
-    assert!(message.contains("error ID: req_01public_error_id"));
+    assert!(message.contains("request id: req_01public_error_id"));
     assert!(!message.contains("shadow"));
     assert_public_error_message_is_normalized(message);
 }
@@ -13347,6 +13379,114 @@ fn kiro_rs_tool_plus_route_amplifies_bounds_and_limits_creation_frequency() {
         second_final.total_input_tokens,
         second_final.input_tokens + second_final.cache_read_input_tokens
     );
+}
+
+/// D1：kiro_rs_tool_plus 在 coverageRatio=1.0、最后一条消息带 cache_control 时，
+/// 上报的 input 不能是 0（官方在最后一个断点之后总会剩下几个 token），总输入不变。
+#[test]
+fn kiro_rs_tool_plus_full_coverage_never_reports_zero_input() {
+    let prompt_cache = Arc::new(PromptCacheTracker::default());
+    let usage_recorder = Arc::new(UsageRecorder::new(10));
+    let plus = crate::model::config::KiroRsToolPlusCachePolicy {
+        coverage_ratio: 1.0,
+        ..Default::default()
+    };
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/plus-full/v1/messages".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::KiroRsToolPlus),
+            kiro_rs_tool_plus: Some(plus),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        usage_recorder,
+        prompt_cache,
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::Disabled,
+        0.95,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let session_id = "1d6a0f52-9a51-4f0e-9a43-2f0b1b6a9d11";
+    let mut payload = MessagesRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        max_tokens: 16,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: json!([{"type":"text","text":"full coverage first turn","cache_control":{"type":"ephemeral"}}]),
+        }],
+        stream: false,
+        system: Some(vec![SystemMessage {
+            text: "stable full coverage system prompt ".repeat(700),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        output_format: None,
+        metadata: Some(Metadata {
+            user_id: Some(format!("user_test_account__session_{session_id}")),
+        }),
+        stop_sequences: None,
+    };
+    let context_for = |payload: &MessagesRequest, input_tokens: i32| {
+        let cache_route = RequestRuntimeConfig::from_app_state(&state)
+            .cache_policy_for_path("/plus-full/v1/messages");
+        prepare_usage_context(
+            &state,
+            cache_route,
+            "/plus-full/v1/messages",
+            false,
+            payload,
+            None,
+            Some(session_id.to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::KiroRsToolPlus,
+                PromptCacheSimulationMode::Disabled,
+                payload,
+            ),
+            input_tokens,
+        )
+        .attach_credential(Some(1), None, false, false, Vec::new())
+    };
+    for (round, input_tokens) in [(1, 2_000), (2, 2_400), (3, 2_800)] {
+        if round > 1 {
+            payload.messages.push(Message {
+                role: "assistant".to_string(),
+                content: json!("ok"),
+            });
+            payload.messages.push(Message {
+                role: "user".to_string(),
+                content: json!([{"type":"text","text":format!("full coverage turn {round}"),"cache_control":{"type":"ephemeral"}}]),
+            });
+        }
+        let context = context_for(&payload, input_tokens);
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            input_tokens,
+            20,
+            context.request.simulated_usage,
+            true,
+        );
+        let source = context.usage_source(&body, None, false);
+        let raw = cache::RawUsage::uncached(input_tokens, 20).to_cache_usage();
+        let reported = context.canonical_reported_usage_for_success_with_raw(body, source, raw);
+        assert!(reported.input_tokens >= 1, "round={round} {reported:?}");
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.input_tokens
+                + reported.cache_read_input_tokens
+                + reported.cache_creation_input_tokens,
+            "round={round} {reported:?}"
+        );
+        context.record_success_reported(reported, source, Some(raw));
+    }
 }
 
 #[test]
@@ -15974,6 +16114,7 @@ fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untou
                     min_cache_read_tokens: Some(1_024),
                     min_cache_creation_tokens: Some(1_024),
                     read_aware_cost_floor: None,
+                    cost_floor_top_up_input: None,
                 }),
                 ..CacheRoutePolicyPatch::default()
             },
@@ -16167,6 +16308,7 @@ fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
                 min_cache_read_tokens: Some(1_024),
                 min_cache_creation_tokens: Some(1_024),
                 read_aware_cost_floor: None,
+                cost_floor_top_up_input: None,
             }),
             cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
                 enabled: Some(true),
@@ -16529,6 +16671,7 @@ fn minea_prod_params_read_aware_floor_shrinks_small_context_and_keeps_large_ones
                 min_cache_read_tokens: Some(1_024),
                 min_cache_creation_tokens: Some(1_024),
                 read_aware_cost_floor: read_aware,
+                cost_floor_top_up_input: None,
             }),
             cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
                 enabled: Some(false),
@@ -18581,4 +18724,144 @@ fn request_cancelled_while_queued_records_client_dropped() {
         "cancelled-while-queued-client-dropped",
         run_request_cancelled_while_queued_records_client_dropped,
     );
+}
+
+/// 上游报 COMPLETED 但整条回复没有任何内容：是空回。流式与非流式都必须返回 5xx、
+/// 记为失败（不计费），绝不能是 200 成功。
+#[test]
+fn completed_without_content_is_an_empty_turn_not_a_success() {
+    run_handler_fixture_on_large_stack_thread("completed-without-content", || async {
+        for stream in [true, false] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::CompletedWithoutContentEveryAttempt,
+            )
+            .await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "stream={stream} body={body}"
+            );
+            assert!(
+                body.contains(envelope::PUBLIC_EMPTY_RESPONSE_MESSAGE),
+                "stream={stream} body={body}"
+            );
+            assert!(
+                !body.contains("administrator"),
+                "stream={stream} body={body}"
+            );
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_ne!(record.status, UsageRecordStatus::Success, "stream={stream}");
+        }
+    });
+}
+
+/// 中途出现空帧、之后正常出字的长流不能被当成空回。
+#[test]
+fn blank_frames_before_text_are_not_an_empty_turn() {
+    run_handler_fixture_on_large_stack_thread("blank-frames-then-text", || async {
+        for stream in [true, false] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::BlankFramesThenText,
+            )
+            .await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+            assert_eq!(status, StatusCode::OK, "stream={stream} body={body}");
+            assert!(body.contains("recovered-ok"), "stream={stream} body={body}");
+            assert_eq!(upstream.hits(), 1, "stream={stream}: 不应换号重试");
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(record.status, UsageRecordStatus::Success, "stream={stream}");
+        }
+    });
+}
+
+/// 只有心跳、过了保留窗口才出字的正常长流：窗口到期时照常发出 200 + 保活（不会因为
+/// 压住响应头而让客户端干等），最终成功、只调用一次上游，不算空回。
+#[test]
+fn heartbeats_then_text_stream_is_not_an_empty_turn() {
+    run_handler_fixture_on_large_stack_thread("heartbeats-then-text", || async {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::HeartbeatsThenText)
+                .await;
+        let (app, usage_recorder) = first_output_router(&upstream.base_url, 2, 1, 0);
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.oneshot(handler_eventstream_fault_request_for_path(
+                "/cc/v1/messages",
+                true,
+            )),
+        )
+        .await
+        .expect("response timed out")
+        .expect("response");
+        let header_at = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            header_at < Duration::from_millis(2_200),
+            "响应头应在保留窗口（1 秒）到期时发出，而不是等到首个内容: {header_at:?}"
+        );
+        let request_id = response_request_id(&response);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(body.contains("recovered-ok"), "body={body}");
+        assert!(!body.contains("event: error"), "body={body}");
+        assert_eq!(upstream.hits(), 1, "长流不应换号重试");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success);
+    });
+}
+
+/// 空回状态码可配置：529 时对外 overloaded_error。
+#[test]
+fn empty_turn_status_code_is_configurable() {
+    run_handler_fixture_on_large_stack_thread("empty-turn-status-code", || async {
+        for stream in [true, false] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::UsageOnlyEveryAttempt,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 2, 1, |config| {
+                    config.empty_turn_error_status_code = 529;
+                });
+            let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
+            assert_eq!(status.as_u16(), 529, "stream={stream} body={body}");
+            assert!(
+                body.contains(r#""type":"overloaded_error""#),
+                "stream={stream} body={body}"
+            );
+        }
+    });
+}
+
+/// 空回重试的等待：固定 300ms 时，两次重试之间至少等了这么久；不等待模式下很快结束。
+#[test]
+fn empty_turn_retry_backoff_delays_the_next_attempt() {
+    run_handler_fixture_on_large_stack_thread("empty-turn-backoff", || async {
+        for (mode, min_ms) in [("none", 0u128), ("fixed", 300u128)] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::UsageOnlyEveryAttempt,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 2, 1, |config| {
+                    config.empty_turn_retry_backoff_mode = mode.to_string();
+                    config.empty_turn_retry_base_delay_ms = 300;
+                    config.empty_turn_retry_jitter_percent = 0;
+                });
+            let started = std::time::Instant::now();
+            let (status, _request_id, body) = call_handler_eventstream_fault(app, false).await;
+            let elapsed = started.elapsed().as_millis();
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "mode={mode} body={body}");
+            assert!(elapsed >= min_ms, "mode={mode} elapsed={elapsed}ms");
+            if mode == "none" {
+                assert!(elapsed < 300, "mode={mode} elapsed={elapsed}ms");
+            }
+        }
+    });
 }

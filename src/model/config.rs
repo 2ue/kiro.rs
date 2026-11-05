@@ -1904,6 +1904,12 @@ pub struct CacheHitShapingPolicy {
     /// 只作用于本地链路的命中率整形；上下限优先策略不使用这个开关。
     #[serde(default)]
     pub read_aware_cost_floor: bool,
+
+    /// 计费差额补入 input，默认开启（原有行为）。计费下限仍按原来的方式在读写之间分配；
+    /// 写入（和读取）补完仍低于下限时，开启则把剩余差额记入 input，关闭则舍弃剩余差额，
+    /// 计费可以低于下限。上下限优先策略关闭时同时不累计差额。
+    #[serde(default = "default_true")]
+    pub cost_floor_top_up_input: bool,
 }
 
 impl Default for CacheHitShapingPolicy {
@@ -1918,6 +1924,7 @@ impl Default for CacheHitShapingPolicy {
             max_read_multiplier: 0.0,
             min_creation_ratio: 0.0,
             read_aware_cost_floor: false,
+            cost_floor_top_up_input: true,
         }
     }
 }
@@ -2153,6 +2160,8 @@ pub struct CacheHitShapingPolicyPatch {
     pub min_creation_ratio: Option<f64>,
     #[serde(default)]
     pub read_aware_cost_floor: Option<bool>,
+    #[serde(default)]
+    pub cost_floor_top_up_input: Option<bool>,
 }
 
 impl CacheHitShapingPolicyPatch {
@@ -2184,6 +2193,9 @@ impl CacheHitShapingPolicyPatch {
         if let Some(value) = self.read_aware_cost_floor {
             policy.read_aware_cost_floor = value;
         }
+        if let Some(value) = self.cost_floor_top_up_input {
+            policy.cost_floor_top_up_input = value;
+        }
         policy.normalized()
     }
 
@@ -2197,6 +2209,7 @@ impl CacheHitShapingPolicyPatch {
             && self.max_read_multiplier.is_none()
             && self.min_creation_ratio.is_none()
             && self.read_aware_cost_floor.is_none()
+            && self.cost_floor_top_up_input.is_none()
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {
@@ -5166,6 +5179,75 @@ pub struct Config {
     #[serde(default)]
     pub credential_upstream_failure_cooldown_enabled: bool,
 
+    /// 是否启用按模型的账号劣化分（默认开启）。
+    ///
+    /// 劣化分累积「与账号相关但不值得冷却」的失败（上游 200 但空轮次、流被截断等），
+    /// 达到 `credential_degrade_suspend_score` 后该账号在调度中被暂时摘除，流量自然
+    /// 溢出到同档位或其他档位的健康账号。摘除不改变账号配置、不写 Redis，成功会衰减分数，
+    /// 到期或衰减后自动恢复；被摘除账号仍保留少量探测流量。
+    ///
+    /// 没有一个健康候选时会全部放行，因此摘除本身不会造成排队。
+    #[serde(default = "default_credential_degrade_enabled")]
+    pub credential_degrade_enabled: bool,
+
+    /// 空回（上游 200 但整条响应没有任何内容，换号重试用尽）对外返回的 HTTP 状态码。
+    ///
+    /// 只允许 502 / 503 / 529，其它值按 502 处理。默认 502：下游网关（如 sub2api）收到 529
+    /// 通常会把账号标成过载、暂停调度。流式请求在首个输出前失败同样使用该状态码；
+    /// 已经开始输出后才失败的，流内 error 事件的 type 随之变化（529→overloaded_error）。
+    #[serde(default = "default_empty_turn_error_status_code")]
+    pub empty_turn_error_status_code: u16,
+
+    /// 空回换号重试之间的等待方式：none（不等待）、fixed（固定间隔）、exponential（指数递增）。
+    #[serde(default = "default_empty_turn_retry_backoff_mode")]
+    pub empty_turn_retry_backoff_mode: String,
+
+    /// 空回重试的首次等待毫秒数（0~10000）。
+    #[serde(default = "default_empty_turn_retry_base_delay_ms")]
+    pub empty_turn_retry_base_delay_ms: u64,
+
+    /// 指数模式下空回重试等待的上限毫秒数（0~30000）。
+    #[serde(default = "default_empty_turn_retry_max_delay_ms")]
+    pub empty_turn_retry_max_delay_ms: u64,
+
+    /// 空回重试等待的随机抖动比例（0~100），避免一批请求同时打到上游。
+    #[serde(default = "default_empty_turn_retry_jitter_percent")]
+    pub empty_turn_retry_jitter_percent: u32,
+
+    /// 劣化分摘除阈值；<= 0 时视为关闭摘除。
+    #[serde(default = "default_credential_degrade_suspend_score")]
+    pub credential_degrade_suspend_score: f64,
+
+    /// 劣化分的半衰期秒数：没有新样本时分数按此半衰期惰性衰减。
+    #[serde(default = "default_credential_degrade_half_life_secs")]
+    pub credential_degrade_half_life_secs: u64,
+
+    /// 恢复比例：劣化分必须降到 `阈值 × 该比例` 以下才解除摘除（0~1）。
+    ///
+    /// 摘除和恢复用两条不同的线构成滞回带。若两者相等，一次成功就把分数减半、
+    /// 账号立刻回到最高档吃满流量、再立刻失败被摘除，形成高频抖动。
+    /// 0.4 意味着 6.0 分要降到 2.4 以下才恢复（两次成功或约两个半衰期）。
+    #[serde(default = "default_credential_degrade_resume_ratio")]
+    pub credential_degrade_resume_ratio: f64,
+
+    /// 每次成功把劣化分乘以该系数（0~1），用于「恢复慢于劣化」。
+    #[serde(default = "default_credential_degrade_success_decay")]
+    pub credential_degrade_success_decay: f64,
+
+    /// 被摘除账号的探测流量比例（百分比，0~100）。
+    ///
+    /// 必须大于 0，否则被摘除的账号接不到请求、永远拿不到成功样本，也就永远无法恢复。
+    #[serde(default = "default_credential_degrade_probe_percent")]
+    pub credential_degrade_probe_percent: u32,
+
+    /// 一次空轮次（上游 200 但没有任何正文）累积的劣化分权重。
+    #[serde(default = "default_credential_degrade_empty_turn_weight")]
+    pub credential_degrade_empty_turn_weight: f64,
+
+    /// 一次流截断 / 上游流故障累积的劣化分权重。应低于空轮次：这类错误更偏向上游。
+    #[serde(default = "default_credential_degrade_stream_weight")]
+    pub credential_degrade_stream_weight: f64,
+
     /// 自愈最小间隔秒数（默认 300，0 表示不限）。
     ///
     /// 所有可调度账号都失效时，调度器会自动重新启用因连续失败被禁用的账号。同一个账号两次自愈
@@ -5832,6 +5914,63 @@ fn default_credential_network_error_cooldown_secs() -> u64 {
 
 fn default_credential_stream_error_cooldown_secs() -> u64 {
     5
+}
+
+fn default_credential_degrade_enabled() -> bool {
+    true
+}
+
+fn default_empty_turn_error_status_code() -> u16 {
+    502
+}
+
+fn default_empty_turn_retry_backoff_mode() -> String {
+    "none".to_string()
+}
+
+fn default_empty_turn_retry_base_delay_ms() -> u64 {
+    100
+}
+
+fn default_empty_turn_retry_max_delay_ms() -> u64 {
+    2000
+}
+
+fn default_empty_turn_retry_jitter_percent() -> u32 {
+    20
+}
+
+/// 5.0：两次空轮次（2.0 × 2 = 4.0）不够，三到四次之间就会触发。
+///
+/// 阈值必须和「N × 权重」留出余量，不能正好相等：累加基数按半衰期做时间衰减，
+/// 三次失败之间只要隔几毫秒，2.0 × 3 就会算出 5.9999 而不是 6.0，
+/// 阈值正好设成 6.0 时判定会时好时坏。这里取 5.0，留出 1.0 的余量。
+fn default_credential_degrade_suspend_score() -> f64 {
+    5.0
+}
+
+fn default_credential_degrade_half_life_secs() -> u64 {
+    120
+}
+
+fn default_credential_degrade_success_decay() -> f64 {
+    0.5
+}
+
+fn default_credential_degrade_resume_ratio() -> f64 {
+    0.4
+}
+
+fn default_credential_degrade_probe_percent() -> u32 {
+    2
+}
+
+fn default_credential_degrade_empty_turn_weight() -> f64 {
+    2.0
+}
+
+fn default_credential_degrade_stream_weight() -> f64 {
+    1.0
 }
 
 fn default_credential_protocol_error_cooldown_secs() -> u64 {
@@ -6909,6 +7048,19 @@ impl Default for Config {
             credential_stream_error_cooldown_secs: default_credential_stream_error_cooldown_secs(),
             credential_empty_turn_cooldown_enabled: false,
             credential_upstream_failure_cooldown_enabled: false,
+            credential_degrade_enabled: default_credential_degrade_enabled(),
+            empty_turn_error_status_code: default_empty_turn_error_status_code(),
+            empty_turn_retry_backoff_mode: default_empty_turn_retry_backoff_mode(),
+            empty_turn_retry_base_delay_ms: default_empty_turn_retry_base_delay_ms(),
+            empty_turn_retry_max_delay_ms: default_empty_turn_retry_max_delay_ms(),
+            empty_turn_retry_jitter_percent: default_empty_turn_retry_jitter_percent(),
+            credential_degrade_suspend_score: default_credential_degrade_suspend_score(),
+            credential_degrade_half_life_secs: default_credential_degrade_half_life_secs(),
+            credential_degrade_success_decay: default_credential_degrade_success_decay(),
+            credential_degrade_resume_ratio: default_credential_degrade_resume_ratio(),
+            credential_degrade_probe_percent: default_credential_degrade_probe_percent(),
+            credential_degrade_empty_turn_weight: default_credential_degrade_empty_turn_weight(),
+            credential_degrade_stream_weight: default_credential_degrade_stream_weight(),
             credential_auto_heal_min_interval_secs: default_credential_auto_heal_min_interval_secs(
             ),
             credential_auto_heal_max_consecutive_rounds:

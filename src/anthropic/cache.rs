@@ -177,6 +177,31 @@ impl CacheUsage {
     /// Puts the whole cache write into one TTL bucket. This is the only place the final 5m/1h
     /// split is set: every shaping step before it may move the split around, so the route's
     /// cache TTL mode is applied last.
+    /// 上报的 input 永远不为 0：官方在最后一个缓存断点之后总会剩下几个 token。
+    ///
+    /// 有读取或写入、但 input 为 0 时，从读取（没有读取时从写入）挪 1 个 token 到 input，
+    /// 总输入不变。全部为 0 时（例如没有任何输入统计）保持原样。
+    pub fn with_nonzero_input(mut self) -> Self {
+        if self.input_tokens > 0 {
+            return self;
+        }
+        self.input_tokens = 0;
+        if self.cache_read_input_tokens > 0 {
+            self.cache_read_input_tokens -= 1;
+        } else if self.cache_creation_input_tokens > 0 {
+            self.cache_creation_input_tokens -= 1;
+            if self.cache_creation_1h_input_tokens > 0 {
+                self.cache_creation_1h_input_tokens -= 1;
+            } else if self.cache_creation_5m_input_tokens > 0 {
+                self.cache_creation_5m_input_tokens -= 1;
+            }
+        } else {
+            return self;
+        }
+        self.input_tokens = 1;
+        self
+    }
+
     pub fn with_cache_creation_ttl(mut self, ttl: CacheWriteTtl) -> Self {
         let creation = self.cache_creation_input_tokens.max(0);
         let (five_minutes, one_hour) = match ttl {
@@ -1175,7 +1200,8 @@ pub struct CacheHitShapingInput {
 /// 3. 非零但过小的读写抬到最小值。
 ///
 /// 是否写入只由 creation control 决定：未放行的请求最终写入为 0，计费差额全部由 input
-/// 补足（此时 input 可以超过 reportedUsage.input 上限）。
+/// 补足（此时 input 可以超过 reportedUsage.input 上限）。`costFloorTopUpInput` 关闭时
+/// 不往 input 补差额：写入补到上限后仍不足的部分直接舍弃，计费可以低于下限。
 /// 优先级：写入频次控制 > 不亏损 > 读写上限 > 命中率。
 pub fn shape_cache_hit_usage(usage: CacheUsage, input: CacheHitShapingInput) -> CacheUsage {
     let policy = input.policy.normalized();
@@ -1220,6 +1246,7 @@ pub fn shape_cache_hit_usage(usage: CacheUsage, input: CacheHitShapingInput) -> 
                     target,
                     &bounds,
                     input.creation_allowed,
+                    policy.cost_floor_top_up_input,
                 )
             } else {
                 lossless_split(
@@ -1474,6 +1501,8 @@ fn lossless_split(
 /// 所以达到同样的计费需要的总量比"非读取单独满足下限、再在外面追加读取"小得多。
 /// 非读取部分放行写入时先记为写入（到写入上限为止），之后记为 input（与 [`raise_cost_to_floor`]
 /// 一致，不受 input 上限约束）；读取到上限后只增加非读取部分，命中率可以低于目标。
+/// `top_up_input` 为 false 时写入到上限（或未放行写入）即停止，不再增加 input。
+#[allow(clippy::too_many_arguments)]
 fn raise_cost_at_ratio(
     mut usage: CacheUsage,
     pricing: ModelPricing,
@@ -1481,6 +1510,7 @@ fn raise_cost_at_ratio(
     ratio: f64,
     bounds: &ShapingBounds,
     creation_allowed: bool,
+    top_up_input: bool,
 ) -> CacheUsage {
     let ratio = ratio.clamp(0.0, CacheHitShapingPolicy::MAX_TARGET_HIT_RATIO);
     let reads_per_non_read = ratio / (1.0 - ratio);
@@ -1499,8 +1529,10 @@ fn raise_cost_at_ratio(
         };
         let (unit_cost, room) = if creation_room > 0 {
             (pricing.cache_creation_input_token_cost, creation_room)
-        } else {
+        } else if top_up_input {
             (pricing.input_cost_per_token, i64::from(i32::MAX))
+        } else {
+            break;
         };
         let read_room =
             (i64::from(bounds.read_cap) - i64::from(usage.cache_read_input_tokens.max(0))).max(0);
@@ -1565,7 +1597,8 @@ fn meets_floor(pricing: ModelPricing, usage: &CacheUsage, floor: f64) -> bool {
 
 /// 总量内已无法不亏损时（例如总量本身过小，或写入被最终上限截断）补足计费：
 /// 放行写入时先增加写入、写入到上限后增加 input；未放行时只增加 input。
-/// 补到 input 的部分不受 input 上限约束，保证计费下限优先于读写上限。
+/// 补到 input 的部分不受 input 上限约束，保证计费下限优先于读写上限；
+/// `costFloorTopUpInput` 关闭时不补 input，剩余差额舍弃。
 fn raise_cost_to_floor(
     usage: &mut CacheUsage,
     pricing: ModelPricing,
@@ -1593,7 +1626,10 @@ fn raise_cost_to_floor(
     }
     // 写入到达上限（或本次未放行写入）后仍不足时，差额全部记入 input，不受 input 上限约束：
     // 计费下限优先于读写上限，否则超长上下文会被写入上限截断后低于下限。
-    if !meets_floor(pricing, usage, floor) && pricing.input_cost_per_token > 0.0 {
+    if policy.cost_floor_top_up_input
+        && !meets_floor(pricing, usage, floor)
+        && pricing.input_cost_per_token > 0.0
+    {
         let gap = floor - pricing.estimate(*usage);
         let tokens = (gap / pricing.input_cost_per_token).ceil();
         let tokens = tokens.clamp(0.0, i32::MAX as f64) as i32;
@@ -4042,6 +4078,7 @@ mod tests {
             max_read_multiplier: 0.0,
             min_creation_ratio: 0.0,
             read_aware_cost_floor: false,
+            cost_floor_top_up_input: true,
         }
     }
 
@@ -4335,9 +4372,118 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cost_floor_without_input_top_up_drops_the_remaining_gap() {
+        // 同一个超长上下文请求，关闭"计费差额补入输入"：写入照常补到上限，
+        // 剩余差额不再记入 input，计费低于下限。
+        let opus = ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: 0.00000625,
+            cache_creation_1h_input_token_cost: 0.0,
+            cache_read_input_token_cost: 0.0000005,
+        };
+        let raw = raw_input(968_653, 1);
+        let floor = opus.estimate(raw) * 0.8;
+        let base = usage(20_000, 0, 400_000, 1);
+        let policy = CacheHitShapingPolicy {
+            cost_floor_top_up_input: false,
+            ..shaping(0.9, 1024, 0.8)
+        };
+        for creation_allowed in [true, false] {
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    has_reusable_prefix: false,
+                    creation_allowed,
+                    pricing: Some(opus),
+                    max_cache_creation_tokens: 457_678,
+                    ..input(policy, raw)
+                },
+            );
+            assert!(opus.estimate(shaped) < floor, "{shaped:?}");
+            if creation_allowed {
+                assert_eq!(shaped.input_tokens, 20_000, "{shaped:?}");
+                assert_eq!(shaped.cache_creation_input_tokens, 457_678, "{shaped:?}");
+            } else {
+                // 未放行写入：写入并回 input（不是计费补差），不再额外补 input。
+                assert_eq!(shaped.input_tokens, 420_000, "{shaped:?}");
+                assert_eq!(shaped.cache_creation_input_tokens, 0, "{shaped:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cost_floor_without_input_top_up_still_balances_within_the_total() {
+        // 总量足够时先按计费下限分配（降低读取占比），结果与开启时一致。
+        let base = usage(3_000, 20_000, 7_000, 10);
+        let raw = raw_input(30_000, 10);
+        let on = shape_cache_hit_usage(base, input(shaping(0.9, 1024, 1.0), raw));
+        let off = shape_cache_hit_usage(
+            base,
+            input(
+                CacheHitShapingPolicy {
+                    cost_floor_top_up_input: false,
+                    ..shaping(0.9, 1024, 1.0)
+                },
+                raw,
+            ),
+        );
+        assert_eq!(on, off);
+        assert!(sonnet_pricing().estimate(off) >= sonnet_pricing().estimate(raw) * (1.0 - 1e-9));
+    }
+
+    #[test]
+    fn read_aware_cost_floor_without_input_top_up_stops_at_the_write_cap() {
+        let raw = raw_input(30_000, 10);
+        let base = usage(500, 2_000, 1_000, 10);
+        let floor = sonnet_pricing().estimate(raw);
+        for creation_allowed in [true, false] {
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    creation_allowed,
+                    input_max_tokens: 500,
+                    max_cache_creation_tokens: 4_000,
+                    ..input(
+                        CacheHitShapingPolicy {
+                            read_aware_cost_floor: true,
+                            cost_floor_top_up_input: false,
+                            ..shaping(0.9, 1024, 1.0)
+                        },
+                        raw,
+                    )
+                },
+            );
+            assert!(sonnet_pricing().estimate(shaped) < floor, "{shaped:?}");
+            assert!(shaped.input_tokens <= 500, "{shaped:?}");
+            assert!(shaped.cache_creation_input_tokens <= 4_000, "{shaped:?}");
+        }
+    }
+
+    #[test]
+    fn cost_floor_top_up_input_defaults_on_and_round_trips() {
+        let policy: CacheHitShapingPolicy =
+            serde_json::from_value(serde_json::json!({ "enabled": true }))
+                .expect("old config without the field");
+        assert!(policy.cost_floor_top_up_input);
+        assert!(CacheHitShapingPolicy::default().cost_floor_top_up_input);
+        let policy: CacheHitShapingPolicy = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "costFloorTopUpInput": false
+        }))
+        .expect("new config");
+        assert!(!policy.cost_floor_top_up_input);
+        assert_eq!(
+            serde_json::to_value(policy).unwrap()["costFloorTopUpInput"],
+            serde_json::json!(false)
+        );
+    }
+
     fn read_aware(policy: CacheHitShapingPolicy) -> CacheHitShapingPolicy {
         CacheHitShapingPolicy {
             read_aware_cost_floor: true,
+            cost_floor_top_up_input: true,
             ..policy
         }
     }
@@ -4724,5 +4870,52 @@ mod tests {
                 cold.cache_creation_input_tokens
             );
         }
+    }
+    /// D1：上报的 input 永远不为 0；从读取（没有时从写入）挪 1 个 token，总输入不变。
+    #[test]
+    fn reported_input_is_never_zero() {
+        let from_read = CacheUsage {
+            total_input_tokens: 1000,
+            input_tokens: 0,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        }
+        .with_nonzero_input();
+        assert_eq!(from_read.input_tokens, 1);
+        assert_eq!(from_read.cache_read_input_tokens, 999);
+        assert_eq!(from_read.reported_total_input_tokens(), 1000);
+
+        let from_creation = CacheUsage {
+            total_input_tokens: 500,
+            input_tokens: 0,
+            output_tokens: 5,
+            cache_creation_input_tokens: 500,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 500,
+        }
+        .with_nonzero_input();
+        assert_eq!(from_creation.input_tokens, 1);
+        assert_eq!(from_creation.cache_creation_input_tokens, 499);
+        assert_eq!(from_creation.cache_creation_1h_input_tokens, 499);
+
+        let untouched = CacheUsage {
+            total_input_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        assert_eq!(untouched.with_nonzero_input(), untouched);
+        let normal = CacheUsage {
+            input_tokens: 7,
+            ..from_read
+        };
+        assert_eq!(normal.with_nonzero_input(), normal);
     }
 }

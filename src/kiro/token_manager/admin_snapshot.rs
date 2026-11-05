@@ -189,6 +189,13 @@ pub struct CredentialEntrySnapshot {
     pub last_error_at_ms: Option<i64>,
     /// 是否处于冷却结束后的降权观察窗口。
     pub in_probation: bool,
+    /// 当前劣化分（按调度实际使用的模型维度，未指定模型时取该账号全局值）。
+    ///
+    /// 达到 `credential_degrade_suspend_score` 时该账号在调度中被暂时摘除；
+    /// 成功会衰减、静置会按半衰期衰减，恢复后自动回到候选集。
+    pub degrade_score: f64,
+    /// 是否因劣化分达到阈值被暂时摘除。
+    pub degraded: bool,
     /// 降权观察窗口剩余秒数。
     pub probation_remaining_secs: u64,
     /// 调度选中该凭据次数。
@@ -594,6 +601,25 @@ pub(super) fn runtime_snapshot_from_entry(
             .health
             .probation_until_ms
             .is_some_and(|until_ms| until_ms > now_ms),
+        degrade_score: {
+            let half_life_ms = (config.credential_degrade_half_life_secs.max(1) as f64) * 1000.0;
+            super::degrade::effective_score(&entry.degrade_scores, None, now_ms, half_life_ms)
+        },
+        degraded: {
+            let half_life_ms = (config.credential_degrade_half_life_secs.max(1) as f64) * 1000.0;
+            let resume_score = (config.credential_degrade_suspend_score
+                * config.credential_degrade_resume_ratio.clamp(0.0, 1.0))
+            .max(0.0);
+            config.credential_degrade_enabled
+                && resume_score > 0.0
+                && super::degrade::is_suspended(
+                    &entry.degrade_scores,
+                    None,
+                    now_ms,
+                    half_life_ms,
+                    resume_score,
+                )
+        },
         probation_remaining_secs: entry
             .health
             .probation_until_ms

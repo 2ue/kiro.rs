@@ -392,6 +392,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 - 范围：`input` ≤ `reportedUsage.input` 上限；`cache_read` ≤ min(最终读取上限, 原始输入 × `hitShaping.maxReadMultiplier`)；`cache_creation` ≤ min(最终写入上限, `creationControl.maxCreationTokensPerEvent`)，未放行写入时为 0。上限在配置值以下确定性浮动（input 15%，读写 5%），不会集中在同一个整数上。
 - 优先级：上下限 > 写入频次控制 > 命中率 > 不亏损。超出范围的部分直接丢弃，不挪到其他字段；非零读写低于最小值时抬到最小值，上限低于最小值时清零。
 - 计费：`hitShaping.minCostRatio` 只在范围内补（依次抬高写入、读取、input）。本次补不上的差额按 creation control 的维度累计（上限为当次下限的 20 倍，状态在进程内存中，随会话空闲过期），之后放行写入的请求在写入上限内补回。
+- `hitShaping.costFloorTopUpInput`（默认 `true`）：写入、读取补完仍低于计费下限时是否用 input 补差额。设为 `false` 时仍先按计费下限分配读写，补不齐的差额直接舍弃，不记入 input，也不跨请求累计；`current_high_cache` 同样适用（关闭后写入补到上限或未放行写入时不再往 input 补）。
 - 外部池路径同样在计费补偿之后按上下限收口。
 
 #### Kiro-RS Tool Plus 缓存策略（`kiro_rs_tool_plus`）

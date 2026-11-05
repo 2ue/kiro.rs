@@ -1595,6 +1595,7 @@ export interface CacheHitShapingPolicyPatch {
   minCreationRatio?: number
   /** Count cache reads toward the cost floor; off keeps the original shaping. */
   readAwareCostFloor?: boolean
+  costFloorTopUpInput?: boolean
 }
 
 export interface CachePolicyConfig {
@@ -2164,6 +2165,19 @@ export interface RuntimeConfig {
   /** 空回（只有用量统计、零帧或空响应体）是否让账号冷却，默认关闭。 */
   credentialEmptyTurnCooldownEnabled: boolean
   credentialUpstreamFailureCooldownEnabled: boolean
+  credentialDegradeEnabled: boolean
+  credentialDegradeSuspendScore: number
+  credentialDegradeResumeRatio: number
+  credentialDegradeHalfLifeSecs: number
+  credentialDegradeSuccessDecay: number
+  credentialDegradeProbePercent: number
+  credentialDegradeEmptyTurnWeight: number
+  credentialDegradeStreamWeight: number
+  emptyTurnErrorStatusCode: number
+  emptyTurnRetryBackoffMode: 'none' | 'fixed' | 'exponential'
+  emptyTurnRetryBaseDelayMs: number
+  emptyTurnRetryMaxDelayMs: number
+  emptyTurnRetryJitterPercent: number
   credentialAutoHealMinIntervalSecs: number
   credentialAutoHealMaxConsecutiveRounds: number
   /** 自动同步 Kiro 客户端版本号（默认关闭）。 */
