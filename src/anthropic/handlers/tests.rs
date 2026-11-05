@@ -13381,6 +13381,112 @@ fn kiro_rs_tool_plus_route_amplifies_bounds_and_limits_creation_frequency() {
     );
 }
 
+/// D1：kiro_rs_tool_plus 在 coverageRatio=1.0、最后一条消息带 cache_control 时，
+/// 上报的 input 不能是 0（官方在最后一个断点之后总会剩下几个 token），总输入不变。
+#[test]
+fn kiro_rs_tool_plus_full_coverage_never_reports_zero_input() {
+    let prompt_cache = Arc::new(PromptCacheTracker::default());
+    let usage_recorder = Arc::new(UsageRecorder::new(10));
+    let mut plus = crate::model::config::KiroRsToolPlusCachePolicy::default();
+    plus.coverage_ratio = 1.0;
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/plus-full/v1/messages".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::KiroRsToolPlus),
+            kiro_rs_tool_plus: Some(plus),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        usage_recorder,
+        prompt_cache,
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::Disabled,
+        0.95,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let session_id = "1d6a0f52-9a51-4f0e-9a43-2f0b1b6a9d11";
+    let mut payload = MessagesRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        max_tokens: 16,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: json!([{"type":"text","text":"full coverage first turn","cache_control":{"type":"ephemeral"}}]),
+        }],
+        stream: false,
+        system: Some(vec![SystemMessage {
+            text: "stable full coverage system prompt ".repeat(700),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        output_format: None,
+        metadata: Some(Metadata {
+            user_id: Some(format!("user_test_account__session_{session_id}")),
+        }),
+        stop_sequences: None,
+    };
+    let context_for = |payload: &MessagesRequest, input_tokens: i32| {
+        let cache_route = RequestRuntimeConfig::from_app_state(&state)
+            .cache_policy_for_path("/plus-full/v1/messages");
+        prepare_usage_context(
+            &state,
+            cache_route,
+            "/plus-full/v1/messages",
+            false,
+            payload,
+            None,
+            Some(session_id.to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::KiroRsToolPlus,
+                PromptCacheSimulationMode::Disabled,
+                payload,
+            ),
+            input_tokens,
+        )
+        .attach_credential(Some(1), None, false, false, Vec::new())
+    };
+    for (round, input_tokens) in [(1, 2_000), (2, 2_400), (3, 2_800)] {
+        if round > 1 {
+            payload.messages.push(Message {
+                role: "assistant".to_string(),
+                content: json!("ok"),
+            });
+            payload.messages.push(Message {
+                role: "user".to_string(),
+                content: json!([{"type":"text","text":format!("full coverage turn {round}"),"cache_control":{"type":"ephemeral"}}]),
+            });
+        }
+        let context = context_for(&payload, input_tokens);
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            input_tokens,
+            20,
+            context.request.simulated_usage,
+            true,
+        );
+        let source = context.usage_source(&body, None, false);
+        let raw = cache::RawUsage::uncached(input_tokens, 20).to_cache_usage();
+        let reported = context.canonical_reported_usage_for_success_with_raw(body, source, raw);
+        assert!(reported.input_tokens >= 1, "round={round} {reported:?}");
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.input_tokens
+                + reported.cache_read_input_tokens
+                + reported.cache_creation_input_tokens,
+            "round={round} {reported:?}"
+        );
+        context.record_success_reported(reported, source, Some(raw));
+    }
+}
+
 #[test]
 fn kiro_rs_tool_plus_does_not_stack_legacy_usage_guards() {
     let mut cache_policy = CachePolicyConfig::default();

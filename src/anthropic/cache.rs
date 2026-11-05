@@ -177,6 +177,31 @@ impl CacheUsage {
     /// Puts the whole cache write into one TTL bucket. This is the only place the final 5m/1h
     /// split is set: every shaping step before it may move the split around, so the route's
     /// cache TTL mode is applied last.
+    /// 上报的 input 永远不为 0：官方在最后一个缓存断点之后总会剩下几个 token。
+    ///
+    /// 有读取或写入、但 input 为 0 时，从读取（没有读取时从写入）挪 1 个 token 到 input，
+    /// 总输入不变。全部为 0 时（例如没有任何输入统计）保持原样。
+    pub fn with_nonzero_input(mut self) -> Self {
+        if self.input_tokens > 0 {
+            return self;
+        }
+        self.input_tokens = 0;
+        if self.cache_read_input_tokens > 0 {
+            self.cache_read_input_tokens -= 1;
+        } else if self.cache_creation_input_tokens > 0 {
+            self.cache_creation_input_tokens -= 1;
+            if self.cache_creation_1h_input_tokens > 0 {
+                self.cache_creation_1h_input_tokens -= 1;
+            } else if self.cache_creation_5m_input_tokens > 0 {
+                self.cache_creation_5m_input_tokens -= 1;
+            }
+        } else {
+            return self;
+        }
+        self.input_tokens = 1;
+        self
+    }
+
     pub fn with_cache_creation_ttl(mut self, ttl: CacheWriteTtl) -> Self {
         let creation = self.cache_creation_input_tokens.max(0);
         let (five_minutes, one_hour) = match ttl {
@@ -4845,5 +4870,52 @@ mod tests {
                 cold.cache_creation_input_tokens
             );
         }
+    }
+    /// D1：上报的 input 永远不为 0；从读取（没有时从写入）挪 1 个 token，总输入不变。
+    #[test]
+    fn reported_input_is_never_zero() {
+        let from_read = CacheUsage {
+            total_input_tokens: 1000,
+            input_tokens: 0,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        }
+        .with_nonzero_input();
+        assert_eq!(from_read.input_tokens, 1);
+        assert_eq!(from_read.cache_read_input_tokens, 999);
+        assert_eq!(from_read.reported_total_input_tokens(), 1000);
+
+        let from_creation = CacheUsage {
+            total_input_tokens: 500,
+            input_tokens: 0,
+            output_tokens: 5,
+            cache_creation_input_tokens: 500,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 500,
+        }
+        .with_nonzero_input();
+        assert_eq!(from_creation.input_tokens, 1);
+        assert_eq!(from_creation.cache_creation_input_tokens, 499);
+        assert_eq!(from_creation.cache_creation_1h_input_tokens, 499);
+
+        let untouched = CacheUsage {
+            total_input_tokens: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        assert_eq!(untouched.with_nonzero_input(), untouched);
+        let normal = CacheUsage {
+            input_tokens: 7,
+            ..from_read
+        };
+        assert_eq!(normal.with_nonzero_input(), normal);
     }
 }

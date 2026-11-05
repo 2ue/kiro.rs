@@ -3531,6 +3531,12 @@ impl StreamContext {
                 }
             }),
         ));
+        // tool_use 块本身就是输出：工具名和（空参数时的）`{}` 都要计入输出估算，
+        // 否则无参工具调用的 output_tokens 会是 0。
+        self.output_token_estimate.record(&output_name);
+        if input_json.is_empty() {
+            self.output_token_estimate.record("{}");
+        }
         if !input_json.is_empty() {
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -4054,6 +4060,13 @@ impl StreamContext {
                 }
             }),
         );
+        if !start_events.is_empty() {
+            // tool_use 块本身就是输出：工具名计入输出估算（无参工具不会再有参数增量）。
+            self.output_token_estimate.record(&original_name);
+            if tool_use.stop && tool_use.input.trim().is_empty() {
+                self.output_token_estimate.record("{}");
+            }
+        }
         events.extend(start_events);
 
         let has_schema_key_map = self.tool_schema_key_map.has_tool(&upstream_name);
@@ -4512,6 +4525,14 @@ impl StreamContext {
             .map(|usage| usage.output_tokens)
             .filter(|tokens| *tokens > 0)
             .unwrap_or(estimated_output_tokens);
+        // 下游已经收到工具调用或文本这类可见内容时，输出不能记为 0。
+        let final_output_tokens = if final_output_tokens <= 0
+            && (self.state_manager.has_tool_use() || self.state_manager.has_non_thinking_blocks())
+        {
+            1
+        } else {
+            final_output_tokens
+        };
         // Kiro 上游没有 max_tokens 字段，输出不会按客户端 max_tokens 截断。内容完整时不再
         // 按 token 数推断 max_tokens：否则 Claude Code 会误判输出被截断并自动续写。
         // 只有上游明确的截断信号（如 ContentLengthExceededException）才报 max_tokens。
@@ -4746,6 +4767,30 @@ mod tests {
             .collect::<String>();
         assert!(!serialized.contains("Hash1a2b3c4d"));
         assert!(serialized.contains(&format!("Calling {original} now.")));
+    }
+
+    /// D2：调用无参工具、上游没有 metadata 也没有 completed 时，下游 output_tokens 不能是 0。
+    #[test]
+    fn no_argument_tool_call_reports_nonzero_output_tokens() {
+        for (input, stop) in [("", true), ("", false)] {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::ToolUse(
+                crate::kiro::model::events::ToolUseEvent {
+                    name: "get_current_time".to_string(),
+                    tool_use_id: "toolu_time".to_string(),
+                    input: input.to_string(),
+                    stop,
+                },
+            )));
+            events.extend(ctx.generate_final_events());
+            let delta = events
+                .iter()
+                .find(|event| event.event == "message_delta")
+                .expect("message_delta");
+            let output = delta.data["usage"]["output_tokens"].as_i64().unwrap_or(0);
+            assert!(output >= 1, "stop={stop} output={output}");
+        }
     }
 
     #[test]

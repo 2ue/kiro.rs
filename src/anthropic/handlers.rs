@@ -3511,11 +3511,13 @@ impl RequestUsageContext {
     }
 
     /// Applies the route's cache TTL mode to a final downstream usage (no-op on no-cache routes).
+    /// 下游 usage 的最后一步：按路由写入 TTL 拆分 5m/1h，并保证上报的 input 不为 0。
     fn apply_cache_write_ttl(&self, usage: super::cache::CacheUsage) -> super::cache::CacheUsage {
-        match self.cache_write_ttl {
+        let usage = match self.cache_write_ttl {
             Some(ttl) => usage.with_cache_creation_ttl(ttl),
             None => usage,
-        }
+        };
+        usage.with_nonzero_input()
     }
 
     fn capture_meta(&self) -> super::request_capture::CaptureRequestMeta<'_> {
@@ -14874,6 +14876,12 @@ async fn handle_non_stream_request(
         .map(|usage| usage.output_tokens)
         .filter(|tokens| *tokens > 0)
         .unwrap_or(estimated_content_output_tokens);
+    // 有可见内容（文本或工具调用）时输出不能记为 0。
+    let output_tokens = if output_tokens <= 0 && !content.is_empty() {
+        1
+    } else {
+        output_tokens
+    };
     // 与流式一致：内容完整时不按 token 数推断 max_tokens（Kiro 上游不按 max_tokens 截断），
     // 避免 Claude Code 误判截断后自动续写。
     if matched_stop_sequence.is_some() {
