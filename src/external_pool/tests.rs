@@ -10847,7 +10847,7 @@ async fn external_pool_error_response_masks_raw_error_body_with_trace_id() {
     assert_eq!(value["error"]["type"], "invalid_request_error");
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.contains(envelope::PUBLIC_INVALID_REQUEST_MESSAGE));
-    assert!(message.contains("request id: req_01"));
+    assert!(message.contains("request-id: req_01"));
     assert!(!message.contains("bad input"));
     assert!(!message.contains("invalid_request_error"));
     assert_public_message_hides_internal_routing(message);
@@ -10871,7 +10871,7 @@ fn external_public_error_masks_raw_message() {
             .message
             .contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE)
     );
-    assert!(public_error.message.contains("request id: req_01public"));
+    assert!(public_error.message.contains("request-id: req_01public"));
     assert!(!public_error.message.contains("buy credits"));
 }
 
@@ -10888,7 +10888,7 @@ fn external_public_error_reports_prompt_too_long_without_raw_pool_message() {
     assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
     assert_eq!(public_error.error_type, "invalid_request_error");
     assert!(public_error.message.contains("Context window is full"));
-    assert!(public_error.message.contains("request id: req_01long"));
+    assert!(public_error.message.contains("request-id: req_01long"));
     assert!(!public_error.message.contains("1000000 maximum"));
     assert!(!public_error.message.contains("buy credits"));
 }
@@ -10907,7 +10907,7 @@ fn external_public_error_reports_payload_limit_without_context_window_message() 
     assert_eq!(public_error.error_type, "invalid_request_error");
     assert!(public_error.message.contains("content length exceeded"));
     assert!(public_error.message.contains("external upstream threshold"));
-    assert!(public_error.message.contains("request id: req_01payload"));
+    assert!(public_error.message.contains("request-id: req_01payload"));
     assert!(!public_error.message.contains("Context window is full"));
     assert!(!public_error.message.contains("Prompt is too long"));
 }
@@ -10984,7 +10984,7 @@ async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
     assert_eq!(value["error"]["type"], "rate_limit_error");
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.contains(envelope::PUBLIC_RATE_LIMIT_MESSAGE));
-    assert!(message.contains("request id: req_01"));
+    assert!(message.contains("request-id: req_01"));
     assert!(!message.contains("slow down"));
     assert!(!message.contains("rate_limit_error"));
     assert_public_message_hides_internal_routing(message);
@@ -11787,7 +11787,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
     assert_eq!(body["error"]["type"], "api_error");
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
-    assert!(message.contains("request id: req_01"));
+    assert!(message.contains("request-id: req_01"));
     assert!(!message.contains("Request capacity is full"));
     assert_public_message_hides_internal_routing(message);
 }
@@ -11895,7 +11895,7 @@ data: {"type":"error","error":{"type":"api_error","message":"raw external promo 
 
     assert!(text.contains("event: error"));
     assert!(text.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
-    assert!(text.contains("request id: req_01streammask"));
+    assert!(text.contains("request-id: req_01streammask"));
     assert!(text.contains("req_stream_mask"));
     assert!(!text.contains("raw external promo text"));
     assert!(!text.contains("pool-a"));

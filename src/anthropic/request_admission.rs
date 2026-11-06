@@ -1195,7 +1195,8 @@ async fn usage_limit_rejection(
                 StatusCode::SERVICE_UNAVAILABLE,
                 RequestRejectionReason::KeyUsageLimitUnavailable,
                 "overloaded_error",
-                "API key usage limit could not be checked. Please retry shortly.".to_string(),
+                "The API key usage limit could not be checked. Please try again shortly."
+                    .to_string(),
                 Some(5),
             )
         }
@@ -1288,7 +1289,7 @@ pub(crate) async fn request_admission_middleware(
             envelope::error_response_with_id_and_headers(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
-                "Request rate limit exceeded. Please retry shortly.",
+                "Request rate limit exceeded. Please try again shortly.",
                 &request_id,
                 [("retry-after", rejection.retry_after_secs.to_string())],
             )

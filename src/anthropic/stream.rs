@@ -7335,7 +7335,7 @@ mod tests {
             .as_str()
             .expect("message should be string");
         assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
-        assert!(message.contains("request id: req_01masked_stream"));
+        assert!(message.contains("request-id: req_01masked_stream"));
         assert!(!message.contains("upstream"));
         assert!(!message.contains("billing"));
         assert!(!message.contains("routing"));
