@@ -1195,7 +1195,8 @@ async fn usage_limit_rejection(
                 StatusCode::SERVICE_UNAVAILABLE,
                 RequestRejectionReason::KeyUsageLimitUnavailable,
                 "overloaded_error",
-                "The API key usage limit could not be checked. Please try again shortly.".to_string(),
+                "The API key usage limit could not be checked. Please try again shortly."
+                    .to_string(),
                 Some(5),
             )
         }
