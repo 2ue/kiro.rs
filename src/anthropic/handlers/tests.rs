@@ -12308,7 +12308,7 @@ async fn official_kiro_upstream_400_message_is_exposed_without_internal_prefix()
     assert!(message.contains("Invalid tool use format."));
     // Upstream reason codes are channel-specific and stay in the logs.
     assert!(!message.contains("REQUEST_BODY_INVALID"));
-    assert!(message.contains("request id: req_01official"));
+    assert!(message.contains("request-id: req_01official"));
     assert!(!message.contains("账号"));
     assert!(!message.contains("secret-user"));
 }
@@ -12374,7 +12374,7 @@ async fn official_kiro_bad_request_message_is_exposed_when_safe() {
     assert!(message.starts_with(envelope::PUBLIC_IMAGE_FORMAT_UNSUPPORTED_MESSAGE));
     assert!(!message.to_ascii_lowercase().contains("bedrock"));
     assert!(!message.contains("IMAGE_FORMAT_UNSUPPORTED"));
-    assert!(message.contains("request id: req_01official_bad_request"));
+    assert!(message.contains("request-id: req_01official_bad_request"));
     assert!(!message.contains("hidden@example.com"));
     assert!(!message.contains("凭据"));
 }
@@ -12450,7 +12450,7 @@ async fn official_kiro_high_load_message_is_exposed_when_safe() {
 
     assert!(message.contains("Encountered unexpectedly high load"));
     assert!(!message.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
-    assert!(message.contains("request id: req_01official_high_load"));
+    assert!(message.contains("request-id: req_01official_high_load"));
     assert!(!message.contains("账号 #157"));
     assert!(!message.contains("hidden"));
 }
@@ -12483,7 +12483,7 @@ async fn official_kiro_upstream_message_with_kiro_term_is_masked() {
         .expect("error message");
 
     assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
-    assert!(message.contains("request id: req_01official_term"));
+    assert!(message.contains("request-id: req_01official_term"));
     assert_public_error_message_is_normalized(message);
 }
 
@@ -12689,7 +12689,7 @@ async fn provider_error_response_exposes_matching_public_error_id() {
         .and_then(|v| v.as_str())
         .expect("error message");
     assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
-    assert!(message.contains("request id: req_01public_error_id"));
+    assert!(message.contains("request-id: req_01public_error_id"));
     assert!(!message.contains("shadow"));
     assert_public_error_message_is_normalized(message);
 }

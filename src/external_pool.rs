@@ -1589,7 +1589,7 @@ fn external_attempt_rejection_final_error(
         status: StatusCode::SERVICE_UNAVAILABLE,
         response_error_type: "service_unavailable".to_string(),
         route_error_type: "inference_attempt_policy".to_string(),
-        message: "Request could not be completed. Please retry shortly.".to_string(),
+        message: "The request could not be completed. Please try again shortly.".to_string(),
         error_id: route.error_id.clone(),
         retryable: false,
         attempts,
