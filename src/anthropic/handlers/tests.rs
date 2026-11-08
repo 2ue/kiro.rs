@@ -7033,6 +7033,7 @@ async fn run_empty_turn_cooldown_follows_global_switch() {
                         4,
                         |config| {
                             config.kiro_upstream_stream_retry_max_attempts = 3;
+                            config.kiro_upstream_usage_only_retry_max_attempts = 3;
                             config.inference_upstream_max_attempts = 10;
                             config.credential_empty_turn_cooldown_enabled = cooldown_enabled;
                         },
@@ -7126,6 +7127,7 @@ async fn run_usage_only_failure_is_captured_for_replay() {
         let (app, _usage_recorder) =
             handler_eventstream_fault_router_with_config(&upstream.base_url, 4, 4, |config| {
                 config.kiro_upstream_stream_retry_max_attempts = 3;
+                config.kiro_upstream_usage_only_retry_max_attempts = 3;
                 config.request_capture.enabled = true;
                 config.request_capture.dir = capture_dir;
             });
