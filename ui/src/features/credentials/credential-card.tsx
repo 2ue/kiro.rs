@@ -1339,44 +1339,56 @@ export function CredentialCard({
                 />
               </div>
               <div className="rounded-lg border border-border">
-                <div className="border-b border-border px-3 py-2 text-sm font-semibold">错误记录</div>
+                <div className="border-b border-border px-3 py-2 text-sm font-semibold">账号错误与恢复记录</div>
                 {diagnosticRecords.length === 0 ? (
                   <EmptyState title="暂无错误记录" description="该账号尚未留下可展示的请求级错误记录。" />
                 ) : (
                   <div className="max-h-[55vh] space-y-2 overflow-y-auto p-3">
-                    {diagnosticRecords.map((record) => (
-                      <div key={record.id} className="rounded-lg border border-border bg-muted/20 p-3 text-xs">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="font-mono text-muted-foreground">{record.createdAt}</span>
-                          <Badge tone="error">{record.errorType || record.status}</Badge>
-                          {record.errorStatusCode && <Badge>{record.errorStatusCode}</Badge>}
-                          <span className="font-mono text-muted-foreground">{record.id}</span>
-                        </div>
-                        {record.errorMessage && <div className="mt-2 text-sm text-foreground">{record.errorMessage}</div>}
-                        {record.rawUpstreamError && (
-                          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-background p-2 font-mono text-[0.7rem] text-muted-foreground">
-                            {record.rawUpstreamError.body}
-                          </pre>
-                        )}
-                        {record.credentialAttempts && record.credentialAttempts.length > 0 && (
-                          <div className="mt-2 space-y-1 border-t border-border pt-2">
-                            {record.credentialAttempts.map((attempt) => (
-                              <div key={`${record.id}-${attempt.attempt}-${attempt.credentialId}`} className="rounded bg-background px-2 py-1">
-                                <span className="font-semibold">#{attempt.credentialId}</span>
-                                <span className="ml-2 text-muted-foreground">{attempt.action}</span>
-                                {attempt.errorType && <span className="ml-2 text-destructive">{attempt.errorType}</span>}
-                                {attempt.errorMessage && <span className="ml-2 text-muted-foreground">{attempt.errorMessage}</span>}
-                                {attempt.rawUpstreamError && (
-                                  <pre className="mt-1 whitespace-pre-wrap font-mono text-[0.68rem] text-muted-foreground">
-                                    {attempt.rawUpstreamError.body}
-                                  </pre>
-                                )}
-                              </div>
-                            ))}
+                    {diagnosticRecords.map((record) => {
+                      const credentialAttemptFailed = record.credentialAttempts?.some(
+                        (attempt) => attempt.credentialId === credential.id && attempt.action !== 'success',
+                      ) ?? false
+                      return (
+                        <div key={record.id} className="rounded-lg border border-border bg-muted/20 p-3 text-xs">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-mono text-muted-foreground">{record.createdAt}</span>
+                            {record.status === 'success' ? (
+                              <>
+                                <Badge tone="success">请求最终成功</Badge>
+                                {credentialAttemptFailed && <span className="text-warning">当前账号曾尝试失败</span>}
+                              </>
+                            ) : (
+                              <Badge tone="error">{record.errorType || record.status}</Badge>
+                            )}
+                            {record.errorStatusCode && <Badge>{record.errorStatusCode}</Badge>}
+                            <span className="font-mono text-muted-foreground">{record.id}</span>
                           </div>
-                        )}
-                      </div>
-                    ))}
+                          {record.errorMessage && <div className="mt-2 text-sm text-foreground">{record.errorMessage}</div>}
+                          {record.rawUpstreamError && (
+                            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-background p-2 font-mono text-[0.7rem] text-muted-foreground">
+                              {record.rawUpstreamError.body}
+                            </pre>
+                          )}
+                          {record.credentialAttempts && record.credentialAttempts.length > 0 && (
+                            <div className="mt-2 space-y-1 border-t border-border pt-2">
+                              {record.credentialAttempts.map((attempt) => (
+                                <div key={`${record.id}-${attempt.attempt}-${attempt.credentialId}`} className="rounded bg-background px-2 py-1">
+                                  <span className="font-semibold">#{attempt.credentialId}</span>
+                                  <span className="ml-2 text-muted-foreground">{attempt.action}</span>
+                                  {attempt.errorType && <span className="ml-2 text-destructive">{attempt.errorType}</span>}
+                                  {attempt.errorMessage && <span className="ml-2 text-muted-foreground">{attempt.errorMessage}</span>}
+                                  {attempt.rawUpstreamError && (
+                                    <pre className="mt-1 whitespace-pre-wrap font-mono text-[0.68rem] text-muted-foreground">
+                                      {attempt.rawUpstreamError.body}
+                                    </pre>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>
