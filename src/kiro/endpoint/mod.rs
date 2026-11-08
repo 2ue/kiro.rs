@@ -351,6 +351,29 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
     default_is_quota_exhausted(body)
 }
 
+/// 400 响应体是否是额度用尽。
+///
+/// cli 端点（api_key 账号）额度用尽时返回 400 `ServiceQuotaExceededException`，
+/// 带 `reason: MONTHLY_REQUEST_COUNT`，而不是 402。400 大多是请求本身的问题，
+/// 所以这里只认结构化的 `reason` 字段，不做子串匹配，避免把回显了这些字样的
+/// 请求错误误判成账号额度用尽。
+pub fn is_quota_exhausted_bad_request(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    ["/reason", "/error/reason"].into_iter().any(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| {
+                matches!(
+                    v,
+                    "MONTHLY_REQUEST_COUNT" | "OVERAGE_REQUEST_LIMIT_EXCEEDED"
+                )
+            })
+    })
+}
+
 /// 默认的 bearer token 失效判断逻辑
 pub fn default_is_bearer_token_invalid(body: &str) -> bool {
     body.contains("The bearer token included in the request is invalid")
@@ -426,6 +449,26 @@ mod tests {
     fn test_default_quota_exhausted_detects_nested_overage_limit() {
         let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
         assert!(default_is_quota_exhausted(body));
+    }
+
+    /// 2026-11-08 59138：cli 端点 api_key 账号额度用尽返回的是 400。
+    #[test]
+    fn test_quota_exhausted_bad_request_requires_reason_field() {
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ServiceQuotaExceededException","message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
+        assert!(is_quota_exhausted_bad_request(body));
+        assert!(is_quota_exhausted_bad_request(
+            r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#
+        ));
+        // 请求错误里回显了这些字样，不算额度用尽。
+        assert!(!is_quota_exhausted_bad_request(
+            r#"{"message":"Improperly formed request: MONTHLY_REQUEST_COUNT","reason":null}"#
+        ));
+        assert!(!is_quota_exhausted_bad_request(
+            "MONTHLY_REQUEST_COUNT in plain text"
+        ));
+        assert!(!is_quota_exhausted_bad_request(
+            r#"{"message":"Input content length exceeds threshold.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#
+        ));
     }
 
     #[test]

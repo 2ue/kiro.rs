@@ -1329,6 +1329,8 @@ mod tests {
         ModelTemporarilyUnavailable,
         InsufficientModelCapacity,
         BadRequest,
+        /// cli 端点 api_key 账号额度用尽的真实形态：400 而不是 402。
+        QuotaExhausted400,
         Forbidden,
         Success,
     }
@@ -1503,6 +1505,15 @@ mod tests {
             RotationReply::BadRequest => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"message": "malformed"})),
+            )
+                .into_response(),
+            RotationReply::QuotaExhausted400 => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "__type": "com.amazon.kiro.runtimeservice#ServiceQuotaExceededException",
+                    "message": "You have reached the limit.",
+                    "reason": "MONTHLY_REQUEST_COUNT"
+                })),
             )
                 .into_response(),
             RotationReply::Forbidden => (
@@ -1697,6 +1708,115 @@ mod tests {
             .map(|attempt| attempt.account)
             .collect::<HashSet<_>>()
             .len()
+    }
+
+    /// 59138 2026-11-08 17:40～18:47：fast 5 的 cli/api_key 账号额度用尽后上游返回
+    /// 400 ServiceQuotaExceededException（不是 402），旧代码按普通请求错误 fail-fast，
+    /// 账号不禁用，fast 档继续独占流量，约 70 分钟几乎全部失败。
+    /// 现在 400 额度用尽要和 402 一样禁用账号并换号；fast 值本身不被改写。
+    #[tokio::test]
+    async fn quota_exhausted_400_disables_fast_tier_account_and_fails_over() {
+        let rule: RotationRule = Arc::new(|attempt: &RotationAttempt| {
+            if attempt.account <= 2 {
+                RotationReply::QuotaExhausted400
+            } else {
+                RotationReply::Success
+            }
+        });
+        let server = RotationServer::start(rule).await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.credential_retry_max_attempts = 0;
+        let credentials = fake_bad_request_credentials(3)
+            .into_iter()
+            .map(|mut credential| {
+                if credential.id.unwrap_or(0) <= 2 {
+                    credential.fast = 5;
+                }
+                credential
+            })
+            .collect();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, credentials, None, None, false)
+                .expect("quota 400 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider =
+            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+
+        for round in 0..3 {
+            let request_body = serde_json::json!({
+                "conversationState": {
+                    "conversationId": format!("conv-quota-400-{round}"),
+                    "currentMessage": {
+                        "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                    }
+                }
+            })
+            .to_string();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                provider.call_api_with_context_with_request_id_and_attempt_budget(
+                    &request_body,
+                    Some("req-quota-400"),
+                    AcquireMode::WaitForCapacity,
+                    1,
+                    Some("claude-sonnet-4"),
+                    Arc::new(InferenceAttemptBudget::new(4)),
+                    false,
+                ),
+            )
+            .await
+            .expect("quota 400 provider call timed out");
+            assert!(
+                result.is_ok(),
+                "round {round}: must fail over to the healthy account: {:?}",
+                server.state.attempts()
+            );
+        }
+
+        let attempts = server.state.attempts();
+        // 第 1 轮把两个 fast 账号各打一次后禁用；之后的轮次直接落到账号 3。
+        assert_eq!(
+            attempts.iter().filter(|a| a.account <= 2).count(),
+            2,
+            "each exhausted fast account is hit exactly once: {attempts:?}"
+        );
+        assert_eq!(attempts.iter().filter(|a| a.account == 3).count(), 3);
+        let snapshot = manager.snapshot();
+        for entry in &snapshot.entries {
+            if entry.id <= 2 {
+                assert!(entry.disabled, "account {} must be disabled", entry.id);
+                assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+                assert_eq!(entry.fast, 5, "fast value must not be rewritten");
+            } else {
+                assert!(!entry.disabled);
+            }
+        }
+    }
+
+    /// 普通 400（请求本身有问题）依旧 fail-fast，不禁用账号。
+    #[tokio::test]
+    async fn plain_400_does_not_disable_the_account() {
+        let server = RotationServer::start(rule_always(RotationReply::BadRequest)).await;
+        let (result, manager) = call_prod_like_rotation_provider_with_manager(
+            &server,
+            3,
+            Arc::new(InferenceAttemptBudget::new(4)),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(server.state.attempts().len(), 1);
+        assert!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .all(|entry| !entry.disabled),
+            "a malformed-request 400 says nothing about the account"
+        );
     }
 
     /// 模型容量不足：换号次数放宽到请求级预算（5），而不是默认的 3 次；每次都换新账号。
@@ -12907,8 +13027,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 402 额度用尽
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 额度用尽（402，或 cli 端点的 400 + 结构化额度 reason）
+            if Self::is_quota_exhausted_response(endpoint.as_ref(), status, &body) {
                 tracing::warn!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
@@ -12922,7 +13042,8 @@ impl KiroProvider {
                 let has_available = self
                     .token_manager
                     .report_quota_exhausted_deferred_with_account_info_refresh(ctx.id);
-                let failure_kind = Self::mcp_failure_kind_for_status(status);
+                // 额度用尽是账号问题，400 形态也不能按「请求无效」上报。
+                let failure_kind = McpCallFailureKind::Upstream;
                 Self::push_mcp_attempt(
                     attribution_sink.as_ref(),
                     &mut attempts,
@@ -14268,8 +14389,10 @@ impl KiroProvider {
                 return Err(Self::traced_error(message, &attempts));
             }
 
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            // 额度用尽：禁用凭据并故障转移。一般是 402；cli 端点（api_key 账号）返回 400
+            // ServiceQuotaExceededException + reason=MONTHLY_REQUEST_COUNT，必须同样禁用，
+            // 否则账号保持可调度，高 Fast 档会把流量一直钉在它上面（59138 2026-11-08）。
+            if Self::is_quota_exhausted_response(endpoint.as_ref(), status, &body) {
                 let message = Self::api_failure_diagnostic(
                     ApiUpstreamFailureKind::Quota,
                     status,
@@ -16136,6 +16259,19 @@ impl KiroProvider {
         }
 
         None
+    }
+
+    /// 上游是否在说「这个账号额度用尽了」：402 + 额度字样，或者 400 + 结构化额度 reason。
+    fn is_quota_exhausted_response(
+        endpoint: &dyn KiroEndpoint,
+        status: reqwest::StatusCode,
+        body: &str,
+    ) -> bool {
+        match status.as_u16() {
+            402 => endpoint.is_monthly_request_limit(body),
+            400 => crate::kiro::endpoint::is_quota_exhausted_bad_request(body),
+            _ => false,
+        }
     }
 
     fn classify_bad_request_reason(body: &str) -> &'static str {
