@@ -6309,6 +6309,8 @@ impl AdminService {
             stream_first_output_timeout_secs: config.stream_first_output_timeout_secs,
             kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
             kiro_upstream_stream_retry_max_attempts: config.kiro_upstream_stream_retry_max_attempts,
+            kiro_upstream_usage_only_retry_max_attempts: config
+                .kiro_upstream_usage_only_retry_max_attempts,
             inference_upstream_max_attempts: config.inference_upstream_max_attempts,
             auxiliary_upstream_max_attempts: config.auxiliary_upstream_max_attempts,
             auxiliary_upstream_max_concurrent_requests: config
@@ -6511,6 +6513,9 @@ impl AdminService {
         let kiro_upstream_stream_retry_max_attempts = req
             .kiro_upstream_stream_retry_max_attempts
             .unwrap_or(current_config.kiro_upstream_stream_retry_max_attempts);
+        let kiro_upstream_usage_only_retry_max_attempts = req
+            .kiro_upstream_usage_only_retry_max_attempts
+            .unwrap_or(current_config.kiro_upstream_usage_only_retry_max_attempts);
         let inference_upstream_max_attempts = req
             .inference_upstream_max_attempts
             .unwrap_or(current_config.inference_upstream_max_attempts);
@@ -7003,6 +7008,11 @@ impl AdminService {
                 "kiroUpstreamStreamRetryMaxAttempts 不能大于 100".to_string(),
             ));
         }
+        if kiro_upstream_usage_only_retry_max_attempts > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "kiroUpstreamUsageOnlyRetryMaxAttempts 不能大于 100".to_string(),
+            ));
+        }
         if !scheduler_error_ewma_alpha.is_finite()
             || !(0.01..=1.0).contains(&scheduler_error_ewma_alpha)
         {
@@ -7222,6 +7232,8 @@ impl AdminService {
                 config.kiro_upstream_stream_retry_enabled = kiro_upstream_stream_retry_enabled;
                 config.kiro_upstream_stream_retry_max_attempts =
                     kiro_upstream_stream_retry_max_attempts;
+                config.kiro_upstream_usage_only_retry_max_attempts =
+                    kiro_upstream_usage_only_retry_max_attempts;
                 config.inference_upstream_max_attempts = inference_upstream_max_attempts;
                 config.auxiliary_upstream_max_attempts = auxiliary_upstream_max_attempts;
                 config.auxiliary_upstream_max_concurrent_requests =

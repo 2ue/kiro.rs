@@ -5351,13 +5351,21 @@ pub struct Config {
     #[serde(default = "default_kiro_upstream_stream_retry_enabled")]
     pub kiro_upstream_stream_retry_enabled: bool,
 
-    /// 单个请求在“未向下游提交”窗口内最多尝试多少次上游（包含首次调用；默认 6）。
+    /// 单个请求在“未向下游提交”窗口内，普通首输出前错误最多尝试多少次上游
+    /// （包含首次调用；默认 6）。
     ///
-    /// 流式和非流式共用，覆盖所有首输出前重试：流读取错误、流静默/首输出超时、2xx 错误事件、
-    /// EventStream 不完整，以及只有 usage/metadata 的空轮次。实际发送次数同时受
+    /// 流式和非流式共用，覆盖流读取错误、流静默/首输出超时、2xx 错误事件和 EventStream
+    /// 不完整。只有 usage/metadata 的空轮次使用独立的
+    /// `kiroUpstreamUsageOnlyRetryMaxAttempts`。实际发送次数同时受
     /// `inferenceUpstreamMaxAttempts` 约束。0/1 都等价于不额外重试。
     #[serde(default = "default_kiro_upstream_stream_retry_max_attempts")]
     pub kiro_upstream_stream_retry_max_attempts: u32,
+
+    /// 只有 usage/metadata、没有 assistant/reasoning/tool 输出的空轮次最多尝试多少次上游
+    /// （包含首次调用；默认 2）。流式和非流式共用，1 表示关闭空轮重试；实际发送次数仍受
+    /// `inferenceUpstreamMaxAttempts` 约束。
+    #[serde(default = "default_kiro_upstream_usage_only_retry_max_attempts")]
+    pub kiro_upstream_usage_only_retry_max_attempts: u32,
 
     /// 单个下游 Messages 请求允许发出的推理上游 HTTP 请求硬上限。
     ///
@@ -6068,13 +6076,19 @@ fn default_kiro_upstream_stream_retry_enabled() -> bool {
     true
 }
 
-/// Default cap on pre-output upstream attempts, first call included. Shared by every pre-output
-/// retry: stream read errors, idle and first-output timeouts, 2xx error events, incomplete
-/// EventStreams and usage-only (empty) turns, streaming and non-streaming alike.
+/// Default cap on ordinary pre-output upstream attempts, first call included.
+/// Usage-only turns use a separate cap.
 pub(crate) const DEFAULT_KIRO_UPSTREAM_STREAM_RETRY_MAX_ATTEMPTS: u32 = 6;
 
 fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
     DEFAULT_KIRO_UPSTREAM_STREAM_RETRY_MAX_ATTEMPTS
+}
+
+/// Default cap for usage-only pre-output attempts, first call included.
+pub(crate) const DEFAULT_KIRO_UPSTREAM_USAGE_ONLY_RETRY_MAX_ATTEMPTS: u32 = 2;
+
+fn default_kiro_upstream_usage_only_retry_max_attempts() -> u32 {
+    DEFAULT_KIRO_UPSTREAM_USAGE_ONLY_RETRY_MAX_ATTEMPTS
 }
 
 /// 狂暴模式轮数上限。
@@ -7086,6 +7100,8 @@ impl Default for Config {
             kiro_upstream_stream_retry_enabled: default_kiro_upstream_stream_retry_enabled(),
             kiro_upstream_stream_retry_max_attempts:
                 default_kiro_upstream_stream_retry_max_attempts(),
+            kiro_upstream_usage_only_retry_max_attempts:
+                default_kiro_upstream_usage_only_retry_max_attempts(),
             inference_upstream_max_attempts: default_inference_upstream_max_attempts(),
             auxiliary_upstream_max_attempts: default_auxiliary_upstream_max_attempts(),
             auxiliary_upstream_max_concurrent_requests:
@@ -7995,6 +8011,7 @@ mod tests {
         assert_eq!(config.stream_first_output_timeout_secs, 0);
         assert!(config.kiro_upstream_stream_retry_enabled);
         assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 6);
+        assert_eq!(config.kiro_upstream_usage_only_retry_max_attempts, 2);
         assert!(config.kiro_upstream_stream_retry_on_idle_timeout);
         assert!(config.kiro_upstream_stream_retry_on_read_error);
         assert!(config.kiro_upstream_stream_retry_on_status_error);

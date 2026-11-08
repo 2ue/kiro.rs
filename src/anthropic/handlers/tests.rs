@@ -3760,12 +3760,18 @@ fn local_stream_protocol_contamination_retry_uses_status_policy_and_explicit_ter
     let enabled = LocalStreamRetryConfig {
         enabled: true,
         max_attempts: 2,
+        usage_only_max_attempts: 1,
         on_idle_timeout: false,
         on_read_error: false,
         on_status_error: true,
         empty_turn_nudge: None,
     };
     assert!(enabled.allows(StreamRetryReason::ProtocolContamination));
+    assert_eq!(
+        enabled.max_attempts_for(StreamRetryReason::ProtocolError),
+        2
+    );
+    assert_eq!(enabled.max_attempts_for(StreamRetryReason::UsageOnly), 1);
     assert_eq!(
         StreamRetryReason::ProtocolContamination.as_str(),
         "protocol_contamination"
@@ -6721,10 +6727,10 @@ async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
     }
 }
 
-/// Usage-only turns are retried up to kiroUpstreamStreamRetryMaxAttempts (first call included),
+/// Usage-only turns are retried up to the dedicated usage-only cap (first call included),
 /// on another account each time, for both streaming and non-streaming; once the cap is used the
 /// request still fails closed instead of returning an empty success.
-async fn run_usage_only_retries_up_to_shared_attempt_cap() {
+async fn run_usage_only_retries_up_to_dedicated_attempt_cap() {
     for (stream, label) in [(true, "stream"), (false, "non-stream")] {
         let upstream =
             HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
@@ -6735,6 +6741,7 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
             8,
             |config| {
                 config.kiro_upstream_stream_retry_max_attempts = 6;
+                config.kiro_upstream_usage_only_retry_max_attempts = 2;
                 config.inference_upstream_max_attempts = 10;
             },
             None,
@@ -6742,8 +6749,8 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
         let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
         assert_eq!(
             upstream.hits(),
-            6,
-            "{label}: six attempts in total, first call included"
+            2,
+            "{label}: two attempts in total, first call included"
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} body={body}");
         assert!(!body.contains(r#""stop_reason":"end_turn""#), "{label}");
@@ -6755,7 +6762,7 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
             .collect();
         assert_eq!(
             accounts.len(),
-            6,
+            2,
             "{label}: every retry moves to another account"
         );
         let cooled: Vec<_> = token_manager
@@ -6778,13 +6785,14 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
         let (app, _usage_recorder) =
             handler_eventstream_fault_router_with_config(&upstream.base_url, 8, 8, |config| {
                 config.kiro_upstream_stream_retry_max_attempts = 6;
+                config.kiro_upstream_usage_only_retry_max_attempts = 2;
                 config.inference_upstream_max_attempts = 3;
             });
         let _ = call_handler_eventstream_fault(app, stream).await;
         assert_eq!(
             upstream.hits(),
-            3,
-            "{label}: capped by inferenceUpstreamMaxAttempts"
+            2,
+            "{label}: capped by dedicated usage-only attempts before inference budget"
         );
 
         // A later attempt that answers ends the retries and succeeds.
@@ -6795,6 +6803,7 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
         let (app, _usage_recorder) =
             handler_eventstream_fault_router_with_config(&upstream.base_url, 8, 8, |config| {
                 config.kiro_upstream_stream_retry_max_attempts = 6;
+                config.kiro_upstream_usage_only_retry_max_attempts = 2;
             });
         let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
         assert_eq!(status, StatusCode::OK, "{label} body={body}");
@@ -6987,10 +6996,10 @@ fn non_stream_body_timeout_counts_silence_not_total_time() {
 }
 
 #[test]
-fn usage_only_retries_up_to_shared_attempt_cap() {
+fn usage_only_retries_up_to_dedicated_attempt_cap() {
     run_handler_fixture_on_large_stack_thread(
-        "usage-only-shared-attempt-cap",
-        run_usage_only_retries_up_to_shared_attempt_cap,
+        "usage-only-dedicated-attempt-cap",
+        run_usage_only_retries_up_to_dedicated_attempt_cap,
     );
 }
 
@@ -7226,8 +7235,12 @@ fn tool_choice_reply_capture_and_updates_display() {
 }
 
 #[test]
-fn default_pre_output_retry_cap_is_six() {
+fn default_pre_output_retry_caps_are_separate() {
     assert_eq!(Config::default().kiro_upstream_stream_retry_max_attempts, 6);
+    assert_eq!(
+        Config::default().kiro_upstream_usage_only_retry_max_attempts,
+        2
+    );
 }
 
 #[test]
@@ -8635,6 +8648,7 @@ fn runtime_config_for_payload_guard(
         stream_first_output_timeout_secs: 0,
         kiro_upstream_stream_retry_enabled: true,
         kiro_upstream_stream_retry_max_attempts: 2,
+        kiro_upstream_usage_only_retry_max_attempts: 2,
         inference_upstream_max_attempts: 4,
         auxiliary_upstream_max_attempts: 2,
         kiro_upstream_stream_retry_on_idle_timeout: true,

@@ -1914,6 +1914,7 @@ pub struct RuntimeConfigResponse {
     pub stream_first_output_timeout_secs: u64,
     pub kiro_upstream_stream_retry_enabled: bool,
     pub kiro_upstream_stream_retry_max_attempts: u32,
+    pub kiro_upstream_usage_only_retry_max_attempts: u32,
     pub inference_upstream_max_attempts: u32,
     pub auxiliary_upstream_max_attempts: u32,
     pub auxiliary_upstream_max_concurrent_requests: u32,
@@ -2118,6 +2119,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub kiro_upstream_stream_retry_enabled: Option<bool>,
     #[serde(default)]
     pub kiro_upstream_stream_retry_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub kiro_upstream_usage_only_retry_max_attempts: Option<u32>,
     #[serde(default)]
     pub inference_upstream_max_attempts: Option<u32>,
     #[serde(default)]

@@ -2202,6 +2202,7 @@ export interface RuntimeConfig {
   streamFirstOutputTimeoutSecs: number
   kiroUpstreamStreamRetryEnabled: boolean
   kiroUpstreamStreamRetryMaxAttempts: number
+  kiroUpstreamUsageOnlyRetryMaxAttempts: number
   inferenceUpstreamMaxAttempts: number
   auxiliaryUpstreamMaxAttempts: number
   auxiliaryUpstreamMaxConcurrentRequests: number

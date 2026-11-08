@@ -574,6 +574,7 @@ const emptyConfig: RuntimeConfig = {
   streamFirstOutputTimeoutSecs: 0,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 6,
+  kiroUpstreamUsageOnlyRetryMaxAttempts: 2,
   inferenceUpstreamMaxAttempts: 4,
   auxiliaryUpstreamMaxAttempts: 2,
   auxiliaryUpstreamMaxConcurrentRequests: 16,
@@ -3925,6 +3926,7 @@ export function RuntimeConfigPanel() {
       streamFirstOutputTimeoutSecs: toWhole(draft.streamFirstOutputTimeoutSecs, 0, 3600),
       kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
       kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
+      kiroUpstreamUsageOnlyRetryMaxAttempts: toWhole(draft.kiroUpstreamUsageOnlyRetryMaxAttempts, 1, 100),
       inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
       auxiliaryUpstreamMaxAttempts: toWhole(draft.auxiliaryUpstreamMaxAttempts, 1, 10),
       auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
@@ -4354,8 +4356,8 @@ export function RuntimeConfigPanel() {
               }
             />
             <NumberField
-              title="首输出前最多尝试"
-              description="包含第一次调用；默认 6。流式和非流式共用，覆盖首输出前的流读取错误、静默或首输出超时、2xx 错误事件、EventStream 不完整和空回（只有用量统计）。实际次数还受下方推理发送硬上限约束。"
+              title="首输出前普通错误最多尝试"
+              description="包含第一次调用；默认 6。流式和非流式共用，覆盖首输出前的流读取错误、静默或首输出超时、2xx 错误事件和 EventStream 不完整。实际次数还受下方推理发送硬上限约束。"
               value={draft.kiroUpstreamStreamRetryMaxAttempts}
               min={1}
               max={100}
@@ -4363,6 +4365,18 @@ export function RuntimeConfigPanel() {
               disabled={!draft.kiroUpstreamStreamRetryEnabled}
               onChange={(kiroUpstreamStreamRetryMaxAttempts) =>
                 setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryMaxAttempts }))
+              }
+            />
+            <NumberField
+              title="usage-only 最多尝试"
+              description="只有 usage/metadata、没有 assistant、reasoning 或 tool 输出时的独立上限，包含第一次调用；默认 2。设置为 1 可关闭空回换号，实际次数仍受推理发送硬上限约束。"
+              value={draft.kiroUpstreamUsageOnlyRetryMaxAttempts}
+              min={1}
+              max={100}
+              suffix="次"
+              disabled={!draft.kiroUpstreamStreamRetryEnabled}
+              onChange={(kiroUpstreamUsageOnlyRetryMaxAttempts) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamUsageOnlyRetryMaxAttempts }))
               }
             />
             <NumberField
