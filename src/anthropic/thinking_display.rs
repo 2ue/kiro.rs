@@ -49,6 +49,8 @@ struct HiddenBlock {
 #[derive(Debug)]
 pub(crate) struct OmittedThinkingFilter {
     report_token_estimates: bool,
+    emit_plain_empty_delta: bool,
+    emit_null_estimated_tokens: bool,
     blocks: HashMap<i64, HiddenBlock>,
 }
 
@@ -56,6 +58,14 @@ impl OmittedThinkingFilter {
     pub(crate) fn new(report_token_estimates: bool) -> Self {
         Self {
             report_token_estimates,
+            emit_plain_empty_delta: std::env::var_os(
+                "KIRO_RS_CCTEST_NO_PLAIN_EMPTY_THINKING_DELTA",
+            )
+            .is_none(),
+            // The beta contract makes the field present on every emitted thinking delta;
+            // frames without a due estimate carry null.
+            emit_null_estimated_tokens: report_token_estimates
+                || std::env::var_os("KIRO_RS_CCTEST_NULL_THINKING_ESTIMATED_TOKENS").is_some(),
             blocks: HashMap::new(),
         }
     }
@@ -96,9 +106,15 @@ impl OmittedThinkingFilter {
                         .report_token_estimates
                         .then(|| due_estimate(block, now, false))
                         .flatten();
-                    if estimate.is_some() || !block.sent_empty_delta {
+                    if estimate.is_some()
+                        || (!block.sent_empty_delta && self.emit_plain_empty_delta)
+                    {
                         block.sent_empty_delta = true;
-                        out.push(empty_thinking_delta(index.unwrap_or_default(), estimate));
+                        out.push(empty_thinking_delta(
+                            index.unwrap_or_default(),
+                            estimate,
+                            self.emit_null_estimated_tokens,
+                        ));
                     }
                 }
                 "content_block_delta" if event.data["delta"]["type"] == "signature_delta" => {
@@ -109,9 +125,15 @@ impl OmittedThinkingFilter {
                             .report_token_estimates
                             .then(|| due_estimate(block, now, true))
                             .flatten();
-                        if estimate.is_some() || !block.sent_empty_delta {
+                        if estimate.is_some()
+                            || (!block.sent_empty_delta && self.emit_plain_empty_delta)
+                        {
                             block.sent_empty_delta = true;
-                            out.push(empty_thinking_delta(index.unwrap_or_default(), estimate));
+                            out.push(empty_thinking_delta(
+                                index.unwrap_or_default(),
+                                estimate,
+                                self.emit_null_estimated_tokens,
+                            ));
                         }
                     }
                     out.push(event);
@@ -124,7 +146,11 @@ impl OmittedThinkingFilter {
                             .then(|| due_estimate(&mut block, now, true))
                             .flatten();
                         if estimate.is_some() {
-                            out.push(empty_thinking_delta(index.unwrap_or_default(), estimate));
+                            out.push(empty_thinking_delta(
+                                index.unwrap_or_default(),
+                                estimate,
+                                self.emit_null_estimated_tokens,
+                            ));
                         }
                     }
                     out.push(event);
@@ -159,10 +185,16 @@ fn due_estimate(block: &mut HiddenBlock, now: Instant, closing: bool) -> Option<
     Some(increment)
 }
 
-fn empty_thinking_delta(index: i64, estimated_tokens: Option<u64>) -> SseEvent {
+fn empty_thinking_delta(
+    index: i64,
+    estimated_tokens: Option<u64>,
+    emit_null_estimated_tokens: bool,
+) -> SseEvent {
     let mut delta = json!({"type": "thinking_delta", "thinking": ""});
     if let Some(tokens) = estimated_tokens {
         delta["estimated_tokens"] = json!(tokens);
+    } else if emit_null_estimated_tokens {
+        delta["estimated_tokens"] = Value::Null;
     }
     SseEvent::new(
         "content_block_delta",

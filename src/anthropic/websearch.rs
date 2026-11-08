@@ -93,6 +93,16 @@ pub struct WebSearchResult {
     pub title: String,
     pub url: String,
     pub snippet: Option<String>,
+    /// Opaque Anthropic field when the search provider supplies one.
+    ///
+    /// Kiro MCP currently returns snippets instead, so the compatibility fallback remains the
+    /// snippet. When an upstream provider starts returning the official opaque value, preserve it
+    /// byte-for-byte instead of silently replacing it.
+    #[serde(rename = "encrypted_content")]
+    pub encrypted_content: Option<String>,
+    /// Opaque citation reference supplied by a search provider, if available.
+    #[serde(rename = "encrypted_index")]
+    pub encrypted_index: Option<String>,
     #[serde(rename = "publishedDate")]
     pub published_date: Option<i64>,
     pub id: Option<String>,
@@ -942,7 +952,11 @@ pub(crate) fn web_search_result_block(result: &WebSearchResult) -> Value {
         "type": "web_search_result",
         "title": result.title,
         "url": result.url,
-        "encrypted_content": result.snippet.clone().unwrap_or_default(),
+        "encrypted_content": result
+            .encrypted_content
+            .clone()
+            .or_else(|| result.snippet.clone())
+            .unwrap_or_default(),
         "page_age": result_page_age(result)
     })
 }
@@ -1003,12 +1017,14 @@ fn generate_websearch_message_with_content(
                 "id": context.tool_use_id,
                 "type": "server_tool_use",
                 "name": "web_search",
-                "input": {"query": context.query}
+                "input": {"query": context.query},
+                "caller": {"type": "direct"}
             },
             {
                 "type": "web_search_tool_result",
                 "tool_use_id": context.tool_use_id,
-                "content": search_content
+                "content": search_content,
+                "caller": {"type": "direct"}
             },
             {
                 "type": "text",
@@ -1111,7 +1127,8 @@ fn generate_websearch_events_with_content(
                 "id": context.tool_use_id,
                 "type": "server_tool_use",
                 "name": "web_search",
-                "input": {"query": context.query}
+                "input": {"query": context.query},
+                "caller": {"type": "direct"}
             }
         }),
     ));
@@ -1134,7 +1151,8 @@ fn generate_websearch_events_with_content(
             "content_block": {
                 "type": "web_search_tool_result",
                 "tool_use_id": context.tool_use_id,
-                "content": search_content
+                "content": search_content,
+                "caller": {"type": "direct"}
             }
         }),
     ));
@@ -1760,6 +1778,8 @@ mod tests {
             title: url.to_string(),
             url: url.to_string(),
             snippet: None,
+            encrypted_content: None,
+            encrypted_index: None,
             published_date: None,
             id: None,
             domain: domain.map(str::to_string),
@@ -2728,6 +2748,8 @@ mod tests {
                 title: "Test Result".to_string(),
                 url: "https://example.com".to_string(),
                 snippet: Some("This is a test snippet".to_string()),
+                encrypted_content: None,
+                encrypted_index: None,
                 published_date: None,
                 id: None,
                 domain: None,

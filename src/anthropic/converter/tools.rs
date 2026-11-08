@@ -469,6 +469,48 @@ fn normalize_tool_description(tool_name: &str, description: &str) -> String {
     }
 }
 
+/// Kiro treats Anthropic's native code execution declaration as a tool with an empty
+/// schema.  That makes the model emit `{}` and leaves the compatibility executor with
+/// nothing to run.  Give the upstream model the concrete input contract while keeping
+/// the original native declaration on the downstream side.
+fn native_code_execution_contract(
+    tool: &AnthropicTool,
+) -> Option<(serde_json::Value, &'static str)> {
+    let kind = tool.tool_type.as_deref()?;
+    if !tool.input_schema.is_empty() {
+        return None;
+    }
+    if tool.name == "code_execution" && kind.starts_with("code_execution_") {
+        return Some((
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python source code to execute"},
+                    "language": {"type": "string", "enum": ["python", "python3"]}
+                },
+                "required": ["code"],
+                "additionalProperties": false
+            }),
+            "Execute Python code and return its stdout and stderr.",
+        ));
+    }
+    if tool.name == "bash_code_execution" && kind.starts_with("bash_code_execution_") {
+        return Some((
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute"},
+                    "language": {"type": "string", "enum": ["bash", "sh"]}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+            "Execute a shell command and return its stdout and stderr.",
+        ));
+    }
+    None
+}
+
 fn kiro_facing_tool_choice_name(
     req: &MessagesRequest,
     requested_name: &str,
@@ -687,7 +729,11 @@ pub(super) fn convert_tools(
 
     for (idx, mapped_name) in allocated_tools {
         let t = &tools[idx];
-        let description = normalize_tool_description(&t.name, &t.description);
+        let native_execution = native_code_execution_contract(t);
+        let description = native_execution
+            .as_ref()
+            .map(|(_, description)| (*description).to_string())
+            .unwrap_or_else(|| normalize_tool_description(&t.name, &t.description));
 
         // 对 Write/Edit 工具追加自定义描述后缀
         let suffix = if options.allows(InjectionId::ChunkedWriteToolSuffix) {
@@ -721,12 +767,12 @@ pub(super) fn convert_tools(
 
         let converted_idx = converted.len();
         let has_cache_control = t.cache_control.is_some();
-        let (input_schema, schema_key_mapping) = input_schema_from_json(
-            serde_json::json!(t.input_schema),
-            &mapped_name,
-            &schema_key_mapper,
-            options.clone(),
-        )?;
+        let schema = native_execution
+            .as_ref()
+            .map(|(schema, _)| schema.clone())
+            .unwrap_or_else(|| serde_json::json!(t.input_schema));
+        let (input_schema, schema_key_mapping) =
+            input_schema_from_json(schema, &mapped_name, &schema_key_mapper, options.clone())?;
         if !schema_key_mapping.is_empty() {
             tool_schema_key_map.insert_tool_mapping(mapped_name.clone(), schema_key_mapping);
         }

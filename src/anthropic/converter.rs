@@ -7128,6 +7128,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_kirogo_signature_is_replayed_as_unsigned_xml() {
+        let thinking = "legacy compatibility thought";
+        let mut decoded = b"kirogo-thinking-signature-block-0-pad-".to_vec();
+        decoded.resize(228, b'0');
+        let signature = BASE64_STANDARD.encode(decoded);
+        let message = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": thinking, "signature": signature},
+                {"type": "text", "text": "visible answer"}
+            ]),
+        };
+
+        let converted =
+            convert_assistant_message(&message, &mut HashMap::new(), ConverterOptions::default())
+                .expect("legacy synthetic signature should remain compatibility history");
+        let assistant = converted.assistant_response_message;
+        assert_eq!(
+            assistant.content,
+            "<thinking>legacy compatibility thought</thinking>\n\nvisible answer"
+        );
+        assert!(assistant.reasoning_content.is_none());
+    }
+
+    #[test]
     fn mismatched_synthetic_thinking_signature_degrades_to_unsigned_thinking() {
         let message = super::super::types::Message {
             role: "assistant".to_string(),

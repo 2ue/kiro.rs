@@ -1,0 +1,51 @@
+{
+  "capture": "logs/llm-capture/capture-20261108T032943Z-7b2c6207/events.jsonl",
+  "request_id": "req_01K1hJhhJw5Q4iy3nmnpW2dy",
+  "source": "59139 development instance through kirotest Caddy",
+  "scores": {
+    "total": 82,
+    "stream_structure": 5,
+    "non_stream": 10,
+    "websearch": 0,
+    "signature_proto": 5,
+    "output_config": 10
+  },
+  "upstream_statuses": [
+    {"phase": "api", "status": 200},
+    {"phase": "mcp", "status": 200},
+    {"phase": "api", "status": 200}
+  ],
+  "lifecycle": [
+    "message_start",
+    "server_tool_use(index=0)",
+    "input_json_delta(index=0)",
+    "content_block_stop(index=0)",
+    "web_search_tool_result(index=1)",
+    "content_block_stop(index=1)",
+    "ping",
+    "text(index=2..9)",
+    "citations_delta/text_delta",
+    "message_delta(stop_reason=end_turn)",
+    "message_stop"
+  ],
+  "blocks": {
+    "server_tool_use": {"index": 0, "caller": {"type": "direct"}, "id_present": true},
+    "web_search_tool_result": {
+      "index": 1,
+      "caller": {"type": "direct"},
+      "tool_use_id_present": true,
+      "content_count": 10,
+      "result_field_keys": ["encrypted_content", "page_age", "title", "type", "url"],
+      "encrypted_content_lengths": [254, 241, 135, 273, 244, 248, 224, 173, 302, 147]
+    }
+  },
+  "citations": {
+    "count": 9,
+    "encrypted_index_decoded_shape": "number:url",
+    "encrypted_index_is_reversible_base64": true,
+    "cited_text_max_chars": 150
+  },
+  "final_usage": {"server_tool_use": {"web_search_requests": 1}, "input_tokens": 1447, "output_tokens": 411},
+  "mcp": {"status": 200, "jsonrpc_envelope": true},
+  "conclusion": "Round 89 与 Round 86/87 一样公开生命周期完整但 websearch=0；opaque 字段差异未变化。"
+}

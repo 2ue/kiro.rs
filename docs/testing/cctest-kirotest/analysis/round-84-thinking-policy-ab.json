@@ -1,0 +1,94 @@
+{
+  "round": 84,
+  "timeWindowUtc": "2026-11-07T21:15:38Z/2026-11-07T21:18:31Z",
+  "route": "/dfcache/tune-ss6-99",
+  "model": "claude-opus-5-5",
+  "variable": "promptInjection.pathOverrides[/dfcache/tune-ss6-99].thinkingOutputPolicy.enabled",
+  "baseline": {
+    "value": false,
+    "result": "docs/testing/cctest-kirotest/results/20261107T205907-round-83-retry-evidence.json",
+    "score": 82,
+    "scores": {
+      "stream_structure": 5,
+      "websearch": 0,
+      "signature_proto": 5,
+      "output_config": 10
+    }
+  },
+  "experiment": {
+    "value": true,
+    "result": "docs/testing/cctest-kirotest/results/20261107T211537-round-84-thinking-policy-on.json",
+    "score": 82,
+    "verdict": "unofficial",
+    "scores": {
+      "tag_check": 10,
+      "stream_structure": 5,
+      "non_stream": 10,
+      "websearch": 0,
+      "signature_proto": 5,
+      "output_config": 10,
+      "server_tool": 10,
+      "knowledge": 10,
+      "model_attribution": 10,
+      "doc_recognition": 10,
+      "image_recognition": 10
+    },
+    "capture": {
+      "directory": "logs/llm-capture/capture-20261107T211537Z-d5880da8",
+      "events": 9860,
+      "bytes": 8725411,
+      "upstreamResponses": 27,
+      "upstream200": 25,
+      "upstream402": 2,
+      "clientRequests": 22,
+      "clientStreams": 22,
+      "completeClientSseLifecycles": 22,
+      "contentBlockStart": 54,
+      "contentBlockStop": 54,
+      "droppedEvents": 0,
+      "badJsonLines": 0,
+      "mcpResponses": 1
+    },
+    "markers": {
+      "clientOrHistorySystemReminder": true,
+      "clientOrHistoryThinkingMode": true,
+      "proxyIdentity": false,
+      "proxyPromptSteering": false,
+      "proxyWebSearchGuidance": false,
+      "proxyLanguageReminder": false,
+      "proxyToolChoice": false,
+      "proxyThinkingOutputPolicy": false
+    },
+    "thinkingShape": {
+      "thinkingDeltaCount": 33,
+      "thinkingTextCharacters": 0,
+      "thinkingEstimatedTokens": {
+        "50": 22,
+        "100": 1,
+        "missing": 10
+      },
+      "signatureDeltaCount": 11,
+      "signatureNonEmptyCount": 11
+    }
+  },
+  "conclusion": {
+    "scoreChanged": false,
+    "protectedChecksRegressed": false,
+    "previewStatus": "not_triggered",
+    "modelRule": "thinkingOutputPolicy 对以 -thinking 结尾且 type=enabled/force-visible 的请求生效，但 Opus 5 系列自动跳过",
+    "directCauseForLongTermFailures": "not_tested",
+    "action": "restore_false_and_do_not_use_this_round_as_effective_prompt_ab",
+    "confidence": "high_that_this_round_did_not_apply_the_policy"
+  },
+  "previewTriggerMatrix": {
+    "routeFeaturesThinkingTrigger": "real_request",
+    "draftEnabled": true,
+    "models": {
+      "claude-sonnet-4-5-thinking": "applied",
+      "claude-sonnet-5-5-thinking": "applied",
+      "claude-opus-4-8-thinking": "applied",
+      "claude-opus-5-5": "not_triggered"
+    },
+    "meaning": "thinkingOutputPolicy 不是全模型通用项；Opus 5.5 明确跳过可见 thinking 策略。"
+  }
+}

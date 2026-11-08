@@ -144,7 +144,11 @@ impl CacheUsage {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
-            "cache_read_input_tokens": self.cache_read_input_tokens
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            // Anthropic's MessageDeltaUsage schema keeps these optional payloads
+            // present as null when the request did not use thinking or server tools.
+            "output_tokens_details": null,
+            "server_tool_use": null
         });
         if let Some(breakdown) = self.cache_creation_breakdown_json() {
             usage["cache_creation"] = breakdown;
@@ -2417,6 +2421,8 @@ mod tests {
         assert_eq!(five["cache_creation_input_tokens"], 9_000);
         assert_eq!(five["cache_creation"]["ephemeral_5m_input_tokens"], 9_000);
         assert_eq!(five["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+        assert_eq!(five["output_tokens_details"], json!(null));
+        assert_eq!(five["server_tool_use"], json!(null));
 
         let hour = usage
             .with_cache_creation_ttl(CacheWriteTtl::OneHour)

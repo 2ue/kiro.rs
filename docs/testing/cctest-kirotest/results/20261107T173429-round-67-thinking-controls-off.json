@@ -1,0 +1,19 @@
+{
+  "status": "error",
+  "step": 1,
+  "stepName": "tag",
+  "progress": 0.08333333333333333,
+  "scores": {},
+  "error": "Target API request failed (retried 3 times): 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"reasoning was requested, but both native reasoning fields and compatible thinking prompt controls are unavailable\"},\"request_id\":\"req_01aW3bxMmRRTtHfNhFSgfwaY\"}",
+  "expectedModel": "claude-opus-5-5",
+  "resumable": true,
+  "errorStep": "tag",
+  "checkTokenUsage": true,
+  "_label": "round-67-thinking-controls-off",
+  "_url": "https://kirotest.okmcode.com/dfcache/tune-ss6-99",
+  "_route": "/dfcache/tune-ss6-99",
+  "_model": "claude-opus-5-5",
+  "_startedAt": "2026-11-07T17:34:29.743023+00:00",
+  "_finishedAt": "2026-11-07T17:34:36.601209+00:00",
+  "_kiro": null
+}

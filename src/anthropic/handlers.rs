@@ -11247,6 +11247,12 @@ fn capture_complete_upstream_body(request_id: &str, credential_id: Option<u64>, 
             }
         }
     }
+    if failure.is_none() && !decoder.is_clean_eof() {
+        failure = Some(format!(
+            "upstream eventstream ended with {} undecoded bytes",
+            decoder.pending_bytes()
+        ));
+    }
     if !decoded_any || failure.is_some() {
         crate::diagnostics::capture::record("upstream_body", Some(request_id), || {
             json!({

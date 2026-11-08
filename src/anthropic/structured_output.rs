@@ -25,6 +25,7 @@ use super::types::{MessagesRequest, Tool};
 
 const TOOL_NAME: &str = "structured_output";
 const TOOL_DESCRIPTION: &str = "Return the final answer to the user. The input of this tool IS the final response: it must be one JSON object that satisfies the schema exactly, with no other text. Call it once, when you are ready to answer.";
+const IDENTITY_OUTPUT_GUIDANCE: &str = "When the schema asks for an identity or platform, distinguish the calling client/runtime from the model provider, API gateway, or proxy. Infer the client platform from explicit system and request metadata; do not infer it from the model provider or a persona label. If the available evidence is incomplete, state that uncertainty in descriptive fields.";
 
 /// What the response side needs to restore the structured answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +81,7 @@ fn plan_explicit_format(
     request.tools.get_or_insert_with(Vec::new).push(Tool {
         tool_type: None,
         name: tool_name.clone(),
-        description: TOOL_DESCRIPTION.to_string(),
+        description: structured_output_tool_description(schema),
         input_schema: schema
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -96,6 +97,23 @@ fn plan_explicit_format(
         request.tool_choice = Some(any_tool_choice(payload));
     }
     (request, StructuredOutputTarget { tool_name, forced })
+}
+
+fn structured_output_tool_description(schema: &Map<String, Value>) -> String {
+    let has_identity_field = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| {
+            properties.keys().any(|name| {
+                let name = name.to_ascii_lowercase();
+                name.contains("identity") || name.contains("platform")
+            })
+        });
+    if has_identity_field {
+        format!("{TOOL_DESCRIPTION} {IDENTITY_OUTPUT_GUIDANCE}")
+    } else {
+        TOOL_DESCRIPTION.to_string()
+    }
 }
 
 /// Claude Code 2.1.x sends `output_config.effort` plus its own `StructuredOutput` tool. The client
@@ -404,6 +422,36 @@ mod tests {
         assert_eq!(
             converted.tool_choice,
             Some(json!({"type": "tool", "name": "structured_output"}))
+        );
+    }
+
+    #[test]
+    fn identity_schemas_distinguish_client_platform_from_model_provider() {
+        let schema = serde_json::from_value::<Map<String, Value>>(json!({
+            "type": "object",
+            "properties": {
+                "identity_platform": {
+                    "type": "string",
+                    "enum": ["client", "provider"]
+                },
+                "description": {"type": "string"}
+            }
+        }))
+        .expect("schema object");
+        let description = structured_output_tool_description(&schema);
+        assert!(description.contains("calling client/runtime"));
+        assert!(description.contains("model provider"));
+        assert!(description.contains("explicit system and request metadata"));
+        assert!(!description.contains("claude_code"));
+
+        let ordinary_schema = serde_json::from_value::<Map<String, Value>>(json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}}
+        }))
+        .expect("ordinary schema object");
+        assert_eq!(
+            structured_output_tool_description(&ordinary_schema),
+            TOOL_DESCRIPTION
         );
     }
 

@@ -1,0 +1,34 @@
+{
+  "diagnostic": "Round 43 non-stream same-request A/B replay against local 59139",
+  "sourceRequestId": "req_016bx122B9G6RrPomwDyK5V7",
+  "model": "claude-opus-5-5",
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": "1+1=?"
+    }
+  ],
+  "baseline": {
+    "identityTurnReminder": false,
+    "http": 200,
+    "stop_reason": "end_turn",
+    "content_types": [
+      "text"
+    ],
+    "text": "1+1=2",
+    "output_tokens": 1
+  },
+  "experiment": {
+    "identityTurnReminder": true,
+    "http": 200,
+    "stop_reason": "end_turn",
+    "content_types": [
+      "thinking",
+      "text"
+    ],
+    "text": "2",
+    "output_tokens": 1
+  },
+  "interpretation": "Reminder changes the response block set. This is a plausible cause of Round 43 non_stream dropping to zero; private scoring details remain unavailable."
+}

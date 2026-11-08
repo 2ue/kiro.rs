@@ -1,0 +1,1139 @@
+{
+  "capture": "logs/llm-capture/capture-20261108T054953Z-fd2ddefb/events.jsonl",
+  "requests": [
+    {
+      "request_id": "req_01vamsatbhZ6AA684CpyPHbX",
+      "request_class": "thinking_text",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 4,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "number": 3
+      },
+      "noop_keepalive": true,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 40,
+        "assistantResponseEvent": 189,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 2,
+        "content_block_delta": 195,
+        "content_block_stop": 2,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01Ai1a2k7EwG1ZHzfLhSj8BM",
+      "request_class": "thinking_text",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 4,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 2
+      },
+      "noop_keepalive": true,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 19,
+        "assistantResponseEvent": 4,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 2,
+        "content_block_delta": 9,
+        "content_block_stop": 2,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01G1MP8qPr9gQrUaJoJNgJQ7",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 4,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 2
+      },
+      "noop_keepalive": true,
+      "history_thinking": false,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 18,
+        "toolUseEvent": 18,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 2,
+        "content_block_delta": 21,
+        "content_block_stop": 2,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01SvPnjXx5dZov1wyn1ZV1ek",
+      "request_class": "non_stream",
+      "stream": false,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "assistantResponseEvent": 1,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": false,
+      "upstream_eof_without_completed": null,
+      "saw_upstream_completed": null,
+      "stop_reason_source": null,
+      "terminal_reason": null,
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": false,
+      "client_sse_counts": {}
+    },
+    {
+      "request_id": "req_01MHhTZnTETmFtSgWKWuxXuo",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 2,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "number": 1
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 9,
+        "toolUseEvent": 32,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 2,
+        "content_block_delta": 33,
+        "content_block_stop": 2,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01xyztsZDAJmmynZZuYwi3fm",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 4,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 2
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 21,
+        "toolUseEvent": 19,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 2,
+        "content_block_delta": 22,
+        "content_block_stop": 2,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01wSarqDP3pMmmAMWgwDZVMP",
+      "request_class": "plain_stream",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 40,
+        "toolUseEvent": 166,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 164,
+        "ping": 1,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01by7R9xDznvTX3kecmmvXXK",
+      "request_class": "tool_continuation",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "tool_use",
+          "name": "Write"
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "toolUseEvent": 725,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 4,
+        "content_block_delta": 720,
+        "content_block_stop": 4,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01xT2pwjjNrk8pVyBYgxYS3h",
+      "request_class": "server_tool",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": true,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "server_tool_use",
+          "name": "bash_code_execution"
+        },
+        {
+          "type": "bash_code_execution_tool_result",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "toolUseEvent": 9,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_explicit_stop_reason",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 2,
+        "content_block_delta": 1,
+        "content_block_stop": 2,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01v1gi5wk37txbHKtXzDDQkB",
+      "request_class": "plain_stream",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 14,
+        "assistantResponseEvent": 2,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 2,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01xbFwgtHCZ4WiGAisdLjKKB",
+      "request_class": "plain_stream",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        402,
+        200
+      ],
+      "upstream_request_count": 2,
+      "upstream_frame_types": {
+        "assistantResponseEvent": 211,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 214,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01BWHjX83o5EE4fWFoiKHDGM",
+      "request_class": "plain_stream",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 28,
+        "assistantResponseEvent": 78,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 78,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01WLAH6aPLMqbGhBc69En3RK",
+      "request_class": "plain_stream",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 27,
+        "assistantResponseEvent": 75,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 75,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01pHV8JFTfAe32xCS6oTp69i",
+      "request_class": "tool_continuation",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "tool_use",
+          "name": "Write"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "toolUseEvent": 151,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 149,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01CBAvaxLk13N9rugHEWp2EK",
+      "request_class": "plain_stream",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "assistantResponseEvent": 1,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 2,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01HXRoUYDzh7wqvhDHv89bYW",
+      "request_class": "plain_stream",
+      "stream": true,
+      "thinking": false,
+      "signature_delta": false,
+      "thinking_delta_count": 0,
+      "estimated_tokens_shape": {},
+      "noop_keepalive": false,
+      "history_thinking": false,
+      "tool_use": false,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "text",
+          "name": null
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "assistantResponseEvent": 1,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_end_turn",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "end_turn",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 1,
+        "content_block_delta": 2,
+        "content_block_stop": 1,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01P2VBi9QfzW7vNxsZJGizZt",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 4,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 2
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 14,
+        "toolUseEvent": 480,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 3,
+        "content_block_delta": 483,
+        "content_block_stop": 3,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01T1uHrhPXZQg1zcHXN8aiwj",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 4,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 2
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 23,
+        "toolUseEvent": 546,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 3,
+        "content_block_delta": 549,
+        "content_block_stop": 3,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01ysBiu3i2o2Tc3unSb75A7K",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 5,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 3
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit"
+        },
+        {
+          "type": "tool_use",
+          "name": "Write"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 36,
+        "toolUseEvent": 342,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 5,
+        "content_block_delta": 342,
+        "content_block_stop": 5,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01zHK8o4r6GisBzrp6Ks2aGn",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 5,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 3
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 33,
+        "toolUseEvent": 64,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 3,
+        "content_block_delta": 66,
+        "content_block_stop": 3,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01jv7Fd4UYAFaDUZkV4wrcXd",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 4,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 2
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "text",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 24,
+        "assistantResponseEvent": 5,
+        "toolUseEvent": 53,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 4,
+        "content_block_delta": 59,
+        "content_block_stop": 4,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    },
+    {
+      "request_id": "req_01pXVCZCJzRVwtQ6qnZpgoaU",
+      "request_class": "thinking_tool",
+      "stream": true,
+      "thinking": true,
+      "signature_delta": true,
+      "thinking_delta_count": 3,
+      "estimated_tokens_shape": {
+        "null": 1,
+        "missing": 1,
+        "number": 1
+      },
+      "noop_keepalive": true,
+      "history_thinking": true,
+      "tool_use": true,
+      "server_tool_use": false,
+      "websearch": false,
+      "blocks": [
+        {
+          "type": "thinking",
+          "name": null
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash"
+        }
+      ],
+      "upstream_statuses": [
+        200
+      ],
+      "upstream_request_count": 1,
+      "upstream_frame_types": {
+        "reasoningContentEvent": 16,
+        "toolUseEvent": 55,
+        "contextUsageEvent": 1,
+        "meteringEvent": 1
+      },
+      "upstream_stream_end": true,
+      "upstream_eof_without_completed": true,
+      "saw_upstream_completed": false,
+      "stop_reason_source": "local_inferred_tool_use",
+      "terminal_reason": "completed",
+      "downstream_stop_reason": "tool_use",
+      "route_subtype": "local_success",
+      "client_lifecycle_complete": true,
+      "client_sse_counts": {
+        "message_start": 1,
+        "content_block_start": 3,
+        "content_block_delta": 55,
+        "content_block_stop": 3,
+        "message_delta": 1,
+        "message_stop": 1
+      }
+    }
+  ]
+}

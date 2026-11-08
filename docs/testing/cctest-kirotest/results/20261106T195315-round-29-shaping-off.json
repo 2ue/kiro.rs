@@ -1,0 +1,19 @@
+{
+  "status": "error",
+  "step": 1,
+  "stepName": "tag",
+  "progress": 0.08333333333333333,
+  "scores": {},
+  "error": "Target API request failed (retried 3 times): 502 {\"type\":\"https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-502/\",\"title\":\"Error 502: Bad gateway\",\"status\":502,\"detail\":\"The origin web server returned an invalid or incomplete response to Cloudflare. This typically indicates the origin is overloaded or misconfigured.\",\"instance\":\"a566a4b89e94066b\",\"error_code\":502,\"error_name\":\"origin_bad_gateway\",\"error_category\":\"origin\",\"ray_id\":\"a566a4b89e94066b\",\"timestamp\":\"2026-11-06T19:53:17Z\",\"zone\"",
+  "expectedModel": "claude-opus-4-8",
+  "resumable": true,
+  "errorStep": "tag",
+  "checkTokenUsage": true,
+  "_label": "round-29-shaping-off",
+  "_url": "https://kirotest.okmcode.com/dfcache/tune-ss6-99",
+  "_route": "/dfcache/tune-ss6-99",
+  "_model": "claude-opus-4-8",
+  "_startedAt": "2026-11-06T19:53:15.326971+00:00",
+  "_finishedAt": "2026-11-06T19:53:19.423898+00:00",
+  "_kiro": null
+}

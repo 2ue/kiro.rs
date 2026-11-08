@@ -1,0 +1,139 @@
+{
+  "route": "/dfcache/tune-ss6-99",
+  "host": "0.0.0.0",
+  "port": 59139,
+  "postgres": {
+    "url": "postgres://<redacted>@127.0.0.1:25432/kirotest_dev"
+  },
+  "redis": {
+    "url": "redis://127.0.0.1:26379/0",
+    "keyPrefix": "kirotest"
+  },
+  "observabilityRedis": {
+    "url": null,
+    "keyPrefix": "kirotest:observability"
+  },
+  "routeFeatures": {
+    "thinkingTrigger": "off",
+    "channelLeakGuard": false,
+    "modelDrivenWebSearch": false
+  },
+  "cachePolicy": {
+    "bounds": {
+      "entryTtlSecs": 86400,
+      "maxEntriesGlobal": 20000,
+      "estimatedBytesLimit": 268435456,
+      "maxEntriesPerAccount": 4000
+    },
+    "cacheTtl": {
+      "local": "force_1h",
+      "externalPool": null
+    },
+    "cacheType": "stable_segment_cache",
+    "cachePoint": null,
+    "hitShaping": {
+      "enabled": true,
+      "ratioJitter": 0.02,
+      "minCostRatio": 0.0,
+      "targetHitRatio": 0.99,
+      "minCreationRatio": 0.0,
+      "maxReadMultiplier": 0.0,
+      "minCacheReadTokens": 1024,
+      "readAwareCostFloor": false,
+      "costFloorTopUpInput": null,
+      "minCacheCreationTokens": 1024
+    },
+    "kiroRsTool": null,
+    "simulation": null,
+    "reportedUsage": {
+      "input": {
+        "mode": "sample-max",
+        "maxTokens": 96,
+        "targetTokens": 0,
+        "normalMaxMultiplier": 1.1,
+        "moveDeltaToCacheRead": true
+      },
+      "output": {
+        "mode": "raw",
+        "maxTokens": 0,
+        "targetTokens": 0,
+        "normalMaxMultiplier": 1.1,
+        "moveDeltaToCacheRead": false
+      },
+      "enabled": true,
+      "cacheRead": {
+        "mode": "preserve",
+        "maxTokens": 0,
+        "targetTokens": 0,
+        "normalMaxMultiplier": 1.1,
+        "moveDeltaToCacheRead": false
+      },
+      "cacheCreation": {
+        "mode": "preserve",
+        "maxTokens": 0,
+        "targetTokens": 0,
+        "normalMaxMultiplier": 1.1,
+        "moveDeltaToCacheRead": false
+      },
+      "outputUpliftPercent": 50,
+      "finalOutputMaxTokens": 200000,
+      "outputUpliftMinTokens": 1000,
+      "finalCacheReadMaxTokens": 700000,
+      "finalOutputGuardEnabled": true,
+      "finalOutputJitterMaxTokens": 12000,
+      "finalOutputJitterMinTokens": 5000,
+      "finalCacheCreationMaxTokens": 400000,
+      "skipNonStreamUsageProjection": false,
+      "strictCacheEligibilityStream": false,
+      "finalCacheReadJitterMaxTokens": 0,
+      "finalCacheReadJitterMinTokens": 0,
+      "strictCacheEligibilityNonStream": false,
+      "finalCacheCreationJitterMaxTokens": 45000,
+      "finalCacheCreationJitterMinTokens": 20000
+    },
+    "stableSegment": {
+      "tokenScale": 1.0,
+      "includeTools": true,
+      "coverageRatio": 1.0,
+      "includeSystem": false,
+      "autoCacheTools": true,
+      "defaultTtlSecs": 300,
+      "includeHistory": true,
+      "autoCacheSystem": true,
+      "extendedTtlSecs": 3600,
+      "minSegmentTokens": 256,
+      "maxCoverageTokens": 0,
+      "capJitterMaxTokens": 54321,
+      "capJitterMinTokens": 12345,
+      "historyMessageLimit": 0,
+      "minTotalInputTokens": 2000,
+      "outputUpliftPercent": 70,
+      "scaleMinInputTokens": 48000,
+      "finalOutputMaxTokens": null,
+      "outputUpliftMinTokens": 2000,
+      "reportedInputMaxTokens": 1000,
+      "reportedInputMinTokens": 32,
+      "finalCacheReadMaxTokens": 500000,
+      "maxSimulatedInputTokens": 500000,
+      "incrementalCreateEnabled": true,
+      "honorExplicitCacheControl": true,
+      "finalOutputJitterMaxTokens": null,
+      "finalOutputJitterMinTokens": null,
+      "autoCacheHistoryMessageEnds": true,
+      "finalCacheCreationMaxTokens": 300000,
+      "cacheCurrentUserStablePrefix": false,
+      "finalCacheReadJitterMaxTokens": 54321,
+      "finalCacheReadJitterMinTokens": 12345,
+      "maxNewCreationTokensPerRequest": 0,
+      "currentUserStablePrefixMaxTokens": 0,
+      "finalCacheCreationJitterMaxTokens": 54321,
+      "finalCacheCreationJitterMinTokens": 12345
+    },
+    "kiroRsToolPlus": null,
+    "routeNamespace": true,
+    "creationControl": null,
+    "coldRequestGuard": null
+  },
+  "usageEnabled": true,
+  "definedCacheRoute": true
+}

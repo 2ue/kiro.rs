@@ -1,0 +1,72 @@
+{
+  "capture": "logs/llm-capture/capture-20261108T031042Z-6baf9b7a/events.jsonl",
+  "request_id": "req_01xtEPhTEqusktvLZjHoa79L",
+  "source": "59139 development instance through kirotest Caddy",
+  "scores": {
+    "total": 73,
+    "stream_structure": 5,
+    "non_stream": 0,
+    "websearch": 0,
+    "signature_proto": 5,
+    "output_config": 10
+  },
+  "upstream_statuses": [
+    {"phase": "api", "status": 200},
+    {"phase": "mcp", "status": 200},
+    {"phase": "api", "status": 200}
+  ],
+  "lifecycle": [
+    "message_start",
+    "server_tool_use(index=0)",
+    "input_json_delta(index=0)",
+    "content_block_stop(index=0)",
+    "web_search_tool_result(index=1)",
+    "content_block_stop(index=1)",
+    "ping",
+    "text(index=2..9)",
+    "citations_delta/text_delta",
+    "message_delta(stop_reason=end_turn)",
+    "message_stop"
+  ],
+  "blocks": [
+    {
+      "index": 0,
+      "type": "server_tool_use",
+      "keys": ["caller", "id", "input", "name", "type"],
+      "id_present": true,
+      "caller": {"type": "direct"},
+      "input_keys": []
+    },
+    {
+      "index": 1,
+      "type": "web_search_tool_result",
+      "keys": ["caller", "content", "tool_use_id", "type"],
+      "tool_use_id_present": true,
+      "caller": {"type": "direct"},
+      "content_count": 10,
+      "result_field_keys": ["encrypted_content", "page_age", "title", "type", "url"],
+      "encrypted_content_count": 10,
+      "encrypted_content_shape": "MCP snippet plaintext",
+      "encrypted_content_lengths": [254, 241, 135, 244, 273, 248, 224, 302, 147, 112],
+      "encrypted_index_present_count": 0
+    }
+  ],
+  "citations": {
+    "count": 9,
+    "field_keys": ["cited_text", "encrypted_index", "title", "type", "url"],
+    "encrypted_index_decoded_shape": "number:url",
+    "encrypted_index_is_reversible_base64": true,
+    "cited_text_max_chars": 150
+  },
+  "final_usage": {
+    "server_tool_use": {"web_search_requests": 1},
+    "input_tokens": 1432,
+    "output_tokens": 457
+  },
+  "mcp": {
+    "status": 200,
+    "body_bytes": 5429,
+    "json_keys": ["error", "id", "jsonrpc", "result"]
+  },
+  "conclusion": "公开 WebSearch 生命周期和 MCP 回灌完整；websearch=0 与 Round 87 相同。剩余直接字段差异仍是 encrypted_content 明文和 encrypted_index 可逆 Base64，缺少官方 opaque fixture、算法和第二轮原样回传证据。"
+}

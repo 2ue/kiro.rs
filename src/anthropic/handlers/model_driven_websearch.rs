@@ -50,6 +50,7 @@ struct Source {
     title: String,
     url: String,
     snippet: String,
+    encrypted_index: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -495,7 +496,8 @@ async fn drive(
                 "type": "server_tool_use",
                 "id": server_id,
                 "name": SEARCH_TOOL_NAME,
-                "input": {"query": query}
+                "input": {"query": query},
+                "caller": {"type": "direct"}
             });
             if !output.push(server_tool_use).await {
                 return Err(DriveError::ClientGone);
@@ -532,6 +534,7 @@ async fn drive(
                             title: result.title.clone(),
                             url: result.url.clone(),
                             snippet: result.snippet.clone().unwrap_or_default(),
+                            encrypted_index: result.encrypted_index.clone(),
                         }));
                         (
                             Value::Array(
@@ -554,7 +557,8 @@ async fn drive(
             let result_block = json!({
                 "type": "web_search_tool_result",
                 "tool_use_id": server_id,
-                "content": result_content
+                "content": result_content,
+                "caller": {"type": "direct"}
             });
             if !output.push(result_block).await {
                 return Err(DriveError::ClientGone);
@@ -598,6 +602,7 @@ async fn drive(
 
     let mut answer = cited_text_blocks(&final_text, &sources);
     clean_text_blocks(ctx, &mut answer);
+    coalesce_text_blocks(&mut answer);
     for block in answer {
         if !output.push(block).await {
             return Err(DriveError::ClientGone);
@@ -653,6 +658,32 @@ fn clean_text_blocks(ctx: &ModelDrivenWebSearchContext, blocks: &mut Vec<Value>)
                 .as_str()
                 .is_some_and(|text| !text.trim().is_empty())
     });
+}
+
+/// 合并没有引用元数据的连续文本块。
+///
+/// 每个带引用的文本段必须保持独立 block：官方 WebSearch 响应按引用段发送多个
+/// `text` block，流式路径也会为每个 block 单独发送 `citations_delta`。只合并两个
+/// 都没有引用的相邻 block，避免把官方 block 边界压扁成一个大 block。
+fn coalesce_text_blocks(blocks: &mut Vec<Value>) {
+    let mut merged = Vec::with_capacity(blocks.len());
+    for block in blocks.drain(..) {
+        let can_merge = block["type"] == "text"
+            && block.get("citations").is_none()
+            && merged.last().is_some_and(|last: &Value| {
+                last["type"] == "text" && last.get("citations").is_none()
+            });
+        if !can_merge {
+            merged.push(block);
+            continue;
+        }
+
+        let last = merged.last_mut().expect("checked above");
+        let previous = last["text"].as_str().unwrap_or_default().to_string();
+        let current = block["text"].as_str().unwrap_or_default();
+        last["text"] = json!(format!("{previous}{current}"));
+    }
+    *blocks = merged;
 }
 
 /// The request sent to the model: the native tool becomes an ordinary `web_search` tool, the
@@ -810,6 +841,12 @@ async fn call_model(
             return Err(processing_failure(error.to_string()));
         }
     };
+    // WebSearch 的内部调用走完整响应读取路径，不能依赖普通流式处理器的
+    // upstream_frame 采集。失败时必须保留空体、JSON 错误体或截断 EventStream
+    // 的阶段证据，否则外层只能看到笼统的 502。
+    if crate::diagnostics::capture::is_active() {
+        super::capture_complete_upstream_body(&ctx.request_id, accounting.credential_id, &body);
+    }
     let body = match inspect_complete_upstream_body(content_type.as_deref(), body) {
         Ok(body) => body,
         Err(error) => {
@@ -949,8 +986,12 @@ fn citation(source: &Source, number: usize, cited_span: &str) -> Value {
         "type": "web_search_result_location",
         "url": source.url,
         "title": source.title,
-        // Proxy-issued opaque index (the official value is Anthropic-encrypted).
-        "encrypted_index": BASE64_STANDARD.encode(format!("{number}:{}", source.url)),
+        // Preserve a provider-issued opaque index. Kiro MCP currently has no such field, so the
+        // legacy reversible fallback remains for compatibility and is explicitly not treated as
+        // an official Anthropic encrypted value.
+        "encrypted_index": source.encrypted_index.clone().unwrap_or_else(|| {
+            BASE64_STANDARD.encode(format!("{number}:{}", source.url))
+        }),
         // At most 150 characters, like the official field.
         "cited_text": cited_text(&source.snippet, cited_span)
     })
@@ -1201,7 +1242,17 @@ fn block_events(index: usize, block: &Value) -> Vec<SseEvent> {
     let kind = block["type"].as_str().unwrap_or_default();
     let start_block = match kind {
         "text" => json!({"type": "text", "text": ""}),
-        "server_tool_use" | "tool_use" => json!({
+        "server_tool_use" => json!({
+            "type": kind,
+            "id": block["id"],
+            "name": block["name"],
+            "input": {},
+            "caller": block
+                .get("caller")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "direct"}))
+        }),
+        "tool_use" => json!({
             "type": kind,
             "id": block["id"],
             "name": block["name"],
@@ -1288,11 +1339,13 @@ mod tests {
                 title: "Rust 1.90".to_string(),
                 url: "https://blog.rust-lang.org/1.90".to_string(),
                 snippet: "Rust 1.90 was released on September 18.".to_string(),
+                encrypted_index: None,
             },
             Source {
                 title: "Releases".to_string(),
                 url: "https://releases.rs".to_string(),
                 snippet: "Release calendar".to_string(),
+                encrypted_index: None,
             },
         ]
     }
@@ -1331,6 +1384,7 @@ mod tests {
             title: "t".to_string(),
             url: "https://example.com".to_string(),
             snippet: "字".repeat(400),
+            encrypted_index: None,
         };
         let cited = citation(&source, 1, "")["cited_text"]
             .as_str()
@@ -1394,8 +1448,8 @@ mod tests {
     fn stream_events_follow_the_official_block_lifecycle() {
         let usage = websearch::raw_websearch_usage(1200, 80);
         let blocks = vec![
-            json!({"type": "server_tool_use", "id": "srvtoolu_01a", "name": "web_search", "input": {"query": "rust"}}),
-            json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_01a", "content": []}),
+            json!({"type": "server_tool_use", "id": "srvtoolu_01a", "name": "web_search", "input": {"query": "rust"}, "caller": {"type": "direct"}}),
+            json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_01a", "content": [], "caller": {"type": "direct"}}),
             json!({"type": "text", "text": "Rust 1.90.", "citations": [citation(&sources()[0], 1, "Rust 1.90.")]}),
         ];
         let events = stream_events("claude-sonnet-4-5", &blocks, "end_turn", usage, 1);
@@ -1424,6 +1478,19 @@ mod tests {
             ]
         );
         assert_eq!(events[1].data["content_block"]["input"], json!({}));
+        assert_eq!(
+            events[1].data["content_block"]["caller"],
+            json!({"type": "direct"})
+        );
+        assert_eq!(events[2].data["delta"]["type"], "input_json_delta");
+        assert_eq!(
+            events[2].data["delta"]["partial_json"],
+            r#"{"query":"rust"}"#
+        );
+        assert_eq!(
+            events[4].data["content_block"]["caller"],
+            json!({"type": "direct"})
+        );
         assert!(
             events[0].data["message"]["usage"]
                 .get("server_tool_use")
@@ -1485,6 +1552,7 @@ mod tests {
             url: "https://example.com".to_string(),
             snippet: "Intro about the site. Rust 1.90 was released on September 18. Other news."
                 .to_string(),
+            encrypted_index: None,
         };
         assert_eq!(
             cited_text(&source.snippet, "Rust 1.90 was released in September"),

@@ -1,0 +1,138 @@
+{
+  "capture": "logs/llm-capture/capture-20261107T205818Z-f291be2b/events.jsonl",
+  "thinking_requests": 11,
+  "all_thinking_text_empty": true,
+  "rows": [
+    {
+      "request_id": "req_01Kog79tQUWD8bFbAsAEwmf1",
+      "thinking_delta_count": 6,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 2,
+        "number": 4
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 2788,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01vQet4u2RpRHRP3xZjpSwte",
+      "thinking_delta_count": 2,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "number": 2
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 1096,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01NWk1MBw7AjiWKshbD4KnHw",
+      "thinking_delta_count": 3,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 2
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 896,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01Z8VtVa4B3qQoFoB7f9Jsqy",
+      "thinking_delta_count": 3,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 2
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 896,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01CSArEmaSFrpydPtGo2UA8a",
+      "thinking_delta_count": 2,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 1
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 888,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01JKyvztF6t5J27oAPicN2Be",
+      "thinking_delta_count": 3,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 2
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 864,
+      "status": "success"
+    },
+    {
+      "request_id": "req_014nMtY5btrD7sfWAn3P4iw4",
+      "thinking_delta_count": 2,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 1
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 876,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01JyjXtMHemeqGYrXQ8a5kpw",
+      "thinking_delta_count": 4,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 3
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 1512,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01zXoy5iCWxxBPRgn2Uh6K4V",
+      "thinking_delta_count": 3,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 2
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 1140,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01nqCn5XVh1xfHVqkjHS2Yj8",
+      "thinking_delta_count": 3,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 2
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 1304,
+      "status": "success"
+    },
+    {
+      "request_id": "req_01TJf1zYX9YxoDdv5rTnvmKQ",
+      "thinking_delta_count": 3,
+      "thinking_text_chars": 0,
+      "estimated_tokens_shapes": {
+        "missing": 1,
+        "number": 2
+      },
+      "signature_delta_count": 1,
+      "signature_chars": 1156,
+      "status": "success"
+    }
+  ]
+}

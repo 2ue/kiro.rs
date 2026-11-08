@@ -1,0 +1,19 @@
+{
+  "status": "error",
+  "step": 1,
+  "stepName": "tag",
+  "progress": 0.08333333333333333,
+  "scores": {},
+  "error": "Target API request failed (retried 3 times): 503 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The service is busy right now. Please try again shortly. (request-id: req_01NYTpjn13Q2PFTf8ozD9nKe)\"},\"request_id\":\"req_01NYTpjn13Q2PFTf8ozD9nKe\"}",
+  "expectedModel": "claude-opus-5-5",
+  "resumable": true,
+  "errorStep": "tag",
+  "checkTokenUsage": true,
+  "_label": "round-55-dev-recheck",
+  "_url": "https://kirotest.okmcode.com/dfcache/tune-ss6-99",
+  "_route": "/dfcache/tune-ss6-99",
+  "_model": "claude-opus-5-5",
+  "_startedAt": "2026-11-07T13:05:07.076377+00:00",
+  "_finishedAt": "2026-11-07T13:05:10.730939+00:00",
+  "_kiro": null
+}

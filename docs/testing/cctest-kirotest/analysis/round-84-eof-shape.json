@@ -1,0 +1,502 @@
+{
+  "round": 84,
+  "capture": "logs/llm-capture/capture-20261107T211537Z-d5880da8/events.jsonl",
+  "requestCount": 23,
+  "counts": [
+    {
+      "key": [
+        true,
+        "local_inferred_end_turn",
+        true,
+        "completed"
+      ],
+      "count": 8
+    },
+    {
+      "key": [
+        false,
+        null,
+        null,
+        null
+      ],
+      "count": 1
+    },
+    {
+      "key": [
+        true,
+        "local_inferred_tool_use",
+        true,
+        "completed"
+      ],
+      "count": 12
+    },
+    {
+      "key": [
+        true,
+        null,
+        null,
+        "completed"
+      ],
+      "count": 1
+    },
+    {
+      "key": [
+        true,
+        "local_explicit_stop_reason",
+        true,
+        "completed"
+      ],
+      "count": 1
+    }
+  ],
+  "requests": [
+    {
+      "requestId": "req_0157F67E7crND4gBhSKbSF7B",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 13
+      },
+      "upstreamFramesBeforeFirstOutput": 13,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01BArJC6sPdG4LmaNZYqGgqA",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 38
+      },
+      "upstreamFramesBeforeFirstOutput": 38,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01ktkoMvhJdPFwp19g6SkVED",
+      "stream": false,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": null,
+      "upstreamEofWithoutCompleted": null,
+      "terminalReason": null,
+      "upstreamEventTypesBeforeFirstOutput": null,
+      "upstreamFramesBeforeFirstOutput": null,
+      "sawUpstreamAssistantResponse": null,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01ZAiZZNJEirZN9JEqxtBxqc",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 17,
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 18,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01pzusQEfMTqjFW4EaBYtXPJ",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 1,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01KuNpnRtW5k7sTwi8XQF8rt",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": null,
+      "upstreamEofWithoutCompleted": null,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": null,
+      "upstreamFramesBeforeFirstOutput": null,
+      "sawUpstreamAssistantResponse": null,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ],
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_015RZgrSfN6BciBwb1iLpiPa",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 58,
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 59,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01fho4kjPUtJx2mzEkNHDmfF",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_explicit_stop_reason",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "tool_use": 11
+      },
+      "upstreamFramesBeforeFirstOutput": 11,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01qYn7a2qFHSYgFwWmFJFZLC",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 30
+      },
+      "upstreamFramesBeforeFirstOutput": 30,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01in9MQzYRiH5jkTLYo6WP4h",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": null,
+      "upstreamFramesBeforeFirstOutput": 0,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          402,
+          1
+        ],
+        [
+          200,
+          2
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01h8sDS2chkG1SmGYVSukvCg",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 22,
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 23,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01DcacfyWwDn7Y9jhPG7ux2L",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 28
+      },
+      "upstreamFramesBeforeFirstOutput": 28,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01BtuQZ3JPqHTDUtMVDZehM6",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 48
+      },
+      "upstreamFramesBeforeFirstOutput": 48,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          402,
+          1
+        ],
+        [
+          200,
+          2
+        ]
+      ]
+    },
+    {
+      "requestId": "req_019W23rEuuRRWLU8n3TTBykR",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 13
+      },
+      "upstreamFramesBeforeFirstOutput": 13,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_0194QzRabLLeB89ir48ooU6U",
+      "stream": true,
+      "downstreamStopReason": "end_turn",
+      "stopReasonSource": "local_inferred_end_turn",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": null,
+      "upstreamFramesBeforeFirstOutput": 0,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01sLUN2AgdoBjtHP5C8UJYhE",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 1,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_018AbQa8LbmLNhYeYv2gg4SJ",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 1,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01h3aeGEPRsE6SX3acAHMhDY",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 13,
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 14,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01a8ZWuBDCNDQnwsbrv8PXwY",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 13,
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 14,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01GSpU8QLFB1yae3Q1NvYBpw",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 39
+      },
+      "upstreamFramesBeforeFirstOutput": 39,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01gbhvjPazPyffXdaYRKSn4M",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 23,
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 24,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01J5JK1CGgCxPpJ6Q6pinuQE",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 34
+      },
+      "upstreamFramesBeforeFirstOutput": 34,
+      "sawUpstreamAssistantResponse": true,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    },
+    {
+      "requestId": "req_01usnLbobxiGQGRnn677hJmu",
+      "stream": true,
+      "downstreamStopReason": "tool_use",
+      "stopReasonSource": "local_inferred_tool_use",
+      "upstreamEofWithoutCompleted": true,
+      "terminalReason": "completed",
+      "upstreamEventTypesBeforeFirstOutput": {
+        "reasoning_content": 21,
+        "tool_use": 1
+      },
+      "upstreamFramesBeforeFirstOutput": 22,
+      "sawUpstreamAssistantResponse": false,
+      "upstreamStatus": [
+        [
+          200,
+          1
+        ]
+      ]
+    }
+  ]
+}

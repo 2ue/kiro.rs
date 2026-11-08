@@ -3185,9 +3185,8 @@ impl StreamContext {
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + tag.open.len()..].to_string();
 
-                    // 创建 thinking 块的 content_block_start 事件。
-                    // 与 Anthropic 协议一致总带 signature 字段；文本提取的 thinking 没有上游签名，
-                    // 用空字符串表示，回传时 converter 按无签名 thinking 处理。
+                    // 创建 thinking 块的 content_block_start 事件。官方流式示例保留
+                    // 非流响应使用的 signature 字段，但值在后续 signature_delta 中填充。
                     let thinking_index = self.state_manager.next_block_index();
                     self.thinking_block_index = Some(thinking_index);
                     let start_events = self.state_manager.handle_content_block_start(
@@ -3752,10 +3751,17 @@ impl StreamContext {
                 "type": "text_delta",
                 "text": ""
             }),
-            "thinking" => json!({
-                "type": "thinking_delta",
-                "thinking": ""
-            }),
+            "thinking" => {
+                let delta = json!({
+                    "type": "thinking_delta",
+                    "thinking": ""
+                });
+                delta
+            }
+            // Structured output rewrites the internal tool block to a downstream text block
+            // after this context has generated the event. An input_json_delta keepalive would
+            // then be invalid for that text block, so let the caller send a standard ping.
+            "tool_use" if self.structured_output.is_some() => return None,
             "tool_use" => json!({
                 "type": "input_json_delta",
                 "partial_json": ""
@@ -3853,13 +3859,19 @@ impl StreamContext {
             // Nothing safe was emitted for this segment, so there is no block to close.
             return events;
         };
-        if polluted {
+        if polluted && self.native_reasoning_signature.is_some() {
             tracing::warn!(
                 native_thinking_bytes = self.native_reasoning_content.len(),
                 "withheld signature of polluted native thinking block"
             );
         } else if let Some(signature_event) = self.take_native_signature_delta_event(index) {
             events.push(signature_event);
+        } else if self.native_reasoning_signature.is_none() {
+            // Kiro reasoningContentEvent often has no opaque signature. The downstream
+            // thinking block still needs a non-empty signature_delta for Claude clients;
+            // sign the exact sanitized text that was emitted.
+            let signature = synthetic_thinking_signature(&self.native_reasoning_emitted);
+            events.push(self.create_signature_delta_event(index, &signature));
         } else if self.synthetic_thinking_signatures {
             let signature = synthetic_thinking_signature(&self.native_reasoning_emitted);
             events.push(self.create_signature_delta_event(index, &signature));
@@ -3977,16 +3989,6 @@ impl StreamContext {
         self.pending_tool_starts
             .retain(|tool_use_id| tool_use_id != &tool_use.tool_use_id);
 
-        // 获取或分配块索引
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
-            idx
-        } else {
-            let idx = self.state_manager.next_block_index();
-            self.tool_block_indices
-                .insert(tool_use.tool_use_id.clone(), idx);
-            idx
-        };
-
         // 还原工具名称（如果有映射）；模型用了去 Hash 后缀等变体时宽容匹配到已定义工具。
         let resolved = super::tool_name_restore::resolve_response_tool_name(
             &self.tool_name_map,
@@ -4035,6 +4037,17 @@ impl StreamContext {
                 .push(super::code_execution::PendingCodeExecution { input, config });
             return events;
         }
+
+        // 获取或分配块索引。代码执行工具在输入完整前只缓存，不应占用一个永远不会
+        // 下发的 Anthropic content block index；否则随后生成的 server_tool_use 会从 1 开始。
+        let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
+            idx
+        } else {
+            let idx = self.state_manager.next_block_index();
+            self.tool_block_indices
+                .insert(tool_use.tool_use_id.clone(), idx);
+            idx
+        };
 
         if !tool_use.input.is_empty() {
             self.tool_input_buffers
@@ -5586,7 +5599,13 @@ mod tests {
             .iter()
             .find(|event| event.data["content_block"]["type"] == "server_tool_use")
             .expect("server_tool_use start");
+        assert_eq!(server_start.data["index"], 0);
         assert_eq!(server_start.data["content_block"]["input"], json!({}));
+        let result_start = events
+            .iter()
+            .find(|event| event.data["content_block"]["type"] == "bash_code_execution_tool_result")
+            .expect("code execution result start");
+        assert_eq!(result_start.data["index"], 1);
         assert!(events.iter().any(|event| {
             event.data["delta"]["type"] == "input_json_delta"
                 && event.data["delta"]["partial_json"]
@@ -5795,6 +5814,35 @@ mod tests {
     }
 
     #[test]
+    fn thinking_token_count_beta_does_not_add_estimates_to_visible_reasoning_deltas() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        ctx.set_omit_thinking_display(false, true);
+        let _initial_events = ctx.generate_initial_events();
+        let mut events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "visible reasoning".to_string(),
+            signature: Some("sig".to_string()),
+            redacted_content: None,
+        }));
+        events.extend(ctx.generate_final_events());
+
+        let deltas = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "thinking_delta"
+            })
+            .collect::<Vec<_>>();
+        assert!(!deltas.is_empty());
+        assert!(
+            deltas
+                .iter()
+                .all(|event| event.data["delta"].get("estimated_tokens").is_none())
+        );
+    }
+
+    #[test]
     fn native_reasoning_only_without_xml_fallback_finishes_as_end_turn() {
         use crate::kiro::model::events::{ContextUsageEvent, MeteringEvent, ReasoningContentEvent};
 
@@ -5898,8 +5946,11 @@ mod tests {
                 e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
             })
             .expect("native thinking block should start");
-        // 真实签名只通过 signature_delta 下发；start 里只有协议要求的空占位。
-        assert_eq!(thinking_start.data["content_block"]["signature"], "");
+        // 真实签名只通过 signature_delta 下发，start 不携带非流 signature 字段。
+        assert_eq!(
+            thinking_start.data["content_block"].get("signature"),
+            Some(&json!(""))
+        );
 
         let signature_delta_pos = all_events
             .iter()
@@ -5930,6 +5981,53 @@ mod tests {
         assert!(
             thinking_stop_pos < text_start_pos,
             "native thinking must stop before visible text starts"
+        );
+    }
+
+    #[test]
+    fn unsigned_native_reasoning_emits_synthetic_signature_before_stop() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        ctx.set_synthetic_thinking_signatures(true);
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: "unsigned native reasoning".to_string(),
+                signature: None,
+                redacted_content: None,
+            })),
+        );
+        events.extend(ctx.process_assistant_response("answer"));
+        events.extend(ctx.generate_final_events());
+
+        let thinking_start = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .expect("thinking block should start");
+        let signature_delta_pos = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("synthetic signature should be emitted");
+        let thinking_stop_pos = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_stop"
+                    && event.data["index"] == thinking_start.data["index"]
+            })
+            .expect("thinking block should stop");
+        assert!(signature_delta_pos < thinking_stop_pos);
+        assert!(
+            !events[signature_delta_pos].data["delta"]["signature"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
         );
     }
 
@@ -7436,6 +7534,29 @@ mod tests {
     }
 
     #[test]
+    fn structured_output_tool_keepalive_falls_back_to_ping() {
+        let mut policy = ResponseToolPolicy::default();
+        policy.set_structured_output(super::super::structured_output::StructuredOutputTarget {
+            tool_name: "structured_output".to_string(),
+            forced: true,
+        });
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.set_response_tool_policy(&policy);
+        let _initial_events = ctx.generate_initial_events();
+        let _tool_events = ctx.process_kiro_event(&tool_use_fragment(
+            "tool_structured",
+            "structured_output",
+            "{\"value\":",
+            false,
+        ));
+
+        assert!(
+            ctx.claude_code_noop_delta_keepalive_event().is_none(),
+            "structured output must not emit input_json_delta after rewrite"
+        );
+    }
+
+    #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
 
@@ -8078,7 +8199,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_block_starts_always_carry_signature_field() {
+    fn thinking_block_starts_include_empty_signature_field() {
         for round in 0..5 {
             let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
             let mut all_events = ctx.generate_initial_events();
@@ -8104,7 +8225,8 @@ mod tests {
             assert_eq!(thinking_starts.len(), 2, "round {round}");
             for start in thinking_starts {
                 assert_eq!(
-                    start.data["content_block"]["signature"], "",
+                    start.data["content_block"].get("signature"),
+                    Some(&json!("")),
                     "round {round}: {:?}",
                     start.data
                 );

@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256, Sha512};
 /// Plaintext marker of signatures issued by earlier releases. Still recognized so already-issued
 /// signatures replay; never emitted again because it names the proxy after base64 decoding.
 const LEGACY_SYNTHETIC_MARKER: &[u8] = b"kiro-rs-compat-thinking-signature-v1\0";
+const KIROGO_SYNTHETIC_PREFIX: &[u8] = b"kirogo-thinking-signature-block-";
+const KIROGO_SYNTHETIC_PADDING: &[u8] = b"-pad-";
 
 /// Marker of new signatures: opaque bytes derived from a hash, same length as the legacy
 /// marker so signature length is unchanged.
@@ -42,7 +44,28 @@ pub(crate) fn synthetic_thinking_signature_matches(thinking: &str, signature: &s
 }
 
 pub(crate) fn is_synthetic_thinking_signature(signature: &str) -> bool {
-    decode_synthetic(signature).is_some()
+    decode_synthetic(signature).is_some() || is_legacy_kirogo_signature(signature)
+}
+
+fn is_legacy_kirogo_signature(signature: &str) -> bool {
+    let Ok(decoded) = STANDARD.decode(signature) else {
+        return false;
+    };
+    let Some(tail) = decoded.strip_prefix(KIROGO_SYNTHETIC_PREFIX) else {
+        return false;
+    };
+    let Some((block_index, padding)) = tail
+        .windows(KIROGO_SYNTHETIC_PADDING.len())
+        .position(|window| window == KIROGO_SYNTHETIC_PADDING)
+        .map(|index| tail.split_at(index))
+    else {
+        return false;
+    };
+    !block_index.is_empty()
+        && block_index.iter().all(u8::is_ascii_digit)
+        && padding[KIROGO_SYNTHETIC_PADDING.len()..]
+            .iter()
+            .all(u8::is_ascii_alphanumeric)
 }
 
 /// Returns the thinking digest of a synthetic signature carrying the current or legacy marker.
@@ -115,5 +138,23 @@ mod tests {
         assert!(!is_synthetic_thinking_signature(&truncated));
         let truncated = STANDARD.encode(SYNTHETIC_MARKER.as_slice());
         assert!(!is_synthetic_thinking_signature(&truncated));
+    }
+
+    #[test]
+    fn kirogo_legacy_synthetic_signatures_are_recognized_without_becoming_native() {
+        let prefix = b"kirogo-thinking-signature-block-0-pad-";
+        let mut decoded = prefix.to_vec();
+        decoded.resize(228, b'0');
+        let signature = STANDARD.encode(decoded);
+
+        assert_eq!(signature.len(), 304);
+        assert!(is_synthetic_thinking_signature(&signature));
+        assert!(!synthetic_thinking_signature_matches(
+            "private thought",
+            &signature
+        ));
+        assert!(!is_synthetic_thinking_signature(
+            &STANDARD.encode(b"opaque Kiro signature")
+        ));
     }
 }

@@ -11,7 +11,10 @@ use crate::{
         },
         types::MessagesRequest,
     },
-    kiro::model::requests::kiro::KiroRequest,
+    kiro::model::requests::{
+        conversation::{Message, ReasoningContent},
+        kiro::KiroRequest,
+    },
 };
 
 pub(crate) struct PreparedKiroRequestBody {
@@ -24,6 +27,13 @@ pub(crate) fn prepare_kiro_request_body(
     request: &mut KiroRequest,
     config: PayloadGuardConfig,
 ) -> Result<PreparedKiroRequestBody, PayloadGuardError> {
+    let removed_synthetic_reasoning = remove_synthetic_history_reasoning_content(request);
+    if removed_synthetic_reasoning > 0 {
+        tracing::debug!(
+            removed_synthetic_reasoning,
+            "removed proxy synthetic reasoning before Kiro serialization"
+        );
+    }
     if !config.enabled {
         return Ok(PreparedKiroRequestBody {
             body: serialize_kiro_request(request)?,
@@ -39,6 +49,35 @@ pub(crate) fn prepare_kiro_request_body(
         report: Some(report),
         guard_elapsed: Some(started_at.elapsed()),
     })
+}
+
+/// Synthetic thinking signatures are an Anthropic compatibility marker. They must never cross
+/// the Kiro native reasoning boundary, where only provider-issued opaque signatures are valid.
+/// Keep real Kiro signatures and redacted reasoning untouched.
+fn remove_synthetic_history_reasoning_content(request: &mut KiroRequest) -> usize {
+    request
+        .conversation_state
+        .history
+        .iter_mut()
+        .filter_map(|message| match message {
+            Message::Assistant(assistant) => {
+                Some(&mut assistant.assistant_response_message.reasoning_content)
+            }
+            Message::User(_) => None,
+        })
+        .filter(|reasoning_content| {
+            matches!(
+                reasoning_content.as_ref(),
+                Some(ReasoningContent::ReasoningText(content))
+                    if crate::anthropic::signature::is_synthetic_thinking_signature(
+                        &content.reasoning_text.signature
+                    )
+            )
+        })
+        .map(|reasoning_content| {
+            *reasoning_content = None;
+        })
+        .count()
 }
 
 pub(crate) struct PreparedExternalMessagesPayload {
@@ -143,6 +182,53 @@ mod tests {
         assert!(prepared.body.contains("current"));
         assert!(prepared.report.is_none());
         assert!(prepared.guard_elapsed.is_none());
+    }
+
+    #[test]
+    fn local_boundary_removes_synthetic_reasoning_but_preserves_native_signature() {
+        use crate::anthropic::signature::synthetic_thinking_signature;
+        use crate::kiro::model::requests::conversation::{
+            AssistantMessage, HistoryAssistantMessage, ReasoningContent,
+        };
+
+        let mut request = kiro_request();
+        let synthetic = synthetic_thinking_signature("compatibility thought");
+        request.conversation_state.history = vec![
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("synthetic")
+                    .with_reasoning_content(ReasoningContent::reasoning_text(
+                        "compatibility thought",
+                        synthetic,
+                    )),
+            }),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("native").with_reasoning_content(
+                    ReasoningContent::reasoning_text(
+                        "provider thought",
+                        "provider-issued-opaque-signature",
+                    ),
+                ),
+            }),
+        ];
+
+        let prepared =
+            prepare_kiro_request_body(&mut request, guard_config(false, 1024)).expect("prepare");
+
+        assert!(!prepared.body.contains("compatibility thought"));
+        assert!(prepared.body.contains("provider-issued-opaque-signature"));
+        assert_eq!(
+            request
+                .conversation_state
+                .history
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    Message::Assistant(assistant)
+                        if assistant.assistant_response_message.reasoning_content.is_some()
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]

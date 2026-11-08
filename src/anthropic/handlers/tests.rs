@@ -17406,15 +17406,23 @@ async fn run_model_driven_websearch_streams_blocks_with_keepalive_and_citations(
         names[tool_stop..result_start].contains(&"ping"),
         "pings expected while the search runs: {names:?}"
     );
-    // server_tool_use: empty input at start, query in input_json_delta.
+    // server_tool_use starts empty and streams its query exactly once.
     let (_, start) = &events[1];
     assert_eq!(start["content_block"]["type"], "server_tool_use");
     assert_eq!(start["content_block"]["input"], json!({}));
-    assert_eq!(events[2].1["delta"]["type"], "input_json_delta");
-    assert!(
-        events[2].1["delta"]["partial_json"]
-            .as_str()
-            .is_some_and(|json| json.contains("rust release"))
+    assert_eq!(start["content_block"]["caller"], json!({"type": "direct"}));
+    let input_deltas: Vec<_> = events
+        .iter()
+        .filter(|(name, data)| {
+            name == "content_block_delta"
+                && data["index"] == 0
+                && data["delta"]["type"] == "input_json_delta"
+        })
+        .collect();
+    assert_eq!(input_deltas.len(), 1);
+    assert_eq!(
+        input_deltas[0].1["delta"]["partial_json"],
+        r#"{"query":"rust release"}"#
     );
     // Contiguous block indexes from 0.
     let mut indexes: Vec<i64> = events

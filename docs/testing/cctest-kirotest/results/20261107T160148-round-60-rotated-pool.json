@@ -1,0 +1,335 @@
+{
+  "status": "done",
+  "step": 12,
+  "stepName": "evaluate",
+  "checkTokenUsage": true,
+  "progress": 1,
+  "scores": {
+    "tag_check": 10,
+    "stream_structure": 5,
+    "non_stream": 10,
+    "websearch": 0,
+    "signature_proto": 5,
+    "output_config": 10,
+    "server_tool": 10,
+    "knowledge": 10,
+    "model_attribution": 10,
+    "doc_recognition": 10,
+    "image_recognition": 10
+  },
+  "infoChecks": {
+    "server_tool": true,
+    "knowledge": true
+  },
+  "stepStatus": {
+    "tag_check": "done",
+    "stream_structure": "done",
+    "non_stream": "done",
+    "websearch": "done",
+    "output_config": "done",
+    "signature_proto": "done",
+    "server_tool": "done",
+    "knowledge": "done",
+    "model_attribution": "done",
+    "doc_recognition": "done",
+    "image_recognition": "done"
+  },
+  "total": 82,
+  "verdictKey": "unofficial",
+  "hasVertex": false,
+  "streamChannel": "aws-bedrock",
+  "nonStreamChannel": null,
+  "expectedModel": "claude-opus-5-5",
+  "tokenAudit": {
+    "rows": [
+      {
+        "round": 1,
+        "input_tokens": 305,
+        "output_tokens": 78,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 30195,
+        "cost": 0.0088,
+        "baseline_cost": 0.0074,
+        "ratio": 1.2,
+        "latency_ms": 4390,
+        "ttfb_ms": 3650,
+        "tokens_per_sec": 105.4,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 2,
+        "input_tokens": 309,
+        "output_tokens": 51,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 30591,
+        "cost": 0.0084,
+        "baseline_cost": 0.0075,
+        "ratio": 1.11,
+        "latency_ms": 3162,
+        "ttfb_ms": 2712,
+        "tokens_per_sec": 113.3,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 3,
+        "input_tokens": 352,
+        "output_tokens": 3463,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 34848,
+        "cost": 0.0776,
+        "baseline_cost": 0.0915,
+        "ratio": 0.85,
+        "latency_ms": 31884,
+        "ttfb_ms": 3956,
+        "tokens_per_sec": 124,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 4,
+        "input_tokens": 344,
+        "output_tokens": 1298,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 34086,
+        "cost": 0.0342,
+        "baseline_cost": 0.0534,
+        "ratio": 0.64,
+        "latency_ms": 20749,
+        "ttfb_ms": 2460,
+        "tokens_per_sec": 71,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 5,
+        "input_tokens": 326,
+        "output_tokens": 250,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 32274,
+        "cost": 0.0128,
+        "baseline_cost": 0.0538,
+        "ratio": 0.24,
+        "latency_ms": 5149,
+        "ttfb_ms": 1991,
+        "tokens_per_sec": 79.2,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 6,
+        "input_tokens": 346,
+        "output_tokens": 865,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 34254,
+        "cost": 0.0255,
+        "baseline_cost": 0.0346,
+        "ratio": 0.74,
+        "latency_ms": 14174,
+        "ttfb_ms": 1906,
+        "tokens_per_sec": 70.5,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 7,
+        "input_tokens": 354,
+        "output_tokens": 957,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 35046,
+        "cost": 0.0276,
+        "baseline_cost": 0.0445,
+        "ratio": 0.62,
+        "latency_ms": 15462,
+        "ttfb_ms": 2780,
+        "tokens_per_sec": 75.5,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 8,
+        "input_tokens": 375,
+        "output_tokens": 666,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 37125,
+        "cost": 0.0222,
+        "baseline_cost": 0.031,
+        "ratio": 0.72,
+        "latency_ms": 14585,
+        "ttfb_ms": 5550,
+        "tokens_per_sec": 73.7,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 9,
+        "input_tokens": 372,
+        "output_tokens": 160,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 36828,
+        "cost": 0.0121,
+        "baseline_cost": 0.0133,
+        "ratio": 0.91,
+        "latency_ms": 5424,
+        "ttfb_ms": 3927,
+        "tokens_per_sec": 106.9,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 10,
+        "input_tokens": 383,
+        "output_tokens": 178,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 37932,
+        "cost": 0.0127,
+        "baseline_cost": 0.0143,
+        "ratio": 0.89,
+        "latency_ms": 6077,
+        "ttfb_ms": 4793,
+        "tokens_per_sec": 138.6,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      },
+      {
+        "round": 11,
+        "input_tokens": 386,
+        "output_tokens": 145,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 38214,
+        "cost": 0.0121,
+        "baseline_cost": 0.011,
+        "ratio": 1.1,
+        "latency_ms": 5349,
+        "ttfb_ms": 4445,
+        "tokens_per_sec": 160.4,
+        "response_model": "claude-opus-5-5",
+        "rate_limited": false
+      }
+    ],
+    "totalCost": 0.254,
+    "baselineTotalCost": 0.3623,
+    "overallRatio": 0.7,
+    "cacheHitRate": 100,
+    "anomalies": []
+  },
+  "tokenBaseline": [
+    {
+      "input_tokens": 4,
+      "output_tokens": 130,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 23814,
+      "msg_count": 1
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 134,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 24194,
+      "msg_count": 3
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 4333,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 24340,
+      "msg_count": 5
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 2420,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 25158,
+      "msg_count": 7
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 2435,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 25534,
+      "msg_count": 9
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 1470,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 26206,
+      "msg_count": 11
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 1958,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 26774,
+      "msg_count": 13
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 1259,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 29211,
+      "msg_count": 15
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 362,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 30126,
+      "msg_count": 17
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 403,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 31261,
+      "msg_count": 19
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 232,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 31658,
+      "msg_count": 21
+    }
+  ],
+  "responseModel": "claude-opus-5-5",
+  "metrics": {
+    "latencyMs": 7697,
+    "ttfbMs": 5423,
+    "tokensPerSec": 76.3,
+    "inputTokens": 948,
+    "outputTokens": 47
+  },
+  "attribution": {
+    "prediction": "claude-opus-5-5",
+    "probability": 100,
+    "family": "claude",
+    "familyProbability": 100,
+    "claimedInBank": true,
+    "usedOutputs": 3,
+    "swapSuspected": false,
+    "top": [
+      {
+        "model": "claude-opus-5-5",
+        "probability": 100
+      },
+      {
+        "model": "gpt-5.4",
+        "probability": 0
+      },
+      {
+        "model": "gpt-6.1-sol",
+        "probability": 0
+      }
+    ],
+    "reason": "指纹归因为 claude-opus-5-5(100%),与声称一致"
+  },
+  "_label": "round-60-rotated-pool",
+  "_url": "https://kirotest.okmcode.com/dfcache/tune-ss6-99",
+  "_route": "/dfcache/tune-ss6-99",
+  "_model": "claude-opus-5-5",
+  "_startedAt": "2026-11-07T16:01:48.021152+00:00",
+  "_finishedAt": "2026-11-07T16:04:29.848240+00:00",
+  "_kiro": null
+}

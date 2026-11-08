@@ -1,0 +1,335 @@
+{
+  "status": "done",
+  "step": 12,
+  "stepName": "evaluate",
+  "checkTokenUsage": true,
+  "progress": 1,
+  "scores": {
+    "tag_check": 10,
+    "stream_structure": 5,
+    "non_stream": 10,
+    "websearch": 0,
+    "signature_proto": 0,
+    "output_config": 10,
+    "server_tool": 10,
+    "knowledge": 10,
+    "model_attribution": 0,
+    "doc_recognition": 10,
+    "image_recognition": 10
+  },
+  "infoChecks": {
+    "server_tool": true,
+    "knowledge": true
+  },
+  "stepStatus": {
+    "tag_check": "done",
+    "stream_structure": "done",
+    "non_stream": "done",
+    "websearch": "done",
+    "output_config": "done",
+    "signature_proto": "done",
+    "server_tool": "done",
+    "knowledge": "done",
+    "model_attribution": "done",
+    "doc_recognition": "done",
+    "image_recognition": "done"
+  },
+  "total": 68,
+  "verdictKey": "reversed",
+  "hasVertex": false,
+  "streamChannel": null,
+  "nonStreamChannel": null,
+  "expectedModel": "claude-opus-4-8",
+  "tokenAudit": {
+    "rows": [
+      {
+        "round": 1,
+        "input_tokens": 302,
+        "output_tokens": 61,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 29909,
+        "cost": 0.018,
+        "baseline_cost": 0.0641,
+        "ratio": 0.28,
+        "latency_ms": 3305,
+        "ttfb_ms": 3280,
+        "tokens_per_sec": 0,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 2,
+        "input_tokens": 305,
+        "output_tokens": 35,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 30222,
+        "cost": 0.0175,
+        "baseline_cost": 0.0184,
+        "ratio": 0.95,
+        "latency_ms": 3241,
+        "ttfb_ms": 3212,
+        "tokens_per_sec": 0,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 3,
+        "input_tokens": 312,
+        "output_tokens": 370,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 30916,
+        "cost": 0.0263,
+        "baseline_cost": 0.0357,
+        "ratio": 0.74,
+        "latency_ms": 6965,
+        "ttfb_ms": 952,
+        "tokens_per_sec": 61.5,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 4,
+        "input_tokens": 317,
+        "output_tokens": 179,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 31394,
+        "cost": 0.0218,
+        "baseline_cost": 0.026,
+        "ratio": 0.84,
+        "latency_ms": 3908,
+        "ttfb_ms": 1644,
+        "tokens_per_sec": 79.1,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 5,
+        "input_tokens": 321,
+        "output_tokens": 155,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 31779,
+        "cost": 0.0214,
+        "baseline_cost": 0.0266,
+        "ratio": 0.8,
+        "latency_ms": 3766,
+        "ttfb_ms": 1617,
+        "tokens_per_sec": 72.1,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 6,
+        "input_tokens": 335,
+        "output_tokens": 497,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 33204,
+        "cost": 0.0307,
+        "baseline_cost": 0.0391,
+        "ratio": 0.79,
+        "latency_ms": 9931,
+        "ttfb_ms": 1707,
+        "tokens_per_sec": 60.4,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 7,
+        "input_tokens": 342,
+        "output_tokens": 566,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 33865,
+        "cost": 0.0328,
+        "baseline_cost": 0.0423,
+        "ratio": 0.77,
+        "latency_ms": 10665,
+        "ttfb_ms": 1086,
+        "tokens_per_sec": 59.1,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 8,
+        "input_tokens": 363,
+        "output_tokens": 377,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 35937,
+        "cost": 0.0292,
+        "baseline_cost": 0.0492,
+        "ratio": 0.59,
+        "latency_ms": 8112,
+        "ttfb_ms": 1005,
+        "tokens_per_sec": 53,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 9,
+        "input_tokens": 366,
+        "output_tokens": 98,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 36280,
+        "cost": 0.0224,
+        "baseline_cost": 0.0234,
+        "ratio": 0.96,
+        "latency_ms": 5491,
+        "ttfb_ms": 5416,
+        "tokens_per_sec": 0,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 10,
+        "input_tokens": 376,
+        "output_tokens": 38,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 37234,
+        "cost": 0.0214,
+        "baseline_cost": 0.0244,
+        "ratio": 0.88,
+        "latency_ms": 1865,
+        "ttfb_ms": 906,
+        "tokens_per_sec": 39.6,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      },
+      {
+        "round": 11,
+        "input_tokens": 383,
+        "output_tokens": 206,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 37919,
+        "cost": 0.026,
+        "baseline_cost": 0.03,
+        "ratio": 0.87,
+        "latency_ms": 5319,
+        "ttfb_ms": 1097,
+        "tokens_per_sec": 48.8,
+        "response_model": "claude-opus-4-8",
+        "rate_limited": false
+      }
+    ],
+    "totalCost": 0.2675,
+    "baselineTotalCost": 0.3792,
+    "overallRatio": 0.71,
+    "cacheHitRate": 100,
+    "anomalies": []
+  },
+  "tokenBaseline": [
+    {
+      "input_tokens": 2,
+      "output_tokens": 193,
+      "cache_creation_input_tokens": 8228,
+      "cache_read_input_tokens": 15590,
+      "msg_count": 1
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 164,
+      "cache_creation_input_tokens": 378,
+      "cache_read_input_tokens": 23818,
+      "msg_count": 3
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 908,
+      "cache_creation_input_tokens": 146,
+      "cache_read_input_tokens": 24196,
+      "msg_count": 5
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 349,
+      "cache_creation_input_tokens": 818,
+      "cache_read_input_tokens": 24342,
+      "msg_count": 7
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 467,
+      "cache_creation_input_tokens": 376,
+      "cache_read_input_tokens": 25160,
+      "msg_count": 9
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 884,
+      "cache_creation_input_tokens": 672,
+      "cache_read_input_tokens": 25536,
+      "msg_count": 11
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 1027,
+      "cache_creation_input_tokens": 568,
+      "cache_read_input_tokens": 26208,
+      "msg_count": 13
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 824,
+      "cache_creation_input_tokens": 2437,
+      "cache_read_input_tokens": 26776,
+      "msg_count": 15
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 124,
+      "cache_creation_input_tokens": 915,
+      "cache_read_input_tokens": 29213,
+      "msg_count": 17
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 91,
+      "cache_creation_input_tokens": 1135,
+      "cache_read_input_tokens": 30128,
+      "msg_count": 19
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 475,
+      "cache_creation_input_tokens": 397,
+      "cache_read_input_tokens": 31263,
+      "msg_count": 21
+    }
+  ],
+  "responseModel": "claude-opus-4-8",
+  "metrics": {
+    "latencyMs": 7051,
+    "ttfbMs": 4475,
+    "tokensPerSec": 92.5,
+    "inputTokens": 840,
+    "outputTokens": 5
+  },
+  "attribution": {
+    "prediction": "claude-sonnet-4-6",
+    "probability": 86,
+    "family": "claude",
+    "familyProbability": 100,
+    "claimedInBank": true,
+    "usedOutputs": 3,
+    "swapSuspected": true,
+    "top": [
+      {
+        "model": "claude-sonnet-4-6",
+        "probability": 86
+      },
+      {
+        "model": "claude-opus-4-6",
+        "probability": 14
+      },
+      {
+        "model": "gpt-5.4",
+        "probability": 0
+      }
+    ],
+    "reason": "指纹归因为同家族的 claude-sonnet-4-6(86%),声称 claude-opus-4-8 仅 0%,疑似被替换或降级"
+  },
+  "_label": "round-32-synthetic-native-signature",
+  "_url": "https://kirotest.okmcode.com/dfcache/tune-ss6-99",
+  "_route": "/dfcache/tune-ss6-99",
+  "_model": "claude-opus-4-8",
+  "_startedAt": "2026-11-06T20:43:19.557900+00:00",
+  "_finishedAt": "2026-11-06T20:45:11.562834+00:00",
+  "_kiro": null
+}
