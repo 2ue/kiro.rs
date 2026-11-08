@@ -33,3 +33,7 @@
 /inventory-system/web/.vite/
 /inventory-system/web/tsconfig.tsbuildinfo
 catch-test/
+
+# local secrets for project skills (cctest etc.)
+/.env
+/.env.local
