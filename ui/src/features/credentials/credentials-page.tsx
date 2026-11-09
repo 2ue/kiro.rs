@@ -102,6 +102,7 @@ import {
 import {
   CREDENTIAL_SUBSCRIPTION_OPTIONS,
   credentialCreditStatus,
+  effectiveCreditRemaining,
   credentialSubscriptionLabel,
   mapById,
   mergeCredentialPlanes,
@@ -171,6 +172,8 @@ interface CreditDetailRow {
   email?: string | null
   subscriptionTitle?: string | null
   creditRemaining?: number
+  /** Snapshot remaining minus credits metered here since the snapshot. */
+  creditRemainingEstimated: boolean
   creditLimit?: number
   checkedAt?: string
   consumedCredits: number
@@ -547,14 +550,16 @@ export function CredentialsPage() {
             lastErrorReason: runtime?.lastErrorReason,
           })
           const consumedCredits = usage?.kiroMeteringUsage ?? 0
-          const estimatedRemainingCostUsd = creditStatus.available && info && consumedCredits > 0
-            ? (usage?.estimatedCostUsd ?? 0) / consumedCredits * info.creditRemaining
+          const remaining = effectiveCreditRemaining(info)
+          const estimatedRemainingCostUsd = creditStatus.available && remaining && consumedCredits > 0
+            ? (usage?.estimatedCostUsd ?? 0) / consumedCredits * remaining.remaining
             : undefined
           return {
             id: cred.id,
             email: cred.email,
             subscriptionTitle: info?.subscriptionTitle ?? cred.subscriptionTitle,
-            creditRemaining: info?.creditRemaining,
+            creditRemaining: remaining?.remaining,
+            creditRemainingEstimated: remaining?.estimated ?? false,
             creditLimit: info?.creditLimit,
             checkedAt: info?.checkedAt,
             consumedCredits,
@@ -1023,7 +1028,7 @@ export function CredentialsPage() {
                 {creditSummary.isFetching && <Spinner size="sm" />}
               </div>
               <div className="mt-1 break-words text-2xl font-semibold tracking-tight tabular-nums text-success">
-                {formatCredits(creditSummary.data?.enabledCreditRemaining)}
+                {formatCredits(creditSummary.data?.enabledEstimatedCreditRemaining ?? creditSummary.data?.enabledCreditRemaining)}
               </div>
             </div>
             <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60 mt-1" />
@@ -1032,7 +1037,7 @@ export function CredentialsPage() {
             历史估算：{formatUsdFixed2(creditSummary.data?.totalEstimatedCostUsd ?? 0)} · 原始 {formatUsdFixed2(creditSummary.data?.totalOriginalCostUsd ?? 0)}
           </div>
           <div className="mt-1 truncate pl-2.5 text-[0.72rem] text-muted-foreground">
-            最近查询：{creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}
+            最近查询：{creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}（剩余已扣除查询后的本地消耗）
           </div>
         </button>
       </StatGrid>
@@ -1421,7 +1426,11 @@ export function CredentialsPage() {
                         <td className="px-3 py-2 text-right font-semibold tabular-nums text-success">
                           {row.creditEstimateBlocked ? (
                             <span className="text-destructive" title={row.creditEstimateBlockedReason}>不可用</span>
-                          ) : row.creditRemaining != null ? formatCredits(row.creditRemaining) : (
+                          ) : row.creditRemaining != null ? (
+                            <span title={row.creditRemainingEstimated ? '估算：快照剩余减去快照之后本地记录的消耗' : '上次查询时的剩余'}>
+                              {row.creditRemainingEstimated && '≈'}{formatCredits(row.creditRemaining)}
+                            </span>
+                          ) : (
                             <span className="text-muted-foreground">未查询</span>
                           )}
                         </td>

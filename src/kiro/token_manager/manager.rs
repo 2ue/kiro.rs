@@ -9685,13 +9685,10 @@ impl MultiTokenManager {
             .overage_status
             .as_deref()
             .is_some_and(|status| status.trim().eq_ignore_ascii_case("disabled"));
-        if overage_disabled
-            && account_info.remaining.is_finite()
-            && account_info.credit_remaining.is_finite()
-            && account_info.remaining <= 0.0
-            && account_info.credit_remaining <= 0.0
-        {
-            Some("fresh_account_info_remaining_and_credit_exhausted_overage_disabled")
+        // 只看上游给出的剩余额度。credit_remaining 曾是按订阅档位写死额度推算的值，
+        // 上游真实上限低于档位额度时它会大于 0，兜底因此失效（59138 2026-11-08）。
+        if overage_disabled && account_info.remaining.is_finite() && account_info.remaining <= 0.0 {
+            Some("fresh_account_info_remaining_exhausted_overage_disabled")
         } else {
             None
         }

@@ -449,6 +449,21 @@ export function credentialCreditStatus(
   return { available: true }
 }
 
+/**
+ * Remaining credits for stats and estimates: the snapshot's remaining minus the credits metered
+ * here since that snapshot, so totals stay close to live without querying the upstream again.
+ * `estimated` is true when local metering was taken off the snapshot value.
+ */
+export function effectiveCreditRemaining(
+  info: Pick<CredentialAccountInfo, 'creditRemaining' | 'estimatedRemaining' | 'meteredSinceCheck'> | undefined,
+): { remaining: number; estimated: boolean } | undefined {
+  if (!info) return undefined
+  if (typeof info.estimatedRemaining === 'number' && Number.isFinite(info.estimatedRemaining)) {
+    return { remaining: info.estimatedRemaining, estimated: (info.meteredSinceCheck ?? 0) > 0 }
+  }
+  return { remaining: info.creditRemaining, estimated: false }
+}
+
 // ============================================================================
 // Data merging
 // ============================================================================

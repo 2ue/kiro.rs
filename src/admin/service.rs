@@ -458,50 +458,27 @@ struct CredentialCreditSnapshot {
     bonus: f64,
 }
 
+/// 积分以上游 getUsageLimits 为准：`usage_limit` 已包含基础额度、激活的试用和奖励额度，
+/// 同订阅的账号上限并不相同（59138 上 KIRO PRO 有 759～1317），不能按订阅写死。
+/// 只有上游没给出上限时，才按订阅档位的名义额度估算。
 fn credit_snapshot_for_subscription(
     subscription_title: Option<&str>,
     current_usage: f64,
     usage_limit: f64,
     active_bonus_limit: f64,
 ) -> CredentialCreditSnapshot {
-    let Some(tier) = credential_credit_tier(subscription_title) else {
-        return CredentialCreditSnapshot {
-            limit: usage_limit,
-            remaining: (usage_limit - current_usage).max(0.0),
-            base: 0.0,
-            bonus: 0.0,
-        };
-    };
-
-    if matches!(
-        tier,
-        CredentialCreditTier::Free | CredentialCreditTier::Students
-    ) {
-        let limit = if usage_limit > 0.0 {
-            usage_limit
-        } else {
-            credential_credit_base(tier)
-        };
-        return CredentialCreditSnapshot {
-            limit,
-            remaining: (limit - current_usage).max(0.0),
-            base: limit,
-            bonus: 0.0,
-        };
-    }
-
-    let base = credential_credit_base(tier);
-    let bonus = if tier != CredentialCreditTier::Free && active_bonus_limit > 0.0 {
-        10_000.0
+    let limit = if usage_limit > 0.0 {
+        usage_limit
     } else {
-        0.0
+        credential_credit_tier(subscription_title)
+            .map(credential_credit_base)
+            .unwrap_or(0.0)
     };
-    let limit = base + bonus;
-
+    let bonus = active_bonus_limit.clamp(0.0, limit);
     CredentialCreditSnapshot {
         limit,
         remaining: (limit - current_usage).max(0.0),
-        base,
+        base: limit - bonus,
         bonus,
     }
 }
@@ -516,15 +493,18 @@ fn credit_snapshot_from_persisted_fields(
     credit_bonus: f64,
 ) -> CredentialCreditSnapshot {
     if usage_limit > 0.0 {
-        let inferred_bonus_limit = credential_credit_tier(subscription_title)
-            .filter(|tier| has_overage_credit_from_usage_limit(*tier, usage_limit))
-            .map(|_| 10_000.0)
-            .unwrap_or(0.0);
+        // 快照存了上游真实上限，按它重算，旧版按档位写死的积分字段读出来也会被纠正。
+        // 奖励额度沿用快照里记下的拆分，只用于展示。
+        let bonus = if (credit_base + credit_bonus - usage_limit).abs() < 0.5 {
+            credit_bonus
+        } else {
+            0.0
+        };
         return credit_snapshot_for_subscription(
             subscription_title,
             current_usage,
             usage_limit,
-            inferred_bonus_limit,
+            bonus,
         );
     }
     if credit_limit > 0.0 || credit_remaining > 0.0 || credit_base > 0.0 || credit_bonus > 0.0 {
@@ -538,6 +518,7 @@ fn credit_snapshot_from_persisted_fields(
     credit_snapshot_for_subscription(subscription_title, current_usage, 0.0, 0.0)
 }
 
+/// 订阅档位的名义额度，只在上游没有返回 `usage_limit` 时作为估算兜底。
 fn credential_credit_base(tier: CredentialCreditTier) -> f64 {
     match tier {
         CredentialCreditTier::Free => 50.0,
@@ -547,13 +528,6 @@ fn credential_credit_base(tier: CredentialCreditTier) -> f64 {
         CredentialCreditTier::Power => 10_000.0,
         CredentialCreditTier::ProMax => 5_000.0,
     }
-}
-
-fn has_overage_credit_from_usage_limit(tier: CredentialCreditTier, usage_limit: f64) -> bool {
-    !matches!(
-        tier,
-        CredentialCreditTier::Free | CredentialCreditTier::Students
-    ) && usage_limit >= credential_credit_base(tier) + 10_000.0 - f64::EPSILON
 }
 
 fn credential_credit_tier(subscription_title: Option<&str>) -> Option<CredentialCreditTier> {
@@ -2378,14 +2352,29 @@ impl AdminService {
         }
     }
 
+    /// 快照之后本地记录的各账号计量积分，失败时返回空表（估算退化为快照值）。
+    fn metering_since_account_info(&self, ids: Option<&[u64]>) -> HashMap<u64, f64> {
+        let store = self.postgres_store.clone();
+        let ids = ids.map(<[u64]>::to_vec);
+        block_on_admin_store(async move {
+            store
+                .credential_metering_since_account_info(ids.as_deref())
+                .await
+        })
+        .unwrap_or_else(|err| {
+            tracing::warn!("汇总额度快照之后的本地积分消耗失败: {}", err);
+            HashMap::new()
+        })
+    }
+
     pub async fn get_credentials_account_info(
         &self,
         ids: &[u64],
     ) -> CredentialAccountInfoListResponse {
-        let info = if ids.is_empty() {
-            HashMap::new()
+        let (info, metered) = if ids.is_empty() {
+            (HashMap::new(), HashMap::new())
         } else {
-            match block_on_admin_store({
+            let info = match block_on_admin_store({
                 let store = self.postgres_store.clone();
                 let ids = ids.to_vec();
                 async move { store.load_credential_account_info_for_ids(&ids).await }
@@ -2395,14 +2384,20 @@ impl AdminService {
                     tracing::warn!("按 ID 加载凭据账号信息失败: {}", err);
                     HashMap::new()
                 }
-            }
+            };
+            (info, self.metering_since_account_info(Some(ids)))
         };
         CredentialAccountInfoListResponse {
             items: ids
                 .iter()
                 .filter_map(|id| {
-                    info.get(id)
-                        .map(|row| credential_account_info_item_from_row(*id, row))
+                    info.get(id).map(|row| {
+                        credential_account_info_item_from_row(
+                            *id,
+                            row,
+                            Some(metered.get(id).copied().unwrap_or(0.0)),
+                        )
+                    })
                 })
                 .collect(),
             updated_at: Utc::now().to_rfc3339(),
@@ -2449,6 +2444,8 @@ impl AdminService {
         let disabled_credentials = total_credentials.saturating_sub(enabled_credentials);
         let mut total_credit_limit = 0.0;
         let mut total_credit_remaining = 0.0;
+        let mut total_estimated_credit_remaining = 0.0;
+        let mut enabled_estimated_credit_remaining = 0.0;
         let mut total_current_usage = 0.0;
         let mut enabled_credit_limit = 0.0;
         let mut enabled_credit_remaining = 0.0;
@@ -2465,6 +2462,7 @@ impl AdminService {
         let cost_summaries = self
             .usage_recorder
             .credential_cost_summary_for_ids(&credential_ids);
+        let metered = self.metering_since_account_info(None);
 
         for credential in &credentials {
             if let Some(summary) = cost_summaries.get(&credential.id) {
@@ -2479,11 +2477,18 @@ impl AdminService {
                 }
             }
 
-            let Some(info) = account_info.get(&credential.id).map(account_info_from_row) else {
+            let Some(info) = account_info.get(&credential.id).map(|row| {
+                account_info_from_row_with_metering(
+                    row,
+                    Some(metered.get(&credential.id).copied().unwrap_or(0.0)),
+                )
+            }) else {
                 continue;
             };
+            let estimated_remaining = info.estimated_remaining.unwrap_or(info.credit_remaining);
             total_credit_limit += info.credit_limit;
             total_credit_remaining += info.credit_remaining;
+            total_estimated_credit_remaining += estimated_remaining;
             total_current_usage += info.current_usage;
             if credential.disabled {
                 disabled_credit_limit += info.credit_limit;
@@ -2491,6 +2496,7 @@ impl AdminService {
             } else {
                 enabled_credit_limit += info.credit_limit;
                 enabled_credit_remaining += info.credit_remaining;
+                enabled_estimated_credit_remaining += estimated_remaining;
             }
             if last_checked_at
                 .as_ref()
@@ -2512,6 +2518,8 @@ impl AdminService {
             enabled_credit_remaining,
             disabled_credit_limit,
             disabled_credit_remaining,
+            total_estimated_credit_remaining,
+            enabled_estimated_credit_remaining,
             total_estimated_cost_usd,
             total_original_cost_usd,
             enabled_estimated_cost_usd,
@@ -5267,9 +5275,8 @@ impl AdminService {
                     max_concurrent_requests: credential.max_concurrent_requests,
                     credit_limit: info.as_ref().map(|value| value.credit_limit),
                     credit_remaining: info.as_ref().map(|value| value.credit_remaining),
-                    credit_used: info
-                        .as_ref()
-                        .map(|value| (value.credit_limit - value.credit_remaining).max(0.0)),
+                    // 直接用上游已用量：「上限 − 剩余」在超额时会封顶在上限。
+                    credit_used: info.as_ref().map(|value| value.current_usage.max(0.0)),
                     account_info_checked_at: info.as_ref().map(|value| value.checked_at.clone()),
                     window_requests: usage.window_requests,
                     window_error_requests: usage.window_error_requests,
@@ -8423,6 +8430,11 @@ fn apply_batch_import_defaults(
             credential.priority = priority;
         }
     }
+    if credential.fast == 0 {
+        if let Some(fast) = defaults.fast {
+            credential.fast = fast;
+        }
+    }
     if credential.max_concurrent_requests.is_none() {
         if let Some(max_concurrent_requests) = defaults.max_concurrent_requests {
             credential.max_concurrent_requests = max_concurrent_requests;
@@ -8607,6 +8619,14 @@ fn extract_external_pool_test_response_text(body: &str) -> Option<String> {
 }
 
 fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInfo {
+    account_info_from_row_with_metering(row, None)
+}
+
+/// `metered_since_check` 是快照之后本地记录的计量积分，用来估算两次上游查询之间的剩余额度。
+fn account_info_from_row_with_metering(
+    row: &CredentialAccountInfoRow,
+    metered_since_check: Option<f64>,
+) -> CredentialAccountInfo {
     let credit = credit_snapshot_from_persisted_fields(
         row.subscription_title.as_deref(),
         row.current_usage,
@@ -8633,6 +8653,9 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
         current_overages: row.current_overages,
         next_reset_at: row.next_reset_at,
         checked_at: row.checked_at.clone(),
+        metered_since_check,
+        estimated_remaining: metered_since_check
+            .map(|used| (credit.remaining - used.max(0.0)).max(0.0)),
     }
 }
 
@@ -8850,8 +8873,9 @@ fn credential_runtime_item_from_snapshot(
 fn credential_account_info_item_from_row(
     id: u64,
     row: &CredentialAccountInfoRow,
+    metered_since_check: Option<f64>,
 ) -> CredentialAccountInfoItem {
-    let info = account_info_from_row(row);
+    let info = account_info_from_row_with_metering(row, metered_since_check);
     CredentialAccountInfoItem {
         id,
         subscription_title: info.subscription_title,
@@ -8870,6 +8894,8 @@ fn credential_account_info_item_from_row(
         current_overages: info.current_overages,
         next_reset_at: info.next_reset_at,
         checked_at: info.checked_at,
+        metered_since_check: info.metered_since_check,
+        estimated_remaining: info.estimated_remaining,
     }
 }
 

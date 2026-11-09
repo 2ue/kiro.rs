@@ -3316,6 +3316,47 @@ impl PostgresStore {
         Ok(info)
     }
 
+    /// 每个账号在额度快照 `checked_at` 之后本地记录的 Kiro 计量积分。
+    ///
+    /// 用来在两次上游查询之间估算当前剩余额度，不触发任何上游请求。
+    /// `ids` 为 `None` 时返回所有有快照的账号。走 `(credential_id, created_at)` 索引，
+    /// 每个账号只扫快照之后的少量记录。
+    pub async fn credential_metering_since_account_info(
+        &self,
+        ids: Option<&[u64]>,
+    ) -> anyhow::Result<HashMap<u64, f64>> {
+        let credential_ids: Option<Vec<i64>> =
+            ids.map(|ids| ids.iter().map(|id| *id as i64).collect());
+        if credential_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT a.credential_id, s.used
+            FROM credential_account_info a
+            JOIN credentials c ON c.id = a.credential_id AND c.deleted_at IS NULL
+            CROSS JOIN LATERAL (
+                SELECT COALESCE(SUM(r.kiro_metering_usage), 0)::double precision AS used
+                FROM usage_records r
+                WHERE r.credential_id = a.credential_id
+                  AND r.created_at > a.checked_at
+                  AND r.deleted_at IS NULL
+            ) s
+            WHERE ($1::bigint[] IS NULL OR a.credential_id = ANY($1))
+              AND s.used > 0
+            "#,
+        )
+        .bind(&credential_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut used = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let credential_id: i64 = row.try_get("credential_id")?;
+            used.insert(credential_id as u64, row.try_get::<f64, _>("used")?);
+        }
+        Ok(used)
+    }
+
     pub async fn load_credential_account_info_for_ids(
         &self,
         ids: &[u64],

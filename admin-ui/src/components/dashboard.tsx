@@ -389,7 +389,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
           id: credential.id,
           email: credential.email,
           subscriptionTitle: accountInfo?.subscriptionTitle ?? credential.subscriptionTitle,
-          creditRemaining: accountInfo?.creditRemaining,
+          // 快照剩余减去快照之后本地记录的消耗，不查上游。
+          creditRemaining: accountInfo?.estimatedRemaining ?? accountInfo?.creditRemaining,
           creditLimit: accountInfo?.creditLimit,
           checkedAt: accountInfo?.checkedAt,
           estimatedCostUsd: usage?.estimatedCostUsd ?? 0,
@@ -1389,7 +1390,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{formatCredits(creditSummary.data?.enabledCreditRemaining)}</div>
+              <div className="text-2xl font-bold">{formatCredits(creditSummary.data?.enabledEstimatedCreditRemaining ?? creditSummary.data?.enabledCreditRemaining)}</div>
               <div className="text-xs text-muted-foreground">
                 总额 {formatCredits(creditSummary.data?.enabledCreditLimit)} · {formatDateTime(creditSummary.data?.lastCheckedAt)}
               </div>

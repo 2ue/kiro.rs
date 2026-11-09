@@ -38,7 +38,7 @@ import {
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { formatCompact, formatCredits, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import { credentialCreditStatus, credentialLabel, mapById } from '@/features/credentials/credential-utils'
+import { credentialCreditStatus, credentialLabel, effectiveCreditRemaining, mapById } from '@/features/credentials/credential-utils'
 import { billingDeltaTextClass, billingDeltaTone } from '@/features/usage/usage-helpers'
 import type {
   CredentialAccountInfo,
@@ -387,7 +387,7 @@ function LocalPoolSection({
     account.accountInfo?.creditRemaining != null
   ))
   const availableCreditRemaining = availableCreditRows.reduce(
-    (sum, account) => sum + (account.accountInfo?.creditRemaining ?? 0),
+    (sum, account) => sum + (effectiveCreditRemaining(account.accountInfo)?.remaining ?? 0),
     0,
   )
   const unavailableCreditCount = accountRows.filter((account) => account.creditEstimateBlocked).length
@@ -585,7 +585,10 @@ function LocalPoolSection({
                       {account.creditEstimateBlocked ? (
                         <span className="text-destructive" title={account.creditEstimateBlockedReason}>不可用</span>
                       ) : account.accountInfo?.creditRemaining != null ? (
-                        formatCredits(account.accountInfo.creditRemaining)
+                        <span title={effectiveCreditRemaining(account.accountInfo)?.estimated ? '估算：快照剩余减去快照之后本地记录的消耗' : '上次查询时的剩余'}>
+                          {effectiveCreditRemaining(account.accountInfo)?.estimated && '≈'}
+                          {formatCredits(effectiveCreditRemaining(account.accountInfo)?.remaining)}
+                        </span>
                       ) : (
                         <span className="text-muted-foreground">未查询</span>
                       )}
@@ -976,8 +979,9 @@ export function OverviewPage() {
         const metrics = usageByCredentialId.get(base.id)?.metrics ?? EMPTY_OVERVIEW_METRICS
         const accountInfo = accountInfoById.get(base.id)
         const creditStatus = credentialCreditStatus(credential)
-        const estimatedRemainingCostUsd = creditStatus.available && accountInfo && metrics.kiroMeteringUsage > 0
-          ? metrics.estimatedCostUsd / metrics.kiroMeteringUsage * accountInfo.creditRemaining
+        const remaining = effectiveCreditRemaining(accountInfo)
+        const estimatedRemainingCostUsd = creditStatus.available && remaining && metrics.kiroMeteringUsage > 0
+          ? metrics.estimatedCostUsd / metrics.kiroMeteringUsage * remaining.remaining
           : undefined
         return {
           credential,

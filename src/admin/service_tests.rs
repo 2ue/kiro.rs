@@ -335,6 +335,29 @@ fn missing_auth_method_with_kiro_api_key_is_inferred_as_api_key() {
 }
 
 #[test]
+fn batch_import_fast_applies_only_when_credential_has_no_fast() {
+    let defaults = BatchCredentialImportDefaults {
+        fast: Some(5),
+        ..Default::default()
+    };
+    let without_fast: AddCredentialRequest =
+        serde_json::from_value(serde_json::json!({ "kiroApiKey": "ksk_without_fast" })).unwrap();
+    assert_eq!(
+        apply_batch_import_defaults(without_fast, &defaults, None).fast,
+        5
+    );
+    let with_fast: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "kiroApiKey": "ksk_with_fast",
+        "fast": 10
+    }))
+    .unwrap();
+    assert_eq!(
+        apply_batch_import_defaults(with_fast, &defaults, None).fast,
+        10
+    );
+}
+
+#[test]
 fn batch_import_tags_apply_only_when_credential_has_no_tags() {
     let defaults = BatchCredentialImportDefaults {
         tags: vec!["默认".to_string(), "team-a".to_string()],
@@ -744,62 +767,49 @@ fn credential_admin_list_options_include_account_info_snapshot() {
 }
 
 #[test]
-fn credit_snapshot_uses_overage_bonus_for_all_paid_tiers() {
-    let free_without_overage =
-        credit_snapshot_for_subscription(Some("KIRO FREE"), 34.52, 50.0, 0.0);
-    assert_eq!(free_without_overage.limit, 50.0);
-    assert!((free_without_overage.remaining - 15.48).abs() < 1e-9);
-    assert_eq!(free_without_overage.base, 50.0);
-    assert_eq!(free_without_overage.bonus, 0.0);
+fn credit_snapshot_takes_the_upstream_limit_for_every_tier() {
+    // 59138 2026-11-08：同为 KIRO PRO，上游上限 808 和 1247 都出现过，不能当成 1000。
+    let used_up_low_limit = credit_snapshot_for_subscription(Some("KIRO PRO"), 808.0, 808.0, 0.0);
+    assert_eq!(used_up_low_limit.limit, 808.0);
+    assert_eq!(used_up_low_limit.remaining, 0.0);
+    assert_eq!(used_up_low_limit.base, 808.0);
+    assert_eq!(used_up_low_limit.bonus, 0.0);
 
-    let pro_without_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 1_000.0, 0.0);
-    assert_eq!(pro_without_overage.limit, 1_000.0);
-    assert_eq!(pro_without_overage.remaining, 874.75);
-    assert_eq!(pro_without_overage.base, 1_000.0);
-    assert_eq!(pro_without_overage.bonus, 0.0);
+    let high_limit = credit_snapshot_for_subscription(Some("KIRO PRO"), 69.28, 1_247.0, 0.0);
+    assert_eq!(high_limit.limit, 1_247.0);
+    assert!((high_limit.remaining - 1_177.72).abs() < 1e-9);
 
-    let pro_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 11_000.0, 10_000.0);
-    assert_eq!(pro_with_overage.limit, 11_000.0);
-    assert_eq!(pro_with_overage.remaining, 10_874.75);
-    assert_eq!(pro_with_overage.base, 1_000.0);
-    assert_eq!(pro_with_overage.bonus, 10_000.0);
+    let pro_plus = credit_snapshot_for_subscription(Some("Kiro Pro+"), 125.25, 1_524.0, 0.0);
+    assert_eq!(pro_plus.limit, 1_524.0);
+    assert_eq!(pro_plus.remaining, 1_398.75);
 
-    let pro_plus_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro+"), 125.25, 12_000.0, 10_000.0);
-    assert_eq!(pro_plus_with_overage.limit, 12_000.0);
-    assert_eq!(pro_plus_with_overage.remaining, 11_874.75);
-    assert_eq!(pro_plus_with_overage.base, 2_000.0);
-    assert_eq!(pro_plus_with_overage.bonus, 10_000.0);
+    // 奖励额度来自上游，已经算在 usage_limit 里；只拆分展示，不再额外加 10000。
+    let with_bonus = credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 1_500.0, 500.0);
+    assert_eq!(with_bonus.limit, 1_500.0);
+    assert_eq!(with_bonus.remaining, 1_374.75);
+    assert_eq!(with_bonus.base, 1_000.0);
+    assert_eq!(with_bonus.bonus, 500.0);
 
-    let pro_max_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro Max"), 125.25, 15_000.0, 10_000.0);
-    assert_eq!(pro_max_with_overage.limit, 15_000.0);
-    assert_eq!(pro_max_with_overage.remaining, 14_874.75);
-    assert_eq!(pro_max_with_overage.base, 5_000.0);
-    assert_eq!(pro_max_with_overage.bonus, 10_000.0);
+    let free = credit_snapshot_for_subscription(Some("KIRO FREE"), 34.52, 50.0, 0.0);
+    assert_eq!(free.limit, 50.0);
+    assert!((free.remaining - 15.48).abs() < 1e-9);
 
-    let power_without_overage =
-        credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 10_000.0, 0.0);
-    assert_eq!(power_without_overage.limit, 10_000.0);
-    assert_eq!(power_without_overage.remaining, 9_874.75);
-    assert_eq!(power_without_overage.base, 10_000.0);
-    assert_eq!(power_without_overage.bonus, 0.0);
+    // 超额：已用量超过上限时剩余为 0，不会出现负数。
+    let overage = credit_snapshot_for_subscription(Some("Kiro Pro"), 1_345.0, 1_000.0, 0.0);
+    assert_eq!(overage.limit, 1_000.0);
+    assert_eq!(overage.remaining, 0.0);
+}
 
-    let power_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 20_000.0, 10_000.0);
-    assert_eq!(power_with_overage.limit, 20_000.0);
-    assert_eq!(power_with_overage.remaining, 19_874.75);
-    assert_eq!(power_with_overage.base, 10_000.0);
-    assert_eq!(power_with_overage.bonus, 10_000.0);
-
-    let students_without_overage =
-        credit_snapshot_for_subscription(Some("KIRO STUDENT"), 125.25, 0.0, 0.0);
-    assert_eq!(students_without_overage.limit, 1_000.0);
-    assert_eq!(students_without_overage.remaining, 874.75);
-    assert_eq!(students_without_overage.base, 1_000.0);
-    assert_eq!(students_without_overage.bonus, 0.0);
+#[test]
+fn credit_snapshot_estimates_by_tier_only_without_an_upstream_limit() {
+    let students = credit_snapshot_for_subscription(Some("KIRO STUDENT"), 125.25, 0.0, 0.0);
+    assert_eq!(students.limit, 1_000.0);
+    assert_eq!(students.remaining, 874.75);
+    let power = credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 0.0, 0.0);
+    assert_eq!(power.limit, 10_000.0);
+    let unknown = credit_snapshot_for_subscription(None, 10.0, 0.0, 0.0);
+    assert_eq!(unknown.limit, 0.0);
+    assert_eq!(unknown.remaining, 0.0);
 }
 
 #[test]
@@ -857,50 +867,39 @@ fn subscription_filter_uses_canonical_official_tiers() {
 }
 
 #[test]
-fn live_credit_snapshot_does_not_infer_bonus_from_usage_limit() {
-    let pro_without_active_bonus =
-        credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 11_000.0, 0.0);
+fn persisted_credit_snapshot_recomputes_from_the_upstream_limit() {
+    // 旧版本按档位写死存下的积分字段：上游 808/808 用尽，却存成 1000 上限、剩余 192。
+    let old_wrong_pro = credit_snapshot_from_persisted_fields(
+        Some("KIRO PRO"),
+        808.0,
+        808.0,
+        1_000.0,
+        192.0,
+        1_000.0,
+        0.0,
+    );
+    assert_eq!(old_wrong_pro.limit, 808.0);
+    assert_eq!(old_wrong_pro.remaining, 0.0);
+    assert_eq!(old_wrong_pro.bonus, 0.0);
 
-    assert_eq!(pro_without_active_bonus.limit, 1_000.0);
-    assert_eq!(pro_without_active_bonus.remaining, 874.75);
-    assert_eq!(pro_without_active_bonus.base, 1_000.0);
-    assert_eq!(pro_without_active_bonus.bonus, 0.0);
-}
-
-#[test]
-fn persisted_credit_snapshot_recomputes_from_usage_limit() {
-    let old_wrong_power = credit_snapshot_from_persisted_fields(
+    // 旧版本会给 usage_limit ≥ 档位 + 10000 的账号凭空加 10000 奖励额度。
+    let old_inferred_bonus = credit_snapshot_from_persisted_fields(
         Some("Kiro Power"),
         250.0,
         20_000.0,
+        20_000.0,
+        19_750.0,
         10_000.0,
-        10_000.0,
-        9_750.0,
         10_000.0,
     );
-    assert_eq!(old_wrong_power.limit, 20_000.0);
-    assert_eq!(old_wrong_power.remaining, 19_750.0);
-    assert_eq!(old_wrong_power.base, 10_000.0);
-    assert_eq!(old_wrong_power.bonus, 10_000.0);
+    assert_eq!(old_inferred_bonus.limit, 20_000.0);
+    assert_eq!(old_inferred_bonus.remaining, 19_750.0);
+    // 存下的拆分与上限一致，就沿用它展示。
+    assert_eq!(old_inferred_bonus.base, 10_000.0);
+    assert_eq!(old_inferred_bonus.bonus, 10_000.0);
 
-    let old_wrong_pro_without_overage = credit_snapshot_from_persisted_fields(
-        Some("Kiro Pro"),
-        250.0,
-        1_000.0,
-        11_000.0,
-        10_750.0,
-        1_000.0,
-        10_000.0,
-    );
-    assert_eq!(old_wrong_pro_without_overage.limit, 1_000.0);
-    assert_eq!(old_wrong_pro_without_overage.remaining, 750.0);
-    assert_eq!(old_wrong_pro_without_overage.base, 1_000.0);
-    assert_eq!(old_wrong_pro_without_overage.bonus, 0.0);
-}
-
-#[test]
-fn persisted_credit_snapshot_only_infers_fixed_overage_bonus() {
-    let trial_like_extra_limit = credit_snapshot_from_persisted_fields(
+    // 拆分与上限对不上（旧版按档位写死），奖励额度不再沿用。
+    let mismatched_split = credit_snapshot_from_persisted_fields(
         Some("Kiro Pro"),
         125.0,
         1_500.0,
@@ -909,11 +908,33 @@ fn persisted_credit_snapshot_only_infers_fixed_overage_bonus() {
         1_000.0,
         10_000.0,
     );
+    assert_eq!(mismatched_split.limit, 1_500.0);
+    assert_eq!(mismatched_split.remaining, 1_375.0);
+    assert_eq!(mismatched_split.bonus, 0.0);
+}
 
-    assert_eq!(trial_like_extra_limit.limit, 1_000.0);
-    assert_eq!(trial_like_extra_limit.remaining, 875.0);
-    assert_eq!(trial_like_extra_limit.base, 1_000.0);
-    assert_eq!(trial_like_extra_limit.bonus, 0.0);
+#[test]
+fn account_info_estimate_subtracts_local_metering_since_the_snapshot() {
+    let row = crate::storage::postgres::CredentialAccountInfoRow {
+        subscription_title: Some("KIRO PRO".to_string()),
+        current_usage: 69.28,
+        usage_limit: 1_247.0,
+        remaining: 1_177.72,
+        overage_status: Some("DISABLED".to_string()),
+        checked_at: "2026-11-09T02:32:50Z".to_string(),
+        ..Default::default()
+    };
+    let info = account_info_from_row_with_metering(&row, Some(200.0));
+    assert!((info.credit_remaining - 1_177.72).abs() < 1e-9);
+    assert_eq!(info.metered_since_check, Some(200.0));
+    assert!((info.estimated_remaining.unwrap() - 977.72).abs() < 1e-9);
+
+    let overspent = account_info_from_row_with_metering(&row, Some(5_000.0));
+    assert_eq!(overspent.estimated_remaining, Some(0.0));
+
+    let plain = account_info_from_row(&row);
+    assert_eq!(plain.metered_since_check, None);
+    assert_eq!(plain.estimated_remaining, None);
 }
 
 pub(in crate::admin) fn credential_item(
@@ -973,6 +994,8 @@ pub(in crate::admin) fn credential_item(
             current_overages: 0.0,
             next_reset_at: None,
             checked_at: "2026-01-01T00:00:00Z".to_string(),
+            metered_since_check: None,
+            estimated_remaining: None,
         }),
         success_count,
         last_used_at: None,

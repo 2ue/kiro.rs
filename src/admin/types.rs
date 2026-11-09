@@ -32,16 +32,16 @@ pub struct CredentialAccountInfo {
     pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
-    /// 按本系统订阅规则计算的总积分。
+    /// 总积分，取上游 usageLimit（含激活的试用和奖励额度）；上游未返回时按订阅档位估算。
     #[serde(default)]
     pub credit_limit: f64,
-    /// 按本系统订阅规则计算的剩余积分。
+    /// 快照时的剩余积分 = 总积分 − 上游已用量。
     #[serde(default)]
     pub credit_remaining: f64,
-    /// 订阅基础积分。
+    /// 总积分中扣除奖励额度后的部分。
     #[serde(default)]
     pub credit_base: f64,
-    /// 开启超额后的额外积分。
+    /// 上游激活的奖励额度。
     #[serde(default)]
     pub credit_bonus: f64,
     /// 上游 Overages 开关状态：ENABLED / DISABLED / UNKNOWN。
@@ -63,6 +63,12 @@ pub struct CredentialAccountInfo {
     pub next_reset_at: Option<f64>,
     /// 上次查询时间（RFC3339 格式）
     pub checked_at: String,
+    /// 快照之后本地记录的该账号 Kiro 计量积分；读取时计算，不查上游。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metered_since_check: Option<f64>,
+    /// 估算的当前剩余积分 = 快照剩余 − 快照之后的本地消耗，下限 0。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_remaining: Option<f64>,
 }
 
 /// 所有凭据状态响应
@@ -143,6 +149,10 @@ pub struct CredentialAccountInfoItem {
     pub current_overages: f64,
     pub next_reset_at: Option<f64>,
     pub checked_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metered_since_check: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_remaining: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,7 +276,7 @@ pub struct UsageDashboardAccountItem {
     /// 最近一次只读账号信息快照中的剩余积分。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_remaining: Option<f64>,
-    /// 积分总额减去剩余积分；仅表示已保存快照，不会触发刷新。
+    /// 快照中上游记录的已用积分（含超额部分）；只读快照，不会触发刷新。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_used: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1123,6 +1133,9 @@ pub struct BatchCredentialImportDefaults {
     pub disabled: Option<bool>,
     #[serde(default)]
     pub priority: Option<u32>,
+    /// 导入后的 Fast 值；单条凭据自带非 0 的 fast 时不覆盖。
+    #[serde(default)]
+    pub fast: Option<u32>,
     #[serde(default)]
     pub max_concurrent_requests: Option<Option<u32>>,
     #[serde(default)]
@@ -1510,16 +1523,16 @@ pub struct BalanceResponse {
     pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
-    /// 按本系统订阅规则计算的总积分。
+    /// 总积分，取上游 usageLimit（含激活的试用和奖励额度）；上游未返回时按订阅档位估算。
     #[serde(default)]
     pub credit_limit: f64,
-    /// 按本系统订阅规则计算的剩余积分。
+    /// 快照时的剩余积分 = 总积分 − 上游已用量。
     #[serde(default)]
     pub credit_remaining: f64,
-    /// 订阅基础积分。
+    /// 总积分中扣除奖励额度后的部分。
     #[serde(default)]
     pub credit_base: f64,
-    /// 开启超额后的额外积分。
+    /// 上游激活的奖励额度。
     #[serde(default)]
     pub credit_bonus: f64,
     /// 上游 Overages 开关状态：ENABLED / DISABLED / UNKNOWN。
@@ -1560,6 +1573,11 @@ pub struct CredentialCreditSummaryResponse {
     pub enabled_credit_remaining: f64,
     pub disabled_credit_limit: f64,
     pub disabled_credit_remaining: f64,
+    /// 各账号快照剩余减去快照之后本地计量消耗的合计，读取时计算，不查上游。
+    #[serde(default)]
+    pub total_estimated_credit_remaining: f64,
+    #[serde(default)]
+    pub enabled_estimated_credit_remaining: f64,
     /// Recorded estimated cost for all credentials in usage history.
     #[serde(default)]
     pub total_estimated_cost_usd: f64,

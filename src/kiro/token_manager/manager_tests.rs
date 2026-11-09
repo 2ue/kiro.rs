@@ -2055,7 +2055,7 @@ fn startup_quota_guard_skips_fresh_exhausted_api_key_and_keeps_runtime_enabled()
     assert!(exhausted.account_quota_blocked);
     assert_eq!(
         exhausted.account_quota_block_reason.as_deref(),
-        Some("fresh_account_info_remaining_and_credit_exhausted_overage_disabled")
+        Some("fresh_account_info_remaining_exhausted_overage_disabled")
     );
     assert!(!exhausted.disabled);
     assert!(!healthy.account_quota_blocked);
@@ -2138,6 +2138,26 @@ fn quota_guard_ignores_stale_missing_non_disabled_and_oauth_account_snapshots() 
     assert!(manager.entries.lock()[0].account_quota_blocked);
     manager.apply_loaded_account_info(&HashMap::new());
     assert!(!manager.entries.lock()[0].account_quota_blocked);
+
+    // 59138 2026-11-08：上游 782/782 已用尽，旧积分字段按档位 1000 推算还剩 218。
+    // 兜底只看上游剩余额度，不能被推算值挡住。
+    let real_exhausted_stale_credit = CredentialAccountInfoRow {
+        current_usage: 782.0,
+        usage_limit: 782.0,
+        remaining: 0.0,
+        credit_remaining: 218.0,
+        overage_status: Some("DISABLED".to_string()),
+        checked_at: Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    assert_eq!(
+        MultiTokenManager::account_info_quota_block_reason(
+            &manager.entries.lock()[0],
+            &real_exhausted_stale_credit,
+            Utc::now()
+        ),
+        Some("fresh_account_info_remaining_exhausted_overage_disabled")
+    );
 }
 
 #[test]
@@ -2280,7 +2300,7 @@ async fn reload_account_info_quota_guard_reselects_healthy_credential() {
         assert!(!exhausted.disabled);
         assert_eq!(
             exhausted.account_quota_block_reason.as_deref(),
-            Some("fresh_account_info_remaining_and_credit_exhausted_overage_disabled")
+            Some("fresh_account_info_remaining_exhausted_overage_disabled")
         );
     })
     .await;

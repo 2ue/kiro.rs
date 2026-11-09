@@ -340,6 +340,10 @@ export interface CredentialAccountInfo {
   currentOverages: number
   nextResetAt: number | null
   checkedAt: string
+  /** 快照之后本地记录的计量积分；读取时计算，不查上游。 */
+  meteredSinceCheck?: number
+  /** 估算当前剩余 = 快照剩余 − 快照之后的本地消耗。 */
+  estimatedRemaining?: number
 }
 
 // Kiro 额度响应
@@ -376,6 +380,8 @@ export interface CredentialCreditSummaryResponse {
   enabledCreditRemaining: number
   disabledCreditLimit: number
   disabledCreditRemaining: number
+  totalEstimatedCreditRemaining?: number
+  enabledEstimatedCreditRemaining?: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
   enabledEstimatedCostUsd: number
@@ -622,6 +628,7 @@ export interface AddCredentialRequest {
   email?: string
   profileArn?: string
   priority?: number
+  fast?: number
   maxConcurrentRequests?: number | null
   rpm?: number | null
   rateLimitAutoDisableEnabled?: boolean | null
