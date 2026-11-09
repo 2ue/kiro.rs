@@ -250,24 +250,102 @@ fn disguise_free_account(
             current_overages: 0.0,
             next_reset_at: None,
             checked_at: info.checked_at.clone(),
+            // 伪装后的额度是编造的，不能附带真实消耗推出来的估算。
+            metered_since_check: None,
+            estimated_remaining: None,
         };
     }
     credential
 }
 
-/// The accounts the page shows, Free ones hidden or disguised by `mode`.
+/// Real accounts of the disguise tier whose quota a Free account may borrow: normally used ones
+/// first, and only when there are none, the others of that tier (disabled, cooling, used up).
+/// Ids are sorted so the pick below stays the same between snapshot rebuilds.
+fn quota_donors(credentials: &[CredentialStatusItem], title: &str) -> Vec<CredentialAccountInfo> {
+    let tier = subscription_tier_key(Some(title));
+    let mut candidates: Vec<&CredentialStatusItem> = credentials
+        .iter()
+        .filter(|credential| !is_free_account(credential))
+        .filter(|credential| {
+            credential.account_info.as_ref().is_some_and(|info| {
+                info.usage_limit > 0.0
+                    && subscription_tier_key(
+                        info.subscription_title
+                            .as_deref()
+                            .or(credential.subscription_title.as_deref()),
+                    ) == tier
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|credential| credential.id);
+    let normal: Vec<&CredentialStatusItem> = candidates
+        .iter()
+        .copied()
+        .filter(|credential| credential_matches_status(credential, "normal"))
+        .collect();
+    let chosen = if normal.is_empty() {
+        candidates
+    } else {
+        normal
+    };
+    chosen
+        .into_iter()
+        .filter_map(|credential| credential.account_info.clone())
+        .collect()
+}
+
+/// A random-looking but stable donor for Free account `id`: the same account keeps the same
+/// donor across the 5-second rebuilds, so its bar does not jump around.
+fn pick_donor(donors: &[CredentialAccountInfo], id: u64) -> Option<&CredentialAccountInfo> {
+    if donors.is_empty() {
+        return None;
+    }
+    let mixed = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+    donors.get((mixed % donors.len() as u64) as usize)
+}
+
+/// A Free account showing the quota of a real account of the disguise tier, title and all.
+fn disguise_with_donor(
+    mut credential: CredentialStatusItem,
+    title: &str,
+    donor: &CredentialAccountInfo,
+) -> CredentialStatusItem {
+    credential.subscription_title = Some(title.to_string());
+    if credential.disabled_reason.as_deref() == Some("QuotaExceeded") {
+        credential.disabled_reason = None;
+    }
+    if let Some(info) = credential.account_info.as_mut() {
+        *info = CredentialAccountInfo {
+            subscription_title: Some(title.to_string()),
+            metered_since_check: None,
+            estimated_remaining: None,
+            ..donor.clone()
+        };
+    }
+    credential
+}
+
+/// The accounts the page shows, Free ones hidden or disguised by `mode`. A disguised Free account
+/// borrows the quota of a real account of the chosen tier; with no such account it falls back to
+/// the tier's nominal limit.
 fn visible_credentials(
     credentials: Vec<CredentialStatusItem>,
     mode: PublicPoolFreeAccounts,
 ) -> Vec<CredentialStatusItem> {
+    let donors = disguise_tier(mode)
+        .map(|(title, _)| quota_donors(&credentials, title))
+        .unwrap_or_default();
     credentials
         .into_iter()
         .filter_map(|credential| {
             if !is_free_account(&credential) {
                 return Some(credential);
             }
-            disguise_tier(mode)
-                .map(|(title, limit)| disguise_free_account(credential, title, limit))
+            let (title, limit) = disguise_tier(mode)?;
+            Some(match pick_donor(&donors, credential.id) {
+                Some(donor) => disguise_with_donor(credential, title, donor),
+                None => disguise_free_account(credential, title, limit),
+            })
         })
         .collect()
 }
@@ -917,6 +995,95 @@ mod tests {
             let json = serde_json::to_string(&response).unwrap();
             assert!(!json.to_ascii_lowercase().contains("free"), "{json}");
         }
+    }
+
+    fn power_credential(id: u64, used: f64, limit: f64) -> CredentialStatusItem {
+        let mut item = credential_item(id, false, None, 0, 0.0, Some(used));
+        item.subscription_title = Some("KIRO POWER".to_string());
+        let info = item.account_info.as_mut().unwrap();
+        info.subscription_title = Some("KIRO POWER".to_string());
+        info.current_usage = used;
+        info.usage_limit = limit;
+        info.current_overages = 0.0;
+        info.overage_status = Some("DISABLED".to_string());
+        item
+    }
+
+    /// A disguised Free account borrows the quota of a real account of the chosen tier, normally
+    /// used ones first; the same Free account keeps the same donor between rebuilds.
+    #[test]
+    fn free_accounts_borrow_the_quota_of_a_normally_used_account_of_the_tier() {
+        let mut disabled_power = power_credential(10, 9_999.0, 9_999.0);
+        disabled_power.disabled = true;
+        disabled_power.disabled_reason = Some("QuotaExceeded".to_string());
+        let credentials = vec![
+            disabled_power,
+            power_credential(11, 1_234.0, 10_250.0),
+            power_credential(12, 4_321.0, 10_400.0),
+            free_credential(2, 23_456.5),
+            free_credential(3, 1.0),
+        ];
+        let snapshot = snapshot_with(credentials.clone(), PublicPoolFreeAccounts::Power);
+        let response = snapshot.page(&query(None, None, Some("all")));
+        let normal_quotas = [(1_234.0, 10_250.0), (4_321.0, 10_400.0)];
+        for id in [2, 3] {
+            let free = response.items.iter().find(|item| item.id == id).unwrap();
+            assert_eq!(free.subscription_title.as_deref(), Some("KIRO POWER"));
+            let quota = free.quota.as_ref().unwrap();
+            assert!(
+                normal_quotas.contains(&(quota.current_usage, quota.usage_limit)),
+                "Free #{id} must borrow a normally used Power account: {quota:?}"
+            );
+            assert_eq!(free.disabled_reason, None);
+        }
+        // Stable between rebuilds.
+        let again = snapshot_with(credentials, PublicPoolFreeAccounts::Power).page(&query(
+            None,
+            None,
+            Some("all"),
+        ));
+        for id in [2, 3] {
+            let quota = |items: &[PublicPoolAccount]| {
+                let quota = items
+                    .iter()
+                    .find(|item| item.id == id)
+                    .unwrap()
+                    .quota
+                    .clone();
+                quota.map(|quota| (quota.current_usage, quota.usage_limit))
+            };
+            assert_eq!(quota(&response.items), quota(&again.items));
+        }
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.to_ascii_lowercase().contains("free"), "{json}");
+    }
+
+    /// With no normally used account of the tier, the others of that tier are used; with none at
+    /// all, the tier's nominal limit.
+    #[test]
+    fn free_accounts_fall_back_to_unused_accounts_then_the_nominal_limit() {
+        let mut disabled_power = power_credential(10, 8_000.0, 9_500.0);
+        disabled_power.disabled = true;
+        disabled_power.disabled_reason = Some("Manual".to_string());
+        let snapshot = snapshot_with(
+            vec![disabled_power, free_credential(2, 5.0)],
+            PublicPoolFreeAccounts::Power,
+        );
+        let response = snapshot.page(&query(None, None, Some("all")));
+        let quota = response
+            .items
+            .iter()
+            .find(|item| item.id == 2)
+            .and_then(|item| item.quota.clone())
+            .unwrap();
+        assert_eq!((quota.current_usage, quota.usage_limit), (8_000.0, 9_500.0));
+
+        let snapshot = snapshot_with(vec![free_credential(2, 5.0)], PublicPoolFreeAccounts::Power);
+        let quota = snapshot.page(&query(None, None, Some("all"))).items[0]
+            .quota
+            .clone()
+            .unwrap();
+        assert_eq!((quota.current_usage, quota.usage_limit), (5.0, 10_000.0));
     }
 
     #[test]
