@@ -190,6 +190,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     email: stringField(normalized.email) ?? stringField(nested?.email),
     profileArn,
     priority: numberField(normalized.priority),
+    fast: numberField(normalized.fast),
     maxConcurrentRequests: numberField(normalized.maxConcurrentRequests) ?? numberField(nested?.maxConcurrentRequests),
     region,
     authRegion,

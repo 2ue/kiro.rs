@@ -11,6 +11,7 @@ export type ProxyAssignmentMode = 'single' | 'round_robin' | 'none'
 export interface CredentialParameterDefaults {
   disabled: string
   priority: string
+  fast: string
   maxConcurrentRequests: string
   rpm: string
   region: string
@@ -32,6 +33,7 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
   return {
     disabled: 'false',
     priority: '',
+    fast: '',
     maxConcurrentRequests: '',
     rpm: '',
     region: '',
@@ -100,6 +102,7 @@ export function mergeCredentialDefaults(
       ? defaults.disabled === 'true'
       : credential.disabled,
     priority: credential.priority ?? parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
+    fast: credential.fast || parseOptionalNonNegativeInteger(defaults.fast, '默认 Fast'),
     maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'undefined'
       ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发')
       : credential.maxConcurrentRequests,
@@ -327,6 +330,9 @@ export function CredentialParameterDefaultsPanel({
         </div>
         <FieldLabel title="默认优先级" description="留空时使用凭据自身值或 0">
           <Input type="number" min="0" value={defaults.priority} disabled={disabled} onChange={(event) => update('priority', event.target.value)} />
+        </FieldLabel>
+        <FieldLabel title="默认 Fast" description="数字越大越先打满；留空或 0 关闭，凭据自带的值优先">
+          <Input type="number" min="0" value={defaults.fast} disabled={disabled} onChange={(event) => update('fast', event.target.value)} placeholder="留空关闭" />
         </FieldLabel>
         <FieldLabel title="默认账号并发" description="留空继承全局，0 表示不限">
           <Input type="number" min="0" value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(event) => update('maxConcurrentRequests', event.target.value)} />

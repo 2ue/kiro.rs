@@ -88,6 +88,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [scopes, setScopes] = useState('')
   const [email, setEmail] = useState('')
   const [priority, setPriority] = useState('0')
+  const [fast, setFast] = useState('')
   const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('')
   const [rpm, setRpm] = useState('')
   const [disabled, setDisabled] = useState(false)
@@ -126,6 +127,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setScopes('')
     setEmail('')
     setPriority('0')
+    setFast('')
     setMaxConcurrentRequests('')
     setRpm('')
     setDisabled(false)
@@ -158,6 +160,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     scopes?: string
     email?: string
     priority?: number
+    fast?: number
     maxConcurrentRequests?: number | null
     rpm?: number | null
     disabled?: boolean | null
@@ -184,6 +187,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setScopes(credential.scopes || '')
     setEmail(credential.email || '')
     setPriority(String(credential.priority ?? 0))
+    setFast(credential.fast ? String(credential.fast) : '')
     setMaxConcurrentRequests(typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '')
     setRpm(typeof credential.rpm === 'number' ? String(credential.rpm) : '')
     setDisabled(Boolean(credential.disabled))
@@ -316,6 +320,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       toast.error('优先级必须是非负整数')
       return
     }
+    const parsedFast = fast.trim() ? Number(fast) : 0
+    if (!Number.isInteger(parsedFast) || parsedFast < 0) {
+      toast.error('Fast 值必须是非负整数')
+      return
+    }
     let parsedMaxConcurrentRequests: number | undefined
     if (maxConcurrentRequests.trim()) {
       const parsed = Number(maxConcurrentRequests)
@@ -358,6 +367,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         scopes: authMethod === 'external_idp' ? scopes.trim() || undefined : undefined,
         email: email.trim() || undefined,
         priority: parsedPriority,
+        fast: parsedFast,
         maxConcurrentRequests: parsedMaxConcurrentRequests,
         rpm: parsedRpm,
         disabled,
@@ -647,6 +657,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 数字越小优先级越高，默认为 0
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="fast" className="text-sm font-medium">
+                Fast（可选）
+              </label>
+              <Input
+                id="fast"
+                type="number"
+                min="0"
+                placeholder="留空关闭"
+                value={fast}
+                onChange={(e) => setFast(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                数字越大越先打满；留空或 0 关闭
               </p>
             </div>
 

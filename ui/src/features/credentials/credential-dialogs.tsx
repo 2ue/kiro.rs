@@ -176,6 +176,7 @@ export interface VerifyResult {
 export interface CredentialParameterDefaults {
   disabled: string
   priority: string
+  fast: string
   maxConcurrentRequests: string
   rpm: string
   region: string
@@ -197,6 +198,7 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
   return {
     disabled: 'false',
     priority: '',
+    fast: '',
     maxConcurrentRequests: '',
     rpm: '',
     region: '',
@@ -216,7 +218,7 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
 }
 
 function initialCredentialForm() {
-  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false, tags: [] as string[] }
+  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', fast: '', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false, tags: [] as string[] }
 }
 
 function formFromCredential(c: AddCredentialRequest) {
@@ -228,6 +230,7 @@ function formFromCredential(c: AddCredentialRequest) {
     clientId: c.clientId || '', clientSecret: c.clientSecret || '', tokenEndpoint: c.tokenEndpoint || '',
     issuerUrl: c.issuerUrl || '', scopes: c.scopes || '', email: c.email || '',
     priority: String(c.priority ?? 0),
+    fast: c.fast ? String(c.fast) : '',
     maxConcurrentRequests: typeof c.maxConcurrentRequests === 'number' ? String(c.maxConcurrentRequests) : '',
     disabled: c.disabled ? 'true' : 'false',
     machineId: c.machineId || '', proxyUrl: c.proxyUrl || '', proxyUsername: c.proxyUsername || '',
@@ -303,6 +306,8 @@ function mergeCredentialDefaults(
     ...cred,
     disabled: typeof cred.disabled === 'undefined' || cred.disabled === null ? defaults.disabled === 'true' : cred.disabled,
     priority: cred.priority ?? parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
+    // 账号自带非 0 的 fast 优先，与后端 apply_batch_import_defaults 一致。
+    fast: cred.fast || parseOptionalNonNegativeInteger(defaults.fast, '默认 Fast'),
     maxConcurrentRequests: typeof cred.maxConcurrentRequests === 'undefined' ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发') : cred.maxConcurrentRequests,
     rpm: typeof cred.rpm === 'undefined' ? parseOptionalNonNegativeInteger(defaults.rpm, '默认账号 RPM') : cred.rpm,
     region: optionalTrimmed(cred.region) || optionalTrimmed(defaults.region),
@@ -327,6 +332,7 @@ export function parameterDefaultsToImportDefaults(defaults: CredentialParameterD
   return {
     disabled: defaults.disabled === 'true',
     priority: parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
+    fast: parseOptionalNonNegativeInteger(defaults.fast, '默认 Fast'),
     maxConcurrentRequests,
     rpm,
     authRegion: optionalTrimmed(defaults.authRegion) || optionalTrimmed(defaults.region),
@@ -463,6 +469,7 @@ export function CredentialParameterDefaultsPanel({ defaults, onChange, proxyReso
             </Select>
           </Field>
           <Field label="默认优先级" description="数字越小越优先"><Input type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(e) => update('priority', e.target.value)} /></Field>
+          <Field label="默认 Fast" description="数字越大越先打满；留空或 0 关闭"><Input type="number" min={0} value={defaults.fast} disabled={disabled} onChange={(e) => update('fast', e.target.value)} placeholder="留空关闭" /></Field>
           <Field label="端点"><Input value={defaults.endpoint} disabled={disabled} onChange={(e) => update('endpoint', e.target.value)} placeholder="ide / cli" /></Field>
           <Field label="默认账号并发" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
           <Field label="默认账号 RPM" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(e) => update('rpm', e.target.value)} /></Field>
@@ -579,6 +586,8 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
     if (form.authMethod === 'external_idp' && !form.clientId.trim()) return toast.error('External IdP 认证需要 Client ID')
     const priority = Number(form.priority)
     if (!Number.isInteger(priority) || priority < 0) return toast.error('优先级必须是非负整数')
+    const fast = form.fast.trim() ? Number(form.fast) : 0
+    if (!Number.isInteger(fast) || fast < 0) return toast.error('Fast 值必须是非负整数')
     let maxConcurrentRequests: number | undefined
     try { maxConcurrentRequests = parseOptionalNonNegativeInteger(form.maxConcurrentRequests, '账号并发') } catch (err) { return toast.error(extractErrorMessage(err)) }
     add.mutate({
@@ -596,6 +605,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       scopes: form.authMethod === 'external_idp' ? form.scopes.trim() || undefined : undefined,
       email: form.email.trim() || undefined,
       priority,
+      fast,
       maxConcurrentRequests,
       disabled: form.disabled === 'true',
       machineId: form.machineId.trim() || undefined,
@@ -687,6 +697,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           </div>
           <Field label="Profile ARN（可选）"><Input value={form.profileArn} disabled={add.isPending} onChange={(e) => update('profileArn', e.target.value)} /></Field>
           <Field label="优先级"><Input type="number" min={0} value={form.priority} disabled={add.isPending} onChange={(e) => update('priority', e.target.value)} /></Field>
+          <Field label="Fast（可选）" description="数字越大越先打满；留空或 0 关闭"><Input type="number" min={0} value={form.fast} disabled={add.isPending} onChange={(e) => update('fast', e.target.value)} placeholder="留空关闭" /></Field>
           <Field label="初始状态" description="新增后默认查询订阅，不测试模型">
             <Select value={form.disabled} onValueChange={(v) => update('disabled', v)} disabled={add.isPending}>
               <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
