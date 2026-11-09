@@ -268,7 +268,8 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `credentialSessionMaxConcurrentRequests` | number | `0` | 同一会话在单个凭据上的最大并发；`0` 表示等于该凭据自身的并发上限。超出的请求临时借用其他凭据，不改绑；没有其他空闲凭据时仍用绑定凭据 |
 | `credentialInFlightLeaseMaxSecs` | number | `900` | 单个并发占用超过多久未活跃时自动释放；`0` 表示关闭。用于兜底异常路径导致的并发槽长期占用 |
 | `credentialWarmupRequests` | number | `3` | 新增凭据默认预热次数；预热只通过真实业务请求成功递减，不伪造 success_count |
-| `credentialWarmupSelectionPercent` | number | `5` | balanced 模式下预热凭据参与真实业务请求调度的概率百分比 |
+| `credentialWarmupSelectionPercent` | number | `5` | 预热起始比例：新凭据起步时的流量为同档位就绪凭据平均流量的这个百分比，随预热进度线性升到 100%。只在有就绪凭据可用时限流，就绪凭据全满/冷却/限流时预热凭据照常接溢出流量。`0` 表示有就绪凭据时预热凭据只接溢出流量。详见 `docs/scheduler-credential-warmup-slow-start-20261109.md` |
+| `credentialWarmupMaxSelectionPercent` | number | `50` | 所有预热凭据合计最多承接的近期流量比例。就绪凭据很少时（例如全局容量配置变更后整个号池重新预热）会自动放宽，避免少数就绪凭据超过公平份额 2 倍 |
 | `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
 | `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Kiro 上游前的最终 payload 防护 |

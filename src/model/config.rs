@@ -5508,15 +5508,19 @@ pub struct Config {
     #[serde(default)]
     pub weighted_capacity: WeightedCapacityConfig,
 
-    /// 新凭据预热请求次数。预热期内 balanced 会降低该凭据调度权重，但不会伪造 success_count。
+    /// 新凭据预热请求次数，每次真实请求成功减 1，不会伪造 success_count。
+    /// 预热期内，只要有就绪凭据可调度，预热凭据就按配额限流（见 `credential_warmup_selection_percent`）。
     #[serde(default = "default_credential_warmup_requests")]
     pub credential_warmup_requests: u32,
 
-    /// balanced 模式下预热凭据参与真实业务请求调度的概率百分比。
+    /// 预热起始比例：预热凭据起步时的流量为同档位就绪凭据平均流量的这个百分比，
+    /// 随预热进度线性升到 100%。只在有就绪凭据可调度时限流；没有时预热凭据照常接溢出流量。
+    /// `0` 表示有就绪凭据时预热凭据只接溢出流量。所有负载均衡模式都生效。
     #[serde(default = "default_credential_warmup_selection_percent")]
     pub credential_warmup_selection_percent: u32,
 
-    /// 已有非预热凭据可用时，所有预热凭据合计最多承接的流量百分比。
+    /// 已有就绪凭据可用时，所有预热凭据合计最多承接的近期流量百分比。
+    /// 就绪凭据很少时会自动放宽，保证就绪凭据不超过公平份额的 2 倍。
     #[serde(default = "default_credential_warmup_max_selection_percent")]
     pub credential_warmup_max_selection_percent: u32,
 

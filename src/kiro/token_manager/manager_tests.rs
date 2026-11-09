@@ -7544,29 +7544,270 @@ async fn test_balanced_mode_rotates_all_warming_credentials_by_recent_selection(
 }
 
 #[tokio::test]
-async fn test_balanced_mode_gives_warming_group_scaled_target_share() {
+async fn test_balanced_mode_holds_warming_credentials_to_their_quota() {
+    // Each idle warming credential takes one request to get its warmup going, then stays at
+    // `credential_warmup_selection_percent` of an average ready credential's load. Six ready
+    // credentials keep the ready-overload guard out of the picture.
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
+    config.credential_warmup_requests = 30;
     config.credential_warmup_selection_percent = 5;
     config.credential_warmup_max_selection_percent = 50;
-    let mut ready = KiroCredentials::default();
-    ready.access_token = Some("ready".to_string());
-    ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut warming_a = KiroCredentials::default();
-    warming_a.access_token = Some("warming-a".to_string());
-    warming_a.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut warming_b = KiroCredentials::default();
-    warming_b.access_token = Some("warming-b".to_string());
-    warming_b.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let manager =
-        MultiTokenManager::new(config, vec![ready, warming_a, warming_b], None, None, false)
-            .unwrap();
-    manager.set_warmup_remaining(2, 3).unwrap();
-    manager.set_warmup_remaining(3, 3).unwrap();
+    let credentials = (1_u64..=8)
+        .map(|id| api_key_credential(&format!("ksk_quota_{id}")))
+        .collect::<Vec<_>>();
+    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    manager.set_warmup_remaining(7, 30).unwrap();
+    manager.set_warmup_remaining(8, 30).unwrap();
 
-    let mut ctx = manager.acquire_context(None).await.unwrap();
-    assert_ne!(ctx.id, 1);
-    ctx.release_in_flight();
+    let mut picks = Vec::new();
+    for _ in 0..24 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        picks.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    let count = |id| picks.iter().filter(|pick| **pick == id).count();
+    assert_eq!(count(7), 1, "picks: {picks:?}");
+    assert_eq!(count(8), 1, "picks: {picks:?}");
+}
+
+#[tokio::test]
+async fn few_ready_credentials_share_load_with_warming_ones() {
+    // One ready credential and two warming ones: holding both warming credentials to 5% would
+    // put nearly all traffic on the single ready one. The ready-overload guard keeps it within
+    // twice its fair share (2/3 here) instead.
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+    config.credential_warmup_requests = 30;
+    config.credential_warmup_selection_percent = 5;
+    config.credential_warmup_max_selection_percent = 50;
+    let credentials = (1_u64..=3)
+        .map(|id| api_key_credential(&format!("ksk_few_{id}")))
+        .collect::<Vec<_>>();
+    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    manager.set_warmup_remaining(2, 30).unwrap();
+    manager.set_warmup_remaining(3, 30).unwrap();
+
+    let mut picks = Vec::new();
+    for _ in 0..30 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        picks.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    let ready = picks.iter().filter(|pick| **pick == 1).count();
+    assert!(
+        (18..=21).contains(&ready),
+        "the ready credential carries about 2/3 of the traffic, picks: {picks:?}"
+    );
+}
+
+#[tokio::test]
+async fn new_credential_in_a_large_pool_ramps_up_slowly() {
+    // Regression for the production report: with 88 ready credentials a new one took about
+    // 4x the traffic of a ready credential right away (a fixed 5% of the pool's traffic per
+    // warming credential). Now it starts at 5% of an average ready credential's share and
+    // stays below the ready average for the whole warmup.
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+    config.credential_max_concurrent_requests = 0;
+    config.credential_warmup_requests = 30;
+    config.credential_warmup_selection_percent = 5;
+    config.credential_warmup_max_selection_percent = 50;
+    let credentials = (1_u64..=21)
+        .map(|id| api_key_credential(&format!("ksk_ramp_{id}")))
+        .collect::<Vec<_>>();
+    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    manager.set_warmup_remaining(21, 30).unwrap();
+
+    let mut new_picks = Vec::new();
+    for round in 0..400 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        if ctx.id == 21 {
+            new_picks.push(round);
+        }
+        manager.report_success(ctx.id);
+        ctx.release_in_flight();
+    }
+    let snapshot = manager.snapshot();
+    let new_count = new_picks.len() as f64;
+    let ready_average = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.id != 21)
+        .map(|entry| entry.success_count as f64)
+        .sum::<f64>()
+        / 20.0;
+    assert!(
+        new_count < ready_average,
+        "a warming credential must stay below the ready average: new={new_count}, ready_average={ready_average}, picks={new_picks:?}"
+    );
+    assert!(
+        new_count >= 2.0,
+        "warmup still progresses: picks={new_picks:?}"
+    );
+    // The first picks are spread out: the second one only after the ready credentials carry
+    // enough load for 5% of it to reach a whole request.
+    assert!(
+        new_picks.get(1).is_some_and(|round| *round >= 20),
+        "the second pick must wait for the quota: picks={new_picks:?}"
+    );
+}
+
+#[tokio::test]
+async fn warming_credential_takes_overflow_when_ready_credentials_are_full() {
+    // Slow entry only applies while the pool has room: a full ready credential leaves the
+    // request to the warming one instead of queueing it.
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+    config.credential_max_concurrent_requests = 1;
+    config.credential_warmup_requests = 30;
+    config.credential_warmup_selection_percent = 0;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            api_key_credential("ksk_full"),
+            api_key_credential("ksk_new"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager.set_warmup_remaining(2, 30).unwrap();
+
+    let mut held = manager.acquire_context(None).await.unwrap();
+    assert_eq!(held.id, 1);
+    let mut overflow = manager.acquire_context(None).await.unwrap();
+    assert_eq!(
+        overflow.id, 2,
+        "a full pool overflows to the warming credential"
+    );
+    overflow.release_in_flight();
+    held.release_in_flight();
+}
+
+#[tokio::test]
+async fn warming_credential_does_not_take_new_session_bindings_while_ready_ones_exist() {
+    // A session binding sends every later request of the session to one credential. A warming
+    // credential that took bindings would collect whole sessions and bypass its quota, so it
+    // only serves the request; the session binds on a later request to a ready credential.
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+    config.credential_warmup_requests = 30;
+    config.credential_warmup_selection_percent = 5;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            api_key_credential("ksk_ready"),
+            api_key_credential("ksk_new"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager.set_warmup_remaining(2, 30).unwrap();
+    let empty = HashSet::new();
+    // Give the ready credential some load, so the idle warming credential sorts first.
+    let mut pulse = manager.acquire_context(None).await.unwrap();
+    assert_eq!(pulse.id, 1);
+    pulse.release_in_flight();
+
+    // The idle warming credential takes the next request (its warmup sample) but no binding.
+    let mut first = manager
+        .acquire_context_for_session(None, Some("warmup-session"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(first.id, 2);
+    assert!(!first.sticky_bound);
+    manager.report_success(first.id);
+    first.release_in_flight();
+
+    let mut second = manager
+        .acquire_context_for_session(None, Some("warmup-session"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(second.id, 1, "the session binds to the ready credential");
+    assert!(!second.sticky_bound);
+    second.release_in_flight();
+
+    let mut third = manager
+        .acquire_context_for_session(None, Some("warmup-session"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(third.id, 1);
+    assert!(
+        third.sticky_bound,
+        "the binding to the ready credential holds"
+    );
+    third.release_in_flight();
+}
+
+#[tokio::test]
+async fn warming_pool_without_ready_credentials_still_binds_sessions() {
+    // A global capacity change puts the whole pool back into warmup; sessions must keep their
+    // stickiness instead of hopping between credentials on every request.
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+    config.credential_warmup_requests = 30;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            api_key_credential("ksk_warm_a"),
+            api_key_credential("ksk_warm_b"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager.set_warmup_remaining(1, 30).unwrap();
+    manager.set_warmup_remaining(2, 30).unwrap();
+    let empty = HashSet::new();
+
+    let mut first = manager
+        .acquire_context_for_session(None, Some("all-warming"), &empty)
+        .await
+        .unwrap();
+    let bound_id = first.id;
+    first.release_in_flight();
+    let mut second = manager
+        .acquire_context_for_session(None, Some("all-warming"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(second.id, bound_id);
+    assert!(second.sticky_bound);
+    second.release_in_flight();
+}
+
+#[tokio::test]
+async fn sessions_do_not_migrate_to_a_warming_credential_in_a_better_tier() {
+    // A better-tier credential pulls bound sessions up one at a time. While it warms up that
+    // move would only cost the session its binding for one request, so sessions stay put.
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_warmup_requests = 30;
+    config.credential_warmup_selection_percent = 100;
+    config.credential_warmup_max_selection_percent = 100;
+    let mut lower = test_access_token_credential("lower", "Pro");
+    lower.priority = 10;
+    let mut better = test_access_token_credential("better", "Pro");
+    better.priority = 0;
+    let manager = MultiTokenManager::new(config, vec![lower, better], None, None, false).unwrap();
+    manager.bind_session_to_credential("bound-low", 1);
+    manager.set_warmup_remaining(2, 30).unwrap();
+    let empty = HashSet::new();
+
+    for _ in 0..3 {
+        let mut ctx = manager
+            .acquire_context_for_session(None, Some("bound-low"), &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+        assert!(ctx.sticky_bound);
+        ctx.release_in_flight();
+        tokio::time::sleep(StdDuration::from_millis(1100)).await;
+    }
 }
 
 #[tokio::test]
@@ -8074,8 +8315,32 @@ async fn priority_mode_splits_warmup_only_inside_the_preferred_tier() {
         ctx.release_in_flight();
     }
 
-    // A warming credential in the preferred tier wins over a ready one in a lower tier, even
-    // when the warmup share is zero: the tier comes first, warmup only splits inside it.
+    // A warming credential in the preferred tier ramps up instead of taking the whole tier at
+    // once: below its quota it is the preferred tier, above it the lower tier keeps serving.
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_warmup_requests = 30;
+    config.credential_warmup_selection_percent = 5;
+    config.credential_warmup_max_selection_percent = 50;
+    let mut ready = test_access_token_credential("ready", "Pro");
+    ready.priority = 10;
+    let mut warming = test_access_token_credential("warming", "Pro");
+    warming.priority = 0;
+    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    manager.set_warmup_remaining(2, 30).unwrap();
+    let mut picks = Vec::new();
+    for _ in 0..5 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        picks.push(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert_eq!(
+        picks,
+        vec![2, 1, 1, 1, 1],
+        "the idle warming credential gets one request, then waits for its quota"
+    );
+
+    // With no warmup share the warming credential only takes overflow, whatever its tier.
     let mut config = Config::default();
     config.load_balancing_mode = "priority".to_string();
     config.credential_warmup_selection_percent = 0;
@@ -8087,7 +8352,10 @@ async fn priority_mode_splits_warmup_only_inside_the_preferred_tier() {
     let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
     manager.set_warmup_remaining(2, 5).unwrap();
     let mut ctx = manager.acquire_context(None).await.unwrap();
-    assert_eq!(ctx.id, 2, "the preferred tier is used before a lower tier");
+    assert_eq!(
+        ctx.id, 1,
+        "a zero warmup share leaves the warming credential to overflow"
+    );
     ctx.release_in_flight();
 }
 
@@ -9859,6 +10127,8 @@ async fn test_added_credential_warmup_does_not_fake_success_count() {
 
 #[tokio::test]
 async fn test_warmup_selection_percent_allows_real_request_sampling() {
+    // At 100% a warming credential competes like a ready one: real requests reach it and each
+    // success counts down its warmup.
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
     config.credential_warmup_requests = 2;
@@ -9874,10 +10144,14 @@ async fn test_warmup_selection_percent_allows_real_request_sampling() {
     let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
     manager.set_warmup_remaining(2, 2).unwrap();
 
-    let mut ctx = manager.acquire_context(None).await.unwrap();
-    assert_eq!(ctx.id, 2);
-    manager.report_success(ctx.id);
-    ctx.release_in_flight();
+    let mut picks = Vec::new();
+    for _ in 0..2 {
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        picks.push(ctx.id);
+        manager.report_success(ctx.id);
+        ctx.release_in_flight();
+    }
+    assert_eq!(picks, vec![1, 2]);
 
     let snapshot = manager.snapshot();
     let warming = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
@@ -15032,13 +15306,13 @@ tiers_fill_in_order/balanced: 1 2 1 2 3 4 3 4 E
 tiers_fill_in_order/health_balanced: 1 2 3 4 1 2 3 4 E
 tiers_fill_in_order/weighted_least_inflight: 1 2 3 4 1 2 3 4 E
 warmup_in_lower_tier/priority: 1 2 1 2 1 2 1 2
-warmup_in_lower_tier/balanced: 3 1 2 1 2 1 2 1
-warmup_in_lower_tier/health_balanced: 3 1 2 1 2 1 2 1
-warmup_in_lower_tier/weighted_least_inflight: 3 1 2 1 2 1 2 1
-warmup_in_same_tier/priority: 2 1 3 1 3 1 3 1
-warmup_in_same_tier/balanced: 2 1 3 1 3 1 3 1
-warmup_in_same_tier/health_balanced: 2 1 3 1 3 1 3 1
-warmup_in_same_tier/weighted_least_inflight: 2 1 3 1 3 1 3 1
+warmup_in_lower_tier/balanced: 1 2 1 2 1 2 1 2
+warmup_in_lower_tier/health_balanced: 1 2 3 4 1 2 1 2
+warmup_in_lower_tier/weighted_least_inflight: 1 2 3 4 1 2 1 2
+warmup_in_same_tier/priority: 1 2 3 1 3 1 3 1
+warmup_in_same_tier/balanced: 1 2 3 1 3 1 3 1
+warmup_in_same_tier/health_balanced: 1 2 3 1 3 1 3 1
+warmup_in_same_tier/weighted_least_inflight: 1 2 3 1 3 1 3 1
 fast_above_priority/priority: 2 2 1 1 3 3 E
 fast_above_priority/balanced: 2 2 1 1 3 3 E
 fast_above_priority/health_balanced: 2 2 1 3 1 3 E

@@ -121,37 +121,92 @@ pub(super) fn selection_pressure_from_totals(
     (share / expected_share - 1.0).max(0.0)
 }
 
-pub(super) fn warmup_target_share_with_config(config: &Config, warming_count: usize) -> f64 {
-    if warming_count == 0 {
-        return 0.0;
+/// How far warmup may push the ready credentials above their fair share of the traffic (the
+/// share they would carry if every candidate were ready). Holding warming credentials back moves
+/// their traffic onto the ready ones; when few credentials are ready, e.g. after a global capacity
+/// change reset the warmup of the whole pool, that would turn the first credentials to finish
+/// warmup into hot spots. Warmup is relaxed instead, as far as needed to stay within this factor.
+pub(super) const WARMUP_READY_OVERLOAD_LIMIT: f64 = 2.0;
+
+/// Traffic weight of a warming credential relative to an average ready one, in `[0, 1]`.
+///
+/// A warming credential starts at `credential_warmup_selection_percent` of an average ready
+/// credential's traffic and ramps linearly to the full share as its remaining warmup requests
+/// count down. The ramp spans `max(credential_warmup_requests, warmup_remaining)`, so a value set
+/// by hand above the configured count starts at the bottom instead of past the end. A ready
+/// credential (`warmup_remaining == 0`) has weight 1.
+pub(super) fn warmup_weight(config: &Config, warmup_remaining: u32) -> f64 {
+    if warmup_remaining == 0 {
+        return 1.0;
     }
-    let per_warming = config.credential_warmup_selection_percent.min(100) as f64 / 100.0;
-    let max_share = config.credential_warmup_max_selection_percent.min(100) as f64 / 100.0;
-    (per_warming * warming_count as f64).min(max_share).min(1.0)
+    let start = config.credential_warmup_selection_percent.min(100) as f64 / 100.0;
+    let span = config.credential_warmup_requests.max(warmup_remaining);
+    let progress = (span - warmup_remaining) as f64 / span as f64;
+    start + (1.0 - start) * progress
 }
 
-pub(super) fn should_select_warming_from_totals(
+/// Lowest warmup weight that keeps `ready_count` ready credentials within
+/// [`WARMUP_READY_OVERLOAD_LIMIT`] of their fair share while `warming_count` credentials warm
+/// up. Zero (no floor) while the ready credentials outnumber the warming ones enough.
+pub(super) fn warmup_weight_floor(ready_count: usize, warming_count: usize) -> f64 {
+    if ready_count == 0 || warming_count == 0 {
+        return 0.0;
+    }
+    let ready = ready_count as f64;
+    let warming = warming_count as f64;
+    // Ready share 1 / (ready + warming * w) <= limit / (ready + warming).
+    let floor = ((ready + warming) / WARMUP_READY_OVERLOAD_LIMIT - ready) / warming;
+    floor.clamp(0.0, 1.0)
+}
+
+/// [`warmup_weight`] raised to `floor` (see [`warmup_weight_floor`]).
+pub(super) fn effective_warmup_weight(config: &Config, warmup_remaining: u32, floor: f64) -> f64 {
+    warmup_weight(config, warmup_remaining).max(floor)
+}
+
+/// Traffic a credential has taken recently, as counted by the warmup quota: selections in the
+/// last five minutes (long enough to resolve shares well below one request a minute) plus
+/// requests in flight. In-flight requests are counted because a selection is only recorded
+/// after the token is ready: without them, concurrent requests arriving in that gap would all
+/// see an idle warming credential and pile onto it.
+pub(super) fn warmup_load(entry: &CredentialEntry) -> f64 {
+    entry.health.recent_selection_count_5m as f64 + entry.in_flight_requests as f64
+}
+
+/// Whether a warming credential may take another request while ready credentials have room:
+/// its recent load must stay below `weight` times the load of an average ready credential it
+/// competes with. An idle warming credential (no selection in the window and nothing in
+/// flight) is always below a positive quota, so warmup keeps progressing, one request per
+/// window at least, when traffic is too sparse for the quota to reach a whole request, and on
+/// an idle pool. A zero weight leaves the credential to overflow traffic only.
+pub(super) fn warming_below_quota(
+    entry: &CredentialEntry,
+    weight: f64,
+    average_ready_load: f64,
+) -> bool {
+    let load = warmup_load(entry);
+    weight > 0.0 && (load <= 0.0 || load < weight * average_ready_load)
+}
+
+/// Whether the warming credentials together already carry their maximum share of the recent
+/// load: `credential_warmup_max_selection_percent`, raised as far as
+/// [`WARMUP_READY_OVERLOAD_LIMIT`] requires when few credentials are ready. A zero cap leaves
+/// warming credentials to overflow traffic only.
+pub(super) fn warming_group_at_cap(
     config: &Config,
     ready_count: usize,
     warming_count: usize,
-    total_recent: u64,
-    warming_recent: u64,
+    warming_load: f64,
+    total_load: f64,
 ) -> bool {
-    if warming_count == 0 {
-        return false;
-    }
-    if ready_count == 0 {
+    let configured = config.credential_warmup_max_selection_percent.min(100) as f64 / 100.0;
+    if configured <= 0.0 {
         return true;
     }
-    let target_share = warmup_target_share_with_config(config, warming_count);
-    if target_share <= 0.0 {
-        return false;
-    }
-    if total_recent == 0 {
-        return true;
-    }
-    let current_share = warming_recent as f64 / total_recent as f64;
-    current_share < target_share
+    let candidates = (ready_count + warming_count) as f64;
+    let overload_floor = 1.0 - WARMUP_READY_OVERLOAD_LIMIT * ready_count as f64 / candidates;
+    let max_share = configured.max(overload_floor);
+    total_load > 0.0 && warming_load >= max_share * total_load
 }
 
 pub(super) fn select_health_weighted<'a>(

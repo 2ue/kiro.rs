@@ -336,8 +336,9 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 | `credentialDispatchMaxWaitSecs` | `60` | 控制单个请求最多排队等待凭据可调度多久。`0` 表示不限制。过长会让过载时请求一直挂起。 |
 | `credentialSessionMaxConcurrentRequests` | `0` | 控制同一会话在单个凭据上最多同时跑几个请求，`0` 表示等于凭据上限。 |
 | `credentialInFlightLeaseMaxSecs` | `900` | 控制单个并发占用超过多久未活跃时自动释放。 |
-| `credentialWarmupRequests` | `3` | 控制新凭据预热剩余请求数。预热不会伪造成功次数，只降低被选中的概率。 |
-| `credentialWarmupSelectionPercent` | `5` | 控制 `balanced` 模式下预热凭据参与真实请求调度的概率百分比。 |
+| `credentialWarmupRequests` | `3` | 控制新凭据预热剩余请求数，每次真实请求成功减 1；号池较大时建议 20–30，让爬坡更平滑。预热不会伪造成功次数。 |
+| `credentialWarmupSelectionPercent` | `5` | 预热起始比例：新凭据起步流量 = 同档位就绪凭据平均流量 × 该百分比，随预热进度线性升到 100%。只在就绪凭据有余量时限流，就绪凭据全满时预热凭据照常接溢出流量。所有负载均衡模式都生效。 |
+| `credentialWarmupMaxSelectionPercent` | `50` | 所有预热凭据合计最多承接的近期流量比例；就绪凭据很少时自动放宽，避免就绪凭据被压到公平份额 2 倍以上。 |
 | `defaultEndpoint` | `ide` | 控制凭据未单独指定 `endpoint` 时走哪个 Kiro 端点；当前可选 `ide` / `cli`。 |
 
 ### 上游请求体防护

@@ -4687,7 +4687,7 @@ export function RuntimeConfigPanel() {
           <ConfigSection
             icon={<Sparkles className="h-4 w-4" />}
             title="新凭据预热"
-            description="预热不会伪造成功次数，只会让新账号在均衡模式下更少被选中，降低刚加入时的调用密度。"
+            description="号池有余量时，新账号从普通账号平均流量的一小部分起步，随预热进度逐步升到正常水平；普通账号全满时新账号照常接溢出流量。预热不会伪造成功次数。"
           >
             <NumberField
               title="预热剩余请求数"
@@ -4700,8 +4700,8 @@ export function RuntimeConfigPanel() {
               }
             />
             <NumberField
-              title="预热凭据参与概率"
-              description="每个预热凭据的目标参与比例。批量导入时会按预热账号数放大，但受下方总预热流量上限限制。"
+              title="预热起始比例"
+              description="新账号起步时的流量占同档位普通账号平均流量的百分比，随预热进度线性升到 100%。填 0 表示有普通账号可用时新账号只接溢出流量。"
               value={draft.credentialWarmupSelectionPercent}
               min={0}
               max={100}
@@ -4712,7 +4712,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="预热总流量上限"
-              description="当已有非预热账号可用时，所有预热账号合计最多承接的真实请求比例，避免批量导入新账号后过度抢流。"
+              description="当已有普通账号可用时，所有预热账号合计最多承接的近期请求比例，避免批量导入新账号后过度抢流。普通账号很少时会自动放宽，避免普通账号被压到公平份额 2 倍以上。"
               value={draft.credentialWarmupMaxSelectionPercent}
               min={0}
               max={100}

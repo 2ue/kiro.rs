@@ -15,7 +15,10 @@ use crate::model::config::Config;
 use super::account_state::CredentialEntry;
 use super::capacity::{credential_catalog_lists_model, effective_max_concurrent_requests};
 use super::degrade::is_suspended;
-use super::strategy::{select_health_weighted, should_select_warming_from_totals};
+use super::strategy::{
+    effective_warmup_weight, select_health_weighted, warming_below_quota, warming_group_at_cap,
+    warmup_load, warmup_weight_floor,
+};
 
 /// Load-balancing mode. Persisted as its snake_case name; unknown names are rejected when the
 /// configuration is validated instead of silently falling back to `priority`.
@@ -87,13 +90,15 @@ impl FromStr for LoadBalancingMode {
 /// Order of decisions:
 /// 1. Catalog preference: when any candidate's catalog lists the model, unknown-catalog
 ///    candidates are dropped.
-/// 2. Fast: only the highest Fast tier competes.
-/// 3. Priority mode: only the preferred priority tier (the lowest priority value that still
+/// 2. Degraded credentials are set aside while a healthy one is dispatchable.
+/// 3. Warmup quota: while a ready credential is dispatchable, a warming credential stays only
+///    below its quota (see [`retain_warmup_quota`]). This comes before the tiers, so a warming
+///    credential over its quota cannot make its Fast or priority tier the chosen one.
+/// 4. Fast: only the highest Fast tier competes.
+/// 5. Priority mode: only the preferred priority tier (the lowest priority value that still
 ///    has a dispatchable credential) competes. A full tier is simply absent from
 ///    `dispatchable`, so traffic overflows to the next tier in the same pick.
-/// 4. Warmup share: the warming or the ready group is chosen by target share, inside the
-///    tier chosen above, so warming credentials never pull traffic across tiers.
-/// 5. The mode orders the chosen group.
+/// 6. The mode orders what is left.
 ///
 /// `bound_sessions` maps a credential id to the number of sessions bound to it that were
 /// active in the last [`ACTIVE_SESSION_WINDOW_SECS`].
@@ -112,12 +117,12 @@ pub(crate) fn select_candidate<'a>(
     // 劣化摘除发生在档位筛选之前：被摘除的账号不再参与后面的 max(fast) 计算，
     // 于是流量自然溢出到同档位或其他档位的健康账号，而不是继续被它霸占。
     retain_non_degraded(&mut available, model, now_ms, config);
+    retain_warmup_quota(&mut available, config);
     retain_top_fast_tier(&mut available);
     if mode.fills_priority_tiers_in_order() {
         retain_preferred_priority_tier(&mut available);
     }
-    let candidates = warmup_group(available, config);
-    order_by_mode(mode, &candidates, model, now_ms, config, bound_sessions)
+    order_by_mode(mode, &available, model, now_ms, config, bound_sessions)
 }
 
 /// Sessions count as active on a credential for this long after their last request.
@@ -134,7 +139,7 @@ pub(crate) fn preferred_priority<'a>(
 }
 
 /// The tier a sticky binding lives in, used to decide whether a session should move up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct StickyTier {
     pub(crate) fast: u32,
     pub(crate) priority: u32,
@@ -243,28 +248,107 @@ fn retain_top_fast_tier(available: &mut Vec<&CredentialEntry>) {
     }
 }
 
-/// Real requests sample warming credentials at the configured target share, scaled by the
-/// number of warming credentials and capped by the maximum share.
-fn warmup_group<'a>(
-    available: Vec<&'a CredentialEntry>,
-    config: &Config,
-) -> Vec<&'a CredentialEntry> {
-    let recent = |entry: &CredentialEntry| entry.health.recent_selection_count_60s as u64;
-    let (warming, ready): (Vec<_>, Vec<_>) = available
-        .into_iter()
-        .partition(|entry| entry.warmup_remaining > 0);
-    let warming_recent = warming.iter().map(|entry| recent(entry)).sum::<u64>();
-    let total_recent = warming_recent + ready.iter().map(|entry| recent(entry)).sum::<u64>();
-    if should_select_warming_from_totals(
-        config,
-        ready.len(),
-        warming.len(),
-        total_recent,
-        warming_recent,
-    ) {
-        warming
-    } else {
-        ready
+/// Holds warming credentials to their warmup quota while a ready credential can take the
+/// request, so a new credential enters slowly when the pool has room and only takes more than
+/// its quota as overflow.
+///
+/// - No ready candidate (every ready credential is full, cooling down, rate limited, degraded
+///   or excluded): nothing is removed, the warming credentials take the traffic.
+/// - The warming credentials together at their maximum share of the recent load (see
+///   [`warming_group_at_cap`]): all of them are removed.
+/// - Otherwise each warming credential stays only while it is below its quota, measured
+///   against the average ready candidate of its own tier: same Fast and priority first, then
+///   same Fast, then every ready candidate.
+///
+/// When few ready candidates remain, the quotas and the group cap are relaxed so that warmup
+/// never pushes the ready credentials above [`WARMUP_READY_OVERLOAD_LIMIT`] times their fair
+/// share (see [`warmup_weight_floor`]).
+///
+/// This runs before the Fast and priority tiers are chosen: a warming credential over its
+/// quota does not make its tier the top one, so a new credential in a better tier ramps up
+/// instead of taking every request of that tier at once.
+///
+/// [`WARMUP_READY_OVERLOAD_LIMIT`]: super::strategy::WARMUP_READY_OVERLOAD_LIMIT
+fn retain_warmup_quota(available: &mut Vec<&CredentialEntry>, config: &Config) {
+    let warming_count = available
+        .iter()
+        .filter(|entry| entry.warmup_remaining > 0)
+        .count();
+    let ready_count = available.len() - warming_count;
+    if ready_count == 0 || warming_count == 0 {
+        return;
+    }
+    let (warming_load, total_load) =
+        available
+            .iter()
+            .fold((0.0, 0.0), |(warming, total), entry| {
+                let load = warmup_load(entry);
+                if entry.warmup_remaining > 0 {
+                    (warming + load, total + load)
+                } else {
+                    (warming, total + load)
+                }
+            });
+    if warming_group_at_cap(config, ready_count, warming_count, warming_load, total_load) {
+        available.retain(|entry| entry.warmup_remaining == 0);
+        return;
+    }
+    let floor = warmup_weight_floor(ready_count, warming_count);
+    let reference = ReadyLoadReference::new(available);
+    available.retain(|entry| {
+        entry.warmup_remaining == 0
+            || warming_below_quota(
+                entry,
+                effective_warmup_weight(config, entry.warmup_remaining, floor),
+                reference.average_for(entry),
+            )
+    });
+}
+
+/// Average warmup load of the ready candidates, per tier, used as the quota reference.
+struct ReadyLoadReference {
+    by_tier: HashMap<StickyTier, (f64, usize)>,
+    by_fast: HashMap<u32, (f64, usize)>,
+    pool: (f64, usize),
+}
+
+impl ReadyLoadReference {
+    fn new(available: &[&CredentialEntry]) -> Self {
+        let mut reference = Self {
+            by_tier: HashMap::new(),
+            by_fast: HashMap::new(),
+            pool: (0.0, 0),
+        };
+        for entry in available.iter().filter(|entry| entry.warmup_remaining == 0) {
+            let load = warmup_load(entry);
+            let add = |slot: &mut (f64, usize)| {
+                slot.0 += load;
+                slot.1 += 1;
+            };
+            add(reference
+                .by_tier
+                .entry(StickyTier::of(&entry.credentials))
+                .or_default());
+            add(reference.by_fast.entry(entry.credentials.fast).or_default());
+            add(&mut reference.pool);
+        }
+        reference
+    }
+
+    fn average_for(&self, entry: &CredentialEntry) -> f64 {
+        let average = |(sum, count): (f64, usize)| (count > 0).then(|| sum / count as f64);
+        self.by_tier
+            .get(&StickyTier::of(&entry.credentials))
+            .copied()
+            .and_then(average)
+            .or_else(|| {
+                self.by_fast
+                    .get(&entry.credentials.fast)
+                    .copied()
+                    .and_then(average)
+            })
+            .or_else(|| average(self.pool))
+            .unwrap_or(0.0)
     }
 }
 
@@ -537,5 +621,194 @@ mod tests {
             .set_load_balancing_mode("health_balanced".to_string())
             .unwrap();
         assert_eq!(manager.get_load_balancing_mode(), "health_balanced");
+    }
+
+    // ---- 预热配额 ----
+
+    /// 构造一个带负载的账号：`load` 记为近 5 分钟选中数。
+    fn warm_entry(id: u64, fast: u32, priority: u32, warmup: u32, load: u32) -> CredentialEntry {
+        let mut entry = test_entry(id, fast, 0.0);
+        entry.credentials.priority = priority;
+        entry.warmup_remaining = warmup;
+        entry.health.recent_selection_count_5m = load;
+        entry
+    }
+
+    fn warmup_config(requests: u32, start_percent: u32, max_percent: u32) -> Config {
+        let mut config = Config::default();
+        config.credential_warmup_requests = requests;
+        config.credential_warmup_selection_percent = start_percent;
+        config.credential_warmup_max_selection_percent = max_percent;
+        config
+    }
+
+    fn kept_ids(entries: &[CredentialEntry], config: &Config) -> Vec<u64> {
+        let mut available: Vec<&CredentialEntry> = entries.iter().collect();
+        retain_warmup_quota(&mut available, config);
+        available.iter().map(|entry| entry.id).collect()
+    }
+
+    /// 权重从起始比例线性爬升到 1，剩余次数越少越接近就绪账号。
+    #[test]
+    fn warmup_weight_ramps_from_start_to_full() {
+        let config = warmup_config(30, 10, 50);
+        let weight = |remaining| super::super::strategy::warmup_weight(&config, remaining);
+        assert!((weight(30) - 0.10).abs() < 1e-9);
+        assert!((weight(15) - 0.55).abs() < 1e-9);
+        assert!((weight(1) - (0.10 + 0.90 * 29.0 / 30.0)).abs() < 1e-9);
+        assert_eq!(weight(0), 1.0);
+        // 手动设置的剩余次数超过配置值时从起点开始，而不是越过终点。
+        assert!((weight(100) - 0.10).abs() < 1e-9);
+    }
+
+    /// 线上问题的回归：88 个就绪账号时，新账号不能拿到普通账号几倍的流量。
+    /// 旧逻辑给每个预热账号固定 5% 的总流量（≈ 普通账号的 4.4 倍），
+    /// 现在配额是普通账号平均负载的 5%，超出即让出。
+    #[test]
+    fn large_pool_does_not_overfeed_a_new_credential() {
+        let config = warmup_config(30, 5, 50);
+        let mut entries: Vec<CredentialEntry> =
+            (1..=88).map(|id| warm_entry(id, 0, 0, 0, 10)).collect();
+        // 新账号已经拿到 1 次，平均就绪负载 10，配额 0.5：必须让出。
+        entries.push(warm_entry(100, 0, 0, 30, 1));
+        assert!(!kept_ids(&entries, &config).contains(&100));
+        // 完全空闲时允许拿第 1 个请求，保证预热能推进。
+        entries.last_mut().unwrap().health.recent_selection_count_5m = 0;
+        assert!(kept_ids(&entries, &config).contains(&100));
+    }
+
+    /// 配额随进度放大：同样的负载，预热后期可以继续接，前期必须让出。
+    #[test]
+    fn quota_grows_with_warmup_progress() {
+        let config = warmup_config(30, 10, 50);
+        let mut entries: Vec<CredentialEntry> =
+            (1..=4).map(|id| warm_entry(id, 0, 0, 0, 10)).collect();
+        entries.push(warm_entry(9, 0, 0, 30, 5));
+        assert!(!kept_ids(&entries, &config).contains(&9), "起步配额 1 < 5");
+        entries.last_mut().unwrap().warmup_remaining = 3;
+        assert!(kept_ids(&entries, &config).contains(&9), "后期配额 9.1 > 5");
+    }
+
+    /// 在途请求计入负载：并发请求在选中记录前到达时，不能都看到「空闲的新账号」而一起涌入。
+    #[test]
+    fn in_flight_requests_count_against_the_quota() {
+        let config = warmup_config(30, 5, 50);
+        let mut entries: Vec<CredentialEntry> =
+            (1..=10).map(|id| warm_entry(id, 0, 0, 0, 10)).collect();
+        let mut warming = warm_entry(20, 0, 0, 30, 0);
+        warming.in_flight_requests = 1;
+        entries.push(warming);
+        assert!(!kept_ids(&entries, &config).contains(&20));
+    }
+
+    /// 就绪账号全满/冷却/限流（不在候选里）时，预热账号作为溢出容量照常接流量。
+    #[test]
+    fn warming_credentials_take_overflow_when_no_ready_one_is_dispatchable() {
+        let config = warmup_config(30, 5, 50);
+        let entries = [warm_entry(1, 0, 0, 30, 50), warm_entry(2, 0, 0, 30, 50)];
+        assert_eq!(kept_ids(&entries, &config), vec![1, 2]);
+    }
+
+    /// 起始比例为 0：有就绪账号时预热账号只做溢出容量，不主动接流量。
+    #[test]
+    fn zero_start_percent_keeps_warming_to_overflow_only() {
+        let config = warmup_config(30, 0, 50);
+        let entries = [warm_entry(1, 0, 0, 0, 10), warm_entry(2, 0, 0, 30, 0)];
+        assert_eq!(kept_ids(&entries, &config), vec![1]);
+    }
+
+    /// 总上限：批量导入大量新账号时，预热组合计不超过配置的总流量比例。
+    #[test]
+    fn group_cap_limits_a_large_warming_batch() {
+        let config = warmup_config(30, 100, 20);
+        // 10 个就绪账号各负载 2，8 个预热账号各负载 1：预热合计 8/28 ≈ 29% > 20%。
+        let mut entries: Vec<CredentialEntry> =
+            (1..=10).map(|id| warm_entry(id, 0, 0, 0, 2)).collect();
+        entries.extend((11..=18).map(|id| warm_entry(id, 0, 0, 30, 1)));
+        assert_eq!(kept_ids(&entries, &config), (1..=10).collect::<Vec<_>>());
+        // 总上限 0 同样表示只做溢出容量。
+        let config = warmup_config(30, 100, 0);
+        let entries = [warm_entry(1, 0, 0, 0, 10), warm_entry(2, 0, 0, 30, 0)];
+        assert_eq!(kept_ids(&entries, &config), vec![1]);
+    }
+
+    /// 全局容量配置变更会把整个号池打回预热。最先完成预热的少数账号不能因此变成热点：
+    /// 就绪账号的负载超过公平份额 2 倍时放宽预热配额和总上限。
+    #[test]
+    fn few_ready_credentials_relax_warmup_instead_of_becoming_hot_spots() {
+        let config = warmup_config(30, 5, 50);
+        // 1 个就绪账号负载 10，9 个预热账号各负载 3（预热合计 27/37 ≈ 73% > 50%）。
+        // 公平份额 10%，就绪账号最多 20%：总上限放宽到 80%，单账号权重下限 4/9。
+        let mut entries = vec![warm_entry(1, 0, 0, 0, 10)];
+        entries.extend((2..=10).map(|id| warm_entry(id, 0, 0, 30, 3)));
+        assert_eq!(kept_ids(&entries, &config), (1..=10).collect::<Vec<_>>());
+        // 负载达到下限 4/9 × 10 ≈ 4.4 后让出。
+        for entry in entries.iter_mut().skip(1) {
+            entry.health.recent_selection_count_5m = 5;
+        }
+        assert_eq!(kept_ids(&entries, &config), vec![1]);
+        let floor = super::super::strategy::warmup_weight_floor(1, 9);
+        assert!((floor - 4.0 / 9.0).abs() < 1e-9);
+        assert_eq!(super::super::strategy::warmup_weight_floor(88, 4), 0.0);
+    }
+
+    /// 更高 Fast 档的新账号：超出配额时不能把整个 Fast 档位拉成最优档、吃掉全部请求。
+    #[test]
+    fn warming_credential_in_a_better_fast_tier_ramps_up() {
+        let config = warmup_config(30, 5, 50);
+        let entries = [
+            warm_entry(1, 0, 0, 0, 10),
+            warm_entry(2, 0, 0, 0, 10),
+            warm_entry(3, 10, 0, 30, 1),
+        ];
+        let mut available: Vec<&CredentialEntry> = entries.iter().collect();
+        retain_warmup_quota(&mut available, &config);
+        retain_top_fast_tier(&mut available);
+        assert_eq!(
+            available.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "超配额的 Fast 预热号让出后，请求回到原档位"
+        );
+    }
+
+    /// 配额以同档位的就绪账号为参照：高 Fast 档就绪号负载高，预热号的配额跟着高档位走。
+    #[test]
+    fn quota_reference_is_the_same_tier() {
+        let config = warmup_config(30, 50, 100);
+        let entries = [
+            warm_entry(1, 0, 0, 0, 2),
+            warm_entry(2, 10, 0, 0, 40),
+            warm_entry(3, 10, 0, 30, 10),
+        ];
+        // 同档平均 40 × 0.5 = 20 > 10，保留；若按全池平均 21 × 0.5 = 10.5 也保留，
+        // 所以再把同档负载调低，确认用的是同档位而非全池。
+        assert!(kept_ids(&entries, &config).contains(&3));
+        let entries = [
+            warm_entry(1, 0, 0, 0, 100),
+            warm_entry(2, 10, 0, 0, 4),
+            warm_entry(3, 10, 0, 30, 3),
+        ];
+        assert!(
+            !kept_ids(&entries, &config).contains(&3),
+            "同档平均 4 × 0.5 = 2 < 3，必须让出（全池平均 52 会错误放行）"
+        );
+    }
+
+    /// 预热号所在档位没有就绪账号时，退回 Fast 档，再退回全池作参照。
+    #[test]
+    fn quota_reference_falls_back_when_the_tier_has_no_ready_credential() {
+        let config = warmup_config(30, 50, 100);
+        let entries = [warm_entry(1, 0, 0, 0, 10), warm_entry(2, 0, 10, 30, 4)];
+        assert!(kept_ids(&entries, &config).contains(&2), "4 < 10 × 0.5");
+        let entries = [warm_entry(1, 0, 0, 0, 10), warm_entry(2, 5, 10, 30, 6)];
+        assert!(!kept_ids(&entries, &config).contains(&2), "6 >= 10 × 0.5");
+    }
+
+    /// 全部完成预热后不再做任何过滤。
+    #[test]
+    fn no_warming_credential_changes_nothing() {
+        let config = warmup_config(30, 5, 50);
+        let entries = [warm_entry(1, 0, 0, 0, 10), warm_entry(2, 10, 5, 0, 0)];
+        assert_eq!(kept_ids(&entries, &config), vec![1, 2]);
     }
 }

@@ -1368,8 +1368,8 @@ export function RuntimePage() {
             {activeSection === 'warmup' && (
               <TwoCol>
                 <NumField label="预热请求数" desc="0 表示不预热" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={set('credentialWarmupRequests')} />
-                <NumField label="单个预热账号参与比例" desc="每次调度时该预热账号被选中的概率上限" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupSelectionPercent')} />
-                <NumField label="预热账号总占比上限" desc="所有预热中账号合计流量不超过此比例" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupMaxSelectionPercent')} />
+                <NumField label="预热起始比例" desc="新账号起步流量占同档位普通账号平均流量的比例，随预热进度升到 100%；普通账号全满时新账号照常接溢出流量" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupSelectionPercent')} />
+                <NumField label="预热账号总占比上限" desc="所有预热中账号合计流量不超过此比例；普通账号很少时自动放宽" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupMaxSelectionPercent')} />
               </TwoCol>
             )}
 

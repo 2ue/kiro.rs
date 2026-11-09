@@ -132,7 +132,8 @@ use super::storage_task::{
     block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
 };
 use super::strategy::{
-    entry_effective_health_mut, record_local_selection, refresh_local_selection_windows_locked,
+    effective_warmup_weight, entry_effective_health_mut, record_local_selection,
+    refresh_local_selection_windows_locked, warmup_weight_floor,
 };
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, DispatchAdmission,
@@ -6652,8 +6653,12 @@ impl MultiTokenManager {
             .fills_priority_tiers_in_order();
         let has_better_tier = {
             let entries = self.entries.lock();
+            // A warming credential does not pull bound sessions up: they would not bind to it
+            // (see `credential_accepts_session_binding`), so the move would only cost the session
+            // its bound credential for one request. Sessions move once the credential is ready.
             let is_better = |entry: &CredentialEntry| {
-                StickyTier::of(&entry.credentials).is_better_than(bound, compare_priority)
+                entry.warmup_remaining == 0
+                    && StickyTier::of(&entry.credentials).is_better_than(bound, compare_priority)
             };
             if !entries.iter().any(&is_better) {
                 return false;
@@ -6733,9 +6738,15 @@ impl MultiTokenManager {
             return None;
         }
         let bound_sessions = self.active_bound_session_counts();
-        let entries = self.entries.lock();
-        let proxy_resources = self.proxy_resources.lock();
+        let mut entries = self.entries.lock();
         let now = Instant::now();
+        // 预热配额读近 5 分钟选中数。没有 Redis 时本地窗口只在账号被选中时裁剪：一个暂时
+        // 超额、随后不再被选中的预热账号，计数会一直停在旧值，配额永远放不开。
+        // 有预热账号时先统一裁剪一次（有 Redis 时由同步刷新）。
+        if self.redis_store.is_none() && entries.iter().any(|entry| entry.warmup_remaining > 0) {
+            refresh_local_selection_windows_locked(&mut entries, now);
+        }
+        let proxy_resources = self.proxy_resources.lock();
         let config = self.runtime_config_snapshot();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
         let global_rpm = config.credential_rpm.unwrap_or(0);
@@ -6769,7 +6780,7 @@ impl MultiTokenManager {
             })
             .collect::<Vec<_>>();
         let mode = *self.load_balancing_mode.lock();
-        let entry = select_candidate(
+        let selection = select_candidate(
             mode,
             dispatchable,
             model,
@@ -6777,7 +6788,51 @@ impl MultiTokenManager {
             &config,
             &bound_sessions,
         )?;
-        Some((entry.id, entry.credentials.clone()))
+        Some((selection.id, selection.credentials.clone()))
+    }
+
+    /// 会话能否绑定到 `credential_id`。
+    ///
+    /// 绑定会把整段会话的后续请求都送到同一个账号，绕过按请求计算的预热配额，所以预热中的
+    /// 账号对绑定也按同一比例限量：它的活跃绑定会话数要低于「就绪账号（未禁用、支持该模型、
+    /// 不在预热）的平均活跃绑定会话数 × 预热权重」。超出时请求照常转发，只是不绑定，会话的
+    /// 下一次请求重新选号。
+    ///
+    /// 权重与请求配额一样受 [`warmup_weight_floor`] 兜底：全局容量配置变更会把所有账号重新
+    /// 打回预热，最先完成预热的少数账号不能因此独占新会话绑定。没有就绪账号时照常绑定。
+    fn credential_accepts_session_binding(&self, credential_id: u64, model: Option<&str>) -> bool {
+        let config = self.runtime_config_snapshot();
+        let bound_sessions = self.active_bound_session_counts();
+        let entries = self.entries.lock();
+        let Some(entry) = entries.iter().find(|entry| entry.id == credential_id) else {
+            return true;
+        };
+        if entry.warmup_remaining == 0 {
+            return true;
+        }
+        let bound = |id: u64| bound_sessions.get(&id).copied().unwrap_or(0) as u64;
+        let (ready_count, warming_count, ready_bound) = entries
+            .iter()
+            .filter(|entry| {
+                credential_is_usable_for_model(entry, model, &config.subscription_model_lists)
+            })
+            .fold((0usize, 0usize, 0u64), |(ready, warming, total), entry| {
+                if entry.warmup_remaining == 0 {
+                    (ready + 1, warming, total + bound(entry.id))
+                } else {
+                    (ready, warming + 1, total)
+                }
+            });
+        if ready_count == 0 {
+            return true;
+        }
+        let weight = effective_warmup_weight(
+            &config,
+            entry.warmup_remaining,
+            warmup_weight_floor(ready_count, warming_count.max(1)),
+        );
+        let average_ready_bound = ready_bound as f64 / ready_count as f64;
+        (bound(credential_id) as f64) < weight * average_ready_bound
     }
 
     /// Sessions bound to each credential that sent a request in the last
@@ -8484,6 +8539,11 @@ impl MultiTokenManager {
                                 self.bound_credential_is_permanently_unavailable(bound_id)
                             }
                         };
+                        // A binding to a new credential waits until its warmup is over; the
+                        // bound credential itself (bound_id == ctx.id) only refreshes its binding.
+                        let should_bind = should_bind
+                            && (request_bound_id == Some(ctx.id)
+                                || self.credential_accepts_session_binding(ctx.id, model));
                         if should_bind {
                             self.bind_session_to_credential_for_request(sid, ctx.id)
                                 .await;
