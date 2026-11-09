@@ -126,12 +126,16 @@ pub struct Bonus {
 }
 
 impl Bonus {
-    /// 检查 bonus 是否处于激活状态
-    pub fn is_active(&self) -> bool {
+    /// 本周期内仍算在账号额度里：激活中，或已用完（`EXHAUSTED`）。
+    ///
+    /// 用完的赠送积分仍是这个周期发放过、也确实用掉的额度。只认 `ACTIVE` 时，
+    /// 赠送积分一用完，它的上限和已用会一起从总数里消失：Pro 账号用完前显示
+    /// 745 + 500 = 1245，用完后却变成 745/745（59138 2026-11-09，上游原始响应
+    /// `"status": "EXHAUSTED"`）。过期（`EXPIRED`）等其他状态不计入。
+    pub fn counts_toward_period(&self) -> bool {
         self.status
             .as_deref()
-            .map(|s| s == "ACTIVE")
-            .unwrap_or(false)
+            .is_some_and(|s| s == "ACTIVE" || s == "EXHAUSTED")
     }
 }
 
@@ -249,7 +253,7 @@ impl UsageLimitsResponse {
 
     /// 获取总使用限额（精确值）
     ///
-    /// 累加基础额度、激活的免费试用额度和激活的奖励额度
+    /// 累加基础额度、激活的免费试用额度和本周期的奖励额度（激活中或已用完）
     pub fn usage_limit(&self) -> f64 {
         let Some(breakdown) = self.primary_breakdown() else {
             return 0.0;
@@ -264,9 +268,9 @@ impl UsageLimitsResponse {
             }
         }
 
-        // 累加激活的 bonus 额度
+        // 累加本周期的 bonus 额度（激活中或已用完）
         for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
+            if bonus.counts_toward_period() {
                 total += bonus.usage_limit;
             }
         }
@@ -274,7 +278,7 @@ impl UsageLimitsResponse {
         total
     }
 
-    /// 获取激活的奖励额度总额。
+    /// 获取本周期的奖励额度总额（激活中或已用完）。
     pub fn active_bonus_limit(&self) -> f64 {
         let Some(breakdown) = self.primary_breakdown() else {
             return 0.0;
@@ -283,14 +287,14 @@ impl UsageLimitsResponse {
         breakdown
             .bonuses
             .iter()
-            .filter(|bonus| bonus.is_active())
+            .filter(|bonus| bonus.counts_toward_period())
             .map(|bonus| bonus.usage_limit)
             .sum()
     }
 
     /// 获取总当前使用量（精确值）
     ///
-    /// 累加基础使用量、激活的免费试用使用量和激活的奖励使用量
+    /// 累加基础使用量、激活的免费试用使用量和本周期的奖励使用量（激活中或已用完）
     pub fn current_usage(&self) -> f64 {
         let Some(breakdown) = self.primary_breakdown() else {
             return 0.0;
@@ -305,9 +309,9 @@ impl UsageLimitsResponse {
             }
         }
 
-        // 累加激活的 bonus 使用量
+        // 累加本周期的 bonus 使用量（激活中或已用完）
         for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
+            if bonus.counts_toward_period() {
                 total += bonus.current_usage;
             }
         }
@@ -345,6 +349,48 @@ mod tests {
         assert_eq!(parsed.overage_cap(), 10.0);
         assert_eq!(parsed.overage_rate(), 0.04);
         assert_eq!(parsed.current_overages(), 0.12);
+    }
+
+    /// 59138 2026-11-09 #2677 的上游原始响应（字段裁剪）：Pro 订阅 745 + 赠送 500，
+    /// 赠送积分已用完，状态为 EXHAUSTED。
+    #[test]
+    fn exhausted_bonus_still_counts_toward_limit_and_usage() {
+        let raw = r#"{
+            "subscriptionInfo": {"subscriptionTitle": "KIRO PRO"},
+            "usageBreakdownList": [{
+                "bonuses": [{
+                    "bonusType": "FIRST_UPGRADE_TRIAL",
+                    "currentUsage": 500.0,
+                    "status": "EXHAUSTED",
+                    "usageLimit": 500.0
+                }],
+                "currentUsageWithPrecision": 745.0,
+                "usageLimitWithPrecision": 745.0
+            }]
+        }"#;
+        let parsed: UsageLimitsResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.usage_limit(), 1_245.0);
+        assert_eq!(parsed.current_usage(), 1_245.0);
+        assert_eq!(parsed.active_bonus_limit(), 500.0);
+
+        // 用完前：赠送积分 ACTIVE，同样计入。
+        let active = raw
+            .replace("\"EXHAUSTED\"", "\"ACTIVE\"")
+            .replace("\"currentUsage\": 500.0", "\"currentUsage\": 0.0")
+            .replace(
+                "\"currentUsageWithPrecision\": 745.0",
+                "\"currentUsageWithPrecision\": 69.0",
+            );
+        let parsed: UsageLimitsResponse = serde_json::from_str(&active).unwrap();
+        assert_eq!(parsed.usage_limit(), 1_245.0);
+        assert_eq!(parsed.current_usage(), 69.0);
+
+        // 过期的赠送积分不再计入。
+        let expired = raw.replace("\"EXHAUSTED\"", "\"EXPIRED\"");
+        let parsed: UsageLimitsResponse = serde_json::from_str(&expired).unwrap();
+        assert_eq!(parsed.usage_limit(), 745.0);
+        assert_eq!(parsed.current_usage(), 745.0);
+        assert_eq!(parsed.active_bonus_limit(), 0.0);
     }
 
     #[test]
