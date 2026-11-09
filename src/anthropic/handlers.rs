@@ -70,17 +70,17 @@ use super::prompt_cache::{
 };
 use super::request_admission::{RequestRejectionAttribution, RequestRejectionReason};
 use super::request_body::MessagesBody;
+use super::request_facts::{
+    EffortRewrite, RawMessagesBodyProbe, deserialize_messages_request_with_probe,
+    normalize_raw_client_reasoning_aliases_with_switches,
+    normalize_raw_reasoning_protocol_with_probe_and_limit, probe_raw_messages_body,
+    rewrite_raw_missing_top_level_max_tokens_with_probe,
+    validate_raw_reasoning_protocol_with_probe,
+};
 #[cfg(test)]
 use super::request_facts::{
     MAX_MESSAGES_JSON_NESTING_DEPTH, normalize_raw_reasoning_protocol_with_probe,
     validate_raw_reasoning_protocol,
-};
-use super::request_facts::{
-    RawMessagesBodyProbe, deserialize_messages_request_with_probe,
-    normalize_raw_client_reasoning_aliases_with_probe,
-    normalize_raw_reasoning_protocol_with_probe_and_limit, probe_raw_messages_body,
-    rewrite_raw_missing_top_level_max_tokens_with_probe,
-    validate_raw_reasoning_protocol_with_probe,
 };
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
@@ -1020,6 +1020,7 @@ struct RequestRuntimeConfig {
     route_features: RouteFeaturesConfig,
     claude_models_only: bool,
     missing_max_tokens: MissingMaxTokensConfig,
+    local_request_compat: crate::model::config::LocalRequestCompatConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
     request_capture: crate::model::config::RequestCaptureConfig,
@@ -1103,6 +1104,7 @@ impl RequestRuntimeConfig {
             route_features: RouteFeaturesConfig::clone(&state.route_features).normalized(),
             claude_models_only: state.claude_models_only,
             missing_max_tokens: state.missing_max_tokens.normalized(),
+            local_request_compat: crate::model::config::LocalRequestCompatConfig::default(),
             payload_shaping: state.payload_shaping,
             external_pools: ExternalPoolsConfig::clone(&state.external_pools),
             request_capture: crate::model::config::RequestCaptureConfig::default(),
@@ -1212,6 +1214,7 @@ impl RequestRuntimeConfig {
             route_features: config.route_features.clone().normalized(),
             claude_models_only: config.claude_models_only,
             missing_max_tokens: config.missing_max_tokens.normalized(),
+            local_request_compat: config.local_request_compat,
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
             request_capture: config.request_capture.normalized(),
@@ -10741,6 +10744,31 @@ async fn read_non_stream_body_with_first_output_deadline(
 /// content block (it resets their idle timer and passes through buffering proxies);
 /// otherwise, and whenever no block is open, a standard `ping` is sent. No synthetic
 /// content block is ever opened just to carry a keepalive.
+/// Sets every token count in the `message_start` usage to 0, keeping the field shape (cache and
+/// tier fields included) so clients that read it do not break.
+fn zero_message_start_usage(events: &mut [SseEvent]) {
+    for event in events
+        .iter_mut()
+        .filter(|event| event.event == "message_start")
+    {
+        if let Some(usage) = event
+            .data
+            .get_mut("message")
+            .and_then(|message| message.get_mut("usage"))
+        {
+            zero_usage_numbers(usage);
+        }
+    }
+}
+
+fn zero_usage_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(_) => *value = serde_json::Value::from(0),
+        serde_json::Value::Object(map) => map.values_mut().for_each(zero_usage_numbers),
+        _ => {}
+    }
+}
+
 fn keepalive_sse_bytes(ctx: &StreamContext, noop_delta_keepalive: bool) -> Bytes {
     if noop_delta_keepalive && let Some(event) = ctx.claude_code_noop_delta_keepalive_event() {
         tracing::trace!("发送空 delta 保活事件");
@@ -13002,6 +13030,18 @@ fn create_sse_stream(
                             attempt = state.attempt_number,
                             "首输出前静默保留窗口已到，开始向客户端下发 message_start 与保活"
                         );
+                        // 保留期一过就得先发 200 和 message_start，之后若上游空回，下游唯一能
+                        // 看到的 usage 就是这里的输入估算，接入方可能据此计费。按开关把它清零，
+                        // 正常请求的最终 usage 仍以 message_delta 为准。
+                        let zero_usage = state.retry_plan.as_ref().is_some_and(|plan| {
+                            plan.provider
+                                .runtime_config_snapshot()
+                                .local_request_compat
+                                .zero_usage_on_hold_expired_message_start
+                        });
+                        if zero_usage {
+                            zero_message_start_usage(&mut state.initial_events);
+                        }
                         state.retry_plan = None;
                         let keepalive = keepalive_sse_bytes(&state.ctx, state.noop_delta_keepalive);
                         let bytes = prepend_initial_bytes_if_needed(&mut state, vec![Ok(keepalive)], true);

@@ -547,58 +547,171 @@ const COMPATIBLE_THINKING_TYPE_ALIASES: &[(&str, &str)] = &[
     ("between_tools", "adaptive"),
 ];
 
+/// What [`normalize_raw_client_reasoning_aliases_with_switches`] did to `output_config.effort`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffortRewrite {
+    /// `"none"`: no explicit effort.
+    DroppedNone,
+    /// Case or whitespace fixed, e.g. `" High "` → `high`.
+    Normalized {
+        original: String,
+        normalized: &'static str,
+    },
+    /// Empty or unknown value dropped; the request continues without an explicit effort.
+    DroppedUnknown { original: String },
+}
+
+/// The rewritten body plus what was changed, so the caller can log or record the original value.
+#[derive(Debug)]
+pub(crate) struct ReasoningAliasRewrite {
+    pub(crate) body: Bytes,
+    pub(crate) effort: Option<EffortRewrite>,
+    pub(crate) thinking_type: Option<(String, &'static str)>,
+}
+
+/// Longest original effort value kept in logs and records.
+const MAX_RECORDED_EFFORT_CHARS: usize = 64;
+
+/// The client's `output_config.effort`, truncated, for recording why a request was rejected.
+/// `None` when there is no string effort or the field cannot be read safely.
+pub(crate) fn raw_output_effort_for_record(
+    raw_body: &Bytes,
+    probe: &RawMessagesBodyProbe,
+) -> Option<String> {
+    if !probe.matches_body(raw_body) {
+        return None;
+    }
+    match parse_bounded_protocol_value(raw_body, probe.output_config_value_span.as_ref()) {
+        Ok(Some(serde_json::Value::Object(output_config))) => output_config
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(bounded_effort),
+        _ => None,
+    }
+}
+
+fn bounded_effort(value: &str) -> String {
+    value.chars().take(MAX_RECORDED_EFFORT_CHARS).collect()
+}
+
+/// Decides what to do with a string `output_config.effort` under the given switches.
+/// `None` leaves the value alone (valid, or the switch that would handle it is off).
+fn effort_rewrite(
+    effort: &str,
+    switches: &crate::model::config::LocalRequestCompatConfig,
+) -> Option<EffortRewrite> {
+    if crate::anthropic::types::parse_thinking_effort(effort).is_some() {
+        return None;
+    }
+    let trimmed = effort.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        return switches
+            .drop_effort_none
+            .then_some(EffortRewrite::DroppedNone);
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if let Some(normalized) = crate::anthropic::types::parse_thinking_effort(&lowered) {
+        return switches
+            .normalize_effort_case
+            .then(|| EffortRewrite::Normalized {
+                original: bounded_effort(effort),
+                normalized,
+            });
+    }
+    switches
+        .drop_unknown_effort
+        .then(|| EffortRewrite::DroppedUnknown {
+            original: bounded_effort(effort),
+        })
+}
+
 /// Rewrites client reasoning controls that newer Claude Code versions send but the entry
 /// validator does not accept, so the request continues instead of failing with
-/// `invalid_reasoning_protocol`:
-/// - `output_config.effort: "none"` means "no explicit effort" and is dropped.
-/// - `thinking.type` aliases in [`COMPATIBLE_THINKING_TYPE_ALIASES`] map to a supported type.
-///
-/// Duplicate fields and duplicate keys are left untouched for the strict validator.
+/// `invalid_reasoning_protocol`. Kept for callers and tests that want every rewrite on.
+#[cfg(test)]
 pub(crate) fn normalize_raw_client_reasoning_aliases_with_probe(
     raw_body: &Bytes,
     probe: &RawMessagesBodyProbe,
 ) -> Result<Option<Bytes>, String> {
+    normalize_raw_client_reasoning_aliases_with_switches(
+        raw_body,
+        probe,
+        &crate::model::config::LocalRequestCompatConfig::default(),
+    )
+    .map(|rewrite| rewrite.map(|rewrite| rewrite.body))
+}
+
+/// Rewrites client reasoning controls the entry validator does not accept, each behind its own
+/// `localRequestCompat` switch:
+/// - `output_config.effort: "none"` is dropped (`dropEffortNone`).
+/// - Effort with odd case or whitespace becomes the canonical value (`normalizeEffortCase`).
+/// - Empty or unknown effort is dropped (`dropUnknownEffort`).
+/// - `thinking.type` aliases in [`COMPATIBLE_THINKING_TYPE_ALIASES`] map to a supported type
+///   (`thinkingTypeAliases`).
+///
+/// A switch that is off leaves its case for the strict validator. Duplicate fields and duplicate
+/// keys are always left untouched for the strict validator.
+pub(crate) fn normalize_raw_client_reasoning_aliases_with_switches(
+    raw_body: &Bytes,
+    probe: &RawMessagesBodyProbe,
+    switches: &crate::model::config::LocalRequestCompatConfig,
+) -> Result<Option<ReasoningAliasRewrite>, String> {
     if !probe.matches_body(raw_body) {
         return Err("raw request probe does not match the request body snapshot".to_string());
     }
+    if !switches.rewrites_reasoning_aliases() {
+        return Ok(None);
+    }
     let mut replacements = Vec::with_capacity(2);
+    let mut effort_change = None;
+    let mut thinking_type_change = None;
 
     if !probe.duplicate_output_config_field
         && let Some(span) = probe.output_config_value_span.as_ref()
         && !json_object_has_duplicate_keys(&raw_body[span.clone()])?
         && let Some(serde_json::Value::Object(mut output_config)) =
             parse_bounded_protocol_value(raw_body, Some(span))?
-        && output_config
+        && let Some(rewrite) = output_config
             .get("effort")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|effort| effort.trim().eq_ignore_ascii_case("none"))
+            .and_then(|effort| effort_rewrite(effort, switches))
     {
-        output_config.remove("effort");
+        match &rewrite {
+            EffortRewrite::Normalized { normalized, .. } => {
+                output_config.insert("effort".to_string(), serde_json::Value::from(*normalized));
+            }
+            EffortRewrite::DroppedNone | EffortRewrite::DroppedUnknown { .. } => {
+                output_config.remove("effort");
+            }
+        }
         let encoded = serde_json::to_vec(&serde_json::Value::Object(output_config))
             .map_err(|error| format!("failed to serialize normalized output_config: {error}"))?;
         replacements.push((span.clone(), encoded));
+        effort_change = Some(rewrite);
     }
 
-    if !probe.duplicate_thinking_field
+    if switches.thinking_type_aliases
+        && !probe.duplicate_thinking_field
         && let Some(span) = probe.thinking_value_span.as_ref()
         && !json_object_has_duplicate_keys(&raw_body[span.clone()])?
         && let Some(serde_json::Value::Object(mut thinking)) =
             parse_bounded_protocol_value(raw_body, Some(span))?
-        && let Some(target) = thinking
+        && let Some((original, target)) = thinking
             .get("type")
             .and_then(serde_json::Value::as_str)
             .and_then(|thinking_type| {
-                let thinking_type = thinking_type.trim().to_ascii_lowercase();
+                let lowered = thinking_type.trim().to_ascii_lowercase();
                 COMPATIBLE_THINKING_TYPE_ALIASES
                     .iter()
-                    .find(|(alias, _)| *alias == thinking_type)
-                    .map(|(_, target)| *target)
+                    .find(|(alias, _)| *alias == lowered)
+                    .map(|(_, target)| (bounded_effort(thinking_type), *target))
             })
     {
         thinking.insert("type".to_string(), serde_json::Value::from(target));
         let encoded = serde_json::to_vec(&serde_json::Value::Object(thinking))
             .map_err(|error| format!("failed to serialize normalized thinking: {error}"))?;
         replacements.push((span.clone(), encoded));
+        thinking_type_change = Some((original, target));
     }
 
     if replacements.is_empty() {
@@ -613,7 +726,11 @@ pub(crate) fn normalize_raw_client_reasoning_aliases_with_probe(
         cursor = span.end;
     }
     out.extend_from_slice(&raw_body[cursor..]);
-    Ok(Some(Bytes::from(out)))
+    Ok(Some(ReasoningAliasRewrite {
+        body: Bytes::from(out),
+        effort: effort_change,
+        thinking_type: thinking_type_change,
+    }))
 }
 
 fn parse_bounded_protocol_value(
@@ -1463,9 +1580,9 @@ mod tests {
         assert!(value["output_config"].get("effort").is_none());
         assert_eq!(value["output_config"]["format"]["type"], "json_schema");
 
+        // 未知值（"bogus"）由 dropUnknownEffort 处理，见 effort_case_and_unknown_values_follow_their_switches。
         for untouched in [
             br#"{"model":"m","output_config":{"effort":"high"},"messages":[]}"#.as_slice(),
-            br#"{"model":"m","output_config":{"effort":"bogus"},"messages":[]}"#.as_slice(),
             br#"{"model":"m","messages":[]}"#.as_slice(),
         ] {
             let raw = Bytes::copy_from_slice(untouched);
@@ -1481,8 +1598,166 @@ mod tests {
         );
         assert!(
             validate_raw_reasoning_protocol(&bogus).is_err(),
-            "unknown efforts still fail"
+            "the strict validator itself still rejects unknown efforts"
         );
+    }
+
+    fn rewrite_with(
+        raw: &'static [u8],
+        switches: crate::model::config::LocalRequestCompatConfig,
+    ) -> Option<ReasoningAliasRewrite> {
+        let raw = Bytes::from_static(raw);
+        let probe = probe_raw_messages_body(&raw);
+        normalize_raw_client_reasoning_aliases_with_switches(&raw, &probe, &switches)
+            .expect("normalize")
+    }
+
+    /// 线上 11-04～11-06 有 19 次 `output_config.effort must be one of` 拒绝；新开关把大小写不规范
+    /// 的改成标准值，空串和不认识的值删掉按未指定处理，不再拒绝。
+    #[test]
+    fn effort_case_and_unknown_values_follow_their_switches() {
+        let defaults = crate::model::config::LocalRequestCompatConfig::default();
+        let rewrite = rewrite_with(
+            br#"{"model":"m","output_config":{"effort":" High ","format":{"type":"json_schema"}},"messages":[]}"#,
+            defaults,
+        )
+        .expect("case normalized");
+        let value: serde_json::Value = serde_json::from_slice(&rewrite.body).unwrap();
+        assert_eq!(value["output_config"]["effort"], "high");
+        assert_eq!(value["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(
+            rewrite.effort,
+            Some(EffortRewrite::Normalized {
+                original: " High ".to_string(),
+                normalized: "high",
+            })
+        );
+        validate_raw_reasoning_protocol(&rewrite.body).expect("validates");
+
+        for (raw, original) in [
+            (
+                br#"{"model":"m","output_config":{"effort":""},"messages":[]}"#.as_slice(),
+                "",
+            ),
+            (
+                br#"{"model":"m","output_config":{"effort":"auto"},"messages":[]}"#.as_slice(),
+                "auto",
+            ),
+            (
+                br#"{"model":"m","output_config":{"effort":"minimal"},"messages":[]}"#.as_slice(),
+                "minimal",
+            ),
+        ] {
+            let raw = Bytes::copy_from_slice(raw);
+            let probe = probe_raw_messages_body(&raw);
+            let rewrite =
+                normalize_raw_client_reasoning_aliases_with_switches(&raw, &probe, &defaults)
+                    .expect("normalize")
+                    .expect("unknown effort dropped");
+            let value: serde_json::Value = serde_json::from_slice(&rewrite.body).unwrap();
+            assert!(
+                value["output_config"].get("effort").is_none(),
+                "{original:?}"
+            );
+            assert_eq!(
+                rewrite.effort,
+                Some(EffortRewrite::DroppedUnknown {
+                    original: original.to_string()
+                })
+            );
+            validate_raw_reasoning_protocol(&rewrite.body).expect("validates");
+        }
+
+        // 开关关掉：这些写法原样交给严格校验，照旧 400。
+        let strict = crate::model::config::LocalRequestCompatConfig {
+            normalize_effort_case: false,
+            drop_unknown_effort: false,
+            ..defaults
+        };
+        for raw in [
+            br#"{"model":"m","output_config":{"effort":"High"},"messages":[]}"#.as_slice(),
+            br#"{"model":"m","output_config":{"effort":"auto"},"messages":[]}"#.as_slice(),
+        ] {
+            let raw = Bytes::copy_from_slice(raw);
+            let probe = probe_raw_messages_body(&raw);
+            assert!(
+                normalize_raw_client_reasoning_aliases_with_switches(&raw, &probe, &strict)
+                    .expect("normalize")
+                    .is_none()
+            );
+            assert!(validate_raw_reasoning_protocol(&raw).is_err());
+            assert!(raw_output_effort_for_record(&raw, &probe).is_some());
+        }
+        // 合法值从不改写。
+        assert!(
+            rewrite_with(
+                br#"{"model":"m","output_config":{"effort":"max"},"messages":[]}"#,
+                defaults
+            )
+            .is_none()
+        );
+        // 非字符串 effort 不在这里处理，交给严格校验报 must be a string。
+        assert!(
+            rewrite_with(
+                br#"{"model":"m","output_config":{"effort":3},"messages":[]}"#,
+                defaults
+            )
+            .is_none()
+        );
+    }
+
+    /// 已有的两项兼容各自可关；关掉后行为与严格校验一致，打开（默认）与之前完全相同。
+    #[test]
+    fn existing_reasoning_aliases_can_be_switched_off() {
+        let defaults = crate::model::config::LocalRequestCompatConfig::default();
+        let none_off = crate::model::config::LocalRequestCompatConfig {
+            drop_effort_none: false,
+            ..defaults
+        };
+        // drop_unknown_effort 也开着，但 "none" 只归 drop_effort_none 管。
+        assert!(
+            rewrite_with(
+                br#"{"model":"m","output_config":{"effort":"none"},"messages":[]}"#,
+                none_off
+            )
+            .is_none()
+        );
+        let aliases_off = crate::model::config::LocalRequestCompatConfig {
+            thinking_type_aliases: false,
+            ..defaults
+        };
+        assert!(
+            rewrite_with(
+                br#"{"model":"m","max_tokens":4096,"thinking":{"type":"between_tools"},"messages":[]}"#,
+                aliases_off
+            )
+            .is_none()
+        );
+        let all_off = crate::model::config::LocalRequestCompatConfig {
+            drop_effort_none: false,
+            thinking_type_aliases: false,
+            normalize_effort_case: false,
+            drop_unknown_effort: false,
+            ..defaults
+        };
+        assert!(!all_off.rewrites_reasoning_aliases());
+        assert!(
+            rewrite_with(
+                br#"{"model":"m","output_config":{"effort":"none"},"thinking":{"type":"between_tools"},"messages":[]}"#,
+                all_off
+            )
+            .is_none()
+        );
+        let rewrite = rewrite_with(
+            br#"{"model":"m","max_tokens":4096,"thinking":{"type":"Between_Tools"},"messages":[]}"#,
+            defaults,
+        )
+        .expect("alias rewritten");
+        assert_eq!(
+            rewrite.thinking_type,
+            Some(("Between_Tools".to_string(), "adaptive"))
+        );
+        assert_eq!(rewrite.effort, None);
     }
 
     #[test]

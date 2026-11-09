@@ -35,6 +35,7 @@ import {
   defaultBodyConversion,
   defaultExternalPoolsConfig,
   defaultMissingMaxTokens,
+  defaultLocalRequestCompat,
   defaultRequestCapture,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
@@ -44,6 +45,7 @@ import {
   normalizeBodyConversion,
   normalizeImageProcessing,
   normalizeMissingMaxTokens,
+  normalizeLocalRequestCompat,
   normalizeRequestCapture,
   normalizeModelMapping,
   normalizePayloadShaping,
@@ -84,6 +86,7 @@ type RuntimeSectionKey =
   | 'modelMapping'
   | 'startupProxy'
   | 'compat'
+  | 'requestCompat'
 
 const runtimeSections: Array<{
   key: RuntimeSectionKey
@@ -101,6 +104,7 @@ const runtimeSections: Array<{
   { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
   { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
   { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
+  { key: 'requestCompat', title: '参数兼容', desc: '客户端参数写法不规范时改写还是拒绝', icon: <Wand2 className="h-4 w-4" /> },
 ]
 
 // ─── 原子组件 ──────────────────────────────────────────────────────────────────
@@ -393,6 +397,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     promptInjection: normalizePromptInjection(draft.promptInjection),
     routeFeatures: normalizeRouteFeatures(draft.routeFeatures),
     missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
+    localRequestCompat: normalizeLocalRequestCompat(draft.localRequestCompat),
     requestCapture: normalizeRequestCapture(draft.requestCapture),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
@@ -520,6 +525,7 @@ export function RuntimePage() {
         promptInjection: normalizePromptInjection(config.data.promptInjection),
         routeFeatures: normalizeRouteFeatures(config.data.routeFeatures),
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens ?? defaultMissingMaxTokens()),
+        localRequestCompat: normalizeLocalRequestCompat(config.data.localRequestCompat),
         requestCapture: normalizeRequestCapture(config.data.requestCapture),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         externalPools: {
@@ -597,6 +603,12 @@ export function RuntimePage() {
         ...prev.missingMaxTokens,
         [k]: v,
       },
+    }))
+
+  const setLocalRequestCompat = (k: keyof RuntimeConfig['localRequestCompat']) => (v: boolean) =>
+    setDraft((prev) => ({
+      ...prev,
+      localRequestCompat: { ...defaultLocalRequestCompat(), ...prev.localRequestCompat, [k]: v },
     }))
 
   const setRequestCapture = <K extends keyof RuntimeConfig['requestCapture']>(k: K) => (v: RuntimeConfig['requestCapture'][K]) =>
@@ -1584,6 +1596,69 @@ export function RuntimePage() {
 
             {activeSection === 'startupProxy' && (
               <StartupProxySection config={draft} />
+            )}
+
+            {activeSection === 'requestCompat' && (
+              <div className="space-y-4">
+                <p className="text-xs leading-5 text-muted-foreground">
+                  客户端发了严格校验不收的写法时：开着就改写后继续，关掉就按协议拒绝（多数返回 400）。
+                  改写在请求入口、选路之前完成。前五项是已有行为，默认开着，与之前一致。
+                </p>
+                <div className="text-sm font-semibold text-foreground">已有兼容</div>
+                <TwoCol>
+                  <TogField
+                    label="effort 为 none 时删除"
+                    desc={'output_config.effort 写成 "none"（不区分大小写）时视为未指定，删掉该字段。'}
+                    checked={draft.localRequestCompat.dropEffortNone}
+                    onChange={setLocalRequestCompat('dropEffortNone')}
+                  />
+                  <TogField
+                    label="thinking 类型别名"
+                    desc="thinking.type 为 between_tools 时改成 adaptive。"
+                    checked={draft.localRequestCompat.thinkingTypeAliases}
+                    onChange={setLocalRequestCompat('thinkingTypeAliases')}
+                  />
+                  <TogField
+                    label="修复 thinking 预算"
+                    desc="预算与 max_tokens 不匹配时自动修复：过小抬到 1024，超出时扩大 max_tokens 或收紧预算；adaptive / disabled 去掉 budget_tokens。"
+                    checked={draft.localRequestCompat.repairThinkingBudget}
+                    onChange={setLocalRequestCompat('repairThinkingBudget')}
+                  />
+                  <TogField
+                    label="归一非标准消息角色"
+                    desc="messages 里的 system / developer 并入系统提示词，其他未知角色丢弃。"
+                    checked={draft.localRequestCompat.normalizeMessageRoles}
+                    onChange={setLocalRequestCompat('normalizeMessageRoles')}
+                  />
+                  <TogField
+                    label="归一消息内容形状"
+                    desc="content 为数字、布尔、null、单个对象，或数组里有非对象元素时，转成标准的文本或块列表。"
+                    checked={draft.localRequestCompat.normalizeMessageContent}
+                    onChange={setLocalRequestCompat('normalizeMessageContent')}
+                  />
+                </TwoCol>
+                <div className="border-t border-border/70 pt-4 text-sm font-semibold text-foreground">新增兼容</div>
+                <TwoCol>
+                  <TogField
+                    label="effort 大小写纠正"
+                    desc={'output_config.effort 大小写或首尾空白不规范时改成标准值，例如 " High " 改为 high。'}
+                    checked={draft.localRequestCompat.normalizeEffortCase}
+                    onChange={setLocalRequestCompat('normalizeEffortCase')}
+                  />
+                  <TogField
+                    label="未知 effort 删除"
+                    desc="output_config.effort 为空串或不认识的值时删掉，按未指定处理，不再返回 400。关掉时拒绝记录会带上客户端传的原值。"
+                    checked={draft.localRequestCompat.dropUnknownEffort}
+                    onChange={setLocalRequestCompat('dropUnknownEffort')}
+                  />
+                  <TogField
+                    label="保留期后 message_start 不带用量"
+                    desc="流式请求超过首输出静默保留期时会先发出 message_start；打开后它的 usage 全为 0，空回不会留下可计费的用量。正常请求的最终用量仍以 message_delta 为准。"
+                    checked={draft.localRequestCompat.zeroUsageOnHoldExpiredMessageStart}
+                    onChange={setLocalRequestCompat('zeroUsageOnHoldExpiredMessageStart')}
+                  />
+                </TwoCol>
+              </div>
             )}
 
             {activeSection === 'compat' && (

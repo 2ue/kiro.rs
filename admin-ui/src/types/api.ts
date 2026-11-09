@@ -2114,6 +2114,17 @@ export interface MissingMaxTokensConfig {
 }
 
 /** Targeted request capture for offline replay (files under `dir`, off by default). */
+export interface LocalRequestCompatConfig {
+  dropEffortNone: boolean
+  thinkingTypeAliases: boolean
+  repairThinkingBudget: boolean
+  normalizeMessageRoles: boolean
+  normalizeMessageContent: boolean
+  normalizeEffortCase: boolean
+  dropUnknownEffort: boolean
+  zeroUsageOnHoldExpiredMessageStart: boolean
+}
+
 export interface RequestCaptureConfig {
   enabled: boolean
   dir: string
@@ -2256,6 +2267,7 @@ export interface RuntimeConfig {
   routeFeatures: RouteFeaturesConfig
   claudeModelsOnly: boolean
   missingMaxTokens: MissingMaxTokensConfig
+  localRequestCompat: LocalRequestCompatConfig
   requestCapture: RequestCaptureConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode

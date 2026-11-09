@@ -5,6 +5,7 @@ import type {
   BodyConversionConfig,
   ImageProcessingConfig,
   MissingMaxTokensConfig,
+  LocalRequestCompatConfig,
   RequestCaptureConfig,
   ModelMappingConfig,
   PayloadShapingConfig,
@@ -251,6 +252,30 @@ export function normalizeMissingMaxTokens(input?: Partial<MissingMaxTokensConfig
     policy,
     defaultValue: toWhole(input?.defaultValue ?? base.defaultValue, 1, 200000),
   }
+}
+
+export function defaultLocalRequestCompat(): LocalRequestCompatConfig {
+  return {
+    dropEffortNone: true,
+    thinkingTypeAliases: true,
+    repairThinkingBudget: true,
+    normalizeMessageRoles: true,
+    normalizeMessageContent: true,
+    normalizeEffortCase: true,
+    dropUnknownEffort: true,
+    zeroUsageOnHoldExpiredMessageStart: true,
+  }
+}
+
+/** Missing switches fall back to the default, so older servers keep today's behavior. */
+export function normalizeLocalRequestCompat(input?: Partial<LocalRequestCompatConfig> | null): LocalRequestCompatConfig {
+  const base = defaultLocalRequestCompat()
+  const out = { ...base }
+  for (const key of Object.keys(base) as (keyof LocalRequestCompatConfig)[]) {
+    const value = input?.[key]
+    if (typeof value === 'boolean') out[key] = value
+  }
+  return out
 }
 
 export function defaultRequestCapture(): RequestCaptureConfig {
@@ -605,6 +630,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   routeFeatures: defaultRouteFeatures(),
   claudeModelsOnly: false,
   missingMaxTokens: defaultMissingMaxTokens(),
+  localRequestCompat: defaultLocalRequestCompat(),
   requestCapture: defaultRequestCapture(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',

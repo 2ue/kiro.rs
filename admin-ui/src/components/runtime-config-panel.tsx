@@ -244,6 +244,30 @@ const normalizeMissingMaxTokens = (
   defaultValue: toWhole(input?.defaultValue ?? 20480, 1, 200000),
 })
 
+const defaultLocalRequestCompat = (): RuntimeConfig['localRequestCompat'] => ({
+  dropEffortNone: true,
+  thinkingTypeAliases: true,
+  repairThinkingBudget: true,
+  normalizeMessageRoles: true,
+  normalizeMessageContent: true,
+  normalizeEffortCase: true,
+  dropUnknownEffort: true,
+  zeroUsageOnHoldExpiredMessageStart: true,
+})
+
+/** Missing switches fall back to the default, so older servers keep today's behavior. */
+const normalizeLocalRequestCompat = (
+  input?: Partial<RuntimeConfig['localRequestCompat']> | null,
+): RuntimeConfig['localRequestCompat'] => {
+  const base = defaultLocalRequestCompat()
+  const out = { ...base }
+  for (const key of Object.keys(base) as (keyof RuntimeConfig['localRequestCompat'])[]) {
+    const value = input?.[key]
+    if (typeof value === 'boolean') out[key] = value
+  }
+  return out
+}
+
 const defaultRequestCapture = (): RuntimeConfig['requestCapture'] => ({
   enabled: false,
   dir: 'logs/request-capture',
@@ -653,6 +677,7 @@ const emptyConfig: RuntimeConfig = {
   },
   claudeModelsOnly: false,
   missingMaxTokens: defaultMissingMaxTokens(),
+  localRequestCompat: defaultLocalRequestCompat(),
   requestCapture: defaultRequestCapture(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
@@ -3844,6 +3869,7 @@ export function RuntimeConfigPanel() {
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
         bodyConversion,
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens),
+        localRequestCompat: normalizeLocalRequestCompat(config.data.localRequestCompat),
         requestCapture: normalizeRequestCapture(config.data.requestCapture),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity),
         externalPools: {
@@ -3967,6 +3993,7 @@ export function RuntimeConfigPanel() {
       routeFeatures: draft.routeFeatures,
       claudeModelsOnly: draft.claudeModelsOnly,
       missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
+      localRequestCompat: normalizeLocalRequestCompat(draft.localRequestCompat),
       requestCapture: normalizeRequestCapture(draft.requestCapture),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -5451,6 +5478,77 @@ export function RuntimeConfigPanel() {
                 }}
               />
             </label>
+          </ConfigSection>
+
+          <ConfigSection
+            icon={<Shield className="h-4 w-4" />}
+            title="参数兼容"
+            description="客户端发了严格校验不收的写法时：开着就改写后继续，关掉就按协议拒绝（多数返回 400）。改写在请求入口、选路之前完成。前五项是已有行为，默认开着。"
+          >
+            <ToggleField
+              title="effort 为 none 时删除"
+              description={'output_config.effort 写成 "none"（不区分大小写）时视为未指定，删掉该字段。已有行为。'}
+              checked={draft.localRequestCompat.dropEffortNone}
+              onCheckedChange={(dropEffortNone) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, dropEffortNone } }))
+              }
+            />
+            <ToggleField
+              title="thinking 类型别名"
+              description={'thinking.type 为 between_tools 时改成 adaptive。已有行为。'}
+              checked={draft.localRequestCompat.thinkingTypeAliases}
+              onCheckedChange={(thinkingTypeAliases) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, thinkingTypeAliases } }))
+              }
+            />
+            <ToggleField
+              title="修复 thinking 预算"
+              description={'预算与 max_tokens 不匹配时自动修复；adaptive / disabled 去掉 budget_tokens。已有行为。'}
+              checked={draft.localRequestCompat.repairThinkingBudget}
+              onCheckedChange={(repairThinkingBudget) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, repairThinkingBudget } }))
+              }
+            />
+            <ToggleField
+              title="归一非标准消息角色"
+              description={'messages 里的 system / developer 并入系统提示词，其他未知角色丢弃。已有行为。'}
+              checked={draft.localRequestCompat.normalizeMessageRoles}
+              onCheckedChange={(normalizeMessageRoles) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, normalizeMessageRoles } }))
+              }
+            />
+            <ToggleField
+              title="归一消息内容形状"
+              description={'content 为数字、布尔、null、单个对象或数组含非对象元素时转成标准形状。已有行为。'}
+              checked={draft.localRequestCompat.normalizeMessageContent}
+              onCheckedChange={(normalizeMessageContent) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, normalizeMessageContent } }))
+              }
+            />
+            <ToggleField
+              title="effort 大小写纠正"
+              description={'output_config.effort 大小写或首尾空白不规范时改成标准值，例如 " High " 改为 high。'}
+              checked={draft.localRequestCompat.normalizeEffortCase}
+              onCheckedChange={(normalizeEffortCase) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, normalizeEffortCase } }))
+              }
+            />
+            <ToggleField
+              title="未知 effort 删除"
+              description={'output_config.effort 为空串或不认识的值时删掉，按未指定处理，不再返回 400。关掉时拒绝记录带上原值。'}
+              checked={draft.localRequestCompat.dropUnknownEffort}
+              onCheckedChange={(dropUnknownEffort) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, dropUnknownEffort } }))
+              }
+            />
+            <ToggleField
+              title="保留期后 message_start 不带用量"
+              description={'流式请求超过首输出静默保留期时先发出的 message_start，usage 全为 0，空回不会留下可计费的用量；正常请求的最终用量仍以 message_delta 为准。'}
+              checked={draft.localRequestCompat.zeroUsageOnHoldExpiredMessageStart}
+              onCheckedChange={(zeroUsageOnHoldExpiredMessageStart) =>
+                setDraft((prev) => ({ ...prev, localRequestCompat: { ...prev.localRequestCompat, zeroUsageOnHoldExpiredMessageStart } }))
+              }
+            />
           </ConfigSection>
 
           <div className="rounded-lg border bg-muted/20 p-4">

@@ -6392,6 +6392,7 @@ impl AdminService {
             route_features: config.route_features.clone().normalized(),
             claude_models_only: config.claude_models_only,
             missing_max_tokens: config.missing_max_tokens.normalized(),
+            local_request_compat: config.local_request_compat,
             request_capture: config.request_capture.normalized(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
@@ -6725,6 +6726,9 @@ impl AdminService {
             .missing_max_tokens
             .unwrap_or(current_config.missing_max_tokens)
             .normalized();
+        let local_request_compat = req
+            .local_request_compat
+            .unwrap_or(current_config.local_request_compat);
         let request_capture = req
             .request_capture
             .as_ref()
@@ -7293,6 +7297,7 @@ impl AdminService {
                 config.route_features = route_features;
                 config.claude_models_only = claude_models_only;
                 config.missing_max_tokens = missing_max_tokens;
+                config.local_request_compat = local_request_compat;
                 config.request_capture = request_capture;
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;

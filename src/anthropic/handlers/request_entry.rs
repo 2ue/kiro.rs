@@ -78,14 +78,28 @@ pub(super) async fn handle_messages_endpoint(
         return error.to_response(&request_id);
     }
     let mut requires_normalized_body = false;
-    match normalize_raw_client_reasoning_aliases_with_probe(&raw_body, &raw_probe) {
-        Ok(Some(body)) => {
+    let compat = runtime_config.local_request_compat;
+    match normalize_raw_client_reasoning_aliases_with_switches(&raw_body, &raw_probe, &compat) {
+        Ok(Some(rewrite)) => {
+            let (effort_action, original_effort) = match &rewrite.effort {
+                None => (None, None),
+                Some(EffortRewrite::DroppedNone) => (Some("dropped_none"), None),
+                Some(EffortRewrite::Normalized { original, .. }) => {
+                    (Some("normalized_case"), Some(original.as_str()))
+                }
+                Some(EffortRewrite::DroppedUnknown { original }) => {
+                    (Some("dropped_unknown"), Some(original.as_str()))
+                }
+            };
             tracing::info!(
                 endpoint,
                 model = ?raw_probe.model,
-                "normalized client reasoning aliases (effort none / thinking type) before routing"
+                effort_action,
+                original_effort,
+                thinking_type_alias = ?rewrite.thinking_type,
+                "normalized client reasoning aliases before routing"
             );
-            raw_body = body;
+            raw_body = rewrite.body;
             raw_probe = probe_raw_messages_body(&raw_body);
             requires_normalized_body = true;
         }
@@ -103,23 +117,32 @@ pub(super) async fn handle_messages_endpoint(
             return error.to_response(&request_id);
         }
     }
-    let model_max_output_tokens = raw_probe.model.as_deref().and_then(|model| {
-        let resolution = state.model_capabilities.resolve_model_with_mapping(
-            model,
-            runtime_config.model_resolution_mode,
-            &runtime_config.model_mapping,
-        );
-        resolution
-            .upstream_model
-            .as_deref()
-            .and_then(|resolved| state.model_capabilities.max_output_tokens_for(resolved))
-            .or_else(|| state.model_capabilities.max_output_tokens_for(model))
-    });
-    match normalize_raw_reasoning_protocol_with_probe_and_limit(
-        &raw_body,
-        &raw_probe,
-        model_max_output_tokens,
-    ) {
+    let model_max_output_tokens = raw_probe
+        .model
+        .as_deref()
+        .filter(|_| compat.repair_thinking_budget)
+        .and_then(|model| {
+            let resolution = state.model_capabilities.resolve_model_with_mapping(
+                model,
+                runtime_config.model_resolution_mode,
+                &runtime_config.model_mapping,
+            );
+            resolution
+                .upstream_model
+                .as_deref()
+                .and_then(|resolved| state.model_capabilities.max_output_tokens_for(resolved))
+                .or_else(|| state.model_capabilities.max_output_tokens_for(model))
+        });
+    let budget_repair = if compat.repair_thinking_budget {
+        normalize_raw_reasoning_protocol_with_probe_and_limit(
+            &raw_body,
+            &raw_probe,
+            model_max_output_tokens,
+        )
+    } else {
+        Ok(None)
+    };
+    match budget_repair {
         Ok(Some(normalization)) => {
             tracing::info!(
                 endpoint,
@@ -161,7 +184,17 @@ pub(super) async fn handle_messages_endpoint(
         validate_raw_reasoning_protocol_with_probe(&effective_raw_body, &raw_probe)
     {
         let request_id = envelope::request_id();
-        let error = EntryRequestError::invalid(message, "invalid_reasoning_protocol");
+        let original_effort = message
+            .starts_with("output_config.effort")
+            .then(|| {
+                super::super::request_facts::raw_output_effort_for_record(
+                    &effective_raw_body,
+                    &raw_probe,
+                )
+            })
+            .flatten();
+        let error = EntryRequestError::invalid(message, "invalid_reasoning_protocol")
+            .with_original_effort(original_effort);
         record_entry_request_error(
             attribution.as_ref(),
             &endpoint,
@@ -327,8 +360,12 @@ async fn continue_messages_endpoint_after_raw_external_routes(
         return response;
     }
     let request_id = envelope::request_id();
-    let payload = match parse_messages_payload_with_probe(&raw_body, &parsed_raw_probe, &request_id)
-    {
+    let payload = match parse_messages_payload_with_probe(
+        &raw_body,
+        &parsed_raw_probe,
+        &request_id,
+        &runtime_config.local_request_compat,
+    ) {
         Ok(payload) => payload,
         Err(error) => {
             record_entry_request_error(
@@ -528,6 +565,9 @@ pub(super) struct EntryRequestError {
     message: String,
     #[cfg_attr(not(test), allow(dead_code))]
     reason: &'static str,
+    /// The client's `output_config.effort` (truncated) when it caused the rejection, so the
+    /// value can be seen in the rejection record without logging the request body.
+    original_effort: Option<String>,
 }
 
 impl EntryRequestError {
@@ -537,7 +577,13 @@ impl EntryRequestError {
             error_type: "invalid_request_error",
             message: message.into(),
             reason,
+            original_effort: None,
         }
+    }
+
+    fn with_original_effort(mut self, original_effort: Option<String>) -> Self {
+        self.original_effort = original_effort;
+        self
     }
 
     pub(super) fn to_response(&self, request_id: &str) -> Response {
@@ -636,13 +682,19 @@ pub(super) fn parse_messages_payload(
     request_id: &str,
 ) -> Result<MessagesRequest, EntryRequestError> {
     let probe = probe_raw_messages_body(raw_body);
-    parse_messages_payload_with_probe(raw_body, &probe, request_id)
+    parse_messages_payload_with_probe(
+        raw_body,
+        &probe,
+        request_id,
+        &crate::model::config::LocalRequestCompatConfig::default(),
+    )
 }
 
 fn parse_messages_payload_with_probe(
     raw_body: &Bytes,
     probe: &RawMessagesBodyProbe,
     _request_id: &str,
+    compat: &crate::model::config::LocalRequestCompatConfig,
 ) -> Result<MessagesRequest, EntryRequestError> {
     if !probe.matches_body(raw_body) {
         return Err(EntryRequestError::invalid(
@@ -661,7 +713,7 @@ fn parse_messages_payload_with_probe(
             "empty_model",
         ));
     }
-    normalize_message_roles_and_content(&mut payload)?;
+    normalize_message_roles_and_content(&mut payload, compat)?;
     validate_typed_reasoning_protocol(&payload)?;
     Ok(payload)
 }
@@ -729,8 +781,14 @@ fn message_content_text(content: &Value) -> String {
 /// (conversion, history, token counting) on the same string-or-block-list shape.
 fn normalize_message_roles_and_content(
     payload: &mut MessagesRequest,
+    compat: &crate::model::config::LocalRequestCompatConfig,
 ) -> Result<(), EntryRequestError> {
-    normalize_message_roles(payload);
+    if compat.normalize_message_roles {
+        normalize_message_roles(payload);
+    }
+    if !compat.normalize_message_content {
+        return Ok(());
+    }
     for (index, message) in payload.messages.iter_mut().enumerate() {
         let replacement = match &mut message.content {
             Value::String(_) => None,
@@ -854,10 +912,17 @@ fn record_entry_request_error(
             error.status,
             request_id,
             endpoint,
-            Some(serde_json::json!({
-                "entryReason": error.reason,
-                "entryMessage": bounded_entry_error_message(&error.message),
-            })),
+            Some(match error.original_effort.as_deref() {
+                Some(original_effort) => serde_json::json!({
+                    "entryReason": error.reason,
+                    "entryMessage": bounded_entry_error_message(&error.message),
+                    "originalEffort": original_effort,
+                }),
+                None => serde_json::json!({
+                    "entryReason": error.reason,
+                    "entryMessage": bounded_entry_error_message(&error.message),
+                }),
+            }),
             raw_probe.and_then(request_rejection_usage_context_from_probe),
         );
     }
@@ -1193,6 +1258,88 @@ mod tests {
             .collect::<Vec<_>>();
         observed_counts.sort_unstable();
         assert_eq!(observed_counts, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// dropUnknownEffort 关掉时，被拒的 effort 原值进拒绝记录（截断，不含请求正文）。
+    #[test]
+    fn rejected_effort_records_original_value_without_body_content() {
+        let recorder = Arc::new(UsageRecorder::new(10));
+        let attribution = test_attribution(recorder.clone());
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-opus-5-5","max_tokens":64,"output_config":{"effort":"Turbo"},"messages":[{"role":"user","content":"secret-body"}]}"#,
+        );
+        let raw_probe = probe_raw_messages_body(&raw);
+        let message = validate_raw_reasoning_protocol_with_probe(&raw, &raw_probe)
+            .expect_err("strict validator rejects the effort");
+        assert!(message.starts_with("output_config.effort"), "{message}");
+        let original =
+            super::super::super::request_facts::raw_output_effort_for_record(&raw, &raw_probe);
+        assert_eq!(original.as_deref(), Some("Turbo"));
+        let error = EntryRequestError::invalid(message, "invalid_reasoning_protocol")
+            .with_original_effort(original);
+        record_entry_request_error(
+            Some(&attribution),
+            "/dfcache/minea/v1/messages",
+            "req_entry_bad_effort",
+            &error,
+            Some(&raw_probe),
+        );
+        let records = recorder.query(UsageRecordQuery::default()).records;
+        let metadata = records[0].error_metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["entryReason"], "invalid_reasoning_protocol");
+        assert_eq!(metadata["originalEffort"], "Turbo");
+        assert!(!metadata.to_string().contains("secret-body"));
+
+        // Errors unrelated to effort carry no originalEffort.
+        let other =
+            EntryRequestError::invalid("max_tokens: field is required", "missing_max_tokens");
+        record_entry_request_error(
+            Some(&attribution),
+            "/dfcache/minea/v1/messages",
+            "req_entry_other",
+            &other,
+            Some(&raw_probe),
+        );
+        let records = recorder.query(UsageRecordQuery::default()).records;
+        assert!(
+            records
+                .iter()
+                .filter_map(|record| record.error_metadata.as_ref())
+                .any(|metadata| metadata.get("originalEffort").is_none())
+        );
+    }
+
+    /// 角色与 content 归一化各自可关；关掉时请求原样交给后续阶段。默认开启，行为与之前一致。
+    #[test]
+    fn role_and_content_normalization_follow_their_switches() {
+        let raw = Bytes::from_static(
+            br#"{"model":"m","max_tokens":64,"messages":[{"role":"system","content":"be brief"},{"role":"user","content":42}]}"#,
+        );
+        let probe = probe_raw_messages_body(&raw);
+        let defaults = crate::model::config::LocalRequestCompatConfig::default();
+        let payload =
+            parse_messages_payload_with_probe(&raw, &probe, "req_compat_default", &defaults)
+                .expect("parses");
+        assert_eq!(payload.messages.len(), 1);
+        assert_eq!(payload.messages[0].content, serde_json::json!("42"));
+        assert_eq!(
+            payload
+                .system
+                .as_ref()
+                .map(|system| system[0].text.as_str()),
+            Some("be brief")
+        );
+
+        let off = crate::model::config::LocalRequestCompatConfig {
+            normalize_message_roles: false,
+            normalize_message_content: false,
+            ..defaults
+        };
+        let payload = parse_messages_payload_with_probe(&raw, &probe, "req_compat_off", &off)
+            .expect("parses");
+        assert_eq!(payload.messages.len(), 2);
+        assert_eq!(payload.messages[0].role, "system");
+        assert_eq!(payload.messages[1].content, serde_json::json!(42));
     }
 
     #[test]

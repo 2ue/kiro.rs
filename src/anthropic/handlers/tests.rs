@@ -3817,6 +3817,9 @@ enum HandlerEventStreamFault {
     BlankFramesThenText,
     /// Only heartbeat events for about 2.5 seconds, then real text and COMPLETED.
     HeartbeatsThenText,
+    /// About 2.5 seconds of heartbeats, then a usage-only end: the hold window expires before the
+    /// turn is known to be empty (production shape behind most 200 empty turns).
+    HeartbeatsThenUsageOnly,
     /// 200 with an empty EventStream body on every attempt ("ended without any frames").
     EmptyStreamEveryAttempt,
     /// 每次都返回 200、content-type 为 JSON 且响应体为空（生产上的 json_stream_incomplete_body）。
@@ -4434,6 +4437,24 @@ async fn handler_eventstream_fault_upstream(
             chunks.push((
                 Duration::ZERO,
                 Ok(Bytes::from(handler_eventstream_normal_body())),
+            ));
+            handler_eventstream_chunked_response(chunks)
+        }
+        HandlerEventStreamFault::HeartbeatsThenUsageOnly => {
+            let mut chunks: Vec<(Duration, Result<Bytes, std::io::Error>)> = (0..10)
+                .map(|_| {
+                    (
+                        Duration::from_millis(250),
+                        Ok(Bytes::from(eventstream_test_frame(
+                            "contextUsageEvent",
+                            json!({"contextUsagePercentage": 1.0}),
+                        ))),
+                    )
+                })
+                .collect();
+            chunks.push((
+                Duration::ZERO,
+                Ok(Bytes::from(handler_eventstream_usage_only_body())),
             ));
             handler_eventstream_chunked_response(chunks)
         }
@@ -5794,6 +5815,132 @@ async fn run_hold_window_starts_keepalive_then_first_output_timeout_frees_upstre
             "round={round}"
         );
     }
+}
+
+/// The `usage` object of the first `message_start` event in an SSE body.
+fn message_start_usage(body: &str) -> serde_json::Value {
+    body.split("\n\n")
+        .find(|chunk| chunk.starts_with("event: message_start"))
+        .and_then(|chunk| chunk.lines().find_map(|line| line.strip_prefix("data: ")))
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .map(|event| event["message"]["usage"].clone())
+        .expect("message_start with usage")
+}
+
+fn usage_numbers(value: &serde_json::Value) -> Vec<i64> {
+    match value {
+        serde_json::Value::Number(number) => vec![number.as_i64().unwrap_or(-1)],
+        serde_json::Value::Object(map) => map.values().flat_map(usage_numbers).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 59138 2026-11-09：流式空回里有 190 次超过 15 秒保留期，先发了 200 和带输入估算的
+/// message_start，接入方可能据此计费。开关打开（默认）时这个 message_start 的 usage 全为 0；
+/// 关掉时保持原来的输入估算。
+async fn run_hold_expired_empty_turn_message_start_carries_no_usage() {
+    for zero_usage in [true, false] {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::HeartbeatsThenUsageOnly,
+        )
+        .await;
+        let (app, usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+                config.kiro_upstream_stream_idle_timeout_secs = 30;
+                config.stream_keepalive_interval_secs = 1;
+                config.stream_pre_output_hold_secs = 1;
+                config.stream_first_output_timeout_secs = 0;
+                config
+                    .local_request_compat
+                    .zero_usage_on_hold_expired_message_start = zero_usage;
+            });
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "zero_usage={zero_usage} body={body}"
+        );
+        assert!(
+            body.contains(r#""type":"error""#),
+            "the empty turn still ends with an error event: {body}"
+        );
+        assert!(
+            !body.contains("event: message_delta"),
+            "an empty turn sends no message_delta: {body}"
+        );
+        let usage = message_start_usage(&body);
+        let numbers = usage_numbers(&usage);
+        assert!(!numbers.is_empty(), "usage keeps its fields: {usage}");
+        if zero_usage {
+            assert!(
+                numbers.iter().all(|value| *value == 0),
+                "no non-zero usage reaches the client: {usage}"
+            );
+        } else {
+            assert!(
+                usage["input_tokens"].as_i64().unwrap_or(0) > 0,
+                "switch off keeps the previous input estimate: {usage}"
+            );
+        }
+        // The local record of the failed turn is unaffected.
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_ne!(record.status, UsageRecordStatus::Success);
+    }
+}
+
+#[test]
+fn hold_expired_empty_turn_message_start_carries_no_usage() {
+    run_handler_fixture_on_large_stack_thread(
+        "hold-expired-empty-turn-usage",
+        run_hold_expired_empty_turn_message_start_carries_no_usage,
+    );
+}
+
+/// 正常请求不受影响：保留期内就有内容时 message_start 照常带输入估算；保留期过后才有内容时
+/// message_start 为 0，但最终 message_delta 带真实 usage。
+async fn run_hold_expired_normal_turn_keeps_final_usage() {
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::HeartbeatsThenText).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+            config.kiro_upstream_stream_idle_timeout_secs = 30;
+            config.stream_keepalive_interval_secs = 1;
+            config.stream_pre_output_hold_secs = 1;
+            config.stream_first_output_timeout_secs = 0;
+        });
+    let (status, _request_id, body) = call_handler_eventstream_fault(app, true).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(
+        usage_numbers(&message_start_usage(&body))
+            .iter()
+            .all(|value| *value == 0)
+    );
+    let delta = body
+        .split("\n\n")
+        .find(|chunk| chunk.starts_with("event: message_delta"))
+        .and_then(|chunk| chunk.lines().find_map(|line| line.strip_prefix("data: ")))
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .expect("message_delta");
+    assert!(
+        delta["usage"]["input_tokens"].as_i64().unwrap_or(0) > 0
+            || delta["usage"]["cache_read_input_tokens"]
+                .as_i64()
+                .unwrap_or(0)
+                > 0
+            || delta["usage"]["cache_creation_input_tokens"]
+                .as_i64()
+                .unwrap_or(0)
+                > 0,
+        "final usage stays authoritative: {delta}"
+    );
+}
+
+#[test]
+fn hold_expired_normal_turn_keeps_final_usage() {
+    run_handler_fixture_on_large_stack_thread(
+        "hold-expired-normal-turn-usage",
+        run_hold_expired_normal_turn_keeps_final_usage,
+    );
 }
 
 #[test]
@@ -8662,6 +8809,7 @@ fn runtime_config_for_payload_guard(
         route_features: RouteFeaturesConfig::default(),
         claude_models_only: false,
         missing_max_tokens: MissingMaxTokensConfig::default(),
+        local_request_compat: crate::model::config::LocalRequestCompatConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
         external_pools: ExternalPoolsConfig::default(),
         request_capture: crate::model::config::RequestCaptureConfig::default(),

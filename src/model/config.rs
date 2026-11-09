@@ -381,6 +381,66 @@ fn default_code_execution_max_code_bytes() -> usize {
     64 * 1024
 }
 
+/// 请求参数兼容开关（`localRequestCompat`）。
+///
+/// 每一项对应一种「客户端发了严格校验不收的写法时怎么处理」的行为：开着就改写后继续，
+/// 关掉就交给严格校验（多数情况下返回 400）。已有的兼容行为默认开启，零配置时与之前完全
+/// 一致；新增的兼容默认也开启，因为它们只把原本会被拒绝或计费的请求改成可用。
+///
+/// 改写发生在请求入口、选路之前，本地账号和外部池都会收到改写后的请求体；外部池的
+/// 参数透传方式不受这里影响。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LocalRequestCompatConfig {
+    /// `output_config.effort: "none"`（不区分大小写、忽略首尾空白）视为未指定并删除。已有行为。
+    pub drop_effort_none: bool,
+    /// `thinking.type: "between_tools"` 改为 `adaptive`。已有行为。
+    pub thinking_type_aliases: bool,
+    /// thinking 预算与 max_tokens 不匹配时自动修复（预算过小抬到 1024、超出时扩大 max_tokens
+    /// 或收紧预算、adaptive/disabled 去掉 budget）。已有行为。
+    pub repair_thinking_budget: bool,
+    /// `messages` 里的 system/developer 角色并入 system 提示词，其他未知角色丢弃。已有行为。
+    pub normalize_message_roles: bool,
+    /// 消息 content 的标量、null、单对象、数组里的非对象元素归一成标准形状。已有行为。
+    pub normalize_message_content: bool,
+    /// 新增：`output_config.effort` 大小写或首尾空白不规范时改成标准写法（`" High "` → `high`）。
+    pub normalize_effort_case: bool,
+    /// 新增：`output_config.effort` 为空串或不认识的值时删除该字段，按未指定处理，
+    /// 不再返回 `output_config.effort must be one of` 的 400。
+    pub drop_unknown_effort: bool,
+    /// 新增：流式请求超过首输出静默保留期才发出的 `message_start`，usage 填 0。
+    ///
+    /// 保留期一过就要先给客户端发 200 和 `message_start`，此后若上游空回，下游唯一能看到
+    /// 的 usage 就是这里的输入估算，接入方可能据此计费。填 0 后空回不留下任何非零 usage；
+    /// 正常请求的最终 usage 仍以 `message_delta` 为准。
+    pub zero_usage_on_hold_expired_message_start: bool,
+}
+
+impl Default for LocalRequestCompatConfig {
+    fn default() -> Self {
+        Self {
+            drop_effort_none: true,
+            thinking_type_aliases: true,
+            repair_thinking_budget: true,
+            normalize_message_roles: true,
+            normalize_message_content: true,
+            normalize_effort_case: true,
+            drop_unknown_effort: true,
+            zero_usage_on_hold_expired_message_start: true,
+        }
+    }
+}
+
+impl LocalRequestCompatConfig {
+    /// 是否需要在入口改写 effort 或 thinking.type（任一相关开关打开）。
+    pub fn rewrites_reasoning_aliases(&self) -> bool {
+        self.drop_effort_none
+            || self.thinking_type_aliases
+            || self.normalize_effort_case
+            || self.drop_unknown_effort
+    }
+}
+
 pub const DEFAULT_MISSING_MAX_TOKENS_VALUE: i32 = 20_480;
 pub const MAX_MISSING_MAX_TOKENS_VALUE: i32 = 200_000;
 
@@ -5564,6 +5624,10 @@ pub struct Config {
     #[serde(default)]
     pub missing_max_tokens: MissingMaxTokensConfig,
 
+    /// 请求参数兼容开关，见 [`LocalRequestCompatConfig`]。
+    #[serde(default)]
+    pub local_request_compat: LocalRequestCompatConfig,
+
     /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
     #[serde(default)]
     pub payload_shaping: PayloadShapingConfig,
@@ -7145,6 +7209,7 @@ impl Default for Config {
             subscription_model_lists: BTreeMap::new(),
             prompt_steering: None,
             missing_max_tokens: MissingMaxTokensConfig::default(),
+            local_request_compat: LocalRequestCompatConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),
