@@ -115,6 +115,35 @@ pub fn resolve_profile_arn(credentials: &KiroCredentials, _config: &Config) -> O
     None
 }
 
+/// Resolve the profile ARN required by the usage-limits control-plane endpoint.
+///
+/// BuilderId/IdC accounts use the protocol placeholder ARN for this endpoint.  The
+/// placeholder must remain excluded from header/query model and MCP requests, but
+/// omitting it from `getUsageLimits` makes the upstream return `Invalid profileArn`.
+pub fn resolve_usage_limits_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+) -> Option<String> {
+    if credentials.is_api_key_credential() {
+        return None;
+    }
+
+    if let Some(profile_arn) = credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|arn| !arn.is_empty() && is_real_profile_arn(arn))
+    {
+        return Some(profile_arn.to_string());
+    }
+
+    if credentials.is_idc_refresh_credential() {
+        return Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string());
+    }
+
+    resolve_profile_arn(credentials, config)
+}
+
 /// Resolve the profile ARN for streaming assistant request bodies.
 ///
 /// Streaming calls are stricter than header/query APIs: BuilderId/free OAuth flows
@@ -299,6 +328,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_profile_arn(&credentials, &Config::default()), None);
+    }
+
+    #[test]
+    fn usage_limits_profile_keeps_builder_id_placeholder_for_idc_credentials() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            profile_arn: Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_usage_limits_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+    }
+
+    #[test]
+    fn usage_limits_profile_falls_back_to_builder_id_placeholder_when_missing() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_usage_limits_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
     }
 
     #[test]

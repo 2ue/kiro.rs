@@ -23,7 +23,9 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::protocol::{is_external_idp_credentials, resolve_profile_arn};
+use crate::kiro::protocol::{
+    is_external_idp_credentials, resolve_profile_arn, resolve_usage_limits_profile_arn,
+};
 use crate::model::config::Config;
 
 use super::auxiliary::{
@@ -1119,7 +1121,7 @@ pub(crate) async fn get_usage_limits(
         )
     });
 
-    if let Some(profile_arn) = resolve_profile_arn(credentials, config) {
+    if let Some(profile_arn) = resolve_usage_limits_profile_arn(credentials, config) {
         url.push_str(&format!(
             "&profileArn={}",
             urlencoding::encode(&profile_arn)
@@ -2183,6 +2185,44 @@ mod tests {
             uri,
             "/fake/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
         );
+    }
+
+    #[tokio::test]
+    async fn idc_usage_limits_keeps_builder_id_profile_arn_query_parameter() {
+        let captured = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/fake/getUsageLimits", get(mock_usage_limits_endpoint))
+            .with_state(UsageEndpointState {
+                captured: captured.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            profile_arn: Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+
+        get_usage_limits(&credentials, &config, "idc-token", None)
+            .await
+            .unwrap();
+        server.abort();
+
+        let (_, authorization, token_type, uri) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(authorization, "Bearer idc-token");
+        assert_eq!(token_type, "");
+        assert!(uri.contains(
+            "profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A638616132270%3Aprofile%2FAAAACCCCXXXX"
+        ));
     }
 
     #[tokio::test]
