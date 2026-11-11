@@ -70,6 +70,22 @@ impl std::fmt::Display for EventType {
     }
 }
 
+/// 新版流式协议把错误作为 `:message-type: event` 帧下发，`:event-type` 是联合成员名。
+///
+/// Kiro IDE 1.4.154 的 runtime 流解码器把 `error`、`throttlingError`、`validationError`、
+/// `serviceUnavailableError` 分别抛成 InternalServerException、ThrottlingException、
+/// ValidationException、ServiceUnavailableException。这里按同样的映射转成 Exception，
+/// 否则它们会落入 Unknown 被丢弃，流在没有任何输出的情况下结束，表现为空回。
+fn stream_error_event_exception_type(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        "error" => Some("InternalServerException"),
+        "throttlingError" => Some("ThrottlingException"),
+        "validationError" => Some("ValidationException"),
+        "serviceUnavailableError" => Some("ServiceUnavailableException"),
+        _ => None,
+    }
+}
+
 /// 事件 payload trait
 ///
 /// 所有具体事件类型都需要实现此 trait
@@ -135,6 +151,12 @@ impl Event {
     /// 解析事件类型消息
     fn parse_event(frame: Frame) -> ParseResult<Self> {
         let event_type_str = frame.event_type().unwrap_or("unknown");
+        if let Some(exception_type) = stream_error_event_exception_type(event_type_str) {
+            return Ok(Self::Exception {
+                exception_type: exception_type.to_string(),
+                message: frame.payload_as_str(),
+            });
+        }
         let event_type = EventType::from_str(event_type_str);
 
         match event_type {
@@ -229,6 +251,32 @@ mod tests {
         Frame {
             headers,
             payload: serde_json::to_vec(&payload).expect("event payload"),
+        }
+    }
+
+    #[test]
+    fn stream_error_events_become_exceptions_instead_of_unknown() {
+        for (event_type, exception_type) in [
+            ("error", "InternalServerException"),
+            ("throttlingError", "ThrottlingException"),
+            ("validationError", "ValidationException"),
+            ("serviceUnavailableError", "ServiceUnavailableException"),
+        ] {
+            let event = Event::from_frame(event_frame(
+                event_type,
+                serde_json::json!({"message": "upstream said no", "reason": "R"}),
+            ))
+            .expect("stream error event");
+            match event {
+                Event::Exception {
+                    exception_type: actual,
+                    message,
+                } => {
+                    assert_eq!(actual, exception_type);
+                    assert!(message.contains("upstream said no"));
+                }
+                other => panic!("{event_type} should be an exception, got {other:?}"),
+            }
         }
     }
 

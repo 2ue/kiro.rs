@@ -2939,7 +2939,13 @@ impl StreamContext {
                     return Vec::new();
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                self.record_stream_error("api_error", message.clone());
+                // ValidationException 是请求本身的问题，重发同一请求不会成功；其余按上游瞬态失败处理。
+                let error_type = if exception_type == "ValidationException" {
+                    "invalid_request_error"
+                } else {
+                    "api_error"
+                };
+                self.record_stream_error(error_type, message.clone());
                 Vec::new()
             }
             _ => Vec::new(),
@@ -9958,6 +9964,29 @@ mod tests {
                 events.iter().any(|event| event.event == "message_stop"),
                 "round {round}"
             );
+        }
+    }
+
+    #[test]
+    fn new_stream_error_events_end_the_stream_with_typed_errors() {
+        for (exception_type, expected) in [
+            ("ThrottlingException", "overloaded_error"),
+            ("ServiceUnavailableException", "overloaded_error"),
+            ("InternalServerException", "overloaded_error"),
+            ("ValidationException", "invalid_request_error"),
+        ] {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::Exception {
+                exception_type: exception_type.to_string(),
+                message: "upstream said no".to_string(),
+            }));
+            events.extend(ctx.generate_final_events());
+            let error = events
+                .iter()
+                .find(|event| event.event == "error")
+                .unwrap_or_else(|| panic!("{exception_type} must end with an error event"));
+            assert_eq!(error.data["error"]["type"], expected, "{exception_type}");
         }
     }
 
