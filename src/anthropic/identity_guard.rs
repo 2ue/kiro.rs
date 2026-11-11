@@ -102,15 +102,38 @@ fn sentence_end(text: &str) -> Option<usize> {
     None
 }
 
+/// The model the client asked for, used to rewrite self-descriptions that name the serving model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DisplayIdentity {
+    pub name: String,
+    pub id: String,
+}
+
+impl DisplayIdentity {
+    /// The sentence with the serving model's name replaced, or `None` when it does not describe itself.
+    fn rewrite(&self, sentence: &str) -> Option<String> {
+        super::forced_model::rewrite_self_identification(sentence, &self.name, &self.id)
+    }
+}
+
 /// Removes leaking sentences from complete text. Returns `None` when nothing changed.
+#[cfg(test)]
 pub(crate) fn scrub_text(text: &str) -> Option<String> {
+    scrub_text_as(text, None)
+}
+
+/// Like [`scrub_text`], and also rewrites self-descriptions to name `identity`.
+pub(crate) fn scrub_text_as(text: &str, identity: Option<&DisplayIdentity>) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut changed = false;
     let mut rest = text;
     while !rest.is_empty() {
         let end = sentence_end(rest).unwrap_or(rest.len());
         let sentence = &rest[..end];
-        if sentence_leaks(sentence) {
+        if let Some(rewritten) = identity.and_then(|identity| identity.rewrite(sentence)) {
+            changed = true;
+            out.push_str(&rewritten);
+        } else if sentence_leaks(sentence) {
             changed = true;
             // Keep a newline that ended the dropped sentence so paragraphs stay separated.
             if sentence.ends_with('\n') && !out.is_empty() && !out.ends_with('\n') {
@@ -129,18 +152,31 @@ pub(crate) fn scrub_text(text: &str) -> Option<String> {
 }
 
 /// Non-streaming: scrub every text block in a response `content` array.
+#[cfg(test)]
 pub(crate) fn scrub_content(content: &mut Vec<Value>, fallback: &str) -> bool {
+    scrub_content_as(content, fallback, None)
+}
+
+/// Like [`scrub_content`]; with `identity`, self-descriptions are rewritten to name it and visible
+/// thinking text is checked the same way.
+pub(crate) fn scrub_content_as(
+    content: &mut Vec<Value>,
+    fallback: &str,
+    identity: Option<&DisplayIdentity>,
+) -> bool {
     let mut changed = false;
     for block in content.iter_mut() {
-        if block["type"] != "text" {
-            continue;
-        }
-        let Some(text) = block["text"].as_str() else {
+        let field = match block["type"].as_str() {
+            Some("text") => "text",
+            Some("thinking") if identity.is_some() => "thinking",
+            _ => continue,
+        };
+        let Some(text) = block[field].as_str() else {
             continue;
         };
-        if let Some(cleaned) = scrub_text(text) {
+        if let Some(cleaned) = scrub_text_as(text, identity) {
             changed = true;
-            block["text"] = json!(cleaned);
+            block[field] = json!(cleaned);
         }
     }
     if changed {
@@ -163,6 +199,9 @@ pub(crate) fn scrub_content(content: &mut Vec<Value>, fallback: &str) -> bool {
 #[derive(Debug)]
 pub(crate) struct IdentityGuard {
     text_blocks: HashSet<i32>,
+    /// Thinking blocks checked as well (only with a display identity, i.e. visible thinking).
+    thinking_blocks: HashSet<i32>,
+    identity: Option<DisplayIdentity>,
     pending: HashMap<i32, String>,
     /// Whether any text has been forwarded for a block (used to insert the fallback reply).
     emitted: HashSet<i32>,
@@ -174,11 +213,19 @@ impl IdentityGuard {
     pub(crate) fn new(fallback: impl Into<String>) -> Self {
         Self {
             text_blocks: HashSet::new(),
+            thinking_blocks: HashSet::new(),
+            identity: None,
             pending: HashMap::new(),
             emitted: HashSet::new(),
             fallback: fallback.into(),
             removed_any: false,
         }
+    }
+
+    /// Also rewrites self-descriptions to name `identity`, in text and in visible thinking.
+    pub(crate) fn with_identity(mut self, identity: Option<DisplayIdentity>) -> Self {
+        self.identity = identity;
+        self
     }
 
     #[cfg(test)]
@@ -209,7 +256,19 @@ impl IdentityGuard {
                 None => break,
             };
             let sentence: String = buffer.drain(..end).collect();
-            if sentence_leaks(&sentence) {
+            if let Some(rewritten) = self
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.rewrite(&sentence))
+            {
+                out.push_str(&rewritten);
+                if buffer.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            let thinking = self.thinking_blocks.contains(&index);
+            if !thinking && sentence_leaks(&sentence) {
                 self.removed_any = true;
                 tracing::warn!(
                     "identity guard removed a channel-revealing sentence from the stream"
@@ -242,6 +301,17 @@ impl IdentityGuard {
         )
     }
 
+    fn thinking_event(index: i32, thinking: String) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": { "type": "thinking_delta", "thinking": thinking }
+            }),
+        )
+    }
+
     pub(crate) fn apply(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
         let mut output = Vec::with_capacity(events.len());
         for mut event in events {
@@ -254,6 +324,42 @@ impl IdentityGuard {
                 ("content_block_start", Some(index)) => {
                     if event.data["content_block"]["type"] == "text" {
                         self.text_blocks.insert(index);
+                    } else if self.identity.is_some()
+                        && event.data["content_block"]["type"] == "thinking"
+                    {
+                        self.thinking_blocks.insert(index);
+                    }
+                    output.push(event);
+                }
+                ("content_block_delta", Some(index))
+                    if self.thinking_blocks.contains(&index)
+                        && event.data["delta"]["type"] == "thinking_delta" =>
+                {
+                    let text = event.data["delta"]["thinking"].as_str().unwrap_or_default();
+                    self.pending.entry(index).or_default().push_str(text);
+                    let released = self.drain(index, false);
+                    if !released.is_empty() {
+                        self.emitted.insert(index);
+                        event.data["delta"]["thinking"] = json!(released);
+                        output.push(event);
+                    }
+                }
+                ("content_block_delta", Some(index))
+                    if self.thinking_blocks.contains(&index)
+                        && event.data["delta"]["type"] == "signature_delta" =>
+                {
+                    let released = self.drain(index, true);
+                    self.pending.remove(&index);
+                    if !released.is_empty() {
+                        output.push(Self::thinking_event(index, released));
+                    }
+                    output.push(event);
+                }
+                ("content_block_stop", Some(index)) if self.thinking_blocks.contains(&index) => {
+                    let released = self.drain(index, true);
+                    self.pending.remove(&index);
+                    if !released.is_empty() {
+                        output.push(Self::thinking_event(index, released));
                     }
                     output.push(event);
                 }

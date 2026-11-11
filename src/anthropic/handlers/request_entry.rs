@@ -360,11 +360,20 @@ async fn continue_messages_endpoint_after_raw_external_routes(
         return response;
     }
     let request_id = envelope::request_id();
-    let payload = match parse_messages_payload_with_probe(
+    // Forced model mapping keeps mid-conversation system messages in place (see
+    // `normalize_message_roles`); decide it from the requested model before parsing.
+    let keep_system_position = parsed_raw_probe.model.as_deref().is_some_and(|model| {
+        runtime_config
+            .forced_model_mapping_for(&endpoint)
+            .and_then(|config| super::super::forced_model::resolve_forced_target(model, config))
+            .is_some()
+    });
+    let payload = match parse_messages_payload_with_probe_and_roles(
         &raw_body,
         &parsed_raw_probe,
         &request_id,
         &runtime_config.local_request_compat,
+        keep_system_position,
     ) {
         Ok(payload) => payload,
         Err(error) => {
@@ -431,8 +440,15 @@ fn maybe_local_pool_unavailable_fast_fail_response(
                 model,
             )
         });
+    // A forced model mapping dispatches the local request under its target model.
+    let dispatch_model = runtime_config
+        .forced_model_mapping_for(endpoint)
+        .and_then(|config| super::super::forced_model::resolve_forced_target(model, config))
+        .map(|forced| forced.target_model);
+    let dispatch_model = dispatch_model.as_deref().unwrap_or(model);
     if !external_can_take_route
-        && let Some(retry_after_secs) = provider.dispatch_queue_full_retry_after(Some(model))
+        && let Some(retry_after_secs) =
+            provider.dispatch_queue_full_retry_after(Some(dispatch_model))
     {
         if let Some(attribution) = attribution {
             attribution.apply_local_temporary_backoff(retry_after_secs);
@@ -690,11 +706,22 @@ pub(super) fn parse_messages_payload(
     )
 }
 
+#[cfg(test)]
 fn parse_messages_payload_with_probe(
+    raw_body: &Bytes,
+    probe: &RawMessagesBodyProbe,
+    request_id: &str,
+    compat: &crate::model::config::LocalRequestCompatConfig,
+) -> Result<MessagesRequest, EntryRequestError> {
+    parse_messages_payload_with_probe_and_roles(raw_body, probe, request_id, compat, false)
+}
+
+fn parse_messages_payload_with_probe_and_roles(
     raw_body: &Bytes,
     probe: &RawMessagesBodyProbe,
     _request_id: &str,
     compat: &crate::model::config::LocalRequestCompatConfig,
+    keep_system_position: bool,
 ) -> Result<MessagesRequest, EntryRequestError> {
     if !probe.matches_body(raw_body) {
         return Err(EntryRequestError::invalid(
@@ -713,7 +740,7 @@ fn parse_messages_payload_with_probe(
             "empty_model",
         ));
     }
-    normalize_message_roles_and_content(&mut payload, compat)?;
+    normalize_message_roles_and_content(&mut payload, compat, keep_system_position)?;
     validate_typed_reasoning_protocol(&payload)?;
     Ok(payload)
 }
@@ -721,7 +748,10 @@ fn parse_messages_payload_with_probe(
 /// Some clients put `system`/`developer` turns inside `messages`. Their text is moved into the
 /// system prompt (in order), and messages with any other non-user/assistant role are dropped,
 /// matching how earlier releases served these requests instead of rejecting them.
-fn normalize_message_roles(payload: &mut MessagesRequest) {
+/// Forced model mapping keeps a mid-conversation `system`/`developer` message where the client
+/// put it: it becomes a reminder in that position, so it applies from that point on instead of
+/// reading as an instruction given at the start, and the system prompt prefix stays cacheable.
+fn normalize_message_roles(payload: &mut MessagesRequest, keep_position: bool) {
     if payload
         .messages
         .iter()
@@ -735,6 +765,18 @@ fn normalize_message_roles(payload: &mut MessagesRequest) {
     for message in std::mem::take(&mut payload.messages) {
         match message.role.to_ascii_lowercase().as_str() {
             "user" | "assistant" => kept.push(message),
+            "system" | "developer" if keep_position && !kept.is_empty() => {
+                let text = message_content_text(&message.content);
+                if !text.trim().is_empty() {
+                    kept.push(crate::anthropic::types::Message {
+                        role: "user".to_string(),
+                        content: Value::String(format!(
+                            "<system-reminder>\n{text}\n</system-reminder>"
+                        )),
+                    });
+                }
+                moved += 1;
+            }
             "system" | "developer" => {
                 let text = message_content_text(&message.content);
                 if !text.trim().is_empty() {
@@ -782,9 +824,10 @@ fn message_content_text(content: &Value) -> String {
 fn normalize_message_roles_and_content(
     payload: &mut MessagesRequest,
     compat: &crate::model::config::LocalRequestCompatConfig,
+    keep_system_position: bool,
 ) -> Result<(), EntryRequestError> {
     if compat.normalize_message_roles {
-        normalize_message_roles(payload);
+        normalize_message_roles(payload, keep_system_position);
     }
     if !compat.normalize_message_content {
         return Ok(());

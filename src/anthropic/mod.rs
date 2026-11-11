@@ -35,6 +35,7 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
+mod anthropic_tools;
 pub(crate) mod body_capabilities;
 pub(crate) mod body_processing;
 pub(crate) mod bounded_shaping;
@@ -46,11 +47,14 @@ mod empty_turn_nudge;
 pub(crate) mod empty_turn_policy;
 pub(crate) mod envelope;
 pub(crate) mod files;
+pub(crate) mod forced_backoff;
+pub(crate) mod forced_model;
 mod handlers;
 mod identity_guard;
 mod image_resize;
 pub(crate) mod inference_attempt_budget;
 pub(crate) mod integer_output;
+mod interleaved_thinking;
 pub(crate) mod kiro_plus_shaping;
 pub(crate) mod language_preference;
 mod middleware;

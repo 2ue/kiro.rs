@@ -5769,6 +5769,10 @@ pub struct Config {
     #[serde(default)]
     pub model_mapping: ModelMappingConfig,
 
+    /// 强制模型收敛：把 Claude 模型请求统一改发到配置的目标模型，对外保持请求模型。默认关闭。
+    #[serde(default)]
+    pub forced_model_mapping: super::forced_model_mapping::ForcedModelMappingConfig,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -7238,6 +7242,7 @@ impl Default for Config {
             kiro_agent_mode_strategy: default_kiro_agent_mode_strategy(),
             model_resolution_mode: default_model_resolution_mode(),
             model_mapping: ModelMappingConfig::default(),
+            forced_model_mapping: Default::default(),
             extract_thinking: default_extract_thinking(),
             thinking_trigger_mode: None,
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),

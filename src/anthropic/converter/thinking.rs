@@ -65,6 +65,14 @@ fn generate_thinking_prefix(
     {
         return Ok(None);
     }
+    if let Some(forced) = options.forced.as_ref() {
+        return Ok(forced_thinking_prefix(
+            req,
+            forced,
+            policy_allowed,
+            &options,
+        ));
+    }
     if let Some(t) = &req.thinking {
         let strict_output_policy = policy_allowed
             && (options.force_visible_thinking
@@ -108,6 +116,52 @@ fn generate_thinking_prefix(
         )));
     }
     Ok(None)
+}
+
+/// 强制模型收敛时，目标模型（4.5 系）只理解明确的思考长度：adaptive / effort 换算成 enabled 和长度，
+/// 外显模型名带 `-thinking` 时按客户端要求输出可见思考。
+fn forced_thinking_prefix(
+    req: &MessagesRequest,
+    forced: &crate::anthropic::forced_model::ForcedTarget,
+    policy_allowed: bool,
+    options: &ConverterOptions,
+) -> Option<String> {
+    use crate::anthropic::forced_model::{
+        FORCED_TARGET_MAX_OUTPUT_TOKENS, clamp_thinking_length, thinking_length_for_effort,
+    };
+    let thinking = req.thinking.as_ref();
+    let effort = req
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.as_deref());
+    let requested_length = match thinking {
+        Some(t) if t.thinking_type == "disabled" => return None,
+        Some(t) if t.thinking_type == "enabled" && t.budget_tokens > 0 => t.budget_tokens,
+        Some(t) if t.is_enabled() => thinking_length_for_effort(effort),
+        None if req
+            .output_config
+            .as_ref()
+            .is_some_and(|config| config.requests_reasoning()) =>
+        {
+            thinking_length_for_effort(effort)
+        }
+        _ => return None,
+    };
+    let length = clamp_thinking_length(
+        requested_length,
+        req.max_tokens,
+        FORCED_TARGET_MAX_OUTPUT_TOKENS,
+    );
+    let output_policy = if policy_allowed
+        && (options.force_visible_thinking || forced.display_requested_thinking)
+    {
+        format!("\n{}", THINKING_OUTPUT_POLICY)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "<thinking_mode>enabled</thinking_mode><max_thinking_length>{length}</max_thinking_length>{output_policy}"
+    ))
 }
 
 pub(super) fn generate_thinking_prefix_for_model(

@@ -951,6 +951,9 @@ pub struct ModelResolution {
     pub source: ModelResolutionSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 强制模型收敛时的外显模型与目标模型；只在请求处理内部使用，不序列化。
+    #[serde(skip)]
+    pub(crate) forced: Option<crate::anthropic::forced_model::ForcedTarget>,
 }
 
 impl ModelResolution {
@@ -960,6 +963,7 @@ impl ModelResolution {
             upstream_model: Some(model),
             source: ModelResolutionSource::ExactUpstream,
             note: None,
+            forced: None,
         }
     }
 
@@ -978,6 +982,7 @@ impl ModelResolution {
             upstream_model: Some(upstream_model),
             source,
             note,
+            forced: None,
         }
     }
 
@@ -987,6 +992,7 @@ impl ModelResolution {
             upstream_model: None,
             source: ModelResolutionSource::Unsupported,
             note: None,
+            forced: None,
         }
     }
 
@@ -996,6 +1002,7 @@ impl ModelResolution {
             upstream_model: Some(requested_model),
             source: ModelResolutionSource::PassThrough,
             note: Some("no mapping rule matched; passing requested model through".to_string()),
+            forced: None,
         }
     }
 

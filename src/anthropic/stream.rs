@@ -1902,6 +1902,12 @@ pub struct StreamContext {
     /// 清洗正文中复述的代理注入控制块（`<thinking_mode>` 等）。
     control_block_cleaner: Option<super::control_block_cleaner::ControlBlockCleaner>,
     identity_guard: Option<super::identity_guard::IdentityGuard>,
+    /// Forced model mapping: the client asked for a model with a larger window, so a full upstream
+    /// window is not reported as `model_context_window_exceeded`.
+    suppress_context_window_exceeded: bool,
+    /// Forced model mapping to Opus 5.5 with hidden thinking: text written right before a tool
+    /// call is sent as an empty thinking block, as that model returns it.
+    interleaved_text_as_thinking: Option<super::interleaved_thinking::InterleavedTextAsThinking>,
     /// Turns the internal structured-output tool call back into JSON text.
     structured_output: Option<super::structured_output::StructuredOutputStreamRewriter>,
     /// Optional local Anthropic code execution compatibility.
@@ -2102,6 +2108,8 @@ impl StreamContext {
             tool_name_text_restorer,
             control_block_cleaner: None,
             identity_guard: None,
+            suppress_context_window_exceeded: false,
+            interleaved_text_as_thinking: None,
             structured_output: None,
             code_execution: None,
             code_execution_handled: false,
@@ -2162,6 +2170,26 @@ impl StreamContext {
         self.identity_guard = fallback.map(super::identity_guard::IdentityGuard::new);
     }
 
+    /// Forced model mapping: self-descriptions are rewritten to name the client's model.
+    pub(crate) fn set_interleaved_text_as_thinking(&mut self, enabled: bool) {
+        self.interleaved_text_as_thinking =
+            enabled.then(super::interleaved_thinking::InterleavedTextAsThinking::new);
+    }
+
+    /// Forced model mapping: never report a full upstream window to the client.
+    pub(crate) fn set_suppress_context_window_exceeded(&mut self, suppress: bool) {
+        self.suppress_context_window_exceeded = suppress;
+    }
+
+    pub(crate) fn set_identity_guard_display(
+        &mut self,
+        identity: Option<super::identity_guard::DisplayIdentity>,
+    ) {
+        if let Some(guard) = self.identity_guard.take() {
+            self.identity_guard = Some(guard.with_identity(identity));
+        }
+    }
+
     fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
         // First, so later text filters see the structured answer as ordinary text.
         let events = match self.structured_output.as_mut() {
@@ -2180,6 +2208,12 @@ impl StreamContext {
         };
         let events = match self.tool_name_text_restorer.as_mut() {
             Some(restorer) => restorer.apply(events),
+            None => events,
+        };
+        // Before the omitted-thinking filter, which then treats the converted blocks like any
+        // other hidden thinking.
+        let events = match self.interleaved_text_as_thinking.as_mut() {
+            Some(filter) => filter.apply(events),
             None => events,
         };
         let events = match self.omitted_thinking_filter.as_mut() {
@@ -2843,7 +2877,10 @@ impl StreamContext {
                     self.context_input_tokens = Some(actual_input_tokens);
                 }
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if percentage.is_finite() && percentage >= 100.0 {
+                if percentage.is_finite()
+                    && percentage >= 100.0
+                    && !self.suppress_context_window_exceeded
+                {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
@@ -3743,6 +3780,14 @@ impl StreamContext {
     pub fn claude_code_noop_delta_keepalive_event(&self) -> Option<SseEvent> {
         // stop sequence 命中后，仍打开的块可能从未下发给客户端，改用 ping 保活。
         if self.stop_sequence_matched() {
+            return None;
+        }
+        // A text block held back for the thinking conversion has not reached the client yet.
+        if self
+            .interleaved_text_as_thinking
+            .as_ref()
+            .is_some_and(|filter| filter.holding())
+        {
             return None;
         }
         let (index, block_type) = self.state_manager.active_open_block_for_keepalive()?;

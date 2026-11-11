@@ -3022,6 +3022,11 @@ impl MultiTokenManager {
         self.config.read().public_pool_free_accounts
     }
 
+    /// Whether any route serves Claude models through a forced model mapping.
+    pub fn forced_model_mapping_enabled(&self) -> bool {
+        self.config.read().forced_model_mapping.any_route_enabled()
+    }
+
     fn runtime_capacity_change_should_reset_warmup(previous: &Config, current: &Config) -> bool {
         previous.credential_rpm != current.credential_rpm
             || previous.credential_max_concurrent_requests

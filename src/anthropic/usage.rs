@@ -599,8 +599,12 @@ impl RequestRejectionUsageContext {
         payload: &crate::anthropic::types::MessagesRequest,
         resolution: Option<&crate::anthropic::model_capabilities::ModelResolution>,
     ) -> Self {
+        let model = resolution
+            .and_then(|resolution| resolution.forced.as_ref())
+            .map(|forced| forced.display_model.as_str())
+            .unwrap_or(&payload.model);
         Self {
-            model: non_empty_string(&payload.model),
+            model: non_empty_string(model),
             stream: Some(payload.stream),
             requested_max_tokens: (payload.max_tokens > 0).then_some(payload.max_tokens),
             upstream_model: resolution.and_then(|resolution| {

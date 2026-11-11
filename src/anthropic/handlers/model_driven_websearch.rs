@@ -32,6 +32,8 @@ pub(super) struct ModelDrivenWebSearchContext {
     pub(super) state: AppState,
     pub(super) provider: Arc<KiroProvider>,
     pub(super) payload: MessagesRequest,
+    /// 响应里报告的模型（客户端请求的模型）。
+    pub(super) display_model: String,
     pub(super) endpoint: String,
     pub(super) runtime_config: Arc<RequestRuntimeConfig>,
     pub(super) cache_route: ResolvedCacheRoutePolicy,
@@ -256,7 +258,7 @@ pub(super) async fn run(ctx: ModelDrivenWebSearchContext) -> websearch::WebSearc
                 "id": envelope::message_id(),
                 "type": "message",
                 "role": "assistant",
-                "model": ctx.payload.model,
+                "model": ctx.display_model,
                 "content": output.blocks,
                 "stop_reason": result.stop_reason,
                 "stop_sequence": null,
@@ -349,7 +351,7 @@ async fn stream_loop(
     // The final usage is only known when the loop ends; message_start carries the first call's
     // input and no cache fields, and the final usage in message_delta replaces it.
     let start_usage = websearch::raw_websearch_usage(accounting.input_tokens, 0);
-    let start = message_start_event(&ctx.payload.model, start_usage);
+    let start = message_start_event(&ctx.display_model, start_usage);
     if !output
         .writer
         .as_mut()
@@ -631,13 +633,25 @@ async fn drive(
 }
 
 /// Text written before a search call, without echoed control prompts or identity leaks.
+fn display_identity(
+    ctx: &ModelDrivenWebSearchContext,
+) -> Option<super::super::identity_guard::DisplayIdentity> {
+    ctx.model_resolution.forced.as_ref().map(|forced| {
+        super::super::identity_guard::DisplayIdentity {
+            name: forced.spec.display_name.to_string(),
+            id: forced.display_model.clone(),
+        }
+    })
+}
+
 fn clean_preamble(ctx: &ModelDrivenWebSearchContext, text: &str) -> String {
     let mut text = text.to_string();
     if !super::super::control_block_cleaner::request_mentions_control_tags(&ctx.payload) {
         text = super::super::control_block_cleaner::strip_control_blocks(&text).into_owned();
     }
     if ctx.identity_output_guard
-        && let Some(cleaned) = super::super::identity_guard::scrub_text(&text)
+        && let Some(cleaned) =
+            super::super::identity_guard::scrub_text_as(&text, display_identity(ctx).as_ref())
     {
         text = cleaned;
     }
@@ -650,7 +664,11 @@ fn clean_text_blocks(ctx: &ModelDrivenWebSearchContext, blocks: &mut Vec<Value>)
         super::super::control_block_cleaner::strip_control_blocks_in_content(blocks);
     }
     if ctx.identity_output_guard {
-        super::super::identity_guard::scrub_content(blocks, IDENTITY_GUARD_FALLBACK);
+        super::super::identity_guard::scrub_content_as(
+            blocks,
+            IDENTITY_GUARD_FALLBACK,
+            display_identity(ctx).as_ref(),
+        );
     }
     blocks.retain(|block| {
         block["type"] != "text"

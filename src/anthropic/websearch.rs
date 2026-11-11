@@ -178,6 +178,8 @@ pub type WebSearchStreamCompletionSlot = Arc<parking_lot::Mutex<Option<WebSearch
 pub struct WebSearchRequestContext<'a> {
     pub provider: Arc<crate::kiro::provider::KiroProvider>,
     pub payload: &'a MessagesRequest,
+    /// 响应里报告的模型（客户端请求的模型）。
+    pub display_model: &'a str,
     pub input_tokens: i32,
     /// 路由需要整形 websearch usage 时提供；None 时按原始估算下发（原有行为）。
     pub usage_mapper: Option<WebSearchUsageMapper<'a>>,
@@ -1383,7 +1385,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
                     estimated_output_tokens(&summary),
                 );
                 let response_context = WebSearchResponseContext {
-                    model: &payload.model,
+                    model: context.display_model,
                     query: &query,
                     tool_use_id: &tool_use_id,
                     summary: &summary,
@@ -1416,7 +1418,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
     }
 
     // 5. 按 Anthropic `stream` 语义生成响应。
-    let model = payload.model.clone();
+    let model = context.display_model.to_string();
     let search_results = Some(search_results);
     let summary = generate_search_summary(&query, &search_results);
     let output_tokens = estimated_output_tokens(&summary);

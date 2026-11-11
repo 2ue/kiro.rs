@@ -729,7 +729,13 @@ pub(super) fn convert_tools(
 
     for (idx, mapped_name) in allocated_tools {
         let t = &tools[idx];
-        let native_execution = native_code_execution_contract(t);
+        let native_execution = native_code_execution_contract(t).or_else(|| {
+            crate::anthropic::anthropic_tools::anthropic_tool_contract(
+                t.tool_type.as_deref(),
+                &t.name,
+                !t.input_schema.is_empty(),
+            )
+        });
         let description = native_execution
             .as_ref()
             .map(|(_, description)| (*description).to_string())

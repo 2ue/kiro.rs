@@ -135,6 +135,8 @@ pub struct ConverterOptions {
     /// 这个请求允许注入的项（已按路由、上游和 compat profile 解析）。
     pub injections: ResolvedInjections,
     pub(crate) language_turn_reminder: Option<ClientLanguagePreference>,
+    /// 强制模型收敛的结果；`None` 表示请求按原模型处理。
+    pub(crate) forced: Option<super::forced_model::ForcedTarget>,
 }
 
 impl Default for ConverterOptions {
@@ -150,6 +152,7 @@ impl Default for ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::LegacyFallback,
             injections: ResolvedInjections::default(),
             language_turn_reminder: None,
+            forced: None,
         }
     }
 }
@@ -425,10 +428,15 @@ pub fn convert_request_with_resolved_model(
     options: ConverterOptions,
     resolution: &ModelResolution,
 ) -> Result<ConversionResult, ConversionError> {
-    let model_id = resolution
-        .upstream_model
-        .clone()
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    let model_id = resolution.upstream_model.clone().ok_or_else(|| {
+        // A forced mapping reports the model the client asked for, never the target.
+        let requested = resolution
+            .forced
+            .as_ref()
+            .map(|forced| forced.display_model.clone())
+            .unwrap_or_else(|| req.model.clone());
+        ConversionError::UnsupportedModel(requested)
+    })?;
     convert_request_with_model_id(req, options, model_id)
 }
 
@@ -638,6 +646,17 @@ fn convert_request_with_model_id(
         content.push_str("\n\n");
         content.push_str(&reminder);
         applied_injections.push(InjectionId::LanguageTurnReminder);
+    }
+    // Forced model mapping: facts about topics the user asked about this turn, only on turns the
+    // user wrote text in, like the other turn reminders.
+    if let Some(block) = options
+        .forced
+        .as_ref()
+        .and_then(|forced| forced.knowledge_block.as_deref())
+        .filter(|_| turn_has_user_text)
+    {
+        content.push_str("\n\n");
+        content.push_str(block);
     }
     if turn_has_user_text && options.allows(InjectionId::IdentityTurnReminder) {
         let reminder = options

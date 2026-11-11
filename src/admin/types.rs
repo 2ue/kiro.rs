@@ -2012,6 +2012,7 @@ pub struct RuntimeConfigResponse {
     pub kiro_agent_mode_strategy: KiroAgentModeStrategy,
     pub model_resolution_mode: ModelResolutionMode,
     pub model_mapping: ModelMappingConfig,
+    pub forced_model_mapping: crate::model::forced_model_mapping::ForcedModelMappingConfig,
     pub extract_thinking: bool,
     pub expose_proxy_warnings: bool,
     pub audit_log_retention_enabled: bool,
@@ -2295,6 +2296,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub model_resolution_mode: Option<ModelResolutionMode>,
     #[serde(default)]
     pub model_mapping: Option<ModelMappingConfig>,
+    #[serde(default)]
+    pub forced_model_mapping: Option<crate::model::forced_model_mapping::ForcedModelMappingConfig>,
     #[serde(default)]
     pub extract_thinking: Option<bool>,
     /// 已停用的旧字段，现在是 `routeFeatures.defaults.thinkingTrigger`。收到时返回 400。

@@ -833,6 +833,35 @@ impl Default for UsageCleanupRuntime {
 }
 
 impl AdminService {
+    /// Every forced mapping target must resolve to a model the upstream catalog serves; an empty
+    /// catalog (not synced yet) cannot be checked and is accepted.
+    fn validate_forced_model_targets(
+        &self,
+        config: &crate::model::forced_model_mapping::ForcedModelMappingConfig,
+    ) -> Result<(), AdminServiceError> {
+        if !config.any_route_enabled() || self.model_capabilities.status().models.is_empty() {
+            return Ok(());
+        }
+        let runtime_config = self.token_manager.runtime_config();
+        for target in config.targets() {
+            let resolution = self.model_capabilities.resolve_model_with_mapping(
+                &target,
+                runtime_config.model_resolution_mode,
+                &runtime_config.model_mapping,
+            );
+            let served = resolution
+                .upstream_model
+                .as_deref()
+                .is_some_and(|model| self.model_capabilities.contains_model(model));
+            if !served {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "强制模型收敛的目标模型在上游模型目录中不存在: {target}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(dependencies: AdminServiceDependencies) -> Self {
         let AdminServiceDependencies {
             token_manager,
@@ -6430,6 +6459,7 @@ impl AdminService {
             kiro_agent_mode_strategy: config.kiro_agent_mode_strategy,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
+            forced_model_mapping: config.forced_model_mapping.clone().normalized(),
             extract_thinking: config.extract_thinking,
             expose_proxy_warnings: config.expose_proxy_warnings,
             audit_log_retention_enabled: config.audit_log_retention_enabled,
@@ -6850,6 +6880,12 @@ impl AdminService {
             .clone()
             .unwrap_or_else(|| current_config.model_mapping.clone())
             .normalized();
+        let forced_model_mapping = req
+            .forced_model_mapping
+            .clone()
+            .unwrap_or_else(|| current_config.forced_model_mapping.clone())
+            .normalized();
+        self.validate_forced_model_targets(&forced_model_mapping)?;
         let extract_thinking = req
             .extract_thinking
             .unwrap_or(current_config.extract_thinking);
@@ -7331,6 +7367,7 @@ impl AdminService {
                 config.kiro_agent_mode_strategy = kiro_agent_mode_strategy;
                 config.model_resolution_mode = model_resolution_mode;
                 config.model_mapping = model_mapping;
+                config.forced_model_mapping = forced_model_mapping;
                 config.extract_thinking = extract_thinking;
                 config.expose_proxy_warnings = expose_proxy_warnings;
                 config.audit_log_retention_enabled = audit_log_retention_enabled;
@@ -11295,12 +11332,23 @@ impl AdminService {
         ids: &[u64],
     ) -> HashMap<u64, Vec<CredentialCooldown>> {
         let snapshot = self.token_manager.runtime_snapshot_for_ids(ids);
+        // With a forced model mapping the cooldown model is the serving model, which the public
+        // view must not reveal; the cooldown still shows, without its model.
+        let hide_model = self.token_manager.forced_model_mapping_enabled();
         snapshot
             .entries
             .into_iter()
             .map(|entry| credential_runtime_item_from_snapshot(entry, snapshot.current_id))
             .filter(|item| !item.cooldowns.is_empty())
-            .map(|item| (item.id, item.cooldowns))
+            .map(|item| {
+                let mut cooldowns = item.cooldowns;
+                if hide_model {
+                    cooldowns
+                        .iter_mut()
+                        .for_each(|cooldown| cooldown.model = None);
+                }
+                (item.id, cooldowns)
+            })
             .collect()
     }
 }

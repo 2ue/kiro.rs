@@ -49,6 +49,26 @@ pub(crate) fn request_config(
         .then(|| config.clone())
 }
 
+/// Removes Anthropic's native code execution tools (by declared type). Returns how many were removed.
+pub(crate) fn drop_native_code_execution_tools(request: &mut MessagesRequest) -> usize {
+    let Some(tools) = request.tools.as_mut() else {
+        return 0;
+    };
+    let before = tools.len();
+    tools.retain(|tool| {
+        !tool.tool_type.as_deref().is_some_and(|kind| {
+            CODE_EXECUTION_TOOL_TYPE_PREFIXES
+                .iter()
+                .any(|prefix| kind.starts_with(prefix))
+        })
+    });
+    let removed = before - tools.len();
+    if tools.is_empty() {
+        request.tools = None;
+    }
+    removed
+}
+
 /// `tool_choice: none` forbids every tool call this turn, so nothing may be executed.
 fn tool_choice_is_none(request: &MessagesRequest) -> bool {
     request.tool_choice.as_ref().is_some_and(|choice| {

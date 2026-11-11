@@ -726,6 +726,13 @@ impl RouteFeaturesConfig {
         self
     }
 
+    /// 路由覆盖里是否显式设置了模型驱动 web search；没有时调用方可按自己的默认值处理。
+    pub fn model_driven_web_search_configured_for(&self, endpoint: &str) -> bool {
+        self.path_overrides.iter().any(|(prefix, route)| {
+            route.model_driven_web_search.is_some() && reported_usage_path_matches(prefix, endpoint)
+        })
+    }
+
     /// 逐项取设置了这一项的最长匹配前缀，没有设置时用全局默认。
     pub fn resolve(&self, endpoint: &str) -> RouteFeatureSet {
         let mut matching: Vec<(&String, &RouteFeatureOverride)> = self

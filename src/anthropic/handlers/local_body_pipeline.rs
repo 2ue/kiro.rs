@@ -308,6 +308,7 @@ pub(super) fn prepare_with_plan(
         native_reasoning_capability,
         injections,
         language_turn_reminder: language_turn_reminder.clone(),
+        forced: model_resolution.forced.clone(),
     };
     // Historical thinking is discarded before conversion for every request when the configured
     // shaping allows it, matching the external-pool path. The protected tool-continuation
@@ -391,7 +392,7 @@ pub(super) fn prepare_with_plan(
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
     let too_long_retry = if plan.retry_payloads.is_enabled() {
-        PayloadTooLongRetryRequest::new(
+        PayloadTooLongRetryRequest::new_with_window(
             payload,
             &kiro_request,
             runtime_config,
@@ -401,6 +402,10 @@ pub(super) fn prepare_with_plan(
             should_expose_proxy_warnings(runtime_config)
                 .then(|| conversion_result.warnings.encode_header())
                 .flatten(),
+            model_resolution
+                .forced
+                .as_ref()
+                .map(|forced| forced.target_window_tokens),
         )
     } else {
         None
