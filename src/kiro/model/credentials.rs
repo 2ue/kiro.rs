@@ -1213,7 +1213,8 @@ mod tests {
         assert!(creds.supports_model(&[Some("Claude-Sonnet-4")]));
         assert!(creds.supports_model(&[None, Some("claude-haiku-4.5")]));
         assert!(!creds.supports_model(&[Some("claude-opus-4.5")]));
-        assert!(!creds.supports_model(&[None]));
+        // 不带模型的辅助调用（WebSearch MCP）不受模型列表限制。
+        assert!(creds.supports_model(&[None]));
     }
 
     #[test]
