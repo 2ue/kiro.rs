@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-09-28 Asia/Shanghai
+Last reviewed: 2026-11-11 Asia/Shanghai
 
 ## Done
 
@@ -94,6 +94,22 @@ Last reviewed: 2026-09-28 Asia/Shanghai
   request-timeline evidence. See [evidence](../../../../feature/evidence/service-audit-backlog-remediation-20260924.md).
 
 ## In Progress
+
+- Endpoint/Region/Kiro version lifecycle implementation is landed in the dirty tree. Focused
+  version tests (`15/15`), full Rust (`3023 passed / 0 failed / 18 ignored`), and both UI
+  builds passed. Same-account endpoint fallback covers inference, models and MCP;
+  bounded Region candidates cover inference, models, MCP, Profile discovery and REST usage;
+  Portal usage remains on its Portal host, overage writes remain single-region, and routine
+  auth refresh remains on auth Region. The MCP 400 root cause was the missing Builder ID/IdC
+  placeholder `x-amzn-kiro-profile-arn`: official FREE IdC A/B returned 400 without it and
+  200 with it; code now supplies it. Fail-fast applies only to remaining protocol 400 errors.
+  Version check/apply/pin/rollback state is persisted with generation CAS and Redis reload;
+  automatic checks only discover candidate and never change active or roll it back. 2026-11-11
+  FREE real-upstream validation covered every registered endpoint, Portal usage, WebSearch and
+  the version lifecycle, and fixed six protocol defects found there (topic §13). Official
+  desktop-client wire capture stays out of scope. Inference and MCP already take one runtime-config snapshot at logical request
+  entry and clone it across credential attempts; keep this contract covered by tests.
+  See [endpoint/version topic](topics/endpoint-rotation-and-client-version-lifecycle.md).
 
 - Thinking Signature 后 Too-Long 修复：已完成 provider terminal reason 保留、handler
   公共 too-long 分类和派生 body guard 基线修复；fake upstream 11 项 focused test
@@ -270,6 +286,10 @@ Last reviewed: 2026-09-28 Asia/Shanghai
    upstream protocol matrix, model/catalog policy, reasoning exposure and rollback gates
    are explicitly accepted.
 5. Continue the independent documentation archive and scheduler observability follow-ups.
+6. Verify registered fallback endpoints with project-root FREE accounts and decide whether
+   to implement structured schema-diff capture; keep the request-wide config snapshot
+   contract covered by tests. The core implementation is landed and no service binary updater
+   is planned.
 
 ## Deferred
 
