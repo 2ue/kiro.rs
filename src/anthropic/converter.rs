@@ -562,11 +562,18 @@ fn convert_request_with_model_id(
         .collect();
     let tools_unavailable = tools_unavailable_this_turn(req, &options);
     let mut response_tool_policy = ResponseToolPolicy::default();
+    response_tool_policy.set_toolset_members(converted_tools.toolset_members.clone());
+    response_tool_policy.set_single_computer_tool(req.tools.iter().flatten().any(|tool| {
+        crate::anthropic::anthropic_tools::is_single_computer_tool(tool.tool_type.as_deref())
+    }));
     if tools_unavailable {
         // tool_choice=none sends no tools upstream, so any call to a declared tool (including
         // server tools such as code_execution) is dropped instead of reaching the client.
         for tool in req.tools.iter().flatten() {
             response_tool_policy.block_tool(&tool.name);
+        }
+        for member in converted_tools.toolset_members.keys() {
+            response_tool_policy.block_tool(member);
         }
     }
     if let Some(max) = max_response_tool_uses(req, &options) {
@@ -2149,6 +2156,7 @@ mod tests {
                 cache_control: None,
                 allowed_domains: None,
                 blocked_domains: None,
+                configs: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -2230,6 +2238,7 @@ mod tests {
                 cache_control: None,
                 allowed_domains: None,
                 blocked_domains: None,
+                configs: None,
             }]),
             thinking: None,
             tool_choice: Some(serde_json::json!({"type": "tool", "name": original_name})),
@@ -2303,6 +2312,7 @@ mod tests {
                 cache_control: None,
                 allowed_domains: None,
                 blocked_domains: None,
+                configs: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -2484,6 +2494,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
                 AnthropicTool {
                     name: "blank".to_string(),
@@ -2494,6 +2505,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
             ]),
             tool_choice: None,
@@ -2547,6 +2559,7 @@ mod tests {
                 cache_control: None,
                 allowed_domains: None,
                 blocked_domains: None,
+                configs: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -2612,6 +2625,7 @@ mod tests {
                 cache_control: None,
                 allowed_domains: None,
                 blocked_domains: None,
+                configs: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -2726,6 +2740,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
                 AnthropicTool {
                     name: "read".to_string(),
@@ -2736,6 +2751,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
             ]),
             tool_choice: None,
@@ -4743,6 +4759,7 @@ mod tests {
             cache_control: None,
             allowed_domains: None,
             blocked_domains: None,
+            configs: None,
         }
     }
 

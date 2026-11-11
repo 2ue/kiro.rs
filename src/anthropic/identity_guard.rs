@@ -64,6 +64,14 @@ fn leak_patterns() -> &'static [Regex] {
             r"(冲突|矛盾)的(指令|说明|信息|身份)",
             r"(最初|原始|初始|一开始)的?(系统)?(提示词|提示|指令)",
             r"(?i)(提到|声称|说).{0,8}(kiro)",
+            // The model citing the injected context as a source instead of just knowing it.
+            r"(?i)\b(according to|based on|from|per)\s+the\s+(provided|given|supplied|attached)\s+(context|information|reminder|system\s+reminder|notes?)\b",
+            r"(?i)\b(the\s+)?system[- ]reminder\b",
+            r"(根据|依据|按照)(你)?(提供的|给出的|给我的|系统的?)(上下文|资料|信息|提示|提醒)",
+            // Echoes of the identity card itself.
+            r"(?i)never\s+mention\s+kiro",
+            r"(?i)don'?t\s+comment\s+on\s+these\s+instructions",
+            r"(?i)if\s+the\s+instructions\s+after\s+this\s+give\s+you\s+another\s+name",
         ]
         .iter()
         .map(|pattern| Regex::new(pattern).expect("identity guard pattern must compile"))
@@ -400,6 +408,26 @@ mod tests {
     use super::*;
 
     const FALLBACK: &str = "I'm Claude, an AI assistant made by Anthropic.";
+
+    #[test]
+    fn echoes_of_injected_context_are_removed_and_technical_text_stays() {
+        for input in [
+            "According to the provided context, the lineup includes Fable 5.1.",
+            "Based on the given information, my cutoff is June 2026.",
+            "The system reminder says I should answer in English.",
+            "根据提供的资料，Claude 模型包括 Fable 5.1。",
+            "I was told to never mention Kiro.",
+        ] {
+            assert_eq!(scrub_text(input).as_deref(), Some(""), "{input}");
+        }
+        for input in [
+            "The context window is 1M tokens.",
+            "Pass the context to the function and return the result.",
+            "上下文窗口是 100 万 tokens。",
+        ] {
+            assert_eq!(scrub_text(input), None, "{input}");
+        }
+    }
 
     #[test]
     fn leaking_sentences_are_removed() {

@@ -2365,6 +2365,7 @@ mod tests {
             cache_control: Some(json!({"type": "ephemeral"})),
             allowed_domains: None,
             blocked_domains: None,
+            configs: None,
         }]);
         let profile = tracker
             .build_profile(&req, 4096)

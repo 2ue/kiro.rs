@@ -59,6 +59,8 @@ pub(crate) struct DisplayModelSpec {
     pub created_at: i64,
 }
 
+/// Table row constructor; the argument order mirrors the struct fields.
+#[allow(clippy::too_many_arguments)]
 const fn spec(
     family: &'static str,
     display_name: &'static str,
@@ -360,6 +362,50 @@ pub(crate) fn display_model_listing() -> Vec<crate::anthropic::types::Model> {
             context_window: Some(spec.context_window),
         })
         .collect()
+}
+
+/// 目标模型（4.5 系）的各种写法：横杠、点号、日期后缀、显示名。
+fn target_model_pattern() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\bclaude-(?:sonnet|haiku)-4[.\-]5(?:-\d{8})?(?:-thinking)?\b|\bclaude\s+(?:sonnet|haiku)\s+4\.5\b|\b(?:sonnet|haiku)\s+4\.5\b",
+        )
+        .expect("target model pattern")
+    })
+}
+
+/// 把文字中出现的目标模型换成外显模型。
+pub(crate) fn conceal_target_model<'a>(
+    text: &'a str,
+    display_model: &str,
+) -> std::borrow::Cow<'a, str> {
+    target_model_pattern().replace_all(text, display_model)
+}
+
+/// 错误响应体里出现目标模型时换成外显模型；其它响应原样返回。错误体都是完整缓冲的 JSON。
+pub(crate) fn conceal_target_model_in_response(
+    response: axum::response::Response,
+    display_model: &str,
+) -> axum::response::Response {
+    use axum::body::{Body, to_bytes};
+    use futures::FutureExt;
+    if response.status().is_success() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    // Error bodies are in-memory JSON, so collecting them never waits on the network.
+    let Some(Ok(bytes)) = to_bytes(body, 1 << 20).now_or_never() else {
+        return axum::response::Response::from_parts(parts, Body::empty());
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let concealed = conceal_target_model(&text, display_model);
+    if matches!(concealed, std::borrow::Cow::Borrowed(_)) {
+        return axum::response::Response::from_parts(parts, Body::from(bytes));
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    axum::response::Response::from_parts(parts, Body::from(concealed.into_owned()))
 }
 
 /// 按规则选出外显模型的目标模型。非 Claude 模型、目标与外显相同时返回 `None`（不改写）。
@@ -1110,6 +1156,43 @@ mod tests {
         assert_eq!(clamp_thinking_length(48_000, 128_000, 64_000), 48_000);
         assert_eq!(clamp_thinking_length(48_000, 8_000, 64_000), 6_000);
         assert_eq!(clamp_thinking_length(48_000, 100, 64_000), 1_024);
+    }
+
+    #[test]
+    fn target_model_ids_in_text_are_replaced_with_the_display_model() {
+        for input in [
+            "model claude-sonnet-4.5 is temporarily unavailable",
+            "model claude-sonnet-4-5-20250929 is temporarily unavailable",
+            "Claude Haiku 4.5 is temporarily unavailable",
+            "model CLAUDE-HAIKU-4-5-thinking is temporarily unavailable",
+        ] {
+            let out = conceal_target_model(input, "claude-opus-5-5");
+            assert!(out.contains("claude-opus-5-5"), "{input} -> {out}");
+            assert!(
+                !out.to_lowercase().contains("4.5") && !out.contains("4-5"),
+                "{input} -> {out}"
+            );
+        }
+        assert!(matches!(
+            conceal_target_model("no model here", "claude-opus-5-5"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn error_bodies_naming_the_target_are_rewritten() {
+        use axum::body::to_bytes;
+        let response = crate::anthropic::envelope::error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "The requested model is not available: claude-sonnet-4.5",
+        );
+        let response = conceal_target_model_in_response(response, "claude-opus-5-5");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("claude-opus-5-5"), "{text}");
+        assert!(!text.contains("sonnet"), "{text}");
     }
 
     #[test]

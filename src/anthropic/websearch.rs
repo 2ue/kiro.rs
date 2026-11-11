@@ -1502,6 +1502,7 @@ pub(crate) fn ensure_claude_code_web_search_tool(req: &mut MessagesRequest) -> b
         max_uses: None,
         allowed_domains: None,
         blocked_domains: None,
+        configs: None,
         cache_control: None,
     });
     true
@@ -1687,6 +1688,7 @@ mod tests {
                 cache_control: None,
                 allowed_domains: None,
                 blocked_domains: None,
+                configs: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -1718,6 +1720,7 @@ mod tests {
                 cache_control: None,
                 allowed_domains: None,
                 blocked_domains: None,
+                configs: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -2030,6 +2033,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
                 Tool {
                     tool_type: None,
@@ -2040,6 +2044,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
             ]),
             tool_choice: None,
@@ -2078,6 +2083,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
                 Tool {
                     tool_type: None,
@@ -2088,6 +2094,7 @@ mod tests {
                     cache_control: None,
                     allowed_domains: None,
                     blocked_domains: None,
+                    configs: None,
                 },
             ]),
             tool_choice: None,

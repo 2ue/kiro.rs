@@ -873,6 +873,10 @@ pub struct Tool {
     /// Prompt cache control for cacheable tool definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<serde_json::Value>,
+    /// Per-member settings of a toolset entry such as `computer_toolset_20260801`
+    /// (`{"zoom": {"enabled": false}}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configs: Option<serde_json::Value>,
 }
 
 /// 内容块

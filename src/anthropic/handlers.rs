@@ -7007,6 +7007,25 @@ fn map_provider_error(
     provider: Option<&crate::kiro::provider::KiroProvider>,
     prompt_context: Option<ProviderErrorContext<'_>>,
 ) -> Response {
+    let response = map_provider_error_inner(err, request_id, error_id, provider, prompt_context);
+    // Forced model mapping: an upstream message that names the serving model is rewritten to
+    // the model the client asked for.
+    match prompt_context.filter(|context| context.forced) {
+        Some(ProviderErrorContext {
+            requested_model: Some(display_model),
+            ..
+        }) => super::forced_model::conceal_target_model_in_response(response, display_model),
+        _ => response,
+    }
+}
+
+fn map_provider_error_inner(
+    err: Error,
+    request_id: Option<&str>,
+    error_id: Option<&str>,
+    provider: Option<&crate::kiro::provider::KiroProvider>,
+    prompt_context: Option<ProviderErrorContext<'_>>,
+) -> Response {
     if let Some(failure_kind) = KiroProvider::call_failure_kind_from_error(&err) {
         let status = match failure_kind {
             KiroCallFailureKind::InferenceAttemptsExhausted
@@ -8544,7 +8563,7 @@ async fn post_messages_inner(
 
     let parsed_body_plan =
         ParsedAnthropicBodyPlan::shared_compatible(runtime_config.image_processing);
-    let _parsed_body_report = match parsed_body_pipeline::prepare(
+    let parsed_body_report = match parsed_body_pipeline::prepare(
         &state,
         &headers,
         &endpoint,
@@ -9102,6 +9121,15 @@ async fn post_messages_inner(
         cache_point_retry,
         applied_injections,
     } = prepared_local;
+    // Computer-use coordinates refer to the screenshot the model saw; when the proxy downscaled
+    // the latest one, map them back to the client's original screenshot.
+    let mut response_tool_policy = response_tool_policy;
+    response_tool_policy.set_screenshot_scale(
+        parsed_body_report
+            .multimodal
+            .as_ref()
+            .and_then(|report| report.latest_screenshot_scale),
+    );
     let request_capture = request_capture_client_body
         .as_ref()
         .and_then(|client_body| {
@@ -15217,6 +15245,9 @@ async fn handle_non_stream_request(
     credential_usage
         .request
         .mark_response_tool_gate(&response_tool_gate);
+    // Toolset member calls carry `toolset_name`; computer-use coordinates go back to the
+    // client's original screenshot when the proxy downscaled it.
+    response_tool_policy.finish_tool_use_blocks(&mut content);
     let code_execution_handled = match code_execution.as_ref() {
         Some(config) => super::code_execution::rewrite_blocks(&mut content, config).await,
         None => 0,

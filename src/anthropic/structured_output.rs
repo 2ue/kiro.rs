@@ -89,6 +89,7 @@ fn plan_explicit_format(
         max_uses: None,
         allowed_domains: None,
         blocked_domains: None,
+        configs: None,
         cache_control: None,
     });
     if forced {

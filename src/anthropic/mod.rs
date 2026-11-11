@@ -51,7 +51,7 @@ pub(crate) mod forced_backoff;
 pub(crate) mod forced_model;
 mod handlers;
 mod identity_guard;
-mod image_resize;
+pub(crate) mod image_resize;
 pub(crate) mod inference_attempt_budget;
 pub(crate) mod integer_output;
 mod interleaved_thinking;

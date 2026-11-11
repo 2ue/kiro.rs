@@ -20,7 +20,7 @@ pub(crate) enum RequiredToolUse {
 }
 
 /// Per-request policy derived from the Anthropic request during conversion.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ResponseToolPolicy {
     /// Lower-cased tool names (Kiro-side and client-side) that must not be called this turn.
     unavailable_tool_names: HashSet<String>,
@@ -30,6 +30,13 @@ pub(crate) struct ResponseToolPolicy {
     required: Option<RequiredToolUse>,
     /// `output_config.format` served through an internal tool; restored to JSON text downstream.
     structured_output: Option<super::structured_output::StructuredOutputTarget>,
+    /// Member tools expanded from a toolset entry (client-side name → toolset name). Their
+    /// downstream `tool_use` blocks carry `toolset_name`.
+    toolset_members: HashMap<String, String>,
+    /// Whether the request declares the single `computer` tool (`computer_20251124` and earlier).
+    single_computer_tool: bool,
+    /// Original-to-resized ratio of the latest screenshot, when the proxy downscaled it.
+    screenshot_scale: Option<super::image_resize::ScreenshotScale>,
 }
 
 impl ResponseToolPolicy {
@@ -61,6 +68,92 @@ impl ResponseToolPolicy {
         &self,
     ) -> Option<&super::structured_output::StructuredOutputTarget> {
         self.structured_output.as_ref()
+    }
+
+    pub(crate) fn set_toolset_members(&mut self, members: HashMap<String, String>) {
+        self.toolset_members = members;
+    }
+
+    pub(crate) fn set_single_computer_tool(&mut self, declared: bool) {
+        self.single_computer_tool = declared;
+    }
+
+    pub(crate) fn set_screenshot_scale(
+        &mut self,
+        scale: Option<super::image_resize::ScreenshotScale>,
+    ) {
+        self.screenshot_scale = scale;
+    }
+
+    /// Toolset name for a downstream tool name expanded from a toolset entry.
+    pub(crate) fn toolset_name(&self, tool_name: &str) -> Option<&str> {
+        self.toolset_members.get(tool_name).map(String::as_str)
+    }
+
+    /// Whether this tool's input holds screenshot coordinates that must be mapped back to the
+    /// original screenshot before the client runs it.
+    pub(crate) fn rescales_tool_input(&self, tool_name: &str) -> bool {
+        self.screenshot_scale.is_some() && self.is_computer_tool(tool_name)
+    }
+
+    fn is_computer_tool(&self, tool_name: &str) -> bool {
+        self.toolset_name(tool_name) == Some(super::anthropic_tools::COMPUTER_TOOLSET_NAME)
+            || (self.single_computer_tool && tool_name == "computer")
+    }
+
+    /// Final downstream shape of a computer-use `tool_use`: screenshot coordinates mapped back to
+    /// the original screenshot. Returns whether the input changed.
+    pub(crate) fn rescale_tool_input(&self, tool_name: &str, input: &mut Value) -> bool {
+        match self.screenshot_scale {
+            Some(scale) if self.is_computer_tool(tool_name) => scale.rescale_computer_input(input),
+            _ => false,
+        }
+    }
+
+    /// Same as [`Self::rescale_tool_input`] for a serialized input; unparseable JSON is
+    /// returned unchanged.
+    pub(crate) fn rescale_tool_input_json(&self, tool_name: &str, input_json: &str) -> String {
+        if !self.rescales_tool_input(tool_name) {
+            return input_json.to_string();
+        }
+        let Ok(mut input) = serde_json::from_str::<Value>(input_json) else {
+            return input_json.to_string();
+        };
+        if self.rescale_tool_input(tool_name, &mut input) {
+            serde_json::to_string(&input).unwrap_or_else(|_| input_json.to_string())
+        } else {
+            input_json.to_string()
+        }
+    }
+
+    /// Adds `toolset_name` and maps screenshot coordinates back in a complete non-streaming
+    /// content array.
+    pub(crate) fn finish_tool_use_blocks(&self, content: &mut [Value]) {
+        if self.toolset_members.is_empty() && self.screenshot_scale.is_none() {
+            return;
+        }
+        for block in content.iter_mut() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(name) = block
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if let Some(input) = block.get_mut("input") {
+                self.rescale_tool_input(&name, input);
+            }
+            if let (Some(toolset), Some(object)) = (self.toolset_name(&name), block.as_object_mut())
+            {
+                object.insert(
+                    "toolset_name".to_string(),
+                    Value::String(toolset.to_string()),
+                );
+            }
+        }
     }
 
     pub(crate) fn limit_tool_uses(&mut self, max: usize) {
@@ -323,6 +416,80 @@ mod tests {
         assert!(gate.admit("toolu_1", "Bash"));
         assert!(gate.admit("toolu_2", "Bash"));
         assert_eq!(gate.dropped_count(), 0);
+    }
+
+    fn computer_toolset_policy(scale: Option<(u32, u32, u32, u32)>) -> ResponseToolPolicy {
+        let mut policy = ResponseToolPolicy::default();
+        policy.set_toolset_members(HashMap::from([
+            ("left_click".to_string(), "computer".to_string()),
+            ("zoom".to_string(), "computer".to_string()),
+            ("screenshot".to_string(), "computer".to_string()),
+        ]));
+        policy.set_screenshot_scale(scale.and_then(|(ow, oh, rw, rh)| {
+            super::super::image_resize::ScreenshotScale::from_dimensions((ow, oh), (rw, rh))
+        }));
+        policy
+    }
+
+    #[test]
+    fn toolset_member_tool_uses_get_toolset_name_and_original_coordinates() {
+        let policy = computer_toolset_policy(Some((2560, 1440, 1280, 720)));
+        let mut content = vec![
+            json!({"type": "text", "text": "clicking"}),
+            json!({"type": "tool_use", "id": "a", "name": "left_click", "input": {"coordinate": [100, 50]}}),
+            json!({"type": "tool_use", "id": "b", "name": "zoom", "input": {"region": [0, 0, 640, 360]}}),
+            json!({"type": "tool_use", "id": "c", "name": "Read", "input": {"coordinate": [1, 2]}}),
+        ];
+        policy.finish_tool_use_blocks(&mut content);
+
+        assert!(content[0].get("toolset_name").is_none());
+        assert_eq!(content[1]["toolset_name"], "computer");
+        assert_eq!(content[1]["input"]["coordinate"], json!([200, 100]));
+        assert_eq!(content[2]["toolset_name"], "computer");
+        assert_eq!(content[2]["input"]["region"], json!([0, 0, 1280, 720]));
+        // Ordinary client tools keep their input and get no toolset name.
+        assert!(content[3].get("toolset_name").is_none());
+        assert_eq!(content[3]["input"]["coordinate"], json!([1, 2]));
+    }
+
+    #[test]
+    fn coordinates_are_untouched_without_a_resized_screenshot() {
+        let policy = computer_toolset_policy(None);
+        let mut content = vec![
+            json!({"type": "tool_use", "id": "a", "name": "left_click", "input": {"coordinate": [100, 50]}}),
+        ];
+        policy.finish_tool_use_blocks(&mut content);
+        assert_eq!(content[0]["toolset_name"], "computer");
+        assert_eq!(content[0]["input"]["coordinate"], json!([100, 50]));
+        assert!(!policy.rescales_tool_input("left_click"));
+        assert_eq!(
+            policy.rescale_tool_input_json("left_click", r#"{"coordinate":[100,50]}"#),
+            r#"{"coordinate":[100,50]}"#
+        );
+    }
+
+    #[test]
+    fn single_computer_tool_coordinates_are_rescaled() {
+        let mut policy = ResponseToolPolicy::default();
+        policy.set_single_computer_tool(true);
+        policy.set_screenshot_scale(
+            super::super::image_resize::ScreenshotScale::from_dimensions(
+                (3000, 2000),
+                (1500, 1000),
+            ),
+        );
+        assert!(policy.rescales_tool_input("computer"));
+        assert!(!policy.rescales_tool_input("Read"));
+        let rewritten = policy.rescale_tool_input_json(
+            "computer",
+            r#"{"action":"left_click_drag","start_coordinate":[1,2],"coordinate":[10,20]}"#,
+        );
+        let rewritten: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(rewritten["start_coordinate"], json!([2, 4]));
+        assert_eq!(rewritten["coordinate"], json!([20, 40]));
+        assert_eq!(rewritten["action"], "left_click_drag");
+        // Invalid JSON passes through unchanged.
+        assert_eq!(policy.rescale_tool_input_json("computer", "{"), "{");
     }
 
     #[test]

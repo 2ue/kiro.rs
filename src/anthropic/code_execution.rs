@@ -527,6 +527,7 @@ mod tests {
             max_uses: None,
             allowed_domains: None,
             blocked_domains: None,
+            configs: None,
             cache_control: None,
         };
         let bash = types::Tool {

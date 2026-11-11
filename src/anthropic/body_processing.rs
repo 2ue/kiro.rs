@@ -41,6 +41,9 @@ pub(crate) struct BodyProcessingReport {
     pub normalized_image_media_types: usize,
     pub resized_images: usize,
     pub resized_image_bytes_saved: usize,
+    /// Set when the latest tool-result screenshot was resized; computer-use coordinates in the
+    /// response are mapped back with it.
+    pub latest_screenshot_scale: Option<super::image_resize::ScreenshotScale>,
     remote_workflow_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -298,6 +301,7 @@ pub(crate) async fn prepare_multimodal_message_sources(
         *messages = owned;
         report.resized_images = resize.resized;
         report.resized_image_bytes_saved = resize.original_bytes.saturating_sub(resize.final_bytes);
+        report.latest_screenshot_scale = resize.latest_screenshot_scale;
     }
 
     if report.was_modified() {

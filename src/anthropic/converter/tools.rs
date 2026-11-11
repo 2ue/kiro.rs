@@ -437,6 +437,7 @@ fn equivalent_tool_definitions(left: &AnthropicTool, right: &AnthropicTool) -> b
         && left.tool_type == right.tool_type
         && left.max_uses == right.max_uses
         && left.cache_control == right.cache_control
+        && left.configs == right.configs
 }
 
 fn input_schema_from_json(
@@ -689,6 +690,74 @@ pub(super) struct ConvertedTools {
     pub(super) tool_schema_key_map: ToolSchemaKeyMap,
     /// Write/Edit 描述后缀至少加到了一个工具上。
     pub(super) chunked_suffix_applied: bool,
+    /// 由 toolset 条目（如 `computer_toolset_20260801`）展开出的成员工具：客户端侧工具名 → toolset 名。
+    pub(super) toolset_members: HashMap<String, String>,
+}
+
+/// Replaces every toolset entry with its enabled member tools, sent upstream as ordinary tools.
+/// A member whose name is already used by another client tool is skipped, so the client tool keeps
+/// its name and the request stays valid. Returns `None` when the request declares no toolset.
+fn expand_toolsets(
+    tools: &[AnthropicTool],
+) -> Option<(Vec<AnthropicTool>, HashMap<String, String>)> {
+    let is_toolset = |tool: &AnthropicTool| {
+        crate::anthropic::anthropic_tools::toolset_members(tool.tool_type.as_deref(), None)
+            .is_some()
+    };
+    if !tools.iter().any(is_toolset) {
+        return None;
+    }
+    let mut taken: std::collections::HashSet<String> = tools
+        .iter()
+        .filter(|tool| !is_toolset(tool))
+        .map(|tool| tool.name.to_ascii_lowercase())
+        .collect();
+    let mut expanded = Vec::with_capacity(tools.len() + 16);
+    let mut members_by_name = HashMap::new();
+    for tool in tools {
+        let Some((toolset_name, members)) = crate::anthropic::anthropic_tools::toolset_members(
+            tool.tool_type.as_deref(),
+            tool.configs.as_ref(),
+        ) else {
+            expanded.push(tool.clone());
+            continue;
+        };
+        let first_member = expanded.len();
+        for member in members {
+            // Kiro matches tool names case-insensitively.
+            if !taken.insert(member.name.to_ascii_lowercase()) {
+                tracing::warn!(
+                    toolset = toolset_name,
+                    member = member.name,
+                    "toolset member name collides with another declared tool; member skipped"
+                );
+                continue;
+            }
+            let serde_json::Value::Object(schema) = member.input_schema else {
+                continue;
+            };
+            expanded.push(AnthropicTool {
+                tool_type: None,
+                name: member.name.to_string(),
+                description: member.description.to_string(),
+                input_schema: schema.into_iter().collect(),
+                max_uses: None,
+                allowed_domains: None,
+                blocked_domains: None,
+                cache_control: None,
+                configs: None,
+            });
+            members_by_name.insert(member.name.to_string(), toolset_name.to_string());
+        }
+        // The toolset entry's cache breakpoint marks the end of the toolset definition.
+        if let Some(cache_control) = &tool.cache_control
+            && expanded.len() > first_member
+            && let Some(last) = expanded.last_mut()
+        {
+            last.cache_control = Some(cache_control.clone());
+        }
+    }
+    Some((expanded, members_by_name))
 }
 
 pub(super) fn convert_tools(
@@ -699,6 +768,11 @@ pub(super) fn convert_tools(
 ) -> Result<ConvertedTools, ConversionError> {
     let Some(tools) = tools else {
         return Ok(ConvertedTools::default());
+    };
+    let expanded = expand_toolsets(tools);
+    let (tools, toolset_members) = match &expanded {
+        Some((expanded, members)) => (expanded.as_slice(), members.clone()),
+        None => (tools.as_slice(), HashMap::new()),
     };
     let directive = if options.tool_choice_steering_enabled() {
         parse_tool_choice(tool_choice)
@@ -805,5 +879,212 @@ pub(super) fn convert_tools(
         tool_cache_point_insert_after: cache_point_insert_after,
         tool_schema_key_map,
         chunked_suffix_applied,
+        toolset_members,
     })
+}
+
+#[cfg(test)]
+mod computer_toolset_tests {
+    use super::*;
+    use crate::anthropic::converter::convert_request;
+
+    fn request(tools: serde_json::Value, messages: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "tools": tools,
+            "messages": messages
+        }))
+        .expect("valid request")
+    }
+
+    fn user_turn() -> serde_json::Value {
+        serde_json::json!([{"role": "user", "content": "open the settings page"}])
+    }
+
+    fn upstream_tools(req: &MessagesRequest) -> Vec<Tool> {
+        convert_request(req)
+            .expect("conversion succeeds")
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools
+    }
+
+    fn names(tools: &[Tool]) -> Vec<String> {
+        tools
+            .iter()
+            .map(|tool| tool.tool_specification.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn computer_toolset_entry_expands_to_ordinary_member_tools() {
+        let req = request(
+            serde_json::json!([
+                {"type": "computer_toolset_20260801"},
+                {"name": "Read", "description": "read a file", "input_schema": {"type": "object", "properties": {}}}
+            ]),
+            user_turn(),
+        );
+        let tools = upstream_tools(&req);
+        let names = names(&tools);
+        assert_eq!(names.len(), 18, "{names:?}");
+        assert_eq!(names[0], "screenshot");
+        assert_eq!(names[16], "wait");
+        assert_eq!(names[17], "Read");
+        let left_click = tools
+            .iter()
+            .find(|tool| tool.tool_specification.name == "left_click")
+            .unwrap();
+        let schema = serde_json::to_value(&left_click.tool_specification.input_schema).unwrap();
+        let schema = schema.get("json").unwrap_or(&schema);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["coordinate"]["type"], "array");
+        assert!(!left_click.tool_specification.description.is_empty());
+
+        let result = convert_request(&req).unwrap();
+        let policy = &result.response_tool_policy;
+        assert_eq!(policy.toolset_name("left_click"), Some("computer"));
+        assert_eq!(policy.toolset_name("screenshot"), Some("computer"));
+        assert_eq!(policy.toolset_name("Read"), None);
+        assert!(result.known_tool_names.contains("left_click"));
+    }
+
+    #[test]
+    fn disabled_members_are_not_expanded() {
+        let req = request(
+            serde_json::json!([
+                {"type": "computer_toolset_20260801", "configs": {"zoom": {"enabled": false}, "wait": {"enabled": false}}}
+            ]),
+            user_turn(),
+        );
+        let names = names(&upstream_tools(&req));
+        assert_eq!(names.len(), 15);
+        assert!(!names.iter().any(|name| name == "zoom" || name == "wait"));
+        let result = convert_request(&req).unwrap();
+        assert_eq!(result.response_tool_policy.toolset_name("zoom"), None);
+    }
+
+    #[test]
+    fn member_colliding_with_a_client_tool_is_skipped() {
+        let req = request(
+            serde_json::json!([
+                {"name": "Type", "description": "client type tool", "input_schema": {"type": "object", "properties": {"value": {"type": "string"}}}},
+                {"type": "computer_toolset_20260801"},
+                {"name": "screenshot", "description": "client screenshot", "input_schema": {"type": "object", "properties": {}}}
+            ]),
+            user_turn(),
+        );
+        let tools = upstream_tools(&req);
+        let names = names(&tools);
+        // 17 members minus the two whose names the client already uses, plus the two client tools.
+        assert_eq!(names.len(), 17, "{names:?}");
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.eq_ignore_ascii_case("screenshot"))
+                .count(),
+            1
+        );
+        let screenshot = tools
+            .iter()
+            .find(|tool| tool.tool_specification.name == "screenshot")
+            .unwrap();
+        assert_eq!(
+            screenshot.tool_specification.description,
+            "client screenshot"
+        );
+        assert!(!names.iter().any(|name| name == "type"));
+        let result = convert_request(&req).unwrap();
+        let policy = &result.response_tool_policy;
+        assert_eq!(policy.toolset_name("screenshot"), None);
+        assert_eq!(policy.toolset_name("type"), None);
+        assert_eq!(policy.toolset_name("left_click"), Some("computer"));
+    }
+
+    #[test]
+    fn toolset_cache_breakpoint_moves_to_the_last_member() {
+        let tools = Some(vec![
+            serde_json::from_value::<AnthropicTool>(serde_json::json!({
+                "type": "computer_toolset_20260801",
+                "cache_control": {"type": "ephemeral"}
+            }))
+            .unwrap(),
+        ]);
+        let (expanded, members) = expand_toolsets(tools.as_deref().unwrap()).unwrap();
+        assert_eq!(expanded.len(), 17);
+        assert_eq!(members.len(), 17);
+        assert!(
+            expanded[..16]
+                .iter()
+                .all(|tool| tool.cache_control.is_none())
+        );
+        assert_eq!(
+            expanded[16].cache_control,
+            Some(serde_json::json!({"type": "ephemeral"}))
+        );
+        assert!(expanded.iter().all(|tool| tool.tool_type.is_none()));
+    }
+
+    #[test]
+    fn toolset_name_on_replayed_history_blocks_is_ignored() {
+        let req = request(
+            serde_json::json!([{"type": "computer_toolset_20260801"}]),
+            serde_json::json!([
+                {"role": "user", "content": "click the button"},
+                {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "toolu_01a", "name": "left_click", "toolset_name": "computer", "input": {"coordinate": [512, 742]}},
+                        {"type": "tool_use", "id": "toolu_01b", "name": "screenshot", "toolset_name": "computer", "input": {}}
+                    ]},
+                {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_01a", "toolset_name": "computer", "content": [{"type": "text", "text": "OK"}]},
+                        {"type": "tool_result", "tool_use_id": "toolu_01b", "toolset_name": "computer", "content": [{"type": "text", "text": "OK"}]}
+                    ]}
+            ]),
+        );
+        let result = convert_request(&req).expect("toolset_name fields do not break conversion");
+        let assistant = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .expect("assistant history turn");
+        let tool_uses = assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("history tool uses");
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_uses[0].name, "left_click");
+        assert_eq!(
+            tool_uses[0].input["coordinate"],
+            serde_json::json!([512, 742])
+        );
+        let results = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_use_id, "toolu_01a");
+        let serialized = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(!serialized.contains("toolset_name"));
+    }
+
+    #[test]
+    fn tool_choice_none_blocks_toolset_members() {
+        let mut req = request(
+            serde_json::json!([{"type": "computer_toolset_20260801"}]),
+            user_turn(),
+        );
+        req.tool_choice = Some(serde_json::json!({"type": "none"}));
+        let result = convert_request(&req).unwrap();
+        assert!(result.response_tool_policy.is_unavailable("left_click"));
+    }
 }

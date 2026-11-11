@@ -1892,6 +1892,9 @@ pub struct StreamContext {
     repeat_guard_tripped: bool,
     /// 响应侧工具调用约束（tool_choice=none 等 Kiro 无法表达的语义）。
     response_tool_gate: ResponseToolGate,
+    /// The request's response tool policy: toolset member names (`toolset_name` on their
+    /// `tool_use` blocks) and the screenshot scale for computer-use coordinates.
+    response_tool_policy: ResponseToolPolicy,
     /// 请求声明了 stop_sequences 时的输出侧截断过滤器。
     stop_sequence_filter: Option<super::stop_sequence::StopSequenceFilter>,
     /// 请求的 thinking 显示方式隐藏推理（`omitted`/`updates`，或模型默认 `omitted`）时，
@@ -2103,6 +2106,7 @@ impl StreamContext {
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
             response_tool_gate: ResponseToolGate::default(),
+            response_tool_policy: ResponseToolPolicy::default(),
             stop_sequence_filter: None,
             omitted_thinking_filter: None,
             tool_name_text_restorer,
@@ -2119,6 +2123,7 @@ impl StreamContext {
 
     pub fn set_response_tool_policy(&mut self, policy: &ResponseToolPolicy) {
         self.response_tool_gate = policy.gate();
+        self.response_tool_policy = policy.clone();
         self.structured_output = policy
             .structured_output()
             .cloned()
@@ -3506,6 +3511,9 @@ impl StreamContext {
             .tool_schema_key_map
             .reverse_tool_input_json(&resolved.upstream, &input_json);
         let input_json = repair_tool_use_input_json_for_cli(&output_name, &input_json);
+        let input_json = self
+            .response_tool_policy
+            .rescale_tool_input_json(&output_name, &input_json);
         let sig = tool_use_signature_from_json_str(&output_name, &input_json);
         if self.seen_tool_sigs.contains(&sig) {
             tracing::debug!(tool = %output_name, "跳过重复的字面 invoke 工具调用");
@@ -3559,12 +3567,7 @@ impl StreamContext {
             json!({
                 "type": "content_block_start",
                 "index": block_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use_id,
-                    "name": output_name,
-                    "input": {}
-                }
+                "content_block": self.tool_use_start_block(&tool_use_id, &output_name)
             }),
         ));
         // tool_use 块本身就是输出：工具名和（空参数时的）`{}` 都要计入输出估算，
@@ -3927,6 +3930,20 @@ impl StreamContext {
         events
     }
 
+    /// `content_block` of a downstream `tool_use` start; toolset members carry `toolset_name`.
+    fn tool_use_start_block(&self, tool_use_id: &str, name: &str) -> serde_json::Value {
+        let mut block = json!({
+            "type": "tool_use",
+            "id": tool_use_id,
+            "name": name,
+            "input": {}
+        });
+        if let Some(toolset) = self.response_tool_policy.toolset_name(name) {
+            block["toolset_name"] = json!(toolset);
+        }
+        block
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -4110,12 +4127,7 @@ impl StreamContext {
             json!({
                 "type": "content_block_start",
                 "index": block_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use.tool_use_id,
-                    "name": original_name,
-                    "input": {}
-                }
+                "content_block": self.tool_use_start_block(&tool_use.tool_use_id, &original_name)
             }),
         );
         if !start_events.is_empty() {
@@ -4128,7 +4140,11 @@ impl StreamContext {
         events.extend(start_events);
 
         let has_schema_key_map = self.tool_schema_key_map.has_tool(&upstream_name);
-        let defer_input_until_stop = original_name == "AskUserQuestion" || has_schema_key_map;
+        let defer_input_until_stop = original_name == "AskUserQuestion"
+            || has_schema_key_map
+            || self
+                .response_tool_policy
+                .rescales_tool_input(&original_name);
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)。AskUserQuestion 需要先
         // 累计完整 JSON，避免已经发给 CLI 的增量参数无法修正。顶层对象闭合之后上游再吐的内容
@@ -4207,6 +4223,9 @@ impl StreamContext {
             } else {
                 output_input
             };
+            let output_input = self
+                .response_tool_policy
+                .rescale_tool_input_json(&original_name, &output_input);
             let input_delta_event = if defer_input_until_stop && !output_input.is_empty() {
                 self.state_manager.handle_content_block_delta(
                     block_index,
@@ -4339,7 +4358,11 @@ impl StreamContext {
             let upstream_name = resolved.upstream;
             let original_name = resolved.original;
             let has_schema_key_map = self.tool_schema_key_map.has_tool(&upstream_name);
-            let defer_input_until_stop = original_name == "AskUserQuestion" || has_schema_key_map;
+            let defer_input_until_stop = original_name == "AskUserQuestion"
+                || has_schema_key_map
+                || self
+                    .response_tool_policy
+                    .rescales_tool_input(&original_name);
             let output_input = if has_schema_key_map {
                 self.tool_schema_key_map
                     .reverse_tool_input_json(&upstream_name, &full_input)
@@ -4351,6 +4374,9 @@ impl StreamContext {
             } else {
                 output_input
             };
+            let output_input = self
+                .response_tool_policy
+                .rescale_tool_input_json(&original_name, &output_input);
 
             let input_delta_event = if defer_input_until_stop && !output_input.is_empty() {
                 self.state_manager.handle_content_block_delta(
@@ -4529,6 +4555,12 @@ impl StreamContext {
             // 执行工具；保持打开时 CLI 丢弃该块并把本轮视为失败。
             events.extend(self.state_manager.close_open_non_tool_use_blocks());
             let message = self.public_stream_error_message(&error_type, raw_message);
+            // Forced model mapping: an upstream message naming the serving model names the client's.
+            let message = if self.suppress_context_window_exceeded {
+                super::forced_model::conceal_target_model(&message, &self.model).into_owned()
+            } else {
+                message
+            };
             // Claude Code 只会自动重发流里 `type` 为 overloaded_error 的错误（流内的 api_error
             // 会直接停下这一轮，见 claude-code 的 shouldRetry）。上游瞬态失败（读流、解码、
             // 静默超时、上游错误事件、工具参数没收完）重发通常就能成功，所以对外报成
@@ -10090,6 +10122,71 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn toolset_member_tool_use_carries_toolset_name_and_rescaled_coordinates() {
+        let mut policy = ResponseToolPolicy::default();
+        policy.set_toolset_members(HashMap::from([
+            ("left_click".to_string(), "computer".to_string()),
+            ("screenshot".to_string(), "computer".to_string()),
+        ]));
+        policy.set_screenshot_scale(
+            super::super::image_resize::ScreenshotScale::from_dimensions((2560, 1440), (1280, 720)),
+        );
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "claude-sonnet-4.6",
+            100,
+            false,
+            HashMap::new(),
+            HashSet::from([
+                "left_click".to_string(),
+                "screenshot".to_string(),
+                "Read".to_string(),
+            ]),
+        );
+        ctx.set_response_tool_policy(&policy);
+        let mut events = ctx.generate_initial_events();
+        for (id, name, input, stop) in [
+            ("toolu_click", "left_click", "{\"coordinate\":[1", false),
+            ("toolu_click", "left_click", "00,50]}", true),
+            ("toolu_shot", "screenshot", "{}", true),
+            ("toolu_read", "Read", "{\"file_path\":\"a\"}", true),
+        ] {
+            events.extend(ctx.process_kiro_event(&tool_use_fragment(id, name, input, stop)));
+        }
+        let starts: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .map(|event| &event.data["content_block"])
+            .collect();
+        assert_eq!(starts.len(), 3, "{events:?}");
+        assert_eq!(starts[0]["name"], "left_click");
+        assert_eq!(starts[0]["toolset_name"], "computer");
+        assert_eq!(starts[1]["toolset_name"], "computer");
+        assert!(starts[2].get("toolset_name").is_none());
+        // The coordinate input is buffered until the call completes, then sent once, rescaled.
+        let click_index = events
+            .iter()
+            .find(|event| event.data["content_block"]["name"] == "left_click")
+            .map(|event| event.data["index"].clone())
+            .unwrap();
+        let click_deltas: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["index"] == click_index
+                    && event.data["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(click_deltas.len(), 1, "{click_deltas:?}");
+        let input: serde_json::Value = serde_json::from_str(click_deltas[0]).unwrap();
+        assert_eq!(input, serde_json::json!({"coordinate": [200, 100]}));
+        assert!(
+            collect_delta_text(&events, "input_json_delta", "partial_json")
+                .contains("\"file_path\":\"a\"")
+        );
     }
 
     #[test]

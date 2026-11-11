@@ -736,6 +736,7 @@ pub(super) fn internal_request(
         max_uses: None,
         allowed_domains: None,
         blocked_domains: None,
+        configs: None,
         cache_control: None,
     });
     request.tools = Some(tools);
