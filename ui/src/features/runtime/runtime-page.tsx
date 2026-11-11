@@ -5,6 +5,7 @@ import {
   Gauge,
   Eye,
   EyeOff,
+  GitMerge,
   Router,
   Save,
   Shield,
@@ -48,6 +49,8 @@ import {
   normalizeLocalRequestCompat,
   normalizeRequestCapture,
   normalizeModelMapping,
+  normalizeForcedModelMapping,
+  forcedModelMappingError,
   normalizePayloadShaping,
   normalizePromptInjection,
   normalizeRouteFeatures,
@@ -66,7 +69,9 @@ import {
   useUpdateRuntimeConfig,
 } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
+import { knownRoutes } from '@/features/prompt-injection/injection-model'
 import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
+import { ForcedModelMappingSection } from './forced-model-mapping-section'
 import {
   normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
@@ -84,6 +89,7 @@ type RuntimeSectionKey =
   | 'warmup'
   | 'payload'
   | 'modelMapping'
+  | 'forcedModelMapping'
   | 'startupProxy'
   | 'compat'
   | 'requestCompat'
@@ -102,6 +108,7 @@ const runtimeSections: Array<{
   { key: 'warmup', title: '新账号预热', desc: '新账号逐步参与请求，稳定后恢复正常', icon: <Sparkles className="h-4 w-4" /> },
   { key: 'payload', title: '请求体处理', desc: '协议转换、大小保护、历史清理和当前请求兜底', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
+  { key: 'forcedModelMapping', title: '强制模型收敛', desc: 'Claude 请求改发到目标模型，对外仍显示原模型', icon: <GitMerge className="h-4 w-4" /> },
   { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
   { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
   { key: 'requestCompat', title: '参数兼容', desc: '客户端参数写法不规范时改写还是拒绝', icon: <Wand2 className="h-4 w-4" /> },
@@ -403,6 +410,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
     modelMapping: normalizeModelMapping(draft.modelMapping),
+    forcedModelMapping: normalizeForcedModelMapping(draft.forcedModelMapping),
     externalPools: {
       ...defaultExternalPoolsConfig(),
       ...draft.externalPools,
@@ -542,6 +550,7 @@ export function RuntimePage() {
         cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
+        forcedModelMapping: normalizeForcedModelMapping(config.data.forcedModelMapping),
       }
       setDraft(hydratedDraft)
       setSavedDraft(hydratedDraft)
@@ -624,6 +633,12 @@ export function RuntimePage() {
     const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
     if (invalidDefinedCacheRoute)
       return toast.error('缓存策略里的 /dfcache 路径必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
+    // 先校验原始草稿：normalize 会丢掉不完整的规则和知识条目，直接保存会让用户误以为它们已生效。
+    const forcedModelMappingProblem = forcedModelMappingError(draft.forcedModelMapping)
+    if (forcedModelMappingProblem) {
+      setActiveSection('forcedModelMapping')
+      return toast.error(forcedModelMappingProblem)
+    }
     const next = normalizeConfig(draft)
     if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs)
       return toast.error('临时冷却秒数不能大于最大冷却秒数')
@@ -644,7 +659,12 @@ export function RuntimePage() {
         setSavedDraft(next)
         toast.success('配置已保存，新请求立即生效')
       },
-      onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),
+      onError: (e) => {
+        const message = extractErrorMessage(e)
+        // 后端校验强制收敛目标模型失败时，切到对应配置区方便修改。
+        if (message.includes('强制模型收敛')) setActiveSection('forcedModelMapping')
+        toast.error(`保存失败: ${message}`)
+      },
     })
   }
 
@@ -1592,6 +1612,15 @@ export function RuntimePage() {
                   onChange={(m: ModelMappingConfig) => set('modelMapping')(m)}
                 />
               </div>
+            )}
+
+            {activeSection === 'forcedModelMapping' && (
+              <ForcedModelMappingSection
+                mapping={draft.forcedModelMapping}
+                capabilities={modelCapabilities.data}
+                routes={knownRoutes(draft)}
+                onChange={set('forcedModelMapping')}
+              />
             )}
 
             {activeSection === 'startupProxy' && (

@@ -3,6 +3,12 @@ import type {
   CachePolicyConfig,
   CacheRoutePolicyPatch,
   BodyConversionConfig,
+  ForcedContextBackoffConfig,
+  ForcedKnowledgeEntry,
+  ForcedModelFamily,
+  ForcedModelMappingConfig,
+  ForcedModelRouteOverride,
+  ForcedModelRule,
   ImageProcessingConfig,
   MissingMaxTokensConfig,
   LocalRequestCompatConfig,
@@ -508,6 +514,169 @@ export function normalizeModelMapping(config?: Partial<ModelMappingConfig> | nul
   }
 }
 
+// ─── 强制模型收敛（forcedModelMapping），与后端 ForcedModelMappingConfig::normalized 对齐 ─────
+
+export const FORCED_MODEL_FAMILIES: ForcedModelFamily[] = ['opus', 'fable', 'mythos', 'sonnet', 'haiku']
+export const DEFAULT_FORCED_SONNET_TARGET = 'claude-sonnet-4-5'
+export const DEFAULT_FORCED_HAIKU_TARGET = 'claude-haiku-4-5'
+
+/** 后端对退避参数的取值范围（超出时后端会夹紧，前端保存前先按同样范围夹紧）。 */
+export const FORCED_CONTEXT_BACKOFF_LIMITS = {
+  safetyMarginRatio: { min: 0, max: 0.5 },
+  minReservedOutputTokens: { min: 1024, max: 64000 },
+  keepRecentToolResults: { min: 1, max: 64 },
+  stepTokens: { min: 1000, max: 500000 },
+} as const
+
+export function defaultForcedModelRules(): ForcedModelRule[] {
+  return [
+    { families: ['haiku'], target: DEFAULT_FORCED_HAIKU_TARGET },
+    { families: ['opus', 'fable', 'mythos', 'sonnet'], target: DEFAULT_FORCED_SONNET_TARGET },
+  ]
+}
+
+export function defaultForcedContextBackoff(): ForcedContextBackoffConfig {
+  return {
+    safetyMarginRatio: 0.05,
+    minReservedOutputTokens: 8000,
+    keepRecentToolResults: 8,
+    stepTokens: 50000,
+  }
+}
+
+export function defaultForcedModelMapping(): ForcedModelMappingConfig {
+  return {
+    enabled: false,
+    rules: defaultForcedModelRules(),
+    defaultTarget: DEFAULT_FORCED_SONNET_TARGET,
+    pathOverrides: {},
+    contextBackoff: defaultForcedContextBackoff(),
+    interleavedTextAsThinking: true,
+    knowledge: [],
+  }
+}
+
+/** 路由前缀写法与后端一致：去首尾空白和末尾斜杠，补前导斜杠，空值视为 `/`。 */
+export function canonicalForcedRoutePrefix(prefix: string): string {
+  const trimmed = prefix.trim().replace(/\/+$/, '')
+  if (!trimmed) return '/'
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+}
+
+/** 知识条目关键词：只按中英文逗号拆分，关键词本身可以带空格（例如 "claude models"）。 */
+export function parseForcedKnowledgeTopics(value: string): string[] {
+  const seen = new Set<string>()
+  const topics: string[] = []
+  for (const raw of value.split(/[,，]/)) {
+    const topic = raw.trim().toLowerCase()
+    if (!topic || seen.has(topic)) continue
+    seen.add(topic)
+    topics.push(topic)
+  }
+  return topics
+}
+
+function uniqueLowercase(values: string[] | undefined | null): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const raw of values ?? []) {
+    const value = String(raw ?? '').trim().toLowerCase()
+    if (!value || seen.has(value)) continue
+    seen.add(value)
+    out.push(value)
+  }
+  return out
+}
+
+function clampBackoffNumber(value: unknown, fallback: number, min: number, max: number, integer: boolean): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  const rounded = integer ? Math.round(parsed) : Number(parsed.toFixed(4))
+  return Math.min(max, Math.max(min, rounded))
+}
+
+export function normalizeForcedModelMapping(input?: Partial<ForcedModelMappingConfig> | null): ForcedModelMappingConfig {
+  const base = defaultForcedModelMapping()
+  const rules = (input?.rules ?? base.rules)
+    .map((rule) => ({
+      families: uniqueLowercase(rule?.families),
+      target: String(rule?.target ?? '').trim().toLowerCase(),
+    }))
+    .filter((rule) => rule.families.length > 0 && rule.target)
+
+  const pathOverrides: Record<string, ForcedModelRouteOverride> = {}
+  const overrideEntries = Object.entries(input?.pathOverrides ?? {})
+    .map(([prefix, value]) => [canonicalForcedRoutePrefix(prefix), value] as const)
+    .filter(([, value]) => typeof value?.enabled === 'boolean')
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  for (const [prefix, value] of overrideEntries) pathOverrides[prefix] = { enabled: value!.enabled }
+
+  const backoffInput: Partial<ForcedContextBackoffConfig> = input?.contextBackoff ?? {}
+  const backoffBase = base.contextBackoff
+  const limits = FORCED_CONTEXT_BACKOFF_LIMITS
+  const contextBackoff: ForcedContextBackoffConfig = {
+    safetyMarginRatio: clampBackoffNumber(backoffInput.safetyMarginRatio, backoffBase.safetyMarginRatio, limits.safetyMarginRatio.min, limits.safetyMarginRatio.max, false),
+    minReservedOutputTokens: clampBackoffNumber(backoffInput.minReservedOutputTokens, backoffBase.minReservedOutputTokens, limits.minReservedOutputTokens.min, limits.minReservedOutputTokens.max, true),
+    keepRecentToolResults: clampBackoffNumber(backoffInput.keepRecentToolResults, backoffBase.keepRecentToolResults, limits.keepRecentToolResults.min, limits.keepRecentToolResults.max, true),
+    stepTokens: clampBackoffNumber(backoffInput.stepTokens, backoffBase.stepTokens, limits.stepTokens.min, limits.stepTokens.max, true),
+  }
+
+  const knowledge: ForcedKnowledgeEntry[] = (input?.knowledge ?? [])
+    .map((entry) => {
+      const locale = String(entry?.locale ?? '').trim().toLowerCase()
+      const normalized: ForcedKnowledgeEntry = {
+        id: String(entry?.id ?? '').trim(),
+        enabled: entry?.enabled !== false,
+        topics: uniqueLowercase(entry?.topics),
+        fact: String(entry?.fact ?? '').trim(),
+      }
+      if (locale === 'en' || locale === 'zh') normalized.locale = locale
+      return normalized
+    })
+    .filter((entry) => entry.topics.length > 0 && entry.fact)
+
+  return {
+    enabled: input?.enabled === true,
+    rules,
+    defaultTarget: String(input?.defaultTarget ?? '').trim().toLowerCase() || base.defaultTarget,
+    pathOverrides,
+    contextBackoff,
+    interleavedTextAsThinking: input?.interleavedTextAsThinking ?? base.interleavedTextAsThinking,
+    knowledge,
+  }
+}
+
+/** 保存前的校验：后端会静默丢弃不完整的规则，这里改为明确提示，避免用户以为规则已生效。 */
+export function forcedModelMappingError(config: ForcedModelMappingConfig): string | null {
+  for (const [index, rule] of config.rules.entries()) {
+    if (rule.families.length === 0) return `强制模型收敛第 ${index + 1} 条规则没有选择模型族`
+    if (!rule.target.trim()) return `强制模型收敛第 ${index + 1} 条规则没有填写目标模型`
+  }
+  if (!config.defaultTarget.trim()) return '强制模型收敛的默认目标模型不能为空'
+  for (const [index, entry] of config.knowledge.entries()) {
+    if (entry.topics.length === 0 || !entry.fact.trim()) return `强制模型收敛第 ${index + 1} 个知识条目缺少关键词或内容`
+  }
+  return null
+}
+
+/** 同一个模型族出现在多条规则里时，只有第一条生效；返回被遮住的族及其所在规则序号（从 1 开始）。 */
+export function shadowedForcedFamilies(rules: ForcedModelRule[]): Array<{ family: string; winner: number; shadowed: number[] }> {
+  const positions = new Map<string, number[]>()
+  rules.forEach((rule, index) => {
+    for (const family of uniqueLowercase(rule.families)) {
+      positions.set(family, [...(positions.get(family) ?? []), index + 1])
+    }
+  })
+  return [...positions.entries()]
+    .filter(([, indexes]) => indexes.length > 1)
+    .map(([family, [winner, ...shadowed]]) => ({ family, winner: winner!, shadowed }))
+}
+
+/** 是否有任意路由实际开启了强制收敛（总开关或某条路由覆盖为开启），与后端 any_route_enabled 一致。 */
+export function forcedModelMappingAnyRouteEnabled(config: ForcedModelMappingConfig): boolean {
+  return config.enabled || Object.values(config.pathOverrides).some((route) => route.enabled === true)
+}
+
 export const emptyRuntimeConfig: RuntimeConfig = {
   proxyUrl: null,
   proxyUsername: null,
@@ -662,6 +831,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   kiroAgentModeStrategy: 'vibe',
   modelResolutionMode: 'compatible',
   modelMapping: defaultModelMappingConfig(),
+  forcedModelMapping: defaultForcedModelMapping(),
   extractThinking: true,
   exposeProxyWarnings: false,
   auditLogRetentionEnabled: false,

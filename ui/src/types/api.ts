@@ -1776,6 +1776,50 @@ export interface ModelMappingConfig {
   rules: ModelMappingRule[]
 }
 
+/** Model families the forced mapping recognises in the client's model name. */
+export type ForcedModelFamily = 'opus' | 'fable' | 'mythos' | 'sonnet' | 'haiku'
+
+/** A display model whose family is in `families` is sent to `target`; the first matching rule wins. */
+export interface ForcedModelRule {
+  families: string[]
+  target: string
+}
+
+/** Per-route override; an unset field keeps the global value. */
+export interface ForcedModelRouteOverride {
+  enabled?: boolean
+}
+
+export interface ForcedContextBackoffConfig {
+  safetyMarginRatio: number
+  minReservedOutputTokens: number
+  keepRecentToolResults: number
+  stepTokens: number
+}
+
+export type ForcedKnowledgeLocale = 'en' | 'zh'
+
+export interface ForcedKnowledgeEntry {
+  id: string
+  enabled: boolean
+  topics: string[]
+  /** Absent means any language. */
+  locale?: ForcedKnowledgeLocale
+  fact: string
+}
+
+/** Forced model convergence; independent of `modelMapping`. */
+export interface ForcedModelMappingConfig {
+  enabled: boolean
+  rules: ForcedModelRule[]
+  defaultTarget: string
+  pathOverrides: Record<string, ForcedModelRouteOverride>
+  contextBackoff: ForcedContextBackoffConfig
+  interleavedTextAsThinking: boolean
+  /** Empty means the server uses its built-in entries. */
+  knowledge: ForcedKnowledgeEntry[]
+}
+
 export interface ReportedUsageFieldPolicy {
   mode: ReportedUsageFieldMode
   maxTokens: number
@@ -2672,6 +2716,7 @@ export interface RuntimeConfig {
   kiroAgentModeStrategy: KiroAgentModeStrategy
   modelResolutionMode: ModelResolutionMode
   modelMapping: ModelMappingConfig
+  forcedModelMapping: ForcedModelMappingConfig
   extractThinking: boolean
   exposeProxyWarnings: boolean
   auditLogRetentionEnabled: boolean

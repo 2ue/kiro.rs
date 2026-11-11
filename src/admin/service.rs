@@ -833,13 +833,18 @@ impl Default for UsageCleanupRuntime {
 }
 
 impl AdminService {
-    /// Every forced mapping target must resolve to a model the upstream catalog serves; an empty
-    /// catalog (not synced yet) cannot be checked and is accepted.
+    /// Every forced mapping target must resolve to a model the upstream catalog serves. A catalog
+    /// that has not been synced from an account yet (empty, or only the built-in seed) cannot be
+    /// checked and is accepted.
     fn validate_forced_model_targets(
         &self,
         config: &crate::model::forced_model_mapping::ForcedModelMappingConfig,
     ) -> Result<(), AdminServiceError> {
-        if !config.any_route_enabled() || self.model_capabilities.status().models.is_empty() {
+        let status = self.model_capabilities.status();
+        let synced = status.models.iter().any(|item| {
+            item.source.as_deref() != Some(crate::anthropic::model_capabilities::SEED_SOURCE)
+        });
+        if !config.any_route_enabled() || !synced {
             return Ok(());
         }
         let runtime_config = self.token_manager.runtime_config();
