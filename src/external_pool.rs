@@ -1374,10 +1374,23 @@ fn external_dispatch_deadline(
     }
 }
 
+/// 非流式请求自身的超时预算：从请求开始算 `externalPoolRequestTimeoutSecs`，换池重试共用这一个预算。
+///
+/// 共享调度截止时间（`credentialDispatchMaxWaitSecs`，默认 30 秒）只约束排队和换池前的等待，
+/// 不参与这里的计算；否则请求发出后会在 30 秒处被切断，慢但正常的非流式响应永远拿不到。
+fn external_non_stream_request_remaining(
+    route: &ExternalRouteRequest,
+    config: &ExternalPoolsConfig,
+) -> Option<Duration> {
+    (!route.is_stream() && config.external_pool_request_timeout_secs > 0)
+        .then(|| route.started_at + Duration::from_secs(config.external_pool_request_timeout_secs))
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .filter(|duration| !duration.is_zero())
+}
+
 fn external_request_send_timeout(
     route: &ExternalRouteRequest,
     config: &ExternalPoolsConfig,
-    dispatch_deadline: Option<Instant>,
 ) -> Option<Duration> {
     let configured = if route.is_stream() {
         (config.external_pool_stream_request_timeout_secs > 0)
@@ -1386,35 +1399,26 @@ fn external_request_send_timeout(
         (config.external_pool_request_timeout_secs > 0)
             .then(|| Duration::from_secs(config.external_pool_request_timeout_secs))
     };
-    let remaining = (!route.is_stream())
-        .then(|| {
-            dispatch_deadline
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .filter(|duration| !duration.is_zero())
-        })
-        .flatten();
-    match (configured, remaining) {
+    match (
+        configured,
+        external_non_stream_request_remaining(route, config),
+    ) {
         (Some(configured), Some(remaining)) => Some(configured.min(remaining)),
-        (Some(configured), None) => Some(configured),
-        (None, Some(remaining)) => Some(remaining),
-        (None, None) => None,
+        (configured, remaining) => configured.or(remaining),
     }
 }
 
 fn external_response_body_timeout_secs(
+    route: &ExternalRouteRequest,
     config: &ExternalPoolsConfig,
-    dispatch_deadline: Option<Instant>,
 ) -> u64 {
     let configured = if config.external_pool_request_timeout_secs == 0 {
         EXTERNAL_POOL_DEFAULT_RESPONSE_BODY_TIMEOUT_SECS
     } else {
         config.external_pool_request_timeout_secs
     };
-    dispatch_deadline
-        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-        .filter(|duration| !duration.is_zero())
-        .map(|duration| duration.as_secs().max(1))
-        .map(|remaining_secs| configured.min(remaining_secs))
+    external_non_stream_request_remaining(route, config)
+        .map(|remaining| configured.min(remaining.as_secs().max(1)))
         .unwrap_or(configured)
 }
 
@@ -6562,7 +6566,7 @@ impl ExternalPoolManager {
             }
             let started = std::time::Instant::now();
             let current_attempt = send_attempt_index.saturating_add(1) as u32;
-            let prepared = self.prepare_forward_once(&pool, &route, &config, dispatch_deadline);
+            let prepared = self.prepare_forward_once(&pool, &route, &config);
             let result = match prepared {
                 Ok(prepared) => {
                     #[cfg(test)]
@@ -6957,7 +6961,6 @@ impl ExternalPoolManager {
         pool: &ExternalPool,
         route: &ExternalRouteRequest,
         config: &ExternalPoolsConfig,
-        dispatch_deadline: Option<Instant>,
     ) -> Result<PreparedExternalForwardRequest, ExternalForwardError> {
         let mut prepared = external_pool_prepare_request(route, pool)?;
         let url = external_pool_url(pool, &route.endpoint, config)?;
@@ -6977,11 +6980,10 @@ impl ExternalPoolManager {
         let known_tool_names = external_route_known_tool_names(route);
         let client = self.client_for_pool(pool);
         let mut request = client.post(url).headers(headers).body(prepared.body);
-        if let Some(timeout) = external_request_send_timeout(route, config, dispatch_deadline) {
+        if let Some(timeout) = external_request_send_timeout(route, config) {
             request = request.timeout(timeout);
         }
-        let response_body_timeout_secs =
-            external_response_body_timeout_secs(config, dispatch_deadline);
+        let response_body_timeout_secs = external_response_body_timeout_secs(route, config);
         Ok(PreparedExternalForwardRequest {
             request,
             outbound_model,
