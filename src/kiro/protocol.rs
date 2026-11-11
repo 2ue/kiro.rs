@@ -257,6 +257,13 @@ pub fn profile_arn_discovery_applies(credentials: &KiroCredentials) -> bool {
     credentials.is_idc_refresh_credential() && stored.is_none() && !declared_builder_id
 }
 
+/// Whether a `ListAvailableProfiles` 403 body says the account has no profile access, as opposed
+/// to an invalid or expired token.
+pub fn profile_listing_denied_for_builder_id(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("builder id") || lower.contains("not authorized to access this feature")
+}
+
 /// Pick the profile in the account's API Region when the organization has several.
 pub fn extract_preferred_profile_arn(body: &str, region: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(body).ok()?;
@@ -321,6 +328,19 @@ mod tests {
             ..Default::default()
         };
         assert!(!profile_arn_discovery_applies(&social));
+    }
+
+    #[test]
+    fn builder_id_profile_denial_is_distinguished_from_token_errors() {
+        assert!(profile_listing_denied_for_builder_id(
+            r#"{"message":"User is not authorized to access this feature.","reason":null}"#
+        ));
+        assert!(profile_listing_denied_for_builder_id(
+            r#"{"message":"AWS Builder ID is not supported for this operation."}"#
+        ));
+        assert!(!profile_listing_denied_for_builder_id(
+            r#"{"message":"Invalid token","reason":null}"#
+        ));
     }
 
     #[test]

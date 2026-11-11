@@ -1626,6 +1626,47 @@ pub struct CredentialInfoRefreshResponse {
     pub failed: usize,
     pub items: Vec<CredentialInfoRefreshItem>,
 }
+/// 批量同步 profileArn 的范围。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileArnSyncMode {
+    /// 只处理还没有 profileArn 的 IdC / External IdP 账号。
+    #[default]
+    Fill,
+    /// 丢弃已存值重新查询，用于已存值有误的情况。
+    Rediscover,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProfileArnRequest {
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub mode: ProfileArnSyncMode,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileArnSyncItem {
+    pub id: u64,
+    pub email: Option<String>,
+    /// updated / unchanged / skipped / failed
+    pub status: &'static str,
+    /// 结果类型：organization / builder_id / none
+    pub profile_kind: Option<&'static str>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileArnSyncResponse {
+    pub total: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub items: Vec<ProfileArnSyncItem>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

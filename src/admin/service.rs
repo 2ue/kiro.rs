@@ -30,22 +30,23 @@ use super::types::{
     CredentialUsageSummaryResponse, CredentialValidationGroup, CredentialValidationInfo,
     CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
     CredentialsStatusResponse, DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest,
-    LoadBalancingModeResponse, ManualModelResponse, ProxyResourceBatchTestItem,
-    ProxyResourceBatchTestResponse, ProxyResourceImportEntry, ProxyResourceResponse,
-    ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
-    RefreshCredentialInfoRequest, RequestApiKeyItem, RequestKeyUsageLimitItem,
-    RequestKeyUsageLimitsResponse, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
-    SetCredentialOverageRequest, SetCredentialProxyRequest,
-    SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
-    SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
-    SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
-    SubscriptionModelListItem, SubscriptionModelListsResponse, SupportedModelsResponse,
-    SyncSubscriptionModelListRequest, TestCredentialRequest, TestCredentialResponse,
-    TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
-    UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
-    UsageDashboardAccountItem, UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
+    LoadBalancingModeResponse, ManualModelResponse, ProfileArnSyncItem, ProfileArnSyncMode,
+    ProfileArnSyncResponse, ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse,
+    ProxyResourceImportEntry, ProxyResourceResponse, ProxyResourceTestRequest,
+    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
+    RequestApiKeyItem, RequestKeyUsageLimitItem, RequestKeyUsageLimitsResponse,
+    RuntimeConfigResponse, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
+    SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+    SetCredentialRegionsRequest, SetCredentialRoutePolicyRequest, SetCredentialRpmRequest,
+    SetLoadBalancingModeRequest, SetSubscriptionModelListRequest, SetSupportedModelsRequest,
+    SetWarmupRequest, SubscriptionModelListItem, SubscriptionModelListsResponse,
+    SupportedModelsResponse, SyncProfileArnRequest, SyncSubscriptionModelListRequest,
+    TestCredentialRequest, TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse,
+    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupResumeRequest, UsageCleanupStatusResponse, UsageDashboardAccountItem,
+    UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
     ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::request_key_limits::{
@@ -2979,6 +2980,126 @@ impl AdminService {
         self.get_account_info(id, false).await
     }
 
+    /// 批量补全或重新识别 IdC / External IdP 账号的 profileArn。
+    pub async fn sync_credentials_profile_arn(
+        &self,
+        req: SyncProfileArnRequest,
+    ) -> Result<ProfileArnSyncResponse, AdminServiceError> {
+        let mut ids = req.ids;
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请至少选择一个凭据".to_string(),
+            ));
+        }
+        if ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多处理 {} 个凭据",
+                MAX_CREDENTIALS_PAGE_LIMIT
+            )));
+        }
+        let concurrency =
+            effective_credential_info_refresh_concurrency(&self.token_manager.runtime_config());
+        let labels = self.credential_lookup();
+        let snapshot = self.token_manager.base_snapshot();
+        let mut items = stream::iter(ids.into_iter().map(|id| {
+            let email = labels.get(&id).and_then(|item| item.email.clone());
+            let before = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| (entry.auth_method.clone(), entry.has_profile_arn));
+            async move {
+                let item = |status, profile_kind, error| ProfileArnSyncItem {
+                    id,
+                    email: email.clone(),
+                    status,
+                    profile_kind,
+                    error,
+                };
+                let Some((auth_method, had_profile_arn)) = before else {
+                    return item("failed", None, Some(format!("凭据不存在: {id}")));
+                };
+                let auth_method = auth_method.unwrap_or_default();
+                if !matches!(auth_method.as_str(), "idc" | "external_idp") {
+                    return item(
+                        "skipped",
+                        None,
+                        Some("该认证类型不使用 profileArn 发现".to_string()),
+                    );
+                }
+                if req.mode == ProfileArnSyncMode::Fill && had_profile_arn {
+                    return item("skipped", None, None);
+                }
+                let previous = self.token_manager.credential_profile_arn(id);
+                let result = match req.mode {
+                    ProfileArnSyncMode::Fill => self
+                        .kiro_provider
+                        .ensure_profile_arn_for_credential(id)
+                        .await
+                        .map(|()| self.token_manager.credential_profile_arn(id)),
+                    ProfileArnSyncMode::Rediscover => self
+                        .kiro_provider
+                        .rediscover_profile_arn_for_credential(id)
+                        .await
+                        .map(|discovered| discovered.or_else(|| previous.clone())),
+                };
+                match result {
+                    Ok(current) => {
+                        let kind = current.as_deref().map(|arn| {
+                            if crate::kiro::protocol::is_placeholder_profile_arn(arn) {
+                                "builder_id"
+                            } else {
+                                "organization"
+                            }
+                        });
+                        if current.is_none() {
+                            item(
+                                "failed",
+                                Some("none"),
+                                Some("上游没有返回可用的 profileArn".to_string()),
+                            )
+                        } else if current == previous {
+                            item("unchanged", kind, None)
+                        } else {
+                            self.invalidate_balance_cache(id);
+                            item("updated", kind, None)
+                        }
+                    }
+                    Err(error) => item("failed", None, Some(error.to_string())),
+                }
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        items.sort_unstable_by_key(|item| item.id);
+        let count = |status: &str| items.iter().filter(|item| item.status == status).count();
+        let response = ProfileArnSyncResponse {
+            total: items.len(),
+            updated: count("updated"),
+            unchanged: count("unchanged"),
+            skipped: count("skipped"),
+            failed: count("failed"),
+            items,
+        };
+        self.audit(
+            "sync_credentials_profile_arn",
+            "credential",
+            None,
+            response.failed == 0,
+            None,
+            json!({
+                "mode": format!("{:?}", req.mode),
+                "total": response.total,
+                "updated": response.updated,
+                "failed": response.failed,
+            }),
+        );
+        Ok(response)
+    }
+
     pub async fn refresh_credentials_info(
         &self,
         req: RefreshCredentialInfoRequest,
@@ -3225,6 +3346,19 @@ impl AdminService {
                         existing_disabled: matched.as_ref().map(|item| item.disabled),
                     });
                     continue;
+                }
+            };
+
+            // JSON 里没有 profileArn 的 IdC 账号先查一次；组织账号带 Builder ID 占位查额度会被拒。
+            let credential = match self
+                .kiro_provider
+                .discover_profile_arn_for_external_credentials(credential.clone())
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    tracing::debug!("外部凭据校验前补全 profileArn 失败: {}", error);
+                    credential
                 }
             };
 
@@ -3657,8 +3791,8 @@ impl AdminService {
             }
         }
 
-        // 组织 IdC 账号导入时通常没有 profileArn：先查出真实 ARN，后续额度查询、模型列表和
-        // 验活才会带对 profile。失败只记录警告，请求前的自动补全会再试。
+        // 导入的 IdC 账号没有 profileArn 时先查一次：组织账号查到真实 ARN 后，额度查询、
+        // 模型列表和验活才会带对 profile。失败只记录警告，请求前的自动补全会再试。
         if let Err(error) = self
             .kiro_provider
             .ensure_profile_arn_for_credential(credential_id)

@@ -1263,7 +1263,7 @@ pub(crate) async fn get_usage_limits(
     if !credentials.is_api_key_credential() {
         let portal = KiroPortalClient::for_credentials(credentials, config, proxy)?;
         // Portal 按 Idp cookie 校验 token 来源：Social token 配 BuilderId 会被拒 401。
-        // 导入的 Social JSON 常缺 provider，此时按 Google 发送（Github 同样被接受）。
+        // 凭据没有 provider 时按 Google 发送（Github 同样被接受）。
         let idp = credentials
             .provider
             .as_deref()

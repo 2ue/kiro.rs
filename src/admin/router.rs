@@ -45,12 +45,13 @@ use super::{
         set_credential_route_policy, set_credential_rpm, set_credential_supported_models,
         set_credential_warmup, set_external_pool_enabled, set_external_pool_supported_models,
         set_load_balancing_mode, set_subscription_model_list, start_usage_cleanup,
-        sync_credential_supported_models, sync_external_pool_supported_models,
-        sync_model_capabilities, sync_model_pricing, sync_subscription_model_list,
-        test_all_proxy_resources, test_credential, test_external_pool, test_proxy_resource,
-        test_proxy_resource_config, update_admin_api_key, update_credential_auth,
-        update_external_pool, update_proxy_resource, update_request_api_key, update_runtime_config,
-        upsert_manual_model, validate_existing_credentials, validate_external_credentials,
+        sync_credential_supported_models, sync_credentials_profile_arn,
+        sync_external_pool_supported_models, sync_model_capabilities, sync_model_pricing,
+        sync_subscription_model_list, test_all_proxy_resources, test_credential,
+        test_external_pool, test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
+        update_credential_auth, update_external_pool, update_proxy_resource,
+        update_request_api_key, update_runtime_config, upsert_manual_model,
+        validate_existing_credentials, validate_external_credentials,
     },
     inventory::http as inventory_http,
     middleware::{AdminState, admin_auth_middleware},
@@ -184,6 +185,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/info", get(get_credential_info))
         .route("/credentials/{id}/overage", post(set_credential_overage))
         .route("/credentials/info/refresh", post(refresh_credentials_info))
+        .route(
+            "/credentials/profile-arn/sync",
+            post(sync_credentials_profile_arn),
+        )
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route(

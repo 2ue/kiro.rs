@@ -78,6 +78,8 @@ import type {
   PromptInjectionPreviewRequest,
   PromptInjectionPreviewResponse,
   RequestKeyUsageLimitsResponse,
+  ProfileArnSyncMode,
+  ProfileArnSyncResponse,
 } from '@/types/api'
 
 const CREDENTIALS_LIST_PAGE_LIMIT = 500
@@ -307,6 +309,11 @@ export async function getCredentialCreditSummary(): Promise<CredentialCreditSumm
 
 export async function refreshCredentialInfo(ids: number[], force = true): Promise<CredentialInfoRefreshResponse> {
   const { data } = await api.post<CredentialInfoRefreshResponse>('/credentials/info/refresh', { ids, force })
+  return data
+}
+
+export async function syncCredentialsProfileArn(ids: number[], mode: ProfileArnSyncMode): Promise<ProfileArnSyncResponse> {
+  const { data } = await api.post<ProfileArnSyncResponse>('/credentials/profile-arn/sync', { ids, mode })
   return data
 }
 

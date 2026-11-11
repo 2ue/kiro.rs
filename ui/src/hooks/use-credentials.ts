@@ -34,6 +34,7 @@ import {
   setPublicPoolConfig,
   resetCredentialFailure,
   rollbackKiroClientVersion,
+  syncCredentialsProfileArn,
   setCredentialDisabled,
   setCredentialConcurrency,
   setCredentialOverage,
@@ -73,6 +74,7 @@ import type {
   ProxyResourceTestRequest,
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
+  ProfileArnSyncMode,
 } from '@/types/api'
 
 interface QueryRefreshOptions {
@@ -424,6 +426,14 @@ export function useForceRefreshToken() {
   return useMutation({
     mutationFn: (id: number) => forceRefreshToken(id),
     onSuccess: (_data, id) => invalidateCredentialCaches(queryClient, id),
+  })
+}
+
+export function useSyncCredentialsProfileArn() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, mode }: { ids: number[]; mode: ProfileArnSyncMode }) => syncCredentialsProfileArn(ids, mode),
+    onSuccess: () => invalidateCredentialCaches(queryClient),
   })
 }
 

@@ -47,8 +47,8 @@ use crate::kiro::model::available_models::{
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::protocol::{
     KIRO_BUILDER_ID_PLACEHOLDER_ARN, extract_preferred_profile_arn, is_external_idp_credentials,
-    is_real_profile_arn, profile_arn_discovery_applies, resolve_mcp_profile_arn,
-    resolve_models_profile_arn, resolve_streaming_profile_arn,
+    is_real_profile_arn, profile_arn_discovery_applies, profile_listing_denied_for_builder_id,
+    resolve_mcp_profile_arn, resolve_models_profile_arn, resolve_streaming_profile_arn,
 };
 use crate::kiro::retry_pipeline::{
     BerserkPlan, RotationCursor, RotationStep, auxiliary_region_candidates,
@@ -3792,6 +3792,14 @@ mod tests {
         };
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
+        if token.starts_with("builder-id-") {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                "message": "User is not authorized to access this feature."
+                   })),
+            );
+        }
         if token.starts_with("forbidden-") {
             return (
                 StatusCode::FORBIDDEN,
@@ -4654,7 +4662,7 @@ mod tests {
         let server = FakeBadRequestServer::start().await;
         let (provider, manager) = fake_profile_provider(
             &server.base_url,
-            vec![fake_idc_credential(1, "forbidden-builder-id", None)],
+            vec![fake_idc_credential(1, "builder-id-account", None)],
             Some(short_profile_discovery_policy(8)),
         );
         provider
@@ -4683,6 +4691,93 @@ mod tests {
                 .expect("confirmed builder id is skipped");
         }
         assert_eq!(server.state.scenario_hits("profile_discovery_success"), 1);
+    }
+
+    #[tokio::test]
+    async fn external_validation_fills_profile_arn_without_storing_the_credential() {
+        let server = FakeBadRequestServer::start().await;
+        let (provider, manager) = fake_profile_provider(&server.base_url, Vec::new(), None);
+        let resolved = provider
+            .discover_profile_arn_for_external_credentials({
+                // IdC 刷新地址固定指向 AWS OIDC；离线测试用可指向假上游的 External IdP。
+                let mut credential = fake_external_idp_credential(9, "org-external");
+                credential.token_endpoint = Some(format!("{}/oauth-refresh", server.base_url));
+                credential
+            })
+            .await
+            .expect("external organization profile");
+        assert_eq!(
+            resolved.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+        );
+        assert!(manager.acquire_context_for_credential(9).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idc_profile_403_without_builder_id_answer_is_not_marked() {
+        let server = FakeBadRequestServer::start().await;
+        let (provider, manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_idc_credential(1, "forbidden-expired-token", None)],
+            None,
+        );
+        provider
+            .ensure_profile_arn_for_credential(1)
+            .await
+            .expect("unclassified 403");
+        let stored = manager
+            .acquire_context_for_credential(1)
+            .await
+            .expect("reacquire account")
+            .credentials;
+        assert!(stored.profile_arn.is_none());
+        assert!(crate::kiro::protocol::profile_arn_discovery_applies(
+            &stored
+        ));
+    }
+
+    #[tokio::test]
+    async fn rediscover_replaces_a_wrong_builder_id_marker_with_the_organization_arn() {
+        let server = FakeBadRequestServer::start().await;
+        // 组织账号此前被误标为 Builder ID：补全会跳过它，只有重新识别能修正。
+        let (provider, manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_idc_credential(
+                1,
+                "org-mislabeled",
+                Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+            )],
+            None,
+        );
+        provider
+            .ensure_profile_arn_for_credential(1)
+            .await
+            .expect("fill skips stored marker");
+        assert_eq!(server.state.scenario_hits("profile_discovery_success"), 0);
+
+        let discovered = provider
+            .rediscover_profile_arn_for_credential(1)
+            .await
+            .expect("rediscover organization profile");
+        let expected = "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE";
+        assert_eq!(discovered.as_deref(), Some(expected));
+        assert_eq!(manager.credential_profile_arn(1).as_deref(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn rediscover_keeps_the_stored_arn_when_the_query_fails() {
+        let server = FakeBadRequestServer::start().await;
+        let stored = "arn:aws:codewhisperer:us-east-1:123456789012:profile/STORED";
+        let (provider, manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_idc_credential(1, "server-error-org", Some(stored))],
+            None,
+        );
+        provider
+            .rediscover_profile_arn_for_credential(1)
+            .await
+            .expect_err("upstream 500 must surface");
+        assert_eq!(manager.credential_profile_arn(1).as_deref(), Some(stored));
     }
 
     #[tokio::test]
@@ -12268,9 +12363,12 @@ impl KiroProvider {
                         upstream_status = status.as_u16(),
                         "ListAvailableProfiles denied the auxiliary request; using fallback profile ARN"
                     );
-                    // Builder ID 没有 profile，上游对它固定返回 403。把占位 ARN 作为“已确认是
-                    // BuilderId”的标记存下，之后不再为这个账号查询。
-                    if !is_external_idp_credentials(&ctx.credentials) {
+                    // Builder ID 没有 profile，上游以 403 拒绝（实测文案为 "User is not authorized to access
+                    // this feature."，也见过 "Builder ID is not supported"）。只有这类明确答复才把占位 ARN
+                    // 存为“已确认是 BuilderId”的标记；token 失效（"Invalid token"）等其它 403 不能据此定性。
+                    if !is_external_idp_credentials(&ctx.credentials)
+                        && profile_listing_denied_for_builder_id(&body.text)
+                    {
                         return Ok(Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()));
                     }
                     return Ok(None);
@@ -13008,6 +13106,75 @@ impl KiroProvider {
             request_kiro_version,
         )
         .await
+    }
+
+    /// 外部 JSON 校验用：凭据不在池里，查到的 profileArn 只回填到返回值，不写库。
+    pub async fn discover_profile_arn_for_external_credentials(
+        &self,
+        mut credentials: KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        if !profile_arn_discovery_applies(&credentials) {
+            return Ok(credentials);
+        }
+        let mut config = self
+            .token_manager
+            .runtime_config_snapshot()
+            .as_ref()
+            .clone();
+        config.snapshot_kiro_version_for_request();
+        let request_kiro_version = config.effective_kiro_version();
+        let ctx = self
+            .token_manager
+            .acquire_context_for_external_credentials_with_version(
+                credentials.clone(),
+                Some(&request_kiro_version),
+            )
+            .await?;
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+        if let Some(profile_arn) = self
+            .fetch_enterprise_profile_arn_for_context(&ctx, &config, &machine_id, None)
+            .await?
+        {
+            credentials.profile_arn = Some(profile_arn);
+        }
+        Ok(credentials)
+    }
+
+    /// 丢弃已存的 profileArn 并重新查询，用于已存值本身有误的情况（组织账号被误标为 Builder ID、
+    /// profile 被重建、外部工具导出的 ARN 已失效）。只处理 IdC 与 External IdP；返回查询后的值。
+    pub async fn rediscover_profile_arn_for_credential(
+        &self,
+        credential_id: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let mut config = self
+            .token_manager
+            .runtime_config_snapshot()
+            .as_ref()
+            .clone();
+        config.snapshot_kiro_version_for_request();
+        let request_kiro_version = config.effective_kiro_version();
+        let mut ctx = self
+            .token_manager
+            .acquire_context_for_credential_with_version(credential_id, Some(&request_kiro_version))
+            .await?;
+        if ctx.credentials.is_api_key_credential()
+            || !(ctx.credentials.is_idc_refresh_credential()
+                || is_external_idp_credentials(&ctx.credentials))
+        {
+            anyhow::bail!("只有 IdC 与 External IdP 账号需要重新识别 profileArn");
+        }
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+        self.clear_profile_arn_discovery_state(&ctx, &config, &machine_id);
+        ctx.credentials.profile_arn = None;
+        let discovered = self
+            .fetch_enterprise_profile_arn_for_context(&ctx, &config, &machine_id, None)
+            .await?;
+        // 查询失败会在上面返回错误，原值保持不变；只有拿到明确结果才覆盖。
+        if let Some(profile_arn) = discovered.as_ref() {
+            self.token_manager
+                .update_credential_profile_arn_deferred(credential_id, Some(profile_arn.clone()))?;
+        }
+        Ok(discovered)
     }
 
     /// 账号缺少 profileArn 时立即查询并写回（导入后、额度查询前调用）。

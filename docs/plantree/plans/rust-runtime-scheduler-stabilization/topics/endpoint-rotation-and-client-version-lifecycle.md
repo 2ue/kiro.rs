@@ -560,6 +560,34 @@ kiroPreferredEndpoint: Option<String>             # 若需要独立于 defaultEn
 6. 不带模型的请求（WebSearch MCP）在账号有自身或订阅等级模型列表后被判 `model_not_supported`，导致 WebSearch 不可用。现无模型请求不受模型列表限制。
 7. 官方 1.4.154 的 runtime 流解码器把 `:message-type: event` 帧里的 `error`、`throttlingError`、`validationError`、`serviceUnavailableError` 当作异常抛出；本项目原把它们归为 Unknown 丢弃，流在零输出时结束，表现为空回。现映射为 InternalServer / Throttling / Validation / ServiceUnavailable 异常，前三类之外按上游瞬态失败处理。
 8. 组织 IdC 与 Builder ID 导入形态相同，原实现只对 External IdP 调 `ListAvailableProfiles`，组织 IdC 永远拿不到真实 profileArn。现对 profileArn 为空且未声明 BuilderId 的 IdC 也查询：查到真实 ARN 写回；收到 403 视为 Builder ID，把占位 ARN 存为标记，之后不再查询。导入后与额度查询前都会先补全；多个 profile 时优先账号 API Region。FREE IdC 实测：重新导入后 403 → 存占位 → 模型列表、账号信息、单号测试均成功，且未再次查询。
+9. `ListAvailableProfiles` 的 403 不全是 Builder ID：token 失效时返回 `Invalid token`。只有 `User is not authorized to access this feature` / `Builder ID is not supported` 才存占位标记，其它 403 不定性、下次再查。
+10. 外部 JSON 校验（`/credential-validation/external`）不经过请求前补全，组织 IdC 没有 profileArn 时额度查询带占位 ARN 被拒 403。现校验前先查 profileArn，结果只回填到本次校验用的凭据，不写库。
+
+### 13.1 2026-11-12 企业 / Pro / API Key 账号复测（不调用模型）
+
+账号来自用户导出文件（3 个：组织 IdC KIRO POWER、Social KIRO PRO、API Key KIRO PRO，均无剩余额度）。`proxyResourceId` 指向的代理资源只存在于导出方的数据库，本地导入时会报“代理资源不存在”，去掉该字段后导入。
+
+| 操作 | 组织 IdC | Social Pro | API Key Pro |
+| --- | --- | --- | --- |
+| 导入 | 成功 | 成功 | 成功 |
+| 去掉 profileArn 后导入 | 自动查到真实 ARN 并写回 | — | — |
+| Token 刷新 | 200 | 200 | 不适用（无 refresh token） |
+| 账号信息 / 额度 | KIRO POWER 10000/10000 | KIRO PRO 1158/1158 | KIRO PRO 1154/1154 |
+| 模型列表 | 22 个 | 23 个 | 10 个（management host） |
+| 外部 JSON 校验（不导入） | 修复前 403，修复后成功 | 成功 | 成功 |
+
+对照：同一组织 IdC token 不带 profileArn 调 `getUsageLimits` / `ListAvailableModels` 返回 `400 Invalid profileArn.`，带 Builder ID 占位返回 `403 Invalid token`，只有真实 ARN 能通过。
+
+### 13.2 补全与重新识别 profileArn
+
+账号卡片“维护”菜单和批量操作栏提供两种操作，只对 IdC / External IdP 生效：
+
+- 补全：只处理还没有 profileArn 的账号，结果与自动补全相同。
+- 重新识别：丢弃已存值重新查询。用于已存值本身有误、自动流程不会再查的情况：组织账号早先被误标为 Builder ID（例如当时 token 失效或网络异常）、组织重建了 profile、外部工具导出的 ARN 已失效。查询失败时保留原值。
+
+实测：把组织 IdC 的 profileArn 人为改成 Builder ID 占位后，模型列表返回 403，补全按设计跳过；重新识别后写回真实 ARN，模型列表恢复 22 个、额度查询正常。Builder ID 账号重新识别结果不变。
+
+期间单号测试报 `INVALID_MODEL_ID`：`claude-haiku-4-5-*` 只有在目录里存在 `claude-haiku-4.5` 时才会改写成它，目录由启用中账号的模型列表合并而来。当时目录还是只启用 API Key 账号时同步的 10 个模型，里面没有任何 Claude 模型，请求名被原样透传。FREE 账号启用后，后台最多 30 秒才重新同步目录；测试请求落在这个窗口内。启用账号后目录同步滞后，属于待处理的缺陷。
 
 `kiro_capture_schema_diff.py 0.11.107.zip 1.4.154.zip` 在 api / mcp / models 三类请求上只报告 KiroIDE 身份与 `api/codewhispererstreaming#1.0.34 → 1.0.44` 的差异；host、path、header 名称、body 字段类型与响应状态均无变化。该结论只覆盖本项目发出的请求，不能代表官方桌面客户端的完整 wire contract。
 

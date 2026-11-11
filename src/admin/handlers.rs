@@ -25,11 +25,11 @@ use super::{
         SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SetSubscriptionModelListRequest,
         SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse, SyncModelCapabilitiesRequest,
-        SyncSubscriptionModelListRequest, SystemVersionResponse, TestCredentialRequest,
-        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-        UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        SyncProfileArnRequest, SyncSubscriptionModelListRequest, SystemVersionResponse,
+        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -927,6 +927,18 @@ pub async fn refresh_credentials_info(
     Json(payload): Json<RefreshCredentialInfoRequest>,
 ) -> impl IntoResponse {
     match state.service.refresh_credentials_info(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/profile-arn/sync
+/// 批量补全（mode=fill）或重新识别（mode=rediscover）IdC / External IdP 的 profileArn
+pub async fn sync_credentials_profile_arn(
+    State(state): State<AdminState>,
+    Json(payload): Json<SyncProfileArnRequest>,
+) -> impl IntoResponse {
+    match state.service.sync_credentials_profile_arn(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

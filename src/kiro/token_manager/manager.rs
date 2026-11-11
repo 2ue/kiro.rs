@@ -14907,6 +14907,15 @@ impl MultiTokenManager {
     }
 
     /// 请求热路径版本：本地 profileArn 立即生效，PgSQL 凭据 CAS 异步持久化。
+    /// 当前内存中的 profileArn（管理端比较同步前后的值用）。
+    pub fn credential_profile_arn(&self, id: u64) -> Option<String> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.credentials.profile_arn.clone())
+    }
+
     pub fn update_credential_profile_arn_deferred(
         &self,
         id: u64,

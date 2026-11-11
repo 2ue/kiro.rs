@@ -456,6 +456,26 @@ export interface CredentialInfoRefreshResponse {
   items: CredentialInfoRefreshItem[]
 }
 
+/** fill：只补没有 profileArn 的账号；rediscover：丢弃已存值重新查询 */
+export type ProfileArnSyncMode = 'fill' | 'rediscover'
+
+export interface ProfileArnSyncItem {
+  id: number
+  email: string | null
+  status: 'updated' | 'unchanged' | 'skipped' | 'failed'
+  profileKind: 'organization' | 'builder_id' | 'none' | null
+  error: string | null
+}
+
+export interface ProfileArnSyncResponse {
+  total: number
+  updated: number
+  unchanged: number
+  skipped: number
+  failed: number
+  items: ProfileArnSyncItem[]
+}
+
 export interface ValidateExistingCredentialsRequest {
   scope?: 'all' | 'enabled' | 'disabled' | 'selected'
   ids?: number[]
