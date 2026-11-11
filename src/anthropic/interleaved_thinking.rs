@@ -32,15 +32,25 @@ struct HeldText {
 /// 流式过滤器：把紧邻 tool_use 之前的 text 块改写为空 thinking 块。
 pub(crate) struct InterleavedTextAsThinking {
     held: Option<HeldText>,
+    /// `display: "updates"`: the converted block keeps the text as a progress update instead of
+    /// coming back empty.
+    keep_text: bool,
     /// 在自身 stop 到达之前就已被改写的块 index。改写时已经补发了 stop，
     /// 之后到达的同 index 事件直接丢弃，避免客户端看到已关闭块的增量。
     closed_early: Vec<Value>,
 }
 
 impl InterleavedTextAsThinking {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_text(false)
+    }
+
+    /// `keep_text`: progress updates (`display: "updates"`) keep their text.
+    pub(crate) fn with_text(keep_text: bool) -> Self {
         Self {
             held: None,
+            keep_text,
             closed_early: Vec::new(),
         }
     }
@@ -168,6 +178,11 @@ impl InterleavedTextAsThinking {
 
     /// 把被扣住的 text 块改写为同 index 的空 thinking 块。
     fn rewrite(&mut self, held: HeldText, out: &mut Vec<SseEvent>) {
+        let text = if self.keep_text {
+            held_text(&held.events)
+        } else {
+            String::new()
+        };
         let index = held.index;
         out.push(SseEvent::new(
             "content_block_start",
@@ -182,7 +197,7 @@ impl InterleavedTextAsThinking {
             json!({
             "type": "content_block_delta",
                    "index": index,
-                   "delta": {"type": "thinking_delta", "thinking": ""}
+                   "delta": {"type": "thinking_delta", "thinking": text}
                }),
         ));
         out.push(SseEvent::new(
@@ -192,7 +207,7 @@ impl InterleavedTextAsThinking {
                    "index": index,
                    "delta": {
                 "type": "signature_delta",
-                "signature": synthetic_thinking_signature("")
+                "signature": synthetic_thinking_signature(&text)
                    }
                }),
         ));
@@ -208,7 +223,13 @@ impl InterleavedTextAsThinking {
 
 /// 非流式：把紧邻 tool_use / server_tool_use 之前的 text 块（含连续多个）原地替换为空
 /// thinking 块，最后一个工具调用之后的 text 保留。返回是否有改动。
+#[cfg(test)]
 pub(crate) fn convert_content(content: &mut [Value]) -> bool {
+    convert_content_with_text(content, false)
+}
+
+/// `keep_text`: progress updates (`display: "updates"`) keep their text.
+pub(crate) fn convert_content_with_text(content: &mut [Value], keep_text: bool) -> bool {
     let mut changed = false;
     for tool_position in 0..content.len() {
         if !content[tool_position]
@@ -223,15 +244,33 @@ pub(crate) fn convert_content(content: &mut [Value]) -> bool {
             && content[position - 1].get("type").and_then(Value::as_str) == Some("text")
         {
             position -= 1;
+            let text = if keep_text {
+                content[position]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let signature = synthetic_thinking_signature(&text);
             content[position] = json!({
-            "type": "thinking",
-            "thinking": "",
-                   "signature": synthetic_thinking_signature("")
-               });
+                "type": "thinking",
+                "thinking": text,
+                "signature": signature
+            });
             changed = true;
         }
     }
     changed
+}
+
+/// Text collected from the held block's text deltas.
+fn held_text(events: &[SseEvent]) -> String {
+    events
+        .iter()
+        .filter(|event| event.data["delta"]["type"] == "text_delta")
+        .filter_map(|event| event.data["delta"]["text"].as_str())
+        .collect()
 }
 
 fn is_tool_use_type(block_type: &str) -> bool {
@@ -733,6 +772,41 @@ mod tests {
             "thinking": "",
             "signature": synthetic_thinking_signature("")
         })
+    }
+
+    #[test]
+    fn progress_updates_keep_their_text_with_a_matching_signature() {
+        let mut content = vec![
+            json!({"type": "text", "text": "Reading the config first."}),
+            json!({"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}),
+            json!({"type": "text", "text": "Done."}),
+        ];
+        assert!(convert_content_with_text(&mut content, true));
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "Reading the config first.");
+        let signature = content[0]["signature"].as_str().unwrap();
+        assert!(
+            crate::anthropic::signature::synthetic_thinking_signature_matches(
+                "Reading the config first.",
+                signature
+            )
+        );
+        assert_eq!(content[2]["type"], "text");
+
+        let mut filter = InterleavedTextAsThinking::with_text(true);
+        let out = filter.apply(vec![
+            text_start(0),
+            text_delta(0, "Checking "),
+            text_delta(0, "the tests."),
+            block_stop(0),
+            tool_start(1, "tool_use"),
+        ]);
+        let thinking: String = out
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|event| event.data["delta"]["thinking"].as_str())
+            .collect();
+        assert_eq!(thinking, "Checking the tests.");
     }
 
     #[test]

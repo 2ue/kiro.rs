@@ -345,10 +345,18 @@ pub(crate) fn display_spec_for(model: &str) -> Option<DisplayModelSpec> {
         .copied()
 }
 
+/// 外显模型是否把工具调用之间写的文字作为 thinking 块返回：Opus 5.5，以及 Fable / Mythos 5 系
+/// （官方：工具调用之间的进度说明以 thinking 块返回，`display: "omitted"` 时为空，`"updates"` 时带文字）。
+pub(crate) fn returns_interleaved_text_as_thinking(spec: &DisplayModelSpec) -> bool {
+    spec.canonical_id == "claude-opus-5-5" || matches!(spec.family, "fable" | "mythos")
+}
+
 /// 模型列表中外显模型的公开条目：窗口与输出上限按官方值，不随目标模型变化。
 pub(crate) fn display_model_listing() -> Vec<crate::anthropic::types::Model> {
     DISPLAY_MODEL_SPECS
         .iter()
+        // Mythos is offered only through Project Glasswing; requests naming it are still served.
+        .filter(|spec| spec.family != "mythos")
         .map(|spec| crate::anthropic::types::Model {
             id: spec.canonical_id.to_string(),
             object: "model".to_string(),
@@ -494,6 +502,97 @@ fn drop_unservable_tools(payload: &mut MessagesRequest) {
             removed,
             "forced model mapping removed tools the target cannot serve"
         );
+    }
+}
+
+/// 中途 system 消息的控制字段（serde 结构里没有这些字段，从原始请求体读取）：
+///
+/// - 只带 `output_config.effort`、内容为空的 system 消息（per-message effort）：从那之后生效，
+///   最后一条决定本轮的 effort，写入请求的 `output_config.effort`。
+/// - `clear_at: "next_user_message"` 的 system 消息只在其后没有新的用户文字时生效；已被后续
+///   用户消息清除的副本，从当轮提醒里移除（官方：清除后的副本不再渲染）。
+pub(crate) fn apply_mid_conversation_controls(raw_body: &[u8], payload: &mut MessagesRequest) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw_body) else {
+        return;
+    };
+    let Some(messages) = value.get("messages").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let mut effort: Option<String> = None;
+    let mut cleared: Vec<String> = Vec::new();
+    for (position, message) in messages.iter().enumerate() {
+        let role = message
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(role, "system" | "developer") {
+            continue;
+        }
+        if let Some(level) = message
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(serde_json::Value::as_str)
+        {
+            effort = Some(level.trim().to_ascii_lowercase());
+        }
+        let turn_scoped = message.get("clear_at").and_then(serde_json::Value::as_str)
+            == Some("next_user_message");
+        // A later user message (a tool_result-only one counts) clears a turn-scoped message.
+        let superseded = messages[position + 1..]
+            .iter()
+            .any(|later| later.get("role").and_then(serde_json::Value::as_str) == Some("user"));
+        if turn_scoped && superseded {
+            let text = system_message_text(message);
+            if !text.trim().is_empty() {
+                cleared.push(text);
+            }
+        }
+    }
+    if let Some(level) = effort
+        .filter(|level| crate::anthropic::types::THINKING_EFFORT_VALUES.contains(&level.as_str()))
+    {
+        payload
+            .output_config
+            .get_or_insert_with(OutputConfig::default)
+            .effort = Some(level);
+    }
+    for text in cleared {
+        remove_reminder_block(payload, &text);
+    }
+}
+
+fn system_message_text(message: &serde_json::Value) -> String {
+    match message.get("content") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// 去掉中途 system 消息并入用户消息后形成的提醒块（与 `append_reminder_to_user_turn` 的形态一致）。
+fn remove_reminder_block(payload: &mut MessagesRequest, text: &str) {
+    let block_text = format!("<system-reminder>\n{text}\n</system-reminder>");
+    for message in payload
+        .messages
+        .iter_mut()
+        .filter(|message| message.role == "user")
+    {
+        if let Some(blocks) = message.content.as_array_mut() {
+            let before = blocks.len();
+            blocks.retain(|block| {
+                block.get("text").and_then(serde_json::Value::as_str) != Some(block_text.as_str())
+            });
+            if blocks.len() != before {
+                if blocks.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": " "}));
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -785,7 +884,13 @@ fn builtin_knowledge() -> &'static [ForcedKnowledgeEntry] {
   "fable51-en",
          &["fable 5.1", "claude-fable-5-1", "claude fable"],
          "en",
-  "Claude Fable 5.1 is Anthropic's most capable widely released model, priced at $10/$50 per million input/output tokens, with a 1M-token context window and 128K max output. Thinking is always on, forced tool_choice (any/tool) is not supported, and thinking blocks are bound to the model that produced them.",
+"Claude Fable 5.1 is Anthropic's most capable widely released model, for the most demanding reasoning and long-horizon agentic work, priced at $10/$50 per million input/output tokens (cache reads $0.25). It has a 1M-token context window and 128K max output, thinking is always on with effort from low to max, display defaults to omitted, and progress updates between tool calls are available with display: updates. Forced tool_choice (any/tool) and assistant prefill are not supported, and thinking blocks are bound to the model and conversation that produced them.",
+     ),
+     entry(
+  "fable51-zh",
+         &["fable 5.1", "claude-fable-5-1", "fable 模型"],
+  "zh",
+  "Claude Fable 5.1 是 Anthropic 公开模型中能力最强的一款，面向最高难度的推理和长时间的智能体任务，价格为每百万 tokens 输入 10 美元、输出 50 美元（缓存读取 0.25 美元）。上下文窗口 100 万 tokens，单次输出最多 128K；思考始终开启，effort 可选 low 到 max，thinking.display 默认 omitted，设为 updates 时工具调用之间会返回进度说明。不支持强制 tool_choice（any/tool）和 assistant 预填，thinking 块只在生成它的模型和对话中有效。",
      ),
      entry(
   "sonnet5-en",
@@ -1224,6 +1329,77 @@ mod tests {
     /// The whole request side after the entry rewrite: the converter sees the target model, an
     /// explicit thinking length, the identity card, the knowledge block and tool contracts.
     #[test]
+    fn per_message_effort_and_turn_scoped_system_messages_follow_fable_rules() {
+        let raw = serde_json::json!({
+            "model": "claude-fable-5-1",
+            "max_tokens": 32000,
+            "output_config": {"effort": "high"},
+            "messages": [
+                {"role": "user", "content": "Plan the migration."},
+                {"role": "assistant", "content": "Here's the plan."},
+                {"role": "system", "content": [], "output_config": {"effort": "low"}},
+                {"role": "user", "content": "Run the script."},
+                {"role": "system", "clear_at": "next_user_message", "content": "old reminder"},
+                {"role": "assistant", "content": "Done."},
+                {"role": "user", "content": "Next step."},
+                {"role": "system", "clear_at": "next_user_message", "content": "current reminder"}
+            ]
+        });
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let mut payload = request("claude-fable-5-1", serde_json::json!({}));
+        payload.output_config = Some(OutputConfig {
+            effort: Some("high".to_string()),
+            format: None,
+        });
+        // Shape after role normalization: each reminder folded into the user turn before it.
+        payload.messages = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "Plan the migration."},
+            {"role": "assistant", "content": "Here's the plan."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Run the script."},
+                {"type": "text", "text": "<system-reminder>\nold reminder\n</system-reminder>"}
+            ]},
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Next step."},
+                {"type": "text", "text": "<system-reminder>\ncurrent reminder\n</system-reminder>"}
+            ]}
+        ]))
+        .unwrap();
+        apply_mid_conversation_controls(&bytes, &mut payload);
+        // The latest effort-only system message decides the effort.
+        assert_eq!(
+            payload.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("low")
+        );
+        let rendered = serde_json::to_string(&payload.messages).unwrap();
+        assert!(!rendered.contains("old reminder"), "{rendered}");
+        assert!(rendered.contains("current reminder"), "{rendered}");
+    }
+
+    #[test]
+    fn fable_family_returns_interleaved_text_as_thinking() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+        ] {
+            let spec = display_spec_for(model).unwrap();
+            assert!(returns_interleaved_text_as_thinking(&spec), "{model}");
+        }
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-haiku-4-5",
+        ] {
+            let spec = display_spec_for(model).unwrap();
+            assert!(!returns_interleaved_text_as_thinking(&spec), "{model}");
+        }
+    }
+
+    #[test]
     fn rewritten_request_converts_for_the_target_model() {
         use crate::anthropic::converter::{ConverterOptions, convert_request_with_resolved_model};
         use crate::anthropic::model_capabilities::{ModelResolution, ModelResolutionSource};
@@ -1269,5 +1445,147 @@ mod tests {
         let tools = &current.user_input_message_context.tools;
         let bash = serde_json::to_value(&tools[0]).unwrap();
         assert!(bash.to_string().contains("\"command\""), "{bash}");
+    }
+
+    /// T3.5: the entry rewrite leaves non-Claude and already-target requests untouched and fixes
+    /// the requested model's semantics before switching the model.
+    #[test]
+    fn entry_rewrite_only_touches_claude_models_that_need_mapping() {
+        assert!(!ForcedModelMappingConfig::default().applies_to("/v1/messages"));
+        for model in [
+            "deepseek-3.2",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5-20251001",
+        ] {
+            let mut payload = request(model, serde_json::json!({}));
+            let before = serde_json::to_value(&payload).unwrap();
+            assert!(
+                apply_forced_mapping(&mut payload, &config()).is_none(),
+                "{model}"
+            );
+            assert_eq!(serde_json::to_value(&payload).unwrap(), before, "{model}");
+        }
+        let mut payload = request("claude-opus-5-5", serde_json::json!({}));
+        let forced = forced_for(&mut payload);
+        assert_eq!(payload.model, "claude-sonnet-4-5");
+        assert_eq!(forced.display_model, "claude-opus-5-5");
+        assert_eq!(forced.target_model, "claude-sonnet-4-5");
+        assert!(forced.client_input_tokens > 0);
+        let thinking = payload.thinking.as_ref().expect("thinking fixed");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.parsed_display(), Some(ThinkingDisplay::Omitted));
+        assert!(
+            payload.system.as_ref().unwrap()[0]
+                .text
+                .starts_with(crate::model::prompt_injection::catalog::IDENTITY_PROMPT_MARKER)
+        );
+    }
+
+    /// T4.4: every display model x thinking form x effort converts without an error and sends the
+    /// target an explicit thinking length within bounds.
+    #[test]
+    fn thinking_matrix_converts_for_every_display_model() {
+        use crate::anthropic::converter::{ConverterOptions, convert_request_with_resolved_model};
+        use crate::anthropic::model_capabilities::{ModelResolution, ModelResolutionSource};
+
+        let models = [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-opus-5-5-thinking",
+            "haiku",
+        ];
+        let thinkings = [
+            None,
+            Some(serde_json::json!({"type": "adaptive"})),
+            Some(serde_json::json!({"type": "enabled", "budget_tokens": 8000})),
+            Some(serde_json::json!({"type": "disabled"})),
+        ];
+        let efforts = [
+            None,
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some("xhigh"),
+            Some("max"),
+        ];
+        let mut combinations = 0;
+        for model in models {
+            for thinking in &thinkings {
+                for effort in efforts {
+                    combinations += 1;
+                    let mut extra = serde_json::json!({});
+                    if let Some(thinking) = thinking {
+                        extra["thinking"] = thinking.clone();
+                    }
+                    if let Some(effort) = effort {
+                        extra["output_config"] = serde_json::json!({"effort": effort});
+                    }
+                    let case = format!("{model} thinking={thinking:?} effort={effort:?}");
+                    let mut payload = request(model, extra);
+                    let forced = forced_for(&mut payload);
+                    let upstream = if forced.target_model.contains("haiku") {
+                        "claude-haiku-4.5"
+                    } else {
+                        "claude-sonnet-4.5"
+                    };
+                    let mut resolution = ModelResolution::resolved(
+                        payload.model.clone(),
+                        upstream.to_string(),
+                        ModelResolutionSource::Alias,
+                    );
+                    resolution.forced = Some(forced.clone());
+                    let options = ConverterOptions {
+                        forced: Some(forced.clone()),
+                        ..ConverterOptions::default()
+                    };
+                    let result =
+                        convert_request_with_resolved_model(&payload, options, &resolution)
+                            .unwrap_or_else(|error| panic!("{case}: {error}"));
+                    let history =
+                        serde_json::to_string(&result.conversation_state.history).unwrap();
+                    assert!(!history.contains("<thinking_effort>"), "{case}");
+                    let length = history
+                        .split("<max_thinking_length>")
+                        .nth(1)
+                        .and_then(|rest| rest.split('<').next())
+                        .and_then(|value| value.parse::<i32>().ok());
+                    if let Some(length) = length {
+                        assert!((1_024..=24_000).contains(&length), "{case}: {length}");
+                    }
+                    let always = matches!(forced.spec.thinking_default, ThinkingDefault::Always);
+                    if always {
+                        assert!(length.is_some(), "{case}: always-thinking model must think");
+                    }
+                    let off = matches!(forced.spec.thinking_default, ThinkingDefault::Off)
+                        && !forced.display_requested_thinking;
+                    if off && thinking.is_none() && effort.is_none() {
+                        assert!(length.is_none(), "{case}: must not think by default");
+                    }
+                    let enabled_budget = thinking
+                        .as_ref()
+                        .is_some_and(|value| value["type"] == "enabled");
+                    if length.is_some() && !enabled_budget {
+                        let expected = match effort {
+                            Some("low") => Some(4_000),
+                            Some("medium") => Some(16_000),
+                            Some(_) => Some(24_000),
+                            None if forced.spec.canonical_id == "claude-opus-5-5"
+                                && !forced.display_requested_thinking =>
+                            {
+                                Some(16_000)
+                            }
+                            None => Some(24_000),
+                        };
+                        assert_eq!(length, expected, "{case}");
+                    }
+                }
+            }
+        }
+        assert_eq!(combinations, 9 * 4 * 6);
     }
 }

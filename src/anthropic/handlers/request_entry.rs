@@ -375,7 +375,15 @@ async fn continue_messages_endpoint_after_raw_external_routes(
         &runtime_config.local_request_compat,
         keep_system_position,
     ) {
-        Ok(payload) => payload,
+        Ok(mut payload) => {
+            if keep_system_position {
+                super::super::forced_model::apply_mid_conversation_controls(
+                    &raw_body,
+                    &mut payload,
+                );
+            }
+            payload
+        }
         Err(error) => {
             record_entry_request_error(
                 attribution.as_ref(),

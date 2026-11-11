@@ -18,7 +18,7 @@
 - **协议差异大部分能在转换层补齐**，包括 max_tokens、thinking/effort、display、采样参数、中途 system、context_management、工具类型、图片尺寸。
 - **上下文窗口补不齐，只能退避。** 客户端以为是 1M，实际只有 200K。服务端按 L0–L5 分级退避，强制模式下不再对外返回 `prompt is too long`。
 - **知识可以部分补上，模型水平补不了。** 用知识库补自我认知（型号、窗口、知识截止）、Claude 生态知识，以及收录范围内的新事实。没收录的内容按"不确定"回答或去搜索，不编造。推理和编码水平补不了，这属于产品层风险，需要如实告知。
-- **每个外显模型都有专项处理。** 包括 thinking 默认值、display 默认值、Opus 5.5 工具调用之间的文字、computer toolset、截图坐标换算等。
+- **每个外显模型都有专项处理。** 包括 thinking 默认值、display 默认值（含 Fable 的 updates 进度说明）、Opus 5.5 与 Fable 工具调用之间的文字、逐条消息 effort 与 clear_at、computer toolset、截图坐标换算等。
 
 ## 文档索引
 

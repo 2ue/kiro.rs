@@ -386,9 +386,11 @@ struct RequestUsageContext {
     display_identity: Option<super::identity_guard::DisplayIdentity>,
     /// Forced model mapping: input tokens of the client's original request.
     client_input_tokens: Option<i32>,
-    /// Forced model mapping to Opus 5.5 with hidden thinking: text before a tool call is sent as an
-    /// empty thinking block.
-    interleaved_text_as_thinking: bool,
+    /// Forced model mapping to a model that returns the text it writes between tool calls as
+    /// thinking blocks (Opus 5.5, the Fable / Mythos 5 family): `None` leaves the text alone,
+    /// `Some(false)` sends it as an empty thinking block (`display: "omitted"`), `Some(true)` keeps it
+    /// as a progress update (`display: "updates"`).
+    interleaved_text_as_thinking: Option<bool>,
     downstream_stop_reason: Arc<Mutex<Option<String>>>,
     conversation_id: Option<String>,
     request_api_key_id: Option<String>,
@@ -6442,11 +6444,12 @@ fn prepare_usage_context_with_inference_attempt_budget(
         interleaved_text_as_thinking: model_resolution
             .as_ref()
             .and_then(|resolution| resolution.forced.as_ref())
-            .is_some_and(|forced| {
+            .filter(|forced| {
                 forced.interleaved_text_as_thinking
-                    && forced.spec.canonical_id == "claude-opus-5-5"
+                    && super::forced_model::returns_interleaved_text_as_thinking(&forced.spec)
                     && request_hides_reasoning(payload, None)
-            }),
+            })
+            .map(|_| request_wants_progress_updates(payload)),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id,
         request_api_key_id,
@@ -9864,6 +9867,7 @@ impl StreamContextTemplate {
             credential_usage.request.display_identity.is_some(),
         );
         ctx.set_interleaved_text_as_thinking(credential_usage.request.interleaved_text_as_thinking);
+
         ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
         ctx.set_local_prompt_cache_projection_enabled(
             credential_usage.request.uses_local_prompt_cache_strategy(),
@@ -11124,6 +11128,13 @@ fn keepalive_sse_bytes(ctx: &StreamContext, noop_delta_keepalive: bool) -> Bytes
 /// decides; without one, the model's official default applies (`omitted` on Claude Opus 5.x,
 /// Sonnet 5.x and the Fable/Mythos 5 family), so Claude Code sees the same blocks it would get
 /// from the Anthropic API. A disabled thinking config has nothing to hide.
+/// `thinking.display: "updates"`: progress notes between tool calls come back as text.
+fn request_wants_progress_updates(payload: &MessagesRequest) -> bool {
+    payload.thinking.as_ref().is_some_and(|thinking| {
+        thinking.parsed_display() == Some(super::types::ThinkingDisplay::Updates)
+    })
+}
+
 fn request_hides_reasoning(payload: &MessagesRequest, upstream_model: Option<&str>) -> bool {
     use super::types::ThinkingDisplay;
     let hidden_by_model = |model: &str| ThinkingDisplay::default_for_model(model).hides_reasoning();
@@ -15274,11 +15285,12 @@ async fn handle_non_stream_request(
     // 正文里复述的 Hash 映射工具名还原为原名，下游不应看到代理内部名称。
     super::tool_name_restore::restore_tool_names_in_content(&tool_name_map, &mut content);
 
-    if credential_usage.request.interleaved_text_as_thinking {
-        super::interleaved_thinking::convert_content(&mut content);
-    }
     if credential_usage.request.omit_thinking_display {
         super::thinking_display::omit_thinking_text_in_content(&mut content);
+    }
+    // After hiding the reasoning, so a progress update (`display: "updates"`) keeps its text.
+    if let Some(keep_text) = credential_usage.request.interleaved_text_as_thinking {
+        super::interleaved_thinking::convert_content_with_text(&mut content, keep_text);
     }
 
     let matched_stop_sequence = super::stop_sequence::truncate_content_at_stop_sequence(

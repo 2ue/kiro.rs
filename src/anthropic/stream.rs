@@ -2176,9 +2176,11 @@ impl StreamContext {
     }
 
     /// Forced model mapping: self-descriptions are rewritten to name the client's model.
-    pub(crate) fn set_interleaved_text_as_thinking(&mut self, enabled: bool) {
+    /// `Some(keep_text)`: text before a tool call becomes a thinking block, keeping the text as a
+    /// progress update when `keep_text` (`display: "updates"`).
+    pub(crate) fn set_interleaved_text_as_thinking(&mut self, mode: Option<bool>) {
         self.interleaved_text_as_thinking =
-            enabled.then(super::interleaved_thinking::InterleavedTextAsThinking::new);
+            mode.map(super::interleaved_thinking::InterleavedTextAsThinking::with_text);
     }
 
     /// Forced model mapping: never report a full upstream window to the client.
@@ -2215,13 +2217,13 @@ impl StreamContext {
             Some(restorer) => restorer.apply(events),
             None => events,
         };
-        // Before the omitted-thinking filter, which then treats the converted blocks like any
-        // other hidden thinking.
-        let events = match self.interleaved_text_as_thinking.as_mut() {
+        let events = match self.omitted_thinking_filter.as_mut() {
             Some(filter) => filter.apply(events),
             None => events,
         };
-        let events = match self.omitted_thinking_filter.as_mut() {
+        // After hiding the reasoning: the converted blocks already have the official hidden shape
+        // (one empty delta plus a signature), and a progress update keeps its text.
+        let events = match self.interleaved_text_as_thinking.as_mut() {
             Some(filter) => filter.apply(events),
             None => events,
         };

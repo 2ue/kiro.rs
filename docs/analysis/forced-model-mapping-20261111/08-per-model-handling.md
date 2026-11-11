@@ -28,19 +28,28 @@
 
 ### 2.1 Fable 5.1 / Fable 5 / Mythos 5.x → Sonnet 4.5
 
-| 项目 | 处理 |
-|---|---|
-| thinking | 不论客户端传什么都开启思考：没传、传 adaptive、传 enabled 都开启；传 disabled 也**不报 400**，但按外显语义仍然开启思考。思考长度按 effort 换算，没传 effort 时按 high（32K） |
-| display | 默认 omitted；`updates` 也按 omitted 处理 |
-| 输出 | 按 64K 预留；超出时以 `max_tokens` 结束，客户端会自己续写 |
-| tool_choice any / tool | 外显模型（5.1）会对强制选工具返回 400，强制模式下**不报错**，按 03 的提示词引导处理 |
-| prefill / 采样参数 | 静默丢弃 |
-| refusal | 外显模型可能返回 `stop_reason: refusal`。目标模型拒答时是用文字说明，不会给出这个停止原因。不模拟 refusal，按原样返回文字 |
-| 新工具 | `web_fetch_20260318` 走 03 的代理抓取；`code_execution_20260521` 等按前缀处理；advisor 静默移除 |
-| 中途 system 消息 / `clear_at` | 按 03 第 3 节的方式，转成当轮文本块 |
-| 单条消息上的 effort（beta） | 只有 effort、`content` 为空的 system 消息：把其中的 effort 用于后续轮次的思考长度换算，消息本身丢弃 |
-| K0 | Fable 卡：在型号、1M、128K 之外，写明"Anthropic 最强的公开模型" |
-| 特别风险 | 能力差距最大。复杂长任务的成功率会明显下降，属于最容易被察觉的组合 |
+按 Anthropic 官方迁移文档（Migrating to Claude Fable 5.1 / Fable 5.1 from Fable 5 / Mythos 5.1）对齐：
+
+| 项目 | 官方行为 | 处理 |
+|---|---|---|
+| 窗口 / 输出 | 1M / 128K | 模型列表与身份卡按官方值报告；上游按 200K / 64K 退避 |
+| thinking | 始终开启；`disabled` 与 `budget_tokens` 都返回 400 | 不论客户端传什么都开启思考，传 disabled 也**不报 400**；思考长度按 effort 换算，没传 effort 时按 high，受 max_tokens × 3/4 封顶 |
+| effort | low / medium / high / xhigh / max | 全部接受，换算成思考长度 |
+| display | 默认 omitted；`summarized` 返回推理摘要；`updates`（beta `thinking-display-updates-2026-08-18`）只返回工具调用之间的进度说明 | 默认 omitted；`summarized` 可见思考；`updates`：推理隐藏，工具调用前的文字作为**带文字的** thinking 块下发（签名按文字生成），与官方进度说明的形态一致 |
+| 工具调用之间的文字 | 以 thinking 块返回（omitted 时为空，updates 时带文字） | 与 Opus 5.5 一样转成 thinking 块，开关 `interleavedTextAsThinking` |
+| tool_choice any / tool | Fable 5.1 / Mythos 5.1 返回 400 | **不报错**，按 03 的提示词引导处理 |
+| prefill / 采样参数 | 不支持 | 静默丢弃 |
+| refusal / stop_details | 分类器可能返回 `stop_reason: refusal` | 目标模型拒答时用文字说明，不模拟 refusal，按原样返回 |
+| fallbacks / inference_geo / speed | 服务端参数 | 接受并忽略 |
+| 工具版本 | `web_fetch_20260318`、`code_execution_20250825/_20260120/_20260521`、`tool_search_tool_*`、`computer_20251124`、advisor | web_fetch 补输入约定；code_execution 按前缀处理（本地执行未开启时移除）；tool_search 与 advisor 静默移除；computer 补输入约定并换算坐标 |
+| 中途 system 消息 | 支持，从该位置起生效 | 并入其后的当轮用户消息，作为提醒块 |
+| `clear_at: "next_user_message"`（beta） | 只在下一条用户消息之前生效，之后的副本不再渲染 | 已被后续用户消息清除的副本从提醒中移除，最新一条保留 |
+| 逐条消息 effort（beta `mid-conversation-output-config-2026-07-01`） | `content` 为空、只带 `output_config.effort` 的 system 消息，从该位置起改变 effort | 取最后一条的 effort 写入请求的 `output_config.effort`，再换算思考长度；消息本身不渲染 |
+| preserved thinking | thinking 块绑定生成它的模型与对话，编辑历史会失效 | 不模拟；历史中的合成签名照常回放，不报错 |
+| 知识截止 | 官方未公布 | 身份卡不写日期，用"更晚的事情可能不知道"的兜底句 |
+| 模型列表 | Mythos 仅 Project Glasswing 可用 | 列表只列 Fable 5.1 / Fable 5，不列 Mythos；请求 Mythos 仍正常承接 |
+| K0 / K1 | — | 身份卡写型号、ID、1M、128K；K1 内置 Fable 5.1 中英文条目（定位、价格、窗口、思考与 display、tool_choice 与 prefill 限制） |
+| 特别风险 | — | 能力差距最大，复杂长任务的成功率会明显下降，属于最容易被察觉的组合 |
 
 ### 2.2 Opus 5.5 → Sonnet 4.5
 
@@ -128,8 +137,8 @@
 2. 模型自述改写（05）。
 3. 注入块复述清理（07，复用 `control_block_cleaner.rs`）。
 4. "根据提供的上下文/资料"这类句子改写。
-5. Opus 5.5 把工具调用之间的文字转成 thinking 块（2.2）。
-6. display 处理（omitted 时清空 thinking 文本）。
+5. display 处理（omitted / updates 时清空推理的 thinking 文本）。
+6. Opus 5.5 与 Fable / Mythos 5 系把工具调用之前的文字转成 thinking 块（2.1、2.2）：omitted 时为空，updates 时保留文字。放在 display 之后，进度说明的文字才不会被清空。
 7. computer 的坐标换算和 `toolset_name` 回填。
 
 **thinking 内容也要经过第 1–4 步。** 现有的 `identity_guard.rs` 只处理 text_delta，thinking 块直接放行（测试 `non_text_blocks_pass_through`）。所以 summarized 和 updates 模式下可见的思考内容需要补上这套检查。omitted 模式下思考内容本来就清空了，不用处理。
@@ -139,7 +148,7 @@
 | 编号 | 场景 | 通过标准 |
 |---|---|---|
 | A13 | 每个外显模型 × 本文第 2 节列出的每一项特殊处理 | 全部返回 200；响应结构与外显模型的官方行为一致 |
-| A14 | Opus 5.5 多工具会话 | 工具之间的文字以 thinking 块返回；omitted 时为空；最后的总结是 text |
+| A14 | Opus 5.5 / Fable 5.1 多工具会话 | 工具之间的文字以 thinking 块返回；omitted 时为空，updates 时带文字；最后的总结是 text |
 | A15 | computer toolset 往返 | 成员工具调用和 `toolset_name` 回填正确；坐标换算后点击位置正确 |
 | A16 | 可见 thinking 的泄漏检查 | summarized / updates 模式下的思考内容不出现 4.5 自述，也不出现注入块复述 |
 | A17 | 知识库对照组（见 07 第 6 节） | 自称外显型号、知识截止说对、生态事实说对的比例达标；"根据上下文"字样出现率达标；未收录的问题不编造答案 |

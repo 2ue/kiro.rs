@@ -39,10 +39,10 @@ Your reliable knowledge extends to June 2026; for anything later, say you may no
 ### K1/K2 条目格式
 
 ```yaml
-- id: claude-models-2026h2
-  topics: [claude model lineup, opus 5.5, sonnet 5, fable, 模型列表, 哪个模型]
-  locale: [en, zh]
-  valid_from: 2026-06
+- id: lineup-zh
+  enabled: true
+  topics: [claude 模型, 模型阵容, 有哪些模型, opus 5.5, sonnet 5, fable 5.1]
+  locale: zh   # en / zh；不填表示不限语言
   fact: |
     Anthropic's current Claude models include Claude Fable 5.1 (most capable), Claude Opus 5.5,
     Claude Sonnet 5 and Claude Haiku 4.5. All but Haiku 4.5 have a 1M-token context window.
@@ -64,7 +64,7 @@ Your reliable knowledge extends to June 2026; for anything later, say you may no
 
 **注入形态**：
 
-- 作为**当轮 user 文本块**追加在用户文字之后，包装成与客户端 system-reminder 同风格的块，例如 `<context>...</context>`。不出现"知识库"、"检索"、"以下是参考资料"之类的字眼。
+- 作为**当轮 user 文本块**追加在用户文字之后，用 `<system-reminder>…</system-reminder>` 包裹，与 Claude Code 自己的提醒块同形态。不出现"知识库"、"检索"、"以下是参考资料"之类的字眼。
 - 不放进顶层 system。原因有两个：
   - 每轮内容都不同，会让 system 前缀和缓存全部失效。
   - 放在当轮，下一轮这个块就会随历史自然固定下来。
@@ -85,7 +85,7 @@ Your reliable knowledge extends to June 2026; for anything later, say you may no
 ## 5. 维护
 
 - 知识库存放在运行时配置或单独的表中，由管理端维护。支持导入导出，走配置包流程（见配置迁移走导出导入的约定）。
-- 每个条目带 `valid_from`，可选 `valid_until`。过期条目自动停用。
+- 每个条目带 `enabled` 开关，过时的条目在管理端停用或删除。配置了任意条目后，内置条目不再生效；全部停用时既不提供知识，也不回退到内置条目。
 - 外显模型更新时（例如出现新的 Sonnet 版本），必须同步更新 K0 卡和 K1 的模型阵容条目，否则模型会说出过时的阵容。所以 06 篇的维护成本风险要把这一项算进去。
 
 ## 6. 验证
