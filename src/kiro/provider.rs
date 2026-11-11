@@ -36,16 +36,23 @@ use crate::kiro::call_trace::{
     KiroCallError, KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink,
     SelectionFailureSummary, summarize_attempts,
 };
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext, configured_upstream_url};
+use crate::kiro::endpoint::{
+    EndpointOperation, EndpointRoutingPlan, KiroEndpoint, RequestContext, configured_upstream_url,
+    resolve_endpoint_candidates,
+};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{
     KiroAvailableModel, KiroAvailableModelCatalog, KiroAvailableModelsResponse,
 };
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::protocol::{
-    extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
+    KIRO_BUILDER_ID_PLACEHOLDER_ARN, extract_preferred_profile_arn, is_external_idp_credentials,
+    is_real_profile_arn, profile_arn_discovery_applies, resolve_mcp_profile_arn,
+    resolve_models_profile_arn, resolve_streaming_profile_arn,
 };
-use crate::kiro::retry_pipeline::{BerserkPlan, RotationCursor, RotationStep};
+use crate::kiro::retry_pipeline::{
+    BerserkPlan, RotationCursor, RotationStep, auxiliary_region_candidates,
+};
 use crate::kiro::token_manager::{
     AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind,
     AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason, DispatchAdmission,
@@ -274,13 +281,20 @@ struct ApiUpstreamBody {
 }
 
 /// LLM 明文采集：记录即将发出的上游请求（URL、最终请求头、完整请求体）。
-fn capture_upstream_request(
+// 采集记录与调用点一一对应：phase、attempt、账号、endpoint、Region 都是该次发送的独立维度。
+#[allow(clippy::too_many_arguments)]
+fn capture_upstream_request<A>(
     request_id: Option<&str>,
     phase: &'static str,
-    attempt: usize,
+    attempt: A,
     credential_id: u64,
+    endpoint: &str,
+    region: &str,
+    config: &Config,
     request: &reqwest::RequestBuilder,
-) {
+) where
+    A: TryInto<u64>,
+{
     if !crate::diagnostics::capture::is_active() {
         return;
     }
@@ -288,13 +302,17 @@ fn capture_upstream_request(
     let Some(built) = request.try_clone().and_then(|builder| builder.build().ok()) else {
         return;
     };
+    let attempt = attempt.try_into().unwrap_or(u64::MAX);
+    let client_version = client_version_from_headers(built.headers())
+        .unwrap_or_else(|| config.effective_kiro_version());
     crate::diagnostics::capture::record("upstream_request", request_id, || {
         serde_json::json!({
             "phase": phase,
             "attempt": attempt + 1,
             "credentialId": credential_id,
+            "route": upstream_capture_route(endpoint, region, &client_version),
             "method": built.method().as_str(),
-            "url": built.url().as_str(),
+            "url": crate::diagnostics::capture::redacted_url(built.url()),
             "headers": crate::diagnostics::capture::http_headers_json(built.headers()),
             "body": built
                 .body()
@@ -305,19 +323,29 @@ fn capture_upstream_request(
 }
 
 /// LLM 明文采集：记录上游响应状态与响应头。
-fn capture_upstream_response(
+// 采集记录与调用点一一对应：phase、attempt、账号、endpoint、Region 都是该次发送的独立维度。
+#[allow(clippy::too_many_arguments)]
+fn capture_upstream_response<A>(
     request_id: Option<&str>,
     phase: &'static str,
-    attempt: usize,
+    attempt: A,
     credential_id: u64,
+    endpoint: &str,
+    region: &str,
+    config: &Config,
     response: &reqwest::Response,
     header_wait: Duration,
-) {
+) where
+    A: TryInto<u64>,
+{
+    let attempt = attempt.try_into().unwrap_or(u64::MAX);
+    let client_version = config.effective_kiro_version();
     crate::diagnostics::capture::record("upstream_response", request_id, || {
         serde_json::json!({
             "phase": phase,
             "attempt": attempt + 1,
             "credentialId": credential_id,
+            "route": upstream_capture_route(endpoint, region, &client_version),
             "status": response.status().as_u16(),
             "httpVersion": format!("{:?}", response.version()),
             "headerWaitMs": header_wait.as_millis() as u64,
@@ -327,24 +355,61 @@ fn capture_upstream_response(
 }
 
 /// LLM 明文采集：记录上游非成功响应体。
-fn capture_upstream_error_body(
+// 采集记录与调用点一一对应：phase、attempt、账号、endpoint、Region 都是该次发送的独立维度。
+#[allow(clippy::too_many_arguments)]
+fn capture_upstream_error_body<A>(
     request_id: Option<&str>,
     phase: &'static str,
-    attempt: usize,
+    attempt: A,
     credential_id: u64,
+    endpoint: &str,
+    region: &str,
+    config: &Config,
     status: reqwest::StatusCode,
     body: &ApiUpstreamBody,
-) {
+) where
+    A: TryInto<u64>,
+{
+    let attempt = attempt.try_into().unwrap_or(u64::MAX);
+    let client_version = config.effective_kiro_version();
     crate::diagnostics::capture::record("upstream_error_body", request_id, || {
         serde_json::json!({
             "phase": phase,
             "attempt": attempt + 1,
             "credentialId": credential_id,
+            "route": upstream_capture_route(endpoint, region, &client_version),
             "status": status.as_u16(),
             "bytes": body.bytes,
             "body": crate::diagnostics::capture::body_json(body.text.as_bytes()),
         })
     });
+}
+
+fn upstream_capture_route(endpoint: &str, region: &str, client_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "endpoint": endpoint,
+        "region": region,
+        "clientVersion": client_version,
+    })
+}
+
+fn client_version_from_headers(headers: &HeaderMap) -> Option<String> {
+    ["x-amz-user-agent", "user-agent"]
+        .into_iter()
+        .filter_map(|header| headers.get(header).and_then(|value| value.to_str().ok()))
+        .flat_map(|value| {
+            ["KiroIDE-", "appVersion-"]
+                .into_iter()
+                .filter_map(move |marker| {
+                    value.split_once(marker).map(|(_, version)| {
+                        version
+                            .chars()
+                            .take_while(|character| character.is_ascii_digit() || *character == '.')
+                            .collect::<String>()
+                    })
+                })
+        })
+        .find_map(|version| crate::kiro::kiro_version::sanitize_version(&version))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -633,6 +698,22 @@ pub struct KiroApiResponse {
 pub struct McpCallResponse {
     response: reqwest::Response,
     completion: McpCallCompletion,
+}
+
+enum McpEndpointSendOutcome {
+    Response {
+        response: Option<reqwest::Response>,
+        status: reqwest::StatusCode,
+        body: Option<Result<String, HttpSendError>>,
+        endpoint: Arc<dyn KiroEndpoint>,
+        region: String,
+        physical_attempt: usize,
+    },
+    TransportFailure {
+        error: HttpSendError,
+        physical_attempt: usize,
+    },
+    BudgetRejected(InferenceAttemptRejection),
 }
 
 impl std::fmt::Debug for McpCallResponse {
@@ -1287,7 +1368,7 @@ mod tests {
         KIRO_CLIENT_CACHE_MAX_ENTRIES, KiroAvailableModel, KiroProvider, KiroStreamCompletion,
         MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS, MODEL_DISCOVERY_MAX_HTTP_SENDS, McpCallCompletion,
         McpCallFailureKind, PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES, ProfileArnDiscoveryPolicy,
-        ProviderClientCacheEntry,
+        ProviderClientCacheEntry, client_version_from_headers, upstream_capture_route,
     };
     use crate::anthropic::inference_attempt_budget::{
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, InferenceAttemptBudget, InferenceAttemptKind,
@@ -1299,11 +1380,51 @@ mod tests {
     };
     use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
     use crate::kiro::model::credentials::KiroCredentials;
-    use crate::kiro::retry_pipeline::KIRO_ROTATION_REGIONS;
+    use crate::kiro::retry_pipeline::{KIRO_ROTATION_REGIONS, auxiliary_region_candidates};
     use crate::kiro::token_manager::{
         AcquireMode, AuxiliaryConcurrencyKind, DispatchAdmission, MultiTokenManager,
     };
     use crate::model::config::Config;
+
+    #[test]
+    fn upstream_capture_route_keeps_selected_route_and_effective_version() {
+        let mut config = Config::default();
+        config.kiro_version = "1.2.3-test".to_string();
+        let expected_version = config.effective_kiro_version();
+        let route = upstream_capture_route(
+            "codewhisperer",
+            "eu-central-1",
+            &config.effective_kiro_version(),
+        );
+        assert_eq!(route["endpoint"], "codewhisperer");
+        assert_eq!(route["region"], "eu-central-1");
+        assert_eq!(route["clientVersion"], expected_version);
+    }
+
+    #[test]
+    fn captured_client_version_prefers_final_kiro_user_agent() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-amz-user-agent",
+            "aws-sdk-js/1.0.34 KiroIDE-1.4.121-machine".parse().unwrap(),
+        );
+        assert_eq!(
+            client_version_from_headers(&headers).as_deref(),
+            Some("1.4.121")
+        );
+
+        headers.clear();
+        headers.insert(
+            "user-agent",
+            "aws-sdk-rust/1.3.15 md/appVersion-1.4.122 app/AmazonQ-For-CLI"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            client_version_from_headers(&headers).as_deref(),
+            Some("1.4.122")
+        );
+    }
 
     // ==================== 狂暴/端点轮换的 mock 上游调度测试 ====================
     //
@@ -1317,6 +1438,7 @@ mod tests {
     struct RotationAttempt {
         account: u64,
         region: String,
+        endpoint: String,
     }
 
     /// mock 上游对某次尝试的应答。
@@ -1326,7 +1448,9 @@ mod tests {
         TooManyRequestsWithRetryAfter,
         RiskControl,
         ServerError,
+        GatewayError,
         ModelTemporarilyUnavailable,
+        ModelTemporarilyUnavailable503,
         InsufficientModelCapacity,
         BadRequest,
         /// cli 端点 api_key 账号额度用尽的真实形态：400 而不是 402。
@@ -1442,16 +1566,36 @@ mod tests {
             .and_then(|value| value.strip_prefix("Bearer fake-token-"))
             .and_then(|id| id.parse::<u64>().ok())
             .expect("rotation upstream expects fake-token-{id} bearer");
-        // host 形如 q.us-east-1.amazonaws.com，取中段即当前端点。
-        let region = headers
+        // host 形如 q.us-east-1.amazonaws.com / runtime.us-east-1.kiro.dev。
+        let host = headers
             .get(axum::http::header::HOST)
             .and_then(|value| value.to_str().ok())
-            .and_then(|host| host.strip_prefix("q."))
-            .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
-            .expect("rotation upstream expects q.{region}.amazonaws.com host")
+            .expect("rotation upstream expects a Kiro host")
             .to_string();
+        let (endpoint, region) = if let Some(rest) = host.strip_prefix("q.") {
+            (
+                "ide".to_string(),
+                rest.trim_end_matches(".amazonaws.com").to_string(),
+            )
+        } else if let Some(rest) = host.strip_prefix("runtime.") {
+            (
+                "runtime".to_string(),
+                rest.trim_end_matches(".kiro.dev").to_string(),
+            )
+        } else if let Some(rest) = host.strip_prefix("codewhisperer.") {
+            (
+                "codewhisperer".to_string(),
+                rest.trim_end_matches(".amazonaws.com").to_string(),
+            )
+        } else {
+            (host.clone(), host)
+        };
 
-        let attempt = RotationAttempt { account, region };
+        let attempt = RotationAttempt {
+            account,
+            region,
+            endpoint,
+        };
         let reply = (state.rule)(&attempt);
         state
             .attempts
@@ -1485,9 +1629,22 @@ mod tests {
                 Json(serde_json::json!({"message": "boom"})),
             )
                 .into_response(),
+            RotationReply::GatewayError => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"message": "gateway failure"})),
+            )
+                .into_response(),
             // 现网 Kiro 上游原文：模型容量不足。
             RotationReply::ModelTemporarilyUnavailable => (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "message": "Encountered unexpectedly high load when processing the request, please try again.",
+                    "reason": "MODEL_TEMPORARILY_UNAVAILABLE"
+                })),
+            )
+                .into_response(),
+            RotationReply::ModelTemporarilyUnavailable503 => (
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "message": "Encountered unexpectedly high load when processing the request, please try again.",
                     "reason": "MODEL_TEMPORARILY_UNAVAILABLE"
@@ -1588,6 +1745,7 @@ mod tests {
         // 重试次数给足，让「何时停止」完全由轮换游标决定而非被预算截断。
         config.credential_retry_max_attempts = 10_000;
         config.kiro_upstream_region_rotation_enabled = settings.region_rotation;
+        config.kiro_region_profile_arn_mismatch_allowed = settings.region_rotation;
         config.local_berserk_mode_enabled = settings.berserk;
         config.local_berserk_max_rounds = settings.rounds;
         // 轮次间隔置 0，避免测试为等待退避而空转。
@@ -1700,6 +1858,388 @@ mod tests {
         .expect("prod-like rotation provider call timed out")
         .map(|_| ());
         (result, manager)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_credential_endpoint_fallback_consumes_shared_budget_and_recovers() {
+        let server = RotationServer::start(Arc::new(|attempt: &RotationAttempt| {
+            if attempt.endpoint == "ide" {
+                RotationReply::GatewayError
+            } else {
+                RotationReply::Success
+            }
+        }))
+        .await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.kiro_endpoint_fallback_enabled = true;
+        config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
+        config.credential_retry_max_attempts = 1;
+        let credentials = vec![KiroCredentials {
+            id: Some(1),
+            access_token: Some("fake-token-1".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("social".to_string()),
+            endpoint: Some("ide".to_string()),
+            ..Default::default()
+        }];
+        let manager = Arc::new(
+            MultiTokenManager::new(config, credentials, None, None, false)
+                .expect("endpoint fallback token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        endpoints.insert(
+            "runtime".to_string(),
+            Arc::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "endpoint-fallback",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let budget = Arc::new(InferenceAttemptBudget::new(2));
+        let response = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-endpoint-fallback"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                budget.clone(),
+                false,
+            )
+            .await
+            .expect("same credential fallback should recover");
+        let (_response, completion) = response.into_parts();
+        completion.release();
+
+        let attempts = server.state.attempts();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].account, 1);
+        assert_eq!(attempts[1].account, 1);
+        assert_eq!(attempts[0].endpoint, "ide");
+        assert_eq!(attempts[1].endpoint, "runtime");
+        assert_eq!(budget.snapshot().consumed, 2);
+        let identities = server.state.conversation_identities();
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].0, "endpoint-fallback");
+        assert_ne!(identities[0].0, identities[1].0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_and_account_fallback_share_explicit_physical_send_cap() {
+        let server = RotationServer::start(rule_always(RotationReply::GatewayError)).await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.kiro_endpoint_fallback_enabled = true;
+        config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
+        config.credential_retry_max_attempts = 2;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
+                .expect("send cap token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        endpoints.insert(
+            "runtime".to_string(),
+            Arc::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "single-send-cap",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let budget = Arc::new(InferenceAttemptBudget::new(4));
+        let result = provider
+            .call_api_with_context_with_request_id_and_attempt_budget_max_sends(
+                &request_body,
+                Some("req-single-send-cap"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                budget.clone(),
+                false,
+                Some(2),
+            )
+            .await;
+        assert!(result.is_err());
+        let attempts = server.state.attempts();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().all(|attempt| attempt.account == 1));
+        assert_eq!(attempts[0].endpoint, "ide");
+        assert_eq!(attempts[1].endpoint, "runtime");
+        assert_eq!(budget.snapshot().consumed, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_conversation_identity_blocks_outer_replay() {
+        let server = RotationServer::start(rule_always(RotationReply::GatewayError)).await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.credential_retry_max_attempts = 3;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
+                .expect("identity guard token manager"),
+        );
+        let provider = ide_provider_off_runtime(manager).await;
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let result = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-missing-conversation-identity"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                Arc::new(InferenceAttemptBudget::new(4)),
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            server.state.attempts().len(),
+            1,
+            "the unchanged request must not be replayed to another credential"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile_arn_region_mismatch_blocks_cross_region_request() {
+        let server = RotationServer::start(Arc::new(|attempt: &RotationAttempt| {
+            if attempt.region == "us-east-1" {
+                RotationReply::GatewayError
+            } else {
+                RotationReply::Success
+            }
+        }))
+        .await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.kiro_region_profile_arn_mismatch_allowed = false;
+        config.credential_retry_max_attempts = 1;
+        let credentials = vec![KiroCredentials {
+            id: Some(1),
+            access_token: Some("fake-token-1".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("social".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REGION_GUARD".to_string(),
+            ),
+            ..Default::default()
+        }];
+        let manager = Arc::new(
+            MultiTokenManager::new(config, credentials, None, None, false)
+                .expect("profile region guard token manager"),
+        );
+        let provider = ide_provider_off_runtime(manager).await;
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "profile-region-guard",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let result = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-profile-region-guard"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                Arc::new(InferenceAttemptBudget::new(2)),
+                false,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the only legal Region returns a gateway failure"
+        );
+        let attempts = server.state.attempts();
+        assert_eq!(attempts.len(), 1, "eu-central-1 must not be requested");
+        assert_eq!(attempts[0].region, "us-east-1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_without_profile_arn_can_recover_on_alternate_region() {
+        let server = RotationServer::start(Arc::new(|attempt: &RotationAttempt| {
+            if attempt.region == "us-east-1" {
+                RotationReply::GatewayError
+            } else {
+                RotationReply::Success
+            }
+        }))
+        .await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.kiro_region_profile_arn_mismatch_allowed = true;
+        config.credential_retry_max_attempts = 1;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
+                .expect("region fallback token manager"),
+        );
+        let provider = ide_provider_off_runtime(manager).await;
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "alternate-region",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let response = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-alternate-region"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                Arc::new(InferenceAttemptBudget::new(2)),
+                false,
+            )
+            .await
+            .expect("alternate Region should recover the same account");
+        let (_response, completion) = response.into_parts();
+        completion.release();
+        let attempts = server.state.attempts();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].account, attempts[1].account);
+        assert_eq!(attempts[0].region, "us-east-1");
+        assert_eq!(attempts[1].region, "eu-central-1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_500_does_not_trigger_protocol_endpoint_fallback() {
+        let server = RotationServer::start(Arc::new(|attempt: &RotationAttempt| {
+            if attempt.endpoint == "ide" {
+                RotationReply::ServerError
+            } else {
+                RotationReply::Success
+            }
+        }))
+        .await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.kiro_endpoint_fallback_enabled = true;
+        config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
+        config.credential_retry_max_attempts = 1;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
+                .expect("500 fallback guard token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        endpoints.insert(
+            "runtime".to_string(),
+            Arc::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "server-error-no-fallback",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let result = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-server-error-no-fallback"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                Arc::new(InferenceAttemptBudget::new(2)),
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        let attempts = server.state.attempts();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "HTTP 500 must stay with the primary route"
+        );
+        assert_eq!(attempts[0].endpoint, "ide");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_503_is_classified_before_protocol_endpoint_fallback() {
+        let server =
+            RotationServer::start(rule_always(RotationReply::ModelTemporarilyUnavailable503)).await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.kiro_endpoint_fallback_enabled = true;
+        config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
+        config.credential_retry_max_attempts = 1;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
+                .expect("503 classification token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        endpoints.insert(
+            "runtime".to_string(),
+            Arc::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "model-unavailable-503",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        let result = provider
+            .call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-model-unavailable-503"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                Arc::new(InferenceAttemptBudget::new(2)),
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        let attempts = server.state.attempts();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "structured 503 must not be hidden by route fallback"
+        );
+        assert_eq!(attempts[0].endpoint, "ide");
     }
 
     fn distinct_accounts(attempts: &[RotationAttempt]) -> usize {
@@ -2008,9 +2548,11 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeBadRequestState {
         hits: Arc<StdMutex<HashMap<String, usize>>>,
+        profile_route_hits: Arc<StdMutex<HashMap<String, usize>>>,
         signature_requests: Arc<StdMutex<HashMap<String, Vec<CapturedSignatureRequest>>>>,
         total_hits: Arc<AtomicUsize>,
         mcp_hits: Arc<AtomicUsize>,
+        mcp_requests: Arc<StdMutex<Vec<CapturedMcpRequest>>>,
         oauth_refresh_hits: Arc<AtomicUsize>,
         profile_active: Arc<AtomicUsize>,
         profile_max_active: Arc<AtomicUsize>,
@@ -2020,6 +2562,14 @@ mod tests {
     #[derive(Clone, Debug)]
     struct CapturedSignatureRequest {
         authorization: Option<String>,
+        body: serde_json::Value,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedMcpRequest {
+        authorization: Option<String>,
+        profile_arn: Option<String>,
+        content_type: Option<String>,
         body: serde_json::Value,
     }
 
@@ -2035,6 +2585,15 @@ mod tests {
 
         fn profile_hits(&self, token: &str) -> usize {
             self.scenario_hits(&format!("profile_token:{token}"))
+        }
+
+        fn profile_route_hits(&self, token: &str, host: &str) -> usize {
+            self.profile_route_hits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&format!("{token}|{host}"))
+                .copied()
+                .unwrap_or(0)
         }
 
         fn oauth_refresh_hits(&self) -> usize {
@@ -2872,19 +3431,80 @@ mod tests {
 
     async fn fake_mcp_server_error(
         State(state): State<FakeBadRequestState>,
+        headers: AxumHeaderMap,
         body: Bytes,
     ) -> axum::response::Response {
         state.mcp_hits.fetch_add(1, Ordering::Relaxed);
-        let scenario = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("testScenario")
+        let request_body = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        let scenario = request_body
+            .as_ref()
+            .and_then(|value| value.get("testScenario"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if request_body
+                    .as_ref()
+                    .and_then(|value| value.pointer("/params/arguments/query"))
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "default".to_string());
+                    == Some("builder-profile-required")
+                {
+                    "mcp_builder_profile_required".to_string()
+                } else {
+                    "default".to_string()
+                }
+            });
+        state
+            .mcp_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(CapturedMcpRequest {
+                authorization: headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                profile_arn: headers
+                    .get("x-amzn-kiro-profile-arn")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                content_type: headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                body: request_body.clone().unwrap_or(serde_json::Value::Null),
+            });
+        let host = headers
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
         match scenario.as_str() {
+            "mcp_region_fallback" if host.contains("eu-central-1") => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "x",
+                    "result": {"content": [], "isError": false}
+                })),
+            )
+                .into_response(),
+            "mcp_region_fallback" => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"message": "upstream gateway failure"})),
+            )
+                .into_response(),
+            "mcp_endpoint_gateway" if host.starts_with("runtime.") => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "x",
+                    "result": {"content": [], "isError": false}
+                })),
+            )
+                .into_response(),
+            "mcp_endpoint_gateway" => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"message": "upstream gateway failure"})),
+            )
+                .into_response(),
             "mcp_success_header" => (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -2896,6 +3516,48 @@ mod tests {
                             "text": "{\"results\":[],\"totalResults\":0}"
                         }],
                         "isError": false
+                    }
+                })),
+            )
+                .into_response(),
+            "mcp_builder_profile_required"
+                if headers
+                    .get("x-amzn-kiro-profile-arn")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN) =>
+            {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request_body
+                            .as_ref()
+                            .and_then(|value| value.get("id"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": "{\"results\":[],\"totalResults\":0}"
+                            }],
+                            "isError": false
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            "mcp_builder_profile_required" => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message": "profileArn is required for this request."})),
+            )
+                .into_response(),
+            "mcp_invalid_request_400" => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "invalid_tool_input",
+                        "message": "query format is rejected",
+                        "reason": "invalid_query"
                     }
                 })),
             )
@@ -2975,6 +3637,8 @@ mod tests {
             "model_discovery_pagination_cycle"
         } else if token.starts_with("pagination-endless") {
             "model_discovery_pagination_endless"
+        } else if token.starts_with("models-region-fallback") {
+            "model_discovery_region_fallback"
         } else {
             "model_discovery_failure"
         };
@@ -2985,6 +3649,58 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(scenario.to_string())
             .or_insert(0) += 1;
+
+        if token.starts_with("models-endpoint-fallback") {
+            *state
+                .hits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry("model_discovery_endpoint_fallback".to_string())
+                .or_insert(0) += 1;
+            if headers
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|host| host.starts_with("codewhisperer."))
+            {
+                return Json(serde_json::json!({
+                "models": [{"modelId": "fallback-model"}],
+                    "nextToken": null
+                }))
+                .into_response();
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                "upstream gateway failure",
+            )
+                .into_response();
+        }
+
+        if token.starts_with("models-region-fallback") {
+            if headers
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|host| host.contains("eu-central-1"))
+            {
+                *state
+                    .hits
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry("model_discovery_region_success".to_string())
+                    .or_insert(0) += 1;
+                return Json(serde_json::json!({
+                    "models": [{"modelId": "region-fallback-model"}],
+                    "nextToken": null
+                }))
+                .into_response();
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                "upstream gateway failure",
+            )
+                .into_response();
+        }
 
         if scenario == "model_discovery_pagination_success" {
             let page = query
@@ -3042,7 +3758,18 @@ mod tests {
             .and_then(|value| value.strip_prefix("Bearer "))
             .unwrap_or("missing-token")
             .to_string();
+        let host = headers
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         state.total_hits.fetch_add(1, Ordering::Relaxed);
+        *state
+            .profile_route_hits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(format!("{token}|{host}"))
+            .or_insert(0) += 1;
         let token_hit = {
             let mut hits = state
                 .hits
@@ -3083,6 +3810,22 @@ mod tests {
         }
         if token.starts_with("empty-") {
             return (StatusCode::OK, Json(serde_json::json!({"profiles": []})));
+        }
+        if token.starts_with("region-profile-") {
+            if host == "codewhisperer.eu-central-1.amazonaws.com" {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "profiles": [{
+                            "arn": "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REGION_FALLBACK"
+                        }]
+                    })),
+                );
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"message": "controlled regional gateway failure"})),
+            );
         }
         let profile_region = if token.starts_with("region-shift-") {
             "eu-central-1"
@@ -3176,6 +3919,7 @@ mod tests {
                     "#1",
                     None,
                     None,
+                    "1.4.121",
                     budget.clone(),
                     &mut excluded_ids,
                     &mut recovered_ids,
@@ -3859,6 +4603,206 @@ mod tests {
         }
     }
 
+    fn fake_idc_credential(id: u64, token: &str, profile_arn: Option<&str>) -> KiroCredentials {
+        KiroCredentials {
+            id: Some(id),
+            access_token: Some(token.to_string()),
+            refresh_token: Some(format!("refresh-{token}-{}", "x".repeat(256))),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("idc".to_string()),
+            client_id: Some("fake-client".to_string()),
+            client_secret: Some("fake-secret".to_string()),
+            profile_arn: profile_arn.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn organization_idc_without_profile_arn_discovers_and_stores_the_real_arn() {
+        let server = FakeBadRequestServer::start().await;
+        let (provider, manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_idc_credential(1, "org-idc", None)],
+            None,
+        );
+        provider
+            .ensure_profile_arn_for_credential(1)
+            .await
+            .expect("discover organization profile");
+        let stored = manager
+            .acquire_context_for_credential(1)
+            .await
+            .expect("reacquire organization account")
+            .credentials
+            .profile_arn;
+        assert_eq!(
+            stored.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+        );
+        assert_eq!(server.state.scenario_hits("profile_discovery_success"), 1);
+
+        // 已存真实 ARN 后不再查询。
+        provider
+            .ensure_profile_arn_for_credential(1)
+            .await
+            .expect("second call is a no-op");
+        assert_eq!(server.state.scenario_hits("profile_discovery_success"), 1);
+    }
+
+    #[tokio::test]
+    async fn builder_id_profile_403_is_stored_as_placeholder_and_not_requeried() {
+        let server = FakeBadRequestServer::start().await;
+        let (provider, manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_idc_credential(1, "forbidden-builder-id", None)],
+            Some(short_profile_discovery_policy(8)),
+        );
+        provider
+            .ensure_profile_arn_for_credential(1)
+            .await
+            .expect("builder id discovery");
+        let stored = manager
+            .acquire_context_for_credential(1)
+            .await
+            .expect("reacquire builder id account")
+            .credentials;
+        assert_eq!(
+            stored.profile_arn.as_deref(),
+            Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+        assert!(!crate::kiro::protocol::profile_arn_discovery_applies(
+            &stored
+        ));
+
+        // 退避过期后也不再查询：标记已持久化在凭据上，而不是只在内存退避里。
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        for _ in 0..3 {
+            provider
+                .ensure_profile_arn_for_credential(1)
+                .await
+                .expect("confirmed builder id is skipped");
+        }
+        assert_eq!(server.state.scenario_hits("profile_discovery_success"), 1);
+    }
+
+    #[tokio::test]
+    async fn idc_with_stored_placeholder_skips_profile_discovery() {
+        let server = FakeBadRequestServer::start().await;
+        let (provider, _manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_idc_credential(
+                1,
+                "stored-builder-id",
+                Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+            )],
+            None,
+        );
+        provider
+            .ensure_profile_arn_for_credential(1)
+            .await
+            .expect("stored placeholder");
+        assert_eq!(server.state.scenario_hits("profile_discovery_success"), 0);
+    }
+
+    #[tokio::test]
+    async fn profile_discovery_region_fallback_obeys_rotation_and_profile_arn_switches() {
+        let server = FakeBadRequestServer::start().await;
+
+        let (disabled_provider, disabled_manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_external_idp_credential(1, "region-profile-disabled")],
+            None,
+        );
+        let disabled_context = disabled_manager
+            .acquire_context_for_credential(1)
+            .await
+            .expect("acquire disabled rotation account");
+        let disabled_error = disabled_provider
+            .fetch_enterprise_profile_arn_for_context(
+                &disabled_context,
+                &disabled_provider.runtime_config(),
+                "fake-machine",
+                None,
+            )
+            .await
+            .expect_err("rotation disabled must preserve the primary Region failure");
+        assert!(
+            disabled_error
+                .to_string()
+                .contains("ListAvailableProfiles failed")
+        );
+        assert_eq!(
+            server.state.profile_route_hits(
+                "region-profile-disabled",
+                "codewhisperer.us-east-1.amazonaws.com"
+            ),
+            1
+        );
+        assert_eq!(
+            server.state.profile_route_hits(
+                "region-profile-disabled",
+                "codewhisperer.eu-central-1.amazonaws.com"
+            ),
+            0
+        );
+        assert!(disabled_context.credentials.profile_arn.is_none());
+
+        let (enabled_provider, enabled_manager) = fake_profile_provider(
+            &server.base_url,
+            vec![fake_external_idp_credential(2, "region-profile-enabled")],
+            None,
+        );
+        enabled_manager
+            .update_runtime_config(|config| config.kiro_upstream_region_rotation_enabled = true)
+            .expect("enable profile discovery Region rotation");
+        let enabled_context = enabled_manager
+            .acquire_context_for_credential(2)
+            .await
+            .expect("acquire enabled rotation account");
+        let enabled_profile = enabled_provider
+            .fetch_enterprise_profile_arn_for_context(
+                &enabled_context,
+                &enabled_provider.runtime_config(),
+                "fake-machine",
+                None,
+            )
+            .await
+            .expect("alternate Region should discover the profile ARN");
+        assert_eq!(
+            enabled_profile.as_deref(),
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/REGION_FALLBACK")
+        );
+        assert_eq!(
+            server.state.profile_route_hits(
+                "region-profile-enabled",
+                "codewhisperer.us-east-1.amazonaws.com"
+            ),
+            1
+        );
+        assert_eq!(
+            server.state.profile_route_hits(
+                "region-profile-enabled",
+                "codewhisperer.eu-central-1.amazonaws.com"
+            ),
+            1
+        );
+
+        let real_profile_arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL_REGION";
+        for (allow_mismatch, expected_regions) in [
+            (false, vec![Some("us-east-1")]),
+            (true, vec![Some("us-east-1"), Some("eu-central-1")]),
+        ] {
+            let mut config = Config::default();
+            config.kiro_upstream_region_rotation_enabled = true;
+            config.kiro_region_profile_arn_mismatch_allowed = allow_mismatch;
+            assert_eq!(
+                auxiliary_region_candidates(&config, "us-east-1", Some(real_profile_arn),),
+                expected_regions,
+                "Profile ARN mismatch switch must control cross-Region candidates"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn profile_discovery_is_per_credential_for_1_20_60_accounts_over_five_rounds() {
         let server = FakeBadRequestServer::start().await;
@@ -4303,7 +5247,7 @@ mod tests {
                 .await
                 .unwrap();
             let model_error = model_provider
-                .list_available_models_for_context(model_context)
+                .list_available_models_for_context(model_context, "1.4.121")
                 .await
                 .unwrap_err();
             assert!(
@@ -4816,6 +5760,132 @@ mod tests {
                 "round {round}: send count must not multiply by credential count"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn model_discovery_uses_same_account_endpoint_fallback_and_shared_run_budget() {
+        let server = FakeBadRequestServer::start().await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 2;
+        config.kiro_endpoint_fallback_enabled = true;
+        // runtime 域名不提供 ListAvailableModels，模型列表备用端点用 codewhisperer（独立 host）。
+        config.kiro_endpoint_fallback_order = vec!["codewhisperer".to_string()];
+        let credentials = vec![KiroCredentials {
+            id: Some(1),
+            access_token: Some("models-endpoint-fallback-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("social".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/MODEL_FALLBACK".to_string(),
+            ),
+            ..Default::default()
+        }];
+        let manager = Arc::new(
+            MultiTokenManager::new(config, credentials, None, None, false)
+                .expect("model endpoint fallback manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        endpoints.insert(
+            "codewhisperer".to_string(),
+            Arc::new(crate::kiro::endpoint::CodewhispererEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+
+        let models = provider
+            .list_available_models_for_credential(1)
+            .await
+            .expect("codewhisperer endpoint should recover model discovery");
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fallback-model"]
+        );
+        assert_eq!(
+            server
+                .state
+                .scenario_hits("model_discovery_endpoint_fallback"),
+            2,
+            "primary 502 and same-account fallback are two physical sends"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_discovery_region_fallback_is_bounded_and_respects_profile_region() {
+        let server = FakeBadRequestServer::start().await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 2;
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.kiro_region_profile_arn_mismatch_allowed = true;
+        config.kiro_endpoint_fallback_enabled = false;
+        let credentials = KiroCredentials {
+            id: Some(1),
+            access_token: Some("models-region-fallback-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(config.clone(), vec![credentials], None, None, false)
+                .expect("model region fallback manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+
+        let models = provider
+            .list_available_models_for_credential(1)
+            .await
+            .expect("alternate Region should recover model discovery");
+        assert_eq!(models[0].model_id, "region-fallback-model");
+        assert_eq!(
+            server
+                .state
+                .scenario_hits("model_discovery_region_fallback"),
+            2,
+            "primary 502 then alternate Region 200"
+        );
+        assert_eq!(
+            server.state.scenario_hits("model_discovery_region_success"),
+            1
+        );
+
+        let mut blocked_config = config;
+        blocked_config.kiro_region_profile_arn_mismatch_allowed = false;
+        let blocked_credentials = KiroCredentials {
+            id: Some(2),
+            access_token: Some("models-region-fallback-blocked-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("social".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/BLOCKED".to_string(),
+            ),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(blocked_config, vec![blocked_credentials], None, None, false)
+                .expect("profile region guard manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let error = provider
+            .list_available_models_for_credential(2)
+            .await
+            .expect_err("Profile ARN region mismatch must not try the alternate Region");
+        assert!(error.to_string().contains("ListAvailableModels failed"));
+        assert_eq!(
+            server
+                .state
+                .scenario_hits("model_discovery_region_fallback"),
+            3,
+            "the second credential sends only its primary Region request"
+        );
     }
 
     async fn call_fake_bad_request_provider(
@@ -8294,9 +9364,9 @@ mod tests {
         assert_eq!(KiroProvider::test_max_retry_attempts(10_000, &config), 12);
     }
 
-    /// S1：全账号全端点持续 429，狂暴模式应恰好打满 账号 × 端点 × 轮数 后失败。
+    /// S1：账号级 429 只换账号；所有账号和轮次耗尽后失败，不推进 Region。
     #[tokio::test]
-    async fn s1_berserk_exhausts_exactly_accounts_times_regions_times_rounds() {
+    async fn s1_berserk_exhausts_exactly_accounts_times_rounds_without_region_fallback() {
         for pool_size in [1usize, 3, 8] {
             for rounds in [1u32, 2, 3] {
                 let server =
@@ -8310,70 +9380,52 @@ mod tests {
 
                 assert!(result.is_err(), "全 429 必须最终失败");
                 let attempts = server.state.attempts();
-                let expected = pool_size * KIRO_ROTATION_REGIONS.len() * rounds as usize;
+                let expected = pool_size * rounds as usize;
                 assert_eq!(
                     attempts.len(),
                     expected,
-                    "pool={pool_size} rounds={rounds}：尝试次数应恰好等于 账号×端点×轮数"
+                    "pool={pool_size} rounds={rounds}：普通 429 只能按账号×轮数重试"
                 );
 
-                // 每个 (账号, 端点) 组合在每轮中恰好出现一次，确认没有重复消耗。
-                let mut seen: HashMap<(u64, String), usize> = HashMap::new();
+                let mut seen: HashMap<u64, usize> = HashMap::new();
                 for attempt in &attempts {
-                    *seen
-                        .entry((attempt.account, attempt.region.clone()))
-                        .or_insert(0) += 1;
+                    assert_eq!(attempt.region, "us-east-1", "429 不得切换 Region");
+                    *seen.entry(attempt.account).or_insert(0) += 1;
                 }
-                assert_eq!(seen.len(), pool_size * KIRO_ROTATION_REGIONS.len());
-                for (key, count) in seen {
-                    assert_eq!(count, rounds as usize, "{key:?} 每轮应恰好尝试一次");
+                assert_eq!(seen.len(), pool_size);
+                for (account, count) in seen {
+                    assert_eq!(count, rounds as usize, "账号 {account} 每轮应恰好尝试一次");
                 }
             }
         }
     }
 
-    /// S3：端点[0] 全 429、端点[1] 正常 —— 必须**先轮完所有账号再换端点**（优先换号）。
+    /// S3：账号级 429 穷尽所有账号后，不能借用备用 Region 重放。
     #[tokio::test]
-    async fn s3_berserk_exhausts_every_account_before_switching_region() {
+    async fn s3_berserk_429_switches_accounts_without_switching_region() {
         for pool_size in [2usize, 5, 12] {
-            let primary = KIRO_ROTATION_REGIONS[0];
-            let rule: RotationRule = Arc::new(move |attempt: &RotationAttempt| {
-                if attempt.region == primary {
-                    RotationReply::TooManyRequests
-                } else {
-                    RotationReply::Success
-                }
-            });
-            let server = RotationServer::start(rule).await;
+            let server = RotationServer::start(rule_always(RotationReply::TooManyRequests)).await;
             let settings = RotationConfig::new(pool_size)
-                .berserk(3)
+                .berserk(1)
                 .with_region_rotation();
             let result =
                 call_rotation_provider(&server, settings, &format!("s3-{pool_size}")).await;
 
-            assert!(result.is_ok(), "第二个端点可用时最终应成功");
+            assert!(result.is_err(), "所有账号都返回 429 时必须失败");
             let attempts = server.state.attempts();
-            // 前 pool_size 次必须全部落在第一个端点上 —— 这正是「优先换号」的定义：
-            // 换端点之前，所有账号都要在当前端点试过一遍。
             assert_eq!(
                 attempts.len(),
-                pool_size + 1,
-                "pool={pool_size}：应当先用光所有账号，再换端点一次命中"
-            );
-            for attempt in attempts.iter().take(pool_size) {
-                assert_eq!(attempt.region, primary, "换端点前必须先轮完所有账号");
-            }
-            let first_region_accounts: HashSet<u64> = attempts
-                .iter()
-                .take(pool_size)
-                .map(|attempt| attempt.account)
-                .collect();
-            assert_eq!(
-                first_region_accounts.len(),
                 pool_size,
-                "第一个端点上每个账号都应恰好被试一次"
+                "pool={pool_size}：账号池每个账号只尝试一次"
             );
-            assert_eq!(attempts[pool_size].region, KIRO_ROTATION_REGIONS[1]);
+            assert!(attempts.iter().all(|attempt| attempt.region == "us-east-1"));
+            let first_round_accounts: HashSet<u64> =
+                attempts.iter().map(|attempt| attempt.account).collect();
+            assert_eq!(
+                first_round_accounts.len(),
+                pool_size,
+                "账号级 429 必须换到不同账号，不得换 Region"
+            );
         }
     }
 
@@ -8484,14 +9536,14 @@ mod tests {
         }
     }
 
-    /// S4：第一轮全 429、第二轮起恢复 —— 验证「轮数」确实生效。
+    /// S4：第一轮账号级 429 耗尽，第二轮从主 Region 重试并恢复。
     #[tokio::test]
     async fn s4_berserk_recovers_on_a_later_round() {
         for pool_size in [2usize, 4] {
-            let first_round = pool_size * KIRO_ROTATION_REGIONS.len();
+            let first_round = pool_size;
             let seen = Arc::new(AtomicUsize::new(0));
             let rule: RotationRule = Arc::new(move |_: &RotationAttempt| {
-                // 前一整轮（账号×端点）全部 429，之后恢复。
+                // 前一整轮的账号全部 429，之后恢复。
                 if seen.fetch_add(1, Ordering::SeqCst) < first_round {
                     RotationReply::TooManyRequests
                 } else {
@@ -8534,7 +9586,14 @@ mod tests {
             assert_eq!(
                 server.state.attempts().len(),
                 first_round + 1,
-                "pool={pool_size}：应当在第二轮第一次尝试就命中"
+                "pool={pool_size}：第二轮第一次尝试应命中"
+            );
+            assert!(
+                server
+                    .state
+                    .attempts()
+                    .iter()
+                    .all(|attempt| attempt.region == "us-east-1")
             );
         }
     }
@@ -8871,15 +9930,15 @@ mod tests {
         }
     }
 
-    /// S7 补充：500 与 429 混合 —— 5xx 同属可重试类，也应参与轮换并被账号覆盖。
+    /// S7 补充：500 与 429 混合时都能切换账号；普通 500 不证明 Region 故障。
     #[tokio::test]
-    async fn s7_server_errors_participate_in_rotation_alongside_rate_limits() {
+    async fn s7_mixed_429_500_fail_over_accounts_without_region_rotation() {
         let pool_size = 4usize;
-        // 奇数账号 429、偶数账号 500，只有最后一个账号在第二个端点上成功。
-        let secondary = KIRO_ROTATION_REGIONS[1];
+        // 账号级 429/500 都先换账号；普通 500 不应单独推进 Region。
+        let primary = KIRO_ROTATION_REGIONS[0];
         let lucky = pool_size as u64;
         let rule: RotationRule = Arc::new(move |attempt: &RotationAttempt| {
-            if attempt.account == lucky && attempt.region == secondary {
+            if attempt.account == lucky {
                 RotationReply::Success
             } else if attempt.account.is_multiple_of(2) {
                 RotationReply::ServerError
@@ -8897,13 +9956,17 @@ mod tests {
         let attempts = server.state.attempts();
         let last = attempts.last().expect("至少一次尝试");
         assert_eq!(last.account, lucky);
-        assert_eq!(last.region, secondary);
+        assert_eq!(last.region, primary);
         // 500 的账号同样应被轮换覆盖，而不是卡在某一个账号上反复重试。
         let touched: HashSet<u64> = attempts.iter().map(|attempt| attempt.account).collect();
         assert_eq!(
             touched.len(),
             pool_size,
             "429 与 500 的账号都应被轮换到，实际只碰到 {touched:?}"
+        );
+        assert!(
+            attempts.iter().all(|attempt| attempt.region == primary),
+            "普通 500 不应被推断为 Region/host 故障"
         );
     }
 
@@ -8920,13 +9983,11 @@ mod tests {
             if attempt.region == secondary {
                 RotationReply::Success
             } else {
-                RotationReply::TooManyRequests
+                RotationReply::GatewayError
             }
         });
         let server = Arc::new(RotationServer::start(rule).await);
-        let settings = RotationConfig::new(pool_size)
-            .berserk(3)
-            .with_region_rotation();
+        let settings = RotationConfig::new(pool_size).with_region_rotation();
 
         let mut handles = Vec::with_capacity(CONCURRENCY);
         for index in 0..CONCURRENCY {
@@ -9471,6 +10532,271 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_invalid_request_is_not_retried_or_exposed_in_usage_attribution() {
+        let server = FakeBadRequestServer::start().await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 2;
+        config.credential_retry_max_attempts = 4;
+        config.kiro_endpoint_fallback_enabled = true;
+        config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.kiro_region_profile_arn_mismatch_allowed = true;
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
+                .expect("MCP invalid request token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        endpoints.insert(
+            "runtime".to_string(),
+            Arc::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let budget = Arc::new(InferenceAttemptBudget::new(4));
+
+        let error = provider
+            .call_mcp(
+                &serde_json::json!({
+                    "id": "web_search_tooluse_invalid_request_fixture",
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "web_search",
+                        "arguments": {"query": "ordinary protocol error"}
+                    },
+                    "testScenario": "mcp_invalid_request_400"
+                })
+                .to_string(),
+                budget.clone(),
+            )
+            .await
+            .expect_err("MCP 400 is an invalid request");
+
+        assert_eq!(
+            KiroProvider::mcp_failure_kind_from_error(&error),
+            Some(McpCallFailureKind::InvalidRequest)
+        );
+        assert_eq!(budget.snapshot().consumed, 1);
+        assert_eq!(server.state.mcp_hits.load(Ordering::Relaxed), 1);
+        assert!(!error.to_string().contains("query format is rejected"));
+
+        let attempts = KiroProvider::mcp_attribution_from_error(&error).attempts;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].action, "fail");
+        assert!(attempts[0].raw_upstream_error.is_none());
+        assert_eq!(attempts[0].credential_id, 1);
+        let requests = server
+            .state
+            .mcp_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            requests.len(),
+            1,
+            "400 must not advance endpoint or account"
+        );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer fake-token-1")
+        );
+        assert_eq!(requests[0].body["jsonrpc"], "2.0");
+        assert_eq!(requests[0].body["method"], "tools/call");
+        assert_eq!(requests[0].body["params"]["name"], "web_search");
+        assert_eq!(
+            requests[0].body["params"]["arguments"]["query"],
+            "ordinary protocol error"
+        );
+        assert_eq!(server.state.mcp_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(budget.snapshot().mcp_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn idc_mcp_request_carries_required_builder_profile_header() {
+        let server = FakeBadRequestServer::start().await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 2;
+        config.credential_retry_max_attempts = 3;
+        let credential = KiroCredentials {
+            id: Some(1),
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            access_token: Some("fake-idc-access-token".to_string()),
+            refresh_token: Some("fake-idc-refresh-token".to_string()),
+            client_id: Some("fake-client-id".to_string()),
+            client_secret: Some("fake-client-secret".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![credential], None, None, false)
+                .expect("IdC MCP token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let budget = Arc::new(InferenceAttemptBudget::new(3));
+
+        let response = provider
+            .call_mcp(
+                &serde_json::json!({
+                    "id": "web_search_tooluse_protocol_fixture",
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "web_search",
+                        "arguments": {"query": "builder-profile-required"}
+                    }
+                })
+                .to_string(),
+                budget.clone(),
+            )
+            .await
+            .expect("Builder ID MCP request with the required Profile header should succeed");
+        response.completion.report_success();
+
+        assert_eq!(budget.snapshot().consumed, 1);
+        assert_eq!(server.state.mcp_hits.load(Ordering::Relaxed), 1);
+        let requests = server
+            .state
+            .mcp_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].profile_arn.as_deref(),
+            Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+        assert_eq!(
+            requests[0].content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(requests[0].body["jsonrpc"], "2.0");
+        assert_eq!(requests[0].body["method"], "tools/call");
+        assert_eq!(requests[0].body["params"]["name"], "web_search");
+        assert_eq!(
+            requests[0].body["params"]["arguments"]["query"],
+            "builder-profile-required"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_gateway_failure_falls_back_on_the_same_account_with_shared_budget() {
+        let server = FakeBadRequestServer::start().await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 2;
+        config.credential_retry_max_attempts = 1;
+        config.kiro_endpoint_fallback_enabled = true;
+        config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
+        let manager = Arc::new(
+            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
+                .expect("MCP endpoint fallback token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        endpoints.insert(
+            "runtime".to_string(),
+            Arc::new(crate::kiro::endpoint::RuntimeEndpoint::new()),
+        );
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let budget = Arc::new(InferenceAttemptBudget::new(2));
+
+        let response = provider
+            .call_mcp(
+                &serde_json::json!({"testScenario": "mcp_endpoint_gateway"}).to_string(),
+                budget.clone(),
+            )
+            .await
+            .expect("runtime endpoint should recover MCP gateway failure");
+
+        assert_eq!(response.completion.credential_id, 1);
+        response.completion.report_success();
+        assert_eq!(budget.snapshot().consumed, 2);
+        assert_eq!(budget.snapshot().mcp_attempts, 2);
+        assert_eq!(server.state.mcp_hits.load(Ordering::Relaxed), 2);
+        let attempts = response.completion.attempts.lock().clone();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].credential_id, 1);
+        assert_eq!(attempts[0].status, Some(502));
+        assert_eq!(
+            attempts[0].error_type.as_deref(),
+            Some("mcp_endpoint_gateway_failure")
+        );
+        assert_eq!(attempts[1].credential_id, 1);
+        assert_eq!(attempts[1].status, Some(200));
+        assert_eq!(attempts[1].action, "success");
+    }
+
+    #[tokio::test]
+    async fn mcp_region_fallback_is_bounded_and_respects_profile_region() {
+        let server = FakeBadRequestServer::start().await;
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 2;
+        config.credential_retry_max_attempts = 1;
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.kiro_region_profile_arn_mismatch_allowed = true;
+        config.kiro_endpoint_fallback_enabled = false;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config.clone(),
+                fake_bad_request_credentials(1),
+                None,
+                None,
+                false,
+            )
+            .expect("MCP Region fallback token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let budget = Arc::new(InferenceAttemptBudget::new(2));
+
+        let response = provider
+            .call_mcp(
+                &serde_json::json!({"testScenario": "mcp_region_fallback"}).to_string(),
+                budget.clone(),
+            )
+            .await
+            .expect("alternate Region should recover an MCP gateway failure");
+        response.completion.report_success();
+        assert_eq!(budget.snapshot().consumed, 2);
+        assert_eq!(server.state.mcp_hits.load(Ordering::Relaxed), 2);
+
+        let mut blocked_config = config;
+        blocked_config.kiro_region_profile_arn_mismatch_allowed = false;
+        blocked_config.kiro_endpoint_fallback_enabled = false;
+        let blocked_credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/MCP".to_string(),
+            ),
+            ..fake_bad_request_credentials(1).remove(0)
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(blocked_config, vec![blocked_credentials], None, None, false)
+                .expect("MCP Profile Region guard manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let budget = Arc::new(InferenceAttemptBudget::new(2));
+        let error = provider
+            .call_mcp(
+                &serde_json::json!({"testScenario": "mcp_region_fallback"}).to_string(),
+                budget.clone(),
+            )
+            .await
+            .expect_err("Profile ARN must block a cross-Region retry by default");
+        assert_eq!(
+            KiroProvider::mcp_failure_kind_from_error(&error),
+            Some(McpCallFailureKind::Upstream)
+        );
+        assert_eq!(budget.snapshot().consumed, 1);
     }
 
     #[tokio::test]
@@ -10523,6 +11849,40 @@ impl KiroProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
+    fn endpoint_candidates_for(
+        &self,
+        credentials: &KiroCredentials,
+        config: &Config,
+        operation: EndpointOperation,
+    ) -> anyhow::Result<Vec<Arc<dyn KiroEndpoint>>> {
+        resolve_endpoint_candidates(
+            credentials,
+            self.endpoints.values().map(Arc::as_ref),
+            &EndpointRoutingPlan::from_config(config),
+            operation,
+        )
+        .into_iter()
+        .map(|name| {
+            self.endpoints
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("未知端点: {name}"))
+        })
+        .collect()
+    }
+
+    fn gateway_response_allows_endpoint_fallback(
+        status: reqwest::StatusCode,
+        body: &str,
+        content_kind: UpstreamContentKind,
+    ) -> bool {
+        matches!(status.as_u16(), 502 | 504)
+            && matches!(
+                Self::classify_non_eventstream_body(body, content_kind),
+                ApiUpstreamFailureKind::Protocol | ApiUpstreamFailureKind::Server
+            )
+    }
+
     fn update_profile_arn_identity_field(hasher: &mut Sha256, label: &str, value: Option<&str>) {
         hasher.update((label.len() as u64).to_be_bytes());
         hasher.update(label.as_bytes());
@@ -10775,7 +12135,7 @@ impl KiroProvider {
         machine_id: &str,
         auxiliary_budget: Option<&AuxiliaryAttemptBudget>,
     ) -> anyhow::Result<Option<String>> {
-        if !is_external_idp_credentials(&ctx.credentials) {
+        if !profile_arn_discovery_applies(&ctx.credentials) {
             return Ok(None);
         }
         if ctx
@@ -10788,104 +12148,183 @@ impl KiroProvider {
             return Ok(ctx.credentials.profile_arn.clone());
         }
 
-        let region = ctx.credentials.effective_api_region(config);
-        let host = Self::codewhisperer_host_for_region(region);
-        let url = configured_upstream_url(config, "ListAvailableProfiles")
-            .unwrap_or_else(|| format!("https://{}/ListAvailableProfiles", host));
-        if let Some(budget) = auxiliary_budget {
+        let credential_region = ctx.credentials.effective_api_region(config);
+        let regions = auxiliary_region_candidates(
+            config,
+            credential_region,
+            ctx.credentials.profile_arn.as_deref(),
+        );
+        if !regions.is_empty()
+            && let Some(budget) = auxiliary_budget
+        {
             budget.ensure_available(AuxiliaryAttemptKind::ProfileDiscovery)?;
         }
         let auxiliary_controller = self.token_manager.auxiliary_concurrency_controller();
         let _auxiliary_permit =
             auxiliary_controller.try_acquire(AuxiliaryConcurrencyKind::ProfileDiscovery)?;
         let client = self.client_for(&ctx.credentials)?;
-        let request = client
-            .post(&url)
-            .headers(Self::list_available_profiles_headers(
-                &ctx.credentials,
-                &ctx.token,
+        for (region_index, region_override) in regions.iter().enumerate() {
+            let region = region_override.unwrap_or(credential_region);
+            let host = Self::codewhisperer_host_for_region(region);
+            let url = configured_upstream_url(config, "ListAvailableProfiles")
+                .unwrap_or_else(|| format!("https://{}/ListAvailableProfiles", host));
+            if let Some(budget) = auxiliary_budget {
+                budget.ensure_available(AuxiliaryAttemptKind::ProfileDiscovery)?;
+            }
+            let request = client
+                .post(&url)
+                .headers(Self::list_available_profiles_headers(
+                    &ctx.credentials,
+                    &ctx.token,
+                    config,
+                    machine_id,
+                    host,
+                )?)
+                .body("{}");
+            if let Some(budget) = auxiliary_budget {
+                budget.reserve(AuxiliaryAttemptKind::ProfileDiscovery)?;
+            }
+            let auxiliary_attempt = self
+                .profile_arn_discovery_metrics
+                .upstream_attempts
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            tracing::debug!(
+                auxiliary_channel = "profile_arn_discovery",
+                operation = "ListAvailableProfiles",
+                credential_id = ctx.id,
+                auxiliary_attempt,
+                region,
+                inference_attempt_consumed = false,
+                "sending bounded auxiliary profile discovery request"
+            );
+            capture_upstream_request(
+                None,
+                "profile_discovery",
+                auxiliary_attempt.saturating_sub(1),
+                ctx.id,
+                "codewhisperer",
+                region,
                 config,
-                machine_id,
-                host,
-            )?)
-            .body("{}");
-        if let Some(budget) = auxiliary_budget {
-            budget.reserve(AuxiliaryAttemptKind::ProfileDiscovery)?;
-        }
-        let auxiliary_attempt = self
-            .profile_arn_discovery_metrics
-            .upstream_attempts
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        tracing::debug!(
-            auxiliary_channel = "profile_arn_discovery",
-            operation = "ListAvailableProfiles",
-            credential_id = ctx.id,
-            auxiliary_attempt,
-            inference_attempt_consumed = false,
-            "sending bounded auxiliary profile discovery request"
-        );
-        let response =
-            send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
-                .await?;
-
-        let status = response.status();
-        let content_kind = Self::upstream_content_kind(&response);
-        let retry_after = Self::retry_after_duration(response.headers());
-        if !status.is_success() {
-            let diagnostic = match Self::read_upstream_body_strict(
-                response,
+                &request,
+            );
+            let response = match send_with_response_header_timeout(
+                request,
                 config.kiro_upstream_response_timeout_secs,
-                PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
             )
             .await
             {
-                Ok(body) => Self::api_failure_diagnostic(
-                    Self::classify_http_status_failure(status),
-                    status,
-                    Some(body.bytes),
-                    retry_after,
-                    Some(content_kind),
-                    Some("profile_discovery"),
-                ),
-                Err(failure) => Self::api_failure_diagnostic(
+                Ok(response) => response,
+                Err(error)
+                    if region_index + 1 < regions.len()
+                        && matches!(&error, HttpSendError::Request(request_error) if request_error.is_connect()) =>
+                {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        region,
+                        next_region = regions[region_index + 1].unwrap_or(credential_region),
+                        "ListAvailableProfiles connection failed; trying the next eligible Region"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            capture_upstream_response(
+                None,
+                "profile_discovery",
+                auxiliary_attempt.saturating_sub(1),
+                ctx.id,
+                "codewhisperer",
+                region,
+                config,
+                &response,
+                Duration::ZERO,
+            );
+
+            let status = response.status();
+            let content_kind = Self::upstream_content_kind(&response);
+            let retry_after = Self::retry_after_duration(response.headers());
+            if !status.is_success() {
+                let body = Self::read_upstream_body_strict(
+                    response,
+                    config.kiro_upstream_response_timeout_secs,
+                    PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
+                )
+                .await
+                .map_err(|failure| {
+                    anyhow::anyhow!(Self::api_failure_diagnostic(
+                        failure.kind,
+                        status,
+                        failure.body_bytes,
+                        retry_after,
+                        Some(content_kind),
+                        Some("profile_discovery_body"),
+                    ))
+                })?;
+                if status.as_u16() == 403 {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        region,
+                        upstream_status = status.as_u16(),
+                        "ListAvailableProfiles denied the auxiliary request; using fallback profile ARN"
+                    );
+                    // Builder ID 没有 profile，上游对它固定返回 403。把占位 ARN 作为“已确认是
+                    // BuilderId”的标记存下，之后不再为这个账号查询。
+                    if !is_external_idp_credentials(&ctx.credentials) {
+                        return Ok(Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()));
+                    }
+                    return Ok(None);
+                }
+                if region_index + 1 < regions.len()
+                    && Self::gateway_response_allows_endpoint_fallback(
+                        status,
+                        &body.text,
+                        content_kind,
+                    )
+                {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        region,
+                        next_region = regions[region_index + 1].unwrap_or(credential_region),
+                        upstream_status = status.as_u16(),
+                        "ListAvailableProfiles gateway failure; trying the next eligible Region"
+                    );
+                    continue;
+                }
+                anyhow::bail!(
+                    "ListAvailableProfiles failed: {}",
+                    Self::api_failure_diagnostic(
+                        Self::classify_http_status_failure(status),
+                        status,
+                        Some(body.bytes),
+                        retry_after,
+                        Some(content_kind),
+                        Some("profile_discovery"),
+                    )
+                );
+            }
+
+            let body = Self::read_upstream_body_strict(
+                response,
+                config.kiro_upstream_response_timeout_secs,
+                PROVIDER_AUXILIARY_BODY_MAX_BYTES,
+            )
+            .await
+            .map_err(|failure| {
+                anyhow::anyhow!(Self::api_failure_diagnostic(
                     failure.kind,
                     status,
                     failure.body_bytes,
                     retry_after,
                     Some(content_kind),
                     Some("profile_discovery_body"),
-                ),
-            };
-            if status.as_u16() == 403 {
-                tracing::warn!(
-                    credential_id = ctx.id,
-                    upstream_status = status.as_u16(),
-                    "ListAvailableProfiles denied the auxiliary request; using fallback profile ARN"
-                );
-                return Ok(None);
-            }
-            anyhow::bail!("ListAvailableProfiles failed: {}", diagnostic);
+                ))
+            })?;
+            return Ok(extract_preferred_profile_arn(&body.text, credential_region)
+                .filter(|arn| is_real_profile_arn(arn)));
         }
 
-        let body = Self::read_upstream_body_strict(
-            response,
-            config.kiro_upstream_response_timeout_secs,
-            PROVIDER_AUXILIARY_BODY_MAX_BYTES,
-        )
-        .await
-        .map_err(|failure| {
-            anyhow::anyhow!(Self::api_failure_diagnostic(
-                failure.kind,
-                status,
-                failure.body_bytes,
-                retry_after,
-                Some(content_kind),
-                Some("profile_discovery_body"),
-            ))
-        })?;
-
-        Ok(extract_first_profile_arn(&body.text).filter(|arn| is_real_profile_arn(arn)))
+        Ok(None)
     }
 
     async fn ensure_profile_arn_for_context(
@@ -10895,7 +12334,7 @@ impl KiroProvider {
         machine_id: &str,
         auxiliary_budget: Option<&AuxiliaryAttemptBudget>,
     ) {
-        if !is_external_idp_credentials(&ctx.credentials) {
+        if !profile_arn_discovery_applies(&ctx.credentials) {
             return;
         }
         let existing = ctx
@@ -10957,14 +12396,14 @@ impl KiroProvider {
                         tracing::warn!(
                             credential_id = ctx.id,
                             profile_arn = %profile_arn,
-                            "Enterprise profileArn 已解析但本地更新失败: {}",
+                            "profileArn 已解析但本地更新失败: {}",
                             err
                         );
                     } else {
                         tracing::info!(
                             credential_id = ctx.id,
                             profile_arn = %profile_arn,
-                            "Enterprise profileArn 已解析，本地已更新并异步持久化"
+                            "profileArn 已解析，本地已更新并异步持久化"
                         );
                     }
                 }
@@ -11138,6 +12577,7 @@ impl KiroProvider {
         credential_label: &str,
         model: Option<&str>,
         session_id: Option<&str>,
+        request_kiro_version: &str,
         auxiliary_attempt_budget: Arc<AuxiliaryAttemptBudget>,
         excluded_ids: &mut HashSet<u64>,
         automatic_recovery_attempted: &mut HashSet<u64>,
@@ -11165,6 +12605,7 @@ impl KiroProvider {
                     &ctx.token,
                     ctx.credentials.storage_revision,
                     auxiliary_attempt_budget,
+                    Some(request_kiro_version),
                 )
                 .await
             {
@@ -11552,14 +12993,48 @@ impl KiroProvider {
         credential_id: u64,
         request_body: &str,
     ) -> anyhow::Result<KiroApiResponse> {
+        let request_kiro_version = self.token_manager.runtime_config().effective_kiro_version();
         let ctx = self
             .token_manager
-            .acquire_context_for_credential(credential_id)
+            .acquire_context_for_credential_with_version(credential_id, Some(&request_kiro_version))
             .await?;
         let credential_label = self.credential_log_label(ctx.id);
         let credential_context = format!("账号 {}", credential_label);
-        self.call_api_with_single_context(ctx, request_body, credential_label, credential_context)
-            .await
+        self.call_api_with_single_context(
+            ctx,
+            request_body,
+            credential_label,
+            credential_context,
+            request_kiro_version,
+        )
+        .await
+    }
+
+    /// 账号缺少 profileArn 时立即查询并写回（导入后、额度查询前调用）。
+    ///
+    /// 与请求前的自动补全共用同一套单飞与退避；Builder ID 的 403 会把占位 ARN 存为标记。
+    pub async fn ensure_profile_arn_for_credential(
+        &self,
+        credential_id: u64,
+    ) -> anyhow::Result<()> {
+        let mut config = self
+            .token_manager
+            .runtime_config_snapshot()
+            .as_ref()
+            .clone();
+        config.snapshot_kiro_version_for_request();
+        let request_kiro_version = config.effective_kiro_version();
+        let mut ctx = self
+            .token_manager
+            .acquire_context_for_credential_with_version(credential_id, Some(&request_kiro_version))
+            .await?;
+        if !profile_arn_discovery_applies(&ctx.credentials) {
+            return Ok(());
+        }
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+        self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id, None)
+            .await;
+        Ok(())
     }
 
     /// 使用外部临时凭据发送一次非流式 API 请求。
@@ -11570,15 +13045,20 @@ impl KiroProvider {
         credentials: KiroCredentials,
         request_body: &str,
     ) -> anyhow::Result<KiroApiResponse> {
+        let request_kiro_version = self.token_manager.runtime_config().effective_kiro_version();
         let ctx = self
             .token_manager
-            .acquire_context_for_external_credentials(credentials)
+            .acquire_context_for_external_credentials_with_version(
+                credentials,
+                Some(&request_kiro_version),
+            )
             .await?;
         self.call_api_with_single_context(
             ctx,
             request_body,
             "external".to_string(),
             "外部凭据".to_string(),
+            request_kiro_version,
         )
         .await
     }
@@ -11591,11 +13071,16 @@ impl KiroProvider {
         &self,
         credentials: KiroCredentials,
     ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let request_kiro_version = self.token_manager.runtime_config().effective_kiro_version();
         let ctx = self
             .token_manager
-            .acquire_context_for_external_credentials(credentials)
+            .acquire_context_for_external_credentials_with_version(
+                credentials,
+                Some(&request_kiro_version),
+            )
             .await?;
-        self.list_available_models_for_context(ctx).await
+        self.list_available_models_for_context(ctx, &request_kiro_version)
+            .await
     }
 
     async fn call_api_with_single_context(
@@ -11604,11 +13089,17 @@ impl KiroProvider {
         request_body: &str,
         credential_label: String,
         credential_context: String,
+        request_kiro_version: String,
     ) -> anyhow::Result<KiroApiResponse> {
         ctx.mark_in_flight_kind(InFlightKind::Test);
         let started_at = Instant::now();
 
-        let config = self.token_manager.runtime_config_snapshot();
+        let mut config = self
+            .token_manager
+            .runtime_config_snapshot()
+            .as_ref()
+            .clone();
+        config.pin_kiro_version_for_request(request_kiro_version);
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
         self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id, None)
             .await;
@@ -11737,6 +13228,7 @@ impl KiroProvider {
     /// 这里只自动使用未禁用凭据，避免后台任务绕过用户手动禁用。
     pub async fn list_available_models(&self) -> anyhow::Result<KiroAvailableModelCatalog> {
         let _run_guard = ModelDiscoveryRunGuard::acquire(&self.model_discovery_in_progress)?;
+        let request_kiro_version = self.token_manager.runtime_config().effective_kiro_version();
         let mut send_budget = ModelDiscoverySendBudget::new();
         let cohorts = self.token_manager.local_model_capability_cohorts();
         let cohort_count = cohorts.len();
@@ -11794,7 +13286,11 @@ impl KiroProvider {
 
         for (cohort_index, id) in samples {
             attempted += 1;
-            let ctx = match self.token_manager.acquire_context_for_credential(id).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_credential_with_version(id, Some(&request_kiro_version))
+                .await
+            {
                 Ok(ctx) => ctx,
                 Err(err) => {
                     last_error = Some(anyhow::anyhow!("账号 #{} 获取 token 失败: {}", id, err));
@@ -11803,7 +13299,11 @@ impl KiroProvider {
             };
             let ctx_id = ctx.id;
             match self
-                .list_available_models_for_context_with_budget(ctx, &mut send_budget)
+                .list_available_models_for_context_with_budget(
+                    ctx,
+                    &request_kiro_version,
+                    &mut send_budget,
+                )
                 .await
             {
                 Ok(models) if !models.is_empty() => {
@@ -12001,123 +13501,209 @@ impl KiroProvider {
         &self,
         id: u64,
     ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let request_kiro_version = self.token_manager.runtime_config().effective_kiro_version();
         let ctx = self
             .token_manager
-            .acquire_context_for_credential(id)
+            .acquire_context_for_credential_with_version(id, Some(&request_kiro_version))
             .await
             .map_err(|err| anyhow::anyhow!("账号 #{} 获取 token 失败: {}", id, err))?;
-        self.list_available_models_for_context(ctx).await
+        self.list_available_models_for_context(ctx, &request_kiro_version)
+            .await
     }
 
     async fn list_available_models_for_context(
         &self,
         ctx: CallContext,
+        request_kiro_version: &str,
     ) -> anyhow::Result<Vec<KiroAvailableModel>> {
         let mut send_budget = ModelDiscoverySendBudget::new();
-        self.list_available_models_for_context_with_budget(ctx, &mut send_budget)
-            .await
+        self.list_available_models_for_context_with_budget(
+            ctx,
+            request_kiro_version,
+            &mut send_budget,
+        )
+        .await
     }
 
     async fn list_available_models_for_context_with_budget(
         &self,
         mut ctx: CallContext,
+        request_kiro_version: &str,
         send_budget: &mut ModelDiscoverySendBudget,
     ) -> anyhow::Result<Vec<KiroAvailableModel>> {
-        let config = self.token_manager.runtime_config_snapshot();
+        let mut config = self
+            .token_manager
+            .runtime_config_snapshot()
+            .as_ref()
+            .clone();
+        config.pin_kiro_version_for_request(request_kiro_version.to_string());
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
         self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id, None)
             .await;
         let auxiliary_controller = self.token_manager.auxiliary_concurrency_controller();
         let _auxiliary_permit =
             auxiliary_controller.try_acquire(AuxiliaryConcurrencyKind::ModelDiscovery)?;
-        let endpoint = self.endpoint_for(&ctx.credentials)?;
+        let endpoints =
+            self.endpoint_candidates_for(&ctx.credentials, &config, EndpointOperation::Models)?;
+        let regions = auxiliary_region_candidates(
+            &config,
+            ctx.credentials.effective_api_region(&config),
+            resolve_models_profile_arn(&ctx.credentials, &config).as_deref(),
+        );
+        let route_candidates = regions
+            .into_iter()
+            .flat_map(|region| {
+                endpoints
+                    .iter()
+                    .cloned()
+                    .map(move |endpoint| (endpoint, region))
+            })
+            .collect::<Vec<_>>();
         let client = self.client_for(&ctx.credentials)?;
-        let rctx = RequestContext {
-            credentials: &ctx.credentials,
-            token: &ctx.token,
-            machine_id: &machine_id,
-            config: &config,
-            // 辅助通道（models / profile 发现）不参与 region 轮换。
-            region_override: None,
-        };
-
-        let mut all_models = Vec::new();
-        let mut next_token: Option<String> = None;
-        let mut seen_next_tokens = HashSet::new();
-        loop {
-            let url = endpoint.models_url(&rctx, next_token.as_deref());
-            let mut request = match endpoint.models_method(&rctx) {
-                Method::GET => client.get(&url),
-                Method::POST => client.post(&url),
-                method => client.request(method, &url),
+        for (route_index, (endpoint, region_override)) in route_candidates.iter().enumerate() {
+            let rctx = RequestContext {
+                credentials: &ctx.credentials,
+                token: &ctx.token,
+                machine_id: &machine_id,
+                config: &config,
+                region_override: *region_override,
             };
-            if let Some(body) = endpoint.models_body(&rctx, next_token.as_deref()) {
-                request = request.body(serde_json::to_vec(&body)?);
-            }
-            let request = endpoint.decorate_models(request, &rctx);
-            let request = request
-                .build()
-                .map_err(|_| anyhow::anyhow!("ListAvailableModels request_build_error"))?;
-            send_budget.reserve()?;
-            let response = execute_with_response_header_timeout(
-                &client,
-                request,
-                config.kiro_upstream_response_timeout_secs,
-            )
-            .await?;
-            let status = response.status();
-            let content_kind = Self::upstream_content_kind(&response);
-            let retry_after = Self::retry_after_duration(response.headers());
-            let body = Self::read_upstream_body_strict(
-                response,
-                config.kiro_upstream_response_timeout_secs,
-                PROVIDER_AUXILIARY_BODY_MAX_BYTES,
-            )
-            .await
-            .map_err(|failure| {
-                anyhow::anyhow!(Self::api_failure_diagnostic(
-                    failure.kind,
-                    status,
-                    failure.body_bytes,
-                    retry_after,
-                    Some(content_kind),
-                    Some("model_discovery_body"),
-                ))
-            })?;
-            if !status.is_success() {
-                anyhow::bail!(
-                    "ListAvailableModels failed: {}",
-                    Self::api_failure_diagnostic(
+            let mut all_models = Vec::new();
+            let mut next_token: Option<String> = None;
+            let mut seen_next_tokens = HashSet::new();
+            let endpoint_failure = loop {
+                let url = endpoint.models_url(&rctx, next_token.as_deref());
+                let mut request = match endpoint.models_method(&rctx) {
+                    Method::GET => client.get(&url),
+                    Method::POST => client.post(&url),
+                    method => client.request(method, &url),
+                };
+                if let Some(body) = endpoint.models_body(&rctx, next_token.as_deref()) {
+                    request = request.body(serde_json::to_vec(&body)?);
+                }
+                let request = endpoint.decorate_models(request, &rctx);
+                send_budget.reserve()?;
+                let send_index = send_budget.consumed.saturating_sub(1);
+                capture_upstream_request(
+                    None,
+                    "models",
+                    send_index,
+                    ctx.id,
+                    endpoint.name(),
+                    rctx.effective_api_region(),
+                    &config,
+                    &request,
+                );
+                let request = request
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("ListAvailableModels request_build_error"))?;
+                let response = match execute_with_response_header_timeout(
+                    &client,
+                    request,
+                    config.kiro_upstream_response_timeout_secs,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error)
+                        if route_index + 1 < route_candidates.len()
+                            && matches!(&error, HttpSendError::Request(request_error) if request_error.is_connect()) =>
+                    {
+                        break Some(format!(
+                            "ListAvailableModels connection failed on {} / {}",
+                            endpoint.name(),
+                            rctx.effective_api_region()
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                capture_upstream_response(
+                    None,
+                    "models",
+                    send_index,
+                    ctx.id,
+                    endpoint.name(),
+                    rctx.effective_api_region(),
+                    &config,
+                    &response,
+                    Duration::ZERO,
+                );
+                let status = response.status();
+                let content_kind = Self::upstream_content_kind(&response);
+                let retry_after = Self::retry_after_duration(response.headers());
+                let body = Self::read_upstream_body_strict(
+                    response,
+                    config.kiro_upstream_response_timeout_secs,
+                    PROVIDER_AUXILIARY_BODY_MAX_BYTES,
+                )
+                .await
+                .map_err(|failure| {
+                    anyhow::anyhow!(Self::api_failure_diagnostic(
+                        failure.kind,
+                        status,
+                        failure.body_bytes,
+                        retry_after,
+                        Some(content_kind),
+                        Some("model_discovery_body"),
+                    ))
+                })?;
+                if !status.is_success() {
+                    let diagnostic = Self::api_failure_diagnostic(
                         Self::classify_http_status_failure(status),
                         status,
                         Some(body.bytes),
                         retry_after,
                         Some(content_kind),
-                        Some("model_discovery")
-                    )
+                        Some("model_discovery"),
+                    );
+                    if route_index + 1 < route_candidates.len()
+                        && Self::gateway_response_allows_endpoint_fallback(
+                            status,
+                            &body.text,
+                            content_kind,
+                        )
+                    {
+                        break Some(diagnostic);
+                    }
+                    anyhow::bail!("ListAvailableModels failed: {diagnostic}");
+                }
+                let parsed: KiroAvailableModelsResponse = serde_json::from_str(&body.text)
+                    .map_err(|error| {
+                        let preview = body.text.chars().take(512).collect::<String>();
+                        anyhow::anyhow!(
+                            "ListAvailableModels protocol_error: {error}; body_preview={preview:?}"
+                        )
+                    })?;
+                all_models.extend(
+                    parsed
+                        .models
+                        .into_iter()
+                        .filter(|model| !model.model_id.trim().is_empty()),
                 );
-            }
-            let parsed: KiroAvailableModelsResponse = serde_json::from_str(&body.text)
-                .map_err(|_| anyhow::anyhow!("ListAvailableModels protocol_error"))?;
-            all_models.extend(
-                parsed
-                    .models
-                    .into_iter()
-                    .filter(|model| !model.model_id.trim().is_empty()),
-            );
-            next_token = parsed
-                .next_token
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty());
-            let Some(token) = next_token.as_ref() else {
-                break;
+                next_token = parsed
+                    .next_token
+                    .map(|token| token.trim().to_string())
+                    .filter(|token| !token.is_empty());
+                let Some(token) = next_token.as_ref() else {
+                    return Ok(all_models);
+                };
+                if !seen_next_tokens.insert(token.clone()) {
+                    anyhow::bail!("ListAvailableModels protocol_error: repeated pagination token");
+                }
             };
-            if !seen_next_tokens.insert(token.clone()) {
-                anyhow::bail!("ListAvailableModels protocol_error: repeated pagination token");
-            }
+            tracing::warn!(
+                credential_id = ctx.id,
+                endpoint = endpoint.name(),
+                region = rctx.effective_api_region(),
+                next_endpoint = route_candidates[route_index + 1].0.name(),
+                next_region = route_candidates[route_index + 1]
+                    .1
+                    .unwrap_or(ctx.credentials.effective_api_region(&config)),
+                "ListAvailableModels route failed; retrying the complete catalog on the next endpoint/Region: {endpoint_failure:?}"
+            );
         }
 
-        Ok(all_models)
+        anyhow::bail!("ListAvailableModels endpoint candidates exhausted")
     }
 
     /// 发送流式 API 请求
@@ -12487,6 +14073,203 @@ impl KiroProvider {
         }
     }
 
+    // 同账号 route 循环共享调用方的预算、归因和尝试记录，拆成结构体只会多一层转发。
+    #[allow(clippy::too_many_arguments)]
+    async fn send_mcp_with_endpoint_fallback(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        ctx: &CallContext,
+        machine_id: &str,
+        config: &Config,
+        client: &Client,
+        routes: &[(Arc<dyn KiroEndpoint>, Option<&'static str>)],
+        budget: &InferenceAttemptBudget,
+        attribution_sink: &McpCallAttributionSink,
+        attempts: &mut Vec<KiroCredentialAttempt>,
+        credential_label: &str,
+        attempt_started_at: Instant,
+    ) -> McpEndpointSendOutcome {
+        for (route_index, (endpoint, region_override)) in routes.iter().enumerate() {
+            let rctx = RequestContext {
+                credentials: &ctx.credentials,
+                token: &ctx.token,
+                machine_id,
+                config,
+                region_override: *region_override,
+            };
+            let url = endpoint.mcp_url(&rctx);
+            let body = crate::http_client::maybe_compress_json_whitespace(
+                endpoint.transform_mcp_body(request_body, &rctx),
+                config.compression.enabled && config.compression.whitespace_compression,
+            );
+            let base = client
+                .post(&url)
+                .body(body)
+                .header("content-type", endpoint.mcp_content_type())
+                .header("Connection", "close");
+            let request = endpoint.decorate_mcp(base, &rctx);
+            let physical_attempt = match budget.reserve(InferenceAttemptKind::Mcp, 0) {
+                Ok(sequence) => sequence.saturating_sub(1) as usize,
+                Err(rejection) => return McpEndpointSendOutcome::BudgetRejected(rejection),
+            };
+            capture_upstream_request(
+                request_id,
+                "mcp",
+                physical_attempt,
+                ctx.id,
+                endpoint.name(),
+                rctx.effective_api_region(),
+                config,
+                &request,
+            );
+            attribution_sink.begin_send(physical_attempt, ctx.id, credential_label);
+
+            let request = match request.build() {
+                Ok(request) => request,
+                Err(error) => {
+                    return McpEndpointSendOutcome::TransportFailure {
+                        error: HttpSendError::Request(error),
+                        physical_attempt,
+                    };
+                }
+            };
+            let upstream_header_started_at = Instant::now();
+            let response = execute_with_response_header_timeout(
+                client,
+                request,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await;
+            budget.record_upstream_header_wait(upstream_header_started_at.elapsed());
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if route_index + 1 < routes.len()
+                        && matches!(&error, HttpSendError::Request(request_error) if request_error.is_connect()) =>
+                {
+                    Self::push_mcp_attempt(
+                        attribution_sink,
+                        attempts,
+                        physical_attempt,
+                        ctx.id,
+                        credential_label,
+                        None,
+                        "retry",
+                        Some("mcp_endpoint_connect_failure"),
+                        Some(format!("endpoint={}", endpoint.name())),
+                        attempt_started_at,
+                        None,
+                    );
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        endpoint = endpoint.name(),
+                        next_endpoint = routes[route_index + 1].0.name(),
+                        next_region = routes[route_index + 1]
+                            .1
+                            .unwrap_or(ctx.credentials.effective_api_region(config)),
+                        "MCP connection failed before reaching the route; trying the next endpoint/Region"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return McpEndpointSendOutcome::TransportFailure {
+                        error,
+                        physical_attempt,
+                    };
+                }
+            };
+
+            capture_upstream_response(
+                request_id,
+                "mcp",
+                physical_attempt,
+                ctx.id,
+                endpoint.name(),
+                rctx.effective_api_region(),
+                config,
+                &response,
+                upstream_header_started_at.elapsed(),
+            );
+            let status = response.status();
+            if !status.is_success() && matches!(status.as_u16(), 502 | 504) {
+                let content_kind = Self::upstream_content_kind(&response);
+                let response_body = response_text_with_limit_and_body_timeout(
+                    response,
+                    config.kiro_upstream_response_timeout_secs,
+                    PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
+                )
+                .await;
+                if crate::diagnostics::capture::is_active()
+                    && let Ok(body) = &response_body
+                {
+                    capture_upstream_error_body(
+                        request_id,
+                        "mcp",
+                        physical_attempt,
+                        ctx.id,
+                        endpoint.name(),
+                        rctx.effective_api_region(),
+                        config,
+                        status,
+                        &ApiUpstreamBody {
+                            text: body.clone(),
+                            bytes: body.len(),
+                        },
+                    );
+                }
+                if let (Ok(body), true) = (&response_body, route_index + 1 < routes.len())
+                    && Self::gateway_response_allows_endpoint_fallback(status, body, content_kind)
+                {
+                    Self::push_mcp_attempt(
+                        attribution_sink,
+                        attempts,
+                        physical_attempt,
+                        ctx.id,
+                        credential_label,
+                        Some(status),
+                        "retry",
+                        Some("mcp_endpoint_gateway_failure"),
+                        Some(format!("endpoint={}", endpoint.name())),
+                        attempt_started_at,
+                        None,
+                    );
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        endpoint = endpoint.name(),
+                        next_endpoint = routes[route_index + 1].0.name(),
+                        next_region = routes[route_index + 1]
+                            .1
+                            .unwrap_or(ctx.credentials.effective_api_region(config)),
+                        upstream_status = status.as_u16(),
+                        response_body_bytes = body.len(),
+                        "MCP gateway response classified before endpoint/Region fallback"
+                    );
+                    continue;
+                }
+                return McpEndpointSendOutcome::Response {
+                    response: None,
+                    status,
+                    body: Some(response_body),
+                    endpoint: endpoint.clone(),
+                    region: rctx.effective_api_region().to_string(),
+                    physical_attempt,
+                };
+            }
+
+            return McpEndpointSendOutcome::Response {
+                response: Some(response),
+                status,
+                body: None,
+                endpoint: endpoint.clone(),
+                region: rctx.effective_api_region().to_string(),
+                physical_attempt,
+            };
+        }
+
+        unreachable!("endpoint candidate list always includes the primary endpoint")
+    }
+
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(
         &self,
@@ -12495,12 +14278,12 @@ impl KiroProvider {
         attribution_sink: Arc<McpCallAttributionSink>,
         request_id: Option<&str>,
     ) -> anyhow::Result<McpCallResponse> {
+        let mut request_config = self.token_manager.runtime_config();
+        request_config.snapshot_kiro_version_for_request();
+        let request_kiro_version = request_config.effective_kiro_version();
         let total_credentials = self.token_manager.total_count();
-        let max_retries = Self::max_retry_attempts(
-            total_credentials,
-            &self.token_manager.runtime_config_snapshot(),
-        )
-        .min(inference_attempt_budget.available_attempts(0) as usize);
+        let max_retries = Self::max_retry_attempts(total_credentials, &request_config)
+            .min(inference_attempt_budget.available_attempts(0) as usize);
         if max_retries == 0 {
             let snapshot = inference_attempt_budget.snapshot();
             let rejection = if snapshot.downstream_committed {
@@ -12525,7 +14308,7 @@ impl KiroProvider {
             let acquire_started_at = Instant::now();
             let acquire_result = self
                 .token_manager
-                .acquire_context_for_dispatch(
+                .acquire_context_for_dispatch_with_version(
                     None,
                     None,
                     &excluded_ids,
@@ -12537,6 +14320,7 @@ impl KiroProvider {
                     },
                     1,
                     Some(auxiliary_attempt_budget.clone()),
+                    Some(&request_kiro_version),
                 )
                 .await;
             inference_attempt_budget
@@ -12575,7 +14359,8 @@ impl KiroProvider {
             last_credential_id = Some(ctx.id);
             last_credential_label = Some(credential_label.clone());
 
-            let config = self.token_manager.runtime_config_snapshot();
+            let mut config = request_config.clone();
+            config.pin_kiro_version_for_request(request_kiro_version.clone());
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
             self.ensure_profile_arn_for_context(
                 &mut ctx,
@@ -12585,8 +14370,12 @@ impl KiroProvider {
             )
             .await;
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
+            let endpoints = match self.endpoint_candidates_for(
+                &ctx.credentials,
+                &config,
+                EndpointOperation::Mcp,
+            ) {
+                Ok(endpoints) => endpoints,
                 Err(e) => {
                     Self::push_mcp_attempt(
                         attribution_sink.as_ref(),
@@ -12620,20 +14409,20 @@ impl KiroProvider {
                 }
             };
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config: &config,
-                // MCP 通道不参与 region 轮换。
-                region_override: None,
-            };
-
-            let url = endpoint.mcp_url(&rctx);
-            let body = crate::http_client::maybe_compress_json_whitespace(
-                endpoint.transform_mcp_body(request_body, &rctx),
-                config.compression.enabled && config.compression.whitespace_compression,
+            let regions = auxiliary_region_candidates(
+                &config,
+                ctx.credentials.effective_api_region(&config),
+                resolve_mcp_profile_arn(&ctx.credentials, &config).as_deref(),
             );
+            let routes = regions
+                .into_iter()
+                .flat_map(|region| {
+                    endpoints
+                        .iter()
+                        .cloned()
+                        .map(move |endpoint| (endpoint, region))
+                })
+                .collect::<Vec<_>>();
 
             let client = match self.client_for(&ctx.credentials) {
                 Ok(client) => client,
@@ -12661,142 +14450,148 @@ impl KiroProvider {
                     ));
                 }
             };
-            let base = client
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let request = endpoint.decorate_mcp(base, &rctx);
-            capture_upstream_request(request_id, "mcp", attempt, ctx.id, &request);
 
-            if let Err(rejection) = inference_attempt_budget.reserve(InferenceAttemptKind::Mcp, 0) {
-                tracing::warn!(
-                    credential_id = ctx.id,
-                    credential_label = %credential_label,
-                    rejection = ?rejection,
-                    "shared inference attempt policy rejected MCP upstream send"
-                );
-                Self::push_attempt(
+            // This internal MCP caller sends WebSearch tools/call only; WebSearch is read-only,
+            // so an eligible gateway fallback may replay the same JSON-RPC id and body.
+            let outcome = self
+                .send_mcp_with_endpoint_fallback(
+                    request_body,
+                    request_id,
+                    &ctx,
+                    &machine_id,
+                    &config,
+                    &client,
+                    &routes,
+                    inference_attempt_budget,
+                    attribution_sink.as_ref(),
                     &mut attempts,
-                    attempt,
-                    ctx.id,
                     &credential_label,
-                    None,
-                    "fail",
-                    Some("mcp_attempt_limit"),
-                    Some("mcp_shared_attempt_limit".to_string()),
                     attempt_started_at,
-                    None,
-                );
-                self.finish_attempt(&mut ctx);
-                return Err(Self::mcp_failure_error_with_attribution(
-                    McpCallFailureKind::AttemptLimit,
-                    Self::inference_attempt_rejected_error(rejection, &attempts).to_string(),
-                    Some(ctx.id),
-                    Some(credential_label),
-                    attempts,
-                ));
-            }
-            attribution_sink.begin_send(attempt, ctx.id, &credential_label);
-
-            let upstream_header_started_at = Instant::now();
-            let response_result = send_with_response_header_timeout(
-                request,
-                config.kiro_upstream_response_timeout_secs,
-            )
-            .await;
-            inference_attempt_budget
-                .record_upstream_header_wait(upstream_header_started_at.elapsed());
-            let response = match response_result {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        "MCP 请求发送失败（{}，尝试 {}/{}）: {}",
-                        credential_context,
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    let failure_kind = match e {
-                        HttpSendError::ResponseHeaderTimeout { .. }
-                        | HttpSendError::ResponseBodyTimeout { .. } => McpCallFailureKind::Timeout,
-                        HttpSendError::Request(_) | HttpSendError::ResponseBodyTooLarge { .. } => {
-                            McpCallFailureKind::Upstream
+                )
+                .await;
+            let (response, status, preloaded_body, endpoint, endpoint_region, physical_attempt) =
+                match outcome {
+                    McpEndpointSendOutcome::BudgetRejected(rejection) => {
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            credential_label = %credential_label,
+                            rejection = ?rejection,
+                            "shared inference attempt policy rejected MCP upstream send"
+                        );
+                        Self::push_attempt(
+                            &mut attempts,
+                            attempt,
+                            ctx.id,
+                            &credential_label,
+                            None,
+                            "fail",
+                            Some("mcp_attempt_limit"),
+                            Some("mcp_shared_attempt_limit".to_string()),
+                            attempt_started_at,
+                            None,
+                        );
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::mcp_failure_error_with_attribution(
+                            McpCallFailureKind::AttemptLimit,
+                            Self::inference_attempt_rejected_error(rejection, &attempts)
+                                .to_string(),
+                            Some(ctx.id),
+                            Some(credential_label),
+                            attempts,
+                        ));
+                    }
+                    McpEndpointSendOutcome::TransportFailure {
+                        error: e,
+                        physical_attempt,
+                    } => {
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            credential_label = %credential_label,
+                            "MCP 请求发送失败（{}，尝试 {}/{}）: {}",
+                            credential_context,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        let failure_kind = match e {
+                            HttpSendError::ResponseHeaderTimeout { .. }
+                            | HttpSendError::ResponseBodyTimeout { .. } => {
+                                McpCallFailureKind::Timeout
+                            }
+                            HttpSendError::Request(_)
+                            | HttpSendError::ResponseBodyTooLarge { .. } => {
+                                McpCallFailureKind::Upstream
+                            }
+                        };
+                        Self::push_mcp_attempt(
+                            attribution_sink.as_ref(),
+                            &mut attempts,
+                            physical_attempt,
+                            ctx.id,
+                            &credential_label,
+                            None,
+                            if attempt + 1 < max_retries {
+                                "retry"
+                            } else {
+                                "fail"
+                            },
+                            Some(failure_kind.as_error_type()),
+                            Some(failure_kind.scheduler_reason().to_string()),
+                            attempt_started_at,
+                            None,
+                        );
+                        last_error = Some(Self::mcp_failure_error(
+                            failure_kind,
+                            format!("MCP 请求发送失败（{}）: {}", credential_context, e),
+                        ));
+                        let retry_target_available = self.maybe_exclude_after_transient_failure(
+                            None,
+                            ctx.id,
+                            &credential_label,
+                            &mut excluded_ids,
+                            true,
+                        );
+                        self.finish_attempt(&mut ctx);
+                        if attempt + 1 < max_retries && retry_target_available {
+                            sleep(Self::retry_delay(attempt)).await;
+                            continue;
                         }
-                    };
-                    Self::push_mcp_attempt(
-                        attribution_sink.as_ref(),
-                        &mut attempts,
-                        attempt,
-                        ctx.id,
-                        &credential_label,
-                        None,
-                        if attempt + 1 < max_retries {
-                            "retry"
-                        } else {
-                            "fail"
-                        },
-                        Some(failure_kind.as_error_type()),
-                        Some(failure_kind.scheduler_reason().to_string()),
-                        attempt_started_at,
-                        None,
-                    );
-                    last_error = Some(Self::mcp_failure_error(
-                        failure_kind,
-                        format!("MCP 请求发送失败（{}）: {}", credential_context, e),
-                    ));
-                    let retry_target_available = self.maybe_exclude_after_transient_failure(
-                        None,
-                        ctx.id,
-                        &credential_label,
-                        &mut excluded_ids,
-                        true,
-                    );
-                    self.finish_attempt(&mut ctx);
-                    if attempt + 1 < max_retries && retry_target_available {
-                        sleep(Self::retry_delay(attempt)).await;
-                        continue;
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                        }
+                        return Err(Self::mcp_failure_error_with_attribution(
+                            failure_kind,
+                            last_error
+                                .take()
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| {
+                                    format!("MCP 请求发送失败（{}）", credential_context)
+                                }),
+                            Some(ctx.id),
+                            Some(credential_label),
+                            attempts,
+                        ));
                     }
-                    if let Some(last) = attempts.last_mut() {
-                        last.action = "fail".to_string();
-                    }
-                    return Err(Self::mcp_failure_error_with_attribution(
-                        failure_kind,
-                        last_error
-                            .take()
-                            .map(|error| error.to_string())
-                            .unwrap_or_else(|| {
-                                format!("MCP 请求发送失败（{}）", credential_context)
-                            }),
-                        Some(ctx.id),
-                        Some(credential_label),
-                        attempts,
-                    ));
-                }
-            };
-
-            capture_upstream_response(
-                request_id,
-                "mcp",
-                attempt,
-                ctx.id,
-                &response,
-                upstream_header_started_at.elapsed(),
-            );
-            let status = response.status();
+                    McpEndpointSendOutcome::Response {
+                        response,
+                        status,
+                        body,
+                        endpoint,
+                        region,
+                        physical_attempt,
+                    } => (response, status, body, endpoint, region, physical_attempt),
+                };
             // 成功响应
             if status.is_success() {
                 return Ok(McpCallResponse {
-                    response,
+                    response: response.expect("successful MCP response is retained"),
                     completion: McpCallCompletion::new_with_attribution_sink(
                         self.token_manager.clone(),
                         ctx.id,
                         credential_label,
                         ctx.take_in_flight_lease(),
                         attempts,
-                        attempt,
+                        physical_attempt,
                         status,
                         attempt_started_at,
                         attribution_sink,
@@ -12805,13 +14600,18 @@ impl KiroProvider {
             }
 
             // 失败响应
-            let body = match response_text_with_limit_and_body_timeout(
-                response,
-                config.kiro_upstream_response_timeout_secs,
-                PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
-            )
-            .await
-            {
+            let body_result = match preloaded_body {
+                Some(body) => body,
+                None => {
+                    response_text_with_limit_and_body_timeout(
+                        response.expect("unconsumed MCP error response is retained"),
+                        config.kiro_upstream_response_timeout_secs,
+                        PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
+                    )
+                    .await
+                }
+            };
+            let body = match body_result {
                 Ok(body) => body,
                 Err(error) => {
                     let failure_kind = match status.as_u16() {
@@ -12895,6 +14695,22 @@ impl KiroProvider {
                 }
             };
             let response_body_bytes = body.len();
+            if crate::diagnostics::capture::is_active() {
+                capture_upstream_error_body(
+                    request_id,
+                    "mcp",
+                    physical_attempt,
+                    ctx.id,
+                    endpoint.name(),
+                    &endpoint_region,
+                    &config,
+                    status,
+                    &ApiUpstreamBody {
+                        text: body.clone(),
+                        bytes: response_body_bytes,
+                    },
+                );
+            }
 
             if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {
                 if Self::should_downgrade_rate_limit_risk_to_cooldown(
@@ -13138,58 +14954,6 @@ impl KiroProvider {
             // 400 Bad Request
             if status.as_u16() == 400 {
                 let bad_request_reason = Self::classify_bad_request_reason(&body);
-                if matches!(
-                    bad_request_reason,
-                    "request_body_invalid_bad_request" | "bad_request"
-                ) && self
-                    .token_manager
-                    .is_credential_account_quota_blocked(ctx.id)
-                {
-                    let has_available = self
-                        .token_manager
-                        .report_quota_exhausted_deferred_with_account_info_refresh(ctx.id);
-                    let can_retry = has_available && attempt + 1 < max_retries;
-                    Self::push_mcp_attempt(
-                        attribution_sink.as_ref(),
-                        &mut attempts,
-                        attempt,
-                        ctx.id,
-                        &credential_label,
-                        Some(status),
-                        if can_retry {
-                            "mcp_quota_snapshot_retry_next"
-                        } else {
-                            "mcp_quota_snapshot_fail"
-                        },
-                        Some("mcp_credential_quota_exhausted_400"),
-                        Some("credential_quota_exhausted_400".to_string()),
-                        attempt_started_at,
-                        None,
-                    );
-                    if can_retry {
-                        excluded_ids.insert(ctx.id);
-                        last_error = Some(Self::mcp_failure_error(
-                            McpCallFailureKind::InvalidRequest,
-                            format!(
-                                "MCP 请求失败（{}，账号额度快照已耗尽）: {}",
-                                credential_context, status
-                            ),
-                        ));
-                        self.finish_attempt(&mut ctx);
-                        continue;
-                    }
-                    self.finish_attempt(&mut ctx);
-                    return Err(Self::mcp_failure_error_with_attribution(
-                        McpCallFailureKind::InvalidRequest,
-                        format!(
-                            "MCP 请求失败（{}，账号额度快照已耗尽）: {}",
-                            credential_context, status
-                        ),
-                        Some(ctx.id),
-                        Some(credential_label),
-                        attempts,
-                    ));
-                }
                 Self::push_mcp_attempt(
                     attribution_sink.as_ref(),
                     &mut attempts,
@@ -13241,6 +15005,7 @@ impl KiroProvider {
                         &credential_label,
                         None,
                         None,
+                        &request_kiro_version,
                         auxiliary_attempt_budget.clone(),
                         &mut excluded_ids,
                         &mut automatic_recovery_attempted,
@@ -13511,16 +15276,15 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         // 请求开始时拍一次配置快照：热重载不得在同一请求中途改变轮换语义，
         // 否则轮换计划会前后不一致。
-        let berserk_plan = BerserkPlan::from_config(&self.token_manager.runtime_config_snapshot());
+        let initial_config = self.token_manager.runtime_config_snapshot();
+        let request_kiro_version = initial_config.effective_kiro_version();
+        let berserk_plan = BerserkPlan::from_config(&initial_config);
         let mut rotation_cursor = RotationCursor::new(&berserk_plan);
         // 仅在跨轮次推进时置位一次，用于在下一次重试前做轮次间隔退避。
         let mut berserk_round_delay: Option<Duration> = None;
-        let mut max_retries = Self::max_retry_attempts(
-            total_credentials,
-            &self.token_manager.runtime_config_snapshot(),
-        );
+        let mut max_retries = Self::max_retry_attempts(total_credentials, &initial_config);
         if let Some(berserk_budget) = berserk_plan.attempt_budget(total_credentials) {
-            // 狂暴模式接管尝试预算：账号数 × region数 × 轮数。
+            // 狂暴模式接管尝试预算：账号数 × 轮数。
             max_retries = max_retries.max(berserk_budget);
         }
         if let Some(max_sends) = max_sends {
@@ -13531,7 +15295,9 @@ impl KiroProvider {
             // 狂暴模式豁免请求级发送预算（默认 clamp 在 1..=10），否则 20 个账号
             // 根本轮不完就被静默截断。豁免后仍由 max_retries 硬封顶，且下游一旦
             // 提交就立即停止重试，不会重复吐字节。
-            if berserk_plan.active() {
+            if berserk_plan.active()
+                && let Some(budget) = inference_attempt_budget
+            {
                 // 仅放宽 max_retries 是不够的：每次发送前还要过 `budget.reserve`，
                 // 那里以预算自身的上限为准，狂暴模式会被静默截断在 10 次。
                 budget.raise_max_attempts_for_berserk(
@@ -13576,9 +15342,7 @@ impl KiroProvider {
             .map(InferenceAttemptBudget::auxiliary_budget)
             .unwrap_or_else(|| {
                 Arc::new(AuxiliaryAttemptBudget::new(
-                    self.token_manager
-                        .runtime_config_snapshot()
-                        .auxiliary_upstream_max_attempts,
+                    initial_config.auxiliary_upstream_max_attempts,
                 ))
             });
         let mut thinking_signature_retry_body_builder = thinking_signature_retry_body_builder;
@@ -13588,9 +15352,19 @@ impl KiroProvider {
         // `max_retries` 在循环中可能被调整（MODEL_TEMPORARILY_UNAVAILABLE 放宽换号次数、
         // 签名原地重试占用发送），因此用 while 每轮重新判断上限。
         let mut next_attempt: usize = 0;
+        let mut total_send_attempts: usize = 0;
         while next_attempt < max_retries {
             let attempt = next_attempt;
             next_attempt += 1;
+            if max_sends.is_some_and(|limit| total_send_attempts >= limit) {
+                tracing::debug!(
+                    request_id,
+                    total_send_attempts,
+                    max_sends = max_sends.unwrap_or_default(),
+                    "Kiro request reached its explicit physical send cap"
+                );
+                break;
+            }
             // 获取调用上下文（绑定 index、credentials、token）
             let acquire_started_at = Instant::now();
             // A stream retried before its first downstream event re-enters this loop with the
@@ -13605,7 +15379,7 @@ impl KiroProvider {
             };
             let acquire_result = self
                 .token_manager
-                .acquire_context_for_dispatch(
+                .acquire_context_for_dispatch_with_version(
                     model.as_deref(),
                     conversation_id.as_deref(),
                     &excluded_ids,
@@ -13613,6 +15387,7 @@ impl KiroProvider {
                     admission,
                     capacity_weight_units,
                     Some(auxiliary_attempt_budget.clone()),
+                    Some(&request_kiro_version),
                 )
                 .await;
             if let Some(budget) = inference_attempt_budget {
@@ -13649,15 +15424,11 @@ impl KiroProvider {
                 InFlightKind::Api
             });
             let credential_label = self.credential_log_label(ctx.id);
-            if let Some(budget) = inference_attempt_budget {
-                budget
-                    .attribution()
-                    .begin_send(attempt + 1, ctx.id, &credential_label);
-            }
             let credential_context = format!("账号 {}", credential_label);
             let attempt_started_at = Instant::now();
 
-            let config = self.token_manager.runtime_config_snapshot();
+            let mut config = initial_config.as_ref().clone();
+            config.pin_kiro_version_for_request(request_kiro_version.clone());
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
             self.ensure_profile_arn_for_context(
                 &mut ctx,
@@ -13667,8 +15438,8 @@ impl KiroProvider {
             )
             .await;
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
+            match self.endpoint_for(&ctx.credentials) {
+                Ok(_) => {}
                 Err(e) => {
                     let message = format!(
                         "{} API 凭据 endpoint 解析失败（{}）: {}",
@@ -13708,65 +15479,35 @@ impl KiroProvider {
             // 为主端点（对齐 kiro-rs-main）。关闭轮换时为 None，退回凭据自身的
             // 解析链，行为与引入轮换之前一致。
             let credential_region = ctx.credentials.effective_api_region(&config).to_string();
-            let attempt_region_override = berserk_plan
-                .region_at(&credential_region, rotation_cursor.region_index_for(ctx.id));
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config: &config,
-                region_override: attempt_region_override,
-            };
-
-            let url = endpoint.api_url(&rctx);
-            let body = crate::http_client::maybe_compress_json_whitespace(
-                endpoint.transform_api_body(
-                    refreshed_request_body.as_deref().unwrap_or(request_body),
-                    &rctx,
-                ),
-                config.compression.enabled && config.compression.whitespace_compression,
+            let profile_arn_for_region = resolve_streaming_profile_arn(&ctx.credentials, &config);
+            let region_index = rotation_cursor.region_index_for(ctx.id);
+            let attempt_region_override = berserk_plan.region_at_for_profile(
+                &credential_region,
+                profile_arn_for_region.as_deref(),
+                region_index,
             );
-            let body_weight = kiro_payload_weight(&body);
-            if should_log_upstream_body_size_at_info(body_weight, &config) {
-                tracing::info!(
-                    request_id,
-                    api_type,
-                    endpoint = endpoint.name(),
-                    credential_id = ctx.id,
-                    credential_label = %credential_label,
-                    attempt = attempt + 1,
-                    max_retries,
-                    upstream_body_bytes = body.len(),
-                    upstream_body_weight = body_weight,
-                    upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
-                    model = model.as_deref(),
-                    conversation_id = conversation_id.as_deref(),
-                    pre_endpoint_body_bytes = request_body.len(),
-                    compression_enabled = config.compression.enabled
-                        && config.compression.whitespace_compression,
-                    "Kiro upstream request body size"
+            if region_index > 0 && attempt_region_override.is_none() {
+                let blocked_region = berserk_plan
+                    .region_at(&credential_region, region_index)
+                    .unwrap_or("unknown");
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    None,
+                    "skip",
+                    Some("profile_arn_region_mismatch"),
+                    Some(format!(
+                        "备用 Region {blocked_region} 与 Profile ARN Region 不匹配，已跳过"
+                    )),
+                    attempt_started_at,
+                    model.as_deref(),
                 );
-            } else {
-                tracing::debug!(
-                    request_id,
-                    api_type,
-                    endpoint = endpoint.name(),
-                    credential_id = ctx.id,
-                    credential_label = %credential_label,
-                    attempt = attempt + 1,
-                    max_retries,
-                    upstream_body_bytes = body.len(),
-                    upstream_body_weight = body_weight,
-                    upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
-                    model = model.as_deref(),
-                    conversation_id = conversation_id.as_deref(),
-                    pre_endpoint_body_bytes = request_body.len(),
-                    compression_enabled = config.compression.enabled
-                        && config.compression.whitespace_compression,
-                    "Kiro upstream request body size"
-                );
+                excluded_ids.insert(ctx.id);
+                self.finish_attempt(&mut ctx);
+                continue;
             }
-
             let client = match self.client_for(&ctx.credentials) {
                 Ok(client) => client,
                 Err(e) => {
@@ -13791,40 +15532,294 @@ impl KiroProvider {
                     return Err(Self::traced_error(message, &attempts));
                 }
             };
-            let base = client
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let request = endpoint.decorate_api(base, &rctx);
-            capture_upstream_request(request_id, "api", attempt, ctx.id, &request);
-
-            if let Some(budget) = inference_attempt_budget {
-                if let Err(rejection) = budget.reserve(
-                    InferenceAttemptKind::LocalCredential,
-                    u32::from(preserve_external_attempt),
-                ) {
-                    tracing::warn!(
-                        request_id,
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        rejection = ?rejection,
-                        "shared inference attempt policy rejected local upstream send"
+            let endpoint_candidates = resolve_endpoint_candidates(
+                &ctx.credentials,
+                self.endpoints.values().map(Arc::as_ref),
+                &EndpointRoutingPlan::from_config(&config),
+                EndpointOperation::Inference,
+            );
+            let mut region_candidates = vec![attempt_region_override];
+            if berserk_plan.region_rotation_active() {
+                for candidate_index in 0..berserk_plan.region_slots() {
+                    let candidate = berserk_plan.region_at_for_profile(
+                        &credential_region,
+                        profile_arn_for_region.as_deref(),
+                        candidate_index,
                     );
-                    self.finish_attempt(&mut ctx);
-                    return Err(Self::inference_attempt_rejected_error(rejection, &attempts));
+                    if candidate.is_some() && !region_candidates.contains(&candidate) {
+                        region_candidates.push(candidate);
+                    }
                 }
             }
-
-            let upstream_header_started_at = Instant::now();
-            let response_result = send_with_response_header_timeout(
-                request,
-                config.kiro_upstream_response_timeout_secs,
-            )
-            .await;
-            if let Some(budget) = inference_attempt_budget {
-                budget.record_upstream_header_wait(upstream_header_started_at.elapsed());
+            let route_candidates = region_candidates
+                .into_iter()
+                .flat_map(|region| {
+                    endpoint_candidates
+                        .iter()
+                        .cloned()
+                        .map(move |endpoint| (endpoint, region))
+                })
+                .collect::<Vec<_>>();
+            if berserk_plan.active()
+                && let Some(budget) = inference_attempt_budget
+            {
+                // Berserk's outer loop counts credential attempts, while a host/Region
+                // fallback consumes additional physical sends for the same credential.
+                // Expand the shared budget by the actual route width so a valid fallback
+                // cannot be truncated at the credential-attempt limit.
+                budget.raise_max_attempts_for_berserk(
+                    max_retries
+                        .saturating_mul(route_candidates.len().max(1))
+                        .saturating_add(usize::from(preserve_external_attempt))
+                        .min(u32::MAX as usize) as u32,
+                );
             }
+            let mut route_index = 0usize;
+            let (response_result, endpoint, upstream_header_started_at, response_attempt) = loop {
+                let (endpoint_name, route_region_override) = &route_candidates[route_index];
+                let endpoint = self
+                    .endpoints
+                    .get(endpoint_name)
+                    .cloned()
+                    .expect("endpoint candidates only contain registered endpoints");
+                let rctx = RequestContext {
+                    credentials: &ctx.credentials,
+                    token: &ctx.token,
+                    machine_id: &machine_id,
+                    config: &config,
+                    region_override: *route_region_override,
+                };
+                let url = endpoint.api_url(&rctx);
+                let body = crate::http_client::maybe_compress_json_whitespace(
+                    endpoint.transform_api_body(
+                        refreshed_request_body.as_deref().unwrap_or(request_body),
+                        &rctx,
+                    ),
+                    config.compression.enabled && config.compression.whitespace_compression,
+                );
+                let body_weight = kiro_payload_weight(&body);
+                if should_log_upstream_body_size_at_info(body_weight, &config) {
+                    tracing::info!(
+                        request_id,
+                        api_type,
+                        endpoint = endpoint.name(),
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        attempt = total_send_attempts + 1,
+                        max_retries,
+                        upstream_body_bytes = body.len(),
+                        upstream_body_weight = body_weight,
+                        upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
+                        model = model.as_deref(),
+                        conversation_id = conversation_id.as_deref(),
+                        pre_endpoint_body_bytes = request_body.len(),
+                        compression_enabled = config.compression.enabled
+                            && config.compression.whitespace_compression,
+                        "Kiro upstream request body size"
+                    );
+                } else {
+                    tracing::debug!(
+                        request_id,
+                        api_type,
+                        endpoint = endpoint.name(),
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        attempt = total_send_attempts + 1,
+                        max_retries,
+                        upstream_body_bytes = body.len(),
+                        upstream_body_weight = body_weight,
+                        upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
+                        model = model.as_deref(),
+                        conversation_id = conversation_id.as_deref(),
+                        pre_endpoint_body_bytes = request_body.len(),
+                        compression_enabled = config.compression.enabled
+                            && config.compression.whitespace_compression,
+                        "Kiro upstream request body size"
+                    );
+                }
+                let base = client
+                    .post(&url)
+                    .body(body)
+                    .header("content-type", endpoint.content_type())
+                    .header("Connection", "close");
+                let request = endpoint.decorate_api(base, &rctx);
+                let current_send_attempt = total_send_attempts;
+                capture_upstream_request(
+                    request_id,
+                    "api",
+                    current_send_attempt,
+                    ctx.id,
+                    endpoint.name(),
+                    route_region_override.unwrap_or(&credential_region),
+                    &config,
+                    &request,
+                );
+
+                if let Some(budget) = inference_attempt_budget {
+                    if let Err(rejection) = budget.reserve(
+                        InferenceAttemptKind::LocalCredential,
+                        u32::from(preserve_external_attempt),
+                    ) {
+                        tracing::warn!(
+                            request_id,
+                            credential_id = ctx.id,
+                            credential_label = %credential_label,
+                            endpoint = endpoint.name(),
+                            rejection = ?rejection,
+                            "shared inference attempt policy rejected local upstream send"
+                        );
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::inference_attempt_rejected_error(rejection, &attempts));
+                    }
+                    budget.attribution().begin_send(
+                        current_send_attempt + 1,
+                        ctx.id,
+                        &credential_label,
+                    );
+                }
+                total_send_attempts = total_send_attempts.saturating_add(1);
+
+                let upstream_header_started_at = Instant::now();
+                let result = send_with_response_header_timeout(
+                    request,
+                    config.kiro_upstream_response_timeout_secs,
+                )
+                .await;
+                if let Some(budget) = inference_attempt_budget {
+                    budget.record_upstream_header_wait(upstream_header_started_at.elapsed());
+                }
+
+                let can_fallback = route_index + 1 < route_candidates.len()
+                    && max_sends.is_none_or(|limit| total_send_attempts < limit)
+                    && inference_attempt_budget
+                        .is_none_or(|budget| !budget.snapshot().downstream_committed);
+                match result {
+                    Err(error) if can_fallback => {
+                        let identity_source =
+                            refreshed_request_body.as_deref().unwrap_or(request_body);
+                        if let Some(refreshed) = refresh_kiro_request_identity(identity_source) {
+                            Self::push_attempt(
+                                &mut attempts,
+                                attempt,
+                                ctx.id,
+                                &credential_label,
+                                None,
+                                "retry",
+                                Some("endpoint_transport_failure"),
+                                Some(format!(
+                                    "endpoint {} / Region {} 传输失败，切换到 endpoint {} / Region {}: {}",
+                                    endpoint.name(),
+                                    route_region_override.unwrap_or(&credential_region),
+                                    route_candidates[route_index + 1].0,
+                                    route_candidates[route_index + 1]
+                                        .1
+                                        .unwrap_or(&credential_region),
+                                    Self::api_transport_failure_diagnostic(
+                                        Self::send_failure_kind(&error)
+                                    )
+                                )),
+                                attempt_started_at,
+                                model.as_deref(),
+                            );
+                            refreshed_request_body = Some(refreshed);
+                            tracing::warn!(
+                                request_id,
+                                credential_id = ctx.id,
+                                endpoint = endpoint.name(),
+                                region = route_region_override.unwrap_or(&credential_region),
+                                next_endpoint = route_candidates[route_index + 1].0,
+                                next_region = route_candidates[route_index + 1]
+                                    .1
+                                    .unwrap_or(&credential_region),
+                                cause = %crate::http_client::send_error_cause(&error),
+                                "Kiro route transport failure; retrying the same credential"
+                            );
+                            route_index += 1;
+                            continue;
+                        }
+                        break (
+                            Err(error),
+                            endpoint,
+                            upstream_header_started_at,
+                            current_send_attempt,
+                        );
+                    }
+                    Ok(response)
+                        if can_fallback
+                            // Kiro uses HTTP 500 for structured request/model errors, and 503
+                            // bodies may carry the same semantics. Keep both with the response
+                            // classifier; only the unambiguous gateway statuses enter route fallback.
+                            && matches!(response.status().as_u16(), 502 | 504) =>
+                    {
+                        let status = response.status();
+                        let identity_source =
+                            refreshed_request_body.as_deref().unwrap_or(request_body);
+                        if let Some(refreshed) = refresh_kiro_request_identity(identity_source) {
+                            capture_upstream_response(
+                                request_id,
+                                "api",
+                                current_send_attempt,
+                                ctx.id,
+                                endpoint.name(),
+                                route_region_override.unwrap_or(&credential_region),
+                                &config,
+                                &response,
+                                upstream_header_started_at.elapsed(),
+                            );
+                            Self::push_attempt(
+                                &mut attempts,
+                                attempt,
+                                ctx.id,
+                                &credential_label,
+                                Some(status),
+                                "retry",
+                                Some("endpoint_gateway_failure"),
+                                Some(format!(
+                                    "endpoint {} / Region {} 返回 HTTP {}，切换到 endpoint {} / Region {}",
+                                    endpoint.name(),
+                                    route_region_override.unwrap_or(&credential_region),
+                                    status.as_u16(),
+                                    route_candidates[route_index + 1].0,
+                                    route_candidates[route_index + 1]
+                                        .1
+                                        .unwrap_or(&credential_region)
+                                )),
+                                attempt_started_at,
+                                model.as_deref(),
+                            );
+                            refreshed_request_body = Some(refreshed);
+                            tracing::warn!(
+                                request_id,
+                                credential_id = ctx.id,
+                                endpoint = endpoint.name(),
+                                region = route_region_override.unwrap_or(&credential_region),
+                                next_endpoint = route_candidates[route_index + 1].0,
+                                next_region = route_candidates[route_index + 1]
+                                    .1
+                                    .unwrap_or(&credential_region),
+                                upstream_status = status.as_u16(),
+                                "Kiro route gateway failure; retrying the same credential"
+                            );
+                            route_index += 1;
+                            continue;
+                        }
+                        break (
+                            Ok(response),
+                            endpoint,
+                            upstream_header_started_at,
+                            current_send_attempt,
+                        );
+                    }
+                    result => {
+                        break (
+                            result,
+                            endpoint,
+                            upstream_header_started_at,
+                            current_send_attempt,
+                        );
+                    }
+                }
+            };
             let response = match response_result {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -13902,13 +15897,21 @@ impl KiroProvider {
                     );
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries && retry_target_available {
-                        Self::refresh_request_identity_for_retry(
+                        let identity_refreshed = Self::refresh_request_identity_for_retry(
                             &mut refreshed_request_body,
                             request_body,
                             request_id,
                         );
-                        sleep(Self::retry_delay(attempt)).await;
-                        continue;
+                        if identity_refreshed {
+                            sleep(Self::retry_delay(attempt)).await;
+                            continue;
+                        }
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("identity_refresh_failed".to_string());
+                            last.error_message =
+                                Some("无法生成新的 conversation identity，禁止重放".to_string());
+                        }
                     }
                     if let Some(last) = attempts.last_mut() {
                         last.action = "fail".to_string();
@@ -13921,8 +15924,13 @@ impl KiroProvider {
             capture_upstream_response(
                 request_id,
                 "api",
-                attempt,
+                response_attempt,
                 ctx.id,
+                endpoint.name(),
+                route_candidates[route_index]
+                    .1
+                    .unwrap_or(&credential_region),
+                &config,
                 &response,
                 upstream_header_started_at.elapsed(),
             );
@@ -13990,7 +15998,19 @@ impl KiroProvider {
             .await
             {
                 Ok(body) => {
-                    capture_upstream_error_body(request_id, "api", attempt, ctx.id, status, &body);
+                    capture_upstream_error_body(
+                        request_id,
+                        "api",
+                        attempt,
+                        ctx.id,
+                        endpoint.name(),
+                        route_candidates[route_index]
+                            .1
+                            .unwrap_or(&credential_region),
+                        &config,
+                        status,
+                        &body,
+                    );
                     body
                 }
                 Err(read_failure) => {
@@ -14078,14 +16098,22 @@ impl KiroProvider {
                     can_retry &= retry_target_available;
                     self.finish_attempt(&mut ctx);
                     if can_retry {
-                        Self::refresh_request_identity_for_retry(
+                        let identity_refreshed = Self::refresh_request_identity_for_retry(
                             &mut refreshed_request_body,
                             request_body,
                             request_id,
                         );
-                        last_error = Some(anyhow::anyhow!(message));
-                        sleep(Self::retry_delay(attempt)).await;
-                        continue;
+                        if identity_refreshed {
+                            last_error = Some(anyhow::anyhow!(message));
+                            sleep(Self::retry_delay(attempt)).await;
+                            continue;
+                        }
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("identity_refresh_failed".to_string());
+                            last.error_message =
+                                Some("无法生成新的 conversation identity，禁止重放".to_string());
+                        }
                     }
                     if let Some(last) = attempts.last_mut() {
                         last.action = "fail".to_string();
@@ -14553,7 +16581,7 @@ impl KiroProvider {
                 // here: it may have been reduced by `preserve_external_attempt`, while this
                 // terminal compatibility retry deliberately reserves with `preserve=0` and
                 // cannot subsequently fall back to the external pool.
-                if max_sends.is_some_and(|limit| attempt.saturating_add(1) >= limit) {
+                if max_sends.is_some_and(|limit| total_send_attempts >= limit) {
                     if let Some(last) = attempts.last_mut() {
                         last.action = "thinking_signature_retry_send_limit_rejected".to_string();
                     }
@@ -14683,6 +16711,7 @@ impl KiroProvider {
                         ));
                     }
                 }
+                total_send_attempts = total_send_attempts.saturating_add(1);
 
                 let retry_started_at = Instant::now();
                 let retry_rctx = RequestContext {
@@ -14699,7 +16728,7 @@ impl KiroProvider {
                     config.compression.enabled && config.compression.whitespace_compression,
                 );
                 let retry_base = client
-                    .post(&url)
+                    .post(endpoint.api_url(&retry_rctx))
                     .body(retry_upstream_body)
                     .header("content-type", endpoint.content_type())
                     .header("Connection", "close");
@@ -14709,6 +16738,9 @@ impl KiroProvider {
                     "thinking_signature_retry",
                     attempt,
                     ctx.id,
+                    endpoint.name(),
+                    attempt_region_override.unwrap_or(&credential_region),
+                    &config,
                     &retry_request,
                 );
                 let upstream_header_started_at = Instant::now();
@@ -14760,6 +16792,9 @@ impl KiroProvider {
                     "thinking_signature_retry",
                     attempt,
                     ctx.id,
+                    endpoint.name(),
+                    attempt_region_override.unwrap_or(&credential_region),
+                    &config,
                     &retry_response,
                     upstream_header_started_at.elapsed(),
                 );
@@ -14821,6 +16856,9 @@ impl KiroProvider {
                             "thinking_signature_retry",
                             attempt,
                             ctx.id,
+                            endpoint.name(),
+                            attempt_region_override.unwrap_or(&credential_region),
+                            &config,
                             retry_status,
                             &body,
                         );
@@ -15002,10 +17040,10 @@ impl KiroProvider {
                             max_sends,
                         );
                     }
-                    let can_retry = attempt + 1 < max_retries;
+                    let mut can_retry = attempt + 1 < max_retries;
                     if can_retry {
                         refreshed_request_body = Some(retry_body.clone());
-                        Self::refresh_request_identity_for_retry(
+                        can_retry = Self::refresh_request_identity_for_retry(
                             &mut refreshed_request_body,
                             &retry_body,
                             request_id,
@@ -15544,6 +17582,7 @@ impl KiroProvider {
                         &credential_label,
                         model.as_deref(),
                         conversation_id.as_deref(),
+                        &request_kiro_version,
                         auxiliary_attempt_budget.clone(),
                         &mut excluded_ids,
                         &mut automatic_recovery_attempted,
@@ -15766,7 +17805,7 @@ impl KiroProvider {
                 // shows the same "Improperly formed request" on every resend with the same ids
                 // (169 of 169 in 24h), so every transient retry gets a fresh identity.
                 if can_retry {
-                    Self::refresh_request_identity_for_retry(
+                    can_retry = Self::refresh_request_identity_for_retry(
                         &mut refreshed_request_body,
                         request_body,
                         request_id,
@@ -15846,31 +17885,16 @@ impl KiroProvider {
                     &mut excluded_ids,
                     acquire_mode.waits_for_capacity(),
                 );
-                // 优先换号：仅当本轮所有账号都已被排除（无可用备选）时，
-                // 才推进到下一个 region，再不行才推进到下一轮。
+                // 429 是账号级限流：先换账号，账号池耗尽后进入下一轮，保留主 Region。
                 if berserk_applies && !retry_target_available && attempt + 1 < max_retries {
                     match rotation_cursor.advance_after_accounts_exhausted(&berserk_plan) {
-                        RotationStep::NextRegion { region_index } => {
-                            tracing::warn!(
-                                credential_id = ctx.id,
-                                credential_label = %credential_label,
-                                round = rotation_cursor.round(),
-                                region_index,
-                                region = berserk_plan
-                                    .region_at(&credential_region, region_index)
-                                    .unwrap_or("default"),
-                                "狂暴模式：本轮账号已全部 429，切换上游 region 并重新轮换全部账号"
-                            );
-                            excluded_ids.clear();
-                            retry_target_available = true;
-                        }
                         RotationStep::NextRound { round, delay } => {
                             tracing::warn!(
                                 credential_id = ctx.id,
                                 credential_label = %credential_label,
                                 round,
                                 round_delay_ms = delay.as_millis() as u64,
-                                "狂暴模式：全部 region 已轮换一遍，进入下一轮重试"
+                                "狂暴模式：账号池全部 429，进入下一轮账号重试"
                             );
                             excluded_ids.clear();
                             retry_target_available = true;
@@ -15881,25 +17905,10 @@ impl KiroProvider {
                                 credential_id = ctx.id,
                                 credential_label = %credential_label,
                                 round = rotation_cursor.round(),
-                                "狂暴模式：账号 × region × 轮次已全部耗尽，放弃重试"
+                                "狂暴模式：账号 × 轮次已全部耗尽，放弃重试"
                             );
                         }
                     }
-                } else if !berserk_applies
-                    && berserk_plan.region_rotation_active()
-                    && retry_target_available
-                {
-                    // 普通模式下的 region 轮换：不改变账号故障转移语义，
-                    // 只让下一次重试打到另一个上游地址。
-                    let region_index = rotation_cursor.advance_region_for_normal_retry(ctx.id);
-                    tracing::debug!(
-                        credential_id = ctx.id,
-                        region_index,
-                        region = berserk_plan
-                            .region_at(&credential_region, region_index)
-                            .unwrap_or("default"),
-                        "普通模式：瞬态失败后切换上游 region 重试"
-                    );
                 }
                 can_retry &= retry_target_available;
                 self.finish_attempt(&mut ctx);
@@ -16032,7 +18041,7 @@ impl KiroProvider {
         refreshed: &mut Option<String>,
         original: &str,
         request_id: Option<&str>,
-    ) {
+    ) -> bool {
         let current = refreshed.as_deref().unwrap_or(original);
         match refresh_kiro_request_identity(current) {
             Some(body) => {
@@ -16041,11 +18050,15 @@ impl KiroProvider {
                     "Kiro retry after an upstream-side failure uses a fresh conversation identity"
                 );
                 *refreshed = Some(body);
+                true
             }
-            None => tracing::warn!(
-                request_id,
-                "Kiro retry could not refresh the conversation identity; resending unchanged"
-            ),
+            None => {
+                tracing::warn!(
+                    request_id,
+                    "Kiro retry could not refresh the conversation identity; retry is blocked"
+                );
+                false
+            }
         }
     }
 

@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   addCredential,
+  applyKiroClientVersion,
   batchUpdateCredentials,
   batchDeleteCredentials,
   clearCredentialInFlight,
+  checkKiroClientVersion,
   createProxyResource,
   deleteCredential,
   deleteDisabledCredentials,
@@ -23,6 +25,7 @@ import {
   getLoadBalancingMode,
   getProxyResources,
   importProxyResources,
+  pinKiroClientVersion,
   getPromptInjectionCatalog,
   getRuntimeConfig,
   previewPromptInjection,
@@ -30,6 +33,7 @@ import {
   getPublicPoolConfig,
   setPublicPoolConfig,
   resetCredentialFailure,
+  rollbackKiroClientVersion,
   setCredentialDisabled,
   setCredentialConcurrency,
   setCredentialOverage,
@@ -475,6 +479,30 @@ export function useRuntimeConfig() {
   return useQuery({
     queryKey: ['runtime-config'],
     queryFn: getRuntimeConfig,
+  })
+}
+
+export function useCheckKiroClientVersion() {
+  return useMutation({
+    mutationFn: checkKiroClientVersion,
+  })
+}
+
+export function useApplyKiroClientVersion() {
+  return useMutation({
+    mutationFn: (version?: string) => applyKiroClientVersion(version),
+  })
+}
+
+export function usePinKiroClientVersion() {
+  return useMutation({
+    mutationFn: pinKiroClientVersion,
+  })
+}
+
+export function useRollbackKiroClientVersion() {
+  return useMutation({
+    mutationFn: rollbackKiroClientVersion,
   })
 }
 

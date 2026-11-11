@@ -2166,6 +2166,20 @@ export interface TokenRefreshAdmissionRuntime {
   remainingMilliTokens: number
 }
 
+export type KiroVersionActiveSource = 'configured' | 'applied' | 'pinned' | string
+
+export interface KiroVersionLifecycleSnapshot {
+  configuredVersion: string
+  activeVersion: string
+  activeSource: KiroVersionActiveSource
+  previousVersion?: string | null
+  candidateVersion?: string | null
+  checkedAt?: string | null
+  lastError?: string | null
+  generation: number
+  autoSyncEnabled: boolean
+}
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -2202,6 +2216,7 @@ export interface RuntimeConfig {
   kiroVersionAutoSyncEnabled: boolean
   /** 最近一次自动同步读到的官方版本。 */
   kiroVersionLatest?: string
+  kiroVersionLifecycle: KiroVersionLifecycleSnapshot
   /** IDE 端点的对话和联网搜索改走 runtime.{region}.kiro.dev（默认关闭）。 */
   kiroRuntimeDomainEnabled: boolean
   credentialProtocolErrorCooldownSecs: number
@@ -2238,6 +2253,9 @@ export interface RuntimeConfig {
   credentialPromptLogicRetryEnabled: boolean
   credentialPromptLogicRetryMaxAttempts: number
   kiroUpstreamRegionRotationEnabled: boolean
+  kiroRegionProfileArnMismatchAllowed: boolean
+  kiroEndpointFallbackEnabled: boolean
+  kiroEndpointFallbackOrder: string[]
   localBerserkModeEnabled: boolean
   localBerserkMaxRounds: number
   localBerserkRoundDelayMs: number
@@ -2306,7 +2324,7 @@ export interface RuntimeConfig {
   auditLogRetentionDays: number
 }
 
-export type UpdateRuntimeConfigRequest = RuntimeConfig
+export type UpdateRuntimeConfigRequest = Omit<RuntimeConfig, 'kiroVersionLatest' | 'kiroVersionLifecycle'>
 
 export interface AccessKeysResponse {
   requestApiKey: string

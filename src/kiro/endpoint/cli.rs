@@ -11,12 +11,14 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    KiroEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
-    configured_upstream_url, contains_json_object_key,
-    normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
+    EndpointAuthKind, EndpointOperation, KiroEndpoint, RequestContext,
+    body_may_need_output_config_thinking_normalization, configured_upstream_url,
+    contains_json_object_key, normalize_output_config_thinking_compatibility_json,
+    serialize_json_with_capacity,
 };
 use crate::kiro::protocol::{
-    is_external_idp_credentials, resolve_profile_arn, resolve_streaming_profile_arn,
+    is_external_idp_credentials, resolve_mcp_profile_arn, resolve_models_profile_arn,
+    resolve_streaming_profile_arn,
 };
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
@@ -95,6 +97,14 @@ impl KiroEndpoint for CliEndpoint {
         CLI_ENDPOINT_NAME
     }
 
+    fn supports_auth_kind(&self, auth_kind: EndpointAuthKind) -> bool {
+        matches!(auth_kind, EndpointAuthKind::ApiKey)
+    }
+
+    fn supports_operation(&self, _operation: EndpointOperation) -> bool {
+        true
+    }
+
     fn content_type(&self) -> &'static str {
         "application/x-amz-json-1.0"
     }
@@ -111,7 +121,7 @@ impl KiroEndpoint for CliEndpoint {
 
     fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String {
         let mut params = vec!["origin=KIRO_CLI".to_string()];
-        if let Some(profile_arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
+        if let Some(profile_arn) = resolve_models_profile_arn(ctx.credentials, ctx.config) {
             params.push(format!("profileArn={}", urlencoding::encode(&profile_arn)));
         }
         if let Some(next_token) = next_token {
@@ -133,7 +143,7 @@ impl KiroEndpoint for CliEndpoint {
     ) -> Option<serde_json::Value> {
         let mut body = serde_json::Map::new();
         body.insert("origin".to_string(), json!("KIRO_CLI"));
-        if let Some(profile_arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
+        if let Some(profile_arn) = resolve_models_profile_arn(ctx.credentials, ctx.config) {
             body.insert("profileArn".to_string(), json!(profile_arn));
         }
         if let Some(next_token) = next_token {
@@ -174,7 +184,7 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
+        if let Some(arn) = resolve_mcp_profile_arn(ctx.credentials, ctx.config) {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -202,7 +212,7 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
+        if let Some(arn) = resolve_models_profile_arn(ctx.credentials, ctx.config) {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -386,6 +396,9 @@ mod tests {
         let credentials = KiroCredentials {
             auth_method: Some("api_key".to_string()),
             kiro_api_key: Some("ksk_fake_lifecycle".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-west-3:123456789012:profile/STALE".to_string(),
+            ),
             api_region: Some("eu-west-3".to_string()),
             ..Default::default()
         };
@@ -402,6 +415,29 @@ mod tests {
         assert_eq!(
             endpoint.models_url(&rctx, None),
             "http://127.0.0.1:39091/aws-lifecycle/?origin=KIRO_CLI"
+        );
+
+        let mcp = endpoint
+            .decorate_mcp(
+                reqwest::Client::new()
+                    .post(endpoint.mcp_url(&rctx))
+                    .header("content-type", endpoint.mcp_content_type()),
+                &rctx,
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            mcp.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(mcp.headers().get("x-amzn-kiro-profile-arn").is_none());
+        assert_eq!(
+            mcp.headers()
+                .get("tokentype")
+                .and_then(|value| value.to_str().ok()),
+            Some("API_KEY")
         );
 
         let api = endpoint
@@ -836,5 +872,93 @@ mod tests {
             headers.get("host").and_then(|v| v.to_str().ok()),
             Some("runtime.us-east-1.kiro.dev")
         );
+    }
+
+    #[test]
+    fn cli_mcp_decorator_applies_idc_and_external_idp_profile_rules() {
+        let endpoint = CliEndpoint::new();
+        let config = Config::default();
+        let real_arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL";
+        let cases = [
+            (
+                "aws sso iam",
+                KiroCredentials {
+                    auth_method: Some("iam".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+                None,
+            ),
+            (
+                "builder idc",
+                KiroCredentials {
+                    auth_method: Some("idc".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+                None,
+            ),
+            (
+                "external idp without profile",
+                KiroCredentials {
+                    auth_method: Some("external_idp".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    ..Default::default()
+                },
+                None,
+                Some("EXTERNAL_IDP"),
+            ),
+            (
+                "external idp with real profile",
+                KiroCredentials {
+                    auth_method: Some("external_idp".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    profile_arn: Some(real_arn.to_string()),
+                    ..Default::default()
+                },
+                Some(real_arn),
+                Some("EXTERNAL_IDP"),
+            ),
+        ];
+
+        for (label, credentials, expected_arn, expected_token_type) in cases {
+            let context = ctx(&credentials, &config, "token");
+            let request = endpoint
+                .decorate_mcp(
+                    reqwest::Client::new()
+                        .post(endpoint.mcp_url(&context))
+                        .header("content-type", endpoint.mcp_content_type()),
+                    &context,
+                )
+                .build()
+                .unwrap();
+            let headers = request.headers();
+
+            assert_eq!(
+                headers
+                    .get("x-amzn-kiro-profile-arn")
+                    .and_then(|value| value.to_str().ok()),
+                expected_arn,
+                "unexpected Profile ARN for {label}"
+            );
+            assert_eq!(
+                headers
+                    .get("tokenType")
+                    .and_then(|value| value.to_str().ok()),
+                expected_token_type,
+                "unexpected TokenType for {label}"
+            );
+            assert_eq!(
+                headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "MCP JSON-RPC must use application/json for {label}"
+            );
+        }
     }
 }

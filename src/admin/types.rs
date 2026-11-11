@@ -1915,6 +1915,7 @@ pub struct RuntimeConfigResponse {
     /// 最近一次自动同步读到的官方版本；未开启或尚未读到时为空。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_version_latest: Option<String>,
+    pub kiro_version_lifecycle: crate::kiro::kiro_version::LifecycleSnapshot,
     pub kiro_runtime_domain_enabled: bool,
     pub credential_protocol_error_cooldown_secs: u64,
     pub credential_auth_error_cooldown_secs: u64,
@@ -1950,6 +1951,9 @@ pub struct RuntimeConfigResponse {
     pub credential_prompt_logic_retry_enabled: bool,
     pub credential_prompt_logic_retry_max_attempts: u32,
     pub kiro_upstream_region_rotation_enabled: bool,
+    pub kiro_region_profile_arn_mismatch_allowed: bool,
+    pub kiro_endpoint_fallback_enabled: bool,
+    pub kiro_endpoint_fallback_order: Vec<String>,
     pub local_berserk_mode_enabled: bool,
     pub local_berserk_max_rounds: u32,
     pub local_berserk_round_delay_ms: u64,
@@ -2171,6 +2175,12 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub kiro_upstream_region_rotation_enabled: Option<bool>,
     #[serde(default)]
+    pub kiro_region_profile_arn_mismatch_allowed: Option<bool>,
+    #[serde(default)]
+    pub kiro_endpoint_fallback_enabled: Option<bool>,
+    #[serde(default)]
+    pub kiro_endpoint_fallback_order: Option<Vec<String>>,
+    #[serde(default)]
     pub local_berserk_mode_enabled: Option<bool>,
     #[serde(default)]
     pub local_berserk_max_rounds: Option<u32>,
@@ -2306,6 +2316,19 @@ pub struct UpdateRuntimeConfigRequest {
     pub audit_log_retention_enabled: Option<bool>,
     #[serde(default)]
     pub audit_log_retention_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KiroVersionApplyRequest {
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KiroVersionPinRequest {
+    pub version: String,
 }
 
 impl UpdateRuntimeConfigRequest {

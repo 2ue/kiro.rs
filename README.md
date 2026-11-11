@@ -242,6 +242,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
 | `kiroVersion` | string | `0.11.107` | Kiro 版本号 |
+| `kiroVersionAutoSyncEnabled` | boolean | `false` | 每 12 小时检查官方客户端版本并更新 candidate；不会自动应用。后台检查开关关闭后，已显式应用或固定的版本不会回退。通过管理后台可立即检查、应用 candidate、固定版本或回退到 previous。active 状态单独保存在 PgSQL，并通过 Redis 通知其他实例。 |
 | `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.22.0` | Node.js 版本标识 |
@@ -319,7 +320,11 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `reportedUsage.*.finalOutputJitterMaxTokens` | number | `12000` | 最终输出上限的确定性扣减上限，避免稳定撞到模型或展示硬上限 |
 | `usageRecordLimit` | number | `5000` | 内存中保留的最近 usage 记录数量；完整 usage 记录写入 PgSQL |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
-| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide`、`cli` |
+| `defaultEndpoint` | string | `ide` | 默认协议端点。凭据未显式指定 `endpoint` 时使用。内置端点：`ide`、`cli`、`codewhisperer`、`amazonq`、`runtime`。 |
+| `kiroEndpointFallbackEnabled` | boolean | `false` | 允许推理请求在同一个账号内切换到备用协议端点。仅传输错误和 HTTP 502/503/504 可触发；候选必须支持该凭据认证类型。API Key 账号仍走 `cli`，不会跨到 OAuth 协议。 |
+| `kiroEndpointFallbackOrder` | string[] | `codewhisperer, amazonq, runtime` | 同账号协议端点 fallback 顺序。primary 仍按凭据 `endpoint` 优先、再按 `defaultEndpoint` 解析；默认关闭 fallback 时该列表不生效。 |
+| `kiroUpstreamRegionRotationEnabled` | boolean | `false` | 推理请求遇瞬态错误时，可在内置 `us-east-1` / `eu-central-1` Region 候选间重试；与协议端点 fallback 分开控制。 |
+| `kiroRegionProfileArnMismatchAllowed` | boolean | `false` | 允许带 Profile ARN 的账号跨到 ARN 所属 Region 以外的备用 Region。关闭时会跳过不匹配的备用 Region；没有 Profile ARN 的账号不受此项阻止。 |
 | `exposeProxyWarnings` | boolean | `false` | 是否通过 `x-kiro-rs-warnings` 暴露代理侧兜底改写。`anthropic-strict` 下会强制关闭 |
 
 最小配置示例：

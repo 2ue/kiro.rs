@@ -1320,11 +1320,30 @@ impl PostgresStore {
                 let mut config = file_config.clone();
                 config.set_request_api_keys(file_config.request_api_keys());
                 config.apply_runtime_config_migrations();
+                if config.legacy_auto_sync_migration_pending() {
+                    let legacy_version_state = crate::kiro::kiro_version::VersionState {
+                        legacy_auto_sync_pending: true,
+                        ..Default::default()
+                    };
+                    self.initialize_kiro_version_state_if_absent(&legacy_version_state)
+                        .await?;
+                    config.clear_legacy_auto_sync_migration_marker();
+                }
                 self.save_runtime_config(&config).await?;
             }
             Some(mut config) => {
                 let mut changed = config.fill_missing_access_keys_from(file_config);
                 changed |= config.apply_runtime_config_migrations();
+                if config.legacy_auto_sync_migration_pending() {
+                    let legacy_version_state = crate::kiro::kiro_version::VersionState {
+                        legacy_auto_sync_pending: true,
+                        ..Default::default()
+                    };
+                    self.initialize_kiro_version_state_if_absent(&legacy_version_state)
+                        .await?;
+                    config.clear_legacy_auto_sync_migration_marker();
+                    changed = true;
+                }
                 if changed {
                     self.save_runtime_config(&config).await?;
                 }
@@ -5006,6 +5025,92 @@ impl PostgresStore {
             reasoning_capability_contract_version,
             reasoning_invalid_models,
         }))
+    }
+
+    pub async fn load_kiro_version_state(
+        &self,
+    ) -> anyhow::Result<Option<crate::kiro::kiro_version::VersionState>> {
+        let row = sqlx::query("SELECT state FROM kiro_version_state WHERE id = 'default'")
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            let value: serde_json::Value = row.try_get("state")?;
+            serde_json::from_value(value).map_err(Into::into)
+        })
+        .transpose()
+    }
+
+    /// Insert the one-time lifecycle row without replacing state written by another instance.
+    pub async fn initialize_kiro_version_state_if_absent(
+        &self,
+        state: &crate::kiro::kiro_version::VersionState,
+    ) -> anyhow::Result<()> {
+        let value = serde_json::to_value(state)?;
+        sqlx::query(
+            r#"
+            INSERT INTO kiro_version_state (id, state, updated_at)
+            VALUES ('default', $1, now())
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 原子保存 Kiro 版本状态；只有数据库中的 generation 等于 expected 时才覆盖。
+    ///
+    /// candidate/错误状态同样推进 generation，并经过同一把 CAS 锁，避免后台检查把
+    /// 另一个实例刚刚应用的 active 版本覆盖掉。
+    pub async fn save_kiro_version_state_if_generation(
+        &self,
+        state: &crate::kiro::kiro_version::VersionState,
+        expected_generation: u64,
+    ) -> anyhow::Result<bool> {
+        let expected_generation = i64::try_from(expected_generation)
+            .map_err(|_| anyhow::anyhow!("Kiro 版本状态 generation 超出 PostgreSQL bigint"))?;
+        let value = serde_json::to_value(state)?;
+        // INSERT ... SELECT 只在 expected=0 时产生候选行；已有行的情况必须走独立的条件 UPDATE，
+        // 否则 SELECT 没有行可插入，ON CONFLICT 分支永远不会触发，第二次及以后的写入全部失败。
+        let sql = if expected_generation == 0 {
+            r#"
+INSERT INTO kiro_version_state (id, state, updated_at)
+VALUES ('default', $1, now())
+ON CONFLICT (id) DO UPDATE
+SET state = EXCLUDED.state,
+updated_at = now()
+WHERE COALESCE(
+CASE
+WHEN kiro_version_state.state->>'generation' ~ '^[0-9]+$'
+THEN (kiro_version_state.state->>'generation')::bigint
+END,
+0
+) = $2
+RETURNING id
+"#
+        } else {
+            r#"
+UPDATE kiro_version_state
+SET state = $1,
+updated_at = now()
+WHERE id = 'default'
+AND COALESCE(
+CASE
+WHEN state->>'generation' ~ '^[0-9]+$'
+THEN (state->>'generation')::bigint
+END,
+0
+) = $2
+RETURNING id
+"#
+        };
+        let result = sqlx::query(sql)
+            .bind(value)
+            .bind(expected_generation)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(result.is_some())
     }
 
     pub async fn save_manual_model(
@@ -13427,6 +13532,12 @@ CREATE TABLE IF NOT EXISTS runtime_config (
 ALTER TABLE runtime_config
     ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 
+CREATE TABLE IF NOT EXISTS kiro_version_state (
+    id TEXT PRIMARY KEY,
+    state JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE SEQUENCE IF NOT EXISTS credentials_id_seq;
 
 CREATE TABLE IF NOT EXISTS credentials (
@@ -14792,6 +14903,125 @@ mod tests {
 
         let missing = required_postgres_schema_missing_columns(&present);
         assert_eq!(missing, vec!["external_upstream_pools.revision"]);
+    }
+
+    #[tokio::test]
+    async fn postgres_kiro_version_state_cas_allows_one_concurrent_writer() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let peer = PostgresStore::connect_test_peer(&config, &store)
+            .await
+            .unwrap();
+        let initial = crate::kiro::kiro_version::VersionState::default();
+        assert!(
+            store
+                .save_kiro_version_state_if_generation(&initial, 0)
+                .await
+                .unwrap()
+        );
+
+        let mut candidate = initial.clone();
+        crate::kiro::kiro_version::record_candidate(&mut candidate, "1.4.121").unwrap();
+        let active =
+            crate::kiro::kiro_version::pin_version(&initial, "1.4.200", "0.11.107").unwrap();
+        let (candidate_result, active_result) = tokio::join!(
+            store.save_kiro_version_state_if_generation(&candidate, 0),
+            peer.save_kiro_version_state_if_generation(&active, 0),
+        );
+        let candidate_saved = candidate_result.unwrap();
+        let active_saved = active_result.unwrap();
+        let results = [candidate_saved, active_saved];
+        assert_eq!(results.iter().filter(|saved| **saved).count(), 1);
+        assert_eq!(results.iter().filter(|saved| !**saved).count(), 1);
+
+        let mut stored = store
+            .load_kiro_version_state()
+            .await
+            .unwrap()
+            .expect("CAS winner must remain persisted");
+        if !candidate_saved {
+            let before = stored.clone();
+            crate::kiro::kiro_version::record_candidate(&mut stored, "1.4.121").unwrap();
+            assert!(
+                store
+                    .save_kiro_version_state_if_generation(&stored, before.generation)
+                    .await
+                    .unwrap()
+            );
+        }
+        if !active_saved {
+            let before = stored.clone();
+            stored =
+                crate::kiro::kiro_version::pin_version(&before, "1.4.200", "0.11.107").unwrap();
+            assert!(
+                store
+                    .save_kiro_version_state_if_generation(&stored, before.generation)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(stored.generation, 2);
+        assert_eq!(stored.active_version.as_deref(), Some("1.4.200"));
+        assert_eq!(stored.candidate_version.as_deref(), Some("1.4.121"));
+        assert!(crate::kiro::kiro_version::active_changed(&initial, &stored));
+        peer.pool.close().await;
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_kiro_version_state_initialization_is_insert_once_and_restartable() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let peer = PostgresStore::connect_test_peer(&config, &store)
+            .await
+            .unwrap();
+
+        let legacy = crate::kiro::kiro_version::VersionState {
+            legacy_auto_sync_pending: true,
+            ..Default::default()
+        };
+        store
+            .initialize_kiro_version_state_if_absent(&legacy)
+            .await
+            .unwrap();
+        peer.initialize_kiro_version_state_if_absent(
+            &crate::kiro::kiro_version::VersionState::default(),
+        )
+        .await
+        .unwrap();
+        let loaded = peer
+            .load_kiro_version_state()
+            .await
+            .unwrap()
+            .expect("initialized state survives process restart");
+        assert!(loaded.legacy_auto_sync_pending);
+
+        let mut activated = loaded.clone();
+        crate::kiro::kiro_version::record_candidate(&mut activated, "1.4.154").unwrap();
+        let active =
+            crate::kiro::kiro_version::apply_version(&activated, None, "0.11.107").unwrap();
+        assert!(
+            store
+                .save_kiro_version_state_if_generation(&active, loaded.generation)
+                .await
+                .unwrap()
+        );
+        let restarted = peer
+            .load_kiro_version_state()
+            .await
+            .unwrap()
+            .expect("applied version survives restart");
+        assert_eq!(restarted.active_version.as_deref(), Some("1.4.154"));
+        assert!(!restarted.legacy_auto_sync_pending);
+
+        peer.pool.close().await;
+        store.drop_test_schema().await.unwrap();
     }
 
     #[tokio::test]

@@ -2538,6 +2538,20 @@ export interface TokenRefreshAdmissionRuntime {
   remainingMilliTokens: number
 }
 
+export type KiroVersionActiveSource = 'configured' | 'applied' | 'pinned' | string
+
+export interface KiroVersionLifecycleSnapshot {
+  configuredVersion: string
+  activeVersion: string
+  activeSource: KiroVersionActiveSource
+  previousVersion?: string | null
+  candidateVersion?: string | null
+  checkedAt?: string | null
+  lastError?: string | null
+  generation: number
+  autoSyncEnabled: boolean
+}
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -2575,6 +2589,8 @@ export interface RuntimeConfig {
   kiroVersionAutoSyncEnabled: boolean
   /** 最近一次自动同步读到的官方版本。 */
   kiroVersionLatest?: string
+  /** 版本检查、显式应用与回退状态；candidate 不会自动成为 active。 */
+  kiroVersionLifecycle: KiroVersionLifecycleSnapshot
   /** IDE 端点的对话和联网搜索改走 runtime.{region}.kiro.dev（默认关闭）。 */
   kiroRuntimeDomainEnabled: boolean
   credentialProtocolErrorCooldownSecs: number
@@ -2611,6 +2627,12 @@ export interface RuntimeConfig {
   credentialPromptLogicRetryEnabled: boolean
   credentialPromptLogicRetryMaxAttempts: number
   kiroUpstreamRegionRotationEnabled: boolean
+  /** 允许 Region rotation 使用与 Profile ARN 区域不一致的候选。 */
+  kiroRegionProfileArnMismatchAllowed: boolean
+  /** 同一认证类型的协议端点故障转移开关。 */
+  kiroEndpointFallbackEnabled: boolean
+  /** 协议端点候选顺序，例如 ide, runtime。 */
+  kiroEndpointFallbackOrder: string[]
   localBerserkModeEnabled: boolean
   localBerserkMaxRounds: number
   localBerserkRoundDelayMs: number
@@ -2679,7 +2701,7 @@ export interface RuntimeConfig {
   definedCacheRoutes: string[]
 }
 
-export type UpdateRuntimeConfigRequest = RuntimeConfig
+export type UpdateRuntimeConfigRequest = Omit<RuntimeConfig, 'kiroVersionLatest' | 'kiroVersionLifecycle'>
 
 export interface AccessKeysResponse {
   requestApiKey: string

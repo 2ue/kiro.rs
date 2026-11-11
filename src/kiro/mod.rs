@@ -7,6 +7,7 @@ pub mod kiro_version;
 pub mod machine_id;
 pub mod model;
 pub mod parser;
+pub mod portal;
 pub mod protocol;
 pub mod provider;
 pub(crate) mod request_head;

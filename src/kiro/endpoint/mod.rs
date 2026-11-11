@@ -6,16 +6,198 @@
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
+use std::collections::HashSet;
+
 use reqwest::{Method, RequestBuilder};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod amazonq;
 pub mod cli;
+pub mod codewhisperer;
+mod compat;
 pub mod ide;
+pub mod runtime;
 
+pub use amazonq::AmazonqEndpoint;
 pub use cli::CliEndpoint;
+pub use codewhisperer::CodewhispererEndpoint;
 pub use ide::IdeEndpoint;
+pub use runtime::RuntimeEndpoint;
+
+/// 端点候选链使用的凭据认证类型。
+///
+/// 端点轮换只能在同一认证类型的实现之间进行。该类型描述的是请求所携带的
+/// Kiro 身份，不是 refresh 操作使用的具体 OAuth provider。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointAuthKind {
+    Social,
+    Idc,
+    ExternalIdp,
+    ApiKey,
+    Unknown,
+}
+
+/// Protocol operation being routed through an endpoint implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointOperation {
+    Inference,
+    Models,
+    Mcp,
+}
+
+/// 从凭据字段归一化端点候选链所需的认证类型。
+pub fn endpoint_auth_kind(credentials: &KiroCredentials) -> EndpointAuthKind {
+    if credentials.is_api_key_credential() {
+        return EndpointAuthKind::ApiKey;
+    }
+    if crate::kiro::protocol::is_builder_id_credentials(credentials) {
+        return EndpointAuthKind::Idc;
+    }
+    if credentials.is_external_idp_refresh_credential() {
+        return EndpointAuthKind::ExternalIdp;
+    }
+    if credentials.is_idc_refresh_credential() {
+        return EndpointAuthKind::Idc;
+    }
+
+    match credentials.auth_method.as_deref() {
+        None => EndpointAuthKind::Social,
+        Some(value) if compact_endpoint_value(value) == "social" => EndpointAuthKind::Social,
+        Some(_) => EndpointAuthKind::Unknown,
+    }
+}
+
+fn compact_endpoint_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// 端点候选链运行时策略。
+///
+/// 默认关闭，且不携带任何候选项，因此调用方可以先接入该结构而不改变现有的
+/// `credentials.endpoint > config.defaultEndpoint` 选择行为。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointRoutingPlan {
+    enabled: bool,
+    preferred_endpoint: String,
+    fallback_order: Vec<String>,
+}
+
+impl Default for EndpointRoutingPlan {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl EndpointRoutingPlan {
+    pub fn disabled() -> Self {
+        Self::new(
+            crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME,
+            false,
+            Vec::new(),
+        )
+    }
+
+    pub fn new(
+        preferred_endpoint: impl Into<String>,
+        enabled: bool,
+        fallback_order: Vec<String>,
+    ) -> Self {
+        Self {
+            enabled,
+            preferred_endpoint: preferred_endpoint.into(),
+            fallback_order,
+        }
+    }
+
+    /// 从运行时配置构建候选计划；`default_endpoint` 是全局 preferred endpoint，
+    /// 凭据显式 endpoint 仍由调用方优先传入 candidate resolver。
+    pub fn from_config(config: &Config) -> Self {
+        Self::new(
+            config.default_endpoint.clone(),
+            config.kiro_endpoint_fallback_enabled,
+            config.kiro_endpoint_fallback_order.clone(),
+        )
+    }
+
+    /// 解析管理配置中常见的逗号分隔候选链。
+    ///
+    /// 空白项会被丢弃，但保留首次出现顺序；真正的端点存在性和认证兼容性在
+    /// [`resolve_endpoint_candidates`] 中依据当前 registry 再校验。
+    #[cfg(test)]
+    pub fn parse(preferred_endpoint: impl Into<String>, enabled: bool, value: &str) -> Self {
+        let fallback_order = value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self::new(preferred_endpoint, enabled, fallback_order)
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn preferred_endpoint(&self) -> &str {
+        &self.preferred_endpoint
+    }
+
+    pub fn fallback_order(&self) -> &[String] {
+        &self.fallback_order
+    }
+}
+
+/// 根据当前凭据和注册表生成有序 endpoint 候选名。
+///
+/// 主端点始终位于首位，即使策略关闭、候选不存在或主端点的能力声明暂未完善。
+/// 这保证了策略层接入前后的默认行为一致。只有开启策略后，候选端点才需要同时
+/// 满足：已注册、不是主端点、未重复，并声明支持当前认证类型。
+pub fn resolve_endpoint_candidates<'a, I>(
+    credentials: &KiroCredentials,
+    registered: I,
+    plan: &EndpointRoutingPlan,
+    operation: EndpointOperation,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a dyn KiroEndpoint>,
+{
+    let primary_endpoint = credentials
+        .endpoint
+        .as_deref()
+        .unwrap_or(plan.preferred_endpoint())
+        .trim();
+    let mut candidates = vec![primary_endpoint.to_string()];
+    if !plan.enabled() {
+        return candidates;
+    }
+
+    let auth_kind = endpoint_auth_kind(credentials);
+    let registered = registered
+        .into_iter()
+        .map(|endpoint| (endpoint.name(), endpoint))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut seen = HashSet::from([primary_endpoint.to_string()]);
+
+    for name in plan.fallback_order() {
+        let name = name.trim();
+        if name.is_empty() || !seen.insert(name.to_string()) {
+            continue;
+        }
+        let Some(endpoint) = registered.get(name) else {
+            continue;
+        };
+        if endpoint.supports_auth_kind(auth_kind) && endpoint.supports_operation(operation) {
+            candidates.push(name.to_string());
+        }
+    }
+    candidates
+}
 
 /// Resolve a local/staging upstream override while preserving endpoint-specific Host headers.
 ///
@@ -210,6 +392,18 @@ pub trait KiroEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
 
+    /// 声明该实现接受的凭据认证类型。
+    ///
+    /// 新端点未声明能力时不会进入 fallback 候选链；primary 仍保持旧路由行为。
+    fn supports_auth_kind(&self, _auth_kind: EndpointAuthKind) -> bool {
+        false
+    }
+
+    /// 声明该实现支持的操作；未声明的实现仅可作为显式 primary，不能进入 fallback。
+    fn supports_operation(&self, _operation: EndpointOperation) -> bool {
+        false
+    }
+
     /// API endpoint URL
     fn api_url(&self, ctx: &RequestContext<'_>) -> String;
 
@@ -217,6 +411,11 @@ pub trait KiroEndpoint: Send + Sync {
     ///
     /// IDE uses normal JSON. CLI runtime uses AWS JSON 1.0.
     fn content_type(&self) -> &'static str {
+        "application/json"
+    }
+
+    /// MCP uses JSON-RPC JSON even when the endpoint's inference protocol uses AWS JSON.
+    fn mcp_content_type(&self) -> &'static str {
         "application/json"
     }
 
@@ -382,6 +581,170 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registered_endpoints() -> [Box<dyn KiroEndpoint>; 5] {
+        [
+            Box::new(IdeEndpoint::new()),
+            Box::new(CliEndpoint::new()),
+            Box::new(CodewhispererEndpoint::new()),
+            Box::new(AmazonqEndpoint::new()),
+            Box::new(RuntimeEndpoint::new()),
+        ]
+    }
+
+    fn registered_refs(endpoints: &[Box<dyn KiroEndpoint>]) -> Vec<&dyn KiroEndpoint> {
+        endpoints.iter().map(Box::as_ref).collect()
+    }
+
+    #[test]
+    fn endpoint_routing_plan_is_disabled_by_default() {
+        let plan = EndpointRoutingPlan::default();
+        let endpoints = registered_endpoints();
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            endpoint: None,
+            ..Default::default()
+        };
+
+        assert_eq!(endpoint_auth_kind(&credentials), EndpointAuthKind::Social);
+        assert_eq!(
+            resolve_endpoint_candidates(
+                &credentials,
+                registered_refs(&endpoints),
+                &plan,
+                EndpointOperation::Inference,
+            ),
+            vec!["ide"],
+            "默认关闭时只返回原 primary endpoint"
+        );
+    }
+
+    #[test]
+    fn endpoint_routing_plan_deduplicates_unknown_and_blank_names() {
+        let plan = EndpointRoutingPlan::parse("cli", true, " cli, ,ide,cli,missing ");
+        assert_eq!(
+            plan.fallback_order(),
+            &["cli", "ide", "cli", "missing"],
+            "解析只负责清理空白，候选存在性由 resolver 判断"
+        );
+
+        let endpoints = registered_endpoints();
+        let credentials = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            endpoint: None,
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_endpoint_candidates(
+                &credentials,
+                registered_refs(&endpoints),
+                &plan,
+                EndpointOperation::Inference,
+            ),
+            vec!["cli"],
+            "primary 和重复候选不能重复出现，未知项必须丢弃"
+        );
+    }
+
+    #[test]
+    fn endpoint_routing_plan_rejects_cross_auth_ide_cli_candidates() {
+        let endpoints = registered_endpoints();
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            endpoint: None,
+            ..Default::default()
+        };
+        let api_key = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            endpoint: None,
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+        let api_key_plan = EndpointRoutingPlan::new("cli", true, vec!["ide".to_string()]);
+        let social_plan = EndpointRoutingPlan::new("ide", true, vec!["cli".to_string()]);
+
+        assert_eq!(
+            resolve_endpoint_candidates(
+                &social,
+                registered_refs(&endpoints),
+                &social_plan,
+                EndpointOperation::Inference,
+            ),
+            vec!["ide"],
+            "social/OAuth 请求不能回退到 CLI API-key 协议"
+        );
+        assert_eq!(
+            resolve_endpoint_candidates(
+                &api_key,
+                registered_refs(&endpoints),
+                &api_key_plan,
+                EndpointOperation::Inference,
+            ),
+            vec!["cli"],
+            "API-key 请求不能回退到 IDE OAuth 协议"
+        );
+    }
+
+    #[test]
+    fn endpoint_auth_kind_preserves_idc_and_external_idp_distinction() {
+        let idc = KiroCredentials {
+            auth_method: Some("builder-id".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let external_idp = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            token_endpoint: Some("https://example.invalid/token".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(endpoint_auth_kind(&idc), EndpointAuthKind::Idc);
+        assert_eq!(
+            endpoint_auth_kind(&external_idp),
+            EndpointAuthKind::ExternalIdp
+        );
+
+        let provider_only_builder_id = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            endpoint_auth_kind(&provider_only_builder_id),
+            EndpointAuthKind::Idc
+        );
+    }
+
+    #[test]
+    fn oauth_fallback_order_accepts_registered_compat_routes() {
+        let endpoints = registered_endpoints();
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let plan = EndpointRoutingPlan::new(
+            "ide",
+            true,
+            vec![
+                "codewhisperer".to_string(),
+                "amazonq".to_string(),
+                "runtime".to_string(),
+                "cli".to_string(),
+            ],
+        );
+        assert_eq!(
+            resolve_endpoint_candidates(
+                &credentials,
+                registered_refs(&endpoints),
+                &plan,
+                EndpointOperation::Inference,
+            ),
+            vec!["ide", "codewhisperer", "amazonq", "runtime"],
+            "OAuth fallback 不能跨到 API key CLI 协议"
+        );
+    }
 
     #[test]
     fn escaped_json_object_key_detector_covers_valid_and_adversarial_shapes_for_five_rounds() {

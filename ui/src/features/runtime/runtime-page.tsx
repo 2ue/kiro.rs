@@ -10,6 +10,7 @@ import {
   Shield,
   Sparkles,
   Wand2,
+  GitBranch,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -67,6 +68,7 @@ import {
 } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
+import { VersionEndpointSection } from './version-endpoint-section'
 import {
   normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
@@ -87,6 +89,7 @@ type RuntimeSectionKey =
   | 'startupProxy'
   | 'compat'
   | 'requestCompat'
+  | 'versionEndpoint'
 
 const runtimeSections: Array<{
   key: RuntimeSectionKey
@@ -105,7 +108,10 @@ const runtimeSections: Array<{
   { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
   { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
   { key: 'requestCompat', title: '参数兼容', desc: '客户端参数写法不规范时改写还是拒绝', icon: <Wand2 className="h-4 w-4" /> },
+  { key: 'versionEndpoint', title: '版本与端点', desc: '客户端版本生命周期和同账号端点故障转移', icon: <GitBranch className="h-4 w-4" /> },
 ]
+
+const SUPPORTED_OAUTH_ENDPOINT_FALLBACKS = new Set(['codewhisperer', 'amazonq', 'runtime'])
 
 // ─── 原子组件 ──────────────────────────────────────────────────────────────────
 
@@ -356,6 +362,11 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
     credentialPromptLogicRetryMaxAttempts: toWhole(draft.credentialPromptLogicRetryMaxAttempts),
     kiroUpstreamRegionRotationEnabled: Boolean(draft.kiroUpstreamRegionRotationEnabled),
+    kiroRegionProfileArnMismatchAllowed: Boolean(draft.kiroRegionProfileArnMismatchAllowed),
+    kiroEndpointFallbackEnabled: Boolean(draft.kiroEndpointFallbackEnabled),
+    kiroEndpointFallbackOrder: [...new Set(draft.kiroEndpointFallbackOrder.map((name) => name.trim().toLowerCase()))]
+      .filter((name) => SUPPORTED_OAUTH_ENDPOINT_FALLBACKS.has(name))
+      .slice(0, 8),
     localBerserkModeEnabled: Boolean(draft.localBerserkModeEnabled),
     localBerserkMaxRounds: toWhole(draft.localBerserkMaxRounds, 1, 10),
     localBerserkRoundDelayMs: toWhole(draft.localBerserkRoundDelayMs, 0, 60_000),
@@ -479,11 +490,15 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
 }
 
 function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
-  const editable = { ...config }
-  delete editable.proxyUrl
-  delete editable.proxyUsername
-  delete editable.proxyPassword
-  return editable
+  const {
+    proxyUrl: _proxyUrl,
+    proxyUsername: _proxyUsername,
+    proxyPassword: _proxyPassword,
+    kiroVersionLatest: _kiroVersionLatest,
+    kiroVersionLifecycle: _kiroVersionLifecycle,
+    ...editable
+  } = config
+  return editable as RuntimeConfig
 }
 
 function runtimeConfigDraftFingerprint(config: RuntimeConfig): string {
@@ -520,6 +535,11 @@ export function RuntimePage() {
           ...emptyRuntimeConfig.tokenRefreshAdmissionRuntime,
           ...config.data.tokenRefreshAdmissionRuntime,
         },
+        kiroVersionLifecycle: {
+          ...emptyRuntimeConfig.kiroVersionLifecycle,
+          ...config.data.kiroVersionLifecycle,
+        },
+        kiroEndpointFallbackOrder: (config.data.kiroEndpointFallbackOrder ?? []).filter((name) => SUPPORTED_OAUTH_ENDPOINT_FALLBACKS.has(name)),
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
         bodyConversion,
         promptInjection: normalizePromptInjection(config.data.promptInjection),
@@ -550,6 +570,9 @@ export function RuntimePage() {
 
   const set = <K extends keyof RuntimeConfig>(k: K) => (v: RuntimeConfig[K]) =>
     setDraft((prev) => ({ ...prev, [k]: v }))
+
+  const setVersionLifecycle = (kiroVersionLifecycle: RuntimeConfig['kiroVersionLifecycle']) =>
+    setDraft((prev) => ({ ...prev, kiroVersionLifecycle }))
 
   const setRequestAdmission = <K extends keyof RuntimeConfig['requestAdmission']>(k: K) => (v: RuntimeConfig['requestAdmission'][K]) =>
     setDraft((prev) => ({
@@ -854,7 +877,6 @@ export function RuntimePage() {
                 </div>
                 <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。建议 30 到 60 秒，过载时快速返回，避免请求一直挂起。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
                 <NumField label="单会话单账号最大并发" desc="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。0 表示等于账号自身的并发上限。" value={draft.credentialSessionMaxConcurrentRequests} min={0} max={1000} suffix="个" onChange={set('credentialSessionMaxConcurrentRequests')} />
-                <TogField label="自动同步 Kiro 客户端版本" desc={`默认关闭。打开后每 12 小时从官方读取当前版本，所有账号的上游请求头改用该版本；读取失败时继续用配置的版本。版本号是上游身份的一部分，会同时影响所有账号。${draft.kiroVersionLatest ? `最近读到：${draft.kiroVersionLatest}` : ''}`} checked={draft.kiroVersionAutoSyncEnabled} onChange={set('kiroVersionAutoSyncEnabled')} />
                 <TogField label="对话改走 Kiro 新域名" desc="默认关闭。打开后 IDE 端点的对话和联网搜索改发到 runtime.{区域}.kiro.dev，请求头不变；模型列表、额度查询、令牌刷新不受影响。注意：实测 FREE 账号打开后对话全部被新域名限流（429），打开前请先用自己的账号小范围验证。" checked={draft.kiroRuntimeDomainEnabled} onChange={set('kiroRuntimeDomainEnabled')} />
                 <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
@@ -883,7 +905,8 @@ export function RuntimePage() {
                 <NumField label="本地 provider 尝试上限" desc="单次本地调用最多尝试多少个凭据；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
                 <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />
-                <TogField label="上游端点轮换" desc="开启后，本地账号遇到上游瞬态错误会在官方支持的 us-east-1 / eu-central-1 两个端点之间轮换重试（端点由程序内置，无需配置）。关闭则始终使用账号自身的端点。与狂暴模式互相独立。" checked={draft.kiroUpstreamRegionRotationEnabled} onChange={set('kiroUpstreamRegionRotationEnabled')} />
+                <TogField label="跨 Region 轮换（既有策略）" desc="同一协议端点按账号 Region 顺序在 us-east-1 / eu-central-1 间尝试；此开关与下方协议端点 fallback 分开生效。" checked={draft.kiroUpstreamRegionRotationEnabled} onChange={set('kiroUpstreamRegionRotationEnabled')} />
+                <TogField label="允许 Profile ARN 跨 Region" desc="默认关闭。仅当上方跨 Region 轮换也开启时才生效；打开后允许使用与 Profile ARN 所在 Region 不同的候选，可能导致上游拒绝。" checked={draft.kiroRegionProfileArnMismatchAllowed} disabled={!draft.kiroUpstreamRegionRotationEnabled} onChange={set('kiroRegionProfileArnMismatchAllowed')} />
                 <TogField label="狂暴模式（429 暴力轮换）" desc="仅作用于本地账号。开启后遇到普通 429 会优先换号重试，把所有账号轮一遍后再换端点，直到成功或轮次耗尽。会显著放大上游请求量，默认关闭。风控型 429 与带 Retry-After 的 429 不受影响。" checked={draft.localBerserkModeEnabled} onChange={set('localBerserkModeEnabled')} />
                 <NumField label="狂暴模式最多轮换几轮" desc="仅在狂暴模式开启时生效。一轮 = 所有账号 × 所有端点各试一遍。" value={draft.localBerserkMaxRounds} min={1} max={10} suffix="轮" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkMaxRounds')} />
                 <NumField label="狂暴模式轮次间隔" desc="仅在狂暴模式开启时生效。同一轮内换号不等待；只有进入下一轮时才退避这么久。0 表示完全不等待。" value={draft.localBerserkRoundDelayMs} min={0} max={60000} suffix="毫秒" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkRoundDelayMs')} />
@@ -1659,6 +1682,10 @@ export function RuntimePage() {
                   />
                 </TwoCol>
               </div>
+            )}
+
+            {activeSection === 'versionEndpoint' && (
+              <VersionEndpointSection draft={draft} setConfig={set} onLifecycle={setVersionLifecycle} />
             )}
 
             {activeSection === 'compat' && (

@@ -41,7 +41,9 @@ use clap::Parser;
 use common::auth::RequestApiKeyStore;
 use external_pool::ExternalPoolManager;
 use futures::StreamExt;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{
+    AmazonqEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -426,6 +428,18 @@ async fn async_main() {
             std::process::exit(1);
         });
 
+    if let Err(error) = kiro::kiro_version::initialize_state_if_missing(
+        &postgres_store,
+        config.legacy_auto_sync_migration_pending(),
+    )
+    .await
+    {
+        tracing::error!(
+            "启动前加载或初始化持久化 Kiro 客户端版本失败，拒绝以不确定版本接收请求: {}",
+            error
+        );
+        std::process::exit(1);
+    }
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
     if let Some(first_credentials) = credentials_list.first() {
@@ -473,6 +487,12 @@ async fn async_main() {
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
         let cli = CliEndpoint::new();
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
+        let codewhisperer = CodewhispererEndpoint::new();
+        endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
+        let amazonq = AmazonqEndpoint::new();
+        endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
+        let runtime = RuntimeEndpoint::new();
+        endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
     }
 
     // 校验默认端点存在
@@ -591,7 +611,8 @@ async fn async_main() {
     let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
     common::runtime_lag::spawn_probe();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
-    let _kiro_version_sync_task = kiro::kiro_version::spawn_auto_sync(token_manager.clone());
+    let _kiro_version_sync_task =
+        kiro::kiro_version::spawn_auto_sync(token_manager.clone(), postgres_store.clone());
     let scheduler_instance_heartbeat_worker =
         token_manager.spawn_scheduler_instance_heartbeat_worker();
     let external_pool_manager = Arc::new(ExternalPoolManager::new(
@@ -1632,6 +1653,17 @@ fn spawn_redis_runtime_event_listener(
                             continue;
                         }
                         if channel == config_channel {
+                            let event_kind = serde_json::from_str::<serde_json::Value>(&payload)
+                                .ok()
+                                .and_then(|event| event.get("kind").and_then(serde_json::Value::as_str).map(str::to_string));
+                            if event_kind.as_deref() == Some("kiro_version_state_changed") {
+                                match token_manager.reload_kiro_version_state_from_postgres().await {
+                                    Ok(true) => tracing::debug!(payload, "已根据 Redis 通知热加载 Kiro 版本状态"),
+                                    Ok(false) => tracing::debug!(payload, "收到 Kiro 版本通知，但没有持久化状态"),
+                                    Err(err) => tracing::warn!(payload, "热加载 Kiro 版本状态失败: {}", err),
+                                }
+                                continue;
+                            }
                             let previous_external_pools =
                                 token_manager.runtime_config().external_pools;
                             match token_manager.reload_runtime_config_from_postgres() {
@@ -1670,6 +1702,9 @@ fn spawn_redis_runtime_event_listener(
                         }
                     }
                     _ = periodic_reload.tick() => {
+                        if let Err(err) = token_manager.reload_kiro_version_state_from_postgres().await {
+                            tracing::warn!("定时热加载 Kiro 版本状态失败: {}", err);
+                        }
                         let previous_external_pools =
                             token_manager.runtime_config().external_pools;
                         match token_manager.reload_runtime_config_from_postgres() {

@@ -10,12 +10,13 @@ use reqwest::RequestBuilder;
 use uuid::Uuid;
 
 use super::{
-    KiroEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
+    EndpointAuthKind, EndpointOperation, KiroEndpoint, RequestContext,
+    body_may_need_output_config_thinking_normalization,
     normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
 };
 use crate::kiro::protocol::{
-    is_external_idp_credentials, resolve_agent_mode, resolve_profile_arn,
-    resolve_streaming_profile_arn,
+    is_external_idp_credentials, resolve_agent_mode, resolve_mcp_profile_arn,
+    resolve_models_profile_arn, resolve_streaming_profile_arn,
 };
 use crate::kiro::request_head::KiroRequestHead;
 
@@ -76,11 +77,15 @@ impl IdeEndpoint {
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
+        let ide_version = ctx.config.effective_kiro_version();
+        let streaming_sdk_version =
+            crate::kiro::kiro_version::streaming_sdk_version_for_ide(&ide_version);
         format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#{} m/E KiroIDE-{}-{}",
             ctx.config.system_version,
             ctx.config.node_version,
-            ctx.config.effective_kiro_version(),
+            streaming_sdk_version,
+            ide_version,
             ctx.machine_id
         )
     }
@@ -97,6 +102,17 @@ impl KiroEndpoint for IdeEndpoint {
         IDE_ENDPOINT_NAME
     }
 
+    fn supports_auth_kind(&self, auth_kind: EndpointAuthKind) -> bool {
+        matches!(
+            auth_kind,
+            EndpointAuthKind::Social | EndpointAuthKind::Idc | EndpointAuthKind::ExternalIdp
+        )
+    }
+
+    fn supports_operation(&self, _operation: EndpointOperation) -> bool {
+        true
+    }
+
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         format!("{}/generateAssistantResponse", self.runtime_base_url(ctx))
     }
@@ -107,7 +123,7 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String {
         let mut params = vec!["origin=AI_EDITOR".to_string(), "maxResults=50".to_string()];
-        if let Some(profile_arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
+        if let Some(profile_arn) = resolve_models_profile_arn(ctx.credentials, ctx.config) {
             params.push(format!("profileArn={}", urlencoding::encode(&profile_arn)));
         }
         if let Some(next_token) = next_token {
@@ -152,7 +168,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
+        if let Some(arn) = resolve_mcp_profile_arn(ctx.credentials, ctx.config) {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -175,7 +191,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
+        if let Some(arn) = resolve_models_profile_arn(ctx.credentials, ctx.config) {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -207,7 +223,7 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
     serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
 }
 
-fn transform_ide_api_body(body: &str, profile_arn: &Option<String>) -> String {
+pub(crate) fn transform_ide_api_body(body: &str, profile_arn: &Option<String>) -> String {
     let normalize_reasoning_fields = body_may_need_output_config_thinking_normalization(body);
     if profile_arn.is_none() && !normalize_reasoning_fields {
         return body.to_string();
@@ -614,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_models_url_skips_builder_id_placeholder_for_idc_credentials() {
+    fn test_models_url_sends_builder_id_placeholder_for_idc_credentials() {
         let endpoint = IdeEndpoint::new();
         let credentials = KiroCredentials {
             auth_method: Some("builder-id".to_string()),
@@ -631,8 +647,12 @@ mod tests {
             region_override: None,
         };
 
+        // KiroIDE-1.4.x 下不带 profileArn 会被拒为 `400 Invalid profileArn.`。
         let url = endpoint.models_url(&ctx, Some("next-token"));
-        assert!(!url.contains("profileArn="));
+        assert!(url.contains(&format!(
+            "profileArn={}",
+            urlencoding::encode(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        )));
         assert!(url.contains("nextToken=next-token"));
     }
 
@@ -749,6 +769,7 @@ mod tests {
             ..Default::default()
         };
         let mut config = Config::default();
+        config.pin_kiro_version_for_request("1.4.121".to_string());
         config.kiro_agent_mode_strategy = KiroAgentModeStrategy::Auto;
         let ctx = RequestContext {
             credentials: &credentials,
@@ -774,22 +795,167 @@ mod tests {
             headers.get("TokenType").and_then(|v| v.to_str().ok()),
             Some("EXTERNAL_IDP")
         );
-        let expected_x_amz_user_agent =
-            format!("aws-sdk-js/1.0.34 KiroIDE-{}-machine", config.kiro_version);
+        let expected_x_amz_user_agent = "aws-sdk-js/1.0.34 KiroIDE-1.4.121-machine";
         assert_eq!(
             headers
                 .get("x-amz-user-agent")
                 .and_then(|v| v.to_str().ok()),
-            Some(expected_x_amz_user_agent.as_str())
+            Some(expected_x_amz_user_agent)
         );
         let expected_user_agent = format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-machine",
-            config.system_version, config.node_version, config.kiro_version
+            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.44 m/E KiroIDE-1.4.121-machine",
+            config.system_version, config.node_version
         );
         assert_eq!(
             headers.get("user-agent").and_then(|v| v.to_str().ok()),
             Some(expected_user_agent.as_str())
         );
+    }
+
+    #[test]
+    fn mcp_and_model_requests_send_builder_id_placeholder() {
+        let endpoint = IdeEndpoint::new();
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+            region_override: None,
+        };
+
+        let mcp = endpoint
+            .decorate_mcp(Client::new().post("https://example.com/mcp"), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            mcp.headers()
+                .get("x-amzn-kiro-profile-arn")
+                .and_then(|value| value.to_str().ok()),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+
+        let models = endpoint
+            .decorate_models(Client::new().get("https://example.com/models"), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            models
+                .headers()
+                .get("x-amzn-kiro-profile-arn")
+                .and_then(|value| value.to_str().ok()),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+    }
+
+    #[test]
+    fn ide_mcp_decorator_covers_authentication_profile_matrix() {
+        let endpoint = IdeEndpoint::new();
+        let config = Config::default();
+        let real_arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL";
+        let cases = [
+            (
+                "iam",
+                KiroCredentials {
+                    auth_method: Some("iam".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+                None,
+            ),
+            (
+                "idc",
+                KiroCredentials {
+                    auth_method: Some("idc".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+                None,
+            ),
+            (
+                "builderid",
+                KiroCredentials {
+                    auth_method: Some("builderid".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+                None,
+            ),
+            (
+                "external idp without real profile",
+                KiroCredentials {
+                    auth_method: Some("external_idp".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    ..Default::default()
+                },
+                None,
+                Some("EXTERNAL_IDP"),
+            ),
+            (
+                "external idp with real profile",
+                KiroCredentials {
+                    auth_method: Some("external_idp".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    profile_arn: Some(real_arn.to_string()),
+                    ..Default::default()
+                },
+                Some(real_arn),
+                Some("EXTERNAL_IDP"),
+            ),
+            (
+                "api key ignores stored profile",
+                KiroCredentials {
+                    auth_method: Some("api_key".to_string()),
+                    kiro_api_key: Some("ksk_test".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    profile_arn: Some(real_arn.to_string()),
+                    ..Default::default()
+                },
+                None,
+                Some("API_KEY"),
+            ),
+        ];
+
+        for (label, credentials, expected_arn, expected_token_type) in cases {
+            let ctx = RequestContext {
+                credentials: &credentials,
+                token: "token",
+                machine_id: "machine",
+                config: &config,
+                region_override: None,
+            };
+            let request = endpoint
+                .decorate_mcp(Client::new().post("https://example.com/mcp"), &ctx)
+                .build()
+                .unwrap();
+            let headers = request.headers();
+            assert_eq!(
+                headers
+                    .get("x-amzn-kiro-profile-arn")
+                    .and_then(|value| value.to_str().ok()),
+                expected_arn,
+                "unexpected Profile ARN for {label}"
+            );
+            assert_eq!(
+                headers
+                    .get("tokenType")
+                    .and_then(|value| value.to_str().ok()),
+                expected_token_type,
+                "unexpected token type for {label}"
+            );
+        }
     }
 
     #[test]
