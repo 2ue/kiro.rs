@@ -142,6 +142,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         }
     }
 

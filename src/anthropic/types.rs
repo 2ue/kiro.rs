@@ -762,6 +762,10 @@ pub struct MessagesRequest {
         deserialize_with = "deserialize_stop_sequences"
     )]
     pub stop_sequences: Option<Vec<String>>,
+    /// Context editing (`context_management.edits`). Kiro has no equivalent; a forced model mapping
+    /// applies the clear edits locally before conversion. Not forwarded upstream.
+    #[serde(default, skip_serializing)]
+    pub context_management: Option<serde_json::Value>,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式

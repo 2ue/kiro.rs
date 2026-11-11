@@ -2128,6 +2128,7 @@ mod tests {
                 ),
             }),
             stop_sequences: None,
+            context_management: None,
         }
     }
 
@@ -2775,6 +2776,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         let first_req = make_req("time=1000");
@@ -2826,6 +2828,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         let plan = tracker.compute_kiro_rs_tool_with_bounds(
@@ -3105,6 +3108,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         let default_plan = tracker.compute_kiro_rs_tool_with_bounds(

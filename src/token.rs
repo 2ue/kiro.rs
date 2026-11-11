@@ -260,7 +260,8 @@ async fn call_remote_count_tokens(
 }
 
 /// 本地计算请求的输入 tokens
-fn count_all_tokens_local(
+/// Local estimate only: never calls a configured remote counter, so the result is deterministic.
+pub(crate) fn count_all_tokens_local(
     system: Option<&[SystemMessage]>,
     messages: &[Message],
     tools: Option<&[Tool]>,

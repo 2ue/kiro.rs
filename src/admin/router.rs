@@ -359,6 +359,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/model-pricing", get(get_model_pricing))
         .route("/model-pricing/sync", post(sync_model_pricing))
         .route("/model-capabilities", get(get_model_capabilities))
+        .route(
+            "/forced-model-mapping/targets",
+            get(super::handlers::get_forced_model_targets),
+        )
         .route("/model-capabilities/sync", post(sync_model_capabilities))
         .route("/model-capabilities/manual", post(upsert_manual_model))
         .route(

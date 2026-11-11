@@ -1408,6 +1408,21 @@ pub async fn get_model_capabilities(State(state): State<AdminState>) -> impl Int
     Json(state.service.get_model_capabilities())
 }
 
+/// GET /api/admin/forced-model-mapping/targets
+/// 强制模型收敛各目标模型的可承接账号数（目标模型取当前运行配置，或 `?models=a,b` 指定）。
+pub async fn get_forced_model_targets(
+    State(state): State<AdminState>,
+    Query(query): Query<ForcedModelTargetsQuery>,
+) -> impl IntoResponse {
+    Json(state.service.forced_model_targets(query.models.as_deref()))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ForcedModelTargetsQuery {
+    #[serde(default)]
+    pub models: Option<String>,
+}
+
 /// POST /api/admin/model-capabilities/sync
 /// 手动同步 Kiro 模型能力
 pub async fn sync_model_capabilities(

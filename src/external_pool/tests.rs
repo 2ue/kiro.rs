@@ -11678,6 +11678,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         }),
         body_mode_filter: Some(ExternalPoolRequestBodyMode::Normalized),
         model_hint: None,
@@ -13053,6 +13054,7 @@ fn test_payload(model: &str) -> MessagesRequest {
             user_id: Some("user_test_account__session_external-projection-session".to_string()),
         }),
         stop_sequences: None,
+        context_management: None,
     }
 }
 

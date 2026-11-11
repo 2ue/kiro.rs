@@ -1536,11 +1536,27 @@ impl PayloadTooLongRetryRequest {
         let requested_model = payload.model.as_str();
         let mut config = runtime_config.payload_guard_config();
         if let Some(window_tokens) = forced_window_tokens.filter(|tokens| *tokens > 0) {
+            // The client cannot compact for a window it does not know about, so the server
+            // always trims and retries, whatever the payload guard settings are. Weight is at least
+            // one unit per token, so 90% of the window keeps the retry inside it.
+            config.enabled = true;
+            config.trim_history = true;
+            config.shaping.enabled = true;
+            config.shaping.discard_historical_thinking = true;
+            config.shaping.truncate_historical_tool_results = true;
+            config.shaping.fit_current_payload_to_budget = true;
             config.shaping.truncate_current_tool_results = true;
             let window_budget = (window_tokens as usize).saturating_mul(9) / 10;
-            config.max_kiro_weight = config.max_kiro_weight.min(window_budget).max(1);
-            config.max_bytes = config.max_bytes.min(window_budget).max(1);
-            return runtime_config.too_long_retry_enabled().then(|| Self {
+            let cap = |limit: usize| {
+                if limit == 0 {
+                    window_budget
+                } else {
+                    limit.min(window_budget)
+                }
+            };
+            config.max_kiro_weight = cap(config.max_kiro_weight).max(1);
+            config.max_bytes = cap(config.max_bytes).max(1);
+            return Some(Self {
                 request: request.clone(),
                 config,
                 endpoint: endpoint.to_string(),
@@ -4663,8 +4679,14 @@ impl CredentialUsageContext {
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
         let usage = self.request.client_input_usage(usage);
-        let raw = super::cache::RawUsage::uncached(self.request.input_tokens, usage.output_tokens)
-            .to_cache_usage();
+        let raw = super::cache::RawUsage::uncached(
+            self.request
+                .client_input_tokens
+                .filter(|tokens| *tokens > 0)
+                .unwrap_or(self.request.input_tokens),
+            usage.output_tokens,
+        )
+        .to_cache_usage();
         if self.request.kiro_rs_tool_plus.is_some() {
             return self.kiro_rs_tool_plus_reported_usage(usage, usage_source, raw, true);
         }
@@ -4703,6 +4725,9 @@ impl CredentialUsageContext {
         raw_usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
         let usage = self.request.client_input_usage(usage);
+        // Raw-mode shaping reports the measured input; under a forced mapping that is the
+        // client's request too, not the trimmed request the target received.
+        let raw_usage = self.request.client_input_usage(raw_usage);
         if self.request.kiro_rs_tool_plus.is_some() {
             return self.kiro_rs_tool_plus_reported_usage(usage, usage_source, raw_usage, true);
         }
@@ -5388,6 +5413,17 @@ impl CredentialUsageContext {
         let error_message = error_message.into();
         let public_error = if error_type == "client_dropped" {
             None
+        } else if self.request.display_identity.is_some()
+            && (is_upstream_payload_too_long_error(&error_message)
+                || is_upstream_context_window_full_error(&error_message))
+        {
+            // Forced model mapping: recorded the same way it was returned (a transient overload).
+            Some(usage_public_error(
+                StatusCode::from_u16(529).expect("529 is a valid status code"),
+                "overloaded_error",
+                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+                Some(&self.request.error_id),
+            ))
         } else {
             Some(provider_public_error_for_message(
                 &error_message,
@@ -8038,12 +8074,15 @@ fn forced_model_listing_applies(state: &AppState) -> bool {
         .any_route_enabled()
 }
 
+/// The public Claude models only: other upstream models (DeepSeek, GLM, ...) and serving-side
+/// spellings would reveal the channel behind the forced mapping.
 fn with_display_model_listing(models: Vec<super::types::Model>) -> Vec<super::types::Model> {
     let display = super::forced_model::display_model_listing();
     let mut merged: Vec<super::types::Model> = models
         .into_iter()
         .filter(|model| !display.iter().any(|listed| listed.id == model.id))
         .filter(|model| super::forced_model::display_spec_for(&model.id).is_none())
+        .filter(|model| is_listed_claude_model(&model.id))
         .collect();
     merged.extend(display);
     merged.sort_by(|a, b| a.id.cmp(&b.id));
@@ -8959,6 +8998,16 @@ async fn post_messages_inner(
             .enabled_for_route(&endpoint)
         {
             super::code_execution::drop_native_code_execution_tools(&mut payload);
+        }
+        let (cleared_by_edits, thinking_by_edits) =
+            super::forced_backoff::apply_context_edits(&mut payload);
+        if cleared_by_edits + thinking_by_edits > 0 {
+            tracing::info!(
+                endpoint,
+                cleared_tool_results = cleared_by_edits,
+                removed_thinking_blocks = thinking_by_edits,
+                "forced model mapping applied the client's context edits"
+            );
         }
         let budget = super::forced_backoff::input_budget(
             forced.target_window_tokens,
@@ -10654,7 +10703,12 @@ async fn handle_stream_request(
     let context_template = StreamContextTemplate {
         // The response reports the client's model; `model` is the dispatch model.
         model: credential_usage.request.model.clone(),
-        input_tokens,
+        // message_start reports the client's input under a forced mapping, like the final usage.
+        input_tokens: credential_usage
+            .request
+            .client_input_tokens
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or(input_tokens),
         context_window_tokens,
         thinking_enabled,
         extract_xml_thinking,

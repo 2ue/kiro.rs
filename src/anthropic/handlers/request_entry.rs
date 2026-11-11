@@ -768,12 +768,7 @@ fn normalize_message_roles(payload: &mut MessagesRequest, keep_position: bool) {
             "system" | "developer" if keep_position && !kept.is_empty() => {
                 let text = message_content_text(&message.content);
                 if !text.trim().is_empty() {
-                    kept.push(crate::anthropic::types::Message {
-                        role: "user".to_string(),
-                        content: Value::String(format!(
-                            "<system-reminder>\n{text}\n</system-reminder>"
-                        )),
-                    });
+                    append_reminder_to_user_turn(&mut kept, &text);
                 }
                 moved += 1;
             }
@@ -798,6 +793,36 @@ fn normalize_message_roles(payload: &mut MessagesRequest, keep_position: bool) {
         dropped_unknown_roles = dropped,
         "normalized non-standard message roles"
     );
+}
+
+/// Appends an operator instruction as a reminder block to the user turn it follows. Folded into
+/// that turn, the model reads it as part of the current request, which it follows reliably; a
+/// separate trailing turn is often ignored. Without a user turn before it, a new one is added.
+fn append_reminder_to_user_turn(kept: &mut Vec<crate::anthropic::types::Message>, text: &str) {
+    let block = serde_json::json!({
+        "type": "text",
+        "text": format!("<system-reminder>\n{text}\n</system-reminder>"),
+    });
+    match kept.last_mut() {
+        Some(last) if last.role == "user" => {
+            let blocks = match std::mem::take(&mut last.content) {
+                Value::Array(blocks) => blocks,
+                Value::String(text) if text.is_empty() => Vec::new(),
+                Value::String(text) => vec![serde_json::json!({"type": "text", "text": text})],
+                Value::Null => Vec::new(),
+                other => {
+                    vec![serde_json::json!({"type": "text", "text": scalar_content_text(&other)})]
+                }
+            };
+            let mut blocks = blocks;
+            blocks.push(block);
+            last.content = Value::Array(blocks);
+        }
+        _ => kept.push(crate::anthropic::types::Message {
+            role: "user".to_string(),
+            content: Value::Array(vec![block]),
+        }),
+    }
 }
 
 fn message_content_text(content: &Value) -> String {
@@ -1159,6 +1184,41 @@ mod tests {
                 "round {round}"
             );
         }
+    }
+
+    #[test]
+    fn forced_mapping_keeps_mid_conversation_system_messages_in_place() {
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-opus-5-5","max_tokens":16,"system":"base","messages":[{"role":"system","content":"leading"},{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"text","text":"again"}]},{"role":"system","content":"answer in English"}]}"#,
+        );
+        let probe = probe_raw_messages_body(&raw);
+        let payload = parse_messages_payload_with_probe_and_roles(
+            &raw,
+            &probe,
+            "req_forced_roles",
+            &crate::model::config::LocalRequestCompatConfig::default(),
+            true,
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        let roles: Vec<&str> = payload.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        // A system message before any turn has no position to keep and joins the system prompt.
+        let system: Vec<&str> = payload
+            .system
+            .as_ref()
+            .expect("system")
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(system, ["base", "leading"]);
+        // The trailing one is folded into the user turn it follows, as a reminder block.
+        let last = payload.messages.last().unwrap().content.as_array().unwrap();
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[0]["text"], "again");
+        assert_eq!(
+            last[1]["text"],
+            "<system-reminder>\nanswer in English\n</system-reminder>"
+        );
     }
 
     #[test]

@@ -6494,6 +6494,22 @@ impl MultiTokenManager {
     ///
     /// 只要有一个可用凭据目录为空（未发现或发现失败），就无法断言"所有可用账号都不支持"，
     /// 返回 `None`；没有可用凭据时同样返回 `None`。
+    /// Enabled accounts whose model lists (own list, else subscription tier list) allow `model`;
+    /// an account with neither list is not restricted and counts too.
+    pub fn enabled_credentials_serving_model(&self, model: &str) -> usize {
+        let tier_lists = self.config.read().subscription_model_lists.clone();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .filter(|entry| {
+                entry
+                    .credentials
+                    .supports_model_with_tier_lists(&[Some(model)], &tier_lists)
+            })
+            .count()
+    }
+
     pub fn usable_explicit_model_catalog(&self) -> Option<Vec<String>> {
         let entries = self.entries.lock();
         let mut catalog = Vec::new();

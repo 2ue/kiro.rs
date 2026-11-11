@@ -833,6 +833,49 @@ impl Default for UsageCleanupRuntime {
 }
 
 impl AdminService {
+    /// Per target model of the forced mapping (or the given comma-separated models): whether the
+    /// upstream catalog serves it, and how many enabled accounts may take it.
+    pub fn forced_model_targets(&self, models: Option<&str>) -> serde_json::Value {
+        let runtime_config = self.token_manager.runtime_config();
+        let targets: Vec<String> = match models {
+            Some(list) => list
+                .split(',')
+                .map(|model| model.trim().to_ascii_lowercase())
+                .filter(|model| !model.is_empty())
+                .collect(),
+            None => runtime_config
+                .forced_model_mapping
+                .clone()
+                .normalized()
+                .targets(),
+        };
+        let items: Vec<serde_json::Value> = targets
+            .iter()
+            .map(|target| {
+                let resolution = self.model_capabilities.resolve_model_with_mapping(
+                    target,
+                    runtime_config.model_resolution_mode,
+                    &runtime_config.model_mapping,
+                );
+                let upstream = resolution.upstream_model.clone();
+                let in_catalog = upstream
+                    .as_deref()
+                    .is_some_and(|model| self.model_capabilities.contains_model(model));
+                let accounts = upstream
+                    .as_deref()
+                    .map(|model| self.token_manager.enabled_credentials_serving_model(model))
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "model": target,
+                    "upstreamModel": upstream,
+                    "inCatalog": in_catalog,
+                    "enabledAccounts": accounts,
+                })
+            })
+            .collect();
+        serde_json::json!({ "targets": items })
+    }
+
     /// Every forced mapping target must resolve to a model the upstream catalog serves. A catalog
     /// that has not been synced from an account yet (empty, or only the built-in seed) cannot be
     /// checked and is accepted.

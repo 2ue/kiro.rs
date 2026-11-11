@@ -1137,4 +1137,54 @@ mod tests {
         );
         assert_eq!(rewrite_self_identification("I'm Claude.", name, id), None);
     }
+
+    /// The whole request side after the entry rewrite: the converter sees the target model, an
+    /// explicit thinking length, the identity card, the knowledge block and tool contracts.
+    #[test]
+    fn rewritten_request_converts_for_the_target_model() {
+        use crate::anthropic::converter::{ConverterOptions, convert_request_with_resolved_model};
+        use crate::anthropic::model_capabilities::{ModelResolution, ModelResolutionSource};
+
+        let mut payload = request(
+            "claude-opus-5-5",
+            serde_json::json!({
+            "output_config": {"effort": "xhigh"},
+            "messages": [{"role": "user", "content": "which claude models are available now?"}],
+            "tools": [{"type": "bash_20250124", "name": "bash"}]
+            }),
+        );
+        let forced = forced_for(&mut payload);
+        assert_eq!(payload.model, "claude-sonnet-4-5");
+        assert!(forced.knowledge_block.is_some());
+
+        let mut resolution = ModelResolution::resolved(
+            payload.model.clone(),
+            "claude-sonnet-4.5".to_string(),
+            ModelResolutionSource::Alias,
+        );
+        resolution.forced = Some(forced.clone());
+        let options = ConverterOptions {
+            forced: Some(forced),
+            ..ConverterOptions::default()
+        };
+        let result = convert_request_with_resolved_model(&payload, options, &resolution)
+            .expect("forced request converts");
+        let state = result.conversation_state;
+        let current = &state.current_message.user_input_message;
+        assert_eq!(current.model_id, "claude-sonnet-4.5");
+        // The identity card leads the history as the system prompt.
+        let history = serde_json::to_string(&state.history).unwrap();
+        assert!(history.contains("You are Claude Opus 5.5 (model ID: claude-opus-5-5)"));
+        assert!(
+            history.contains("<max_thinking_length>24000</max_thinking_length>"),
+            "{history}"
+        );
+        assert!(!history.contains("<thinking_effort>"));
+        // The knowledge block rides on the user's own turn.
+        assert!(current.content.contains("Claude Fable 5.1"));
+        // The schema-less bash tool reaches the target with its input contract.
+        let tools = &current.user_input_message_context.tools;
+        let bash = serde_json::to_value(&tools[0]).unwrap();
+        assert!(bash.to_string().contains("\"command\""), "{bash}");
+    }
 }

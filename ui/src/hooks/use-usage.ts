@@ -7,6 +7,7 @@ import {
   getAccountEventSummary,
   getAuditLogsPage,
   getUsageCleanupStatus,
+  getForcedModelTargets,
   getModelCapabilities,
   getModelPricing,
   getUsageDashboard,
@@ -406,6 +407,16 @@ export function useSyncModelPricing() {
   return useMutation({
     mutationFn: syncModelPricing,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['model-pricing'] }),
+  })
+}
+
+export function useForcedModelTargets(models: string[]) {
+  const key = [...new Set(models.map((model) => model.trim().toLowerCase()).filter(Boolean))].sort()
+  return useQuery({
+    queryKey: ['forced-model-targets', key],
+    queryFn: () => getForcedModelTargets(key),
+    enabled: key.length > 0,
+    refetchInterval: 60000,
   })
 }
 

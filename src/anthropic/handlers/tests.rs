@@ -3755,6 +3755,7 @@ fn messages_request_for_model(model: &str) -> MessagesRequest {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     }
 }
 
@@ -10298,6 +10299,7 @@ fn strict_cache_eligibility_is_off_by_default_and_switchable_per_stream_kind() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
     let shaped = |route: &ResolvedCacheRoutePolicy| {
         route.policy.cache_type == PromptCacheStrategyType::CurrentHighCache
@@ -10469,6 +10471,7 @@ fn route_strategy_without_strict_check_never_caches_requests_below_the_model_min
                 user_id: Some(format!("user_test_account__session_{session}")),
             }),
             stop_sequences: None,
+            context_management: None,
         };
         let raw_input = token::count_all_tokens(
             &payload.model,
@@ -12942,6 +12945,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
     let profile = prompt_cache.build_profile(&payload, 4096);
     let usage_context = RequestUsageContext {
@@ -13053,6 +13057,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
     let profile = prompt_cache.build_high_cache_profile(&payload, 4096);
     let usage_context = RequestUsageContext {
@@ -13202,6 +13207,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
     let first_conversation_id =
         extract_stable_conversation_id(&first_payload).expect("fallback id");
@@ -13266,6 +13272,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
     let second_conversation_id =
         extract_stable_conversation_id(&second_payload).expect("fallback id");
@@ -13344,6 +13351,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
         stop_sequences: None,
+        context_management: None,
     };
     let cache_route =
         RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
@@ -13498,6 +13506,7 @@ fn kiro_rs_tool_plus_route_amplifies_bounds_and_limits_creation_frequency() {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
         stop_sequences: None,
+        context_management: None,
     };
     let context_for = |payload: &MessagesRequest, input_tokens: i32| {
         let cache_route =
@@ -13641,6 +13650,7 @@ fn kiro_rs_tool_plus_full_coverage_never_reports_zero_input() {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
         stop_sequences: None,
+        context_management: None,
     };
     let context_for = |payload: &MessagesRequest, input_tokens: i32| {
         let cache_route = RequestRuntimeConfig::from_app_state(&state)
@@ -13738,6 +13748,7 @@ fn kiro_rs_tool_plus_does_not_stack_legacy_usage_guards() {
             ),
         }),
         stop_sequences: None,
+        context_management: None,
     };
     let mut route = RequestRuntimeConfig::from_app_state(&state)
         .cache_policy_for_path("/plus-isolated/v1/messages");
@@ -13816,6 +13827,7 @@ fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
         stop_sequences: None,
+        context_management: None,
     };
 
     let first_context = prepare_usage_context(
@@ -13916,6 +13928,7 @@ fn disabled_prompt_cache_does_not_simulate_without_stable_conversation_id() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
     let (simulation, source) =
         build_simulated_usage(PromptCacheSimulationMode::Disabled, None, None);
@@ -13983,6 +13996,7 @@ fn builtin_na_path_does_not_build_local_profile_or_reporting_policy() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
 
     let context = prepare_usage_context(
@@ -14071,6 +14085,7 @@ fn no_cache_route_does_not_build_cache_profile_plan_or_shape_reporting() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
 
     let cache_route =
@@ -14186,6 +14201,7 @@ fn no_cache_disabled_reported_usage_preserves_upstream_metadata_usage() {
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
 
     let context = prepare_usage_context(
@@ -14275,6 +14291,7 @@ fn no_cache_canonical_record_keeps_upstream_raw_when_default_reporting_exists() 
         output_format: None,
         metadata: None,
         stop_sequences: None,
+        context_management: None,
     };
 
     let context = prepare_usage_context(
@@ -16166,6 +16183,7 @@ fn cold_request_guard_is_off_by_default_and_only_changes_cold_requests_when_on()
             ),
         }),
         stop_sequences: None,
+        context_management: None,
     };
     let run = |state: &AppState, payload: &MessagesRequest, raw_input: i32| {
         let route = RequestRuntimeConfig::from_app_state(state).cache_policy_for_path(endpoint);
@@ -16372,6 +16390,7 @@ fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untou
             ),
         }),
         stop_sequences: None,
+        context_management: None,
     };
     let replay = |state: &AppState| {
         let cache_route =
@@ -16557,6 +16576,7 @@ fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
         stop_sequences: None,
+        context_management: None,
     };
     let run = |payload: &MessagesRequest, raw_input: i32| {
         let conversation_id = extract_stable_conversation_id(payload).expect("session id");
@@ -16743,6 +16763,7 @@ fn minea_like_route_keeps_target_hit_ratio_and_no_small_cache_values() {
                 user_id: Some(format!("user_test_account__session_{session_id}")),
             }),
             stop_sequences: None,
+            context_management: None,
         };
         let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
         let raw_input = 24_000 + round * 650;
@@ -16936,6 +16957,7 @@ fn minea_prod_params_read_aware_floor_shrinks_small_context_and_keeps_large_ones
                     ),
                 }),
                 stop_sequences: None,
+                context_management: None,
             };
             let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
             let context = prepare_usage_context(
@@ -17129,6 +17151,7 @@ fn hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round() {
                 user_id: Some(format!("user_test_account__session_{session_id}")),
             }),
             stop_sequences: None,
+            context_management: None,
         };
         let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
         let raw_input = 24_000 + round * 1_300;

@@ -42,6 +42,7 @@ import type {
   ForcedModelRule,
   ModelCapabilitiesStatus,
 } from '@/types/api'
+import { useForcedModelTargets } from '@/hooks/use-usage'
 import { NumField, TogField } from './runtime-sections'
 
 const FAMILY_LABEL: Record<string, string> = {
@@ -725,6 +726,11 @@ export function ForcedModelMappingSection({
 }) {
   const options = useMemo(() => catalogOptions(capabilities), [capabilities])
   const active = forcedModelMappingAnyRouteEnabled(mapping)
+  const targetModels = useMemo(
+    () => [...mapping.rules.map((rule) => rule.target), mapping.defaultTarget],
+    [mapping.rules, mapping.defaultTarget],
+  )
+  const targetStatus = useForcedModelTargets(targetModels)
   const catalogEmpty = !capabilities || capabilities.models.length === 0
   const limits = FORCED_CONTEXT_BACKOFF_LIMITS
   const setBackoff =
@@ -735,6 +741,23 @@ export function ForcedModelMappingSection({
     const defaults = defaultForcedModelMapping()
     onChange({ ...mapping, rules: defaults.rules, defaultTarget: defaults.defaultTarget })
   }
+
+  const targetSummary = targetStatus.data?.length ? (
+    <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+      {targetStatus.data.map((target) => (
+        <span key={target.model}>
+          <span className="font-mono">{target.model}</span>
+          {target.inCatalog ? (
+            <span className={target.enabledAccounts > 0 ? undefined : 'text-destructive'}>
+              ：可承接的启用账号 {target.enabledAccounts} 个
+            </span>
+          ) : (
+            <span className="text-warning">：不在上游模型目录中</span>
+          )}
+        </span>
+      ))}
+    </div>
+  ) : null
 
   return (
     <div className="space-y-6">
@@ -779,6 +802,7 @@ export function ForcedModelMappingSection({
         }
       >
         <RulesTable rules={mapping.rules} options={options} onChange={(rules) => onChange({ ...mapping, rules })} />
+        {targetSummary}
         <div className="max-w-xl space-y-1.5 pt-1">
           <div className="text-[13px] font-medium">默认目标模型</div>
           <TargetModelInput

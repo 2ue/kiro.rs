@@ -612,6 +612,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         }
     }
 
@@ -697,6 +698,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         let cc = resolve("/cc/v1/messages");

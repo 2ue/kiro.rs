@@ -6545,6 +6545,45 @@ async fn test_supported_model_filter_aliases_local_scheduler_selection() {
     ctx.release_in_flight();
 }
 
+/// Forced model mapping dispatches under the target model: free accounts that list only the
+/// 4.5 models take the request, and the serving count reflects their lists.
+#[tokio::test]
+async fn forced_target_model_selects_free_accounts_listing_it() {
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+
+    let mut free = test_access_token_credential("free", "KIRO FREE");
+    free.priority = 0;
+    free.supported_models = vec![
+        "claude-haiku-4.5".to_string(),
+        "claude-sonnet-4.5".to_string(),
+    ];
+    let mut other = test_access_token_credential("opus-only", "Pro");
+    other.priority = 1;
+    other.supported_models = vec!["claude-opus-4.8".to_string()];
+
+    let manager = MultiTokenManager::new(config, vec![free, other], None, None, false).unwrap();
+    assert_eq!(
+        manager.enabled_credentials_serving_model("claude-sonnet-4.5"),
+        1
+    );
+    assert_eq!(
+        manager.enabled_credentials_serving_model("claude-sonnet-4-5"),
+        1
+    );
+    assert_eq!(
+        manager.enabled_credentials_serving_model("claude-opus-5-5"),
+        0
+    );
+
+    let mut ctx = manager
+        .acquire_context_for_session(Some("claude-sonnet-4-5"), None, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(ctx.id, 1);
+    ctx.release_in_flight();
+}
+
 #[tokio::test]
 async fn test_empty_supported_models_allows_future_model_when_restricted_credential_does_not() {
     let mut config = Config::default();

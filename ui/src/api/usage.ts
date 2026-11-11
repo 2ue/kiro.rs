@@ -258,6 +258,21 @@ export async function syncModelPricing(): Promise<ModelPricingStatus> {
   return data
 }
 
+export interface ForcedModelTargetStatus {
+  model: string
+  upstreamModel?: string | null
+  inCatalog: boolean
+  enabledAccounts: number
+}
+
+/** 强制模型收敛的目标模型在上游目录中的情况和可承接的启用账号数。 */
+export async function getForcedModelTargets(models: string[]): Promise<ForcedModelTargetStatus[]> {
+  const { data } = await api.get<{ targets: ForcedModelTargetStatus[] }>('/forced-model-mapping/targets', {
+    params: { models: models.join(',') },
+  })
+  return data.targets
+}
+
 export async function getModelCapabilities(): Promise<ModelCapabilitiesStatus> {
   const { data } = await api.get<ModelCapabilitiesStatus>('/model-capabilities')
   return data

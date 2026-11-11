@@ -806,7 +806,11 @@ async fn call_model(
             Some(ctx.request_id.as_str()),
             Some(ctx.error_id.as_str()),
             Some(ctx.provider.as_ref()),
-            None,
+            Some(ProviderErrorContext {
+                requested_model: Some(ctx.display_model.as_str()),
+                forced: ctx.model_resolution.forced.is_some(),
+                ..Default::default()
+            }),
         );
         CallFailure {
             error_type: error_type_for_status(status_response.status()),

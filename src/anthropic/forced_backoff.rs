@@ -58,9 +58,9 @@ pub(crate) fn input_budget(
     (available - margin).max(1)
 }
 
+/// Local estimate only: a remote counter would make the trimming non-deterministic and block.
 fn estimate(request: &MessagesRequest) -> i32 {
-    crate::token::count_all_tokens(
-        &request.model,
+    crate::token::count_all_tokens_local(
         request.system.as_deref(),
         &request.messages,
         request.tools.as_deref(),
@@ -133,6 +133,37 @@ pub(crate) fn fit_to_budget(
         report.final_tokens = estimate(request);
     }
     report
+}
+
+/// 客户端的 `context_management.edits`：`clear_tool_uses_*` 与 `clear_thinking_*` 在本地执行，
+/// 其它类型忽略。返回 (清理的工具结果数, 删除的 thinking 块数)。
+pub(crate) fn apply_context_edits(request: &mut MessagesRequest) -> (usize, usize) {
+    let Some(edits) = request
+        .context_management
+        .as_ref()
+        .and_then(|value| value.get("edits"))
+        .and_then(Value::as_array)
+        .cloned()
+    else {
+        return (0, 0);
+    };
+    let mut cleared = 0;
+    let mut removed_thinking = 0;
+    for edit in edits {
+        let kind = edit.get("type").and_then(Value::as_str).unwrap_or_default();
+        if kind.starts_with("clear_tool_uses_") {
+            // `keep: {type: "tool_uses", value: N}`; the API keeps the 3 most recent by default.
+            let keep = edit
+                .get("keep")
+                .and_then(|keep| keep.get("value"))
+                .and_then(Value::as_u64)
+                .unwrap_or(3) as usize;
+            cleared += clear_old_tool_results(&mut request.messages, keep, usize::MAX);
+        } else if kind.starts_with("clear_thinking_") {
+            removed_thinking += drop_old_thinking(&mut request.messages);
+        }
+    }
+    (cleared, removed_thinking)
 }
 
 fn blocks_mut(message: &mut Message) -> Option<&mut Vec<Value>> {
@@ -446,6 +477,32 @@ mod tests {
     }
 
     #[test]
+    fn context_edits_clear_tool_results_and_thinking() {
+        let mut request = conversation(6, 50);
+        request.context_management = Some(json!({"edits": [
+            {"type": "clear_tool_uses_20250919", "keep": {"type": "tool_uses", "value": 2}},
+            {"type": "clear_thinking_20251015"},
+            {"type": "compact_20260112"}
+        ]}));
+        let (cleared, thinking) = apply_context_edits(&mut request);
+        assert_eq!(cleared, 4);
+        assert!(thinking > 0);
+        assert!(paired(&request));
+        let results: Vec<&Value> = request
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_array())
+            .flatten()
+            .filter(|b| block_type(b) == Some("tool_result"))
+            .collect();
+        assert_eq!(results.iter().filter(|b| is_cleared(b)).count(), 4);
+        assert!(!is_cleared(results.last().unwrap()));
+
+        let mut untouched = conversation(2, 10);
+        assert_eq!(apply_context_edits(&mut untouched), (0, 0));
+    }
+
+    #[test]
     fn budget_reserves_output_and_margin() {
         let budget = input_budget(200_000, 128_000, &config());
         // 64K reserved (target cap), 5% margin.
@@ -504,6 +561,39 @@ mod tests {
             .find(|b| block_type(b) == Some("tool_result"))
             .unwrap();
         assert_ne!(last_result["content"], json!(CLEARED_TOOL_RESULT));
+    }
+
+    #[test]
+    fn one_long_agent_turn_is_trimmed_by_dropping_old_tool_pairs() {
+        // One user request followed by hundreds of tool calls, still running (ends on a tool
+        // result): there is no plain user turn to cut at.
+        let mut messages = vec![json!({"role": "user", "content": "refactor the module"})];
+        for i in 0..300 {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "text", "text": big(40)},
+                {"type": "tool_use", "id": format!("toolu_{i}"), "name": "Read", "input": {"file": big(5)}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("toolu_{i}"), "content": "ok"}
+            ]}));
+        }
+        let mut request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 32000,
+            "messages": messages
+        }))
+        .unwrap();
+        let report = fit_to_budget(&mut request, 30_000, &config());
+        assert!(report.final_tokens <= 30_000, "{report:?}");
+        assert!(report.removed_messages > 0);
+        assert!(paired(&request));
+        assert_eq!(request.messages[0].content, json!("refactor the module"));
+        assert_eq!(request.messages.last().unwrap().role, "user");
+        let roles: Vec<&str> = request.messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            roles.windows(2).all(|pair| pair[0] != pair[1]),
+            "roles must alternate"
+        );
     }
 
     #[test]

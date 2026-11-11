@@ -1694,6 +1694,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         }
     }
 
@@ -1724,6 +1725,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         assert!(has_web_search_tool(&req));
@@ -1750,6 +1752,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         assert!(ensure_claude_code_web_search_tool(&mut req));
@@ -2045,6 +2048,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
@@ -2092,6 +2096,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         assert!(!has_web_search_tool(&custom_with_peer));
@@ -2122,6 +2127,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         let query = extract_search_query(&req);
@@ -2149,6 +2155,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         let query = extract_search_query(&req);

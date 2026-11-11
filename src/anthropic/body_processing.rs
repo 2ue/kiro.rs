@@ -1184,6 +1184,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         }
     }
 
@@ -1320,6 +1321,7 @@ mod tests {
                 output_format: None,
                 metadata: None,
                 stop_sequences: None,
+                context_management: None,
             };
 
             let error = materialize_remote_multimodal_sources(&mut payload.messages, None)
@@ -1357,6 +1359,7 @@ mod tests {
             output_format: None,
             metadata: None,
             stop_sequences: None,
+            context_management: None,
         };
 
         assert_eq!(count_remote_multimodal_sources(&payload.messages), 1);
@@ -1382,6 +1385,7 @@ mod tests {
                 output_format: None,
                 metadata: None,
                 stop_sequences: None,
+                context_management: None,
             };
             let expected = serde_json::to_value(&payload.messages).expect("serialize fixture");
             let mut samples = Vec::with_capacity(100);
