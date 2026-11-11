@@ -71,7 +71,7 @@ pub struct ForcedModelRule { pub families: Vec<String>, pub target: String }
   6. `payload.model = target_model`，并把 `payload.forced` 设为 `Some(..)`。
 - [x] T3.3 `maybe_local_pool_unavailable_fast_fail_response` 在强制模式下改用目标模型。目标模型由 raw probe 的 model 经 `resolve_forced_target` 计算得出。
 - [x] T3.4 `request_hides_reasoning` 的请求模型参数优先使用 `payload.forced.display_model`。由于 T3.2 第 3 步已经固化了 display，这里保留作为兜底。
-- [ ] T3.5 单测：开关关闭时，payload 与现状一致；开启后 model 被替换、thinking 与 display 已固化、forced 已填充。
+- [x] T3.5 单测：开关关闭时，payload 与现状一致；开启后 model 被替换、thinking 与 display 已固化、forced 已填充。
 
 ## 5. thinking 补全（T4）
 
@@ -91,7 +91,7 @@ pub struct ForcedModelRule { pub families: Vec<String>, pub target: String }
   - adaptive 或只传了 effort：改为 `enabled` 分支，`max_thinking_length = effort_to_length(effort)`。对应关系为 low 4000、medium 16000、high 32000、xhigh 48000、max 48000，并且不超过 min(max_tokens, 64000) × 3/4，不低于 1024。
   - enabled：沿用 budget_tokens，同样受上面的限制。
 - [x] T4.3 可见思考策略里判断 `-thinking` 的逻辑，改为读取 `forced.display_requested_thinking`。
-- [ ] T4.4 单测：外显模型 × thinking 四种形态 × effort 五档，检查上游提示前缀里的 `max_thinking_length`。所有组合都不能返回错误。
+- [x] T4.4 单测：外显模型 × thinking 四种形态 × effort 五档，检查上游提示前缀里的 `max_thinking_length`。所有组合都不能返回错误。
 
 ## 6. 协议字段（T5）
 
@@ -217,4 +217,60 @@ pub struct ForcedModelRule { pub families: Vec<String>, pub target: String }
 
 ## 15. 验收记录
 
-（实现完成后填写：每个任务的状态、验证方式、关键证据）
+验收日期 2026-11-11，分支 `feat/forced-model-mapping`（独立 worktree，未合入 main）。
+
+### 15.1 提交
+
+| 提交 | 内容 |
+|---|---|
+| `1cd03e77` | 强制模型收敛主体：配置、外显规格表、入口改写、thinking 补全、对外字段、退避、身份卡与知识库、工具补全、Opus 5.5 工具间文字 |
+| `5b5c963a` | 管理端"强制模型收敛"配置区 |
+| `1a1bec97` | context_management 本地执行、按客户端原始请求报 input、中途 system 并入当轮、模型列表只列 Claude、可承接账号数接口与界面 |
+| `dc118683` | computer toolset 展开与 `toolset_name` 回填、截图坐标换算、错误文案替换目标模型、注入块复述清理 |
+| `cd3e67d7` | Fable / Mythos 5 系按官方行为对齐：工具间文字转 thinking（updates 保留文字）、逐条消息 effort、clear_at、Mythos 不进模型列表、Fable 知识条目 |
+
+### 15.2 自动化验证
+
+| 项目 | 结果 |
+|---|---|
+| `cargo test --bin kiro-rs`（全量） | 3040 passed，0 failed，18 ignored |
+| clippy 基线 | 746 条，基线允许 849 条，无新增类别 |
+| `cargo fmt --check`、前端 `tsc -b` | 通过 |
+| 强制收敛相关单测 | forced_model 28 项（含 216 组 thinking 组合矩阵、入口改写、错误文案替换、逐条 effort 与 clear_at）、forced_backoff 8 项、interleaved_thinking 18 项、identity_guard 11 项、anthropic_tools 与 toolset 相关 18 项、调度按目标模型选号 1 项 |
+
+### 15.3 真实链路验收（本地服务 + 10 个可用 free 账号，上游目录只有 haiku 4.5 / sonnet 4.5）
+
+| 编号 | 场景 | 结果 |
+|---|---|---|
+| A1 | 开关关闭回归 | 全量单测通过；开关关闭时 `apply_forced_mapping` 不被调用，请求路径不变 |
+| A2 | 外显模型 × 规则 | opus-5-5 / fable-5-1 / sonnet-5 → sonnet-4-5，haiku → haiku-4-5；调度按目标模型选号（单测 `forced_target_model_selects_free_accounts_listing_it`） |
+| A3 | 泄漏扫描 | 16 个协议用例、4 个 Claude Code 场景、7 个 Fable 专项用例的响应体与响应头中无目标模型、无 Kiro、无 prompt too long、无窗口已满；仅有的命中是模型列表中的官方 haiku/sonnet 4.5 条目与阵容回答中对 Haiku 4.5 的正常介绍 |
+| A4 | thinking 形态 × effort × display | 216 组合全部转换成功；端到端 Fable 传 disabled + 强制 tool_choice 返回 200 |
+| A5 | 协议字段 | temperature + prefill、fallbacks、中途 system、context_management、structured outputs 均返回 200 |
+| A6 | 工具 | bash 返回 tool_use 且 input 含 command；mcp_toolset / advisor 静默移除后 200 |
+| A7 | 长上下文 | 327K token 历史退避到预算内（清理 17 个旧工具结果）后 200，对外 input 按客户端原始请求报告 |
+| A9 | Claude Code 压缩请求 | 压缩请求走强制裁剪重试路径（单测覆盖），端到端未出现报错 |
+| A10 | 身份 | 问型号答"Claude Opus 5.5，模型 ID：claude-opus-5-5"；Mythos 答"Claude Mythos 5.1"；问知识截止答"June 2026" |
+| A11 | 真实 Claude Code | 自我认知、多工具（8 次工具调用，统计结果正确）、子代理、编辑代码（Fable 5.1）四个场景全部成功，无 API 错误 |
+| A12 | 外部号池 | 外部池兜底使用改写前的客户端请求（代码路径确认） |
+| A14 | Opus 5.5 / Fable 5.1 多工具 | 工具调用之前没有 text 块；omitted 时为空 thinking 块，updates 时 thinking 块带进度文字（"我将列出 /tmp 目录中的文件。"）；流式同样成立 |
+| A15 | computer toolset | 展开、`toolset_name` 回填、坐标换算由单测覆盖（未在真实链路跑 computer use） |
+| A16 | 可见 thinking 泄漏 | 身份过滤覆盖 thinking_delta，自述改写对 thinking 生效（单测） |
+| A17 | 知识库 | 问模型阵容命中内置条目，回答阵容、窗口、输出与官方一致；代码与工具输出中的模型名不触发 |
+
+### 15.4 中途 system 指令遵从率（对照组，每组 3–4 次）
+
+| 写法 | Opus 5.5 外显 | Sonnet 5 外显 |
+|---|---|---|
+| 不加指令 | 0/4 | 0/3 |
+| 顶层 system | 4/4 | 3/3 |
+| 并入当轮用户消息的提醒块（最终实现） | 3/4 | 3/3 |
+| 单独一条末尾 user 消息 | 0/4 | 1/3 |
+
+结论：并入当轮的写法接近顶层 system 的遵从率；未达 100% 是目标模型本身的能力边界。
+
+### 15.5 已知边界
+
+- 推理与编码水平、知识库未收录的近期事实、响应速度、tokenizer 比例属于无法消除的差异（见 05 第 3 节）。
+- computer use 与截图坐标换算只有单测覆盖，真实客户端未跑。
+- 真实链路使用的是 free 账号（只有 haiku 4.5 / sonnet 4.5），付费账号目录下的行为由单测与模型目录逻辑保证。

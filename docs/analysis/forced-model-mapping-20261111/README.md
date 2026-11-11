@@ -1,6 +1,6 @@
 # 强制模型收敛（Forced Model Mapping）分析与方案
 
-日期：2026-11-11　状态：决策已定稿，按 [10-implementation-checklist.md](10-implementation-checklist.md) 实施
+日期：2026-11-11　状态：已实现并验收（分支 `feat/forced-model-mapping`），验收记录见 [10-implementation-checklist.md](10-implementation-checklist.md) 第 15 节
 
 ## 需求
 
