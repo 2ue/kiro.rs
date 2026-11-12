@@ -13529,6 +13529,13 @@ impl KiroProvider {
         ))
     }
 
+    /// 账号启用、新增或订阅变化导致 cohort 改变时提前醒来，最多等 `max_wait`。
+    pub(crate) async fn wait_model_capability_cohort_change(&self, max_wait: Duration) {
+        self.token_manager
+            .wait_model_capability_cohort_change(max_wait)
+            .await;
+    }
+
     pub(crate) fn model_capability_cohort_keys(
         &self,
     ) -> Arc<Vec<crate::kiro::model::available_models::KiroModelCapabilityCohortKey>> {

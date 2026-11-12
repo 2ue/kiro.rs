@@ -1063,7 +1063,9 @@ fn spawn_model_capability_recovery_worker(
                     );
                     reported_empty_local_cohort = true;
                 }
-                tokio::time::sleep(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL).await;
+                kiro_provider
+                    .wait_model_capability_cohort_change(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL)
+                    .await;
                 continue;
             }
             reported_empty_local_cohort = false;
@@ -1081,7 +1083,9 @@ fn spawn_model_capability_recovery_worker(
                     );
                 }
                 consecutive_failures = 0;
-                tokio::time::sleep(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL).await;
+                kiro_provider
+                    .wait_model_capability_cohort_change(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL)
+                    .await;
                 continue;
             }
 
@@ -1132,7 +1136,9 @@ fn spawn_model_capability_recovery_worker(
                         "native reasoning cohort fence 后台恢复成功"
                     );
                     consecutive_failures = 0;
-                    tokio::time::sleep(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL).await;
+                    kiro_provider
+                        .wait_model_capability_cohort_change(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL)
+                        .await;
                 }
                 NativeReasoningStartupDecision::ContinueReasoningUnknown(reason) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -1145,7 +1151,9 @@ fn spawn_model_capability_recovery_worker(
                         retry_in_secs = retry_delay.as_secs(),
                         "native reasoning cohort fence 尚未恢复；普通及 external-only 流量继续服务，后台发现按上限退避"
                     );
-                    tokio::time::sleep(retry_delay).await;
+                    kiro_provider
+                        .wait_model_capability_cohort_change(retry_delay)
+                        .await;
                 }
             }
         }

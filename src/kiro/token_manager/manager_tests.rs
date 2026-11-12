@@ -9238,6 +9238,32 @@ async fn selection_failure_summary_records_rpm_limited_accounts() {
 }
 
 #[tokio::test]
+async fn enabling_an_account_wakes_the_model_catalog_worker_immediately() {
+    let mut credential = api_key_credential("ksk_cohort_wake");
+    credential.disabled = true;
+    let manager = Arc::new(
+        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
+    );
+    let waiter = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            manager
+                .wait_model_capability_cohort_change(std::time::Duration::from_secs(30))
+                .await;
+            started.elapsed()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    manager.set_disabled(1, false).unwrap();
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("cohort change must wake the waiter")
+        .unwrap();
+    assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+}
+
+#[tokio::test]
 async fn selection_failure_summary_records_model_not_supported() {
     let mut free = api_key_credential("ksk_selection_free");
     free.subscription_title = Some("Free".to_string());

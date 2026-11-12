@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -1093,6 +1093,9 @@ pub struct MultiTokenManager {
     /// Secret-free capability cohorts are rebuilt only after a relevant credential/config/proxy
     /// mutation. Request reads clone one Arc and never scan the account pool.
     model_capability_cohort_generation: AtomicU64,
+    /// Wakes the model-capability recovery worker when the cohorts change, so enabling or adding
+    /// an account re-syncs the model catalog without waiting for the next poll.
+    model_capability_cohort_changed: Notify,
     /// Last account-info refresh started after a model rejection, per credential. Bounds the
     /// refresh to one per account per [`MODEL_REJECTION_REFRESH_INTERVAL`].
     model_rejection_refreshes: Mutex<HashMap<u64, Instant>>,
@@ -2792,6 +2795,7 @@ impl MultiTokenManager {
             #[cfg(test)]
             auto_heal_pgsql_attempts: AtomicU64::new(0),
             model_capability_cohort_generation: AtomicU64::new(1),
+            model_capability_cohort_changed: Notify::new(),
             model_rejection_refreshes: Mutex::new(HashMap::new()),
             subscription_tier_observer: std::sync::OnceLock::new(),
             model_capability_cohort_cache: Mutex::new(ModelCapabilityCohortCache::default()),
@@ -14266,6 +14270,13 @@ impl MultiTokenManager {
     fn invalidate_model_capability_cohorts(&self) {
         self.model_capability_cohort_generation
             .fetch_add(1, Ordering::AcqRel);
+        self.model_capability_cohort_changed.notify_one();
+    }
+
+    /// Resolves when the capability cohorts change or after `max_wait`, whichever comes first.
+    pub(crate) async fn wait_model_capability_cohort_change(&self, max_wait: std::time::Duration) {
+        let _ =
+            tokio::time::timeout(max_wait, self.model_capability_cohort_changed.notified()).await;
     }
 
     #[cfg(test)]
