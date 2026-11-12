@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{DeclaredAuthKind, KiroCredentials};
 use crate::model::config::{Config, KiroAgentModeStrategy};
 
 pub const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
@@ -46,47 +46,23 @@ pub fn enterprise_fallback_profile_arn(region: &str) -> String {
     )
 }
 
+/// Whether Kiro API calls carry the external IdP semantics (`TokenType: EXTERNAL_IDP`, real
+/// profile ARN). An explicit `authMethod` decides; `provider` is only consulted when
+/// `authMethod` is missing or unrecognised.
 pub fn is_external_idp_credentials(credentials: &KiroCredentials) -> bool {
-    if credentials.is_api_key_credential() {
-        return false;
-    }
-
-    credentials
-        .auth_method
-        .as_deref()
-        .is_some_and(is_external_idp_auth_method)
-        || credentials
-            .provider
-            .as_deref()
-            .is_some_and(is_external_idp_provider)
-}
-
-pub fn is_external_idp_auth_method(value: &str) -> bool {
-    matches!(
-        compact_protocol_value(value).as_str(),
-        "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
-    )
-}
-
-pub fn is_external_idp_provider(value: &str) -> bool {
-    matches!(
-        compact_protocol_value(value).as_str(),
-        "enterprise" | "externalidp" | "iamsso" | "awsidc" | "internal"
-    )
+    credentials.is_external_idp_refresh_credential()
 }
 
 pub fn is_social_credentials(credentials: &KiroCredentials) -> bool {
     if credentials.is_api_key_credential() {
         return false;
     }
-
-    credentials
-        .auth_method
-        .as_deref()
-        .is_some_and(|value| compact_protocol_value(value) == "social")
-        || credentials.provider.as_deref().is_some_and(|value| {
+    match credentials.declared_auth_kind() {
+        Some(kind) => kind == DeclaredAuthKind::Social,
+        None => credentials.provider.as_deref().is_some_and(|value| {
             matches!(compact_protocol_value(value).as_str(), "github" | "google")
-        })
+        }),
+    }
 }
 
 /// Recognize Builder ID credentials even when an importer only preserved `provider`.
@@ -94,8 +70,11 @@ pub fn is_builder_id_credentials(credentials: &KiroCredentials) -> bool {
     if is_external_idp_credentials(credentials) {
         return false;
     }
-    credentials.is_idc_refresh_credential()
-        || credentials
+    if credentials.is_idc_refresh_credential() {
+        return true;
+    }
+    credentials.declared_auth_kind().is_none()
+        && credentials
             .provider
             .as_deref()
             .is_some_and(|value| compact_protocol_value(value) == "builderid")
@@ -413,7 +392,9 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_enterprise_provider_aliases() {
+    fn explicit_idc_auth_method_is_not_reclassified_by_enterprise_provider() {
+        // KAM / kiro-manager-lite / Kiro-Go export organization IdC accounts as
+        // authMethod=IdC + clientId/clientSecret + provider=Enterprise (or an alias).
         for provider in [
             "Enterprise",
             "ExternalIdp",
@@ -426,7 +407,7 @@ mod tests {
             "Internal",
         ] {
             let credentials = KiroCredentials {
-                auth_method: Some("idc".to_string()),
+                auth_method: Some("IdC".to_string()),
                 provider: Some(provider.to_string()),
                 api_region: Some("eu-west-1".to_string()),
                 client_id: Some("client".to_string()),
@@ -435,8 +416,54 @@ mod tests {
             };
 
             assert!(
+                !is_external_idp_credentials(&credentials),
+                "provider {provider} must not turn an explicit IdC account into external IdP"
+            );
+            assert!(
+                credentials.is_idc_refresh_credential(),
+                "provider {provider}"
+            );
+            assert!(
+                is_builder_id_credentials(&credentials),
+                "provider {provider}"
+            );
+            assert!(!is_social_credentials(&credentials), "provider {provider}");
+            assert_eq!(
+                resolve_usage_limits_profile_arn(&credentials, &Config::default()).as_deref(),
+                Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+                "provider {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn enterprise_provider_aliases_imply_external_idp_only_without_auth_method() {
+        for provider in [
+            "Enterprise",
+            "ExternalIdp",
+            "External IDP",
+            "external_idp",
+            "IAM_SSO",
+            "IAMSSO",
+            "AWSIdC",
+            "AWS_IDC",
+            "Internal",
+        ] {
+            let credentials = KiroCredentials {
+                provider: Some(provider.to_string()),
+                api_region: Some("eu-west-1".to_string()),
+                client_id: Some("client".to_string()),
+                token_endpoint: Some("https://login.example.invalid/token".to_string()),
+                ..Default::default()
+            };
+
+            assert!(
                 is_external_idp_credentials(&credentials),
                 "provider alias {provider} should be treated as external IdP"
+            );
+            assert!(
+                !credentials.is_idc_refresh_credential(),
+                "provider {provider}"
             );
             assert_eq!(
                 resolve_profile_arn(&credentials, &Config::default()).as_deref(),
@@ -444,6 +471,21 @@ mod tests {
                 "provider alias {provider} should not send fallback ARN to header/query APIs"
             );
         }
+    }
+
+    #[test]
+    fn explicit_social_auth_method_ignores_enterprise_provider() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Enterprise".to_string()),
+            ..Default::default()
+        };
+        assert!(!is_external_idp_credentials(&credentials));
+        assert!(is_social_credentials(&credentials));
+        assert_eq!(
+            resolve_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(KIRO_SOCIAL_PROFILE_ARN)
+        );
     }
 
     #[test]

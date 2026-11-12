@@ -762,21 +762,10 @@ pub(crate) async fn refresh_token_with_client(
 
     validate_refresh_token(credentials)?;
 
-    // 根据 auth_method 选择刷新方式
-    // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
-    let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
-        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
-            "idc"
-        } else {
-            "social"
-        }
-    });
-
-    let mut refresh_credentials = credentials.clone();
-    refresh_credentials.auth_method = Some(auth_method.to_string());
-    if refresh_credentials.is_external_idp_refresh_credential() {
+    // 显式 authMethod 决定刷新协议；缺失或无法识别时按 provider、clientId/clientSecret 推断。
+    if credentials.is_external_idp_refresh_credential() {
         refresh_external_idp_token(credentials, config, &client, admission.as_ref()).await
-    } else if refresh_credentials.is_idc_refresh_credential() {
+    } else if credentials.is_idc_refresh_credential() {
         refresh_idc_token(credentials, config, &client, admission.as_ref()).await
     } else {
         refresh_social_token(credentials, config, &client, admission.as_ref()).await
@@ -1894,6 +1883,7 @@ mod tests {
         RefreshFailureStage, get_usage_limits, refresh_failure_from_token_refresh_admission,
         refresh_token, usage_region_fallback_allows,
     };
+    use crate::http_client::ProxyConfig;
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::token_manager::auxiliary::{
         TokenRefreshAdmissionAuthority, TokenRefreshAdmissionRejected,
@@ -3089,6 +3079,121 @@ mod tests {
         assert_eq!(token_type, "EXTERNAL_IDP");
         assert!(uri.starts_with("/fake/getUsageLimits?"));
         assert_eq!(portal_captured.lock().unwrap().len(), 1);
+    }
+
+    /// Accepts proxy connections and records the `CONNECT host:port` target of each one, then
+    /// answers 502 so no request leaves the machine.
+    async fn spawn_recording_connect_proxy()
+    -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let recorded = targets.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 4096];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    if let Some(target) = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.strip_prefix("CONNECT "))
+                        .and_then(|rest| rest.split_whitespace().next())
+                    {
+                        recorded.lock().unwrap().push(target.to_string());
+                    }
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (format!("http://{address}"), targets, server)
+    }
+
+    #[tokio::test]
+    async fn explicit_idc_with_enterprise_provider_refreshes_through_aws_oidc() {
+        let captured_form = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/token", post(mock_external_idp_token_endpoint))
+            .with_state(TokenEndpointState {
+                captured_form: captured_form.clone(),
+            });
+        let token_server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (proxy_url, connect_targets, proxy_server) = spawn_recording_connect_proxy().await;
+
+        // KAM / kiro-manager-lite / Kiro-Go organization IdC export. A stray tokenEndpoint must
+        // not pull it onto the external IdP refresh either.
+        let credentials = KiroCredentials {
+            auth_method: Some("IdC".to_string()),
+            provider: Some("Enterprise".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            client_id: Some("client-123".to_string()),
+            client_secret: Some("secret-456".to_string()),
+            token_endpoint: Some(format!("http://{token_address}/token")),
+            auth_region: Some("eu-west-1".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.tls_backend = refresh_test_tls_backend();
+
+        let result = refresh_token(&credentials, &config, Some(&ProxyConfig::new(proxy_url))).await;
+        token_server.abort();
+        proxy_server.abort();
+
+        assert!(result.is_err(), "the recording proxy refuses every tunnel");
+        assert_eq!(
+            connect_targets.lock().unwrap().as_slice(),
+            ["oidc.eu-west-1.amazonaws.com:443"]
+        );
+        assert!(
+            captured_form.lock().unwrap().is_none(),
+            "the external IdP token endpoint must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_auth_method_with_enterprise_provider_refreshes_through_token_endpoint() {
+        let captured_form = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/token", post(mock_external_idp_token_endpoint))
+            .with_state(TokenEndpointState {
+                captured_form: captured_form.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            client_id: Some("client-123".to_string()),
+            token_endpoint: Some(format!("http://{address}/token")),
+            ..Default::default()
+        };
+
+        let refreshed = refresh_token(&credentials, &Config::default(), None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(refreshed.access_token.as_deref(), Some("new-access-token"));
+        let form = captured_form.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            form.get("client_id").map(String::as_str),
+            Some("client-123")
+        );
     }
 
     #[tokio::test]
