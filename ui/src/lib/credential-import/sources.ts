@@ -40,8 +40,6 @@ export const IMPORT_SOURCE_OPTIONS: Array<{ value: ImportSource; label: string }
   { value: 'generic', label: '通用 JSON' },
 ]
 
-const TEXT_SOURCES: DetectedSource[] = ['account-text', 'api-key-text']
-
 export function importSourceLabel(source: ImportSource): string {
   return IMPORT_SOURCE_OPTIONS.find((option) => option.value === source)?.label ?? source
 }
@@ -451,7 +449,7 @@ export function parseImportText(text: string, source: ImportSource = 'auto'): Im
 
   // JSONL 的每一行都是一个账号，按数组识别
   const detected = detectJsonSource(roots.length > 1 ? roots : roots[0])
-  const chosen = source === 'auto' || TEXT_SOURCES.includes(source) ? detected : source
+  const chosen = source === 'auto' ? detected : source
   const items = roots.flatMap(accountItems).map((item, index) => ({ label: `第 ${index + 1} 条`, item }))
   return collectAccounts(chosen, detected, items, buildNameLookup(roots[0]))
 }

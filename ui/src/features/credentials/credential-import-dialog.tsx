@@ -350,7 +350,7 @@ export function ImportCredentialsModal({ open, onClose, existingCredentials, onD
       update({ credentialId, warning: response.warning, label: response.email || row.label })
     } catch (error) {
       if (isDuplicateCredentialError(error)) {
-        update({ status: 'skipped', skipReason: `账号池中已存在（${extractErrorMessage(error)}）` })
+        update({ status: 'skipped', skipReason: `服务端查重：${extractErrorMessage(error)}` })
         return 'skipped'
       }
       update({ status: 'failed', error: extractErrorMessage(error) })
