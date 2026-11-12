@@ -813,20 +813,15 @@ fn credit_snapshot_estimates_by_tier_only_without_an_upstream_limit() {
 }
 
 #[test]
-fn subscription_key_and_rank_distinguish_pro_max_from_pro() {
+fn subscription_key_distinguishes_pro_max_from_pro() {
     for title in ["Kiro Pro Max", "KIRO PRO_MAX", "pro-max", "promax"] {
         assert_eq!(subscription_key(Some(title)), "pro_max", "title={title}");
-        assert_eq!(subscription_rank(Some(title)), 5, "title={title}");
     }
     assert_eq!(subscription_key(Some("Kiro Pro")), "pro");
-    assert_eq!(subscription_rank(Some("Kiro Pro")), 3);
     assert_eq!(subscription_key(Some("Kiro Pro+")), "pro_plus");
-    assert_eq!(subscription_rank(Some("Kiro Pro+")), 4);
     assert_eq!(subscription_key(Some("Kiro Power")), "power");
-    assert_eq!(subscription_rank(Some("Kiro Power")), 6);
     assert_eq!(subscription_key(Some("KIRO STUDENT")), "students");
     assert_eq!(subscription_key(Some("Kiro Students")), "students");
-    assert_eq!(subscription_rank(Some("Kiro Students")), 2);
     assert_eq!(subscription_key(Some("legacy trial")), "free");
 }
 

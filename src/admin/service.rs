@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
@@ -27,27 +27,24 @@ use super::types::{
     CredentialDiagnosticsResponse, CredentialInfoRefreshItem, CredentialInfoRefreshResponse,
     CredentialListItem, CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse,
     CredentialStatusItem, CredentialSummaryResponse, CredentialUsageSummaryItem,
-    CredentialUsageSummaryResponse, CredentialValidationGroup, CredentialValidationInfo,
-    CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
-    CredentialsStatusResponse, DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest,
-    LoadBalancingModeResponse, ManualModelResponse, ProfileArnSyncItem, ProfileArnSyncMode,
-    ProfileArnSyncResponse, ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse,
-    ProxyResourceImportEntry, ProxyResourceResponse, ProxyResourceTestRequest,
-    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
-    RequestApiKeyItem, RequestKeyUsageLimitItem, RequestKeyUsageLimitsResponse,
-    RuntimeConfigResponse, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
-    SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
-    SetCredentialRegionsRequest, SetCredentialRoutePolicyRequest, SetCredentialRpmRequest,
-    SetLoadBalancingModeRequest, SetSubscriptionModelListRequest, SetSupportedModelsRequest,
-    SetWarmupRequest, SubscriptionModelListItem, SubscriptionModelListsResponse,
-    SupportedModelsResponse, SyncProfileArnRequest, SyncSubscriptionModelListRequest,
-    TestCredentialRequest, TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse,
-    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
-    UsageCleanupResumeRequest, UsageCleanupStatusResponse, UsageDashboardAccountItem,
-    UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
-    ValidateExternalCredentialsRequest,
+    CredentialUsageSummaryResponse, CredentialsPageResponse, CredentialsStatusResponse,
+    DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest, LoadBalancingModeResponse,
+    ManualModelResponse, ProfileArnSyncItem, ProfileArnSyncMode, ProfileArnSyncResponse,
+    ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse, ProxyResourceImportEntry,
+    ProxyResourceResponse, ProxyResourceTestRequest, ProxyResourceTestResponse,
+    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem,
+    RequestKeyUsageLimitItem, RequestKeyUsageLimitsResponse, RuntimeConfigResponse,
+    SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
+    SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
+    SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
+    SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
+    SubscriptionModelListItem, SubscriptionModelListsResponse, SupportedModelsResponse,
+    SyncProfileArnRequest, SyncSubscriptionModelListRequest, TestCredentialRequest,
+    TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest,
+    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
+    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
+    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupResumeRequest,
+    UsageCleanupStatusResponse, UsageDashboardAccountItem, UsageDashboardAccountsResponse,
 };
 use crate::anthropic::request_key_limits::{
     KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
@@ -125,7 +122,6 @@ const MAX_LOCAL_RATE_LIMIT_RETRIES: u32 = 20;
 const CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET: StdDuration = StdDuration::from_secs(120);
 const MIN_LOCAL_RATE_LIMIT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
 const MAX_LOCAL_RATE_LIMIT_RETRY_DELAY: StdDuration = StdDuration::from_secs(5);
-const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
@@ -427,7 +423,6 @@ impl CredentialStatusBuildOptions {
 
 #[derive(Debug, Clone)]
 struct CredentialLookupLabel {
-    id: u64,
     email: Option<String>,
     disabled: bool,
 }
@@ -1844,30 +1839,10 @@ impl AdminService {
                 (
                     credential.id,
                     CredentialLookupLabel {
-                        id: credential.id,
                         email: credential.email,
                         disabled: credential.disabled,
                     },
                 )
-            })
-            .collect()
-    }
-
-    fn credential_lookup_by_email(&self) -> HashMap<String, CredentialLookupLabel> {
-        self.token_manager
-            .base_snapshot()
-            .entries
-            .into_iter()
-            .filter_map(|credential| {
-                let email = credential.email.as_deref()?;
-                Some((
-                    email_key(email),
-                    CredentialLookupLabel {
-                        id: credential.id,
-                        email: credential.email,
-                        disabled: credential.disabled,
-                    },
-                ))
             })
             .collect()
     }
@@ -3163,308 +3138,6 @@ impl AdminService {
         })
     }
 
-    pub async fn validate_existing_credentials(
-        &self,
-        req: ValidateExistingCredentialsRequest,
-    ) -> Result<CredentialValidationResponse, AdminServiceError> {
-        let previous = self
-            .postgres_store
-            .load_credential_account_info()
-            .await
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        let requested_ids: HashSet<u64> = req.ids.into_iter().collect();
-        let scope = req
-            .scope
-            .unwrap_or_else(|| "all".to_string())
-            .to_lowercase();
-        let (_, _, _, _, _, _, _, credentials) =
-            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
-        let candidates: Vec<_> = credentials
-            .into_iter()
-            .filter(|credential| {
-                if !requested_ids.is_empty() {
-                    return requested_ids.contains(&credential.id);
-                }
-                match scope.as_str() {
-                    "enabled" => !credential.disabled,
-                    "disabled" => credential.disabled,
-                    "selected" => false,
-                    _ => true,
-                }
-            })
-            .collect();
-        if candidates.is_empty() {
-            return Err(AdminServiceError::InvalidCredential(
-                "没有可校验的凭据".to_string(),
-            ));
-        }
-
-        let mut items = Vec::with_capacity(candidates.len());
-        for credential in candidates {
-            let previous_info = previous.get(&credential.id).map(validation_info_from_row);
-            match self.get_account_info(credential.id, req.force).await {
-                Ok(current) => {
-                    let current_info = validation_info_from_balance(&current);
-                    let change_kind =
-                        compare_subscription_change(previous_info.as_ref(), Some(&current_info));
-                    let subscription_title = current_info
-                        .subscription_title
-                        .clone()
-                        .unwrap_or_else(|| "未知".to_string());
-                    let subscription_key = subscription_key(Some(&subscription_title));
-                    items.push(CredentialValidationItem {
-                        id: Some(credential.id),
-                        index: None,
-                        email: credential.email.clone(),
-                        disabled: Some(credential.disabled),
-                        ok: true,
-                        previous: previous_info,
-                        current: Some(current_info),
-                        change_kind,
-                        subscription_key,
-                        subscription_title,
-                        error: None,
-                        subscription_checked: true,
-                        usage_checked: true,
-                        liveness_checked: false,
-                        subscription_ok: Some(true),
-                        usage_ok: Some(true),
-                        liveness_ok: None,
-                        usage_error: None,
-                        liveness_error: None,
-                        liveness_model: None,
-                        liveness_response: None,
-                        matched_existing_credential_id: None,
-                        existing_disabled: None,
-                    });
-                }
-                Err(err) => items.push(CredentialValidationItem {
-                    id: Some(credential.id),
-                    index: None,
-                    email: credential.email.clone(),
-                    disabled: Some(credential.disabled),
-                    ok: false,
-                    previous: previous_info,
-                    current: None,
-                    change_kind: "failed".to_string(),
-                    subscription_key: "failed".to_string(),
-                    subscription_title: "查询失败".to_string(),
-                    error: Some(err.to_string()),
-                    subscription_checked: true,
-                    usage_checked: true,
-                    liveness_checked: false,
-                    subscription_ok: Some(false),
-                    usage_ok: Some(false),
-                    liveness_ok: None,
-                    usage_error: Some(err.to_string()),
-                    liveness_error: None,
-                    liveness_model: None,
-                    liveness_response: None,
-                    matched_existing_credential_id: None,
-                    existing_disabled: None,
-                }),
-            }
-        }
-
-        Ok(build_validation_response(items))
-    }
-
-    pub async fn validate_external_credentials(
-        &self,
-        req: ValidateExternalCredentialsRequest,
-    ) -> Result<CredentialValidationResponse, AdminServiceError> {
-        let query_subscription = req.query_subscription;
-        let query_usage = req.query_usage;
-        let check_liveness = req.check_liveness;
-        if !query_subscription && !query_usage && !check_liveness {
-            return Err(AdminServiceError::InvalidCredential(
-                "请至少选择订阅、用量或验活中的一个校验项".to_string(),
-            ));
-        }
-        let query_account_info = query_subscription || query_usage;
-        let liveness_model = req
-            .liveness_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .unwrap_or(DEFAULT_VALIDATION_TEST_MODEL)
-            .to_string();
-        let liveness_prompt = req
-            .liveness_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty())
-            .unwrap_or(DEFAULT_VALIDATION_TEST_PROMPT)
-            .to_string();
-
-        if req.credentials.is_empty() {
-            return Err(AdminServiceError::InvalidCredential(
-                "请先提供要校验的凭据 JSON".to_string(),
-            ));
-        }
-        if req.credentials.len() > MAX_CREDENTIALS_PAGE_LIMIT {
-            return Err(AdminServiceError::InvalidCredential(format!(
-                "单次最多校验 {} 个凭据",
-                MAX_CREDENTIALS_PAGE_LIMIT
-            )));
-        }
-
-        let existing_by_email = self.credential_lookup_by_email();
-        let mut items = Vec::with_capacity(req.credentials.len());
-        for (index, req) in req.credentials.into_iter().enumerate() {
-            let email = req.email.clone();
-            let matched = email
-                .as_deref()
-                .and_then(|value| existing_by_email.get(&email_key(value)))
-                .cloned();
-            let credential = match self.credential_from_request(req, false) {
-                Ok(credential) => credential,
-                Err(err) => {
-                    items.push(CredentialValidationItem {
-                        id: None,
-                        index: Some(index + 1),
-                        email,
-                        disabled: None,
-                        ok: false,
-                        previous: None,
-                        current: None,
-                        change_kind: "failed".to_string(),
-                        subscription_key: "failed".to_string(),
-                        subscription_title: "解析失败".to_string(),
-                        error: Some(err.to_string()),
-                        subscription_checked: query_subscription,
-                        usage_checked: query_usage,
-                        liveness_checked: check_liveness,
-                        subscription_ok: query_subscription.then_some(false),
-                        usage_ok: query_usage.then_some(false),
-                        liveness_ok: check_liveness.then_some(false),
-                        usage_error: None,
-                        liveness_error: None,
-                        liveness_model: check_liveness.then(|| liveness_model.clone()),
-                        liveness_response: None,
-                        matched_existing_credential_id: matched.as_ref().map(|item| item.id),
-                        existing_disabled: matched.as_ref().map(|item| item.disabled),
-                    });
-                    continue;
-                }
-            };
-
-            // JSON 里没有 profileArn 的 IdC 账号先查一次；组织账号带 Builder ID 占位查额度会被拒。
-            let credential = match self
-                .kiro_provider
-                .discover_profile_arn_for_external_credentials(credential.clone())
-                .await
-            {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    tracing::debug!("外部凭据校验前补全 profileArn 失败: {}", error);
-                    credential
-                }
-            };
-
-            let mut current: Option<CredentialValidationInfo> = None;
-            let mut usage_error: Option<String> = None;
-            if query_account_info {
-                match self
-                    .token_manager
-                    .probe_usage_limits_for_credentials(credential.clone())
-                    .await
-                {
-                    Ok(usage) => {
-                        current = Some(validation_info_from_usage(&usage));
-                    }
-                    Err(err) => {
-                        usage_error = Some(err.to_string());
-                    }
-                }
-            }
-
-            let mut liveness_error: Option<String> = None;
-            let mut liveness_response: Option<String> = None;
-            if check_liveness {
-                match self
-                    .test_external_credential_liveness(
-                        credential,
-                        &liveness_model,
-                        &liveness_prompt,
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        liveness_response = Some(response);
-                    }
-                    Err(err) => {
-                        liveness_error = Some(err.to_string());
-                    }
-                }
-            }
-
-            let query_ok = !query_account_info || usage_error.is_none();
-            let liveness_ok = !check_liveness || liveness_error.is_none();
-            let ok = query_ok && liveness_ok;
-            let error = validation_error_summary(usage_error.as_deref(), liveness_error.as_deref());
-            let subscription_title = if query_subscription {
-                current
-                    .as_ref()
-                    .and_then(|info| info.subscription_title.clone())
-                    .unwrap_or_else(|| {
-                        if usage_error.is_some() {
-                            "查询失败".to_string()
-                        } else {
-                            "未知".to_string()
-                        }
-                    })
-            } else if query_usage {
-                if usage_error.is_some() {
-                    "查询失败".to_string()
-                } else {
-                    "用量已查询".to_string()
-                }
-            } else if liveness_error.is_some() {
-                "验活失败".to_string()
-            } else {
-                "验活成功".to_string()
-            };
-            let subscription_key = if ok {
-                if query_subscription {
-                    subscription_key(Some(&subscription_title))
-                } else {
-                    "external".to_string()
-                }
-            } else {
-                "failed".to_string()
-            };
-
-            items.push(CredentialValidationItem {
-                id: None,
-                index: Some(index + 1),
-                email,
-                disabled: None,
-                ok,
-                previous: None,
-                current,
-                change_kind: if ok { "external" } else { "failed" }.to_string(),
-                subscription_key,
-                subscription_title,
-                error,
-                subscription_checked: query_subscription,
-                usage_checked: query_usage,
-                liveness_checked: check_liveness,
-                subscription_ok: query_subscription.then_some(query_ok),
-                usage_ok: query_usage.then_some(query_ok),
-                liveness_ok: check_liveness.then_some(liveness_ok),
-                usage_error,
-                liveness_error,
-                liveness_model: check_liveness.then(|| liveness_model.clone()),
-                liveness_response,
-                matched_existing_credential_id: matched.as_ref().map(|item| item.id),
-                existing_disabled: matched.as_ref().map(|item| item.disabled),
-            });
-        }
-
-        Ok(build_validation_response(items))
-    }
-
     /// 使用指定凭据发起一次模型调用测试。
     pub async fn test_credential(
         &self,
@@ -3514,41 +3187,6 @@ impl AdminService {
             response: response_text,
             duration_ms: started_at.elapsed().as_millis() as u64,
         })
-    }
-
-    async fn test_external_credential_liveness(
-        &self,
-        credential: KiroCredentials,
-        model: &str,
-        prompt: &str,
-    ) -> Result<String, AdminServiceError> {
-        let (_, _, _, request_body) = self.build_model_test_request(model, prompt)?;
-        let runtime_config = self.token_manager.runtime_config();
-        let api_response = self
-            .kiro_provider
-            .call_api_with_external_credentials(credential, &request_body)
-            .await
-            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
-        let (response, completion) = api_response.into_parts();
-        let body_bytes = match response_bytes_with_limit_and_body_timeout(
-            response,
-            runtime_config.kiro_upstream_response_timeout_secs,
-            ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                completion.release();
-                return Err(AdminServiceError::UpstreamError(format!(
-                    "读取验活响应失败: {}",
-                    e
-                )));
-            }
-        };
-        let response_text = parse_model_test_response(&body_bytes)?;
-        completion.release();
-        Ok(response_text)
     }
 
     fn build_model_test_request(
@@ -9998,123 +9636,8 @@ fn credential_base_search_text(credential: &CredentialListItem) -> String {
     .to_lowercase()
 }
 
-fn validation_info_from_row(row: &CredentialAccountInfoRow) -> CredentialValidationInfo {
-    CredentialValidationInfo {
-        subscription_title: row.subscription_title.clone(),
-        current_usage: row.current_usage,
-        usage_limit: row.usage_limit,
-        usage_percentage: row.usage_percentage,
-        checked_at: row.checked_at.clone(),
-    }
-}
-
-fn validation_info_from_balance(balance: &BalanceResponse) -> CredentialValidationInfo {
-    CredentialValidationInfo {
-        subscription_title: balance.subscription_title.clone(),
-        current_usage: balance.current_usage,
-        usage_limit: balance.usage_limit,
-        usage_percentage: balance.usage_percentage,
-        checked_at: balance.checked_at.clone(),
-    }
-}
-
-fn validation_info_from_usage(usage: &UsageLimitsResponse) -> CredentialValidationInfo {
-    let current_usage = usage.current_usage();
-    let usage_limit = usage.usage_limit();
-    let usage_percentage = if usage_limit > 0.0 {
-        (current_usage / usage_limit * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-    CredentialValidationInfo {
-        subscription_title: usage.subscription_title().map(|value| value.to_string()),
-        current_usage,
-        usage_limit,
-        usage_percentage,
-        checked_at: Utc::now().to_rfc3339(),
-    }
-}
-
-fn validation_error_summary(
-    usage_error: Option<&str>,
-    liveness_error: Option<&str>,
-) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(error) = usage_error.filter(|value| !value.trim().is_empty()) {
-        parts.push(format!("查询失败: {}", error));
-    }
-    if let Some(error) = liveness_error.filter(|value| !value.trim().is_empty()) {
-        parts.push(format!("验活失败: {}", error));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("；"))
-    }
-}
-
-fn compare_subscription_change(
-    previous: Option<&CredentialValidationInfo>,
-    current: Option<&CredentialValidationInfo>,
-) -> String {
-    let Some(previous) = previous else {
-        return "unknown".to_string();
-    };
-    let Some(current) = current else {
-        return "unknown".to_string();
-    };
-    let previous_rank = subscription_rank(previous.subscription_title.as_deref());
-    let current_rank = subscription_rank(current.subscription_title.as_deref());
-    if previous_rank == 0 || current_rank == 0 {
-        return "unknown".to_string();
-    }
-    if current_rank < previous_rank {
-        "downgraded".to_string()
-    } else if current_rank > previous_rank {
-        "upgraded".to_string()
-    } else {
-        "unchanged".to_string()
-    }
-}
-
 fn subscription_key(title: Option<&str>) -> String {
     crate::model::model_support::subscription_tier_key(title).to_string()
-}
-
-fn subscription_rank(title: Option<&str>) -> u8 {
-    match subscription_key(title).as_str() {
-        "free" => 1,
-        "students" => 2,
-        "pro" => 3,
-        "pro_plus" => 4,
-        "pro_max" => 5,
-        "power" => 6,
-        _ => 0,
-    }
-}
-
-fn validation_group_key(item: &CredentialValidationItem) -> String {
-    match item.change_kind.as_str() {
-        "failed" | "downgraded" | "upgraded" => item.change_kind.clone(),
-        _ => item.subscription_key.clone(),
-    }
-}
-
-fn validation_group_title(key: &str) -> String {
-    match key {
-        "failed" => "查询失败".to_string(),
-        "downgraded" => "疑似订阅掉级".to_string(),
-        "upgraded" => "订阅升级".to_string(),
-        "students" => "Kiro Students".to_string(),
-        "pro_plus" => "Kiro Pro+".to_string(),
-        "pro" => "Kiro Pro".to_string(),
-        "pro_max" => "Kiro Pro Max".to_string(),
-        "power" => "Kiro Power".to_string(),
-        "free" => "Kiro Free".to_string(),
-        "unknown" => "未知订阅".to_string(),
-        "external" => "外部校验".to_string(),
-        other => other.to_string(),
-    }
 }
 
 fn subscription_filter_key(value: &str) -> Option<String> {
@@ -10144,77 +9667,6 @@ fn subscription_label(key: &str) -> &'static str {
         "power" => "Kiro Power",
         _ => "未知订阅",
     }
-}
-
-fn build_validation_response(items: Vec<CredentialValidationItem>) -> CredentialValidationResponse {
-    let total = items.len();
-    let success = items.iter().filter(|item| item.ok).count();
-    let failed = total.saturating_sub(success);
-    let downgraded = items
-        .iter()
-        .filter(|item| item.change_kind == "downgraded")
-        .count();
-    let upgraded = items
-        .iter()
-        .filter(|item| item.change_kind == "upgraded")
-        .count();
-    let unchanged = items
-        .iter()
-        .filter(|item| item.change_kind == "unchanged")
-        .count();
-    let mut grouped: BTreeMap<String, Vec<CredentialValidationItem>> = BTreeMap::new();
-    for item in items {
-        grouped
-            .entry(validation_group_key(&item))
-            .or_default()
-            .push(item);
-    }
-    let preferred = [
-        "downgraded",
-        "failed",
-        "upgraded",
-        "power",
-        "pro_max",
-        "pro_plus",
-        "pro",
-        "students",
-        "free",
-        "external",
-        "unknown",
-    ];
-    let mut groups = Vec::new();
-    for key in preferred {
-        if let Some(items) = grouped.remove(key) {
-            groups.push(CredentialValidationGroup {
-                key: key.to_string(),
-                title: validation_group_title(key),
-                count: items.len(),
-                items,
-            });
-        }
-    }
-    for (key, items) in grouped {
-        groups.push(CredentialValidationGroup {
-            title: validation_group_title(&key),
-            count: items.len(),
-            key,
-            items,
-        });
-    }
-
-    CredentialValidationResponse {
-        total,
-        success,
-        failed,
-        downgraded,
-        upgraded,
-        unchanged,
-        groups,
-    }
-}
-
-fn email_key(email: &str) -> String {
-    email.trim().to_lowercase()
 }
 
 fn normalize_usage_cleanup_request(

@@ -15137,10 +15137,9 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
-    /// 使用一份外部凭据临时查询账号信息，不加入凭据池、不改变调度状态。
+    /// 为不在凭据池里的凭据（号库账号、导入前的能力发现）刷新 token 并构造调用上下文。
     ///
-    /// 这个方法用于 Admin 的外部 JSON 订阅校验。它允许使用凭据绑定的代理资源，
-    /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
+    /// 使用凭据绑定的代理资源；不保存 token、不启用 / 禁用任何池内凭据，也不占用调度并发槽。
     pub async fn acquire_context_for_external_credentials(
         &self,
         credentials: KiroCredentials,
@@ -15203,33 +15202,6 @@ impl MultiTokenManager {
             refreshed,
             false,
             tokio::time::Instant::now() + CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT,
-        )
-        .await
-    }
-
-    /// 使用一份外部凭据临时查询账号信息，不加入凭据池、不改变调度状态。
-    ///
-    /// 这个方法用于 Admin 的外部 JSON 订阅校验。它允许使用凭据绑定的代理资源，
-    /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
-    pub async fn probe_usage_limits_for_credentials(
-        &self,
-        credentials: KiroCredentials,
-    ) -> anyhow::Result<UsageLimitsResponse> {
-        let mut config = self.runtime_config();
-        config.snapshot_kiro_version_for_request();
-        let request_kiro_version = config.effective_kiro_version();
-        let ctx = self
-            .acquire_context_for_external_credentials_with_version(
-                credentials,
-                Some(&request_kiro_version),
-            )
-            .await?;
-        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
-        get_usage_limits(
-            &ctx.credentials,
-            &config,
-            &ctx.token,
-            effective_proxy.as_ref(),
         )
         .await
     }

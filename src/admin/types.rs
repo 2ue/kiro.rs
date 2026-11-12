@@ -1668,99 +1668,6 @@ pub struct ProfileArnSyncResponse {
     pub items: Vec<ProfileArnSyncItem>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ValidateExistingCredentialsRequest {
-    /// all / enabled / disabled / selected
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub ids: Vec<u64>,
-    #[serde(default = "default_true")]
-    pub force: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ValidateExternalCredentialsRequest {
-    #[serde(default)]
-    pub credentials: Vec<AddCredentialRequest>,
-    /// 是否查询订阅标题。默认保持旧行为：查询。
-    #[serde(default = "default_true")]
-    pub query_subscription: bool,
-    /// 是否查询当前用量/额度。默认保持旧行为：查询。
-    #[serde(default = "default_true")]
-    pub query_usage: bool,
-    /// 是否发送一次最小模型请求做验活。默认发送模型请求。
-    #[serde(default = "default_true")]
-    pub check_liveness: bool,
-    /// 验活模型；为空时使用管理端默认验活模型。
-    #[serde(default)]
-    pub liveness_model: Option<String>,
-    /// 验活提示词；为空时使用管理端默认提示词。
-    #[serde(default)]
-    pub liveness_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialValidationInfo {
-    pub subscription_title: Option<String>,
-    pub current_usage: f64,
-    pub usage_limit: f64,
-    pub usage_percentage: f64,
-    pub checked_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialValidationItem {
-    pub id: Option<u64>,
-    pub index: Option<usize>,
-    pub email: Option<String>,
-    pub disabled: Option<bool>,
-    pub ok: bool,
-    pub previous: Option<CredentialValidationInfo>,
-    pub current: Option<CredentialValidationInfo>,
-    pub change_kind: String,
-    pub subscription_key: String,
-    pub subscription_title: String,
-    pub error: Option<String>,
-    pub subscription_checked: bool,
-    pub usage_checked: bool,
-    pub liveness_checked: bool,
-    pub subscription_ok: Option<bool>,
-    pub usage_ok: Option<bool>,
-    pub liveness_ok: Option<bool>,
-    pub usage_error: Option<String>,
-    pub liveness_error: Option<String>,
-    pub liveness_model: Option<String>,
-    pub liveness_response: Option<String>,
-    pub matched_existing_credential_id: Option<u64>,
-    pub existing_disabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialValidationGroup {
-    pub key: String,
-    pub title: String,
-    pub count: usize,
-    pub items: Vec<CredentialValidationItem>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CredentialValidationResponse {
-    pub total: usize,
-    pub success: usize,
-    pub failed: usize,
-    pub downgraded: usize,
-    pub upgraded: usize,
-    pub unchanged: usize,
-    pub groups: Vec<CredentialValidationGroup>,
-}
-
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应
@@ -2711,26 +2618,6 @@ mod tests {
 
         assert_eq!(request.defaults.proxy_resource_ids, vec![1, 3, 5]);
         assert!(request.defaults.proxy_resource_id.is_none());
-    }
-
-    #[test]
-    fn validate_external_credentials_defaults_liveness_on_but_accepts_override() {
-        let default_req: ValidateExternalCredentialsRequest =
-            serde_json::from_value(serde_json::json!({
-                "credentials": [{ "kiroApiKey": "ksk_fake" }]
-            }))
-            .unwrap();
-        assert!(default_req.query_subscription);
-        assert!(default_req.query_usage);
-        assert!(default_req.check_liveness);
-
-        let override_req: ValidateExternalCredentialsRequest =
-            serde_json::from_value(serde_json::json!({
-                "checkLiveness": false,
-                "credentials": [{ "kiroApiKey": "ksk_fake" }]
-            }))
-            .unwrap();
-        assert!(!override_req.check_liveness);
     }
 
     #[test]

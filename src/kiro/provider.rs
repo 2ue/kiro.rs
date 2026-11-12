@@ -4694,26 +4694,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_validation_fills_profile_arn_without_storing_the_credential() {
-        let server = FakeBadRequestServer::start().await;
-        let (provider, manager) = fake_profile_provider(&server.base_url, Vec::new(), None);
-        let resolved = provider
-            .discover_profile_arn_for_external_credentials({
-                // IdC 刷新地址固定指向 AWS OIDC；离线测试用可指向假上游的 External IdP。
-                let mut credential = fake_external_idp_credential(9, "org-external");
-                credential.token_endpoint = Some(format!("{}/oauth-refresh", server.base_url));
-                credential
-            })
-            .await
-            .expect("external organization profile");
-        assert_eq!(
-            resolved.profile_arn.as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
-        );
-        assert!(manager.acquire_context_for_credential(9).await.is_err());
-    }
-
-    #[tokio::test]
     async fn idc_profile_403_without_builder_id_answer_is_not_marked() {
         let server = FakeBadRequestServer::start().await;
         let (provider, manager) = fake_profile_provider(
@@ -13108,38 +13088,6 @@ impl KiroProvider {
         .await
     }
 
-    /// 外部 JSON 校验用：凭据不在池里，查到的 profileArn 只回填到返回值，不写库。
-    pub async fn discover_profile_arn_for_external_credentials(
-        &self,
-        mut credentials: KiroCredentials,
-    ) -> anyhow::Result<KiroCredentials> {
-        if !profile_arn_discovery_applies(&credentials) {
-            return Ok(credentials);
-        }
-        let mut config = self
-            .token_manager
-            .runtime_config_snapshot()
-            .as_ref()
-            .clone();
-        config.snapshot_kiro_version_for_request();
-        let request_kiro_version = config.effective_kiro_version();
-        let ctx = self
-            .token_manager
-            .acquire_context_for_external_credentials_with_version(
-                credentials.clone(),
-                Some(&request_kiro_version),
-            )
-            .await?;
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
-        if let Some(profile_arn) = self
-            .fetch_enterprise_profile_arn_for_context(&ctx, &config, &machine_id, None)
-            .await?
-        {
-            credentials.profile_arn = Some(profile_arn);
-        }
-        Ok(credentials)
-    }
-
     /// 丢弃已存的 profileArn 并重新查询，用于已存值本身有误的情况（组织账号被误标为 Builder ID、
     /// profile 被重建、外部工具导出的 ARN 已失效）。只处理 IdC 与 External IdP；返回查询后的值。
     pub async fn rediscover_profile_arn_for_credential(
@@ -13202,32 +13150,6 @@ impl KiroProvider {
         self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id, None)
             .await;
         Ok(())
-    }
-
-    /// 使用外部临时凭据发送一次非流式 API 请求。
-    ///
-    /// 仅用于 Admin 外部 JSON 验活：不加入凭据池、不参与负载均衡、不累计调度状态。
-    pub async fn call_api_with_external_credentials(
-        &self,
-        credentials: KiroCredentials,
-        request_body: &str,
-    ) -> anyhow::Result<KiroApiResponse> {
-        let request_kiro_version = self.token_manager.runtime_config().effective_kiro_version();
-        let ctx = self
-            .token_manager
-            .acquire_context_for_external_credentials_with_version(
-                credentials,
-                Some(&request_kiro_version),
-            )
-            .await?;
-        self.call_api_with_single_context(
-            ctx,
-            request_body,
-            "external".to_string(),
-            "外部凭据".to_string(),
-            request_kiro_version,
-        )
-        .await
     }
 
     /// 使用外部临时凭据同步可用模型列表。
