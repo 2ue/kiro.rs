@@ -35,6 +35,9 @@ pub struct UsageLimitsResponse {
 pub struct UserInfo {
     #[serde(default)]
     pub email: Option<String>,
+    /// Portal `GetUserInfo` 返回的身份提供方（如 Google / Github / BuilderId）；REST 额度接口不返回。
+    #[serde(default)]
+    pub idp: Option<String>,
 }
 
 /// 订阅信息
@@ -189,6 +192,15 @@ impl UsageLimitsResponse {
             .and_then(|info| info.email.as_deref())
             .map(str::trim)
             .filter(|email| !email.is_empty())
+    }
+
+    /// 获取上游返回的身份提供方。
+    pub fn idp(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.idp.as_deref())
+            .map(str::trim)
+            .filter(|idp| !idp.is_empty())
     }
 
     /// 获取订阅标题

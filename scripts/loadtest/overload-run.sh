@@ -111,7 +111,6 @@ json.dump({"host": "127.0.0.1", "port": int(port), "apiKey": api_key, "adminApiK
            "postgres": {"url": f"postgres://kiro_rs:{pgpw}@127.0.0.1:25432/{db}", "maxConnections": 10},
            "redis": {"url": f"redis://127.0.0.1:26379/{redis_db}", "keyPrefix": "kiro-overload-probe"}},
           open(f"{d}/config.json", "w"))
-json.dump([], open(f"{d}/credentials.json", "w"))
 PY
   chmod 600 "$D"/*.json "$D/seed.sql"
   docker exec -i kiro-rs-postgres-local psql -U kiro_rs -d $DB -v ON_ERROR_STOP=1 -q < "$D/seed.sql" || return 1
@@ -253,7 +252,7 @@ for case_name in $CASES; do
   wait_port $MOCK_PORT || continue
   curl -sS -m 5 -X POST "http://127.0.0.1:$MOCK_PORT/__control" -H 'content-type: application/json' \
     -d "$(echo "$mock_json" | python3 -c 'import json,sys;d=json.load(sys.stdin);d["resetCounters"]=True;print(json.dumps(d))')" >/dev/null
-  (cd "$D" && RUST_LOG=info nohup ./kiro-rs -c config.json --credentials credentials.json > "$D/server-$case_name.log" 2>&1 < /dev/null &)
+  (cd "$D" && RUST_LOG=info nohup ./kiro-rs -c config.json > "$D/server-$case_name.log" 2>&1 < /dev/null &)
   wait_port $PORT || { tail -20 "$D/server-$case_name.log"; stop_all; continue; }
   # Process CPU and RSS of the server for the whole case: a fault must not pin CPU, and the
   # pool must come back to idle CPU after it. One line per second: epoch utime stime rss_kb.
@@ -312,5 +311,5 @@ stop_all
 if [ "${KEEP:-0}" != "1" ]; then
   docker exec kiro-rs-postgres-local psql -U kiro_rs -d postgres -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" 2>&1 | grep -v NOTICE
   docker exec kiro-rs-redis-local redis-cli -n $REDIS_DB FLUSHDB >/dev/null
-  rm -f "$D"/config.json "$D"/credentials.json "$D/kiro-rs" "$D/limits.json"
+  rm -f "$D"/config.json "$D/kiro-rs" "$D/limits.json"
 fi

@@ -18,6 +18,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { seedCredentialsBeforeStartup } from './postgres-credential-seed.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
@@ -607,19 +608,23 @@ function serviceConfig({ databaseUrl, redisUrl, port, localPort }) {
   }
 }
 
-async function startService(configPath, credentialsPath, logPath, port) {
+function serviceEnvironment(port) {
+  return validationChildEnvironment({
+    KIRO_API_KEY: '', KIRO_RS_HOST: '127.0.0.1', KIRO_RS_PORT: String(port),
+    RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs::anthropic::handlers=info,kiro_rs=info',
+  })
+}
+
+async function startService(configPath, logPath, port) {
   const logFd = fs.openSync(logPath, 'a')
-  const child = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const child = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
-    env: validationChildEnvironment({
-      KIRO_API_KEY: '', KIRO_RS_HOST: '127.0.0.1', KIRO_RS_PORT: String(port),
-      RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs::anthropic::handlers=info,kiro_rs=info',
-    }),
+    env: serviceEnvironment(port),
     stdio: ['ignore', logFd, logFd], detached: true,
   })
   ACTIVE_CHILDREN.add(child)
   child.once('exit', () => { try { fs.closeSync(logFd) } catch {} ACTIVE_CHILDREN.delete(child) })
-  const service = { child, port, baseUrl: `http://127.0.0.1:${port}`, logPath, configPath, credentialsPath }
+  const service = { child, port, baseUrl: `http://127.0.0.1:${port}`, logPath, configPath }
   try {
     await waitFor(async () => {
       if (child.exitCode !== null) throw new Error(`service exited ${child.exitCode}`)
@@ -828,14 +833,24 @@ async function runRound(round) {
   const roundRoot = path.join(TEMP_ROOT, `round-${round}`)
   fs.mkdirSync(roundRoot, { recursive: true, mode: 0o700 })
   const configPaths = []
-  const credentialPath = path.join(roundRoot, 'credentials.json')
-  fs.writeFileSync(credentialPath, `${JSON.stringify(credentialsFixture(), null, 2)}\n`, { mode: 0o600 })
+  let credentialsSeeded = false
   const start = async (name, port) => {
     const configPath = path.join(roundRoot, `${name}.config.json`)
     const logPath = path.join(roundRoot, `${name}.log`)
     fs.writeFileSync(configPath, `${JSON.stringify(serviceConfig({ databaseUrl: dbUrl, redisUrl, port, localPort }), null, 2)}\n`, { mode: 0o600 })
     configPaths.push(configPath)
-    return startService(configPath, credentialPath, logPath, port)
+    if (!credentialsSeeded) {
+      seedCredentialsBeforeStartup({
+ binary: BINARY,
+        configPath,
+        serviceEnvironment: serviceEnvironment(port),
+        postgresUrl: dbUrl,
+        credentials: credentialsFixture(),
+        cwd: ROOT,
+      })
+      credentialsSeeded = true
+    }
+    return startService(configPath, logPath, port)
   }
   const serviceA = await start('a', await reservePort())
   const serviceB = await start('b', await reservePort())

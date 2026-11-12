@@ -26,7 +26,6 @@ from typing import Iterable
 REPO = Path(__file__).resolve().parents[4]
 DEFAULT_ROOT = Path(os.environ.get("KIROTEST_DEV_ROOT", "/tmp/kirotest-dev"))
 DEFAULT_CONFIG = DEFAULT_ROOT / "config" / "config.json"
-DEFAULT_CREDENTIALS = DEFAULT_ROOT / "config" / "credentials.json"
 DEV_CACHE = Path.home() / ".cache" / "kirotest-dev"
 DEFAULT_BINARY = DEV_CACHE / "kiro-rs-dev"
 DEFAULT_TARGET = DEV_CACHE / "cargo-target-debug"
@@ -97,7 +96,6 @@ def parse_args() -> argparse.Namespace:
         help="生产实例只读健康探针端口",
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--credentials", type=Path, default=DEFAULT_CREDENTIALS)
     parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
     parser.add_argument("--target-dir", type=Path, default=DEFAULT_TARGET)
     parser.add_argument("--pid-file", type=Path, default=DEFAULT_PID)
@@ -411,7 +409,7 @@ def install_binary(built: Path, destination: Path) -> str:
 
 
 def start_server(args: argparse.Namespace, digest: str, log_handle) -> int:
-    command = [str(args.binary), "-c", str(args.config), "--credentials", str(args.credentials)]
+    command = [str(args.binary), "-c", str(args.config)]
     env = os.environ.copy()
     env["KIRO_RS_HOST"] = "0.0.0.0"
     process = subprocess.Popen(
@@ -486,7 +484,6 @@ def run(args: argparse.Namespace) -> int:
     ):
         raise ValueError("资源暂停阈值必须不高于恢复阈值；load 恢复阈值必须不高于暂停阈值")
     args.config = args.config.resolve()
-    args.credentials = args.credentials.resolve()
     args.binary = args.binary.resolve()
     args.target_dir = args.target_dir.resolve()
     args.pid_file = args.pid_file.resolve()

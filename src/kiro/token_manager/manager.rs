@@ -1088,6 +1088,10 @@ pub struct MultiTokenManager {
     /// 异步自愈 single-flight：账号池全灭时大量并发请求会同时走到自愈分支，
     /// 只让一个请求写 PgSQL，其余请求等它完成后按最新状态重新选择。
     auto_heal_gate: TokioMutex<()>,
+    /// 新增凭据的“复查重复 → 写库 → 登记到内存”三步在这里串行。token 刷新等网络调用在锁外，
+    /// 多个导入可以并发；两个请求带同一 refreshToken / kiroApiKey 时，后拿到锁的一方在复查时
+    /// 发现重复并返回“凭据已存在”。
+    credential_insert_gate: TokioMutex<()>,
     #[cfg(test)]
     auto_heal_pgsql_attempts: AtomicU64,
     /// Secret-free capability cohorts are rebuilt only after a relevant credential/config/proxy
@@ -2792,6 +2796,7 @@ impl MultiTokenManager {
             selection_reservation_gate: TokioMutex::new(()),
             tier_sticky_migration_last: Mutex::new(None),
             auto_heal_gate: TokioMutex::new(()),
+            credential_insert_gate: TokioMutex::new(()),
             #[cfg(test)]
             auto_heal_pgsql_attempts: AtomicU64::new(0),
             model_capability_cohort_generation: AtomicU64::new(1),
@@ -9456,6 +9461,30 @@ impl MultiTokenManager {
         cred
     }
 
+    /// 池里已有同一 refreshToken（API Key 凭据比较 kiroApiKey）时返回“凭据已存在”。
+    fn ensure_credential_not_duplicated(&self, credential: &KiroCredentials) -> anyhow::Result<()> {
+        let api_key = credential.is_api_key_credential();
+        let (secret, label) = if api_key {
+            (credential.kiro_api_key.as_deref(), "kiroApiKey")
+        } else {
+            (credential.refresh_token.as_deref(), "refreshToken")
+        };
+        let secret = secret.ok_or_else(|| anyhow::anyhow!("缺少 {}", label))?;
+        let candidate = sha256_hex(secret);
+        let duplicate = self.entries.lock().iter().any(|entry| {
+            let existing = if api_key {
+                entry.credentials.kiro_api_key.as_deref()
+            } else {
+                entry.credentials.refresh_token.as_deref()
+            };
+            existing.map(sha256_hex).as_deref() == Some(candidate.as_str())
+        });
+        if duplicate {
+            anyhow::bail!("凭据已存在（{} 重复）", label);
+        }
+        Ok(())
+    }
+
     fn ensure_machine_id_available(
         &self,
         credentials: &KiroCredentials,
@@ -15066,6 +15095,43 @@ impl MultiTokenManager {
             }
         }
 
+        // provider 同样只在本地为空时写回：Portal GetUserInfo 返回的 idp 是账号的实际身份提供方，
+        // 用于卡片展示和后续 Portal 请求的 Idp cookie；导入时已带 provider 的账号不改。
+        if let Some(idp) = usage_limits.idp() {
+            let idp = idp.to_string();
+            let provider_missing = self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| {
+                    entry
+                        .credentials
+                        .provider
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty())
+                });
+            if provider_missing {
+                if let Err(error) = self.persist_credential_mutation(id, |credential| {
+                    if credential
+                        .provider
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty())
+                    {
+                        credential.provider = Some(idp.clone());
+                    }
+                    Ok(())
+                }) {
+                    tracing::warn!(
+                        "上游 provider 自动补齐后持久化失败（不影响本次查询）: {}",
+                        error
+                    );
+                } else {
+                    self.publish_credentials_changed("credential_provider_updated");
+                }
+            }
+        }
+
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
             let old_title = self
@@ -15284,51 +15350,11 @@ impl MultiTokenManager {
             validate_refresh_token(&new_cred)?;
         }
 
-        // 2. 基于哈希检测重复
-        if new_cred.is_api_key_credential() {
-            let new_api_key = new_cred
-                .kiro_api_key
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("缺少 kiroApiKey"))?;
-            let new_api_key_hash = sha256_hex(new_api_key);
-            let duplicate_exists = {
-                let entries = self.entries.lock();
-                entries.iter().any(|entry| {
-                    entry
-                        .credentials
-                        .kiro_api_key
-                        .as_deref()
-                        .map(sha256_hex)
-                        .as_deref()
-                        == Some(new_api_key_hash.as_str())
-                })
-            };
-            if duplicate_exists {
-                anyhow::bail!("凭据已存在（kiroApiKey 重复）");
-            }
-        } else {
-            let new_refresh_token = new_cred
-                .refresh_token
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
-            let new_refresh_token_hash = sha256_hex(new_refresh_token);
-            let duplicate_exists = {
-                let entries = self.entries.lock();
-                entries.iter().any(|entry| {
-                    entry
-                        .credentials
-                        .refresh_token
-                        .as_deref()
-                        .map(sha256_hex)
-                        .as_deref()
-                        == Some(new_refresh_token_hash.as_str())
-                })
-            };
-            if duplicate_exists {
-                anyhow::bail!("凭据已存在（refreshToken 重复）");
-            }
-        }
+        // 2. 刷新 token 之前先查一次重复，避免对已有账号发起网络刷新；写库前在 credential_insert_gate
+        //    里还会再查一次，覆盖并发导入同一账号的情况。
+        self.ensure_credential_not_duplicated(&new_cred)?;
         self.ensure_machine_id_available(&new_cred, None)?;
+        let dedup_probe = new_cred.clone();
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
         let (mut validated_cred, learned_auth_region) = if new_cred.is_api_key_credential() {
@@ -15406,6 +15432,13 @@ impl MultiTokenManager {
             credential_disabled: Some(initial_disabled),
             ..Default::default()
         };
+        // 5. 复查重复、写库、登记到内存这三步串行，否则并发导入同一账号时两边都能通过上面的预检。
+        //    原始 token 和刷新后返回的 token 都要查：刷新可能换发新的 refreshToken。PgSQL 的唯一索引
+        //    仍会拒绝重复，这里提前拦下，并让内存列表与数据库保持一致。
+        let _insert_guard = self.credential_insert_gate.lock().await;
+        self.ensure_credential_not_duplicated(&dedup_probe)?;
+        self.ensure_credential_not_duplicated(&validated_cred)?;
+        self.ensure_machine_id_available(&dedup_probe, None)?;
         let (new_id, persisted_runtime) = if let Some(store) = &self.postgres_store {
             validated_cred.disabled = initial_disabled;
             let operation_id = uuid::Uuid::new_v4();

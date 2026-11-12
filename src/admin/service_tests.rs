@@ -246,6 +246,29 @@ fn credential_info_refresh_only_recognizes_local_coordination_rate_limits() {
 }
 
 #[test]
+fn credential_import_claim_rejects_the_same_account_until_released() {
+    let in_flight = Arc::new(Mutex::new(HashSet::new()));
+    let first = CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
+        .expect("first import claims the account");
+    let err = CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
+        .err()
+        .expect("second import of the same account is rejected");
+    assert!(matches!(err, AdminServiceError::Conflict(_)));
+    assert!(err.to_string().contains("凭据已存在"));
+
+    // 不同账号互不影响；空 token 不登记，交给后续校验报错。
+    let _other = CredentialImportClaim::acquire(&in_flight, Some("rt-other"), "refreshToken")
+        .expect("another account imports concurrently");
+    let _empty = CredentialImportClaim::acquire(&in_flight, Some(""), "refreshToken")
+        .expect("empty token is not claimed");
+    assert_eq!(in_flight.lock().len(), 2);
+
+    drop(first);
+    CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
+        .expect("released account can be imported again");
+}
+
+#[test]
 fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
     let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
         "refreshToken": "fake-refresh-token",

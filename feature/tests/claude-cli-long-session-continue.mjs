@@ -806,7 +806,6 @@ async function main() {
   try {
     await fake.listen(upstreamPort)
     const configPath = path.join(TEMP_ROOT, 'config.json')
-    const credentialsPath = path.join(TEMP_ROOT, 'missing-credentials.json')
     const serviceLogPath = path.join(TEMP_ROOT, 'service.log')
     fs.writeFileSync(
       configPath,
@@ -814,7 +813,7 @@ async function main() {
       { mode: 0o600 },
     )
     const serviceLog = fs.openSync(serviceLogPath, 'a', 0o600)
-    service = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+    service = spawn(BINARY, ['--config', configPath], {
       cwd: ROOT,
       env: validationChildEnvironment({
         KIRO_API_KEY: KIRO_KEY,

@@ -1,12 +1,8 @@
-//! Kiro OAuth 凭证数据模型
-//!
-//! 支持从 Kiro IDE 的凭证文件加载，使用 Social 认证方式
-//! 支持单凭据和多凭据配置格式
+//! Kiro 凭证数据模型
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
-use std::{fmt, fs};
+use std::fmt;
 
 use base64::{
     Engine as _,
@@ -366,58 +362,43 @@ pub(crate) fn validate_kiro_region_host_label(region: &str) -> Result<(), &'stat
     Ok(())
 }
 
-fn looks_like_kiro_api_key_text(value: &str) -> bool {
-    let key = value
-        .trim()
-        .split_once('|')
-        .map(|(key, _)| key)
-        .unwrap_or_else(|| value.trim())
-        .trim();
-    key.starts_with("ksk_")
+/// Authentication protocol named by an explicit `authMethod` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclaredAuthKind {
+    ApiKey,
+    Idc,
+    ExternalIdp,
+    Social,
 }
 
-fn api_key_credential_from_text(raw: &str, priority: u32) -> Option<KiroCredentials> {
-    let (api_key, region) = split_kiro_api_key_and_region(raw)?;
-    if !looks_like_kiro_api_key_text(&api_key) {
-        return None;
-    }
-
-    let mut credential = KiroCredentials {
-        auth_method: Some("api_key".to_string()),
-        kiro_api_key: Some(api_key),
-        priority,
-        region: region.clone(),
-        auth_region: region.clone(),
-        api_region: region,
-        endpoint: Some(KIRO_API_KEY_DEFAULT_ENDPOINT.to_string()),
-        ..Default::default()
-    };
-    credential.normalize_api_key_defaults();
-    Some(credential)
-}
-
-fn api_key_credentials_from_plain_text(content: &str) -> Option<Vec<KiroCredentials>> {
-    let mut credentials = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+fn auth_kind_of(value: &str) -> Option<DeclaredAuthKind> {
+    match compact_protocol_value(value).as_str() {
+        "apikey" => Some(DeclaredAuthKind::ApiKey),
+        "builderid" | "iam" | "idc" => Some(DeclaredAuthKind::Idc),
+        "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal" => {
+            Some(DeclaredAuthKind::ExternalIdp)
         }
-        let credential = api_key_credential_from_text(line, credentials.len() as u32)?;
-        credentials.push(credential);
+        "social" => Some(DeclaredAuthKind::Social),
+        _ => None,
     }
+}
 
-    (!credentials.is_empty()).then_some(credentials)
+/// Provider values that name an external identity provider. Only consulted when the
+/// credential has no recognised `authMethod`.
+pub(crate) fn is_external_idp_provider(value: &str) -> bool {
+    matches!(
+        compact_protocol_value(value).as_str(),
+        "enterprise" | "externalidp" | "iamsso" | "awsidc" | "internal"
+    )
 }
 
 fn canonicalize_auth_method_value(value: &str) -> &str {
-    match compact_protocol_value(value).as_str() {
-        "builderid" | "iam" | "idc" => "idc",
-        "apikey" => "api_key",
-        "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal" => "external_idp",
-        "social" => "social",
-        _ => value,
+    match auth_kind_of(value) {
+        Some(DeclaredAuthKind::ApiKey) => "api_key",
+        Some(DeclaredAuthKind::Idc) => "idc",
+        Some(DeclaredAuthKind::ExternalIdp) => "external_idp",
+        Some(DeclaredAuthKind::Social) => "social",
+        None => value,
     }
 }
 
@@ -483,106 +464,6 @@ pub(crate) fn profile_arn_region(profile_arn: &str) -> Option<&str> {
     (!region.is_empty()).then_some(region)
 }
 
-/// 凭据配置（支持单对象或数组格式）
-///
-/// 自动识别配置文件格式：
-/// - 单对象格式（旧格式，向后兼容）
-/// - 数组格式（新格式，支持多凭据）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum CredentialsConfig {
-    /// 单个凭据（旧格式）
-    Single(KiroCredentials),
-    /// 多凭据数组（新格式）
-    Multiple(Vec<KiroCredentials>),
-}
-
-impl CredentialsConfig {
-    /// 从文件加载凭据配置
-    ///
-    /// - 如果文件不存在，返回空数组
-    /// - 如果文件内容为空，返回空数组
-    /// - 支持单对象或数组格式
-    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-
-        // 文件不存在时返回空数组
-        if !path.exists() {
-            return Ok(CredentialsConfig::Multiple(vec![]));
-        }
-
-        let content = fs::read_to_string(path)?;
-
-        // 文件为空时返回空数组
-        if content.trim().is_empty() {
-            return Ok(CredentialsConfig::Multiple(vec![]));
-        }
-
-        match serde_json::from_str(&content) {
-            Ok(config) => {
-                let config: CredentialsConfig = config;
-                config.validate_api_key_pipe_formats()?;
-                Ok(config)
-            }
-            Err(json_error) => {
-                if let Some(credentials) = api_key_credentials_from_plain_text(&content) {
-                    Ok(CredentialsConfig::Multiple(credentials))
-                } else {
-                    Err(json_error.into())
-                }
-            }
-        }
-    }
-
-    fn validate_api_key_pipe_formats(&self) -> anyhow::Result<()> {
-        let credentials: &[KiroCredentials] = match self {
-            Self::Single(credential) => std::slice::from_ref(credential),
-            Self::Multiple(credentials) => credentials,
-        };
-        for (index, credential) in credentials.iter().enumerate() {
-            credential
-                .validate_api_key_import_fields()
-                .map_err(|reason| {
-                    anyhow::anyhow!(
-                        "credential #{} has invalid API-key import fields: {}",
-                        index + 1,
-                        reason
-                    )
-                })?;
-        }
-        Ok(())
-    }
-
-    /// 转换为按优先级排序的凭据列表
-    pub fn into_sorted_credentials(self) -> Vec<KiroCredentials> {
-        match self {
-            CredentialsConfig::Single(mut cred) => {
-                cred.canonicalize_auth_method();
-                cred.normalize_supported_models();
-                cred.normalize_api_key_defaults();
-                cred.normalize_external_idp_defaults();
-                vec![cred]
-            }
-            CredentialsConfig::Multiple(mut creds) => {
-                // 按优先级排序（数字越小优先级越高）
-                creds.sort_by_key(|c| c.priority);
-                for cred in &mut creds {
-                    cred.canonicalize_auth_method();
-                    cred.normalize_supported_models();
-                    cred.normalize_api_key_defaults();
-                    cred.normalize_external_idp_defaults();
-                }
-                creds
-            }
-        }
-    }
-
-    /// 判断是否为多凭据格式（数组格式）
-    pub fn is_multiple(&self) -> bool {
-        matches!(self, CredentialsConfig::Multiple(_))
-    }
-}
-
 impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
@@ -636,11 +517,6 @@ impl KiroCredentials {
     /// 标签不是独立实体：保留首次出现顺序、按精确字符串去重，空白标签丢弃。
     pub fn normalize_tags(&mut self) -> Result<(), String> {
         normalize_credential_tags(&mut self.tags)
-    }
-
-    /// 获取默认凭证文件路径
-    pub fn default_credentials_path() -> &'static str {
-        "credentials.json"
     }
 
     /// 429 临时风控是否自动禁用账号。未配置时默认启用，保持旧行为。
@@ -876,55 +752,51 @@ impl KiroCredentials {
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
     pub fn is_api_key_credential(&self) -> bool {
-        self.kiro_api_key.is_some()
-            || self
-                .auth_method
-                .as_deref()
-                .map(|m| compact_protocol_value(m) == "apikey")
-                .unwrap_or(false)
+        self.kiro_api_key.is_some() || self.declared_auth_kind() == Some(DeclaredAuthKind::ApiKey)
+    }
+
+    /// 显式 `authMethod` 声明的认证协议；值缺失或无法识别时为 `None`。
+    pub(crate) fn declared_auth_kind(&self) -> Option<DeclaredAuthKind> {
+        self.auth_method.as_deref().and_then(auth_kind_of)
     }
 
     /// 检查是否应使用 AWS SSO OIDC refresh token 协议刷新。
     ///
-    /// Enterprise / external IdP 与 Builder ID 一样走 OIDC 刷新，但请求 Kiro API
-    /// 时仍保留 external_idp 语义以附加 TokenType。
+    /// 显式 `authMethod` 为 idc / builderid / iam 时成立，provider 不参与判断
+    /// （KAM、kiro-manager-lite、Kiro-Go 导出的组织 IdC 账号带 `provider: "Enterprise"`）。
+    /// `authMethod` 缺失或无法识别时，provider 不是外部 IdP 且同时带 clientId 和
+    /// clientSecret 才成立。
     pub fn is_idc_refresh_credential(&self) -> bool {
         if self.is_api_key_credential() {
             return false;
         }
-        if self.is_external_idp_refresh_credential() {
-            return false;
+        match self.declared_auth_kind() {
+            Some(kind) => kind == DeclaredAuthKind::Idc,
+            None => {
+                !self.is_external_idp_refresh_credential()
+                    && self.client_id.is_some()
+                    && self.client_secret.is_some()
+            }
         }
-
-        self.auth_method.as_deref().is_some_and(|m| {
-            matches!(
-                compact_protocol_value(m).as_str(),
-                "idc" | "builderid" | "iam"
-            )
-        }) || (self.client_id.is_some() && self.client_secret.is_some())
     }
 
     /// 检查是否应使用外部 IdP 自带 token endpoint 刷新。
     ///
     /// 这类凭证来自企业 SSO，例如 Microsoft Entra ID，通常只有 public
     /// clientId、refreshToken、tokenEndpoint 和 scopes，不存在 AWS SSO
-    /// OIDC device-flow 的 clientSecret。
+    /// OIDC device-flow 的 clientSecret。显式 `authMethod` 决定结果；
+    /// 只有 `authMethod` 缺失或无法识别时才按 provider 推断。
     pub fn is_external_idp_refresh_credential(&self) -> bool {
         if self.is_api_key_credential() {
             return false;
         }
-
-        self.auth_method.as_deref().is_some_and(|m| {
-            matches!(
-                compact_protocol_value(m).as_str(),
-                "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
-            )
-        }) || self.provider.as_deref().is_some_and(|p| {
-            matches!(
-                compact_protocol_value(p).as_str(),
-                "enterprise" | "externalidp" | "iamsso" | "awsidc" | "internal"
-            )
-        })
+        match self.declared_auth_kind() {
+            Some(kind) => kind == DeclaredAuthKind::ExternalIdp,
+            None => self
+                .provider
+                .as_deref()
+                .is_some_and(is_external_idp_provider),
+        }
     }
 }
 
@@ -1237,14 +1109,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_credentials_path() {
-        assert_eq!(
-            KiroCredentials::default_credentials_path(),
-            "credentials.json"
-        );
-    }
-
-    #[test]
     fn test_priority_default() {
         let json = r#"{"refreshToken": "test"}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
@@ -1332,6 +1196,75 @@ mod tests {
         assert_eq!(creds.provider.as_deref(), Some("Enterprise"));
         assert!(creds.is_external_idp_refresh_credential());
         assert!(!creds.is_idc_refresh_credential());
+    }
+
+    #[test]
+    fn explicit_idc_auth_method_keeps_idc_refresh_with_enterprise_provider() {
+        // KAM / kiro-manager-lite / Kiro-Go organization IdC export.
+        for (auth_method, provider) in [
+            ("IdC", "Enterprise"),
+            ("idc", "AWSIdC"),
+            ("builder-id", "IAM_SSO"),
+            ("iam", "Internal"),
+        ] {
+            let mut creds = KiroCredentials {
+                auth_method: Some(auth_method.to_string()),
+                provider: Some(provider.to_string()),
+                refresh_token: Some("test_refresh".to_string()),
+                client_id: Some("client123".to_string()),
+                client_secret: Some("secret456".to_string()),
+                ..Default::default()
+            };
+            creds.canonicalize_auth_method();
+            creds.normalize_external_idp_defaults();
+            assert_eq!(
+                creds.auth_method.as_deref(),
+                Some("idc"),
+                "{auth_method}/{provider}"
+            );
+            assert!(
+                creds.is_idc_refresh_credential(),
+                "{auth_method}/{provider}"
+            );
+            assert!(
+                !creds.is_external_idp_refresh_credential(),
+                "{auth_method}/{provider}"
+            );
+            assert!(creds.token_endpoint.is_none(), "{auth_method}/{provider}");
+            assert!(creds.scopes.is_none(), "{auth_method}/{provider}");
+        }
+    }
+
+    #[test]
+    fn missing_auth_method_infers_protocol_from_provider_and_client_fields() {
+        let external = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            refresh_token: Some("test_refresh".to_string()),
+            client_id: Some("client123".to_string()),
+            token_endpoint: Some("https://login.example.invalid/token".to_string()),
+            ..Default::default()
+        };
+        assert!(external.is_external_idp_refresh_credential());
+        assert!(!external.is_idc_refresh_credential());
+
+        let idc = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            refresh_token: Some("test_refresh".to_string()),
+            client_id: Some("client123".to_string()),
+            client_secret: Some("secret456".to_string()),
+            ..Default::default()
+        };
+        assert!(idc.is_idc_refresh_credential());
+        assert!(!idc.is_external_idp_refresh_credential());
+
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Enterprise".to_string()),
+            refresh_token: Some("test_refresh".to_string()),
+            ..Default::default()
+        };
+        assert!(!social.is_external_idp_refresh_credential());
+        assert!(!social.is_idc_refresh_credential());
     }
 
     #[test]
@@ -1559,86 +1492,6 @@ mod tests {
     }
 
     #[test]
-    fn json_credentials_reject_malformed_api_key_pipe_before_normalization() {
-        let malformed = [
-            "|us-east-1",
-            "ksk_fake|us-east-1|extra",
-            "ksk_fake|us east-1",
-            "ksk_fake|us-east-1\\nextra",
-            "ksk_fake|us-east-1.example",
-        ];
-        for round in 0..3 {
-            for (index, value) in malformed.iter().enumerate() {
-                let path = std::env::temp_dir().join(format!(
-                    "kiro-rs-invalid-api-key-pipe-{round}-{index}-{}.json",
-                    uuid::Uuid::new_v4()
-                ));
-                let body = serde_json::json!([{
-                    "authMethod": "api_key",
-                    "kiroApiKey": value
-                }]);
-                std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
-                let error = CredentialsConfig::load(&path).unwrap_err().to_string();
-                assert!(error.contains("invalid API-key import fields"));
-                assert!(!error.contains(value));
-                let _ = std::fs::remove_file(path);
-            }
-
-            for (index, (field, value)) in [
-                ("region", "us east-1"),
-                ("authRegion", "us-east-1\nextra"),
-                ("apiRegion", "us-east-1.example"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let path = std::env::temp_dir().join(format!(
-                    "kiro-rs-invalid-explicit-region-{round}-{index}-{}.json",
-                    uuid::Uuid::new_v4()
-                ));
-                let mut credential = serde_json::Map::new();
-                credential.insert("authMethod".to_string(), serde_json::json!("api_key"));
-                credential.insert("kiroApiKey".to_string(), serde_json::json!("ksk_fake"));
-                credential.insert(field.to_string(), serde_json::json!(value));
-                std::fs::write(
-                    &path,
-                    serde_json::to_vec(&serde_json::json!([credential])).unwrap(),
-                )
-                .unwrap();
-                let error = CredentialsConfig::load(&path).unwrap_err().to_string();
-                assert!(error.contains("invalid API-key import fields"));
-                assert!(!error.contains(value));
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    #[test]
-    fn plain_credentials_reject_malformed_pipe_forms_for_three_rounds() {
-        for round in 0..3 {
-            for (index, value) in [
-                "|us-east-1",
-                "ksk_fake|us-east-1|extra",
-                "ksk_fake|us east-1",
-                "ksk_fake|us-east-1\nextra",
-                "ksk_fake|us-east-1.example",
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let path = std::env::temp_dir().join(format!(
-                    "kiro-rs-invalid-plain-api-key-{round}-{index}-{}.txt",
-                    uuid::Uuid::new_v4()
-                ));
-                std::fs::write(&path, format!("{value}\n")).unwrap();
-                let error = CredentialsConfig::load(&path).unwrap_err().to_string();
-                assert!(!error.contains(value));
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    #[test]
     fn explicit_api_key_regions_reject_host_unsafe_values_for_three_rounds() {
         for _round in 0..3 {
             for (field, value) in [
@@ -1690,68 +1543,6 @@ mod tests {
         assert_eq!(creds.api_region.as_deref(), Some("us-west-2"));
         assert_eq!(creds.endpoint.as_deref(), Some("ide"));
     }
-
-    #[test]
-    fn test_credentials_config_plain_text_api_key_with_region() {
-        let path = std::env::temp_dir().join(format!(
-            "kiro-rs-credentials-api-key-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(
-            &path,
-            "ksk_first|eu-central-1\n# comment\nksk_second|us-east-1\n",
-        )
-        .unwrap();
-
-        let config = CredentialsConfig::load(&path).unwrap();
-        let credentials = config.into_sorted_credentials();
-
-        assert_eq!(credentials.len(), 2);
-        assert_eq!(credentials[0].auth_method.as_deref(), Some("api_key"));
-        assert_eq!(credentials[0].kiro_api_key.as_deref(), Some("ksk_first"));
-        assert_eq!(credentials[0].api_region.as_deref(), Some("eu-central-1"));
-        assert_eq!(credentials[0].endpoint.as_deref(), Some("cli"));
-        assert_eq!(credentials[1].kiro_api_key.as_deref(), Some("ksk_second"));
-        assert_eq!(credentials[1].api_region.as_deref(), Some("us-east-1"));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_credentials_config_single() {
-        let json = r#"{"refreshToken": "test", "expiresAt": "2025-12-31T00:00:00Z"}"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
-        assert!(matches!(config, CredentialsConfig::Single(_)));
-    }
-
-    #[test]
-    fn test_credentials_config_multiple() {
-        let json = r#"[
-            {"refreshToken": "test1", "priority": 1},
-            {"refreshToken": "test2", "priority": 0}
-        ]"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
-        assert!(matches!(config, CredentialsConfig::Multiple(_)));
-        assert_eq!(config.into_sorted_credentials().len(), 2);
-    }
-
-    #[test]
-    fn test_credentials_config_priority_sorting() {
-        let json = r#"[
-            {"refreshToken": "t1", "priority": 2},
-            {"refreshToken": "t2", "priority": 0},
-            {"refreshToken": "t3", "priority": 1}
-        ]"#;
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
-        let list = config.into_sorted_credentials();
-
-        // 验证按优先级排序
-        assert_eq!(list[0].refresh_token, Some("t2".to_string())); // priority 0
-        assert_eq!(list[1].refresh_token, Some("t3".to_string())); // priority 1
-        assert_eq!(list[2].refresh_token, Some("t1".to_string())); // priority 2
-    }
-
-    // ============ Region 字段测试 ============
 
     #[test]
     fn test_region_field_parsing() {
@@ -1840,23 +1631,6 @@ mod tests {
 
         let json = creds.to_pretty_json().unwrap();
         assert!(!json.contains("machineId"));
-    }
-
-    #[test]
-    fn test_multiple_credentials_with_different_regions() {
-        // 测试多凭据场景下不同凭据使用各自的 region
-        let json = r#"[
-            {"refreshToken": "t1", "region": "us-east-1"},
-            {"refreshToken": "t2", "region": "eu-west-1"},
-            {"refreshToken": "t3"}
-        ]"#;
-
-        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
-        let list = config.into_sorted_credentials();
-
-        assert_eq!(list[0].region, Some("us-east-1".to_string()));
-        assert_eq!(list[1].region, Some("eu-west-1".to_string()));
-        assert_eq!(list[2].region, None);
     }
 
     #[test]

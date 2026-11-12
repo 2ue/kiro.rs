@@ -9,6 +9,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { seedCredentialsBeforeStartup } from './postgres-credential-seed.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
@@ -743,16 +744,20 @@ function listenerSnapshot(port) {
   return String(result.stdout || '').trim().split('\n').filter(Boolean).sort()
 }
 
-function startService(configPath, credentialsPath, logPath, servicePort) {
+function serviceEnvironment(servicePort) {
+  return validationChildEnvironment({
+    KIRO_API_KEY: '',
+    KIRO_RS_HOST: '127.0.0.1',
+    KIRO_RS_PORT: String(servicePort),
+    RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs=info',
+  })
+}
+
+function startService(configPath, logPath, servicePort) {
   const log = fs.openSync(logPath, 'a')
-  const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
-    env: validationChildEnvironment({
-      KIRO_API_KEY: '',
-      KIRO_RS_HOST: '127.0.0.1',
-      KIRO_RS_PORT: String(servicePort),
-      RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs=info',
-    }),
+    env: serviceEnvironment(servicePort),
     stdio: ['ignore', log, log],
   })
   handle.once('exit', () => fs.closeSync(log))
@@ -1278,6 +1283,7 @@ async function startCaseService({
   caseRoot,
   servicePorts,
   poolName,
+  seedCredentials,
 }) {
   const servicePort = await reservePort()
   assert.notEqual(servicePort, 9022)
@@ -1285,7 +1291,6 @@ async function startCaseService({
   const serviceRoot = path.join(caseRoot, name)
   fs.mkdirSync(serviceRoot, { recursive: true, mode: 0o700 })
   const configPath = path.join(serviceRoot, 'config.json')
-  const credentialsPath = path.join(serviceRoot, 'credentials.json')
   const logPath = path.join(serviceRoot, 'service.log')
   fs.writeFileSync(
     configPath,
@@ -1299,12 +1304,17 @@ async function startCaseService({
     }), null, 2)}\n`,
     { mode: 0o600 },
   )
-  fs.writeFileSync(
-    credentialsPath,
-    `${JSON.stringify(credentialsFor(mode), null, 2)}\n`,
-    { mode: 0o600 },
-  )
-  const handle = startService(configPath, credentialsPath, logPath, servicePort)
+  if (seedCredentials) {
+    seedCredentialsBeforeStartup({
+      binary: BINARY,
+      configPath,
+      serviceEnvironment: serviceEnvironment(servicePort),
+      postgresUrl: databaseUrl,
+      credentials: credentialsFor(mode),
+      cwd: ROOT,
+    })
+  }
+  const handle = startService(configPath, logPath, servicePort)
   const baseUrl = `http://127.0.0.1:${servicePort}`
   try {
     await waitForHealth(baseUrl, handle)
@@ -2079,6 +2089,7 @@ async function runCase({
     caseRoot,
     servicePorts,
     poolName: `e0102-primary-${mode}-${caseIndex}`,
+    seedCredentials: true,
   })
   let secondary
   let sampler
@@ -2094,6 +2105,7 @@ async function runCase({
       caseRoot,
       servicePorts,
       poolName: `e0102-secondary-${mode}-${caseIndex}`,
+      seedCredentials: false,
     })
     const externalReady = await waitForExternalReady([primary, secondary])
     const auxiliaryBeforeWorkloads = fake.records

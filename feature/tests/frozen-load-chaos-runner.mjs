@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 
+import { importCredentialsViaAdmin } from "./admin-credential-import.mjs";
 import { resolveRuntimeValidationPaths } from "./runtime-validation-paths.mjs";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, "../.."));
@@ -563,7 +564,6 @@ async function startProxy(ctx, fakePort, options = {}) {
   const redisPrefix = `${ctx.redisPrefix}:db:${database}:`;
   ctx.redisPrefixes.push(redisPrefix);
   const configPath = path.join(ctx.root, `${database}.config.json`);
-  const credentialsPath = path.join(ctx.root, `${database}.credentials.json`);
   const apiKey = `sk-load-${database}`;
   writeJson(
     configPath,
@@ -576,11 +576,10 @@ async function startProxy(ctx, fakePort, options = {}) {
       apiKey,
     }),
   );
-  writeJson(credentialsPath, fakeCredentials(options.credentials ?? 4));
   const log = path.join(ctx.logsDir, `proxy-${database}.log`);
   const child = spawnLogged(
     ctx.productBinary,
-    ["-c", configPath, "--credentials", credentialsPath],
+    ["-c", configPath],
     log,
     {
       env: minimalEnvironment({
@@ -593,6 +592,11 @@ async function startProxy(ctx, fakePort, options = {}) {
   await waitTcp(proxyPort, `proxy ${database}`);
   await waitReady(proxyPort);
   ctx.children.push({ child, label: `proxy ${database}`, log });
+  await importCredentialsViaAdmin(
+    `http://127.0.0.1:${proxyPort}`,
+    `${apiKey}-admin`,
+    fakeCredentials(options.credentials ?? 4),
+  );
   return { port: proxyPort, child, log, database, apiKey, redisPrefix };
 }
 
@@ -600,14 +604,13 @@ async function restartProxy(ctx, proxy, fakePort) {
   await terminate(proxy.child, `proxy ${proxy.database}`);
   ctx.children = ctx.children.filter((entry) => entry.child !== proxy.child);
   const configPath = path.join(ctx.root, `${proxy.database}.config.json`);
-  const credentialsPath = path.join(ctx.root, `${proxy.database}.credentials.json`);
   const existingConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
   existingConfig.kiroUpstreamBaseUrl = `http://127.0.0.1:${fakePort}`;
   writeJson(configPath, existingConfig);
   const log = path.join(ctx.logsDir, `proxy-${proxy.database}-restart-${ctx.sequence++}.log`);
   const child = spawnLogged(
     ctx.productBinary,
-    ["-c", configPath, "--credentials", credentialsPath],
+    ["-c", configPath],
     log,
     {
       env: minimalEnvironment({
