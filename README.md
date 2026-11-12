@@ -439,7 +439,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
 | `authMethod`   | string | 认证方式：`social`、`idc`、`external_idp` 或 `api_key`；决定 Token 刷新协议 |
-| `provider`     | string | 身份提供方（`Github`、`Google`、`BuilderId`、`Enterprise` 等），用于展示和 Portal 查询；为空时由额度查询自动补全 |
+| `provider`     | string | 身份提供方（`Github`、`Google`、`BuilderId`、`Enterprise` 等），用于展示和 Portal 查询；`authMethod` 缺失时参与推断认证方式 |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
 | `kiroApiKey`   | string | Kiro API Key / headless 凭据，格式 `ksk_xxx`；也支持 `ksk_xxx|region` 便捷写法 |
