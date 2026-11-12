@@ -88,6 +88,26 @@ pub(super) fn publish_runtime_config_changed(
     });
 }
 
+pub(super) fn publish_kiro_version_state_changed(
+    redis_store: Option<&Arc<RedisStore>>,
+    reason: &str,
+    source_instance_id: &str,
+) {
+    let Some(redis) = redis_store else {
+        return;
+    };
+    let redis = redis.clone();
+    let payload = runtime_event_payload(
+        "kiro_version_state_changed",
+        None,
+        reason,
+        source_instance_id,
+    );
+    spawn_best_effort_storage_task("发布 Kiro 版本状态变更通知", async move {
+        redis.publish_runtime_config_changed(payload).await
+    });
+}
+
 pub(super) fn publish_credentials_changed(
     postgres_store: Option<&Arc<PostgresStore>>,
     redis_store: Option<&Arc<RedisStore>>,

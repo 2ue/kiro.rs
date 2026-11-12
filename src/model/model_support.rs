@@ -222,6 +222,15 @@ pub fn model_is_supported_by_list(models: &[String], candidates: &[Option<&str>]
     if models.is_empty() {
         return true;
     }
+    // 不带模型的请求（WebSearch MCP 等辅助调用）不受模型列表限制；否则账号一旦有
+    // 自身或订阅等级模型列表，就再也选不中它，表现为 websearch_mcp_scheduler_unavailable。
+    if candidates
+        .iter()
+        .flatten()
+        .all(|candidate| normalize_model_id(candidate).is_none())
+    {
+        return true;
+    }
 
     let supported_models = normalize_supported_models(models.iter().cloned())
         .into_iter()
@@ -417,6 +426,13 @@ mod tests {
     #[test]
     fn empty_supported_models_allows_any_model() {
         assert!(model_is_supported_by_list(&[], &[Some("anything")]));
+        let listed = vec!["claude-haiku-4.5".to_string()];
+        assert!(model_is_supported_by_list(&listed, &[None]));
+        assert!(model_is_supported_by_list(&listed, &[Some("  ")]));
+        assert!(!model_is_supported_by_list(
+            &listed,
+            &[Some("claude-opus-4.8")]
+        ));
     }
 
     #[test]

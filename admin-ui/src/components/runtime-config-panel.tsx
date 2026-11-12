@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Router, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
+import { Check, Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Pin, Plus, RefreshCw, RotateCcw, Router, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -20,6 +20,10 @@ import {
   getAccessKeys,
   updateAdminApiKey,
   updateRequestApiKey,
+  applyKiroClientVersion,
+  checkKiroClientVersion,
+  pinKiroClientVersion,
+  rollbackKiroClientVersion,
 } from '@/api/credentials'
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
@@ -49,6 +53,7 @@ import type {
   RequestApiKeyItem,
   RequestAdmissionConfig,
   RuntimeConfig,
+  KiroVersionLifecycleSnapshot,
 } from '@/types/api'
 
 const DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS = 1000
@@ -76,6 +81,17 @@ function joinStatusCodeList(value: number[] = []): string {
   return value
     .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
     .join(', ')
+}
+
+const OAUTH_ENDPOINT_FALLBACKS = new Set(['codewhisperer', 'amazonq', 'runtime'])
+
+function normalizeKiroEndpointFallbackOrder(value: string): string[] {
+  const seen = new Set<string>()
+  return value.split(',').map((item) => item.trim().toLowerCase()).filter((item) => {
+    if (!OAUTH_ENDPOINT_FALLBACKS.has(item) || seen.has(item)) return false
+    seen.add(item)
+    return true
+  }).slice(0, 8)
 }
 
 const preserveFieldPolicy = (): ReportedUsageFieldPolicy => ({
@@ -581,6 +597,17 @@ const emptyConfig: RuntimeConfig = {
   credentialAutoHealMinIntervalSecs: 300,
   credentialAutoHealMaxConsecutiveRounds: 5,
   kiroVersionAutoSyncEnabled: false,
+  kiroVersionLifecycle: {
+    configuredVersion: '0.11.107',
+    activeVersion: '0.11.107',
+    activeSource: 'configured',
+    previousVersion: null,
+    candidateVersion: null,
+    checkedAt: null,
+    lastError: null,
+    generation: 0,
+    autoSyncEnabled: false,
+  },
   kiroRuntimeDomainEnabled: false,
   credentialProtocolErrorCooldownSecs: 10,
   credentialAuthErrorCooldownSecs: 10,
@@ -637,6 +664,9 @@ const emptyConfig: RuntimeConfig = {
   credentialPromptLogicRetryEnabled: false,
   credentialPromptLogicRetryMaxAttempts: 0,
   kiroUpstreamRegionRotationEnabled: false,
+  kiroRegionProfileArnMismatchAllowed: false,
+  kiroEndpointFallbackEnabled: false,
+  kiroEndpointFallbackOrder: [],
   localBerserkModeEnabled: false,
   localBerserkMaxRounds: 1,
   localBerserkRoundDelayMs: 1000,
@@ -3843,11 +3873,14 @@ export function RuntimeConfigPanel() {
   const updateConfig = useUpdateRuntimeConfig()
   const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyConfig)
+  const [pinVersion, setPinVersion] = useState('')
+  const [endpointOrder, setEndpointOrder] = useState('')
+  const [versionActionPending, setVersionActionPending] = useState(false)
 
   useEffect(() => {
     if (config.data) {
       const bodyConversion = normalizeBodyConversion(config.data.bodyConversion)
-      setDraft({
+      const hydrated = {
         ...emptyConfig,
         ...config.data,
         requestAdmission: {
@@ -3862,6 +3895,11 @@ export function RuntimeConfigPanel() {
           ...emptyConfig.tokenRefreshAdmissionRuntime,
           ...config.data.tokenRefreshAdmissionRuntime,
         },
+        kiroVersionLifecycle: {
+          ...emptyConfig.kiroVersionLifecycle,
+          ...config.data.kiroVersionLifecycle,
+        },
+        kiroEndpointFallbackOrder: normalizeKiroEndpointFallbackOrder((config.data.kiroEndpointFallbackOrder ?? []).join(',')),
         payloadShaping: {
           ...defaultPayloadShaping(),
           ...config.data.payloadShaping,
@@ -3884,9 +3922,29 @@ export function RuntimeConfigPanel() {
         cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
-      })
+      }
+      setDraft(hydrated)
+      setPinVersion(hydrated.kiroVersionLifecycle.activeVersion)
+      setEndpointOrder(hydrated.kiroEndpointFallbackOrder.join(', '))
     }
   }, [config.data])
+
+  const updateVersionLifecycle = async (
+    action: () => Promise<KiroVersionLifecycleSnapshot>,
+    message: string,
+  ) => {
+    if (versionActionPending) return
+    setVersionActionPending(true)
+    try {
+      const lifecycle = await action()
+      setDraft((prev) => ({ ...prev, kiroVersionLifecycle: lifecycle, kiroVersionLatest: lifecycle.candidateVersion ?? prev.kiroVersionLatest }))
+      toast.success(message)
+    } catch (error) {
+      toast.error(`版本操作失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setVersionActionPending(false)
+    }
+  }
 
   const handleSave = () => {
     const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
@@ -3898,6 +3956,9 @@ export function RuntimeConfigPanel() {
     const next: RuntimeConfig = {
       ...draft,
       kiroUpstreamRegionRotationEnabled: Boolean(draft.kiroUpstreamRegionRotationEnabled),
+      kiroRegionProfileArnMismatchAllowed: Boolean(draft.kiroRegionProfileArnMismatchAllowed),
+      kiroEndpointFallbackEnabled: Boolean(draft.kiroEndpointFallbackEnabled),
+      kiroEndpointFallbackOrder: normalizeKiroEndpointFallbackOrder(draft.kiroEndpointFallbackOrder.join(',')),
       localBerserkModeEnabled: Boolean(draft.localBerserkModeEnabled),
       localBerserkMaxRounds: toWhole(draft.localBerserkMaxRounds, 1, 10),
       localBerserkRoundDelayMs: toWhole(draft.localBerserkRoundDelayMs, 0, 60_000),
@@ -4103,10 +4164,14 @@ export function RuntimeConfigPanel() {
       toast.error('Payload 安全余量不能让实际裁剪目标小于 65536')
       return
     }
-    const editableConfig = { ...next }
-    delete editableConfig.proxyUrl
-    delete editableConfig.proxyUsername
-    delete editableConfig.proxyPassword
+    const {
+      proxyUrl: _proxyUrl,
+      proxyUsername: _proxyUsername,
+      proxyPassword: _proxyPassword,
+      kiroVersionLatest: _kiroVersionLatest,
+      kiroVersionLifecycle: _kiroVersionLifecycle,
+      ...editableConfig
+    } = next
     updateConfig.mutate(editableConfig, {
       onSuccess: () => toast.success('配置已更新'),
       onError: (error) => toast.error(`更新失败: ${extractErrorMessage(error)}`),
@@ -4364,10 +4429,48 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="自动同步 Kiro 客户端版本"
-              description={`默认关闭。打开后每 12 小时从官方读取当前版本，所有账号的上游请求头改用该版本；读取失败时继续用配置的版本。${draft.kiroVersionLatest ? `最近读到：${draft.kiroVersionLatest}` : ''}`}
+              description={`默认关闭。打开后每 12 小时只发现 candidate，不会自动替换 active；关闭检查也不会回退已应用版本。${draft.kiroVersionLatest ? `最近读到：${draft.kiroVersionLatest}` : ''}`}
               checked={draft.kiroVersionAutoSyncEnabled}
               onCheckedChange={(kiroVersionAutoSyncEnabled) => setDraft((prev) => ({ ...prev, kiroVersionAutoSyncEnabled }))}
             />
+            <div className="col-span-full space-y-3 rounded-lg border bg-muted/20 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold">版本状态与显式切换</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                    当前 {draft.kiroVersionLifecycle.activeVersion}（{draft.kiroVersionLifecycle.activeSource}），candidate {draft.kiroVersionLifecycle.candidateVersion || '-'}，上一个版本 {draft.kiroVersionLifecycle.previousVersion || '-'}。
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                    disabled={versionActionPending}
+                  onClick={() => void updateVersionLifecycle(() => checkKiroClientVersion(), '已读取官方版本 candidate')}
+                >
+                  <RefreshCw />
+                  立即检查
+                </Button>
+              </div>
+              <div className="flex flex-wrap items-end gap-2">
+                <Button
+                  size="sm"
+                  disabled={versionActionPending || !draft.kiroVersionLifecycle.candidateVersion || draft.kiroVersionLifecycle.candidateVersion === draft.kiroVersionLifecycle.activeVersion}
+                  onClick={() => void updateVersionLifecycle(() => applyKiroClientVersion(), `已应用 ${draft.kiroVersionLifecycle.candidateVersion}`)}
+                >
+                  <Check />
+                  应用 candidate
+                </Button>
+                <Input className="h-8 w-44 font-mono text-xs" value={pinVersion} onChange={(event) => setPinVersion(event.target.value)} placeholder="固定版本，例如 0.11.107" />
+                <Button size="sm" variant="outline" disabled={versionActionPending || !pinVersion.trim()} onClick={() => void updateVersionLifecycle(() => pinKiroClientVersion(pinVersion.trim()), `已固定 ${pinVersion.trim()}`)}>
+                  <Pin />
+                  固定
+                </Button>
+                <Button size="sm" variant="outline" disabled={versionActionPending || !draft.kiroVersionLifecycle.previousVersion} onClick={() => void updateVersionLifecycle(() => rollbackKiroClientVersion(), '已回退到上一个版本')}>
+                  <RotateCcw />
+                  回退
+                </Button>
+              </div>
+            </div>
             <ToggleField
               title="对话改走 Kiro 新域名"
               description="默认关闭。打开后 IDE 端点的对话和联网搜索改发到 runtime.{区域}.kiro.dev，请求头不变；模型列表、额度查询、令牌刷新不受影响。注意：实测 FREE 账号打开后对话全部被新域名限流（429），打开前请先用自己的账号小范围验证。"
@@ -4554,13 +4657,43 @@ export function RuntimeConfigPanel() {
               }
             />
             <ToggleField
-              title="上游端点轮换"
-              description="开启后，本地账号遇到上游瞬态错误会在官方支持的 us-east-1 / eu-central-1 两个端点之间轮换重试（端点由程序内置，无需配置）。关闭则始终使用账号自身的端点。该开关与狂暴模式互相独立。"
+              title="跨 Region 轮换（既有策略）"
+              description="同一协议端点按账号 Region 顺序在 us-east-1 / eu-central-1 间尝试；此开关与下方协议端点 fallback 分开生效。"
               checked={draft.kiroUpstreamRegionRotationEnabled}
               onCheckedChange={(kiroUpstreamRegionRotationEnabled) =>
                 setDraft((prev) => ({ ...prev, kiroUpstreamRegionRotationEnabled }))
               }
             />
+            <ToggleField
+              title="允许 Profile ARN 跨 Region"
+              description="默认关闭。仅当跨 Region 轮换也开启时才生效；打开后允许使用与 Profile ARN 所在 Region 不同的候选，可能导致上游拒绝。"
+              checked={draft.kiroRegionProfileArnMismatchAllowed}
+              disabled={!draft.kiroUpstreamRegionRotationEnabled}
+              onCheckedChange={(kiroRegionProfileArnMismatchAllowed) => setDraft((prev) => ({ ...prev, kiroRegionProfileArnMismatchAllowed }))}
+            />
+            <ToggleField
+              title="启用同账号端点 fallback"
+              description="关闭时保持账号原端点行为；fallback 只接受与当前 OAuth 账号认证类型兼容的协议端点。"
+              checked={draft.kiroEndpointFallbackEnabled}
+              onCheckedChange={(kiroEndpointFallbackEnabled) => setDraft((prev) => ({ ...prev, kiroEndpointFallbackEnabled }))}
+            />
+            <div className="col-span-full space-y-1.5">
+              <div className="text-sm font-semibold">候选端点顺序</div>
+              <Input
+                value={endpointOrder}
+                disabled={!draft.kiroEndpointFallbackEnabled}
+                placeholder="例如 ide, cli"
+                onChange={(event) => {
+                  setEndpointOrder(event.target.value)
+                }}
+                onBlur={() => {
+                  const value = normalizeKiroEndpointFallbackOrder(endpointOrder)
+                  setEndpointOrder(value.join(', '))
+                  setDraft((prev) => ({ ...prev, kiroEndpointFallbackOrder: value }))
+                }}
+              />
+              <div className="text-xs leading-5 text-muted-foreground">仅接受 codewhisperer、amazonq、runtime。primary 仍按凭据 endpoint 优先、再按 defaultEndpoint 解析；API Key 账号仍使用 cli。</div>
+            </div>
             <ToggleField
               title="狂暴模式（429 暴力轮换）"
               description="仅作用于本地账号。开启后遇到普通 429 会优先换号重试，把所有账号轮一遍后再换端点，直到成功或轮次耗尽。会显著放大上游请求量，默认关闭。风控型 429 与带 Retry-After 的 429 不受影响。"

@@ -51,6 +51,29 @@ const SECRET_HEADERS: &[&str] = &[
     "set-cookie",
     "x-amz-security-token",
 ];
+const SECRET_QUERY_PARAMETERS: &[&str] = &[
+    "access_token",
+    "accesskey",
+    "apikey",
+    "api_key",
+    "authorization",
+    "client_assertion",
+    "client_secret",
+    "code",
+    "credential",
+    "id_token",
+    "password",
+    "privatekey",
+    "refresh_token",
+    "secret",
+    "signature",
+    "state",
+    "token",
+    "x-api-key",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "x-amz-signature",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -484,10 +507,25 @@ const EVENT_TYPE_DOCS: &[(&str, &str)] = &[
     ),
     (
         "upstream_request",
-        "每次发往 Kiro 上游的请求：attempt、凭据 ID、URL、请求头、完整请求体",
+        "每次发往 Kiro 上游的请求：attempt、凭据 ID、endpoint/Region/clientVersion、URL、请求头、完整请求体",
     ),
-    ("upstream_response", "上游响应状态与响应头"),
-    ("upstream_error_body", "上游非 2xx 响应体"),
+    (
+        "upstream_response",
+        "上游响应状态与响应头，包含 endpoint/Region/clientVersion",
+    ),
+    (
+        "upstream_error_body",
+        "上游非 2xx 响应体，包含 endpoint/Region/clientVersion",
+    ),
+    (
+        "protocol_request",
+        "账号协议请求：Token refresh、额度、超额设置；refresh token/client secret 只记录长度摘要",
+    ),
+    ("protocol_response", "账号协议响应状态与响应头"),
+    (
+        "protocol_response_body",
+        "账号协议响应体；Token refresh 响应正文不会采集",
+    ),
     ("upstream_frame", "上游 AWS EventStream 帧：帧头与 payload"),
     (
         "upstream_body",
@@ -654,6 +692,45 @@ pub fn http_headers_json(headers: &http::HeaderMap) -> Value {
         object.insert(key.to_string(), value);
     }
     Value::Object(object)
+}
+
+/// Redact URL userinfo and credential-like query values before writing a capture event.
+pub fn redacted_url(url: &reqwest::Url) -> String {
+    let mut redacted = url.clone();
+    if !url.username().is_empty() {
+        let _ = redacted.set_username("");
+    }
+    if url.password().is_some() {
+        let _ = redacted.set_password(None);
+    }
+
+    let query_pairs = url
+        .query_pairs()
+        .map(|(name, value)| {
+            let normalized = name
+                .chars()
+                .filter(|character| !matches!(character, '-' | '_'))
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            let value = if SECRET_QUERY_PARAMETERS.iter().any(|secret| {
+                secret
+                    .chars()
+                    .filter(|character| !matches!(character, '-' | '_'))
+                    .flat_map(char::to_lowercase)
+                    .eq(normalized.chars())
+            }) {
+                format!("[redacted] (len={})", value.len())
+            } else {
+                value.into_owned()
+            };
+            (name.into_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    if url.query().is_some() {
+        redacted.set_query(None);
+        redacted.query_pairs_mut().extend_pairs(query_pairs);
+    }
+    redacted.to_string()
 }
 
 /// 保留凭据的类型前缀与长度，便于排查而不泄露值。
@@ -872,6 +949,22 @@ mod tests {
         assert_eq!(value["authorization"], "Bearer [redacted] (len=13)");
         assert_eq!(value["x-api-key"], "[redacted] (len=6)");
         assert_eq!(value["user-agent"], "claude-cli/2.1");
+    }
+
+    #[test]
+    fn credential_like_url_query_values_are_redacted() {
+        let url = reqwest::Url::parse(
+            "https://user:pass@example.test/token?client_id=public&refresh_token=private-refresh&x-amz-signature=sig",
+        )
+        .unwrap();
+        let redacted = redacted_url(&url);
+        assert!(redacted.contains("client_id=public"));
+        assert!(redacted.contains("refresh_token=%5Bredacted%5D+%28len%3D15%29"));
+        assert!(redacted.contains("x-amz-signature=%5Bredacted%5D+%28len%3D3%29"));
+        assert!(!redacted.contains("private-refresh"));
+        assert!(!redacted.contains("=sig"));
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("pass"));
     }
 
     #[test]

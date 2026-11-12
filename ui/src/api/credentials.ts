@@ -29,6 +29,7 @@ import type {
   BatchProxyResourceImportResponse,
   AccessKeysResponse,
   RuntimeConfig,
+  KiroVersionLifecycleSnapshot,
   SetCredentialConcurrencyRequest,
   SetCredentialRateLimitAutoDisableRequest,
   SetCredentialRpmRequest,
@@ -77,6 +78,8 @@ import type {
   PromptInjectionPreviewRequest,
   PromptInjectionPreviewResponse,
   RequestKeyUsageLimitsResponse,
+  ProfileArnSyncMode,
+  ProfileArnSyncResponse,
 } from '@/types/api'
 
 const CREDENTIALS_LIST_PAGE_LIMIT = 500
@@ -309,6 +312,11 @@ export async function refreshCredentialInfo(ids: number[], force = true): Promis
   return data
 }
 
+export async function syncCredentialsProfileArn(ids: number[], mode: ProfileArnSyncMode): Promise<ProfileArnSyncResponse> {
+  const { data } = await api.post<ProfileArnSyncResponse>('/credentials/profile-arn/sync', { ids, mode })
+  return data
+}
+
 export async function testCredential(id: number, req: TestCredentialRequest): Promise<TestCredentialResponse> {
   const { data } = await api.post<TestCredentialResponse>(`/credentials/${id}/test`, req)
   return data
@@ -425,6 +433,26 @@ export async function previewPromptInjection(
 
 export async function updateRuntimeConfig(req: UpdateRuntimeConfigRequest): Promise<RuntimeConfig> {
   const { data } = await api.put<RuntimeConfig>('/config/runtime', req)
+  return data
+}
+
+export async function checkKiroClientVersion(): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/check')
+  return data
+}
+
+export async function applyKiroClientVersion(version?: string): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/apply', version ? { version } : {})
+  return data
+}
+
+export async function pinKiroClientVersion(version: string): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/pin', { version })
+  return data
+}
+
+export async function rollbackKiroClientVersion(): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/rollback')
   return data
 }
 

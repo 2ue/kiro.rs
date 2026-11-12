@@ -1,6 +1,20 @@
 # Implementation Status
 
-Last reviewed: 2026-09-28 Asia/Shanghai
+Last reviewed: 2026-11-11 Asia/Shanghai
+
+## 当前交接：端点/Region/版本生命周期（2026-11-11）
+
+当前阶段：已实现并完成 FREE 账号真实上游验证，详见 [设计文档 §13](topics/endpoint-rotation-and-client-version-lifecycle.md#13-2026-11-11-真实上游验证矩阵)。
+
+Last Landed：
+
+- MCP 400 根因修复：IdC/Builder ID 的 MCP 请求补 placeholder `x-amzn-kiro-profile-arn`。
+- inference、models、MCP 同账号 endpoint 候选；inference、models、MCP、Profile discovery、REST usage 有界 Region 候选。
+- 版本生命周期 candidate/active/previous、check/apply/pin/rollback、PostgreSQL CAS、Redis reload。
+- 真实上游验证后修复：Portal usage 的 Idp cookie 与 CBOR 数字解码、版本状态 CAS 第二次写入失败、`1.4.x` 模型列表 Profile ARN 与 null 列表、runtime 域名不提供模型列表、无模型请求被模型列表排除导致 WebSearch 不可用。
+- `scripts/kiro_capture_schema_diff.py`：两份 capture 的线协议结构差异报告。
+
+Out of scope：官方 Kiro 桌面客户端自身流量的完整 wire capture；自动版本回退、canary、服务二进制自更新。
 
 Current active work: [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md).
 

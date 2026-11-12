@@ -4,6 +4,7 @@ import {
   Download,
   FileUp,
   Filter,
+  Fingerprint,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -23,12 +24,17 @@ import {
   getCredentialRuntime,
   getCredentialUsageSummary,
   refreshCredentialInfo,
+  syncCredentialsProfileArn,
   testCredential,
 } from '@/api/credentials'
 import {
   Badge,
   Button,
   Checkbox,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
   Input,
   Select,
   SelectContent,
@@ -822,6 +828,29 @@ export function CredentialsPage() {
     else toast.warning(`刷新 Token：成功 ${success}，失败 ${fail}`)
   }
 
+  const batchSyncProfileArn = async (mode: 'fill' | 'rediscover') => {
+    // 只有 IdC / External IdP 用 ListAvailableProfiles 确定 profileArn；补全时跳过已有值的账号。
+    const ids = selectedCredentials
+      .filter((c) => c.authMethod === 'idc' || c.authMethod === 'external_idp')
+      .filter((c) => mode === 'rediscover' || !c.hasProfileArn)
+      .map((c) => c.id)
+    if (!ids.length) {
+      return toast.error(mode === 'fill' ? '选中项中没有缺少 Profile ARN 的 IdC / 企业账号' : '选中项中没有 IdC / 企业账号')
+    }
+    setBatchRefreshing(true)
+    try {
+      const res = await syncCredentialsProfileArn(ids, mode)
+      invalidate()
+      const summary = `更新 ${res.updated}，未变化 ${res.unchanged}，失败 ${res.failed}`
+      if (res.failed === 0) toast.success(`Profile 识别完成：${summary}`)
+      else toast.warning(`Profile 识别完成：${summary}`)
+    } catch (e) {
+      toast.error(`Profile 识别失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setBatchRefreshing(false)
+    }
+  }
+
   const batchResetPriority = async () => {
     const ids = selectedCredentials.filter((c) => c.priority !== 0).map((c) => c.id)
     if (!ids.length) return toast.error('选中账号没有自定义优先级')
@@ -1248,7 +1277,18 @@ export function CredentialsPage() {
             <Button variant="outline" size="xs" onClick={batchForceRefresh} disabled={batchRefreshing}>
               {batchRefreshing ? <Spinner size="sm" /> : <RefreshCw className="h-3.5 w-3.5" />}刷新Token
             </Button>
-            <Button variant="outline" size="xs" onClick={batchQueryCreditInfo} disabled={queryingCreditInfo}>
+            <DropdownMenu>
+       <DropdownMenuTrigger asChild>
+  <Button variant="outline" size="xs" disabled={batchRefreshing}>
+    <Fingerprint className="h-3.5 w-3.5" />识别 Profile
+  </Button>
+       </DropdownMenuTrigger>
+       <DropdownMenuContent align="start">
+  <DropdownMenuItem onSelect={() => void batchSyncProfileArn('fill')}>补全缺失的 Profile</DropdownMenuItem>
+  <DropdownMenuItem onSelect={() => void batchSyncProfileArn('rediscover')}>全部重新识别</DropdownMenuItem>
+       </DropdownMenuContent>
+     </DropdownMenu>
+     <Button variant="outline" size="xs" onClick={batchQueryCreditInfo} disabled={queryingCreditInfo}>
               {queryingCreditInfo ? <Spinner size="sm" /> : <Wallet className="h-3.5 w-3.5" />}查询积分
             </Button>
             <Button variant="outline" size="xs" onClick={batchResetFailure}>

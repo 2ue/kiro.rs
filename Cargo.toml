@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "0.0.244"
+version = "0.0.245"
 edition = "2024"
 
 [features]
@@ -22,6 +22,7 @@ rustls-native-certs = "0.8"
 webpki-roots = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["unbounded_depth"] }
+ciborium = "0.2"
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

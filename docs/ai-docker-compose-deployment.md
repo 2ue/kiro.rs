@@ -339,7 +339,12 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 | `credentialWarmupRequests` | `3` | 控制新凭据预热剩余请求数，每次真实请求成功减 1；号池较大时建议 20–30，让爬坡更平滑。预热不会伪造成功次数。 |
 | `credentialWarmupSelectionPercent` | `5` | 预热起始比例：新凭据起步流量 = 同档位就绪凭据平均流量 × 该百分比，随预热进度线性升到 100%。只在就绪凭据有余量时限流，就绪凭据全满时预热凭据照常接溢出流量。所有负载均衡模式都生效。 |
 | `credentialWarmupMaxSelectionPercent` | `50` | 所有预热凭据合计最多承接的近期流量比例；就绪凭据很少时自动放宽，避免就绪凭据被压到公平份额 2 倍以上。 |
-| `defaultEndpoint` | `ide` | 控制凭据未单独指定 `endpoint` 时走哪个 Kiro 端点；当前可选 `ide` / `cli`。 |
+| `defaultEndpoint` | `ide` | 控制凭据未单独指定 `endpoint` 时走哪个协议端点；内置 `ide`、`cli`、`codewhisperer`、`amazonq`、`runtime`。 |
+| `kiroEndpointFallbackEnabled` | `false` | 启用推理请求的同账号协议端点故障转移；仅传输错误和 502/503/504 生效，候选端点须支持当前账号认证类型。 |
+| `kiroEndpointFallbackOrder` | `codewhisperer, amazonq, runtime` | 同账号端点候选顺序；primary 仍由凭据 `endpoint` 或 `defaultEndpoint` 决定。 |
+| `kiroUpstreamRegionRotationEnabled` | `false` | 启用推理请求的 `us-east-1` / `eu-central-1` Region 重试，独立于协议端点 fallback。 |
+| `kiroRegionProfileArnMismatchAllowed` | `false` | 允许带 Profile ARN 的请求进入 ARN Region 不匹配的备用 Region；无 Profile ARN 的账号仍可按 Region 开关轮换。 |
+| `kiroVersionAutoSyncEnabled` | `false` | 每 12 小时发现官方版本 candidate，不自动改变 active。管理后台支持立即检查、显式 apply、pin 和 rollback；active 单独持久化并广播到其他实例。 |
 
 ### 上游请求体防护
 

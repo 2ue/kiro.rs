@@ -47,12 +47,21 @@ pub(crate) struct KiroModelCapabilityCohort {
     pub credential_ids: Vec<u64>,
 }
 
+/// `KiroIDE-1.4.x` 请求下上游会把未填的列表字段写成 `null`（如 `defaultModel.supportedInputTypes`）。
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroAvailableModelsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<KiroAvailableModel>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub models: Vec<KiroAvailableModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -67,7 +76,11 @@ pub struct KiroAvailableModel {
     pub model_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub supported_input_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limits: Option<KiroModelTokenLimits>,
@@ -106,6 +119,27 @@ pub struct KiroModelPromptCaching {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserializes_null_list_fields_returned_for_new_client_versions() {
+        // KiroIDE-1.4.154 请求的真实响应：defaultModel 的列表字段为 null。
+        let body = r#"{
+     "defaultModel": {"modelId": "auto", "supportedInputTypes": null, "availableOrigins": null},
+     "models": [{"modelId": "claude-haiku-4.5", "supportedInputTypes": ["TEXT"], "disclaimers": null}],
+     "nextToken": null
+        }"#;
+
+        let parsed: KiroAvailableModelsResponse = serde_json::from_str(body).unwrap();
+        assert!(
+            parsed
+                .default_model
+                .unwrap()
+                .supported_input_types
+                .is_empty()
+        );
+        assert_eq!(parsed.models[0].supported_input_types, ["TEXT"]);
+        assert!(parsed.next_token.is_none());
+    }
 
     #[test]
     fn deserializes_cli_management_model_catalog_fields() {

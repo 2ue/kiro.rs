@@ -6,6 +6,7 @@ import {
   Coins,
   Ellipsis,
   Eraser,
+  Fingerprint,
   Flame,
   FlaskConical,
   Gauge,
@@ -71,6 +72,7 @@ import {
   useCredentialDiagnostics,
   useDeleteCredential,
   useForceRefreshToken,
+  useSyncCredentialsProfileArn,
   useResetFailure,
   useRuntimeConfig,
   useSetCredentialConcurrency,
@@ -421,6 +423,7 @@ export function CredentialCard({
   const setWarmup = useSetWarmup()
   const clearInFlight = useClearInFlight()
   const forceRefresh = useForceRefreshToken()
+  const syncProfileArn = useSyncCredentialsProfileArn()
   const runtimeConfig = useRuntimeConfig()
   const diagnostics = useCredentialDiagnostics(credential.id, diagnosticsPage, showDiagnostics)
   const confirmDialog = useConfirm()
@@ -646,6 +649,22 @@ export function CredentialCard({
     onSuccess: (res) => toast.success(res.message),
     onError: (e) => toast.error(`刷新失败: ${extractErrorMessage(e)}`),
   })
+  // 只有 IdC / External IdP 账号靠 ListAvailableProfiles 确定 profileArn。
+  const usesProfileDiscovery = credential.authMethod === 'idc' || credential.authMethod === 'external_idp'
+  const runSyncProfileArn = (mode: 'fill' | 'rediscover') => syncProfileArn.mutate(
+    { ids: [credential.id], mode },
+    {
+      onSuccess: (res) => {
+ const item = res.items[0]
+ if (!item) return
+ if (item.status === 'failed') return toast.error(`识别 Profile 失败: ${item.error ?? '未知错误'}`)
+        if (item.status === 'skipped') return toast.info('已有 Profile ARN，无需补全')
+        const kind = item.profileKind === 'builder_id' ? 'Builder ID' : '组织 Profile'
+ toast.success(item.status === 'updated' ? `已更新为${kind}` : `Profile 未变化（${kind}）`)
+      },
+      onError: (e) => toast.error(`识别 Profile 失败: ${extractErrorMessage(e)}`),
+    }
+  )
   const runResetFailure = () => resetFailure.mutate(credential.id, {
     onSuccess: (res) => toast.success(res.message),
     onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
@@ -904,7 +923,12 @@ export function CredentialCard({
               <DropdownMenuItem disabled={forceRefresh.isPending || credential.authMethod === 'api_key'} onSelect={runForceRefresh}>
                 <RefreshCw /> {credential.authMethod === 'api_key' ? '刷新 Token（API Key 无需）' : '刷新 Token'}
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={resetFailure.isPending || !hasFailures} onSelect={runResetFailure}>
+              {usesProfileDiscovery && (
+         <DropdownMenuItem disabled={syncProfileArn.isPending} onSelect={() => runSyncProfileArn(credential.hasProfileArn ? 'rediscover' : 'fill')}>
+    <Fingerprint /> {credential.hasProfileArn ? '重新识别 Profile' : '补全 Profile'}
+  </DropdownMenuItem>
+       )}
+       <DropdownMenuItem disabled={resetFailure.isPending || !hasFailures} onSelect={runResetFailure}>
                 <RotateCcw /> 恢复异常
               </DropdownMenuItem>
               <DropdownMenuItem disabled={clearInFlight.isPending || !canClearInFlight} onSelect={runClearInFlight}>

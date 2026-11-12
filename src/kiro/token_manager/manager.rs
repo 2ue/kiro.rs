@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -102,6 +102,7 @@ use super::redis_runtime::{
     apply_scheduler_states_with_global_rpm as apply_redis_scheduler_states_with_global_rpm,
     clear_scheduler_state_for_credential_local, clear_scheduler_state_for_credential_redis,
     publish_credentials_changed as publish_redis_credentials_changed,
+    publish_kiro_version_state_changed as publish_redis_kiro_version_state_changed,
     publish_runtime_config_changed as publish_redis_runtime_config_changed,
 };
 use super::refresh::{
@@ -1092,6 +1093,9 @@ pub struct MultiTokenManager {
     /// Secret-free capability cohorts are rebuilt only after a relevant credential/config/proxy
     /// mutation. Request reads clone one Arc and never scan the account pool.
     model_capability_cohort_generation: AtomicU64,
+    /// Wakes the model-capability recovery worker when the cohorts change, so enabling or adding
+    /// an account re-syncs the model catalog without waiting for the next poll.
+    model_capability_cohort_changed: Notify,
     /// Last account-info refresh started after a model rejection, per credential. Bounds the
     /// refresh to one per account per [`MODEL_REJECTION_REFRESH_INTERVAL`].
     model_rejection_refreshes: Mutex<HashMap<u64, Instant>>,
@@ -2791,6 +2795,7 @@ impl MultiTokenManager {
             #[cfg(test)]
             auto_heal_pgsql_attempts: AtomicU64::new(0),
             model_capability_cohort_generation: AtomicU64::new(1),
+            model_capability_cohort_changed: Notify::new(),
             model_rejection_refreshes: Mutex::new(HashMap::new()),
             subscription_tier_observer: std::sync::OnceLock::new(),
             model_capability_cohort_cache: Mutex::new(ModelCapabilityCohortCache::default()),
@@ -7329,6 +7334,16 @@ impl MultiTokenManager {
     ///
     /// 仅用于 Admin 手动模型调用测试；即使凭据已被禁用，也允许验证一次上游模型调用。
     pub async fn acquire_context_for_credential(&self, id: u64) -> anyhow::Result<CallContext> {
+        let request_kiro_version = self.runtime_config().effective_kiro_version();
+        self.acquire_context_for_credential_with_version(id, Some(&request_kiro_version))
+            .await
+    }
+
+    pub async fn acquire_context_for_credential_with_version(
+        &self,
+        id: u64,
+        request_kiro_version: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let credentials = {
             let entries = self.entries.lock();
             let entry = entries
@@ -7338,7 +7353,16 @@ impl MultiTokenManager {
             entry.credentials.clone()
         };
 
-        self.try_ensure_token(id, &credentials, false).await
+        self.try_ensure_token_with_budgets_and_auxiliary_budget_and_lead(
+            id,
+            &credentials,
+            false,
+            TokenRefreshBudgets::default(),
+            None,
+            None,
+            request_kiro_version,
+        )
+        .await
     }
 
     /// 获取 API 调用上下文，优先保持同一会话使用同一个凭据。
@@ -7410,6 +7434,7 @@ impl MultiTokenManager {
 
     /// Selects a credential for one dispatch of a request; `admission` tells a first dispatch
     /// from a retry after a failed attempt (see [`DispatchAdmission`]).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn acquire_context_for_dispatch(
         &self,
@@ -7420,6 +7445,31 @@ impl MultiTokenManager {
         admission: DispatchAdmission,
         request_weight_units: u32,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_dispatch_with_version(
+            model,
+            session_id,
+            excluded_ids,
+            acquire_mode,
+            admission,
+            request_weight_units,
+            auxiliary_attempt_budget,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn acquire_context_for_dispatch_with_version(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        acquire_mode: AcquireMode,
+        admission: DispatchAdmission,
+        request_weight_units: u32,
+        auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+        request_kiro_version: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         let request_weight_units = normalize_capacity_weight_units(request_weight_units);
         enum AcquireDecision {
@@ -8360,6 +8410,7 @@ impl MultiTokenManager {
                     &credentials,
                     true,
                     auxiliary_attempt_budget.clone(),
+                    request_kiro_version,
                 )
                 .await
             {
@@ -8792,6 +8843,7 @@ impl MultiTokenManager {
         Ok(entry.credentials.clone())
     }
 
+    #[cfg(test)]
     async fn try_ensure_token(
         &self,
         id: u64,
@@ -8814,13 +8866,16 @@ impl MultiTokenManager {
         credentials: &KiroCredentials,
         update_refresh_health: bool,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+        request_kiro_version: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.try_ensure_token_with_budgets_and_auxiliary_budget(
+        self.try_ensure_token_with_budgets_and_auxiliary_budget_and_lead(
             id,
             credentials,
             update_refresh_health,
             TokenRefreshBudgets::default(),
             auxiliary_attempt_budget,
+            None,
+            request_kiro_version,
         )
         .await
     }
@@ -8843,6 +8898,7 @@ impl MultiTokenManager {
         .await
     }
 
+    #[cfg(test)]
     async fn try_ensure_token_with_budgets_and_auxiliary_budget(
         &self,
         id: u64,
@@ -8858,10 +8914,13 @@ impl MultiTokenManager {
             budgets,
             auxiliary_attempt_budget,
             None,
+            None,
         )
         .await
     }
 
+    // 请求级版本快照需要贯穿刷新与恢复路径，与既有预算参数并列传入。
+    #[allow(clippy::too_many_arguments)]
     async fn try_ensure_token_with_budgets_and_auxiliary_budget_and_lead(
         &self,
         id: u64,
@@ -8870,6 +8929,7 @@ impl MultiTokenManager {
         budgets: TokenRefreshBudgets,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
         refresh_lead: Option<StdDuration>,
+        request_kiro_version: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -8926,7 +8986,10 @@ impl MultiTokenManager {
                     })?;
                 let effective_proxy = current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
                 let refresh_identity = {
-                    let config = self.config.read();
+                    let mut config = self.runtime_config();
+                    if let Some(version) = request_kiro_version {
+                        config.pin_kiro_version_for_request(version.to_string());
+                    }
                     RefreshAttemptIdentity::from_refresh_request(
                         &current_creds_for_proxy,
                         &config,
@@ -9048,7 +9111,10 @@ impl MultiTokenManager {
                             let authoritative_proxy =
                                 authoritative_for_proxy.effective_proxy(self.proxy.as_ref());
                             let authoritative_identity = {
-                                let config = self.config.read();
+                                let mut config = self.runtime_config();
+                                if let Some(version) = request_kiro_version {
+                                    config.pin_kiro_version_for_request(version.to_string());
+                                }
                                 RefreshAttemptIdentity::from_refresh_request(
                                     &authoritative_for_proxy,
                                     &config,
@@ -9096,7 +9162,10 @@ impl MultiTokenManager {
                         // Invalid local configuration is health-neutral and must not create
                         // avoidable client-cache/RPM/concurrency pressure during a failure wave.
                         validate_refresh_token(&refresh_source_for_proxy)?;
-                        let config = self.runtime_config();
+                        let mut config = self.runtime_config();
+                        if let Some(version) = request_kiro_version {
+                            config.pin_kiro_version_for_request(version.to_string());
+                        }
                         let admission = RefreshSendAdmission::new_with_send_started_marker(
                             auxiliary_attempt_budget.clone(),
                             self.auxiliary_concurrency_controller(),
@@ -10726,6 +10795,25 @@ impl MultiTokenManager {
         );
     }
 
+    pub(crate) fn publish_kiro_version_state_changed(&self, reason: &str) {
+        publish_redis_kiro_version_state_changed(
+            self.redis_store.as_ref(),
+            reason,
+            &self.scheduler_instance_id,
+        );
+    }
+
+    pub(crate) async fn reload_kiro_version_state_from_postgres(&self) -> anyhow::Result<bool> {
+        let Some(store) = &self.postgres_store else {
+            return Ok(false);
+        };
+        let Some(state) = store.load_kiro_version_state().await? else {
+            return Ok(false);
+        };
+        crate::kiro::kiro_version::replace_state(state);
+        Ok(true)
+    }
+
     fn publish_credentials_changed(&self, reason: &str) {
         publish_redis_credentials_changed(
             self.postgres_store.as_ref(),
@@ -11548,7 +11636,9 @@ impl MultiTokenManager {
     }
 
     async fn run_background_token_refresh_pass(&self) -> BackgroundTokenRefreshPassReport {
-        let config = self.runtime_config();
+        let mut config = self.runtime_config();
+        config.snapshot_kiro_version_for_request();
+        let request_kiro_version = config.effective_kiro_version();
         if !config.token_refresh_background_enabled {
             return BackgroundTokenRefreshPassReport::default();
         }
@@ -11589,6 +11679,7 @@ impl MultiTokenManager {
                     TokenRefreshBudgets::default(),
                     None,
                     Some(lead),
+                    Some(&request_kiro_version),
                 )
                 .await
             {
@@ -14200,6 +14291,13 @@ impl MultiTokenManager {
     fn invalidate_model_capability_cohorts(&self) {
         self.model_capability_cohort_generation
             .fetch_add(1, Ordering::AcqRel);
+        self.model_capability_cohort_changed.notify_one();
+    }
+
+    /// Resolves when the capability cohorts change or after `max_wait`, whichever comes first.
+    pub(crate) async fn wait_model_capability_cohort_change(&self, max_wait: std::time::Duration) {
+        let _ =
+            tokio::time::timeout(max_wait, self.model_capability_cohort_changed.notified()).await;
     }
 
     #[cfg(test)]
@@ -14841,6 +14939,15 @@ impl MultiTokenManager {
     }
 
     /// 请求热路径版本：本地 profileArn 立即生效，PgSQL 凭据 CAS 异步持久化。
+    /// 当前内存中的 profileArn（管理端比较同步前后的值用）。
+    pub fn credential_profile_arn(&self, id: u64) -> Option<String> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.credentials.profile_arn.clone())
+    }
+
     pub fn update_credential_profile_arn_deferred(
         &self,
         id: u64,
@@ -14933,12 +15040,16 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let ctx = self.acquire_context_for_credential(id).await?;
+        let mut config = self.runtime_config();
+        config.snapshot_kiro_version_for_request();
+        let request_kiro_version = config.effective_kiro_version();
+        let ctx = self
+            .acquire_context_for_credential_with_version(id, Some(&request_kiro_version))
+            .await?;
         let token = ctx.token;
         let credentials = ctx.credentials;
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let config = self.runtime_config();
         let usage_limits =
             get_usage_limits(&credentials, &config, &token, effective_proxy.as_ref()).await?;
 
@@ -15023,12 +15134,16 @@ impl MultiTokenManager {
         id: u64,
         enabled: bool,
     ) -> anyhow::Result<UsageLimitsResponse> {
-        let ctx = self.acquire_context_for_credential(id).await?;
+        let mut config = self.runtime_config();
+        config.snapshot_kiro_version_for_request();
+        let request_kiro_version = config.effective_kiro_version();
+        let ctx = self
+            .acquire_context_for_credential_with_version(id, Some(&request_kiro_version))
+            .await?;
         let token = ctx.token;
         let credentials = ctx.credentials;
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let config = self.runtime_config();
         set_overage_status(
             &credentials,
             &config,
@@ -15049,7 +15164,20 @@ impl MultiTokenManager {
     /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
     pub async fn acquire_context_for_external_credentials(
         &self,
+        credentials: KiroCredentials,
+    ) -> anyhow::Result<CallContext> {
+        let request_kiro_version = self.runtime_config().effective_kiro_version();
+        self.acquire_context_for_external_credentials_with_version(
+            credentials,
+            Some(&request_kiro_version),
+        )
+        .await
+    }
+
+    pub async fn acquire_context_for_external_credentials_with_version(
+        &self,
         mut credentials: KiroCredentials,
+        request_kiro_version: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         credentials.canonicalize_auth_method();
         credentials.normalize_api_key_defaults();
@@ -15074,7 +15202,10 @@ impl MultiTokenManager {
         let source_credentials = credentials.clone();
         let credentials = self.resolve_proxy_for_credential(credentials)?;
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let config = self.runtime_config();
+        let mut config = self.runtime_config();
+        if let Some(version) = request_kiro_version {
+            config.pin_kiro_version_for_request(version.to_string());
+        }
         let admission = RefreshSendAdmission::new(
             None,
             self.auxiliary_concurrency_controller(),
@@ -15105,11 +15236,16 @@ impl MultiTokenManager {
         &self,
         credentials: KiroCredentials,
     ) -> anyhow::Result<UsageLimitsResponse> {
+        let mut config = self.runtime_config();
+        config.snapshot_kiro_version_for_request();
+        let request_kiro_version = config.effective_kiro_version();
         let ctx = self
-            .acquire_context_for_external_credentials(credentials)
+            .acquire_context_for_external_credentials_with_version(
+                credentials,
+                Some(&request_kiro_version),
+            )
             .await?;
         let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
-        let config = self.runtime_config();
         get_usage_limits(
             &ctx.credentials,
             &config,
@@ -15249,7 +15385,8 @@ impl MultiTokenManager {
         } else {
             let new_cred_for_proxy = self.resolve_proxy_for_credential(new_cred.clone())?;
             let effective_proxy = new_cred_for_proxy.effective_proxy(self.proxy.as_ref());
-            let config = self.runtime_config();
+            let mut config = self.runtime_config();
+            config.snapshot_kiro_version_for_request();
             let admission = RefreshSendAdmission::new(
                 None,
                 self.auxiliary_concurrency_controller(),
@@ -15608,6 +15745,7 @@ impl MultiTokenManager {
         expected_access_token: &str,
         expected_storage_revision: u64,
         auxiliary_attempt_budget: Arc<AuxiliaryAttemptBudget>,
+        request_kiro_version: Option<&str>,
     ) -> anyhow::Result<AutomaticTokenRecoveryOutcome> {
         let initial_credentials = {
             let entries = self.entries.lock();
@@ -15665,7 +15803,10 @@ impl MultiTokenManager {
             })?;
         let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
         let refresh_identity = {
-            let config = self.config.read();
+            let mut config = self.runtime_config();
+            if let Some(version) = request_kiro_version {
+                config.pin_kiro_version_for_request(version.to_string());
+            }
             RefreshAttemptIdentity::from_automatic_recovery_request(
                 &credentials_for_proxy,
                 expected_access_token,
@@ -15796,7 +15937,10 @@ impl MultiTokenManager {
                     let authoritative_proxy =
                         authoritative_for_proxy.effective_proxy(self.proxy.as_ref());
                     let authoritative_identity = {
-                        let config = self.config.read();
+                        let mut config = self.runtime_config();
+                        if let Some(version) = request_kiro_version {
+                            config.pin_kiro_version_for_request(version.to_string());
+                        }
                         RefreshAttemptIdentity::from_automatic_recovery_request(
                             &authoritative_for_proxy,
                             expected_access_token,
@@ -15835,7 +15979,10 @@ impl MultiTokenManager {
 
         Self::ensure_refresh_state_generation(&refresh_state, refresh_reset_generation, false)?;
         auxiliary_attempt_budget.ensure_available(AuxiliaryAttemptKind::TokenRefresh)?;
-        let config = self.runtime_config();
+        let mut config = self.runtime_config();
+        if let Some(version) = request_kiro_version {
+            config.pin_kiro_version_for_request(version.to_string());
+        }
         let admission = RefreshSendAdmission::new_with_send_started_marker(
             Some(auxiliary_attempt_budget),
             self.auxiliary_concurrency_controller(),
@@ -16040,6 +16187,7 @@ impl MultiTokenManager {
         id: u64,
         budgets: TokenRefreshBudgets,
     ) -> anyhow::Result<()> {
+        let request_kiro_version = self.runtime_config().effective_kiro_version();
         let initial_credentials = {
             let entries = self.entries.lock();
             entries
@@ -16063,7 +16211,8 @@ impl MultiTokenManager {
             })?;
         let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
         let refresh_identity = {
-            let config = self.config.read();
+            let mut config = self.runtime_config();
+            config.pin_kiro_version_for_request(request_kiro_version.clone());
             RefreshAttemptIdentity::from_refresh_request(
                 &credentials_for_proxy,
                 &config,
@@ -16219,7 +16368,8 @@ impl MultiTokenManager {
                         ))
                     })?;
                 let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
-                let config = self.runtime_config();
+                let mut config = self.runtime_config();
+                config.pin_kiro_version_for_request(request_kiro_version.clone());
                 let admission = RefreshSendAdmission::new_with_send_started_marker(
                     None,
                     self.auxiliary_concurrency_controller(),

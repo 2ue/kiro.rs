@@ -30,22 +30,23 @@ use super::types::{
     CredentialUsageSummaryResponse, CredentialValidationGroup, CredentialValidationInfo,
     CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
     CredentialsStatusResponse, DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest,
-    LoadBalancingModeResponse, ManualModelResponse, ProxyResourceBatchTestItem,
-    ProxyResourceBatchTestResponse, ProxyResourceImportEntry, ProxyResourceResponse,
-    ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
-    RefreshCredentialInfoRequest, RequestApiKeyItem, RequestKeyUsageLimitItem,
-    RequestKeyUsageLimitsResponse, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
-    SetCredentialOverageRequest, SetCredentialProxyRequest,
-    SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
-    SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
-    SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
-    SubscriptionModelListItem, SubscriptionModelListsResponse, SupportedModelsResponse,
-    SyncSubscriptionModelListRequest, TestCredentialRequest, TestCredentialResponse,
-    TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
-    UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
-    UsageDashboardAccountItem, UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
+    LoadBalancingModeResponse, ManualModelResponse, ProfileArnSyncItem, ProfileArnSyncMode,
+    ProfileArnSyncResponse, ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse,
+    ProxyResourceImportEntry, ProxyResourceResponse, ProxyResourceTestRequest,
+    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
+    RequestApiKeyItem, RequestKeyUsageLimitItem, RequestKeyUsageLimitsResponse,
+    RuntimeConfigResponse, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
+    SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+    SetCredentialRegionsRequest, SetCredentialRoutePolicyRequest, SetCredentialRpmRequest,
+    SetLoadBalancingModeRequest, SetSubscriptionModelListRequest, SetSupportedModelsRequest,
+    SetWarmupRequest, SubscriptionModelListItem, SubscriptionModelListsResponse,
+    SupportedModelsResponse, SyncProfileArnRequest, SyncSubscriptionModelListRequest,
+    TestCredentialRequest, TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse,
+    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupResumeRequest, UsageCleanupStatusResponse, UsageDashboardAccountItem,
+    UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
     ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::request_key_limits::{
@@ -3056,6 +3057,126 @@ impl AdminService {
         self.get_account_info(id, false).await
     }
 
+    /// 批量补全或重新识别 IdC / External IdP 账号的 profileArn。
+    pub async fn sync_credentials_profile_arn(
+        &self,
+        req: SyncProfileArnRequest,
+    ) -> Result<ProfileArnSyncResponse, AdminServiceError> {
+        let mut ids = req.ids;
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请至少选择一个凭据".to_string(),
+            ));
+        }
+        if ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多处理 {} 个凭据",
+                MAX_CREDENTIALS_PAGE_LIMIT
+            )));
+        }
+        let concurrency =
+            effective_credential_info_refresh_concurrency(&self.token_manager.runtime_config());
+        let labels = self.credential_lookup();
+        let snapshot = self.token_manager.base_snapshot();
+        let mut items = stream::iter(ids.into_iter().map(|id| {
+            let email = labels.get(&id).and_then(|item| item.email.clone());
+            let before = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| (entry.auth_method.clone(), entry.has_profile_arn));
+            async move {
+                let item = |status, profile_kind, error| ProfileArnSyncItem {
+                    id,
+                    email: email.clone(),
+                    status,
+                    profile_kind,
+                    error,
+                };
+                let Some((auth_method, had_profile_arn)) = before else {
+                    return item("failed", None, Some(format!("凭据不存在: {id}")));
+                };
+                let auth_method = auth_method.unwrap_or_default();
+                if !matches!(auth_method.as_str(), "idc" | "external_idp") {
+                    return item(
+                        "skipped",
+                        None,
+                        Some("该认证类型不使用 profileArn 发现".to_string()),
+                    );
+                }
+                if req.mode == ProfileArnSyncMode::Fill && had_profile_arn {
+                    return item("skipped", None, None);
+                }
+                let previous = self.token_manager.credential_profile_arn(id);
+                let result = match req.mode {
+                    ProfileArnSyncMode::Fill => self
+                        .kiro_provider
+                        .ensure_profile_arn_for_credential(id)
+                        .await
+                        .map(|()| self.token_manager.credential_profile_arn(id)),
+                    ProfileArnSyncMode::Rediscover => self
+                        .kiro_provider
+                        .rediscover_profile_arn_for_credential(id)
+                        .await
+                        .map(|discovered| discovered.or_else(|| previous.clone())),
+                };
+                match result {
+                    Ok(current) => {
+                        let kind = current.as_deref().map(|arn| {
+                            if crate::kiro::protocol::is_placeholder_profile_arn(arn) {
+                                "builder_id"
+                            } else {
+                                "organization"
+                            }
+                        });
+                        if current.is_none() {
+                            item(
+                                "failed",
+                                Some("none"),
+                                Some("上游没有返回可用的 profileArn".to_string()),
+                            )
+                        } else if current == previous {
+                            item("unchanged", kind, None)
+                        } else {
+                            self.invalidate_balance_cache(id);
+                            item("updated", kind, None)
+                        }
+                    }
+                    Err(error) => item("failed", None, Some(error.to_string())),
+                }
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        items.sort_unstable_by_key(|item| item.id);
+        let count = |status: &str| items.iter().filter(|item| item.status == status).count();
+        let response = ProfileArnSyncResponse {
+            total: items.len(),
+            updated: count("updated"),
+            unchanged: count("unchanged"),
+            skipped: count("skipped"),
+            failed: count("failed"),
+            items,
+        };
+        self.audit(
+            "sync_credentials_profile_arn",
+            "credential",
+            None,
+            response.failed == 0,
+            None,
+            json!({
+                "mode": format!("{:?}", req.mode),
+                "total": response.total,
+                "updated": response.updated,
+                "failed": response.failed,
+            }),
+        );
+        Ok(response)
+    }
+
     pub async fn refresh_credentials_info(
         &self,
         req: RefreshCredentialInfoRequest,
@@ -3302,6 +3423,19 @@ impl AdminService {
                         existing_disabled: matched.as_ref().map(|item| item.disabled),
                     });
                     continue;
+                }
+            };
+
+            // JSON 里没有 profileArn 的 IdC 账号先查一次；组织账号带 Builder ID 占位查额度会被拒。
+            let credential = match self
+                .kiro_provider
+                .discover_profile_arn_for_external_credentials(credential.clone())
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    tracing::debug!("外部凭据校验前补全 profileArn 失败: {}", error);
+                    credential
                 }
             };
 
@@ -3555,6 +3689,19 @@ impl AdminService {
 
     /// 从上游获取账号信息（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        // 额度查询不经过 provider 的请求前补全；组织 IdC 先查出真实 profileArn，
+        // 否则只能带 Builder ID 占位去查而被拒。已有 ARN 或已确认的账号直接跳过。
+        if let Err(error) = self
+            .kiro_provider
+            .ensure_profile_arn_for_credential(id)
+            .await
+        {
+            tracing::debug!(
+                credential_id = id,
+                "额度查询前补全 profileArn 失败: {}",
+                error
+            );
+        }
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
@@ -3719,6 +3866,20 @@ impl AdminService {
                     None => format!("超额开启失败: {}", err),
                 });
             }
+        }
+
+        // 导入的 IdC 账号没有 profileArn 时先查一次：组织账号查到真实 ARN 后，额度查询、
+        // 模型列表和验活才会带对 profile。失败只记录警告，请求前的自动补全会再试。
+        if let Err(error) = self
+            .kiro_provider
+            .ensure_profile_arn_for_credential(credential_id)
+            .await
+        {
+            tracing::warn!(
+                credential_id,
+                "导入后补全 profileArn 失败（不影响导入）: {}",
+                error
+            );
         }
 
         // 导入时同步补齐订阅、额度和 email。查询失败只记录警告，不影响凭据导入；
@@ -6334,6 +6495,177 @@ impl AdminService {
         }
     }
 
+    pub async fn check_kiro_client_version(
+        &self,
+    ) -> Result<crate::kiro::kiro_version::LifecycleSnapshot, AdminServiceError> {
+        let config = self.token_manager.runtime_config();
+        let check = crate::kiro::kiro_version::check_now(&config).await;
+        let check_error = check.as_ref().err().map(ToString::to_string);
+        let next = match &check {
+            Ok(version) => {
+                crate::kiro::kiro_version::persist_check_result(
+                    &self.postgres_store,
+                    Some(version),
+                    None,
+                    &config.kiro_version,
+                    false,
+                )
+                .await
+            }
+            Err(_) => {
+                crate::kiro::kiro_version::persist_check_result(
+                    &self.postgres_store,
+                    None,
+                    check_error.as_deref(),
+                    &config.kiro_version,
+                    false,
+                )
+                .await
+            }
+        }
+        .map_err(|error| {
+            AdminServiceError::InternalError(format!("保存 Kiro 版本检查状态失败: {error}"))
+        })?;
+        if let Err(error) = check {
+            self.audit(
+                "check_kiro_client_version",
+                "kiro_client_version",
+                None,
+                false,
+                Some(error.to_string()),
+                json!({}),
+            );
+            return Err(AdminServiceError::UpstreamError(error.to_string()));
+        }
+        self.audit(
+            "check_kiro_client_version",
+            "kiro_client_version",
+            None,
+            true,
+            None,
+            json!({ "candidateVersion": next.candidate_version }),
+        );
+        Ok(crate::kiro::kiro_version::lifecycle_snapshot(
+            &config.kiro_version,
+            config.kiro_version_auto_sync_enabled,
+        ))
+    }
+
+    pub async fn apply_kiro_client_version(
+        &self,
+        version: Option<&str>,
+        pin: bool,
+    ) -> Result<crate::kiro::kiro_version::LifecycleSnapshot, AdminServiceError> {
+        let config = self.token_manager.runtime_config();
+        let current = self
+            .postgres_store
+            .load_kiro_version_state()
+            .await
+            .map_err(|error| {
+                AdminServiceError::InternalError(format!("读取 Kiro 版本状态失败: {error}"))
+            })?
+            .unwrap_or_default()
+            .normalized();
+        let result = if pin {
+            let version = version.ok_or_else(|| {
+                AdminServiceError::InvalidCredential("pin 操作必须指定 version".to_string())
+            })?;
+            crate::kiro::kiro_version::pin_version(&current, version, &config.kiro_version)
+        } else {
+            crate::kiro::kiro_version::apply_version(&current, version, &config.kiro_version)
+        }
+        .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        if !self
+            .postgres_store
+            .save_kiro_version_state_if_generation(&result, current.generation)
+            .await
+            .map_err(|error| {
+                AdminServiceError::InternalError(format!("保存 Kiro active 版本失败: {error}"))
+            })?
+        {
+            if let Ok(Some(latest)) = self.postgres_store.load_kiro_version_state().await {
+                crate::kiro::kiro_version::replace_state(latest);
+            }
+            return Err(AdminServiceError::Conflict(
+                "Kiro 版本状态已被其他实例更新，请刷新后重试".to_string(),
+            ));
+        }
+        crate::kiro::kiro_version::replace_state(result.clone());
+        if crate::kiro::kiro_version::active_changed(&current, &result) {
+            self.token_manager
+                .publish_kiro_version_state_changed(if pin {
+                    "admin_version_pin"
+                } else {
+                    "admin_version_apply"
+                });
+        }
+        self.audit(
+            if pin {
+                "pin_kiro_client_version"
+            } else {
+                "apply_kiro_client_version"
+            },
+            "kiro_client_version",
+            None,
+            true,
+            None,
+            json!({ "version": result.active_version, "source": result.active_source }),
+        );
+        Ok(crate::kiro::kiro_version::lifecycle_snapshot(
+            &config.kiro_version,
+            config.kiro_version_auto_sync_enabled,
+        ))
+    }
+
+    pub async fn rollback_kiro_client_version(
+        &self,
+    ) -> Result<crate::kiro::kiro_version::LifecycleSnapshot, AdminServiceError> {
+        let config = self.token_manager.runtime_config();
+        let current = self
+            .postgres_store
+            .load_kiro_version_state()
+            .await
+            .map_err(|error| {
+                AdminServiceError::InternalError(format!("读取 Kiro 版本状态失败: {error}"))
+            })?
+            .unwrap_or_default()
+            .normalized();
+        let result = crate::kiro::kiro_version::rollback_version(&current, &config.kiro_version)
+            .map_err(|error| AdminServiceError::Conflict(error.to_string()))?;
+        if !self
+            .postgres_store
+            .save_kiro_version_state_if_generation(&result, current.generation)
+            .await
+            .map_err(|error| {
+                AdminServiceError::InternalError(format!("保存 Kiro 回退版本失败: {error}"))
+            })?
+        {
+            if let Ok(Some(latest)) = self.postgres_store.load_kiro_version_state().await {
+                crate::kiro::kiro_version::replace_state(latest);
+            }
+            return Err(AdminServiceError::Conflict(
+                "Kiro 版本状态已被其他实例更新，请刷新后重试".to_string(),
+            ));
+        }
+        crate::kiro::kiro_version::replace_state(result.clone());
+        if crate::kiro::kiro_version::active_changed(&current, &result) {
+            self.token_manager
+                .publish_kiro_version_state_changed("admin_version_rollback");
+        }
+        self.audit(
+            "rollback_kiro_client_version",
+            "kiro_client_version",
+            None,
+            true,
+            None,
+            json!({ "version": result.active_version, "source": result.active_source }),
+        );
+        Ok(crate::kiro::kiro_version::lifecycle_snapshot(
+            &config.kiro_version,
+            config.kiro_version_auto_sync_enabled,
+        ))
+    }
+
     /// 获取运行时全局配置。
     pub fn get_runtime_config(&self) -> RuntimeConfigResponse {
         let config = self.token_manager.runtime_config();
@@ -6375,6 +6707,10 @@ impl AdminService {
                 .credential_auto_heal_max_consecutive_rounds,
             kiro_version_auto_sync_enabled: config.kiro_version_auto_sync_enabled,
             kiro_version_latest: crate::kiro::kiro_version::latest(),
+            kiro_version_lifecycle: crate::kiro::kiro_version::lifecycle_snapshot(
+                &config.kiro_version,
+                config.kiro_version_auto_sync_enabled,
+            ),
             kiro_runtime_domain_enabled: config.kiro_runtime_domain_enabled,
             credential_protocol_error_cooldown_secs: config.credential_protocol_error_cooldown_secs,
             credential_auth_error_cooldown_secs: config.credential_auth_error_cooldown_secs,
@@ -6440,6 +6776,10 @@ impl AdminService {
             credential_prompt_logic_retry_max_attempts: config
                 .credential_prompt_logic_retry_max_attempts,
             kiro_upstream_region_rotation_enabled: config.kiro_upstream_region_rotation_enabled,
+            kiro_region_profile_arn_mismatch_allowed: config
+                .kiro_region_profile_arn_mismatch_allowed,
+            kiro_endpoint_fallback_enabled: config.kiro_endpoint_fallback_enabled,
+            kiro_endpoint_fallback_order: config.kiro_endpoint_fallback_order.clone(),
             local_berserk_mode_enabled: config.local_berserk_mode_enabled,
             local_berserk_max_rounds: config.local_berserk_max_rounds,
             local_berserk_round_delay_ms: config.local_berserk_round_delay_ms,
@@ -6647,6 +6987,34 @@ impl AdminService {
         let kiro_upstream_region_rotation_enabled = req
             .kiro_upstream_region_rotation_enabled
             .unwrap_or(current_config.kiro_upstream_region_rotation_enabled);
+        let kiro_region_profile_arn_mismatch_allowed = req
+            .kiro_region_profile_arn_mismatch_allowed
+            .unwrap_or(current_config.kiro_region_profile_arn_mismatch_allowed);
+        let kiro_endpoint_fallback_enabled = req
+            .kiro_endpoint_fallback_enabled
+            .unwrap_or(current_config.kiro_endpoint_fallback_enabled);
+        let kiro_endpoint_fallback_order = req
+            .kiro_endpoint_fallback_order
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| current_config.kiro_endpoint_fallback_order.clone());
+        let mut normalized_endpoint_fallback_order = Vec::new();
+        let mut seen_endpoint_fallbacks = HashSet::new();
+        for name in kiro_endpoint_fallback_order {
+            let name = name.trim();
+            if name.is_empty() || !seen_endpoint_fallbacks.insert(name.to_string()) {
+                continue;
+            }
+            if !self.known_endpoints.contains(name) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知 Kiro fallback endpoint: {name}"
+                )));
+            }
+            normalized_endpoint_fallback_order.push(name.to_string());
+            if normalized_endpoint_fallback_order.len() == 8 {
+                break;
+            }
+        }
         let local_berserk_mode_enabled = req
             .local_berserk_mode_enabled
             .unwrap_or(current_config.local_berserk_mode_enabled);
@@ -7352,6 +7720,10 @@ impl AdminService {
                     credential_prompt_logic_retry_max_attempts;
                 config.kiro_upstream_region_rotation_enabled =
                     kiro_upstream_region_rotation_enabled;
+                config.kiro_region_profile_arn_mismatch_allowed =
+                    kiro_region_profile_arn_mismatch_allowed;
+                config.kiro_endpoint_fallback_enabled = kiro_endpoint_fallback_enabled;
+                config.kiro_endpoint_fallback_order = normalized_endpoint_fallback_order;
                 config.local_berserk_mode_enabled = local_berserk_mode_enabled;
                 config.local_berserk_max_rounds = local_berserk_max_rounds;
                 config.local_berserk_round_delay_ms = local_berserk_round_delay_ms;

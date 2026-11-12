@@ -5085,13 +5085,20 @@ pub struct Config {
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
-    /// 是否自动同步 Kiro 客户端版本号（默认关闭）。
+    #[serde(skip)]
+    kiro_version_request_snapshot: Option<String>,
+
+    /// 是否自动检查 Kiro 客户端版本号（默认关闭）。
     ///
-    /// 打开后，后台每 12 小时从官方发布元数据读取当前版本，所有上游请求头里的 `KiroIDE-{版本}`
-    /// 改用读到的版本；读取失败或尚未读到时继续使用 `kiro_version`。版本号是上游身份的一部分，
-    /// 会同时影响所有账号，所以默认关闭。
+    /// 打开后，后台每 12 小时从官方发布元数据读取 candidate；candidate 只有在管理员显式
+    /// apply/pin 后才会用于上游请求头。关闭检查不会回退已经应用或固定的 active 版本。
     #[serde(default)]
     pub kiro_version_auto_sync_enabled: bool,
+
+    /// Set by the one-time runtime config migration when the legacy auto-sync behavior was
+    /// enabled. Startup transfers it to `kiro_version_state` and clears it.
+    #[serde(default)]
+    kiro_version_legacy_auto_sync_migration: bool,
 
     /// IDE 端点的对话和联网搜索请求是否改走新版 Kiro 域名 `runtime.{region}.kiro.dev`（默认关闭，
     /// 走 `q.{region}.amazonaws.com`）。只换地址，请求头仍是 IDE 那一套；模型列表、用量查询、
@@ -5522,6 +5529,13 @@ pub struct Config {
     #[serde(default)]
     pub kiro_upstream_region_rotation_enabled: bool,
 
+    /// 是否允许把带有 Profile ARN 的账号请求发送到与 ARN 区域不同的备用 Region。
+    ///
+    /// 默认关闭。开启 Region rotation 后，仍需显式打开此开关才会尝试异 Region
+    /// Profile；关闭时只允许与 Profile ARN 区域一致的候选。
+    #[serde(default)]
+    pub kiro_region_profile_arn_mismatch_allowed: bool,
+
     /// 本地账号 429 狂暴轮换模式主开关。
     ///
     /// 默认关闭。关闭时所有调度、重试与冷却行为与引入该特性之前逐项一致。
@@ -5886,6 +5900,19 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 是否允许一次请求在同认证类型的协议端点之间故障转移。
+    ///
+    /// 默认关闭；关闭时只使用凭据 endpoint 或 defaultEndpoint，保持现有行为。
+    #[serde(default)]
+    pub kiro_endpoint_fallback_enabled: bool,
+
+    /// 协议端点候选顺序。候选必须已注册且声明支持当前凭据认证类型。
+    ///
+    /// 该字段只描述运行时顺序，不改变凭据的 primary endpoint，也不参与认证 Region
+    /// 或 API Region 的解析。空列表等价于没有备用端点。
+    #[serde(default = "default_kiro_endpoint_fallback_order")]
+    pub kiro_endpoint_fallback_order: Vec<String>,
+
     /// 是否在响应头中暴露代理改写动作（默认 false）。
     ///
     /// 启用后，凡涉及消息合并 / 孤立 tool_use|tool_result 清理 / thinking 覆写等
@@ -5933,23 +5960,45 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 14;
+fn default_kiro_endpoint_fallback_order() -> Vec<String> {
+    vec![
+        "codewhisperer".to_string(),
+        "amazonq".to_string(),
+        "runtime".to_string(),
+    ]
+}
+
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 15;
 
 impl Config {
-    /// 上游请求头里实际使用的 Kiro 客户端版本：开启自动同步且已读到官方版本时用读到的版本，
-    /// 否则用配置的 `kiro_version`。
+    /// 上游请求头里实际使用的 Kiro 客户端版本：显式 active override 优先，
+    /// 否则使用配置的 `kiro_version`。自动检查发现的 candidate 不会自动应用。
     pub fn effective_kiro_version(&self) -> String {
-        if self.kiro_version_auto_sync_enabled
-            && let Some(version) = crate::kiro::kiro_version::latest()
-        {
-            return version;
-        }
-        self.kiro_version.clone()
+        self.kiro_version_request_snapshot
+            .clone()
+            .unwrap_or_else(|| crate::kiro::kiro_version::effective_version(&self.kiro_version))
+    }
+
+    pub(crate) fn pin_kiro_version_for_request(&mut self, version: String) {
+        self.kiro_version_request_snapshot = Some(version);
+    }
+
+    pub(crate) fn snapshot_kiro_version_for_request(&mut self) {
+        let version = self.effective_kiro_version();
+        self.pin_kiro_version_for_request(version);
+    }
+
+    pub(crate) fn legacy_auto_sync_migration_pending(&self) -> bool {
+        self.kiro_version_legacy_auto_sync_migration
+    }
+
+    pub(crate) fn clear_legacy_auto_sync_migration_marker(&mut self) {
+        self.kiro_version_legacy_auto_sync_migration = false;
     }
 }
 
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    crate::kiro::kiro_version::VERIFIED_IDE_CLIENT_VERSION.to_string()
 }
 
 fn default_system_version() -> String {
@@ -7104,7 +7153,9 @@ impl Default for Config {
             auth_region: None,
             api_region: None,
             kiro_version: default_kiro_version(),
+            kiro_version_request_snapshot: None,
             kiro_version_auto_sync_enabled: false,
+            kiro_version_legacy_auto_sync_migration: false,
             kiro_runtime_domain_enabled: false,
             machine_id: None,
             global_machine_id_fallback_enabled: false,
@@ -7192,6 +7243,7 @@ impl Default for Config {
             credential_prompt_logic_retry_enabled: false,
             credential_prompt_logic_retry_max_attempts: 0,
             kiro_upstream_region_rotation_enabled: false,
+            kiro_region_profile_arn_mismatch_allowed: false,
             local_berserk_mode_enabled: false,
             local_berserk_max_rounds: default_local_berserk_max_rounds(),
             local_berserk_round_delay_ms: default_local_berserk_round_delay_ms(),
@@ -7266,6 +7318,8 @@ impl Default for Config {
             request_capture: RequestCaptureConfig::default(),
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
+            kiro_endpoint_fallback_enabled: false,
+            kiro_endpoint_fallback_order: default_kiro_endpoint_fallback_order(),
             expose_proxy_warnings: default_expose_proxy_warnings(),
             audit_log_retention_enabled: false,
             audit_log_retention_days: default_audit_log_retention_days(),
@@ -7581,6 +7635,11 @@ impl Config {
             self.runtime_config_migration_version = 14;
             changed = true;
         }
+        if self.runtime_config_migration_version < 15 {
+            self.kiro_version_legacy_auto_sync_migration = self.kiro_version_auto_sync_enabled;
+            self.runtime_config_migration_version = 15;
+            changed = true;
+        }
         changed
     }
 
@@ -7728,6 +7787,17 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_version_snapshot_is_not_serialized_into_runtime_config() {
+        let mut config = Config::default();
+        config.kiro_version = "0.11.107".to_string();
+        config.pin_kiro_version_for_request("1.4.121".to_string());
+
+        assert_eq!(config.effective_kiro_version(), "1.4.121");
+        let serialized = serde_json::to_value(&config).expect("serialize config");
+        assert!(serialized.get("kiroVersionRequestSnapshot").is_none());
+    }
 
     #[test]
     fn code_execution_defaults_to_disabled_and_supports_longest_route_override() {
@@ -8100,6 +8170,7 @@ mod tests {
             !config.kiro_upstream_region_rotation_enabled,
             "端点轮换总开关必须默认关闭，保证默认使用改造之前的端点"
         );
+        assert!(!config.kiro_region_profile_arn_mismatch_allowed);
         assert_eq!(config.local_berserk_max_rounds, 1);
         assert_eq!(config.local_berserk_round_delay_ms, 1_000);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
@@ -8317,6 +8388,7 @@ mod tests {
     fn berserk_switches_round_trip_through_camel_case() {
         let config = Config {
             kiro_upstream_region_rotation_enabled: true,
+            kiro_region_profile_arn_mismatch_allowed: true,
             local_berserk_mode_enabled: true,
             local_berserk_max_rounds: 7,
             local_berserk_round_delay_ms: 2_500,
@@ -8325,6 +8397,7 @@ mod tests {
 
         let serialized = serde_json::to_value(&config).unwrap();
         assert_eq!(serialized["kiroUpstreamRegionRotationEnabled"], true);
+        assert_eq!(serialized["kiroRegionProfileArnMismatchAllowed"], true);
         assert_eq!(serialized["localBerserkModeEnabled"], true);
         assert_eq!(serialized["localBerserkMaxRounds"], 7);
         assert_eq!(serialized["localBerserkRoundDelayMs"], 2_500);
@@ -8333,6 +8406,7 @@ mod tests {
 
         let restored: Config = serde_json::from_value(serialized).unwrap();
         assert!(restored.kiro_upstream_region_rotation_enabled);
+        assert!(restored.kiro_region_profile_arn_mismatch_allowed);
         assert!(restored.local_berserk_mode_enabled);
         assert_eq!(restored.local_berserk_max_rounds, 7);
         assert_eq!(restored.local_berserk_round_delay_ms, 2_500);
@@ -8345,6 +8419,7 @@ mod tests {
         let config: Config = serde_json::from_str(r#"{"apiKey":"sk-legacy"}"#).unwrap();
 
         assert!(!config.kiro_upstream_region_rotation_enabled);
+        assert!(!config.kiro_region_profile_arn_mismatch_allowed);
         assert!(!config.local_berserk_mode_enabled);
         assert_eq!(config.local_berserk_max_rounds, 1);
         assert_eq!(config.local_berserk_round_delay_ms, 1_000);
@@ -10503,6 +10578,25 @@ mod tests {
         config.payload_guard_mode = PayloadGuardMode::Preemptive;
         assert!(!config.apply_runtime_config_migrations());
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
+    }
+
+    #[test]
+    fn runtime_config_v15_migrates_legacy_auto_sync_without_rewriting_explicit_version() {
+        let mut config = Config {
+            runtime_config_migration_version: 14,
+            kiro_version: "0.11.107".to_string(),
+            kiro_version_auto_sync_enabled: true,
+            ..Config::default()
+        };
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(config.runtime_config_migration_version, 15);
+        assert_eq!(config.kiro_version, "0.11.107");
+        assert!(config.legacy_auto_sync_migration_pending());
+
+        config.clear_legacy_auto_sync_migration_marker();
+        assert!(!config.legacy_auto_sync_migration_pending());
+        assert_eq!(config.kiro_version, "0.11.107");
     }
 
     #[test]

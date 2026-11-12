@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{Context, bail};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::header::HeaderMap;
 use serde::de::DeserializeOwned;
@@ -23,9 +23,11 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::portal::{KiroPortalClient, is_auth_or_permission_error};
 use crate::kiro::protocol::{
     is_external_idp_credentials, resolve_profile_arn, resolve_usage_limits_profile_arn,
 };
+use crate::kiro::retry_pipeline::auxiliary_region_candidates;
 use crate::model::config::Config;
 
 use super::auxiliary::{
@@ -36,6 +38,93 @@ use super::auxiliary::{
 
 const TOKEN_SERVICE_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 const TOKEN_SERVICE_RESPONSE_TIMEOUT_SECS: u64 = 60;
+
+fn capture_protocol_request(
+    operation: &'static str,
+    credentials: &KiroCredentials,
+    endpoint: &str,
+    region: &str,
+    config: &Config,
+    request: &reqwest::Request,
+    body: serde_json::Value,
+) {
+    crate::diagnostics::capture::record("protocol_request", None, || {
+        serde_json::json!({
+            "operation": operation,
+            "credentialId": credentials.id,
+            "route": {
+                "endpoint": endpoint,
+                "region": region,
+                "clientVersion": config.effective_kiro_version(),
+            },
+            "method": request.method().as_str(),
+            "url": crate::diagnostics::capture::redacted_url(request.url()),
+            "headers": crate::diagnostics::capture::http_headers_json(request.headers()),
+            "body": body,
+        })
+    });
+}
+
+fn capture_protocol_response(
+    operation: &'static str,
+    credentials: &KiroCredentials,
+    endpoint: &str,
+    region: &str,
+    config: &Config,
+    response: &reqwest::Response,
+) {
+    crate::diagnostics::capture::record("protocol_response", None, || {
+        serde_json::json!({
+            "operation": operation,
+            "credentialId": credentials.id,
+            "route": {
+                "endpoint": endpoint,
+                "region": region,
+                "clientVersion": config.effective_kiro_version(),
+            },
+            "status": response.status().as_u16(),
+            "httpVersion": format!("{:?}", response.version()),
+            "headers": crate::diagnostics::capture::http_headers_json(response.headers()),
+        })
+    });
+}
+
+fn capture_protocol_response_body(
+    operation: &'static str,
+    credentials: &KiroCredentials,
+    endpoint: &str,
+    region: &str,
+    config: &Config,
+    status: reqwest::StatusCode,
+    body: &[u8],
+) {
+    crate::diagnostics::capture::record("protocol_response_body", None, || {
+        serde_json::json!({
+            "operation": operation,
+            "credentialId": credentials.id,
+            "route": {
+                "endpoint": endpoint,
+                "region": region,
+                "clientVersion": config.effective_kiro_version(),
+            },
+            "status": status.as_u16(),
+            "body": crate::diagnostics::capture::body_json(body),
+        })
+    });
+}
+
+fn redacted_refresh_body(fields: &[(&str, Option<&str>)]) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (name, value) in fields {
+        object.insert(
+            (*name).to_string(),
+            value
+                .map(|value| serde_json::Value::String(format!("[redacted] (len={})", value.len())))
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    serde_json::Value::Object(object)
+}
 #[cfg(test)]
 // Test-only timeout used by fake OAuth endpoints. Keep it short enough to prove bounded
 // failure recovery, but not so tight that full-suite parallel scheduling starves recovery
@@ -649,6 +738,9 @@ pub(crate) async fn refresh_token_with_client(
     client: Arc<reqwest::Client>,
     admission: Option<RefreshSendAdmission>,
 ) -> anyhow::Result<KiroCredentials> {
+    let mut request_config = config.clone();
+    request_config.snapshot_kiro_version_for_request();
+    let config = &request_config;
     let mut normalized_credentials = credentials.clone();
     normalized_credentials.canonicalize_auth_method();
     normalized_credentials.normalize_external_idp_defaults();
@@ -830,6 +922,9 @@ pub(crate) async fn refresh_token_with_region_rotation(
     client: Arc<reqwest::Client>,
     admission: Option<RefreshSendAdmission>,
 ) -> anyhow::Result<RegionRotatedRefresh> {
+    let mut request_config = config.clone();
+    request_config.snapshot_kiro_version_for_request();
+    let config = &request_config;
     let candidates = auth_region_candidates(credentials, config);
     if candidates.len() <= 1 {
         let credentials = refresh_token_with_client(credentials, config, client, admission).await?;
@@ -889,8 +984,25 @@ async fn refresh_social_token(
         .header("Connection", "close")
         .json(&body);
     let request = build_token_refresh_request(request)?;
+    capture_protocol_request(
+        "social_token_refresh",
+        credentials,
+        "social_auth",
+        region,
+        config,
+        &request,
+        redacted_refresh_body(&[("refresh_token", Some(refresh_token.as_str()))]),
+    );
     let _send_permit = reserve_refresh_send(admission).await?;
     let response = send_token_refresh_request(client, request, false).await?;
+    capture_protocol_response(
+        "social_token_refresh",
+        credentials,
+        "social_auth",
+        region,
+        config,
+        &response,
+    );
     let response = read_token_refresh_response(response).await?;
     if !response.status.is_success() {
         return Err(token_refresh_status_failure(&response).into());
@@ -970,6 +1082,20 @@ async fn refresh_external_idp_token(
         .header("Connection", "close")
         .form(&form);
     let request = build_token_refresh_request(request)?;
+    capture_protocol_request(
+        "external_idp_token_refresh",
+        credentials,
+        "external_idp_auth",
+        "external",
+        config,
+        &request,
+        redacted_refresh_body(&[
+            ("client_id", Some(client_id.as_str())),
+            ("grant_type", Some("refresh_token")),
+            ("refresh_token", Some(refresh_token.as_str())),
+            ("scope", credentials.scopes.as_deref()),
+        ]),
+    );
     let _send_permit = reserve_refresh_send(admission).await?;
     let response = send_token_refresh_request(
         client,
@@ -977,6 +1103,14 @@ async fn refresh_external_idp_token(
         uses_controlled_test_response_header_timeout(token_endpoint),
     )
     .await?;
+    capture_protocol_response(
+        "external_idp_token_refresh",
+        credentials,
+        "external_idp_auth",
+        "external",
+        config,
+        &response,
+    );
     let response = read_token_refresh_response(response).await?;
     if !response.status.is_success() {
         return Err(token_refresh_status_failure(&response).into());
@@ -1063,8 +1197,30 @@ async fn refresh_idc_token(
         .header("Connection", "close")
         .json(&body);
     let request = build_token_refresh_request(request)?;
+    capture_protocol_request(
+        "idc_token_refresh",
+        credentials,
+        "idc_auth",
+        region,
+        config,
+        &request,
+        redacted_refresh_body(&[
+            ("client_id", Some(client_id.as_str())),
+            ("client_secret", Some(client_secret.as_str())),
+            ("refresh_token", Some(refresh_token.as_str())),
+            ("grant_type", Some("refresh_token")),
+        ]),
+    );
     let _send_permit = reserve_refresh_send(admission).await?;
     let response = send_token_refresh_request(client, request, false).await?;
+    capture_protocol_response(
+        "idc_token_refresh",
+        credentials,
+        "idc_auth",
+        region,
+        config,
+        &response,
+    );
     let response = read_token_refresh_response(response).await?;
     if !response.status.is_success() {
         return Err(token_refresh_status_failure(&response).into());
@@ -1100,33 +1256,67 @@ pub(crate) async fn get_usage_limits(
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
+    let mut request_config = config.clone();
+    request_config.snapshot_kiro_version_for_request();
+    let config = &request_config;
 
-    // 优先级：凭据.api_region > profileArn region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    if !credentials.is_api_key_credential() {
+        let portal = KiroPortalClient::for_credentials(credentials, config, proxy)?;
+        // Portal 按 Idp cookie 校验 token 来源：Social token 配 BuilderId 会被拒 401。
+        // 凭据没有 provider 时按 Google 发送（Github 同样被接受）。
+        let idp = credentials
+            .provider
+            .as_deref()
+            .filter(|provider| !provider.trim().is_empty())
+            .or_else(|| {
+                if credentials.is_external_idp_refresh_credential() {
+                    Some("Enterprise")
+                } else if credentials.is_idc_refresh_credential() {
+                    None
+                } else {
+                    Some("Google")
+                }
+            });
+        match portal.get_user_usage_and_limits(token, idp).await {
+            Ok(mut usage) => {
+                if usage.email().is_none()
+                    && let Ok(user_info) = portal.get_user_info(token, idp).await
+                    && let Some(email) = user_info
+                        .email
+                        .map(|email| email.trim().to_string())
+                        .filter(|email| !email.is_empty())
+                {
+                    usage.user_info =
+                        Some(crate::kiro::model::usage_limits::UserInfo { email: Some(email) });
+                }
+                return Ok(usage);
+            }
+            Err(error)
+                if is_auth_or_permission_error(&error)
+                    && (credentials.is_idc_refresh_credential()
+                        || credentials.is_external_idp_refresh_credential()) =>
+            {
+                tracing::debug!(
+                    auth_method = credentials.auth_method.as_deref().unwrap_or("unknown"),
+                    "Portal usage was rejected for this account type; retrying with REST usage"
+                );
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                return Err(error).context(format!("query Kiro Portal usage limits: {detail}"));
+            }
+        }
+    }
+
+    // REST usage is read-only, so it may try the bounded API Region candidates. Portal CBOR
+    // remains its own fixed-host operation above and never enters this route list.
+    let primary_region = credentials.effective_api_region(config);
+    let usage_profile_arn = resolve_usage_limits_profile_arn(credentials, config);
+    let regions = auxiliary_region_candidates(config, primary_region, usage_profile_arn.as_deref());
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.effective_kiro_version();
     let os_name = &config.system_version;
     let node_version = &config.node_version;
-
-    // 构建 URL
-    let mut url = configured_upstream_url(
-        config,
-        "getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-    )
-    .unwrap_or_else(|| {
-        format!(
-            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-            host
-        )
-    });
-
-    if let Some(profile_arn) = resolve_usage_limits_profile_arn(credentials, config) {
-        url.push_str(&format!(
-            "&profileArn={}",
-            urlencoding::encode(&profile_arn)
-        ));
-    }
 
     // 构建 User-Agent headers
     let user_agent = usage_limits_user_agent(os_name, node_version, kiro_version, &machine_id);
@@ -1134,47 +1324,211 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+    let mut last_region_failure = None;
+    for (index, region_override) in regions.iter().enumerate() {
+        let region = region_override.unwrap_or(primary_region);
+        let host = format!("q.{region}.amazonaws.com");
+        let mut url = configured_upstream_url(
+            config,
+            "getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        )
+        .unwrap_or_else(|| {
+            format!(
+                "https://{host}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+            )
+        });
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
-    if is_external_idp_credentials(credentials) {
-        request = request.header("TokenType", "EXTERNAL_IDP");
-    }
+        if let Some(profile_arn) = usage_profile_arn.as_deref() {
+            url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+        }
 
-    let response =
-        send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
-            .await?;
+        let mut request = client
+            .get(&url)
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close");
 
-    let status = response.status();
-    let response_body = response_bytes_with_limit_and_body_timeout(
-        response,
-        config.kiro_upstream_response_timeout_secs,
-        TOKEN_SERVICE_RESPONSE_MAX_BYTES,
-    )
-    .await?;
-    if !status.is_success() {
-        let error_msg = match status.as_u16() {
-            401 => "认证失败，Token 无效或已过期",
-            403 => "权限不足，无法获取使用额度",
-            429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS 服务暂时不可用",
-            _ => "获取使用额度失败",
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+        if is_external_idp_credentials(credentials) {
+            request = request.header("TokenType", "EXTERNAL_IDP");
+        }
+
+        if crate::diagnostics::capture::is_active()
+            && let Some(built) = request.try_clone().and_then(|request| request.build().ok())
+        {
+            capture_protocol_request(
+                "usage_limits",
+                credentials,
+                "usage_limits",
+                region,
+                config,
+                &built,
+                serde_json::Value::Null,
+            );
+        }
+
+        let response = match send_with_response_header_timeout(
+            request,
+            config.kiro_upstream_response_timeout_secs,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error)
+                if index + 1 < regions.len()
+                    && matches!(&error, HttpSendError::Request(request_error) if request_error.is_connect()) =>
+            {
+                tracing::warn!(
+                    operation = "getUsageLimits",
+                    credential_id = credentials.id,
+                    region,
+                    next_region = regions[index + 1].unwrap_or(primary_region),
+                    "REST usage connection failed before reaching the host; trying the next Region"
+                );
+                last_region_failure = Some(anyhow::Error::from(error));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         };
-        bail!("{}: {}", error_msg, status);
+
+        capture_protocol_response(
+            "usage_limits",
+            credentials,
+            "usage_limits",
+            region,
+            config,
+            &response,
+        );
+
+        let status = response.status();
+        let response_body = response_bytes_with_limit_and_body_timeout(
+            response,
+            config.kiro_upstream_response_timeout_secs,
+            TOKEN_SERVICE_RESPONSE_MAX_BYTES,
+        )
+        .await?;
+        capture_protocol_response_body(
+            "usage_limits",
+            credentials,
+            "usage_limits",
+            region,
+            config,
+            status,
+            &response_body,
+        );
+        if !status.is_success() {
+            if index + 1 < regions.len() && usage_region_fallback_allows(status, &response_body) {
+                tracing::warn!(
+                    operation = "getUsageLimits",
+                    credential_id = credentials.id,
+                    region,
+                    next_region = regions[index + 1].unwrap_or(primary_region),
+                    upstream_status = status.as_u16(),
+                    "REST usage gateway failure; trying the next Region"
+                );
+                last_region_failure = Some(usage_status_error(status));
+                continue;
+            }
+            return Err(usage_status_error(status));
+        }
+
+        return serde_json::from_slice(&response_body)
+            .context("decode REST getUsageLimits response");
     }
 
-    let data: UsageLimitsResponse = serde_json::from_slice(&response_body)?;
-    Ok(data)
+    Err(last_region_failure.unwrap_or_else(|| anyhow::anyhow!("no REST usage Region candidate")))
+}
+
+fn usage_status_error(status: reqwest::StatusCode) -> anyhow::Error {
+    let error_msg = match status.as_u16() {
+        401 => "认证失败，Token 无效或已过期",
+        403 => "权限不足，无法获取使用额度",
+        429 => "请求过于频繁，已被限流",
+        500..=599 => "服务器错误，AWS 服务暂时不可用",
+        _ => "获取使用额度失败",
+    };
+    anyhow::anyhow!("{}: {}", error_msg, status)
+}
+
+fn usage_region_fallback_allows(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    let body_text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let explicit_profile_region_mismatch = (body_text.contains("profilearn")
+        || (body_text.contains("profile") && body_text.contains("arn")))
+        && (body_text.contains("region")
+            || body_text.contains("improperly formed request")
+            || body_text.contains("not authorized for this region"));
+    if status.as_u16() == 403 {
+        return explicit_profile_region_mismatch;
+    }
+    if !matches!(status.as_u16(), 502 | 504) {
+        return false;
+    }
+    if [
+        "invalid",
+        "validation",
+        "unauthorized",
+        "accessdenied",
+        "forbidden",
+        "throttl",
+        "rate_limit",
+        "quota",
+        "profile",
+        "region",
+        "schema",
+        "tool",
+        "malformed",
+        "improperly formed",
+    ]
+    .iter()
+    .any(|marker| body_text.contains(marker))
+    {
+        return false;
+    }
+
+    let has_client_or_identity_error = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            [
+                "/__type",
+                "/type",
+                "/code",
+                "/reason",
+                "/message",
+                "/error/__type",
+                "/error/type",
+                "/error/code",
+                "/error/reason",
+                "/error/message",
+            ]
+            .into_iter()
+            .filter_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
+            .map(str::to_ascii_lowercase)
+            .any(|code| {
+                [
+                    "invalid",
+                    "validation",
+                    "unauthorized",
+                    "accessdenied",
+                    "forbidden",
+                    "throttl",
+                    "rate_limit",
+                    "quota",
+                    "profile",
+                    "region",
+                    "improperly formed",
+                    "invalid_tool_input",
+                ]
+                .iter()
+                .any(|marker| code.contains(marker))
+            })
+        });
+    !has_client_or_identity_error && !explicit_profile_region_mismatch
 }
 
 /// 设置 Kiro/AWS Q Overages 开关。
@@ -1185,6 +1539,9 @@ pub(crate) async fn set_overage_status(
     proxy: Option<&ProxyConfig>,
     enabled: bool,
 ) -> anyhow::Result<()> {
+    let mut request_config = config.clone();
+    request_config.snapshot_kiro_version_for_request();
+    let config = &request_config;
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
@@ -1227,9 +1584,30 @@ pub(crate) async fn set_overage_status(
         request = request.header("TokenType", "EXTERNAL_IDP");
     }
 
+    if crate::diagnostics::capture::is_active()
+        && let Some(built) = request.try_clone().and_then(|request| request.build().ok())
+    {
+        capture_protocol_request(
+            "set_overage_status",
+            credentials,
+            "usage_limits",
+            region,
+            config,
+            &built,
+            payload.clone(),
+        );
+    }
     let response =
         send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
             .await?;
+    capture_protocol_response(
+        "set_overage_status",
+        credentials,
+        "usage_limits",
+        region,
+        config,
+        &response,
+    );
     let status_code = response.status();
     let _response_body = response_bytes_with_limit_and_body_timeout(
         response,
@@ -1237,6 +1615,15 @@ pub(crate) async fn set_overage_status(
         TOKEN_SERVICE_RESPONSE_MAX_BYTES,
     )
     .await?;
+    capture_protocol_response_body(
+        "set_overage_status",
+        credentials,
+        "usage_limits",
+        region,
+        config,
+        status_code,
+        &_response_body,
+    );
     if !status_code.is_success() {
         bail!("设置超额开关失败: {}", status_code);
     }
@@ -1262,6 +1649,20 @@ pub(super) fn usage_limits_amz_user_agent(kiro_version: &str, machine_id: &str) 
 #[cfg(test)]
 mod region_rotation_tests {
     use super::*;
+
+    #[test]
+    fn captured_token_refresh_body_keeps_field_names_but_redacts_values() {
+        let body = redacted_refresh_body(&[
+            ("client_secret", Some("private-client-secret")),
+            ("refresh_token", Some("private-refresh-token")),
+            ("scope", Some("openid profile")),
+        ]);
+        let encoded = body.to_string();
+        assert!(encoded.contains("client_secret"));
+        assert!(encoded.contains("refresh_token"));
+        assert!(!encoded.contains("private-client-secret"));
+        assert!(!encoded.contains("private-refresh-token"));
+    }
 
     fn idc(
         region: Option<&str>,
@@ -1478,18 +1879,20 @@ mod tests {
     use std::time::{Duration as StdDuration, Instant};
 
     use anyhow::Context;
-    use axum::extract::{Form, State};
-    use axum::http::{HeaderMap, Uri};
+    use axum::body::Bytes;
+    use axum::extract::{Form, Path, State};
+    use axum::http::{HeaderMap, StatusCode, Uri, header};
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use chrono::{Duration as ChronoDuration, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, RefreshFailure, RefreshFailureKind,
         RefreshFailureStage, get_usage_limits, refresh_failure_from_token_refresh_admission,
-        refresh_token,
+        refresh_token, usage_region_fallback_allows,
     };
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::token_manager::auxiliary::{
@@ -2098,9 +2501,15 @@ mod tests {
         }))
     }
 
+    type CapturedUsageRequest = Arc<Mutex<Option<(String, String, String, String)>>>;
+    type CapturedPortalRequests = Arc<Mutex<Vec<(String, HeaderMap, Value)>>>;
+    type CapturedRegionRequests = Arc<Mutex<Vec<(String, String, String, String)>>>;
+
     #[derive(Clone)]
     struct UsageEndpointState {
-        captured: Arc<Mutex<Option<(String, String, String, String)>>>,
+        captured: CapturedUsageRequest,
+        portal_captured: CapturedPortalRequests,
+        portal_usage_status: StatusCode,
     }
 
     async fn mock_usage_limits_endpoint(
@@ -2142,16 +2551,153 @@ mod tests {
         }))
     }
 
+    #[derive(Clone)]
+    struct UsageRegionRotationState {
+        requests: CapturedRegionRequests,
+        first_status: StatusCode,
+        portal_requests: Arc<Mutex<Vec<String>>>,
+        portal_status: StatusCode,
+    }
+
+    async fn mock_usage_region_rotation_endpoint(
+        State(state): State<UsageRegionRotationState>,
+        headers: HeaderMap,
+        uri: Uri,
+    ) -> impl IntoResponse {
+        let request = (
+            headers
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+            headers
+                .get("tokentype")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+            uri.to_string(),
+        );
+        let mut requests = state.requests.lock().unwrap();
+        let is_first = requests.is_empty();
+        requests.push(request);
+        drop(requests);
+
+        if is_first {
+            let body = if state.first_status == StatusCode::FORBIDDEN {
+                r#"{"__type":"AccessDeniedException","message":"account permission denied"}"#
+            } else {
+                "upstream gateway failure"
+            };
+            return (state.first_status, body).into_response();
+        }
+
+        Json(json!({
+            "subscriptionInfo": {"subscriptionTitle": "KIRO REGION FALLBACK"},
+            "userInfo": {"email": "region@example.com"},
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 2.0,
+                "usageLimitWithPrecision": 100.0
+            }]
+        }))
+        .into_response()
+    }
+
+    async fn mock_usage_region_rotation_portal(
+        State(state): State<UsageRegionRotationState>,
+        Path(operation): Path<String>,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let _: Value = ciborium::de::from_reader(std::io::Cursor::new(body)).unwrap();
+        state
+            .portal_requests
+            .lock()
+            .unwrap()
+            .push(operation.clone());
+        let response = if operation == "GetUserUsageAndLimits" {
+            json!({"__type":"AccessDeniedException","message":"not available"})
+        } else {
+            json!({"email":"unused@example.com"})
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&response, &mut bytes).unwrap();
+        (
+            state.portal_status,
+            [(header::CONTENT_TYPE, "application/cbor")],
+            bytes,
+        )
+            .into_response()
+    }
+
+    async fn mock_portal_endpoint(
+        State(state): State<UsageEndpointState>,
+        Path(operation): Path<String>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let decoded: Value = ciborium::de::from_reader(std::io::Cursor::new(body)).unwrap();
+        state
+            .portal_captured
+            .lock()
+            .unwrap()
+            .push((operation.clone(), headers, decoded));
+
+        let status = if operation == "GetUserUsageAndLimits" {
+            state.portal_usage_status
+        } else {
+            StatusCode::OK
+        };
+        let response = if status.is_success() {
+            match operation.as_str() {
+                "GetUserInfo" => json!({
+                    "email": "portal-user@example.invalid",
+                    "userId": "portal-user",
+                    "idp": "Github",
+                    "status": "ACTIVE"
+                }),
+                "GetUserUsageAndLimits" => json!({
+                    "subscriptionInfo": {"subscriptionTitle": "KIRO PORTAL"},
+                    "usageBreakdownList": [{
+                        "currentUsageWithPrecision": 4.0,
+                        "usageLimitWithPrecision": 200.0
+                    }]
+                }),
+                _ => unreachable!(),
+            }
+        } else {
+            json!({"__type": "AccessDeniedException", "message": "not available"})
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&response, &mut bytes).unwrap();
+        (status, [(header::CONTENT_TYPE, "application/cbor")], bytes)
+    }
+
+    fn usage_endpoint_state(
+        captured: CapturedUsageRequest,
+        portal_usage_status: StatusCode,
+    ) -> UsageEndpointState {
+        UsageEndpointState {
+            captured,
+            portal_captured: Arc::new(Mutex::new(Vec::new())),
+            portal_usage_status,
+        }
+    }
+
     #[tokio::test]
-    async fn api_key_usage_limits_honors_transport_override_and_region_headers() {
+    async fn usage_protocol_api_key_keeps_rest_transport_and_region_headers() {
         let captured = Arc::new(Mutex::new(None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let state = usage_endpoint_state(captured.clone(), StatusCode::OK);
+        let portal_captured = state.portal_captured.clone();
         let app = Router::new()
             .route("/fake/getUsageLimits", get(mock_usage_limits_endpoint))
-            .with_state(UsageEndpointState {
-                captured: captured.clone(),
-            });
+            .route("/fake/{operation}", post(mock_portal_endpoint))
+            .with_state(state);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -2181,6 +2727,7 @@ mod tests {
         assert_eq!(host, "q.ap-south-2.amazonaws.com");
         assert_eq!(authorization, "Bearer ksk_fake_balance");
         assert_eq!(token_type, "API_KEY");
+        assert!(portal_captured.lock().unwrap().is_empty());
         assert_eq!(
             uri,
             "/fake/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
@@ -2188,15 +2735,208 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idc_usage_limits_keeps_builder_id_profile_arn_query_parameter() {
+    async fn usage_protocol_rest_retries_gateway_failure_on_the_next_region() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = UsageRegionRotationState {
+            requests: requests.clone(),
+            first_status: StatusCode::BAD_GATEWAY,
+            portal_requests: Arc::new(Mutex::new(Vec::new())),
+            portal_status: StatusCode::OK,
+        };
+        let app = Router::new()
+            .route(
+                "/fake/getUsageLimits",
+                get(mock_usage_region_rotation_endpoint),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_fake_balance".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+        config.kiro_upstream_region_rotation_enabled = true;
+
+        let usage = get_usage_limits(
+            &credentials,
+            &config,
+            credentials.kiro_api_key.as_deref().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(usage.subscription_title(), Some("KIRO REGION FALLBACK"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q.us-east-1.amazonaws.com", "q.eu-central-1.amazonaws.com"]
+        );
+        assert!(
+            requests.iter().all(|request| {
+                request.1 == "Bearer ksk_fake_balance" && request.2 == "API_KEY"
+            })
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.3.starts_with("/fake/getUsageLimits?"))
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_protocol_rest_does_not_retry_account_permission_failure() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = UsageRegionRotationState {
+            requests: requests.clone(),
+            first_status: StatusCode::FORBIDDEN,
+            portal_requests: Arc::new(Mutex::new(Vec::new())),
+            portal_status: StatusCode::OK,
+        };
+        let app = Router::new()
+            .route(
+                "/fake/getUsageLimits",
+                get(mock_usage_region_rotation_endpoint),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_fake_balance".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+        config.kiro_upstream_region_rotation_enabled = true;
+
+        let error = get_usage_limits(
+            &credentials,
+            &config,
+            credentials.kiro_api_key.as_deref().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.to_string().contains("403 Forbidden"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idc_rest_usage_keeps_portal_fallback_and_builder_profile_across_regions() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let portal_requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = UsageRegionRotationState {
+            requests: requests.clone(),
+            first_status: StatusCode::BAD_GATEWAY,
+            portal_requests: portal_requests.clone(),
+            portal_status: StatusCode::FORBIDDEN,
+        };
+        let app = Router::new()
+            .route(
+                "/fake/getUsageLimits",
+                get(mock_usage_region_rotation_endpoint),
+            )
+            .route("/fake/{operation}", post(mock_usage_region_rotation_portal))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            profile_arn: Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.kiro_region_profile_arn_mismatch_allowed = true;
+
+        let usage = get_usage_limits(&credentials, &config, "idc-token", None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(usage.subscription_title(), Some("KIRO REGION FALLBACK"));
+        assert_eq!(
+            portal_requests.lock().unwrap().as_slice(),
+            &["GetUserUsageAndLimits"]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q.us-east-1.amazonaws.com", "q.eu-central-1.amazonaws.com"]
+        );
+        assert!(requests.iter().all(|request| {
+            request.1 == "Bearer idc-token"
+                && request.2.is_empty()
+                && request.3.contains("profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A638616132270%3Aprofile%2FAAAACCCCXXXX")
+        }));
+    }
+
+    #[test]
+    fn usage_region_fallback_only_accepts_gateway_or_explicit_profile_region_failures() {
+        assert!(usage_region_fallback_allows(
+            StatusCode::BAD_GATEWAY,
+            b"plain gateway failure"
+        ));
+        assert!(!usage_region_fallback_allows(
+            StatusCode::BAD_GATEWAY,
+            br#"{"__type":"ValidationException","message":"invalid request"}"#
+        ));
+        assert!(!usage_region_fallback_allows(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"internal server error"
+        ));
+        assert!(!usage_region_fallback_allows(
+            StatusCode::FORBIDDEN,
+            br#"{"__type":"AccessDeniedException","message":"account permission denied"}"#
+        ));
+        assert!(usage_region_fallback_allows(
+            StatusCode::FORBIDDEN,
+            br#"{"__type":"InvalidRequestException","message":"Profile ARN region mismatch"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn usage_protocol_idc_uses_rest_after_portal_permission_error() {
         let captured = Arc::new(Mutex::new(None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let state = usage_endpoint_state(captured.clone(), StatusCode::FORBIDDEN);
+        let portal_captured = state.portal_captured.clone();
         let app = Router::new()
             .route("/fake/getUsageLimits", get(mock_usage_limits_endpoint))
-            .with_state(UsageEndpointState {
-                captured: captured.clone(),
-            });
+            .route("/fake/{operation}", post(mock_portal_endpoint))
+            .with_state(state);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -2223,6 +2963,132 @@ mod tests {
         assert!(uri.contains(
             "profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A638616132270%3Aprofile%2FAAAACCCCXXXX"
         ));
+        let portal_requests = portal_captured.lock().unwrap();
+        assert_eq!(portal_requests.len(), 1);
+        assert_eq!(portal_requests[0].0, "GetUserUsageAndLimits");
+        assert_eq!(
+            portal_requests[0].2,
+            json!({
+                "isEmailRequired": true,
+                "origin": "KIRO_IDE"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_protocol_social_uses_portal_and_fills_missing_email_from_user_info() {
+        let captured = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = usage_endpoint_state(captured, StatusCode::OK);
+        let portal_captured = state.portal_captured.clone();
+        let app = Router::new()
+            .route("/fake/getUsageLimits", get(mock_usage_limits_endpoint))
+            .route("/fake/{operation}", post(mock_portal_endpoint))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Github".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+
+        let usage = get_usage_limits(&credentials, &config, "social-token", None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(usage.subscription_title(), Some("KIRO PORTAL"));
+        assert_eq!(usage.email(), Some("portal-user@example.invalid"));
+        assert_eq!(usage.usage_limit(), 200.0);
+        let requests = portal_captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, "GetUserUsageAndLimits");
+        assert_eq!(requests[1].0, "GetUserInfo");
+        assert_eq!(
+            requests[0].1[header::COOKIE],
+            "Idp=Github; AccessToken=social-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_protocol_social_without_provider_sends_google_idp_cookie() {
+        let captured = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = usage_endpoint_state(captured, StatusCode::OK);
+        let portal_captured = state.portal_captured.clone();
+        let app = Router::new()
+            .route("/fake/getUsageLimits", get(mock_usage_limits_endpoint))
+            .route("/fake/{operation}", post(mock_portal_endpoint))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // 根目录 FREE JSON 的 Social 账号只有 authMethod，没有 provider。
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+
+        let usage = get_usage_limits(&credentials, &config, "social-token", None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(usage.subscription_title(), Some("KIRO PORTAL"));
+        let requests = portal_captured.lock().unwrap();
+        assert_eq!(requests[0].0, "GetUserUsageAndLimits");
+        assert_eq!(
+            requests[0].1[header::COOKIE],
+            "Idp=Google; AccessToken=social-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_protocol_external_idp_falls_back_to_rest_after_portal_permission_error() {
+        let captured = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = usage_endpoint_state(captured.clone(), StatusCode::FORBIDDEN);
+        let portal_captured = state.portal_captured.clone();
+        let app = Router::new()
+            .route("/fake/getUsageLimits", get(mock_usage_limits_endpoint))
+            .route("/fake/{operation}", post(mock_portal_endpoint))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("Enterprise".to_string()),
+            api_region: Some("eu-west-1".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+
+        let usage = get_usage_limits(&credentials, &config, "enterprise-token", None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(usage.subscription_title(), Some("KIRO TEST"));
+        let (host, authorization, token_type, uri) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(host, "q.eu-west-1.amazonaws.com");
+        assert_eq!(authorization, "Bearer enterprise-token");
+        assert_eq!(token_type, "EXTERNAL_IDP");
+        assert!(uri.starts_with("/fake/getUsageLimits?"));
+        assert_eq!(portal_captured.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2931,7 +3797,13 @@ mod tests {
                     let budget = Arc::new(AuxiliaryAttemptBudget::new(2));
                     barrier.wait().await;
                     let result = manager
-                        .recover_invalid_access_token_for(1, &expected_token, 0, budget.clone())
+                        .recover_invalid_access_token_for(
+                            1,
+                            &expected_token,
+                            0,
+                            budget.clone(),
+                            None,
+                        )
                         .await;
                     (result, budget.snapshot())
                 }));
@@ -2982,7 +3854,13 @@ mod tests {
                     let budget = Arc::new(AuxiliaryAttemptBudget::new(2));
                     barrier.wait().await;
                     let error = manager
-                        .recover_invalid_access_token_for(1, &expected_token, 0, budget.clone())
+                        .recover_invalid_access_token_for(
+                            1,
+                            &expected_token,
+                            0,
+                            budget.clone(),
+                            None,
+                        )
                         .await
                         .expect_err("controlled automatic recovery must fail");
                     (error, budget.snapshot())
@@ -3036,7 +3914,7 @@ mod tests {
                 .expect("consume the only auxiliary send");
 
             let error = manager
-                .recover_invalid_access_token_for(1, &expected_token, 0, budget.clone())
+                .recover_invalid_access_token_for(1, &expected_token, 0, budget.clone(), None)
                 .await
                 .expect_err("zero remaining budget rejects recovery");
             assert!(
@@ -3068,7 +3946,13 @@ mod tests {
 
             let changed_budget = Arc::new(AuxiliaryAttemptBudget::new(1));
             let outcome = manager
-                .recover_invalid_access_token_for(1, "different-token", 0, changed_budget.clone())
+                .recover_invalid_access_token_for(
+                    1,
+                    "different-token",
+                    0,
+                    changed_budget.clone(),
+                    None,
+                )
                 .await
                 .expect("a replaced access token supersedes the failed request");
             assert_eq!(
@@ -3080,7 +3964,13 @@ mod tests {
 
             let regression_budget = Arc::new(AuxiliaryAttemptBudget::new(1));
             let error = manager
-                .recover_invalid_access_token_for(1, &expected_token, 1, regression_budget.clone())
+                .recover_invalid_access_token_for(
+                    1,
+                    &expected_token,
+                    1,
+                    regression_budget.clone(),
+                    None,
+                )
                 .await
                 .expect_err("a local revision behind the failed request must fail closed");
             let failure = error
@@ -3121,7 +4011,7 @@ mod tests {
                         let budget = Arc::new(AuxiliaryAttemptBudget::new(2));
                         barrier.wait().await;
                         manager
-                            .recover_invalid_access_token_for(id, &expected_token, 0, budget)
+                            .recover_invalid_access_token_for(id, &expected_token, 0, budget, None)
                             .await
                     }));
                 }

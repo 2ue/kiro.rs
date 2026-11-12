@@ -12,10 +12,11 @@ use tower_http::compression::{
 use super::{
     capture_handlers::{download_capture, get_capture_overview, start_capture, stop_capture},
     handlers::{
-        add_credential, batch_delete_credentials, batch_import_credentials,
-        batch_update_credentials, cancel_usage_cleanup, clear_credential_in_flight,
-        clear_external_pool_auto_disabled, clear_external_pool_cooldown, clear_usage_records,
-        create_external_pool, create_proxy_resource, create_request_api_key, delete_credential,
+        add_credential, apply_kiro_client_version, batch_delete_credentials,
+        batch_import_credentials, batch_update_credentials, cancel_usage_cleanup,
+        check_kiro_client_version, clear_credential_in_flight, clear_external_pool_auto_disabled,
+        clear_external_pool_cooldown, clear_usage_records, create_external_pool,
+        create_proxy_resource, create_request_api_key, delete_credential,
         delete_disabled_credentials, delete_external_pool, delete_manual_model,
         delete_proxy_resource, delete_request_api_key, discover_credential_supported_models,
         discover_external_pool_supported_models,
@@ -35,20 +36,22 @@ use super::{
         get_usage_dashboard_overview_rankings, get_usage_dashboard_overview_series,
         get_usage_dashboard_overview_summary, get_usage_dashboard_series, get_usage_dashboard_top,
         get_usage_dashboard_windows, get_usage_records, get_usage_records_page, get_usage_summary,
-        get_usage_writer_stats, import_proxy_resources, preview_prompt_injection,
-        preview_usage_cleanup, refresh_credentials_info, reset_failure_count,
-        reset_request_key_usage, resume_usage_cleanup, set_credential_concurrency,
-        set_credential_disabled, set_credential_fast, set_credential_overage,
-        set_credential_priority, set_credential_proxy, set_credential_rate_limit_auto_disable,
-        set_credential_regions, set_credential_route_policy, set_credential_rpm,
-        set_credential_supported_models, set_credential_warmup, set_external_pool_enabled,
-        set_external_pool_supported_models, set_load_balancing_mode, set_subscription_model_list,
-        start_usage_cleanup, sync_credential_supported_models, sync_external_pool_supported_models,
-        sync_model_capabilities, sync_model_pricing, sync_subscription_model_list,
-        test_all_proxy_resources, test_credential, test_external_pool, test_proxy_resource,
-        test_proxy_resource_config, update_admin_api_key, update_credential_auth,
-        update_external_pool, update_proxy_resource, update_request_api_key, update_runtime_config,
-        upsert_manual_model, validate_existing_credentials, validate_external_credentials,
+        get_usage_writer_stats, import_proxy_resources, pin_kiro_client_version,
+        preview_prompt_injection, preview_usage_cleanup, refresh_credentials_info,
+        reset_failure_count, reset_request_key_usage, resume_usage_cleanup,
+        rollback_kiro_client_version, set_credential_concurrency, set_credential_disabled,
+        set_credential_fast, set_credential_overage, set_credential_priority, set_credential_proxy,
+        set_credential_rate_limit_auto_disable, set_credential_regions,
+        set_credential_route_policy, set_credential_rpm, set_credential_supported_models,
+        set_credential_warmup, set_external_pool_enabled, set_external_pool_supported_models,
+        set_load_balancing_mode, set_subscription_model_list, start_usage_cleanup,
+        sync_credential_supported_models, sync_credentials_profile_arn,
+        sync_external_pool_supported_models, sync_model_capabilities, sync_model_pricing,
+        sync_subscription_model_list, test_all_proxy_resources, test_credential,
+        test_external_pool, test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
+        update_credential_auth, update_external_pool, update_proxy_resource,
+        update_request_api_key, update_runtime_config, upsert_manual_model,
+        validate_existing_credentials, validate_external_credentials,
     },
     inventory::http as inventory_http,
     middleware::{AdminState, admin_auth_middleware},
@@ -182,6 +185,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/info", get(get_credential_info))
         .route("/credentials/{id}/overage", post(set_credential_overage))
         .route("/credentials/info/refresh", post(refresh_credentials_info))
+        .route(
+            "/credentials/profile-arn/sync",
+            post(sync_credentials_profile_arn),
+        )
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route(
@@ -314,6 +321,19 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/runtime",
             get(get_runtime_config).put(update_runtime_config),
+        )
+        .route(
+            "/config/kiro-version/check",
+            post(check_kiro_client_version),
+        )
+        .route(
+            "/config/kiro-version/apply",
+            post(apply_kiro_client_version),
+        )
+        .route("/config/kiro-version/pin", post(pin_kiro_client_version))
+        .route(
+            "/config/kiro-version/rollback",
+            post(rollback_kiro_client_version),
         )
         .route(
             "/prompt-injection/catalog",

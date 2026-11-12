@@ -37,6 +37,7 @@ import type {
   SetCredentialRegionsRequest,
   SetSupportedModelsRequest,
   RuntimeConfig,
+  KiroVersionLifecycleSnapshot,
   UpdateAdminApiKeyRequest,
   CreateRequestApiKeyRequest,
   UpdateRequestApiKeyRequest,
@@ -526,6 +527,26 @@ export async function updateRuntimeConfig(
   req: UpdateRuntimeConfigRequest
 ): Promise<RuntimeConfig> {
   const { data } = await api.put<RuntimeConfig>('/config/runtime', req)
+  return data
+}
+
+export async function checkKiroClientVersion(): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/check')
+  return data
+}
+
+export async function applyKiroClientVersion(version?: string): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/apply', version ? { version } : {})
+  return data
+}
+
+export async function pinKiroClientVersion(version: string): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/pin', { version })
+  return data
+}
+
+export async function rollbackKiroClientVersion(): Promise<KiroVersionLifecycleSnapshot> {
+  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/rollback')
   return data
 }
 

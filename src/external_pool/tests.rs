@@ -1316,7 +1316,7 @@ fn external_stream_request_timeout_zero_does_not_inherit_non_stream_timeout() {
         "overall stream dispatch capacity wait still has a bounded deadline"
     );
     assert_eq!(
-        external_request_send_timeout(&route, &config, dispatch_deadline),
+        external_request_send_timeout(&route, &config),
         None,
         "stream request_timeout=0 must keep long stream semantics and rely on idle timeout"
     );
@@ -1961,6 +1961,51 @@ async fn external_pool_first_output_timeout_fails_over_a_pool_that_stalls_after_
     assert_eq!(record.status, UsageRecordStatus::Success);
     assert_eq!(record.external_attempts.len(), 2);
 
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_non_stream_response_after_dispatch_deadline_is_not_cut_off() {
+    // 调度截止时间只管排队；已发出的非流式请求要按 externalPoolRequestTimeoutSecs 等完。
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let (url, server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(1_200),
+            br#"{"id":"msg_slow","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"slow-ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#.to_vec(),
+        ),
+    )
+    .await;
+    create_messages_pool(&postgres, "slow-non-stream", 1, &url).await;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 1,
+        external_pool_same_pool_retry_count: 0,
+        external_pool_request_timeout_secs: 10,
+        ..ExternalPoolsConfig::default()
+    };
+    let route = test_route("claude-sonnet-4-6");
+    route
+        .inference_attempt_budget
+        .set_dispatch_deadline_after(Duration::from_millis(300));
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("slow non-stream response should finish within the request timeout")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("the dispatch deadline must not cut off a request already sent: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("slow-ok"), "{body}");
+    let _ = server.await;
     postgres.drop_test_schema().await.unwrap();
 }
 

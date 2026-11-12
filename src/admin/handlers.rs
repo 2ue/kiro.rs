@@ -17,19 +17,19 @@ use super::{
         BatchDeleteCredentialsRequest, BatchProxyResourceImportRequest,
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
         CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
-        ExportCredentialsQuery, ExternalPoolTestRequest, PromptInjectionPreviewBody,
-        ProxyResourceTestRequest, RefreshCredentialInfoRequest, ResetRequestKeyUsageRequest,
-        SetCredentialConcurrencyRequest, SetCredentialFastRequest, SetCredentialOverageRequest,
-        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
-        SetCredentialRegionsRequest, SetCredentialRoutePolicyRequest, SetCredentialRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
-        SuccessResponse, SyncModelCapabilitiesRequest, SyncSubscriptionModelListRequest,
-        SystemVersionResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
-        UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-        UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
-        UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        ExportCredentialsQuery, ExternalPoolTestRequest, KiroVersionApplyRequest,
+        KiroVersionPinRequest, PromptInjectionPreviewBody, ProxyResourceTestRequest,
+        RefreshCredentialInfoRequest, ResetRequestKeyUsageRequest, SetCredentialConcurrencyRequest,
+        SetCredentialFastRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
+        SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
+        SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetSubscriptionModelListRequest,
+        SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse, SyncModelCapabilitiesRequest,
+        SyncProfileArnRequest, SyncSubscriptionModelListRequest, SystemVersionResponse,
+        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -932,6 +932,18 @@ pub async fn refresh_credentials_info(
     }
 }
 
+/// POST /api/admin/credentials/profile-arn/sync
+/// 批量补全（mode=fill）或重新识别（mode=rediscover）IdC / External IdP 的 profileArn
+pub async fn sync_credentials_profile_arn(
+    State(state): State<AdminState>,
+    Json(payload): Json<SyncProfileArnRequest>,
+) -> impl IntoResponse {
+    match state.service.sync_credentials_profile_arn(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credential-validation/existing
 /// 校验系统已有凭据订阅信息
 pub async fn validate_existing_credentials(
@@ -1369,6 +1381,48 @@ pub async fn update_runtime_config(
     match state.service.update_runtime_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn check_kiro_client_version(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.check_kiro_client_version().await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn apply_kiro_client_version(
+    State(state): State<AdminState>,
+    Json(payload): Json<KiroVersionApplyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .apply_kiro_client_version(payload.version.as_deref(), false)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn pin_kiro_client_version(
+    State(state): State<AdminState>,
+    Json(payload): Json<KiroVersionPinRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .apply_kiro_client_version(Some(&payload.version), true)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
+pub async fn rollback_kiro_client_version(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.rollback_kiro_client_version().await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 

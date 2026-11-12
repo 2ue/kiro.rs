@@ -89,11 +89,21 @@ pub fn is_social_credentials(credentials: &KiroCredentials) -> bool {
         })
 }
 
-/// Resolve a profile ARN that is safe to send as an upstream identity selector.
+/// Recognize Builder ID credentials even when an importer only preserved `provider`.
+pub fn is_builder_id_credentials(credentials: &KiroCredentials) -> bool {
+    if is_external_idp_credentials(credentials) {
+        return false;
+    }
+    credentials.is_idc_refresh_credential()
+        || credentials
+            .provider
+            .as_deref()
+            .is_some_and(|value| compact_protocol_value(value) == "builderid")
+}
+
+/// Resolve a real profile ARN for endpoints where the ARN is an optional selector.
 ///
-/// Header/query endpoints such as MCP, ListAvailableModels, and usage APIs must not
-/// receive BuilderId placeholders or Enterprise fallback ARNs. Those values are not
-/// caller-owned real profiles and can make otherwise valid accounts fail with 400/403.
+/// MCP and usage-limit operations have their own credential-specific requirements.
 pub fn resolve_profile_arn(credentials: &KiroCredentials, _config: &Config) -> Option<String> {
     if credentials.is_api_key_credential() {
         return None;
@@ -117,9 +127,9 @@ pub fn resolve_profile_arn(credentials: &KiroCredentials, _config: &Config) -> O
 
 /// Resolve the profile ARN required by the usage-limits control-plane endpoint.
 ///
-/// BuilderId/IdC accounts use the protocol placeholder ARN for this endpoint.  The
-/// placeholder must remain excluded from header/query model and MCP requests, but
-/// omitting it from `getUsageLimits` makes the upstream return `Invalid profileArn`.
+/// BuilderId/IdC accounts use the protocol placeholder ARN for this endpoint.
+/// Model-list requests have a separate optional-profile rule; MCP also requires
+/// this placeholder for Builder ID requests.
 pub fn resolve_usage_limits_profile_arn(
     credentials: &KiroCredentials,
     config: &Config,
@@ -137,11 +147,30 @@ pub fn resolve_usage_limits_profile_arn(
         return Some(profile_arn.to_string());
     }
 
-    if credentials.is_idc_refresh_credential() {
+    if is_builder_id_credentials(credentials) {
         return Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string());
     }
 
     resolve_profile_arn(credentials, config)
+}
+
+/// Resolve the Profile ARN required by the Kiro MCP endpoint.
+///
+/// Builder ID requests require the protocol placeholder.
+pub fn resolve_mcp_profile_arn(credentials: &KiroCredentials, config: &Config) -> Option<String> {
+    resolve_usage_limits_profile_arn(credentials, config)
+}
+
+/// Resolve the Profile ARN sent with `ListAvailableModels`.
+///
+/// With `KiroIDE-1.4.x` user agents the endpoint rejects Builder ID/IdC requests that omit
+/// `profileArn` (`400 Invalid profileArn.`, FREE IdC 2026-11-11); `0.11.107` still accepted
+/// them. The placeholder is accepted by both versions, matching kiro-manager-lite.
+pub fn resolve_models_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+) -> Option<String> {
+    resolve_usage_limits_profile_arn(credentials, config)
 }
 
 /// Resolve the profile ARN for streaming assistant request bodies.
@@ -177,12 +206,7 @@ pub fn resolve_streaming_profile_arn(
         return Some(KIRO_SOCIAL_PROFILE_ARN.to_string());
     }
 
-    if credentials.is_idc_refresh_credential()
-        || credentials
-            .provider
-            .as_deref()
-            .is_some_and(|value| compact_protocol_value(value) == "builderid")
-    {
+    if is_builder_id_credentials(credentials) {
         return Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string());
     }
 
@@ -208,30 +232,159 @@ pub fn resolve_agent_mode(credentials: &KiroCredentials, config: &Config) -> &'s
     }
 }
 
-pub fn extract_first_profile_arn(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<Value>(body).ok()?;
+/// Whether `ListAvailableProfiles` should be used to fill a missing profile ARN.
+///
+/// External IdP always lacks a usable ARN until discovered. IdC covers both Builder ID and
+/// organization (IAM Identity Center) accounts, which import identically; only organization
+/// accounts have a profile. An IdC account that already stores the Builder ID placeholder was
+/// confirmed as Builder ID by an earlier 403 and is not queried again.
+pub fn profile_arn_discovery_applies(credentials: &KiroCredentials) -> bool {
+    if credentials.is_api_key_credential() {
+        return false;
+    }
+    let stored = credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|arn| !arn.is_empty());
+    if is_external_idp_credentials(credentials) {
+        return stored.is_none_or(|arn| !is_real_profile_arn(arn));
+    }
+    let declared_builder_id = credentials
+        .provider
+        .as_deref()
+        .is_some_and(|value| compact_protocol_value(value) == "builderid");
+    credentials.is_idc_refresh_credential() && stored.is_none() && !declared_builder_id
+}
 
-    let profiles = value
+/// Whether a `ListAvailableProfiles` 403 body says the account has no profile access, as opposed
+/// to an invalid or expired token.
+pub fn profile_listing_denied_for_builder_id(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("builder id") || lower.contains("not authorized to access this feature")
+}
+
+/// Pick the profile in the account's API Region when the organization has several.
+pub fn extract_preferred_profile_arn(body: &str, region: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let arns = value
         .get("profiles")
         .or_else(|| value.get("Profiles"))
-        .and_then(Value::as_array)?;
-
-    profiles.iter().find_map(|profile| {
-        profile
-            .get("arn")
-            .or_else(|| profile.get("profileArn"))
-            .or_else(|| profile.get("profileARN"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|arn| !arn.is_empty())
-            .map(ToOwned::to_owned)
-    })
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|profile| {
+            profile
+                .get("arn")
+                .or_else(|| profile.get("profileArn"))
+                .or_else(|| profile.get("profileARN"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|arn| !arn.is_empty())
+        })
+        .collect::<Vec<_>>();
+    let region_marker = format!(":{region}:");
+    arns.iter()
+        .find(|arn| arn.contains(&region_marker))
+        .or_else(|| arns.first())
+        .map(|arn| (*arn).to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    #[test]
+    fn profile_discovery_targets_unconfirmed_idc_and_external_idp_only() {
+        let idc = |profile_arn: Option<&str>| KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            profile_arn: profile_arn.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(profile_arn_discovery_applies(&idc(None)));
+        let declared = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            ..idc(None)
+        };
+        assert!(!profile_arn_discovery_applies(&declared));
+        assert!(!profile_arn_discovery_applies(&idc(Some(
+            KIRO_BUILDER_ID_PLACEHOLDER_ARN
+        ))));
+        assert!(!profile_arn_discovery_applies(&idc(Some(
+            "arn:aws:codewhisperer:us-east-1:614333540591:profile/REAL"
+        ))));
+
+        let external = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            profile_arn: Some(enterprise_fallback_profile_arn("us-east-1")),
+            ..Default::default()
+        };
+        assert!(profile_arn_discovery_applies(&external));
+
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        assert!(!profile_arn_discovery_applies(&social));
+    }
+
+    #[test]
+    fn builder_id_profile_denial_is_distinguished_from_token_errors() {
+        assert!(profile_listing_denied_for_builder_id(
+            r#"{"message":"User is not authorized to access this feature.","reason":null}"#
+        ));
+        assert!(profile_listing_denied_for_builder_id(
+            r#"{"message":"AWS Builder ID is not supported for this operation."}"#
+        ));
+        assert!(!profile_listing_denied_for_builder_id(
+            r#"{"message":"Invalid token","reason":null}"#
+        ));
+    }
+
+    #[test]
+    fn preferred_profile_matches_the_account_region() {
+        let body = r#"{"profiles":[
+            {"arn":"arn:aws:codewhisperer:us-east-1:111111111111:profile/US"},
+            {"arn":"arn:aws:codewhisperer:eu-central-1:111111111111:profile/EU"}
+        ]}"#;
+        assert_eq!(
+            extract_preferred_profile_arn(body, "eu-central-1").as_deref(),
+            Some("arn:aws:codewhisperer:eu-central-1:111111111111:profile/EU")
+        );
+        assert_eq!(
+            extract_preferred_profile_arn(body, "ap-south-2").as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:111111111111:profile/US")
+        );
+    }
+
+    #[test]
+    fn model_list_profile_uses_builder_placeholder_for_idc() {
+        let config = Config::default();
+        let idc = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_models_profile_arn(&idc, &config).as_deref(),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+        let social = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_models_profile_arn(&social, &config).as_deref(),
+            Some(KIRO_SOCIAL_PROFILE_ARN)
+        );
+        let api_key = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_models_profile_arn(&api_key, &config), None);
+    }
 
     #[test]
     fn header_profile_skips_external_idp_fallback() {
@@ -360,6 +513,117 @@ mod tests {
     }
 
     #[test]
+    fn mcp_profile_uses_builder_id_placeholder_while_optional_profile_omits_it() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_profile_arn(&credentials, &Config::default()), None);
+        assert_eq!(
+            resolve_mcp_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+    }
+
+    #[test]
+    fn mcp_profile_resolution_covers_authentication_matrix() {
+        let real_arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL";
+        let cases = [
+            (
+                "aws sso iam auth method",
+                KiroCredentials {
+                    auth_method: Some("iam".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+            ),
+            (
+                "idc auth method",
+                KiroCredentials {
+                    auth_method: Some("idc".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+            ),
+            (
+                "builderid auth method",
+                KiroCredentials {
+                    auth_method: Some("builderid".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+            ),
+            (
+                "external idp without profile",
+                KiroCredentials {
+                    auth_method: Some("external_idp".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "external idp with real profile",
+                KiroCredentials {
+                    auth_method: Some("external_idp".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    profile_arn: Some(real_arn.to_string()),
+                    ..Default::default()
+                },
+                Some(real_arn),
+            ),
+            (
+                "api key ignores stale profile",
+                KiroCredentials {
+                    auth_method: Some("api_key".to_string()),
+                    kiro_api_key: Some("ksk_test".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    profile_arn: Some(real_arn.to_string()),
+                    ..Default::default()
+                },
+                None,
+            ),
+        ];
+
+        for (label, credentials, expected) in cases {
+            assert_eq!(
+                resolve_mcp_profile_arn(&credentials, &Config::default()).as_deref(),
+                expected,
+                "unexpected MCP profile resolution for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_only_builder_id_keeps_required_usage_and_mcp_profile() {
+        let credentials = KiroCredentials {
+            provider: Some("BuilderId".to_string()),
+            ..Default::default()
+        };
+        assert!(is_builder_id_credentials(&credentials));
+        assert_eq!(
+            resolve_usage_limits_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+        assert_eq!(
+            resolve_mcp_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+        assert_eq!(
+            resolve_streaming_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+    }
+
+    #[test]
     fn streaming_profile_keeps_builder_id_placeholder_for_idc_credentials() {
         let credentials = KiroCredentials {
             auth_method: Some("idc".to_string()),
@@ -419,10 +683,10 @@ mod tests {
     }
 
     #[test]
-    fn extracts_first_profile_arn() {
+    fn extracts_profile_arn_from_profile_list() {
         let body = r#"{"profiles":[{"profileName":"dev","arn":"arn:profile/1"}]}"#;
         assert_eq!(
-            extract_first_profile_arn(body).as_deref(),
+            extract_preferred_profile_arn(body, "us-east-1").as_deref(),
             Some("arn:profile/1")
         );
     }

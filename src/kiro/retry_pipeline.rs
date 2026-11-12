@@ -15,18 +15,17 @@
 //!  ├─ ② 带 Retry-After    → 直接返回，遵守上游，不狂暴
 //!  └─ ③ 普通 429/408/5xx
 //!       ├─ 狂暴关闭 → 完全走既有逻辑（零影响）
-//!       └─ 狂暴开启 → 优先换号 → 换 region → 换轮次
+//!       └─ 狂暴开启 → 优先换号 → 账号池耗尽后进入下一轮
 //! ```
 //!
 //! # 轮换顺序（优先换号）
 //!
 //! ```text
 //! 轮次 1:
-//!   region[0] : acct1 → acct2 → ... → acctN     ← 先把账号轮完
-//!   region[1] : acct1 → acct2 → ... → acctN     ← 再换 region
-//!        ↓ 一轮全失败，退避一次
+//!   primary region : acct1 → acct2 → ... → acctN
+//!        ↓ 账号池全失败，退避一次
 //! 轮次 2:
-//!   region[0] : acct1 → ...
+//!   primary region : acct1 → ...
 //! ```
 //!
 //! 同一轮内切换账号**不退避**（不同账号不共享上游限流配额）；跨轮次退避，
@@ -70,7 +69,9 @@ pub(crate) struct BerserkPlan {
     enabled: bool,
     /// 端点轮换总开关；关闭时沿用凭据自身解析出的 region。
     region_rotation_enabled: bool,
-    /// 完整遍历 `账号 × region` 的轮数，至少为 1。
+    /// 是否允许带 Profile ARN 的请求跨 ARN 所属 Region 轮换。
+    profile_arn_region_mismatch_allowed: bool,
+    /// 完整遍历账号池的轮数，至少为 1。
     rounds: u32,
     /// 跨轮次退避。
     round_delay: Duration,
@@ -88,6 +89,7 @@ impl BerserkPlan {
             // 关闭时置空，使下游所有轮换判断统一退化为"沿用凭据自身的 region"，
             // 即改造之前的端点行为。
             region_rotation_enabled: config.kiro_upstream_region_rotation_enabled,
+            profile_arn_region_mismatch_allowed: config.kiro_region_profile_arn_mismatch_allowed,
             // 0 等价于 1 轮；上限与 admin 校验一致，防止配置文件绕过 admin 写入超大值。
             rounds: config.local_berserk_max_rounds.clamp(1, MAX_BERSERK_ROUNDS),
             round_delay: Duration::from_millis(config.local_berserk_round_delay_ms.min(60_000)),
@@ -139,17 +141,37 @@ impl BerserkPlan {
         rotation_regions_for(credential_region).get(index).copied()
     }
 
-    /// 狂暴模式下单次请求的尝试上限：`账号数 × region数 × 轮数`。
+    /// 返回当前账号允许使用的 Region。没有 Profile ARN 时不额外限制；有 ARN
+    /// 且未打开 mismatch 开关时，只允许账号身份所在的首选 Region。
+    pub(crate) fn region_at_for_profile(
+        &self,
+        credential_region: &str,
+        profile_arn: Option<&str>,
+        index: usize,
+    ) -> Option<&'static str> {
+        let candidate = self.region_at(credential_region, index)?;
+        if index == 0 || self.profile_arn_region_mismatch_allowed || profile_arn.is_none() {
+            return Some(candidate);
+        }
+        let profile_region = profile_arn
+            .and_then(crate::kiro::model::credentials::profile_arn_region)
+            .unwrap_or(credential_region);
+        (profile_region == candidate).then_some(candidate)
+    }
+
+    /// 狂暴模式下账号级调度的尝试上限：`账号数 × 轮数`。
+    ///
+    /// 同账号的 endpoint/Region 故障 fallback 另计入共享 physical-send budget，
+    /// 不改变 429 等账号级错误的换号顺序。
     ///
     /// 关闭时返回 `None`，调用方沿用既有的 `max_retry_attempts`。
     pub(crate) fn attempt_budget(&self, total_credentials: usize) -> Option<usize> {
         if !self.enabled {
             return None;
         }
-        let accounts = total_credentials.max(1);
         Some(
-            accounts
-                .saturating_mul(self.region_slots())
+            total_credentials
+                .max(1)
                 .saturating_mul(self.rounds as usize)
                 // 兜底硬上限：即使账号池异常膨胀也不至于把单个下游请求放大到失控。
                 .min(2_000),
@@ -157,10 +179,35 @@ impl BerserkPlan {
     }
 }
 
-/// `账号 × region × 轮次` 的遍历游标。
+/// 为只读辅助查询生成有界的 API Region 候选。
 ///
-/// 语义是"优先换号"：先在当前 region 上把所有账号试一遍，再切换 region，
-/// 所有 region 都试完才进入下一轮。
+/// 关闭 Region rotation 时返回 `None`，保留调用方原有的 effective Region。
+/// 开启时按账号 Region 顺序尝试官方 Region，并使用与 inference 相同的 Profile
+/// ARN 跨 Region 资格开关。
+pub(crate) fn auxiliary_region_candidates(
+    config: &Config,
+    credential_region: &str,
+    profile_arn: Option<&str>,
+) -> Vec<Option<&'static str>> {
+    let plan = BerserkPlan::from_config(config);
+    let profile_arn = profile_arn.filter(|arn| {
+        crate::kiro::protocol::is_real_profile_arn(arn)
+            || *arn == crate::kiro::protocol::KIRO_SOCIAL_PROFILE_ARN
+    });
+    if !plan.region_rotation_active() {
+        return vec![None];
+    }
+
+    (0..plan.region_slots())
+        .filter_map(|index| plan.region_at_for_profile(credential_region, profile_arn, index))
+        .map(Some)
+        .collect()
+}
+
+/// 账号池与 Region 轮换的遍历游标。
+///
+/// 语义是"账号级错误优先换号"：普通 429 等账号级错误先遍历账号池；
+/// 明确 host/Region 故障由当前账号的 route 候选处理。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RotationCursor {
     region_index: usize,
@@ -179,8 +226,6 @@ pub(crate) struct RotationCursor {
 /// 一轮账号耗尽后的下一步动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RotationStep {
-    /// 切换到下一个 region，重新开放全部账号；同一轮内不退避。
-    NextRegion { region_index: usize },
     /// 当前轮的所有 region 都试完，进入下一轮并退避。
     NextRound { round: u32, delay: Duration },
     /// 轮数耗尽，停止重试。
@@ -229,8 +274,13 @@ impl RotationCursor {
     /// 与 [`Self::advance_after_accounts_exhausted`] 的区别是这里没有"轮次"概念，
     /// 也不清空账号排除集合——普通模式的账号故障转移语义保持原样，
     /// 仅仅是让连续重试打到不同的上游地址。
-    pub(crate) fn advance_region_for_normal_retry(&mut self, credential_id: u64) -> usize {
-        if self.region_slots > 1 {
+    #[cfg(test)]
+    pub(crate) fn advance_region_for_normal_retry(
+        &mut self,
+        credential_id: u64,
+        allow_advance: bool,
+    ) -> usize {
+        if self.region_slots > 1 && allow_advance {
             let current = self.region_index_for(credential_id);
             self.region_index = (current + 1) % self.region_slots;
             self.normal_region_owner = (!self.pool_wide_regions).then_some(credential_id);
@@ -238,20 +288,11 @@ impl RotationCursor {
         self.region_index
     }
 
-    /// 当前 region 下所有账号都试过后调用，推进游标。
+    /// 账号级错误耗尽当前账号池后调用，进入下一轮。
     ///
-    /// 调用方拿到 [`RotationStep::NextRegion`] / [`RotationStep::NextRound`] 后
-    /// 必须清空本请求的账号排除集合，让所有账号在新 region / 新轮次重新可选。
+    /// 调用方拿到 [`RotationStep::NextRound`] 后必须清空本请求的账号排除集合。
     pub(crate) fn advance_after_accounts_exhausted(&mut self, plan: &BerserkPlan) -> RotationStep {
-        // Berserk rotation is pool-wide: the new region applies to every account.
         self.normal_region_owner = None;
-        if self.region_index + 1 < self.region_slots {
-            self.region_index += 1;
-            return RotationStep::NextRegion {
-                region_index: self.region_index,
-            };
-        }
-
         if self.round < self.max_rounds {
             self.round += 1;
             self.region_index = 0;
@@ -339,7 +380,7 @@ mod tests {
 
         let mut cursor = RotationCursor::new(&plan);
         assert_eq!(
-            cursor.advance_region_for_normal_retry(7),
+            cursor.advance_region_for_normal_retry(7, true),
             0,
             "关闭时普通模式重试不得切换端点"
         );
@@ -356,6 +397,45 @@ mod tests {
             plan.region_at("us-east-1", 2),
             None,
             "越界必须返回 None 而不是 panic"
+        );
+    }
+
+    #[test]
+    fn profile_arn_mismatch_switch_only_filters_cross_region_candidates() {
+        let profile_arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE";
+        let mut config = config_with(false, true, 1, 0);
+        let plan = BerserkPlan::from_config(&config);
+        assert_eq!(
+            plan.region_at_for_profile("us-east-1", Some(profile_arn), 0),
+            Some("us-east-1"),
+            "primary endpoint preserves the existing behavior"
+        );
+        assert_eq!(
+            plan.region_at_for_profile("us-east-1", Some(profile_arn), 1),
+            None,
+            "a Profile ARN cannot cross Region while the switch is off"
+        );
+        assert_eq!(
+            plan.region_at_for_profile("us-east-1", None, 1),
+            Some("eu-central-1"),
+            "accounts without Profile ARN can still use Region rotation"
+        );
+
+        config.kiro_region_profile_arn_mismatch_allowed = true;
+        let plan = BerserkPlan::from_config(&config);
+        assert_eq!(
+            plan.region_at_for_profile("us-east-1", Some(profile_arn), 1),
+            Some("eu-central-1"),
+            "opening the mismatch switch enables the alternate Region"
+        );
+
+        let eu_profile_arn = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/FAKE";
+        config.kiro_region_profile_arn_mismatch_allowed = false;
+        let plan = BerserkPlan::from_config(&config);
+        assert_eq!(
+            plan.region_at_for_profile("us-east-1", Some(eu_profile_arn), 1),
+            Some("eu-central-1"),
+            "a candidate matching the ARN Region remains available"
         );
     }
 
@@ -380,12 +460,12 @@ mod tests {
             "仅开狂暴时预算退化为 账号数 × 1个端点 × 1轮"
         );
 
-        // 同时开：完整笛卡尔积。
+        // Region fallback 不扩大账号级 429 的重试预算。
         let plan = BerserkPlan::from_config(&config_with(true, true, 3, 0));
         assert_eq!(
             plan.attempt_budget(20),
-            Some(20 * 2 * 3),
-            "同时开启时预算为 账号数 × 端点数 × 轮数"
+            Some(20 * 3),
+            "账号级错误只按账号数 × 轮数重试"
         );
     }
 
@@ -395,9 +475,9 @@ mod tests {
         let plan = BerserkPlan::from_config(&config_with(false, true, 1, 0));
         let mut cursor = RotationCursor::new(&plan);
         assert_eq!(cursor.region_index(), 0, "首次请求必须使用主力端点");
-        assert_eq!(cursor.advance_region_for_normal_retry(7), 1);
+        assert_eq!(cursor.advance_region_for_normal_retry(7, true), 1);
         assert_eq!(
-            cursor.advance_region_for_normal_retry(7),
+            cursor.advance_region_for_normal_retry(7, true),
             0,
             "用完一圈后必须回到第一个端点继续循环"
         );
@@ -408,7 +488,7 @@ mod tests {
         let plan = BerserkPlan::from_config(&config_with(false, true, 1, 0));
         let mut cursor = RotationCursor::new(&plan);
         // Account 1 fails and its retry moves to its other endpoint.
-        assert_eq!(cursor.advance_region_for_normal_retry(1), 1);
+        assert_eq!(cursor.advance_region_for_normal_retry(1, true), 1);
         assert_eq!(
             cursor.region_index_for(1),
             1,
@@ -425,24 +505,21 @@ mod tests {
             "a us-east-1 account must not be sent to eu-central-1 with its us-east-1 profileArn"
         );
         // Account 2 then fails too: it advances from its own position.
-        assert_eq!(cursor.advance_region_for_normal_retry(2), 1);
+        assert_eq!(cursor.advance_region_for_normal_retry(2, true), 1);
         assert_eq!(cursor.region_index_for(2), 1);
         assert_eq!(cursor.region_index_for(1), 0);
     }
 
     #[test]
-    fn berserk_region_advance_applies_to_every_account() {
+    fn account_level_berserk_rounds_keep_each_account_on_its_primary_region() {
         let plan = BerserkPlan::from_config(&config_with(true, true, 1, 0));
         let mut cursor = RotationCursor::new(&plan);
-        cursor.advance_region_for_normal_retry(1);
         assert!(matches!(
             cursor.advance_after_accounts_exhausted(&plan),
-            RotationStep::NextRegion { region_index: 1 }
-                | RotationStep::NextRound { .. }
-                | RotationStep::Exhausted
+            RotationStep::Exhausted
         ));
-        assert_eq!(cursor.region_index_for(1), cursor.region_index());
-        assert_eq!(cursor.region_index_for(2), cursor.region_index());
+        assert_eq!(cursor.region_index_for(1), 0);
+        assert_eq!(cursor.region_index_for(2), 0);
     }
 
     #[test]
@@ -479,17 +556,11 @@ mod tests {
     }
 
     #[test]
-    fn cursor_prefers_switching_accounts_then_region_then_round() {
-        // 用户明确要求的顺序：优先换号 → 换端点 → 换轮次。
+    fn account_level_errors_switch_accounts_then_start_a_new_round() {
         let plan = BerserkPlan::from_config(&config_with(true, true, 2, 1_000));
         let mut cursor = RotationCursor::new(&plan);
 
-        // 端点[0] 账号耗尽 → 换到端点[1]，同轮内不退避。
-        assert_eq!(
-            cursor.advance_after_accounts_exhausted(&plan),
-            RotationStep::NextRegion { region_index: 1 }
-        );
-        // 端点[1] 也耗尽 → 进入第 2 轮并退避。
+        // 当前账号池耗尽后进入第 2 轮；Region 留在账号首选值。
         assert_eq!(
             cursor.advance_after_accounts_exhausted(&plan),
             RotationStep::NextRound {
@@ -501,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn full_rotation_sequence_matches_the_documented_order() {
+    fn account_level_retry_sequence_never_advances_region() {
         let plan = BerserkPlan::from_config(&config_with(true, true, 2, 0));
         let mut cursor = RotationCursor::new(&plan);
         let mut visited = vec![(cursor.round(), cursor.region_index())];
@@ -513,13 +584,13 @@ mod tests {
         }
         assert_eq!(
             visited,
-            vec![(1, 0), (1, 1), (2, 0), (2, 1)],
-            "必须先把端点轮完再进下一轮"
+            vec![(1, 0), (2, 0)],
+            "普通 429 只推进账号轮次，不切换 Region"
         );
     }
 
     #[test]
-    fn cursor_without_rotation_only_advances_rounds() {
+    fn account_level_cursor_advances_rounds_without_region_rotation() {
         let plan = BerserkPlan::from_config(&config_with(true, false, 3, 0));
         let mut cursor = RotationCursor::new(&plan);
         for expected_round in 2..=3 {
@@ -545,7 +616,7 @@ mod tests {
         assert_eq!(
             cursor.advance_after_accounts_exhausted(&plan),
             RotationStep::Exhausted,
-            "1 轮 + 不轮换端点时，账号耗尽即结束"
+            "1 轮后账号池耗尽即结束"
         );
     }
 
@@ -562,7 +633,30 @@ mod tests {
     #[test]
     fn attempt_budget_treats_empty_pool_as_a_single_account() {
         let plan = BerserkPlan::from_config(&config_with(true, true, 2, 0));
-        // 账号 1（空池按单账号兜底）× 端点 2 × 轮数 2。
-        assert_eq!(plan.attempt_budget(0), Some(4));
+        // 空池按单账号兜底，再乘轮数 2。
+        assert_eq!(plan.attempt_budget(0), Some(2));
+    }
+
+    #[test]
+    fn auxiliary_region_candidates_follow_switch_and_profile_arn_region() {
+        let mut config = config_with(false, false, 1, 0);
+        assert_eq!(
+            auxiliary_region_candidates(&config, "us-east-1", None),
+            vec![None]
+        );
+
+        config.kiro_upstream_region_rotation_enabled = true;
+        let us_profile = Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/P");
+        assert_eq!(
+            auxiliary_region_candidates(&config, "us-east-1", us_profile),
+            vec![Some("us-east-1")],
+            "默认不把带真实 Profile ARN 的查询发往 ARN Region 之外"
+        );
+
+        config.kiro_region_profile_arn_mismatch_allowed = true;
+        assert_eq!(
+            auxiliary_region_candidates(&config, "us-east-1", us_profile),
+            vec![Some("us-east-1"), Some("eu-central-1")]
+        );
     }
 }

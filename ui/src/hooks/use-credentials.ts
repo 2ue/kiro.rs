@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   addCredential,
+  applyKiroClientVersion,
   batchUpdateCredentials,
   batchDeleteCredentials,
   clearCredentialInFlight,
+  checkKiroClientVersion,
   createProxyResource,
   deleteCredential,
   deleteDisabledCredentials,
@@ -23,6 +25,7 @@ import {
   getLoadBalancingMode,
   getProxyResources,
   importProxyResources,
+  pinKiroClientVersion,
   getPromptInjectionCatalog,
   getRuntimeConfig,
   previewPromptInjection,
@@ -30,6 +33,8 @@ import {
   getPublicPoolConfig,
   setPublicPoolConfig,
   resetCredentialFailure,
+  rollbackKiroClientVersion,
+  syncCredentialsProfileArn,
   setCredentialDisabled,
   setCredentialConcurrency,
   setCredentialOverage,
@@ -69,6 +74,7 @@ import type {
   ProxyResourceTestRequest,
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
+  ProfileArnSyncMode,
 } from '@/types/api'
 
 interface QueryRefreshOptions {
@@ -423,6 +429,14 @@ export function useForceRefreshToken() {
   })
 }
 
+export function useSyncCredentialsProfileArn() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, mode }: { ids: number[]; mode: ProfileArnSyncMode }) => syncCredentialsProfileArn(ids, mode),
+    onSuccess: () => invalidateCredentialCaches(queryClient),
+  })
+}
+
 export function useAddCredential() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -475,6 +489,30 @@ export function useRuntimeConfig() {
   return useQuery({
     queryKey: ['runtime-config'],
     queryFn: getRuntimeConfig,
+  })
+}
+
+export function useCheckKiroClientVersion() {
+  return useMutation({
+    mutationFn: checkKiroClientVersion,
+  })
+}
+
+export function useApplyKiroClientVersion() {
+  return useMutation({
+    mutationFn: (version?: string) => applyKiroClientVersion(version),
+  })
+}
+
+export function usePinKiroClientVersion() {
+  return useMutation({
+    mutationFn: pinKiroClientVersion,
+  })
+}
+
+export function useRollbackKiroClientVersion() {
+  return useMutation({
+    mutationFn: rollbackKiroClientVersion,
   })
 }
 

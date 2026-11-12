@@ -4,9 +4,9 @@ Role: 当前 Rust 项目的运行时、调度、外部池、thinking signature �
 
 Status: `In Progress`
 
-Current phase: `external-pool quality-aware scheduling focused-validated / Claude Code-Kiro interop P0 focused + isolated-real normal/alias validated / scheduler architecture and signature blockers open`
+Current phase: `external-pool quality-aware scheduling focused-validated / Claude Code-Kiro interop P0 focused + isolated-real normal/alias validated / endpoint-Region-version lifecycle focused validation / scheduler architecture and signature blockers open`
 
-Last reviewed: 2026-09-28 Asia/Shanghai
+Last reviewed: 2026-11-11 Asia/Shanghai
 
 Authority:
 
@@ -37,6 +37,7 @@ Authority:
    - [OpenAI 官方协议与 Kiro 协议互转改造方案](topics/openai-kiro-protocol-interop-refactor-plan.md)
    - [服务问题审计与并发积压因果](topics/service-audit-and-backlog-causality.md)
    - [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md)
+   - [端点轮换与 Kiro 客户端版本生命周期设计](topics/endpoint-rotation-and-client-version-lifecycle.md)
    - [导入账号标签属性](topics/credential-import-tags.md)
    - [官方 Claude Code / Anthropic 与 Kiro 协议互操作审计](topics/official-claude-code-kiro-protocol-audit-20260928.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
@@ -80,6 +81,7 @@ Out of scope:
 | 生产 `THINKING_SIGNATURE_INVALID`、stream read error、retry 后 too-long 归因 | Completed read-only audits; retry-state-machine, observability and protocol follow-ups open | [Production Thinking Signature audit](topics/production-thinking-signature-error-20260928.md) |
 | Claude Code / Kiro reasoning 400 与入口拒绝记录 `model=unknown`、内容/诊断缺失 | Audit complete; the thinking compatibility tags are now the per-route injection item `thinkingControls`, verified with real Claude Code CLI; release/deploy validation pending | [Official Claude Code / Anthropic 与 Kiro protocol audit](topics/official-claude-code-kiro-protocol-audit-20260928.md) |
 | OpenAI 官方 Chat/Responses ↔ Kiro 协议互转入口缺失 | Planning only; current service exposes Anthropic Messages routes and has no `/v1/chat/completions` or `/v1/responses` | [OpenAI/Kiro protocol interop refactor plan](topics/openai-kiro-protocol-interop-refactor-plan.md) |
+| 端点/Region 轮换与 Kiro 客户端版本生命周期 | Implemented; FREE real-upstream matrix verified on 2026-11-11 (endpoints, Portal usage, WebSearch, version lifecycle, PostgreSQL CAS) and capture schema diff added | [端点轮换与 Kiro 客户端版本生命周期设计](topics/endpoint-rotation-and-client-version-lifecycle.md) |
 | 真实 CLI / load chaos / release gates 未全量闭环 | Open validation | [Validation and release gates](topics/validation-and-release-gates.md) |
 | 项目文档状态漂移、旧分析未归档 | In progress | [Document disposition](indexes/document-disposition.md) |
 | 本地账号 WebSearch/tools/image Wave 1 | WebSearch and tool parsing focused verified; image/model/multi-tool-history follow-up open | [Current issue status index](../../../../feature/issues/current-issue-status-index-20260731.md), [analysis priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) |
