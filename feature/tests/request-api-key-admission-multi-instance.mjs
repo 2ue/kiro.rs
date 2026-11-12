@@ -9,6 +9,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { seedCredentialsBeforeStartup } from './postgres-credential-seed.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
@@ -507,16 +508,20 @@ function createFakeUpstream() {
   }
 }
 
-function startService({ configPath, credentialsPath, logPath, port }) {
+function serviceEnvironment(port) {
+  return minimalEnvironment({
+    KIRO_API_KEY: '',
+    KIRO_RS_HOST: '127.0.0.1',
+    KIRO_RS_PORT: String(port),
+    RUST_LOG: 'kiro_rs::anthropic::request_admission=debug,kiro_rs=info',
+  })
+}
+
+function startService({ configPath, logPath, port }) {
   const log = fs.openSync(logPath, 'a')
-  const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
-    env: minimalEnvironment({
-      KIRO_API_KEY: '',
-      KIRO_RS_HOST: '127.0.0.1',
-      KIRO_RS_PORT: String(port),
-      RUST_LOG: 'kiro_rs::anthropic::request_admission=debug,kiro_rs=info',
-    }),
+    env: serviceEnvironment(port),
     stdio: ['ignore', log, log],
   })
   handle.once('exit', () => fs.closeSync(log))
@@ -699,6 +704,7 @@ async function startCaseService({
   redisKeyPrefix,
   upstreamPort,
   servicePorts,
+  seedCredentials,
 }) {
   const port = await reservePort()
   assert.notEqual(port, 9022)
@@ -706,7 +712,6 @@ async function startCaseService({
   const root = path.join(caseRoot, name)
   fs.mkdirSync(root, { recursive: true, mode: 0o700 })
   const configPath = path.join(root, 'config.json')
-  const credentialsPath = path.join(root, 'credentials.json')
   const logPath = path.join(root, 'service.log')
   fs.writeFileSync(configPath, `${JSON.stringify(serviceConfig({
     databaseUrl,
@@ -715,10 +720,17 @@ async function startCaseService({
     servicePort: port,
     upstreamPort,
   }), null, 2)}\n`, { mode: 0o600 })
-  fs.writeFileSync(credentialsPath, `${JSON.stringify(credentialFixture(), null, 2)}\n`, {
-    mode: 0o600,
-  })
-  const handle = startService({ configPath, credentialsPath, logPath, port })
+  if (seedCredentials) {
+    seedCredentialsBeforeStartup({
+      binary: BINARY,
+      configPath,
+      serviceEnvironment: serviceEnvironment(port),
+      postgresUrl: databaseUrl,
+      credentials: credentialFixture(),
+      cwd: ROOT,
+    })
+  }
+  const handle = startService({ configPath, logPath, port })
   const service = {
     name,
     port,
@@ -1329,6 +1341,7 @@ async function runRound({
       redisKeyPrefix,
       upstreamPort,
       servicePorts,
+      seedCredentials: true,
     }))
     services.push(await startCaseService({
       name: 'secondary',
@@ -1339,6 +1352,7 @@ async function runRound({
       redisKeyPrefix,
       upstreamPort,
       servicePorts,
+      seedCredentials: false,
     }))
     await Promise.all(services.map((service) => waitAdmission(service, INITIAL_ADMISSION)))
 

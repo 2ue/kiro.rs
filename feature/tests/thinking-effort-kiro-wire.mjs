@@ -10,6 +10,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { importCredentialsViaAdmin } from './admin-credential-import.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '../..')
@@ -1853,13 +1854,13 @@ function isolatedServiceEnvironment(endpoint, servicePort) {
   })
 }
 
-function startService({ endpoint, configPath, credentialsPath, logPath, servicePort, serviceCwd }) {
+function startService({ endpoint, configPath, logPath, servicePort, serviceCwd }) {
   throwIfShutdownRequested()
   const verifiedServiceCwd = assertExternalDirectory(serviceCwd, 'isolated service cwd')
   const logFd = fs.openSync(logPath, 'a', 0o600)
   let child
   try {
-    child = spawnOwned(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+    child = spawnOwned(BINARY, ['--config', configPath], {
       cwd: verifiedServiceCwd,
       env: isolatedServiceEnvironment(endpoint, servicePort),
       detached: true,
@@ -1985,23 +1986,16 @@ async function runEndpoint({ endpoint, upstreamPort, fake }) {
   const servicePort = await reservePort()
   const ingressPort = await reservePort()
   const configPath = path.join(endpointRoot, 'config.json')
-  const credentialsPath = path.join(endpointRoot, 'credentials.json')
   const logPath = path.join(endpointRoot, 'service.log')
   fs.writeFileSync(
     configPath,
     `${JSON.stringify(isolatedConfig({ endpoint, servicePort, upstreamPort }), null, 2)}\n`,
     { mode: 0o600 },
   )
-  fs.writeFileSync(
-    credentialsPath,
-    `${JSON.stringify(isolatedCredential(endpoint), null, 2)}\n`,
-    { mode: 0o600 },
-  )
 
   const service = startService({
     endpoint,
     configPath,
-    credentialsPath,
     logPath,
     servicePort,
     serviceCwd: serviceCwdReal,
@@ -2016,6 +2010,7 @@ async function runEndpoint({ endpoint, upstreamPort, fake }) {
   let postgresAfter = null
   try {
     await waitForHealth(baseUrl, service)
+    await importCredentialsViaAdmin(baseUrl, ADMIN_KEY, isolatedCredential(endpoint))
     assert.deepEqual(listeningPids(servicePort), [service.pid])
     assert.deepEqual(listeningPids(ingressPort), [process.pid])
     resourcesStart = processResources(service.pid)

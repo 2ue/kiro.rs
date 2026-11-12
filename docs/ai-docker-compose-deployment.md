@@ -47,8 +47,7 @@ docker compose version
 /opt/kiro-rs/
 ├── docker-compose.yml
 └── config/
-    ├── config.json
-    └── credentials.json
+    └── config.json
 ```
 
 创建目录：
@@ -215,49 +214,38 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 - Docker 部署时 `host` 必须是 `0.0.0.0`，否则宿主机端口映射后可能访问不到服务。
 - Compose 会通过 `KIRO_RS_POSTGRES_URL` 和 `KIRO_RS_REDIS_URL` 注入数据库连接地址；文件里的 `postgres.url` 和 `redis.url` 也可以保留，主要用于本地或非 Compose 场景。
 - 未写出的配置会使用内置默认值。首次启动导入 PgSQL 后，可以在后台配置页热更新调度、payload 防护、高缓存模拟和路径级 usage 上报策略。
-- 首次启动时，如果 PgSQL 没有运行配置或凭据，服务会从 `config.json` 和 `credentials.json` 导入。
+- 首次启动时，如果 PgSQL 没有运行配置，服务会从 `config.json` 导入。服务启动不读取任何凭据文件，凭据在启动后通过管理后台导入。
 - 导入后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、调度统计、usage 记录、模型价格都以 PgSQL 为准。
 - 会话粘性绑定、同会话软失败计数、上游瞬态错误冷却、本地 RPM 限流、单凭据并发 lease 和跨实例 Token 刷新锁都以 Redis 为准。
 
-## 6. credentials.json
+## 6. 导入凭据
 
-首次启动前，在 `/opt/kiro-rs/config/credentials.json` 写入凭据。可以是单个对象，也可以是数组。
+服务启动后打开管理后台 `/ui`，用 `adminApiKey` 登录，在账号页导入凭据（支持 JSON、JSONL、`ksk_xxx|region` 文本和 KAM 导出文件）。导入时会先刷新一次 Token 验证凭据，再写入 PgSQL。
 
-单个 OAuth 凭据示例：
+也可以直接调用管理接口：
 
-```json
-{
-  "refreshToken": "替换成你的 refresh token",
-  "expiresAt": "2026-12-31T00:00:00Z",
-  "authMethod": "social",
-  "priority": 0,
-  "email": "account@example.com"
-}
+```bash
+# 单个 OAuth 凭据
+curl http://127.0.0.1:8990/api/admin/credentials \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <adminApiKey>" \
+  -d '{"refreshToken": "替换成你的 refresh token", "authMethod": "social", "priority": 0}'
+
+# 批量导入；duplicateMode=skip 会跳过已存在的凭据
+curl http://127.0.0.1:8990/api/admin/credentials/import \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <adminApiKey>" \
+  -d '{
+    "duplicateMode": "skip",
+    "continueOnError": true,
+    "credentials": [
+      {"refreshToken": "替换成第一个 refresh token", "authMethod": "social", "priority": 0},
+      {"kiroApiKey": "ksk_xxxxxxxx", "authMethod": "api_key", "priority": 10}
+    ]
+  }'
 ```
 
-多凭据示例：
-
-```json
-[
-  {
-    "id": 1,
-    "refreshToken": "替换成第一个 refresh token",
-    "expiresAt": "2026-12-31T00:00:00Z",
-    "authMethod": "social",
-    "priority": 0,
-    "email": "account1@example.com"
-  },
-  {
-    "id": 2,
-    "kiroApiKey": "ksk_xxxxxxxx",
-    "authMethod": "api_key",
-    "priority": 10,
-    "email": "account2@example.com"
-  }
-]
-```
-
-数据库已有凭据后，服务启动不依赖 `credentials.json`。之后建议通过管理后台新增、禁用、删除或导出凭据。
+只使用一个 Kiro API Key 时，可以在 Compose 的环境变量里设置 `KIRO_API_KEY`，服务启动时自动导入（已存在时跳过）。
 
 ## 7. 配置项中文说明
 
@@ -468,21 +456,21 @@ http://服务器地址:8990/ui
 | 位置 | 控制什么 |
 | --- | --- |
 | PgSQL `runtime_config` | 运行配置。首次可从 `config.json` 导入，之后后台修改写入这里。 |
-| PgSQL `credentials` | 凭据列表、禁用状态、刷新后的 Token、优先级等。首次可从 `credentials.json` 导入。 |
+| PgSQL `credentials` | 凭据列表、禁用状态、刷新后的 Token、优先级等。通过管理后台导入。 |
 | PgSQL `credential_runtime_state` | 凭据失败计数、刷新失败计数、禁用原因、预热剩余次数。 |
 | PgSQL `credential_stats` | 凭据成功次数、最后使用时间等调度统计。 |
 | PgSQL `usage_records` | 请求级 usage 记录、错误详情、模型计价结果。 |
 | PgSQL `model_pricing` | 模型价格同步结果。 |
 | Redis | 会话粘性绑定、同会话软失败计数、临时冷却、本地限流、并发 lease、Token 刷新锁、余额查询缓存。 |
 | `config/config.json` | 首次导入和数据库连接配置。 |
-| `config/credentials.json` | 首次导入凭据文件；数据库已有凭据后服务启动不依赖它。 |
 
-备份时至少备份 PgSQL 数据卷。如果还依赖文件做首次导入，也备份：
+备份时至少备份 PgSQL 数据卷，以及首次导入用的：
 
 ```text
 config/config.json
-config/credentials.json
 ```
+
+凭据可以在管理后台导出备份。
 
 ## 11. 停止、重启、升级
 
@@ -526,10 +514,6 @@ docker compose logs kiro-rs
 ### 修改 config.json 后为什么不生效
 
 首次导入后，运行配置以 PgSQL `runtime_config` 为准。后续请在管理后台修改配置；如果要重新从文件导入，需要清空数据库中的运行配置，谨慎操作。
-
-### 修改 credentials.json 后为什么不生效
-
-首次导入后，凭据以 PgSQL `credentials` 为准。后续请在管理后台新增、删除、禁用或导出凭据；如果要重新从文件导入，需要清空数据库中的凭据，谨慎操作。
 
 ### 下游 API Key 的 RPM / 并发限额在多实例下为什么变大了
 
