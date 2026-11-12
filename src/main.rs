@@ -38,10 +38,9 @@ use futures::StreamExt;
 use kiro::endpoint::{
     AmazonqEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
 };
-use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
-use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
+use model::arg::{Args, Command, MaintenanceCommand};
 use model::config::Config;
 use serde_json::{Value, json};
 use storage::postgres::{PostgresStore, PostgresUsageLifecycleGuard, PostgresUsageStore};
@@ -177,10 +176,7 @@ async fn async_main() {
     });
 
     if let Some(command) = args.command {
-        let credentials_path = args
-            .credentials
-            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-        if let Err(err) = handle_cli_command(command, &file_config, &credentials_path).await {
+        if let Err(err) = handle_cli_command(command, &file_config).await {
             tracing::error!("{}", err);
             std::process::exit(1);
         }
@@ -240,41 +236,6 @@ async fn async_main() {
             tracing::error!("从配置文件 bootstrap 运行配置到 PgSQL 失败: {}", e);
             std::process::exit(1);
         });
-    let credentials_exist = postgres_store
-        .credentials_exist()
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("检查 PgSQL 凭据是否存在失败: {}", e);
-            std::process::exit(1);
-        });
-    if !credentials_exist {
-        let credentials_path = args
-            .credentials
-            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-        match CredentialsConfig::load(&credentials_path) {
-            Ok(file_credentials) => {
-                let file_credentials_list = file_credentials.into_sorted_credentials();
-                postgres_store
-                    .bootstrap_credentials_from_file(&file_credentials_list)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!("从凭据文件 bootstrap 凭据到 PgSQL 失败: {}", e);
-                        std::process::exit(1);
-                    });
-            }
-            Err(err) if env_kiro_api_key.is_some() => {
-                tracing::warn!(
-                    "首次导入凭据文件不可用，将仅使用 KIRO_API_KEY 自动导入: {}",
-                    err
-                );
-            }
-            Err(err) => {
-                tracing::error!("加载首次导入凭据文件失败: {}", err);
-                std::process::exit(1);
-            }
-        }
-    }
-
     if let Some(kiro_api_key) = &env_kiro_api_key {
         postgres_store
             .ensure_api_key_credential(kiro_api_key)
@@ -1723,17 +1684,8 @@ fn spawn_redis_runtime_event_listener(
     })
 }
 
-async fn handle_cli_command(
-    command: Command,
-    config: &Config,
-    credentials_path: &str,
-) -> anyhow::Result<()> {
+async fn handle_cli_command(command: Command, config: &Config) -> anyhow::Result<()> {
     match command {
-        Command::Credentials { command } => {
-            // CLI 凭据诊断仍然面向本地文件，用于首次导入前排查 credentials.json。
-            let credentials_config = CredentialsConfig::load(credentials_path)?;
-            handle_credentials_command(command, config, credentials_config, credentials_path)
-        }
         Command::Maintenance { command } => handle_maintenance_command(command, config).await,
     }
 }
@@ -1789,92 +1741,6 @@ async fn handle_maintenance_command(
         }
     }
     maintenance_guard.release().await?;
-    Ok(())
-}
-
-fn handle_credentials_command(
-    command: CredentialsCommand,
-    config: &Config,
-    credentials_config: CredentialsConfig,
-    credentials_path: &str,
-) -> anyhow::Result<()> {
-    let is_multiple = credentials_config.is_multiple();
-    let credentials = credentials_config.into_sorted_credentials();
-
-    match command {
-        CredentialsCommand::Stats => {
-            println!("credentials: {}", credentials.len());
-            println!(
-                "format: {}",
-                if is_multiple { "multiple" } else { "single" }
-            );
-            println!("loadBalancingMode: {}", config.load_balancing_mode);
-            println!(
-                "credentialRpm: {}",
-                config
-                    .credential_rpm
-                    .map(|rpm| rpm.to_string())
-                    .unwrap_or_else(|| "disabled".to_string())
-            );
-            for (index, credential) in credentials.iter().enumerate() {
-                let id = credential.id.unwrap_or((index + 1) as u64);
-                let label = credential
-                    .email
-                    .as_deref()
-                    .or_else(|| credential.endpoint.as_deref())
-                    .unwrap_or("-");
-                println!(
-                    "#{id} priority={} disabled={} auth={} label={}",
-                    credential.priority,
-                    credential.disabled,
-                    credential.auth_method.as_deref().unwrap_or(
-                        if credential.kiro_api_key.is_some() {
-                            "api_key"
-                        } else {
-                            "oauth"
-                        }
-                    ),
-                    label
-                );
-            }
-        }
-        CredentialsCommand::Diagnostics => {
-            println!("credentialsPath: {}", credentials_path);
-            println!("credentials: {}", credentials.len());
-            println!(
-                "format: {}",
-                if is_multiple { "multiple" } else { "single" }
-            );
-            if !is_multiple {
-                println!("warning: single credentials format cannot be rewritten by token refresh");
-            }
-            if let Err(err) = config
-                .load_balancing_mode
-                .parse::<kiro::token_manager::LoadBalancingMode>()
-            {
-                println!("error: loadBalancingMode: {err}");
-            }
-            let mut ids = std::collections::HashSet::new();
-            for (index, credential) in credentials.iter().enumerate() {
-                let id = credential.id.unwrap_or((index + 1) as u64);
-                if !ids.insert(id) {
-                    println!("error: duplicate credential id #{id}");
-                }
-                if credential.is_api_key_credential() && credential.kiro_api_key.is_none() {
-                    println!("error: credential #{id} authMethod=api_key but missing kiroApiKey");
-                }
-                if !credential.is_api_key_credential() && credential.refresh_token.is_none() {
-                    println!("warning: credential #{id} missing refreshToken");
-                }
-                if credential.machine_id.is_none() {
-                    println!(
-                        "info: credential #{id} missing machineId, it will be generated at startup"
-                    );
-                }
-            }
-        }
-    }
-
     Ok(())
 }
 

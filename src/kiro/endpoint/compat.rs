@@ -384,6 +384,18 @@ mod tests {
                 None,
             ),
             (
+                "organization idc with enterprise provider",
+                KiroCredentials {
+                    auth_method: Some("IdC".to_string()),
+                    provider: Some("Enterprise".to_string()),
+                    client_id: Some("client".to_string()),
+                    client_secret: Some("secret".to_string()),
+                    ..Default::default()
+                },
+                Some(crate::kiro::protocol::KIRO_BUILDER_ID_PLACEHOLDER_ARN),
+                None,
+            ),
+            (
                 "external idp without real profile",
                 KiroCredentials {
                     auth_method: Some("external_idp".to_string()),

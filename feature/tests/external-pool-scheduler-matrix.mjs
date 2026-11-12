@@ -19,6 +19,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { seedCredentialsBeforeStartup } from './postgres-credential-seed.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
@@ -1282,14 +1283,18 @@ function processMetrics(pid) {
   }
 }
 
-function spawnService(configPath, credentialsPath, logPath) {
+function serviceEnvironment() {
+  return validationChildEnvironment({
+    RUST_LOG: 'kiro_rs::external_pool=debug,kiro_rs::anthropic=info,kiro_rs=info',
+    KIRO_API_KEY: '',
+  })
+}
+
+function spawnService(configPath, logPath) {
   const fd = fs.openSync(logPath, 'a')
-  const child = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const child = spawn(BINARY, ['--config', configPath], {
     cwd: TEMP_ROOT,
-    env: validationChildEnvironment({
-      RUST_LOG: 'kiro_rs::external_pool=debug,kiro_rs::anthropic=info,kiro_rs=info',
-      KIRO_API_KEY: '',
-    }),
+    env: serviceEnvironment(),
     stdio: ['ignore', fd, fd],
     detached: true,
   })
@@ -1721,7 +1726,6 @@ async function main() {
   }
   const logPath = path.join(TEMP_ROOT, 'service.log')
   const configPath = path.join(TEMP_ROOT, 'config.json')
-  const credentialsPath = path.join(TEMP_ROOT, 'credentials.json')
 
   const upstreams = {
     primary: createMockUpstream('primary', BEHAVIOR.success),
@@ -1739,9 +1743,16 @@ async function main() {
 
   const config = baseConfig(servicePort, localPort)
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
-  fs.writeFileSync(credentialsPath, `${JSON.stringify(credentials(), null, 2)}\n`, { mode: 0o600 })
+  seedCredentialsBeforeStartup({
+    binary: BINARY,
+    configPath,
+    serviceEnvironment: serviceEnvironment(),
+    postgresUrl: POSTGRES_URL,
+    credentials: credentials(),
+    cwd: TEMP_ROOT,
+  })
 
-  const service = spawnService(configPath, credentialsPath, logPath)
+  const service = spawnService(configPath, logPath)
   const baseUrl = `http://127.0.0.1:${servicePort}`
   const scenarioReports = []
   let pools = null

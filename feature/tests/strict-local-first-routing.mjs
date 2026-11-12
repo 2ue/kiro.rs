@@ -9,6 +9,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { seedCredentialsBeforeStartup } from './postgres-credential-seed.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '../..')
@@ -582,10 +583,12 @@ async function stopService(handle) {
   await stopChild(handle, 'kiro-rs service')
 }
 
-function startService(configPath, credentialsPath, logPath) {
+const SERVICE_ENV = Object.freeze({ RUST_LOG: 'info', KIRO_API_KEY: '' })
+
+function startService(configPath, logPath) {
   const log = fs.openSync(logPath, 'a')
-  const handle = startChild(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
-    env: { RUST_LOG: 'info', KIRO_API_KEY: '' },
+  const handle = startChild(BINARY, ['--config', configPath], {
+    env: SERVICE_ENV,
     stdio: ['ignore', log, log],
   })
   handle.once('exit', () => {
@@ -760,7 +763,6 @@ async function runCase({
   const caseRoot = path.join(TEMP_ROOT, caseId)
   fs.mkdirSync(caseRoot, { recursive: true, mode: 0o700 })
   const configPath = path.join(caseRoot, 'config.json')
-  const credentialsPath = path.join(caseRoot, 'credentials.json')
   const logPath = path.join(caseRoot, 'service.log')
   const servicePort = await reservePort()
   assert.notEqual(servicePort, 9022)
@@ -811,11 +813,18 @@ async function runCase({
     config.externalPools.fallbackOnSchedulerRedisDegraded = SCHEDULER_FALLBACK_ENABLED
   }
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
-  fs.writeFileSync(credentialsPath, `${JSON.stringify(credentialsFor(mode), null, 2)}\n`, { mode: 0o600 })
+  seedCredentialsBeforeStartup({
+    binary: BINARY,
+    configPath,
+    serviceEnvironment: minimalChildEnv(SERVICE_ENV),
+    postgresUrl,
+    credentials: credentialsFor(mode),
+    cwd: ROOT,
+  })
 
   fake.setCase(caseId)
   const hitsBeforeCase = fake.snapshot()
-  const service = startService(configPath, credentialsPath, logPath)
+  const service = startService(configPath, logPath)
   let schedulerToxicInstalled = false
   let schedulerChaosFaultActive = false
   try {

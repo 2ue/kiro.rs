@@ -2254,25 +2254,6 @@ impl PostgresStore {
         }
     }
 
-    pub async fn credentials_exist(&self) -> anyhow::Result<bool> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM credentials WHERE deleted_at IS NULL")
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(count > 0)
-    }
-
-    pub async fn bootstrap_credentials_from_file(
-        &self,
-        credentials: &[KiroCredentials],
-    ) -> anyhow::Result<()> {
-        if self.credentials_exist().await? || credentials.is_empty() {
-            return Ok(());
-        }
-        self.save_credentials(credentials).await?;
-        Ok(())
-    }
-
     async fn lock_credential_id_sequence_in_tx(
         tx: &mut Transaction<'_, Postgres>,
     ) -> anyhow::Result<()> {
@@ -2316,8 +2297,8 @@ impl PostgresStore {
 
     /// 非破坏性保存凭据列表。
     ///
-    /// 该方法用于首次 bootstrap 或补全旧凭据字段，只 upsert 传入行，不删除
-    /// PgSQL 中其他未软删除凭据，避免旧进程内存快照覆盖其他实例新增的凭据。
+    /// 只 upsert 传入行，不删除 PgSQL 中其他未软删除凭据，避免旧进程内存快照
+    /// 覆盖其他实例新增的凭据。
     pub async fn save_credentials(
         &self,
         credentials: &[KiroCredentials],
@@ -18998,7 +18979,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .bootstrap_credentials_from_file(std::slice::from_ref(&credential))
+            .save_credentials(std::slice::from_ref(&credential))
             .await
             .unwrap();
         let credentials = store.load_credentials().await.unwrap();

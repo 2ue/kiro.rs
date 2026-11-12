@@ -20,6 +20,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { importCredentialsViaAdmin } from './admin-credential-import.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
@@ -484,7 +485,6 @@ async function main() {
   const servicePort = await reservePort()
   const fakePort = await reservePort()
   const configPath = path.join(TEMP_ROOT, 'config.json')
-  const credentialsPath = path.join(TEMP_ROOT, 'credentials.json')
   const fakeLog = path.join(TEMP_ROOT, 'fake.log')
   const fakeCaptureDir = path.join(TEMP_ROOT, 'fake-captures')
   const serviceLog = path.join(TEMP_ROOT, 'service.log')
@@ -495,7 +495,6 @@ async function main() {
     servicePort,
     upstreamPort: fakePort,
   }))
-  writeJson(credentialsPath, credentialsFixture())
 
   let fake = null
   let service = null
@@ -510,7 +509,7 @@ async function main() {
     await probeFake(fakePort)
     service = startProcess(
       BINARY,
-      ['--config', configPath, '--credentials', credentialsPath],
+      ['--config', configPath],
       serviceLog,
       {
         KIRO_API_KEY: '',
@@ -520,6 +519,7 @@ async function main() {
       },
     )
     await waitForReady(baseUrl, service)
+    await importCredentialsViaAdmin(baseUrl, ADMIN_KEY, credentialsFixture())
 
     holder = await openHolder(baseUrl, 'BACKLOG-HOLDER')
     await sleep(250)
