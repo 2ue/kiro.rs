@@ -130,7 +130,7 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
 
 ### 3. 导入凭据
 
-服务启动后，在 Admin 管理后台（`/ui` 或 `/admin`，需要配置 `adminApiKey`）的账号页导入凭据，支持 JSON、JSONL、`ksk_xxx|region` 文本和 KAM 导出文件。也可以直接调用管理接口：
+服务启动后，在管理后台（`/ui`，需要配置 `adminApiKey`）的账号页导入凭据。导入会自动识别来源，也可以手动指定：本项目导出、KAM / Kiro-Go 导出包、kiro-manager-lite 导出和整库备份、Kiro-Go `config.json`、KAM / lite 的卡密 / CSV / TXT 文本、`ksk_xxx|region` 文本，以及通用 JSON / JSONL。也可以直接调用管理接口：
 
 ```bash
 # 单个凭据
@@ -437,7 +437,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
 | `authMethod`   | string | 认证方式：`social`、`idc`、`external_idp` 或 `api_key`；决定 Token 刷新协议 |
-| `provider`     | string | 身份提供方（`Github`、`Google`、`BuilderId`、`Enterprise` 等），用于展示和 Portal 查询；`authMethod` 缺失时参与推断认证方式 |
+| `provider`     | string | 身份提供方（`Github`、`Google`、`BuilderId`、`Enterprise` 等），用于展示和 Portal 查询；`authMethod` 缺失时参与推断认证方式。为空时，查询额度后用 Portal 返回的身份提供方补齐 |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
 | `kiroApiKey`   | string | Kiro API Key / headless 凭据，格式 `ksk_xxx`；也支持 `ksk_xxx|region` 便捷写法 |
