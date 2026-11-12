@@ -633,6 +633,44 @@ fn mask_secret(value: &str) -> String {
     format!("{}...{}", head, tail)
 }
 
+/// 正在导入的账号登记；析构时从 `credential_imports_in_flight` 移除。
+struct CredentialImportClaim {
+    key: Option<String>,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+}
+
+impl CredentialImportClaim {
+    fn acquire(
+        in_flight: &Arc<Mutex<HashSet<String>>>,
+        secret: Option<&str>,
+        label: &str,
+    ) -> Result<Self, AdminServiceError> {
+        let key = secret
+            .filter(|value| !value.is_empty())
+            .map(credential_secret_hash);
+        if let Some(key) = &key
+            && !in_flight.lock().insert(key.clone())
+        {
+            return Err(AdminServiceError::Conflict(format!(
+                "凭据已存在（{} 重复，另一个导入正在处理同一账号）",
+                label
+            )));
+        }
+        Ok(Self {
+            key,
+            in_flight: in_flight.clone(),
+        })
+    }
+}
+
+impl Drop for CredentialImportClaim {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.in_flight.lock().remove(&key);
+        }
+    }
+}
+
 fn credential_secret_hash(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
@@ -745,8 +783,9 @@ pub struct AdminService {
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
     kiro_provider: Arc<KiroProvider>,
     external_pool_manager: Arc<ExternalPoolManager>,
-    /// Serializes credential imports so duplicate preflight cannot fan out auxiliary model calls.
-    credential_import_lock: Arc<tokio::sync::Mutex<()>>,
+    /// refreshToken / kiroApiKey 哈希 → 正在导入。同一账号同时提交两次时，第二次直接返回“凭据已存在”，
+    /// 不再刷新 token 或发现模型；不同账号的导入互不等待。
+    credential_imports_in_flight: Arc<Mutex<HashSet<String>>>,
     usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
     admin_cache_shadow: Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
 }
@@ -865,7 +904,7 @@ impl AdminService {
             model_capabilities,
             kiro_provider,
             external_pool_manager,
-            credential_import_lock: Arc::new(tokio::sync::Mutex::new(())),
+            credential_imports_in_flight: Arc::new(Mutex::new(HashSet::new())),
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
             admin_cache_shadow: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -1947,6 +1986,19 @@ impl AdminService {
             }
         }
         Ok(credentials)
+    }
+
+    /// 登记一个正在导入的账号；同一账号已在导入中时返回“凭据已存在”。返回值析构时撤销登记。
+    fn claim_credential_import(
+        &self,
+        credential: &KiroCredentials,
+    ) -> Result<CredentialImportClaim, AdminServiceError> {
+        let (secret, label) = if credential.is_api_key_credential() {
+            (credential.kiro_api_key.as_deref(), "kiroApiKey")
+        } else {
+            (credential.refresh_token.as_deref(), "refreshToken")
+        };
+        CredentialImportClaim::acquire(&self.credential_imports_in_flight, secret, label)
     }
 
     fn reject_duplicate_credential_before_auxiliary_calls(
@@ -3350,13 +3402,13 @@ impl AdminService {
         req: AddCredentialRequest,
         auto_discover_supported_models: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
-        let _import_guard = self.credential_import_lock.lock().await;
         let email = req.email.clone();
         let warmup_remaining = req.warmup_remaining;
         let enable_overage_after_import = req.enable_overage_after_import.unwrap_or(false);
         let disabled = req.disabled.unwrap_or(false);
         let mut new_cred = self.credential_from_request(req, disabled)?;
         self.reject_duplicate_credential_before_auxiliary_calls(&new_cred)?;
+        let _in_flight = self.claim_credential_import(&new_cred)?;
         let mut api_key_supported_models_autodiscovered = false;
 
         if auto_discover_supported_models

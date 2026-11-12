@@ -1279,15 +1279,29 @@ pub(crate) async fn get_usage_limits(
             });
         match portal.get_user_usage_and_limits(token, idp).await {
             Ok(mut usage) => {
-                if usage.email().is_none()
+                // 额度响应不带 email 时，或凭据没有记录 provider 时，再调一次 GetUserInfo 补齐。
+                // 查询失败不影响额度结果。
+                let provider_missing = credentials
+                    .provider
+                    .as_deref()
+                    .is_none_or(|provider| provider.trim().is_empty());
+                if (usage.email().is_none() || provider_missing)
                     && let Ok(user_info) = portal.get_user_info(token, idp).await
-                    && let Some(email) = user_info
-                        .email
-                        .map(|email| email.trim().to_string())
-                        .filter(|email| !email.is_empty())
                 {
-                    usage.user_info =
-                        Some(crate::kiro::model::usage_limits::UserInfo { email: Some(email) });
+                    let trimmed = |value: Option<String>| {
+                        value
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                    };
+                    let email = usage
+                        .email()
+                        .map(str::to_string)
+                        .or_else(|| trimmed(user_info.email));
+                    let idp = trimmed(user_info.idp);
+                    if email.is_some() || idp.is_some() {
+                        usage.user_info =
+                            Some(crate::kiro::model::usage_limits::UserInfo { email, idp });
+                    }
                 }
                 return Ok(usage);
             }
@@ -3045,8 +3059,11 @@ mod tests {
         server.abort();
 
         assert_eq!(usage.subscription_title(), Some("KIRO PORTAL"));
+        // 没有 provider 时补查 GetUserInfo，把上游返回的 idp 带回给调用方写入凭据。
+        assert_eq!(usage.idp(), Some("Github"));
         let requests = portal_captured.lock().unwrap();
         assert_eq!(requests[0].0, "GetUserUsageAndLimits");
+        assert_eq!(requests[1].0, "GetUserInfo");
         assert_eq!(
             requests[0].1[header::COOKIE],
             "Idp=Google; AccessToken=social-token"
