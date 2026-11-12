@@ -1,5 +1,4 @@
 mod admin;
-mod admin_ui;
 mod anthropic;
 mod common;
 mod diagnostics;
@@ -9,6 +8,7 @@ mod kiro;
 mod model;
 mod storage;
 pub mod token;
+mod ui;
 
 // 发布镜像静态链接 musl，它自带的 malloc 对所有线程共用一把锁；并发处理多 MB 请求体时
 // CPU 大量耗在锁竞争、futex 和反复还页上（见 docs/analysis/prod-59137-cpu-musl-malloc-root-cause-20261104.md）。
@@ -29,13 +29,7 @@ use std::{
 
 use anyhow::Context as _;
 use axum::serve::ListenerExt as _;
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Redirect},
-    routing::get,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use chrono::Utc;
 use clap::Parser;
 use common::auth::RequestApiKeyStore;
@@ -783,20 +777,12 @@ async fn async_main() {
             let public_pool_app = admin::create_public_pool_router(admin_state.service.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
-            // 创建管理后台 UI 路由
-            let admin_ui_app = admin_ui::create_admin_ui_router();
-            let new_ui_app = admin_ui::create_new_ui_router();
-
             tracing::info!("Admin API 已启用");
-            tracing::info!("Admin UI 已启用: /admin");
-            tracing::info!("New UI 已启用: /ui");
+            tracing::info!("管理后台 UI 已启用: /ui");
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/api/public", public_pool_app)
-                .route("/admin/", get(admin_ui_index_redirect))
-                .route("/ui/", get(new_ui_index_redirect))
-                .nest("/admin", admin_ui_app)
-                .nest("/ui", new_ui_app)
+                .merge(ui::create_ui_router())
         }
     } else {
         anthropic_app
@@ -855,8 +841,7 @@ async fn async_main() {
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
         tracing::info!("Public API（默认关闭）:");
         tracing::info!("  GET  /api/public/pool");
-        tracing::info!("Admin UI:");
-        tracing::info!("  GET  /admin");
+        tracing::info!("管理后台 UI:");
         tracing::info!("  GET  /ui");
     }
 
@@ -1514,14 +1499,6 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),
     )
-}
-
-async fn admin_ui_index_redirect() -> Redirect {
-    Redirect::permanent("/admin")
-}
-
-async fn new_ui_index_redirect() -> Redirect {
-    Redirect::permanent("/ui")
 }
 
 fn refresh_admin_api_key_from_runtime_config(

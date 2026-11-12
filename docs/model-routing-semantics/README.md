@@ -278,11 +278,11 @@ claude-opus-4-8 -> claude-opus-4-8
 
 ### 前端
 
-- `admin-ui/src/lib/test-models.ts`
+- `ui/src/lib/test-models.ts`
   - 外部池测试模型列表使用完整横杠模型。
   - 兼容输入可以规范化到完整横杠模型，但发送值不能省略 `claude-`。
 
-- `admin-ui/src/components/external-pools-panel.tsx`
+- `ui/src/features/external-pools/`（`external-pool-form-modal.tsx`、`external-pool-utils.ts`）
   - 新建外部池默认模式为 `passthrough_mapping`。
   - supported_models 占位与提示使用完整横杠模型。
   - 映射规则描述区分调用方模型和 Kiro 点号模型。
@@ -358,7 +358,7 @@ feature/tests/run-cargo-scoped.sh model-routing -- cargo test <targeted tests>
 前端验证：
 
 ```bash
-cd admin-ui
+cd ui
 pnpm build
 ```
 

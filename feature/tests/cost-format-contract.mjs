@@ -20,18 +20,12 @@ try {
       '--rootDir', repoRoot,
       '--outDir', compiledRoot,
       join(repoRoot, 'ui/src/lib/format.ts'),
-      join(repoRoot, 'admin-ui/src/lib/format.ts'),
     ],
     { stdio: 'inherit' },
   )
 
   const ui = await import(pathToFileURL(join(compiledRoot, 'ui/src/lib/format.js')))
-  const admin = await import(pathToFileURL(join(compiledRoot, 'admin-ui/src/lib/format.js')))
-
-  const formatters = [
-    ['ui', ui.formatUsd, ui.formatUsdDetailed, ui.formatUsdCsv],
-    ['admin-ui', admin.formatUsd, admin.formatUsdDetailed, admin.formatUsdCsv],
-  ]
+  const { formatUsd: summary, formatUsdDetailed: detailed, formatUsdCsv: csv } = ui
 
   const detailedCases = [
     [0, '$0.00000000', '0.00000000'],
@@ -43,23 +37,21 @@ try {
     [-2, '-$2.00000000', '-2.00000000'],
   ]
 
-  for (const [name, summary, detailed, csv] of formatters) {
-    assert.equal(summary(0.5), '$0.500000', `${name} small summary precision`)
-    assert.equal(summary(2), '$2.00', `${name} positive summary precision`)
-    assert.equal(summary(-2), '-$2.00', `${name} negative summary precision`)
-    assert.equal(summary(Number.NaN), '-', `${name} NaN summary`)
-    assert.equal(summary(null), '-', `${name} null summary`)
-    assert.equal(detailed(Number.NaN), '-', `${name} NaN detail`)
-    assert.equal(csv(Number.NaN), '', `${name} NaN CSV`)
-    assert.equal(csv(null), '', `${name} null CSV`)
+  assert.equal(summary(0.5), '$0.500000', 'small summary precision')
+  assert.equal(summary(2), '$2.00', 'positive summary precision')
+  assert.equal(summary(-2), '-$2.00', 'negative summary precision')
+  assert.equal(summary(Number.NaN), '-', 'NaN summary')
+  assert.equal(summary(null), '-', 'null summary')
+  assert.equal(detailed(Number.NaN), '-', 'NaN detail')
+  assert.equal(csv(Number.NaN), '', 'NaN CSV')
+  assert.equal(csv(null), '', 'null CSV')
 
-    for (const [value, expectedDetailed, expectedCsv] of detailedCases) {
-      assert.equal(detailed(value), expectedDetailed, `${name} detail ${value}`)
-      assert.equal(csv(value), expectedCsv, `${name} CSV ${value}`)
-    }
+  for (const [value, expectedDetailed, expectedCsv] of detailedCases) {
+    assert.equal(detailed(value), expectedDetailed, `detail ${value}`)
+    assert.equal(csv(value), expectedCsv, `CSV ${value}`)
   }
 
-  console.log('cost format contract: PASS (ui + admin-ui)')
+  console.log('cost format contract: PASS (ui)')
 } finally {
   rmSync(compiledRoot, { recursive: true, force: true })
 }

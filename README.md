@@ -69,11 +69,9 @@
 
 CI、Docker 和发布构建固定使用 Node.js `22.23.0`、pnpm `11.11.0` 与 Rust `1.92.0`。
 
-> **发布/嵌入式构建前置步骤**：从干净 checkout 构建二进制时，必须先生成新旧两套前端的 `dist`：
+> **发布/嵌入式构建前置步骤**：从干净 checkout 构建二进制时，必须先生成前端 `ui` 的 `dist`：
 > ```bash
 > npm install --global pnpm@11.11.0  # 仅用于安装 pnpm；项目命令统一使用 pnpm
-> pnpm --dir admin-ui install --frozen-lockfile
-> pnpm --dir admin-ui build
 > pnpm --dir ui install --frozen-lockfile
 > pnpm --dir ui build
 > ```
@@ -89,7 +87,7 @@ cargo +1.92.0 build --release --locked
 
 ### 构建门禁
 
-PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `admin-ui` 与 `ui`，检查 Rust 格式和 Clippy 告警基线，使用真实 PgSQL/Redis 分别执行默认 feature 与无默认 feature 测试，并用默认 feature 生成 release 二进制。发布 tag 必须严格等于 `v` 加 `Cargo.toml` 中的版本，例如 Cargo 版本 `0.0.101` 对应 `v0.0.101`。
+PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `ui`，检查 Rust 格式和 Clippy 告警基线，使用真实 PgSQL/Redis 分别执行默认 feature 与无默认 feature 测试，并用默认 feature 生成 release 二进制。发布 tag 必须严格等于 `v` 加 `Cargo.toml` 中的版本，例如 Cargo 版本 `0.0.101` 对应 `v0.0.101`。
 
 本地执行存储集成测试时必须显式提供测试实例；测试会在 PgSQL 中创建临时 schema，并在 Redis 中使用随机 key prefix：
 
@@ -607,21 +605,17 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
-| `KIRO_ADMIN_UI_MODE` | debug: `redirect`; release: `embedded` | 旧版 `/admin` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
-| `KIRO_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_ADMIN_UI_DEV_SERVER` | debug: `http://127.0.0.1:9025/admin` | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
-| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
 | `KIRO_NEW_UI_DIR` / `KIRO_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
 | `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | debug: `http://127.0.0.1:9023/ui` | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
 
-生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/admin` 和 `/ui` 会重定向到对应 Vite 服务；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
+生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/ui` 会重定向到 Vite 服务；旧的 `/admin` 及其子路径永久重定向到 `/ui`；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
 
 本地开发预览地址：
 
 | 前端 | 命令 | 浏览器地址 | 用途 |
 |------|------|------------|------|
-| 旧版 Admin UI | `bash scripts/dev-ui.sh admin` | `http://127.0.0.1:9025/admin/` | 旧版管理入口 |
-| 新版 UI | `bash scripts/dev-ui.sh ui` | `http://127.0.0.1:9023/ui/runtime` | 当前主要开发入口 |
+| UI | `bash scripts/dev-ui.sh ui` | `http://127.0.0.1:9023/ui/runtime` | 当前主要开发入口 |
 
 后端 API 示例：
 
@@ -636,7 +630,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 ```
 
-日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/admin` 或 `/ui`，后端也会自动重定向到对应 Vite 地址。release 二进制仍默认使用 embedded 页面。
+日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/ui`，后端也会自动重定向到 Vite 地址。release 二进制仍默认使用 embedded 页面。
 
 ## API 端点
 
@@ -742,9 +736,8 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
   - `POST /api/admin/model-pricing/sync` - 手动同步模型价格目录
   - `GET /api/admin/audit-logs` - 分页查询后台审计日志
 
-- **Admin UI**
-  - `GET /admin` - 访问旧版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
-  - `GET /ui` - 访问新版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
+- **管理后台 UI**
+  - `GET /ui` - 访问管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。旧的 `/admin` 及其子路径永久重定向到 `/ui`。
 
 ## 注意事项
 
@@ -797,7 +790,7 @@ kiro-rs/
 │   │   ├── types.rs            # 类型定义
 │   │   ├── middleware.rs       # 认证中间件
 │   │   └── error.rs            # 错误处理
-│   ├── admin_ui/               # Admin UI 静态文件服务
+│   ├── ui/                     # 管理后台 UI 静态文件服务（/ui）
 │   │   └── router.rs           # embedded / redirect / proxy / filesystem 路由
 │   ├── storage/                # PgSQL 和 Redis 存储
 │   │   ├── postgres.rs         # PgSQL 表结构和读写
