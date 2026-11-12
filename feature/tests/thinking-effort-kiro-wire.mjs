@@ -93,7 +93,6 @@ const SOURCE_MANIFEST_PATHS = [
   'Cargo.lock',
   'src',
   'data',
-  'admin-ui/dist',
   'ui/dist',
 ]
 const SOURCE_MANIFEST_EXCLUDES = [

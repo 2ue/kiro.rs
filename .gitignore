@@ -6,13 +6,6 @@
 /credentials.json
 /.idea
 /test.json
-/admin-ui/node_modules/
-/admin-ui/dist/
-/admin-ui/tsconfig.tsbuildinfo
-/admin-ui-daisy/node_modules/
-/admin-ui-daisy/dist/
-/admin-ui-daisy/.vite/
-/admin-ui-daisy/tsconfig.tsbuildinfo
 /credentials.*
 /kiro-credentials-*.json
 /kiro_balance_cache.json

@@ -19,7 +19,7 @@ src/
   external_pool.rs        external compatible pool orchestration
   external_pool/          extracted external body/model/retry/usage stages
   admin/                  Admin API, service, middleware, DTOs
-  admin_ui/               embedded Admin UI routing/assets
+  ui/                     embedded management UI routing/assets (`/ui`; `/admin` redirects)
   storage/                PgSQL and Redis implementations
   model/                  runtime configuration, CLI arguments, model processing/support
   common/                 shared request authentication
@@ -121,8 +121,8 @@ The extracted scheduler files improve navigation and isolate some algorithms, bu
 | `src/admin/middleware.rs` | `AdminState` and key authentication | Admin key is process-local after construction |
 | `src/admin/handlers.rs` | HTTP extraction/response conversion | Mostly thin, but invokes synchronous service facades |
 | `src/admin/service.rs` | Credentials, proxies, pools, usage, catalogs, config, keys, cleanup, audits | Approximately 6,602 lines and more than 80 public operations |
-| `src/admin/types.rs` | Handwritten Admin API DTOs | Duplicated manually in two frontend codebases |
-| `src/admin_ui/*` | Embedded static Admin applications | Maintains legacy and newer UI surfaces |
+| `src/admin/types.rs` | Handwritten Admin API DTOs | Duplicated manually in the `ui` frontend |
+| `src/ui/*` | Embedded static management UI (`/ui`) | Single UI surface since the legacy `/admin` app was removed after `v0.0.245`; `/admin` paths redirect to `/ui` |
 
 `AdminService` is a facade and a broad domain service at the same time. Some synchronous methods bridge into async storage through `block_in_place`, making request-path I/O less visible.
 

@@ -175,7 +175,7 @@ The current multi-stage Docker build pins these main tool/runtime versions:
 | Rust builder | Rust `1.92.0` on Alpine `3.23` |
 | Runtime image | Alpine `3.23` |
 
-Both `admin-ui` and `ui` are built, then their output is embedded/consumed by the Rust build. The final image contains the release binary and CA certificates/BusyBox networking utilities, declares `/app/config` and `/app/logs` volumes, exposes port 8990, and starts with bootstrap config/credentials paths.
+The `ui` frontend is built, then its output is embedded by the Rust build (the legacy `admin-ui` stage was removed after `v0.0.245`). The final image contains the release binary and CA certificates/BusyBox networking utilities, declares `/app/config` and `/app/logs` volumes, exposes port 8990, and starts with bootstrap config/credentials paths.
 
 Current runtime-hardening facts:
 

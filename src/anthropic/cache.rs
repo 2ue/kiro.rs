@@ -2368,7 +2368,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_ttl_modes_use_the_wire_names_the_admin_ui_sends() {
+    fn cache_ttl_modes_use_the_wire_names_the_ui_sends() {
         use crate::model::config::{CacheTtlMode, CacheTtlPolicy};
         for (wire, mode) in [
             (

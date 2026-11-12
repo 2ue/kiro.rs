@@ -115,9 +115,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-          cache-dependency-path: |
-            admin-ui/pnpm-lock.yaml
-            ui/pnpm-lock.yaml
+          cache-dependency-path: ui/pnpm-lock.yaml
 
       - name: Setup Node.js for release
         if: ${{ env.QUALITY_PROFILE == 'release' }}
@@ -149,24 +147,10 @@ jobs:
           docker exec "${{ job.services.postgres.id }}" pg_isready -U kiro_rs -d kiro_rs_test
           test "$(docker exec "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
 
-      - name: Install admin-ui dependencies
-        if: ${{ env.QUALITY_PROFILE == 'full' }}
-        working-directory: admin-ui
-        run: pnpm install --frozen-lockfile
-
       - name: Install ui dependencies
         if: ${{ env.QUALITY_PROFILE == 'full' }}
         working-directory: ui
         run: pnpm install --frozen-lockfile
-
-      - name: Check shared frontend contracts
-        if: ${{ env.QUALITY_PROFILE == 'full' }}
-        run: node scripts/check-frontend-contracts.mjs
-
-      - name: Build admin-ui
-        if: ${{ env.QUALITY_PROFILE == 'full' }}
-        working-directory: admin-ui
-        run: pnpm build
 
       - name: Build ui
         if: ${{ env.QUALITY_PROFILE == 'full' }}

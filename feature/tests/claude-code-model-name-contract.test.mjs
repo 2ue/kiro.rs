@@ -8,7 +8,7 @@ import test from 'node:test'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 
-test('both UI surfaces canonicalize official legacy Claude 3.5 IDs for external pools', async () => {
+test('the UI canonicalizes official legacy Claude 3.5 IDs for external pools', async () => {
   const compiledRoot = mkdtempSync(join(tmpdir(), 'kiro-claude-model-contract-'))
   try {
     execFileSync(
@@ -22,26 +22,24 @@ test('both UI surfaces canonicalize official legacy Claude 3.5 IDs for external 
         '--rootDir', repoRoot,
         '--outDir', compiledRoot,
         join(repoRoot, 'ui/src/lib/test-models.ts'),
-        join(repoRoot, 'admin-ui/src/lib/test-models.ts'),
       ],
       { stdio: 'inherit' },
     )
 
-    const surfaces = await Promise.all([
-      import(pathToFileURL(join(compiledRoot, 'ui/src/lib/test-models.js'))),
-      import(pathToFileURL(join(compiledRoot, 'admin-ui/src/lib/test-models.js'))),
-    ])
+    const { toExternalPoolTestModelName } = await import(
+      pathToFileURL(join(compiledRoot, 'ui/src/lib/test-models.js'))
+    )
 
-    for (const { toClaudeCodeModelName } of surfaces) {
-      assert.equal(toClaudeCodeModelName('claude-3-5-sonnet-20241022'), 'sonnet-3.5')
-      assert.equal(toClaudeCodeModelName('claude-3.5-sonnet'), 'sonnet-3.5')
-      assert.equal(
-        toClaudeCodeModelName('claude-3-5-haiku-20241022-thinking[1m]'),
-        'haiku-3.5-thinking[1m]',
-      )
-      assert.equal(toClaudeCodeModelName('claude-3-5-opus-20241022'), 'claude-3-5-opus-20241022')
-      assert.equal(toClaudeCodeModelName('tenant-claude-3-5-sonnet'), 'tenant-claude-3-5-sonnet')
-    }
+    // External pools receive standard Claude Code ids: dotted spellings become dashed, dates are
+    // kept, -thinking/[1m] variants collapse to the base id, and non-Claude ids are rejected.
+    assert.equal(toExternalPoolTestModelName('claude-3-5-sonnet-20241022'), 'claude-3-5-sonnet-20241022')
+    assert.equal(toExternalPoolTestModelName('claude-3.5-sonnet'), 'claude-3-5-sonnet')
+    assert.equal(
+      toExternalPoolTestModelName('claude-3-5-haiku-20241022-thinking[1m]'),
+      'claude-3-5-haiku-20241022',
+    )
+    assert.equal(toExternalPoolTestModelName('claude-3-5-opus-20241022'), null)
+    assert.equal(toExternalPoolTestModelName('tenant-claude-3-5-sonnet'), null)
   } finally {
     rmSync(compiledRoot, { recursive: true, force: true })
   }
