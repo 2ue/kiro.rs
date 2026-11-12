@@ -178,4 +178,3 @@ version_generation
 - `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/kiroChat.ts`
 - `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/store.ts`
 - `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/updater.ts`
-

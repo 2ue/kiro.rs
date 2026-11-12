@@ -590,4 +590,3 @@ kiroPreferredEndpoint: Option<String>             # 若需要独立于 defaultEn
 期间单号测试报 `INVALID_MODEL_ID`：`claude-haiku-4-5-*` 只有在目录里存在 `claude-haiku-4.5` 时才会改写成它，目录由启用中账号的模型列表合并而来。当时目录还是只启用 API Key 账号时同步的 10 个模型，里面没有任何 Claude 模型，请求名被原样透传。FREE 账号启用后，后台最多 30 秒才重新同步目录；测试请求落在这个窗口内。现在账号启用、禁用、新增或订阅变化时会立即唤醒目录同步，不再等最多 30 秒的轮询。
 
 `kiro_capture_schema_diff.py 0.11.107.zip 1.4.154.zip` 在 api / mcp / models 三类请求上只报告 KiroIDE 身份与 `api/codewhispererstreaming#1.0.34 → 1.0.44` 的差异；host、path、header 名称、body 字段类型与响应状态均无变化。该结论只覆盖本项目发出的请求，不能代表官方桌面客户端的完整 wire contract。
-
