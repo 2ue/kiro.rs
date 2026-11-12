@@ -5,7 +5,7 @@ import { Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, Sele
 import { Callout, Field, FieldGrid, ModalShell } from '@/components/patterns'
 import { useProxyResources } from '@/hooks/use-credentials'
 import { useImportInventory, usePushInventory, useUpdateInventory } from '@/hooks/use-inventory'
-import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
+import { parseImportInputs, readImportFiles, type ParsedImportAccount } from '@/lib/credential-import/sources'
 import { extractErrorMessage } from '@/lib/utils'
 import type { AddCredentialRequest, InventoryActionResponse, InventoryImportResponse, InventoryItem } from '@/types/api'
 import {
@@ -33,6 +33,7 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
   const [apiRegion, setApiRegion] = useState('us-east-1')
   const [proxy, setProxy] = useState<ProxyAssignmentValue>(() => initialProxyAssignment('single'))
   const [check, setCheck] = useState(true)
+  const [importProxy, setImportProxy] = useState(false)
   const [source, setSource] = useState('')
   const [result, setResult] = useState<InventoryImportResponse | null>(null)
   const [error, setError] = useState('')
@@ -43,26 +44,39 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
   useEffect(() => {
     if (!open) {
       setText(''); setResult(null); setError(''); setSource('')
-      setProxy(initialProxyAssignment('single')); setCheck(true)
+      setProxy(initialProxyAssignment('single')); setCheck(true); setImportProxy(false)
     }
   }, [open])
 
-  const parsed = useMemo<AddCredentialRequest[] | string>(() => {
+  const parsedAccounts = useMemo<ParsedImportAccount[] | string>(() => {
     if (!text.trim()) return []
-    try { return parseCredentialImportText(text) } catch (e) { return extractErrorMessage(e) }
+    const [input] = parseImportInputs([{ name: '粘贴内容', text }])
+    return input.error ?? input.result?.accounts ?? []
   }, [text])
+  // 来源文件里的代理只在勾选“导入代理”时使用；停用状态不进号库
+  const parsed = useMemo<AddCredentialRequest[] | string>(() => {
+    if (!Array.isArray(parsedAccounts)) return parsedAccounts
+    return parsedAccounts.map((account) => (importProxy ? { ...account.credential, ...account.sourceProxy } : account.credential))
+  }, [parsedAccounts, importProxy])
   const parsedCount = Array.isArray(parsed) ? parsed.length : 0
+  const sourceProxyCount = Array.isArray(parsedAccounts) ? parsedAccounts.filter((account) => account.sourceProxy).length : 0
 
   const handleFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
     if (!files.length) return
-    const read = await parseCredentialImportFiles(files)
-    if (!read.credentials.length) { toast.error(read.errors[0] || '文件中没有有效账号'); return }
-    setText(read.credentials.map((c) => JSON.stringify(c)).join('\n'))
+    const read = await readImportFiles(files)
+    const errors = [...read.errors]
+    // 带上来源代理，重新解析时仍能识别出来；是否使用由“导入代理”决定
+    const credentials = parseImportInputs(read.inputs).flatMap((input) => {
+      if (input.error) errors.push(`${input.name}: ${input.error}`)
+      return input.result?.accounts.map((account) => ({ ...account.credential, ...account.sourceProxy })) ?? []
+    })
+    if (!credentials.length) { toast.error(errors[0] || '文件中没有有效账号'); return }
+    setText(credentials.map((c) => JSON.stringify(c)).join('\n'))
     setResult(null)
-    toast.success(`已读取 ${read.credentials.length} 条账号`)
-    if (read.errors.length) toast.warning(`部分文件未读取: ${read.errors.slice(0, 3).join('；')}`)
+    toast.success(`已读取 ${credentials.length} 条账号`)
+    if (errors.length) toast.warning(`部分文件未读取: ${errors.slice(0, 3).join('；')}`)
   }
 
   const submit = async () => {
@@ -137,7 +151,7 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
             title="账号数据"
             actions={(
               <label className="cursor-pointer">
-                <input type="file" className="sr-only" accept=".json,.jsonl,.txt" multiple onChange={(e) => void handleFile(e)} />
+                <input type="file" className="sr-only" accept=".json,.jsonl,.txt,.csv" multiple onChange={(e) => void handleFile(e)} />
                 <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
               </label>
             )}
@@ -164,13 +178,17 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
             </FieldGrid>
           </FormSection>
 
-          <FormSection title="代理" description="建议绑定代理：续期、查询和推送到账号池后的调用都走同一个出口，账号环境保持一致。账号自带代理时优先使用账号的。">
+          <FormSection title="代理" description="建议绑定代理：续期、查询和推送到账号池后的调用都走同一个出口，账号环境保持一致。勾选“导入代理”时，账号自带的代理优先。">
             <ProxyAssignmentField
               value={proxy}
               onChange={setProxy}
               proxyResources={proxies}
               modes={['single', 'round_robin', 'direct_url', 'none']}
             />
+            <label className="mt-3 flex items-center gap-2">
+              <Checkbox checked={importProxy} onCheckedChange={(value) => setImportProxy(value === true)} />
+              <span>导入代理<span className="ml-1 text-xs text-muted-foreground">（{sourceProxyCount} 个账号自带代理；默认不导入）</span></span>
+            </label>
             {proxy.mode === 'none' && <Callout tone="warning" className="mt-3">不使用代理时，续期和查询走本机出口，和推送后的调用出口可能不一致。</Callout>}
           </FormSection>
 

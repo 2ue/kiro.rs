@@ -1,23 +1,17 @@
 import {
-  AlertCircle,
   CheckCircle2,
   Download,
   FileUp,
   Loader2,
   Play,
-
   XCircle,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
-  addCredential,
-  deleteCredential,
   exportCredentials,
   getCredentialBalance,
-  setCredentialDisabled,
-  testCredential,
   getRouteScenarioOptions,
 } from '@/api/credentials'
 import { RouteSelector } from '@/features/route-scenarios/route-selector'
@@ -38,8 +32,7 @@ import {
   Textarea,
 } from '@/components/ui'
 import { Field, FieldGrid, ModalShell } from '@/components/patterns'
-import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
-import { parseKamFiles, parseKamJson, type KamAccount } from '@/lib/kam-import'
+import { parseImportText, readImportFiles } from '@/lib/credential-import/sources'
 import {
   buildTestModelOptions,
   defaultTestModelForOptions,
@@ -47,7 +40,7 @@ import {
   DEFAULT_TEST_PROMPT,
   testModelLabel,
 } from '@/lib/test-models'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { extractErrorMessage } from '@/lib/utils'
 import { useAddCredential, useBatchUpdateCredentials, useCredentials, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
@@ -72,90 +65,7 @@ import {
   type ProxyAssignmentValue,
 } from '@/features/proxies/proxy-assignment-field'
 
-// ============================================================================
-// ImportProgressList — 共用进度列表（BatchImportModal + KamImportModal 共用）
-// ============================================================================
-
-function statusIcon(s: ImportResult['status']) {
-  if (s === 'success') return <CheckCircle2 className="h-4 w-4 text-success" />
-  if (s === 'failed') return <XCircle className="h-4 w-4 text-destructive" />
-  if (s === 'importing' || s === 'verifying') return <Loader2 className="h-4 w-4 animate-spin text-primary" />
-  if (s === 'skipped') return <AlertCircle className="h-4 w-4 text-warning" />
-  return <div className="h-4 w-4 rounded-full bg-muted" />
-}
-
-function ImportProgressList({
-  results,
-  getLabel,
-}: {
-  results: ImportResult[]
-  /** 根据条目索引返回显示标签 */
-  getLabel: (index: number) => string
-}) {
-  return (
-    <div className="max-h-72 overflow-y-auto scrollbar-thin space-y-1">
-      {results.map((r, i) => (
-        <div key={i} className="flex items-start gap-2 rounded-lg bg-muted/30 px-3 py-2">
-          <div className="mt-0.5 shrink-0">{statusIcon(r.status)}</div>
-          <div className="min-w-0 flex-1 text-xs">
-            <div className="font-semibold truncate">{getLabel(i)}</div>
-            {r.status === 'success' && r.model && (
-              <div className="text-muted-foreground truncate">{r.model}: {r.response?.slice(0, 60)}</div>
-            )}
-            {r.warning && <div className="text-warning">{r.warning}</div>}
-            {r.error && <div className="text-destructive">{r.error}</div>}
-            {r.status === 'verifying' && <div className="text-primary">验活中…</div>}
-            {r.status === 'importing' && <div className="text-primary">导入中…</div>}
-          </div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-// ============================================================================
-// ImportResultFooter — 共用底部操作栏（关闭/开始/重试/完成）
-// ============================================================================
-
-function ImportResultFooter({
-  running,
-  results,
-  failedCount,
-  onClose,
-  onRun,
-  onRetry,
-}: {
-  running: boolean
-  results: ImportResult[]
-  failedCount: number
-  onClose: () => void
-  onRun?: () => void
-  onRetry?: () => void
-}) {
-  const hasPending = results.some((r) => r.status === 'pending')
-  const allDone = results.length > 0 && results.every((r) => r.status !== 'pending')
-  return (
-    <div className="flex justify-end gap-2">
-      <Button variant="ghost" size="sm" onClick={onClose} disabled={running}>关闭</Button>
-      {!running && hasPending && onRun && (
-        <Button size="sm" onClick={onRun}>
-          <Play className="h-3.5 w-3.5" />开始导入
-        </Button>
-      )}
-      {!running && failedCount > 0 && onRetry && (
-        <Button size="sm" onClick={onRetry}>
-          <AlertCircle className="h-3.5 w-3.5" />重试失败账号 ({failedCount})
-        </Button>
-      )}
-      {!running && allDone && failedCount === 0 && (
-        <Button size="sm" onClick={onClose}>完成</Button>
-      )}
-    </div>
-  )
-}
-
 type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
-type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 type ProxyAssignmentMode = 'single' | 'round_robin' | 'direct_url' | 'none'
 
 // ============================================================================
@@ -218,7 +128,7 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
 }
 
 function initialCredentialForm() {
-  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', fast: '', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false, tags: [] as string[] }
+  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', provider: '', priority: '0', fast: '', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false, tags: [] as string[] }
 }
 
 function formFromCredential(c: AddCredentialRequest) {
@@ -228,7 +138,7 @@ function formFromCredential(c: AddCredentialRequest) {
     refreshToken: c.refreshToken || '', kiroApiKey: c.kiroApiKey || '', profileArn: c.profileArn || '',
     region: c.region || '', authRegion: c.authRegion || '', apiRegion: c.apiRegion || '',
     clientId: c.clientId || '', clientSecret: c.clientSecret || '', tokenEndpoint: c.tokenEndpoint || '',
-    issuerUrl: c.issuerUrl || '', scopes: c.scopes || '', email: c.email || '',
+    issuerUrl: c.issuerUrl || '', scopes: c.scopes || '', email: c.email || '', provider: c.provider || '',
     priority: String(c.priority ?? 0),
     fast: c.fast ? String(c.fast) : '',
     maxConcurrentRequests: typeof c.maxConcurrentRequests === 'number' ? String(c.maxConcurrentRequests) : '',
@@ -260,22 +170,6 @@ function splitKiroApiKeyDraft(value: string): { key: string; region?: string } {
   }
 }
 
-function normalizedKamAuthMethod(
-  value: unknown,
-  clientId?: string,
-  clientSecret?: string
-): AddCredentialRequest['authMethod'] {
-  const compact = optionalTrimmed(value)?.toLowerCase().replace(/[^a-z0-9]/g, '')
-  if (compact === 'externalidp' || compact === 'enterprise' || compact === 'iamsso' || compact === 'awsidc') {
-    return 'external_idp'
-  }
-  if (compact === 'idc' || compact === 'builderid' || compact === 'iam' || (clientId && clientSecret)) {
-    return 'idc'
-  }
-  if (compact === 'apikey') return 'api_key'
-  return 'social'
-}
-
 function parseOptionalNonNegativeInteger(value: string, label: string): number | undefined {
   const t = value.trim()
   if (!t) return undefined
@@ -284,7 +178,8 @@ function parseOptionalNonNegativeInteger(value: string, label: string): number |
   return n
 }
 
-function mergeCredentialDefaults(
+/** 把默认参数填进账号缺失的字段；`importIndex` 用于代理轮换。 */
+export function mergeCredentialDefaults(
   cred: AddCredentialRequest,
   defaults: CredentialParameterDefaults,
   importIndex = 0,
@@ -379,28 +274,6 @@ function proxyAssignmentToDefaults(defaults: CredentialParameterDefaults, value:
   }
 }
 
-async function verifyImportedCredential(
-  credentialId: number,
-  mode: ImportVerificationMode,
-  model: string,
-  refreshInfoAfterModelTest: boolean,
-): Promise<{ model: string; response: string }> {
-  if (mode === 'subscription_only') {
-    const info = await getCredentialBalance(credentialId)
-    return { model: '订阅查询', response: `订阅: ${credentialSubscriptionLabel(info.subscriptionTitle)}，用量 ${info.currentUsage}/${info.usageLimit}` }
-  }
-  const tested = await testCredential(credentialId, { model, prompt: DEFAULT_TEST_PROMPT })
-  if (refreshInfoAfterModelTest) {
-    try { await getCredentialBalance(credentialId) } catch { /* ignore */ }
-  }
-  return { model: testModelLabel(tested.model), response: tested.response }
-}
-
-async function rollbackCredential(id: number): Promise<{ success: boolean; error?: string }> {
-  try { await setCredentialDisabled(id, true) } catch (e) { return { success: false, error: `禁用失败: ${extractErrorMessage(e)}` } }
-  try { await deleteCredential(id); return { success: true } } catch (e) { return { success: false, error: `删除失败: ${extractErrorMessage(e)}` } }
-}
-
 function exportFilename(format: CredentialExportFormat): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
   return `kiro-credentials-${stamp}.${format === 'jsonl' ? 'jsonl' : 'json'}`
@@ -452,13 +325,13 @@ export function CredentialParameterDefaultsPanel({ defaults, onChange, proxyReso
   type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds' | 'tags'>
   const update = (key: StringDefaultKey, value: string) => onChange({ ...defaults, [key]: value })
   return (
-    <div className="space-y-4">
+    <div className="@container space-y-4">
       <FormSection
         title="默认参数"
         description="只填充每条账号里缺失的字段；账号自身带的值优先。"
         actions={<Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => onChange(initialParameterDefaults())}>清空</Button>}
       >
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-4 @md:grid-cols-2 @3xl:grid-cols-3">
           <Field label="导入后状态">
             <Select value={defaults.disabled} onValueChange={(v) => update('disabled', v)} disabled={disabled}>
               <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
@@ -477,7 +350,7 @@ export function CredentialParameterDefaultsPanel({ defaults, onChange, proxyReso
           <Field label="Auth Region"><Input className="font-mono" value={defaults.authRegion} disabled={disabled} onChange={(e) => update('authRegion', e.target.value)} placeholder="us-east-1" /></Field>
           <Field label="API Region"><Input className="font-mono" value={defaults.apiRegion} disabled={disabled} onChange={(e) => update('apiRegion', e.target.value)} placeholder="us-east-1" /></Field>
           <Field label="Region 兼容" description="未设置 Auth Region 时的回退"><Input className="font-mono" value={defaults.region} disabled={disabled} onChange={(e) => update('region', e.target.value)} placeholder="us-east-1" /></Field>
-          <div className="space-y-1.5 sm:col-span-2 lg:col-span-3">
+          <div className="space-y-1.5 @md:col-span-2 @3xl:col-span-3">
             <div className="text-sm font-medium">账号标签</div>
             <CredentialTagsField
               value={defaults.tags}
@@ -487,7 +360,7 @@ export function CredentialParameterDefaultsPanel({ defaults, onChange, proxyReso
             />
             <p className="text-[0.7rem] leading-4 text-muted-foreground">文件中已有标签优先；没有标签的账号使用这里的默认标签。</p>
           </div>
-          <label className="flex items-center gap-2 text-sm sm:col-span-2 lg:col-span-3">
+          <label className="flex items-center gap-2 text-sm @md:col-span-2 @3xl:col-span-3">
             <Checkbox
               id="default-enable-overage"
               checked={defaults.enableOverageAfterImport}
@@ -571,11 +444,20 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
     const files = Array.from(e.target.files || [])
     e.target.value = ''
     if (!files.length) return
-    const result = await parseCredentialImportFiles(files)
-    if (!result.credentials[0]) { toast.error(result.errors[0] || '文件中没有有效账号'); return }
-    setForm(formFromCredential(result.credentials[0]))
-    toast.success(`已填充第一条账号${result.credentials.length > 1 ? `，另有 ${result.credentials.length - 1} 条可批量导入` : ''}`)
-    if (result.errors.length) toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
+    const read = await readImportFiles(files)
+    const errors = [...read.errors]
+    const credentials = read.inputs.flatMap(({ name, text }) => {
+      try {
+        return parseImportText(text).accounts.map((account) => account.credential)
+      } catch (error) {
+        errors.push(`${name}: ${extractErrorMessage(error)}`)
+        return []
+      }
+    })
+    if (!credentials[0]) { toast.error(errors[0] || '文件中没有有效账号'); return }
+    setForm(formFromCredential(credentials[0]))
+    toast.success(`已填充第一条账号${credentials.length > 1 ? `，另有 ${credentials.length - 1} 条可批量导入` : ''}`)
+    if (errors.length) toast.warning(`部分文件未读取: ${errors.slice(0, 3).join('；')}`)
   }
 
   const submit = (e: React.FormEvent) => {
@@ -604,6 +486,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       issuerUrl: form.authMethod === 'external_idp' ? form.issuerUrl.trim() || undefined : undefined,
       scopes: form.authMethod === 'external_idp' ? form.scopes.trim() || undefined : undefined,
       email: form.email.trim() || undefined,
+      provider: form.provider.trim() || undefined,
       priority,
       fast,
       maxConcurrentRequests,
@@ -650,7 +533,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           </Field>
           <div className="flex-1" />
           <label className="cursor-pointer">
-            <input type="file" className="sr-only" accept=".json,.jsonl,.txt" multiple onChange={handleFile} />
+            <input type="file" className="sr-only" accept=".json,.jsonl,.txt,.csv" multiple onChange={handleFile} />
             <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件填充</span></Button>
           </label>
         </div>
@@ -685,6 +568,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
             <Field label="Scopes（可选）"><Input className="font-mono" value={form.scopes} disabled={add.isPending} onChange={(e) => update('scopes', e.target.value)} placeholder="offline_access ..." /></Field>
           </>}
           <Field label="邮箱（可选）"><Input value={form.email} disabled={add.isPending} onChange={(e) => update('email', e.target.value)} placeholder="user@example.com" /></Field>
+          <Field label="身份提供方（可选）" description="Google / Github / BuilderId / Enterprise，只用于展示和 Portal 查询"><Input value={form.provider} disabled={add.isPending} onChange={(e) => update('provider', e.target.value)} placeholder="留空则按认证方式推断" /></Field>
           <div className="sm:col-span-2 space-y-1.5">
             <div className="text-sm font-medium">账号标签</div>
             <div className="text-xs leading-5 text-muted-foreground">可点击已有标签，也可以输入新标签后按 Enter。</div>
@@ -727,540 +611,6 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           <Button type="submit" size="sm" disabled={add.isPending}>{add.isPending && <Spinner size="sm" />}添加</Button>
         </div>
       </form>
-    </ModalShell>
-  )
-}
-
-// ============================================================================
-// BatchImportModal
-// ============================================================================
-
-interface ImportResult {
-  index: number
-  credentialId?: number
-  email?: string
-  status: 'pending' | 'importing' | 'verifying' | 'success' | 'failed' | 'skipped'
-  error?: string
-  warning?: string
-  model?: string
-  response?: string
-}
-
-export function BatchImportModal({ open, onClose, existingCredentials, onDone }: {
-  open: boolean; onClose: () => void
-  existingCredentials: Array<{ id: number; refreshTokenHash?: string; apiKeyHash?: string; tags?: string[] }>
-  onDone: () => void
-}) {
-  const [text, setText] = useState('')
-  const [defaults, setDefaults] = useState(initialParameterDefaults)
-  const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
-  const [skipVerify, setSkipVerify] = useState(false)
-  const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
-  const [autoDiscoverSupportedModels, setAutoDiscoverSupportedModels] = useState(false)
-  const [running, setRunning] = useState(false)
-  const [results, setResults] = useState<ImportResult[]>([])
-  const [parsed, setParsed] = useState<AddCredentialRequest[]>([])
-  const [parseError, setParseError] = useState('')
-  const proxyResources = useProxyResources()
-  const proxyOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
-  const tagOptions = useMemo(
-    () => Array.from(new Set(existingCredentials.flatMap((credential) => credential.tags ?? []))).sort((a, b) => a.localeCompare(b)),
-    [existingCredentials],
-  )
-  const modelCapabilities = useModelCapabilities()
-  const testModelOptions = useMemo(
-    () => buildTestModelOptions(modelCapabilities.data?.models),
-    [modelCapabilities.data?.models]
-  )
-  const importTestModel = defaultTestModelForOptions(testModelOptions)
-  const cancelRef = useRef(false)
-
-  useEffect(() => {
-    if (!open) { setText(''); setDefaults(initialParameterDefaults()); setVerifyMode('subscription_only'); setSkipVerify(false); setRefreshInfoAfterModelTest(false); setAutoDiscoverSupportedModels(false); setResults([]); setParsed([]); setParseError(''); setRunning(false) }
-  }, [open])
-
-  const handleParse = () => {
-    setParseError('')
-    try {
-      const proxyError = validateProxyAssignment(defaults)
-      if (proxyError) { setParseError(proxyError); return }
-      const items = parseCredentialImportText(text)
-      if (!items.length) { setParseError('未找到有效账号，请检查格式'); return }
-      const merged = items.map((c, index) => mergeCredentialDefaults(c, defaults, index))
-      setParsed(merged)
-      setResults(merged.map((_, i) => ({ index: i, status: 'pending' })))
-    } catch (e) {
-      setParseError(extractErrorMessage(e))
-    }
-  }
-
-  const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || [])
-    e.target.value = ''
-    if (!files.length) return
-    const result = await parseCredentialImportFiles(files)
-    if (!result.credentials.length) { toast.error(result.errors[0] || '文件中没有有效账号'); return }
-    setParsed([])
-    setResults([])
-    setText(result.credentials.map((c) => JSON.stringify(c)).join('\n'))
-    toast.success(`已读取 ${result.credentials.length} 条账号`)
-    if (result.errors.length) toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
-  }
-
-  const existingHashes = useMemo(() => {
-    const hashes = new Set<string>()
-    for (const c of existingCredentials) {
-      if (c.refreshTokenHash) hashes.add(c.refreshTokenHash)
-      if (c.apiKeyHash) hashes.add(c.apiKeyHash)
-    }
-    return hashes
-  }, [existingCredentials])
-
-  const isDuplicate = async (cred: AddCredentialRequest): Promise<boolean> => {
-    if (cred.refreshToken) {
-      const hash = await sha256Hex(cred.refreshToken)
-      return existingHashes.has(hash)
-    }
-    if (cred.kiroApiKey) {
-      const hash = await sha256Hex(cred.kiroApiKey)
-      return existingHashes.has(hash)
-    }
-    return false
-  }
-
-  const runItems = async (items: AddCredentialRequest[], isRetry = false) => {
-    setRunning(true); cancelRef.current = false
-    const newResults: ImportResult[] = items.map((_, i) => ({ index: i, status: 'pending' }))
-    if (!isRetry) setResults([...newResults])
-
-    for (let i = 0; i < items.length; i++) {
-      if (cancelRef.current) break
-      const cred = items[i]
-      newResults[i] = { ...newResults[i], status: 'importing' }
-      if (!isRetry) setResults([...newResults])
-      try {
-        const dup = !isRetry && await isDuplicate(cred)
-        if (dup) { newResults[i] = { ...newResults[i], status: 'skipped', error: '重复账号' }; if (!isRetry) setResults([...newResults]); continue }
-        const res = await addCredential({ ...cred, autoDiscoverSupportedModels })
-        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
-        if (!skipVerify) {
-          newResults[i].status = 'verifying'
-          if (!isRetry) setResults([...newResults])
-          try {
-            const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel, refreshInfoAfterModelTest)
-            newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
-          } catch (ve) {
-            await rollbackCredential(res.credentialId)
-            newResults[i] = { ...newResults[i], status: 'failed', error: `验活失败: ${extractErrorMessage(ve)}` }
-          }
-        } else {
-          newResults[i].status = 'success'
-        }
-      } catch (e) {
-        newResults[i] = { ...newResults[i], status: 'failed', error: extractErrorMessage(e) }
-      }
-      if (!isRetry) setResults([...newResults])
-    }
-
-    if (isRetry) {
-      // merge retry outcomes back into the full results list
-      setResults((prev) => {
-        let retryIdx = 0
-        return prev.map((r) => {
-          if (r.status === 'failed' && retryIdx < newResults.length) {
-            return { ...newResults[retryIdx++], index: r.index }
-          }
-          return r
-        })
-      })
-    }
-
-    setRunning(false)
-    const success = newResults.filter((r) => r.status === 'success').length
-    const failed = newResults.filter((r) => r.status === 'failed').length
-    const skipped = newResults.filter((r) => r.status === 'skipped').length
-    onDone()
-    toast.success(`批量导入完成：成功 ${success}，失败 ${failed}，跳过 ${skipped}`)
-  }
-
-  const run = () => { if (parsed.length) runItems(parsed) }
-
-  const failedItems = parsed.filter((_, i) => results[i]?.status === 'failed')
-  const retryFailed = () => { if (failedItems.length) runItems(failedItems, true) }
-
-  return (
-    <ModalShell
-      open={open}
-      title="批量导入账号"
-      description="粘贴或选择文件后先解析预览，确认无误再开始导入。"
-      width="max-w-5xl"
-      onClose={onClose}
-      footer={!results.length ? (
-        <>
-          <Button variant="outline" size="sm" onClick={onClose}>取消</Button>
-          <Button size="sm" onClick={handleParse} disabled={!text.trim()}>解析预览</Button>
-        </>
-      ) : undefined}
-    >
-      <div className="space-y-4">
-        {!results.length ? (
-          <>
-            <FormSection
-              title="账号数据"
-              description="支持 JSON 数组、每行一个 JSON 对象（JSONL），以及账号页导出的文件。"
-              actions={(
-                <label className="cursor-pointer">
-                  <input type="file" className="sr-only" accept=".json,.jsonl,.txt" multiple onChange={handleFile} />
-                  <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
-                </label>
-              )}
-            >
-              <Textarea
-                className="min-h-[160px] font-mono text-xs"
-                placeholder={'[{"refreshToken":"eyJ..."},{"refreshToken":"eyJ..."}]\n// 或每行一个 JSON 对象'}
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-              />
-              {parseError && <div className="mt-2 text-xs text-destructive">{parseError}</div>}
-            </FormSection>
-            <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} tagOptions={tagOptions} />
-            <FormSection title="导入选项">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="验活方式" description={skipVerify ? '导入后不做任何检查' : verifyMode === 'subscription_only' ? '刷新 token 并查询订阅和积分，不消耗模型额度' : '发一次模型请求确认账号可用'}>
-                  <Select
-                    value={skipVerify ? 'skip' : verifyMode}
-                    onValueChange={(v) => { if (v === 'skip') setSkipVerify(true); else { setSkipVerify(false); setVerifyMode(v as ImportVerificationMode) } }}
-                  >
-                    <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="subscription_only">查询订阅/积分（不请求模型）</SelectItem>
-                      <SelectItem value="model_and_subscription">只测试模型</SelectItem>
-                      <SelectItem value="skip">跳过验活</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <div className="flex flex-col justify-center gap-2.5 text-sm">
-                  <label className="flex items-center gap-2">
-                    <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="batch-auto-discover-models" />
-                    自动发现模型限制
-                  </label>
-                  {!skipVerify && verifyMode === 'model_and_subscription' && (
-                    <label className="flex items-center gap-2">
-                      <Checkbox checked={refreshInfoAfterModelTest} onCheckedChange={(v) => setRefreshInfoAfterModelTest(Boolean(v))} id="batch-refresh-info-after-model-test" />
-                      同时查询订阅/积分
-                    </label>
-                  )}
-                </div>
-              </div>
-            </FormSection>
-          </>
-        ) : (
-          <>
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-sm">
-                共 <span className="font-semibold">{parsed.length}</span> 条
-                {results.some((r) => r.status !== 'pending') && (
-                  <span className="ml-2 text-muted-foreground">
-                    成功 {results.filter((r) => r.status === 'success').length} · 失败 {results.filter((r) => r.status === 'failed').length} · 跳过 {results.filter((r) => r.status === 'skipped').length}
-                  </span>
-                )}
-              </div>
-              {!running && <Button variant="ghost" size="xs" onClick={() => { setResults([]); setParsed([]) }}>重新编辑</Button>}
-            </div>
-            {running && <Progress value={Math.round((results.filter((r) => r.status !== 'pending').length / parsed.length) * 100)} className="h-1.5" />}
-            <ImportProgressList
-              results={results}
-              getLabel={(i) => parsed[i]?.email || parsed[i]?.kiroApiKey?.slice(0, 20) || `账号 ${i + 1}`}
-            />
-            <ImportResultFooter
-              running={running}
-              results={results}
-              failedCount={failedItems.length}
-              onClose={onClose}
-              onRun={run}
-              onRetry={retryFailed}
-            />
-          </>
-        )}
-      </div>
-    </ModalShell>
-  )
-}
-
-// ============================================================================
-// KamImportModal
-// ============================================================================
-
-export function KamImportModal({ open, onClose, existingCredentials, onDone }: {
-  open: boolean; onClose: () => void
-  existingCredentials?: Array<{ id: number; refreshTokenHash?: string; apiKeyHash?: string; tags?: string[] }>
-  onDone: () => void
-}) {
-  const [text, setText] = useState('')
-  const [accounts, setAccounts] = useState<KamAccount[]>([])
-  const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
-  const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
-  const [skipVerify, setSkipVerify] = useState(false)
-  const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
-  const [autoDiscoverSupportedModels, setAutoDiscoverSupportedModels] = useState(false)
-  const [defaults, setDefaults] = useState(initialParameterDefaults)
-  const [running, setRunning] = useState(false)
-  const [results, setResults] = useState<ImportResult[]>([])
-  const proxyResources = useProxyResources()
-  const proxyOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
-  const tagOptions = useMemo(
-    () => Array.from(new Set((existingCredentials || []).flatMap((credential) => credential.tags ?? []))).sort((a, b) => a.localeCompare(b)),
-    [existingCredentials],
-  )
-  const modelCapabilities = useModelCapabilities()
-  const testModelOptions = useMemo(
-    () => buildTestModelOptions(modelCapabilities.data?.models),
-    [modelCapabilities.data?.models]
-  )
-  const importTestModel = defaultTestModelForOptions(testModelOptions)
-
-  const hasErrorAccounts = accounts.some((a) => a.status === 'error')
-
-  useEffect(() => {
-    if (!open) {
-      setText(''); setAccounts([]); setResults([])
-      setDefaults(initialParameterDefaults()); setRunning(false)
-      setSkipErrorAccounts(true); setVerifyMode('subscription_only'); setSkipVerify(false); setRefreshInfoAfterModelTest(false); setAutoDiscoverSupportedModels(false)
-    }
-  }, [open])
-
-  const handleParse = () => {
-    const proxyError = validateProxyAssignment(defaults)
-    if (proxyError) { toast.error(proxyError); return }
-    try {
-      const result = parseKamJson(text)
-      if (!result.length) { toast.error('未找到有效的 KAM 账号'); return }
-      setAccounts(result)
-      setResults(result.map((_, i) => ({ index: i, status: 'pending' })))
-      toast.success(`解析到 ${result.length} 个 KAM 账号`)
-    } catch (e) { toast.error(`解析失败: ${extractErrorMessage(e)}`) }
-  }
-
-  const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || [])
-    e.target.value = ''
-    if (!files.length) return
-    try {
-      const result = await parseKamFiles(files)
-      if (!result.accounts.length) { toast.error('文件中未找到有效 KAM 账号'); return }
-      setText(JSON.stringify(result.accounts, null, 2))
-      setAccounts([])
-      setResults([])
-      toast.success(`从文件解析到 ${result.accounts.length} 个账号`)
-    } catch (e) { toast.error(`文件解析失败: ${extractErrorMessage(e)}`) }
-  }
-
-  const runAccounts = async (
-    targetAccounts: KamAccount[],
-    isRetry = false,
-    originalIndices = targetAccounts.map((_, index) => index),
-  ) => {
-    setRunning(true)
-    const newResults: ImportResult[] = targetAccounts.map((_, i) => ({ index: i, status: 'pending' }))
-    if (!isRetry) setResults([...newResults])
-    let skippedCount = 0
-    for (let i = 0; i < targetAccounts.length; i++) {
-      const acc = targetAccounts[i]
-      const originalIndex = originalIndices[i] ?? i
-      // skip error-status accounts if option enabled (only on first run, not retry)
-      if (!isRetry && skipErrorAccounts && acc.status === 'error') {
-        newResults[i] = { ...newResults[i], status: 'skipped', error: '跳过 error 状态账号' }
-        setResults([...newResults]); skippedCount++; continue
-      }
-      newResults[i] = { ...newResults[i], status: 'importing' }
-      setResults([...newResults])
-      try {
-        const clientId = optionalTrimmed(acc.credentials.clientId)
-        const clientSecret = optionalTrimmed(acc.credentials.clientSecret)
-        const authMethod = normalizedKamAuthMethod(acc.credentials.authMethod, clientId, clientSecret)
-        const cred: AddCredentialRequest = mergeCredentialDefaults({
-          authMethod,
-          accessToken: optionalTrimmed(acc.credentials.accessToken),
-          expiresAt: optionalTrimmed(acc.credentials.expiresAt),
-          refreshToken: optionalTrimmed(acc.credentials.refreshToken),
-          clientId,
-          clientSecret: authMethod === 'idc' ? clientSecret : undefined,
-          tokenEndpoint: authMethod === 'external_idp' ? optionalTrimmed(acc.credentials.tokenEndpoint) : undefined,
-          issuerUrl: authMethod === 'external_idp' ? optionalTrimmed(acc.credentials.issuerUrl) : undefined,
-          scopes: authMethod === 'external_idp' ? optionalTrimmed(acc.credentials.scopes) : undefined,
-          profileArn: optionalTrimmed(acc.credentials.profileArn),
-          region: optionalTrimmed(acc.credentials.region),
-          apiRegion: optionalTrimmed(acc.credentials.apiRegion),
-          email: optionalTrimmed(acc.email),
-          machineId: optionalTrimmed(acc.machineId),
-          tags: acc.tags,
-        }, defaults, originalIndex)
-        const res = await addCredential({ ...cred, autoDiscoverSupportedModels })
-        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
-        if (skipVerify) {
-          newResults[i] = { ...newResults[i], status: 'success' }
-        } else {
-          newResults[i] = { ...newResults[i], status: 'verifying' }
-          setResults([...newResults])
-          try {
-            const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel, refreshInfoAfterModelTest)
-            newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
-          } catch (ve) {
-            await rollbackCredential(res.credentialId)
-            newResults[i] = { ...newResults[i], status: 'failed', error: `验活失败: ${extractErrorMessage(ve)}` }
-          }
-        }
-      } catch (e) {
-        newResults[i] = { ...newResults[i], status: 'failed', error: extractErrorMessage(e) }
-      }
-      setResults([...newResults])
-    }
-    if (isRetry) {
-      setResults((prev) => {
-        let retryIdx = 0
-        return prev.map((r) => {
-          if (r.status === 'failed' && retryIdx < newResults.length) {
-            return { ...newResults[retryIdx++], index: r.index }
-          }
-          return r
-        })
-      })
-    }
-    setRunning(false)
-    const success = newResults.filter((r) => r.status === 'success').length
-    const failed = newResults.filter((r) => r.status === 'failed').length
-    onDone()
-    toast.success(`KAM 导入完成：成功 ${success}，失败 ${failed}，跳过 ${skippedCount}`)
-  }
-
-  const run = () => { if (accounts.length) runAccounts(accounts) }
-
-  const failedAccountEntries = accounts
-    .map((account, index) => ({ account, index }))
-    .filter(({ index }) => results[index]?.status === 'failed')
-  const failedAccounts = failedAccountEntries.map(({ account }) => account)
-  const retryFailed = () => {
-    if (failedAccounts.length) {
-      runAccounts(
-        failedAccounts,
-        true,
-        failedAccountEntries.map(({ index }) => index),
-      )
-    }
-  }
-
-  return (
-    <ModalShell
-      open={open}
-      title="KAM 导入账号"
-      description="粘贴 KAM 导出的 JSON 或选择文件，解析后可以选择验活方式再导入。"
-      width="max-w-5xl"
-      onClose={onClose}
-      footer={!accounts.length ? (
-        <>
-          <Button variant="outline" size="sm" onClick={onClose}>取消</Button>
-          <Button size="sm" onClick={handleParse} disabled={!text.trim()}>解析预览</Button>
-        </>
-      ) : undefined}
-    >
-      <div className="space-y-4">
-        {!accounts.length ? (
-          <>
-            <FormSection
-              title="KAM 数据"
-              actions={(
-                <label className="cursor-pointer">
-                  <input type="file" className="sr-only" accept=".json,.txt" multiple onChange={handleFile} />
-                  <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
-                </label>
-              )}
-            >
-              <Textarea className="min-h-[160px] font-mono text-xs" placeholder='粘贴 KAM JSON...' value={text} onChange={(e) => setText(e.target.value)} />
-            </FormSection>
-            <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} tagOptions={tagOptions} />
-            <FormSection title="导入选项">
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="kam-auto-discover-models" />
-                自动发现模型限制
-              </label>
-            </FormSection>
-          </>
-        ) : (
-          <>
-            <div className="flex items-center justify-between">
-              <div className="text-sm">
-                共 <span className="font-semibold">{accounts.length}</span> 个账号
-                {results.some((r) => r.status !== 'pending') && (
-                  <span className="ml-2 text-muted-foreground">
-                    成功 {results.filter((r) => r.status === 'success').length} · 失败 {results.filter((r) => r.status === 'failed').length} · 跳过 {results.filter((r) => r.status === 'skipped').length}
-                  </span>
-                )}
-              </div>
-              {!running && <Button variant="ghost" size="xs" onClick={() => { setAccounts([]); setResults([]) }}>重新编辑</Button>}
-            </div>
-            {/* 验活模式和跳过 error 选项（仅未开始时显示） */}
-            {results.every((r) => r.status === 'pending') && (
-              <div className="rounded-lg bg-muted/30 p-3 space-y-2">
-                <div className="text-sm font-semibold">导入选项</div>
-                <div className="flex items-center gap-2">
-                  <Checkbox checked={skipVerify} onCheckedChange={(v) => setSkipVerify(Boolean(v))} id="kam-skip-verify" disabled={running} />
-                  <label htmlFor="kam-skip-verify" className="text-sm cursor-pointer">跳过验活</label>
-                </div>
-                {!skipVerify && (
-                  <div className="space-y-2">
-                    <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)} disabled={running}>
-                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="subscription_only">查询订阅/积分（不请求模型）</SelectItem>
-                        <SelectItem value="model_and_subscription">只测试模型</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    {verifyMode === 'model_and_subscription' && (
-                      <div className="flex items-center gap-2">
-                        <Checkbox
-                          id="kam-refresh-info-after-model-test"
-                          checked={refreshInfoAfterModelTest}
-                          onCheckedChange={(v) => setRefreshInfoAfterModelTest(Boolean(v))}
-                          disabled={running}
-                        />
-                        <label htmlFor="kam-refresh-info-after-model-test" className="text-sm cursor-pointer">
-                          同步查询订阅/积分
-                        </label>
-                      </div>
-                    )}
-                  </div>
-                )}
-                {hasErrorAccounts && (
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      id="skip-error-accounts"
-                      checked={skipErrorAccounts}
-                      onCheckedChange={(v) => setSkipErrorAccounts(Boolean(v))}
-                      disabled={running}
-                    />
-                    <label htmlFor="skip-error-accounts" className="text-sm cursor-pointer">
-                      跳过 error 状态的账号（{accounts.filter((a) => a.status === 'error').length} 个）
-                    </label>
-                  </div>
-                )}
-              </div>
-            )}
-            {running && <Progress value={Math.round((results.filter((r) => r.status !== 'pending').length / accounts.length) * 100)} className="h-1.5" />}
-            <ImportProgressList
-              results={results}
-              getLabel={(i) => accounts[i]?.email || `账号 ${i + 1}`}
-            />
-            <ImportResultFooter
-              running={running}
-              results={results}
-              failedCount={failedAccounts.length}
-              onClose={onClose}
-              onRun={run}
-              onRetry={retryFailed}
-            />
-          </>
-        )}
-      </div>
     </ModalShell>
   )
 }
