@@ -3714,6 +3714,7 @@ impl RequestUsageContext {
             upstream_header_ms,
             credential_dispatch_elapsed_ms,
             upstream_header_wait_ms,
+     downstream_first_byte_ms: None,
             first_upstream_chunk_ms,
             first_output_delta_ms,
             first_thinking_delta_ms,

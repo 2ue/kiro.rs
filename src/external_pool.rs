@@ -489,6 +489,9 @@ pub enum ExternalPoolStreamRetryMode {
     Inherit,
     Enabled,
     Disabled,
+    /// 立即把上游 message_start（usage 清零）和 ping 发给下游；首个内容前出错仍换池重放，
+    /// 重放成功时丢弃新一次的 message_start，全部失败时以 SSE error 事件收尾。
+    EarlyCommit,
 }
 
 impl ExternalPoolStreamRetryMode {
@@ -501,6 +504,7 @@ impl ExternalPoolStreamRetryMode {
             "inherit" => Some(Self::Inherit),
             "enabled" => Some(Self::Enabled),
             "disabled" => Some(Self::Disabled),
+            "early_commit" => Some(Self::EarlyCommit),
             _ => None,
         }
     }
@@ -510,6 +514,7 @@ impl ExternalPoolStreamRetryMode {
             Self::Inherit => "inherit",
             Self::Enabled => "enabled",
             Self::Disabled => "disabled",
+     Self::EarlyCommit => "early_commit",
         }
     }
 }
@@ -1232,6 +1237,7 @@ fn requested_max_tokens_from_raw_body(body: &Bytes) -> Option<i32> {
 #[derive(Debug, Default)]
 pub struct ExternalLatencyTraceState {
     upstream_header_ms: AtomicU64,
+    downstream_first_byte_ms: AtomicU64,
     first_upstream_chunk_ms: AtomicU64,
     first_output_delta_ms: AtomicU64,
     stream_gap_to_first_output_ms: AtomicU64,
@@ -1253,6 +1259,10 @@ impl ExternalLatencyTraceState {
 
     fn mark_upstream_header(&self, started_at: Instant) {
         Self::store_once(&self.upstream_header_ms, Self::elapsed_ms(started_at));
+    }
+
+    fn mark_downstream_first_byte(&self, started_at: Instant) {
+        Self::store_once(&self.downstream_first_byte_ms, Self::elapsed_ms(started_at));
     }
 
     fn mark_first_upstream_chunk(&self, started_at: Instant) {
@@ -1282,6 +1292,7 @@ impl ExternalLatencyTraceState {
             upstream_header_ms: load_nonzero(&self.upstream_header_ms),
             credential_dispatch_elapsed_ms: None,
             upstream_header_wait_ms: None,
+     downstream_first_byte_ms: load_nonzero(&self.downstream_first_byte_ms),
             first_upstream_chunk_ms: load_nonzero(&self.first_upstream_chunk_ms),
             first_output_delta_ms,
             first_thinking_delta_ms: None,
@@ -11122,12 +11133,16 @@ fn effective_external_pool_pre_output_stream_retry_enabled(
     config: &ExternalPoolsConfig,
 ) -> bool {
     match pool.pre_output_stream_retry_mode {
-        ExternalPoolStreamRetryMode::Enabled => true,
+        ExternalPoolStreamRetryMode::Enabled | ExternalPoolStreamRetryMode::EarlyCommit => true,
         ExternalPoolStreamRetryMode::Disabled => false,
         ExternalPoolStreamRetryMode::Inherit => {
             config.external_pool_stream_pre_output_retry_enabled
         }
     }
+}
+
+fn external_pool_stream_early_commit_enabled(pool: &ExternalPool) -> bool {
+    pool.pre_output_stream_retry_mode == ExternalPoolStreamRetryMode::EarlyCommit
 }
 
 fn external_pre_output_stream_protocol_error(

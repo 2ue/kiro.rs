@@ -282,6 +282,9 @@ pub struct UsageLatencyTrace {
     pub credential_dispatch_elapsed_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_header_wait_ms: Option<u64>,
+    /// 外部池提前提交模式下，下游收到首个字节（message_start）的时间，从请求开始计。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downstream_first_byte_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_upstream_chunk_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,7 +410,8 @@ impl UsageLatencyTrace {
             && self.upstream_header_ms.is_none()
             && self.credential_dispatch_elapsed_ms.is_none()
             && self.upstream_header_wait_ms.is_none()
-            && self.first_upstream_chunk_ms.is_none()
+            && self.downstream_first_byte_ms.is_none()
+     && self.first_upstream_chunk_ms.is_none()
             && self.first_output_delta_ms.is_none()
             && self.first_thinking_delta_ms.is_none()
             && self.first_visible_text_delta_ms.is_none()
