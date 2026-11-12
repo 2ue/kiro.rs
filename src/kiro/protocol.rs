@@ -283,6 +283,11 @@ mod tests {
             ..Default::default()
         };
         assert!(profile_arn_discovery_applies(&idc(None)));
+        let organization_idc = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            ..idc(None)
+        };
+        assert!(profile_arn_discovery_applies(&organization_idc));
         let declared = KiroCredentials {
             provider: Some("BuilderId".to_string()),
             ..idc(None)

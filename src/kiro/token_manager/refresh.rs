@@ -2917,6 +2917,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_protocol_idc_with_enterprise_provider_keeps_idc_rest_semantics() {
+        let captured = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = usage_endpoint_state(captured.clone(), StatusCode::FORBIDDEN);
+        let portal_captured = state.portal_captured.clone();
+        let app = Router::new()
+            .route("/fake/getUsageLimits", get(mock_usage_limits_endpoint))
+            .route("/fake/{operation}", post(mock_portal_endpoint))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Organization IdC export (KAM / kiro-manager-lite / Kiro-Go): the provider must only
+        // change the Portal Idp cookie, not add `TokenType: EXTERNAL_IDP` to the REST call.
+        let credentials = KiroCredentials {
+            auth_method: Some("IdC".to_string()),
+            provider: Some("Enterprise".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+
+        get_usage_limits(&credentials, &config, "idc-token", None)
+            .await
+            .unwrap();
+        server.abort();
+
+        let (_, authorization, token_type, uri) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(authorization, "Bearer idc-token");
+        assert_eq!(token_type, "", "organization IdC must not send TokenType");
+        assert!(uri.contains(
+     "profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A638616132270%3Aprofile%2FAAAACCCCXXXX"
+ ));
+        let portal_requests = portal_captured.lock().unwrap();
+        assert_eq!(portal_requests.len(), 1);
+        assert_eq!(
+            portal_requests[0].1[header::COOKIE],
+            "Idp=Enterprise; AccessToken=idc-token"
+        );
+    }
+
+    #[tokio::test]
     async fn usage_protocol_idc_uses_rest_after_portal_permission_error() {
         let captured = Arc::new(Mutex::new(None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

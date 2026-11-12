@@ -8922,6 +8922,28 @@ mod tests {
     }
 
     #[test]
+    fn list_available_profiles_headers_do_not_attach_token_type_for_organization_idc() {
+        // KAM / kiro-manager-lite / Kiro-Go organization IdC export.
+        let credentials = KiroCredentials {
+            auth_method: Some("IdC".to_string()),
+            provider: Some("Enterprise".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let headers = KiroProvider::list_available_profiles_headers(
+            &credentials,
+            "token",
+            &Config::default(),
+            "machine",
+            "codewhisperer.us-east-1.amazonaws.com",
+        )
+        .unwrap();
+
+        assert!(headers.get("TokenType").is_none());
+    }
+
+    #[test]
     fn stream_completion_reports_success_once() {
         let mut cred = KiroCredentials::default();
         cred.access_token = Some("token".to_string());
