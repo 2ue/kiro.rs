@@ -392,6 +392,10 @@ pub(crate) fn is_external_idp_provider(value: &str) -> bool {
     )
 }
 
+fn is_ambiguous_enterprise_provider(value: &str) -> bool {
+    compact_protocol_value(value).as_str() == "enterprise"
+}
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
     match auth_kind_of(value) {
         Some(DeclaredAuthKind::ApiKey) => "api_key",
@@ -792,10 +796,22 @@ impl KiroCredentials {
         }
         match self.declared_auth_kind() {
             Some(kind) => kind == DeclaredAuthKind::ExternalIdp,
-            None => self
-                .provider
-                .as_deref()
-                .is_some_and(is_external_idp_provider),
+            None => {
+                let enterprise_idc_shape = self
+                    .provider
+                    .as_deref()
+                    .is_some_and(is_ambiguous_enterprise_provider)
+                    && trimmed_non_empty(&self.client_id).is_some()
+                    && trimmed_non_empty(&self.client_secret).is_some()
+                    && trimmed_non_empty(&self.token_endpoint).is_none()
+                    && trimmed_non_empty(&self.issuer_url).is_none()
+                    && trimmed_non_empty(&self.scopes).is_none();
+                !enterprise_idc_shape
+                    && self
+                        .provider
+                        .as_deref()
+                        .is_some_and(is_external_idp_provider)
+            }
         }
     }
 }
@@ -1265,6 +1281,35 @@ mod tests {
         };
         assert!(!social.is_external_idp_refresh_credential());
         assert!(!social.is_idc_refresh_credential());
+    }
+
+    #[test]
+    fn enterprise_provider_with_client_secret_is_implicit_idc() {
+        let idc = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            refresh_token: Some("test_refresh".to_string()),
+            client_id: Some("client123".to_string()),
+            client_secret: Some("secret456".to_string()),
+            ..Default::default()
+        };
+
+        assert!(idc.is_idc_refresh_credential());
+        assert!(!idc.is_external_idp_refresh_credential());
+    }
+
+    #[test]
+    fn enterprise_provider_with_external_endpoint_stays_external_idp() {
+        let external = KiroCredentials {
+            provider: Some("Enterprise".to_string()),
+            refresh_token: Some("test_refresh".to_string()),
+            client_id: Some("client123".to_string()),
+            client_secret: Some("secret456".to_string()),
+            token_endpoint: Some("https://login.example.invalid/token".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!external.is_idc_refresh_credential());
+        assert!(external.is_external_idp_refresh_credential());
     }
 
     #[test]

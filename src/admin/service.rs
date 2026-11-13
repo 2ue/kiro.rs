@@ -8615,23 +8615,36 @@ fn resolve_add_credential_auth_method(req: &AddCredentialRequest) -> String {
         return "api_key".to_string();
     }
 
-    if add_request_looks_external_idp(req) {
+    // Kiro Manager Lite and similar exporters use `provider: Enterprise` for
+    // AWS SSO OIDC credentials. External IdP fields disambiguate the same
+    // provider value when the credential actually carries its own endpoint.
+    let has_client_credentials = req.client_id.as_deref().is_some_and(has_text)
+        && req.client_secret.as_deref().is_some_and(has_text);
+    let enterprise_idc_shape = has_client_credentials
+        && req
+            .provider
+            .as_deref()
+            .is_some_and(|provider| compact_auth_value(provider).as_str() == "enterprise")
+        && !add_request_has_external_idp_fields(req);
+    if add_request_looks_external_idp(req) && !enterprise_idc_shape {
         return "external_idp".to_string();
     }
 
-    if req.client_id.as_deref().is_some_and(has_text)
-        && req.client_secret.as_deref().is_some_and(has_text)
-    {
+    if has_client_credentials {
         return "idc".to_string();
     }
 
     "social".to_string()
 }
 
-fn add_request_looks_external_idp(req: &AddCredentialRequest) -> bool {
+fn add_request_has_external_idp_fields(req: &AddCredentialRequest) -> bool {
     req.token_endpoint.as_deref().is_some_and(has_text)
         || req.issuer_url.as_deref().is_some_and(has_text)
         || req.scopes.as_deref().is_some_and(has_text)
+}
+
+fn add_request_looks_external_idp(req: &AddCredentialRequest) -> bool {
+    add_request_has_external_idp_fields(req)
         || req.provider.as_deref().is_some_and(|provider| {
             matches!(
                 compact_auth_value(provider).as_str(),
