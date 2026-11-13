@@ -1,6 +1,6 @@
 # 强制模型收敛（Forced Model Mapping）分析与方案
 
-日期：2026-11-11　状态：已实现并验收（分支 `feat/forced-model-mapping`），验收记录见 [10-implementation-checklist.md](10-implementation-checklist.md) 第 15 节
+日期：2026-11-11　状态：已实现并验收（分支 `feat/forced-model-mapping`），第一阶段验收记录见 [10-implementation-checklist.md](10-implementation-checklist.md) 第 15 节，第二阶段（2026-11-13）见 [11-phase2-gap-closure.md](11-phase2-gap-closure.md) 第 6 节
 
 ## 需求
 
@@ -34,6 +34,10 @@
 | [08-per-model-handling.md](08-per-model-handling.md) | 逐模型专项处理：每个外显模型映射到 4.5 时的 thinking、display、工具、视觉、自述处理，以及输出侧的改写顺序 |
 | [09-gaps-and-mitigations.md](09-gaps-and-mitigations.md) | 遗漏点与对策：请求链路、对外暴露、usage、运维、行为一致性、测试 |
 | [10-implementation-checklist.md](10-implementation-checklist.md) | 实现清单（实施基准）：决策定稿、逐任务的文件、做法与验收，验收记录 |
+| [11-phase2-gap-closure.md](11-phase2-gap-closure.md) | 第二阶段总览：对照官方 2026-11 协议与 Claude Code 实际行为的缺口、决策、任务清单与验收记录 |
+| [12-phase2-context.md](12-phase2-context.md) | 第二阶段上下文方案：摘要检查点、滞回阈值、缓存稳定、compaction 协议对接 |
+| [13-phase2-knowledge-identity.md](13-phase2-knowledge-identity.md) | 第二阶段知识库与身份：确定性注入、匹配、内置条目、自述改写与身份过滤收窄 |
+| [14-reference-2026-11.md](14-reference-2026-11.md) | 官方事实参考（2026-11-12 核对）：模型规格、协议限制、Claude Code 行为、退役时间表 |
 
 ## 依据
 

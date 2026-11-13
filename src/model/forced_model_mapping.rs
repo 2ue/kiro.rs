@@ -71,6 +71,22 @@ pub struct ForcedContextBackoffConfig {
     /// 清理边界的推进步长（tokens），相邻请求在同一步长内得到相同的处理结果。
     #[serde(default = "default_step_tokens")]
     pub step_tokens: i32,
+    /// 预留输出的上限。Kiro 不接收 max_tokens，实际输出很少超过 32K；按客户端的 128K 预留会让
+    /// 可用输入只剩窗口的六成多。
+    #[serde(default = "default_max_reserved_output_tokens")]
+    pub max_reserved_output_tokens: i32,
+    /// 摘要检查点：超出预算时把早期对话浓缩成一段记录，而不是直接删掉（关闭时只用硬裁剪）。
+    #[serde(default = "default_true")]
+    pub summary_enabled: bool,
+    /// 估算值超过 `预算 × 该比例` 时在后台预先生成下一个检查点。
+    #[serde(default = "default_summary_precompact_ratio")]
+    pub summary_precompact_ratio: f64,
+    /// 新检查点让 [首条消息 + 摘要 + 尾部] 落到 `预算 × 该比例` 以下。
+    #[serde(default = "default_summary_target_ratio")]
+    pub summary_target_ratio: f64,
+    /// 同步等待摘要的上限（秒），超时就本次走硬裁剪，摘要在后台继续完成。
+    #[serde(default = "default_summary_timeout_secs")]
+    pub summary_timeout_secs: u64,
 }
 
 fn default_safety_margin_ratio() -> f64 {
@@ -89,6 +105,22 @@ fn default_step_tokens() -> i32 {
     50_000
 }
 
+fn default_max_reserved_output_tokens() -> i32 {
+    32_000
+}
+
+fn default_summary_precompact_ratio() -> f64 {
+    0.75
+}
+
+fn default_summary_target_ratio() -> f64 {
+    0.45
+}
+
+fn default_summary_timeout_secs() -> u64 {
+    120
+}
+
 impl Default for ForcedContextBackoffConfig {
     fn default() -> Self {
         Self {
@@ -96,6 +128,11 @@ impl Default for ForcedContextBackoffConfig {
             min_reserved_output_tokens: default_min_reserved_output_tokens(),
             keep_recent_tool_results: default_keep_recent_tool_results(),
             step_tokens: default_step_tokens(),
+            max_reserved_output_tokens: default_max_reserved_output_tokens(),
+            summary_enabled: true,
+            summary_precompact_ratio: default_summary_precompact_ratio(),
+            summary_target_ratio: default_summary_target_ratio(),
+            summary_timeout_secs: default_summary_timeout_secs(),
         }
     }
 }
@@ -109,6 +146,20 @@ impl ForcedContextBackoffConfig {
         self.min_reserved_output_tokens = self.min_reserved_output_tokens.clamp(1_024, 64_000);
         self.keep_recent_tool_results = self.keep_recent_tool_results.clamp(1, 64);
         self.step_tokens = self.step_tokens.clamp(1_000, 500_000);
+        self.max_reserved_output_tokens = self
+            .max_reserved_output_tokens
+            .clamp(self.min_reserved_output_tokens, 64_000);
+        if !self.summary_precompact_ratio.is_finite() {
+            self.summary_precompact_ratio = default_summary_precompact_ratio();
+        }
+        if !self.summary_target_ratio.is_finite() {
+            self.summary_target_ratio = default_summary_target_ratio();
+        }
+        self.summary_precompact_ratio = self.summary_precompact_ratio.clamp(0.3, 0.95);
+        self.summary_target_ratio = self
+            .summary_target_ratio
+            .clamp(0.2, (self.summary_precompact_ratio - 0.1).max(0.2));
+        self.summary_timeout_secs = self.summary_timeout_secs.clamp(5, 300);
         self
     }
 }
@@ -381,6 +432,11 @@ mod tests {
                 min_reserved_output_tokens: 1,
                 keep_recent_tool_results: 0,
                 step_tokens: 1,
+                max_reserved_output_tokens: 1,
+                summary_enabled: true,
+                summary_precompact_ratio: f64::NAN,
+                summary_target_ratio: 5.0,
+                summary_timeout_secs: 0,
             },
             ..ForcedModelMappingConfig::default()
         }
@@ -389,6 +445,10 @@ mod tests {
         assert_eq!(config.context_backoff.min_reserved_output_tokens, 1_024);
         assert_eq!(config.context_backoff.keep_recent_tool_results, 1);
         assert_eq!(config.context_backoff.step_tokens, 1_000);
+        assert_eq!(config.context_backoff.max_reserved_output_tokens, 1_024);
+        assert_eq!(config.context_backoff.summary_precompact_ratio, 0.75);
+        assert_eq!(config.context_backoff.summary_target_ratio, 0.65);
+        assert_eq!(config.context_backoff.summary_timeout_secs, 5);
     }
 
     #[test]

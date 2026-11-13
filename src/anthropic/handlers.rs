@@ -113,6 +113,8 @@ use crate::kiro::token_manager::{
     local_scheduler_error_kind,
 };
 
+#[path = "handlers/forced_summary_call.rs"]
+mod forced_summary_call;
 #[path = "handlers/injection_preview.rs"]
 mod injection_preview;
 #[path = "handlers/local_body_pipeline.rs"]
@@ -1463,6 +1465,9 @@ fn reported_usage_config_for_policy(policy: ReportedUsagePathPolicy) -> Reported
 struct PayloadTooLongRetryRequest {
     request: KiroRequest,
     config: PayloadGuardConfig,
+    /// Forced model mapping: an `Improperly formed request` rejection also flattens history tool
+    /// calls into text on the retry, so a structural problem trimming can't fix does not fail.
+    flatten_history_tool_uses: bool,
     endpoint: String,
     requested_model: String,
     upstream_model: Option<String>,
@@ -1540,7 +1545,8 @@ impl PayloadTooLongRetryRequest {
         if let Some(window_tokens) = forced_window_tokens.filter(|tokens| *tokens > 0) {
             // The client cannot compact for a window it does not know about, so the server
             // always trims and retries, whatever the payload guard settings are. Weight is at least
-            // one unit per token, so 90% of the window keeps the retry inside it.
+            // one unit per token; the retry targets 75% of the window, leaving room for the local
+            // estimate being low (the upstream already rejected the first, fitted attempt).
             config.enabled = true;
             config.trim_history = true;
             config.shaping.enabled = true;
@@ -1548,19 +1554,20 @@ impl PayloadTooLongRetryRequest {
             config.shaping.truncate_historical_tool_results = true;
             config.shaping.fit_current_payload_to_budget = true;
             config.shaping.truncate_current_tool_results = true;
-            let window_budget = (window_tokens as usize).saturating_mul(9) / 10;
-            let cap = |limit: usize| {
-                if limit == 0 {
-                    window_budget
-                } else {
-                    limit.min(window_budget)
-                }
-            };
-            config.max_kiro_weight = cap(config.max_kiro_weight).max(1);
-            config.max_bytes = cap(config.max_bytes).max(1);
+            let window_budget = (window_tokens as usize).saturating_mul(75) / 100;
+            config.max_kiro_weight = if config.max_kiro_weight == 0 {
+                window_budget
+            } else {
+                config.max_kiro_weight.min(window_budget)
+            }
+            .max(1);
+            if config.max_bytes == 0 {
+                config.max_bytes = (window_tokens as usize).saturating_mul(4);
+            }
             return Some(Self {
                 request: request.clone(),
                 config,
+                flatten_history_tool_uses: true,
                 endpoint: endpoint.to_string(),
                 requested_model: requested_model.to_string(),
                 upstream_model: upstream_model.map(str::to_string),
@@ -1591,6 +1598,7 @@ impl PayloadTooLongRetryRequest {
             .then(|| Self {
                 request: request.clone(),
                 config,
+                flatten_history_tool_uses: false,
                 endpoint: endpoint.to_string(),
                 requested_model: requested_model.to_string(),
                 upstream_model: upstream_model.map(str::to_string),
@@ -1600,11 +1608,33 @@ impl PayloadTooLongRetryRequest {
     }
 
     fn build_retry_body_after_provider_error(
-        self,
+        mut self,
         usage_context: &mut RequestUsageContext,
         attempts: &[KiroCredentialAttempt],
     ) -> Result<(String, Option<String>, KiroRequest), PayloadGuardError> {
         let base = payload_too_long_retry_base_for_provider_attempts(attempts);
+        let improperly_formed = attempts.last().is_some_and(|attempt| {
+            attempt
+                .error_message
+                .as_deref()
+                .is_some_and(is_upstream_improperly_formed_error)
+                || attempt
+                    .raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| is_upstream_improperly_formed_error(&raw.body))
+        });
+        if self.flatten_history_tool_uses && improperly_formed {
+            let flattened = self
+                .request
+                .conversation_state
+                .flatten_history_tool_uses_for_compatibility_retry();
+            tracing::warn!(
+            request_id = %usage_context.request_id,
+            endpoint = %self.endpoint,
+            flattened_tool_items = flattened,
+            "forced model mapping: improperly formed rejection, retrying with history tool calls as text"
+               );
+        }
         self.build_retry_body_with_base(usage_context, base)
     }
 
@@ -6271,10 +6301,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
     let display_identity = model_resolution
         .as_ref()
         .and_then(|resolution| resolution.forced.as_ref())
-        .map(|forced| super::identity_guard::DisplayIdentity {
-            name: forced.spec.display_name.to_string(),
-            id: forced.display_model.clone(),
-        });
+        .map(|forced| super::identity_guard::DisplayIdentity::for_forced(forced, payload));
     let prompt_cache_supported = state
         .model_capabilities
         .supports_prompt_caching_for(prompt_cache_model)
@@ -8044,6 +8071,117 @@ fn should_extract_unsigned_thinking(
         && runtime_config.compat_profile.allows_unsigned_thinking()
 }
 
+/// Forced model mapping, before anything is sent: a compaction block from the client replaces the
+/// turns before it; an on-demand compaction request is answered with the summary; otherwise the
+/// request is fitted into the serving window (summary checkpoint first, then trimming).
+#[allow(clippy::too_many_arguments)]
+async fn forced_request_pipeline(
+    state: &AppState,
+    provider: &Arc<KiroProvider>,
+    endpoint: &str,
+    runtime_config: &Arc<RequestRuntimeConfig>,
+    cache_route: &ResolvedCacheRoutePolicy,
+    model_resolution: &ModelResolution,
+    payload: &mut MessagesRequest,
+    on_demand_compaction: Option<String>,
+) -> Option<Response> {
+    let forced = model_resolution.forced.as_ref()?;
+    if super::forced_summary::apply_client_compaction_block(&mut payload.messages) {
+        tracing::info!(
+            endpoint,
+            "forced model mapping applied a client compaction block"
+        );
+    }
+    let summary_context = forced_summary_call::SummaryContext {
+        state: state.clone(),
+        provider: provider.clone(),
+        endpoint: endpoint.to_string(),
+        runtime_config: runtime_config.clone(),
+        cache_route: cache_route.clone(),
+        model_resolution: ModelResolution {
+            forced: None,
+            ..model_resolution.clone()
+        },
+        display_name: forced.spec.display_name.to_string(),
+        display_id: forced.spec.canonical_id.to_string(),
+    };
+    // On-demand compaction (top-level `compaction`): the response is the summary itself.
+    if let Some(instructions) = on_demand_compaction {
+        return Some(
+            forced_summary_call::on_demand_compaction_response(
+                payload,
+                summary_context,
+                &forced.display_model,
+                (!instructions.trim().is_empty()).then_some(instructions),
+            )
+            .await,
+        );
+    }
+    apply_forced_context_fitting(payload, forced, runtime_config, endpoint, summary_context).await;
+    None
+}
+
+/// Forced model mapping, before conversion: drop the hosted code execution tool when this route
+/// has no local executor, run the client's context edits, and fit the request into the serving
+/// window.
+async fn apply_forced_context_fitting(
+    payload: &mut MessagesRequest,
+    forced: &super::forced_model::ForcedTarget,
+    runtime_config: &RequestRuntimeConfig,
+    endpoint: &str,
+    summary_context: forced_summary_call::SummaryContext,
+) {
+    let Some(config) = runtime_config.forced_model_mapping_for(endpoint) else {
+        return;
+    };
+    // The target cannot run Anthropic's hosted code execution; without the local executor for
+    // this route the tool would come back as a call nobody can run, so it is dropped.
+    if !runtime_config
+        .body_conversion
+        .code_execution
+        .enabled_for_route(endpoint)
+    {
+        super::code_execution::drop_native_code_execution_tools(payload);
+    }
+    let (cleared_by_edits, thinking_by_edits) = super::forced_backoff::apply_context_edits(payload);
+    if cleared_by_edits + thinking_by_edits > 0 {
+        tracing::info!(
+            endpoint,
+            cleared_tool_results = cleared_by_edits,
+            removed_thinking_blocks = thinking_by_edits,
+            "forced model mapping applied the client's context edits"
+        );
+    }
+    let budget = super::forced_backoff::input_budget(
+        forced.target_window_tokens,
+        payload.max_tokens,
+        &config.context_backoff,
+    );
+    // Condense early turns into a checkpoint summary first; trimming only handles what is left.
+    let summarized = forced_summary_call::apply_summary_checkpoint(
+        payload,
+        summary_context,
+        budget,
+        &config.context_backoff,
+    )
+    .await;
+    let report = super::forced_backoff::fit_to_budget(payload, budget, &config.context_backoff);
+    if report.changed() || summarized {
+        tracing::info!(
+            endpoint,
+            summarized,
+            budget_tokens = report.budget_tokens,
+            original_tokens = report.original_tokens,
+            final_tokens = report.final_tokens,
+            removed_thinking_blocks = report.removed_thinking_blocks,
+            cleared_tool_results = report.cleared_tool_results,
+            removed_messages = report.removed_messages,
+            truncated_blocks = report.truncated_blocks,
+            "forced model mapping fitted the request into the target context window"
+        );
+    }
+}
+
 fn websearch_supported_for_profile(profile: CompatProfile) -> bool {
     !profile.is_strict()
 }
@@ -8496,6 +8634,13 @@ async fn post_messages_inner(
         .request_capture
         .enabled
         .then(|| raw_body.clone());
+    // On-demand compaction (top-level `compaction`), read before the body moves on. Only forced
+    // requests act on it.
+    let on_demand_compaction = runtime_config
+        .forced_model_mapping_for(&endpoint)
+        .is_some()
+        .then(|| super::forced_summary::on_demand_compaction_instructions(&effective_raw_body))
+        .flatten();
     let mut external_fallback = build_external_fallback_context(
         &state,
         &runtime_config,
@@ -8672,6 +8817,28 @@ async fn post_messages_inner(
         external.model_resolution = Some(external_route_model_resolution(model_resolution.clone()));
     }
 
+    // Forced model mapping: fit the request into the target window before anything is sent,
+    // the web search loop included. The client keeps sending the history it would send the model
+    // it asked for; trimming here keeps every request inside the serving window.
+    if model_resolution.forced.is_some() {
+        // Boxed: the forced pipeline owns large clones and nests model calls; inlining it would
+        // grow every request's future (and overflow small debug-build stacks).
+        if let Some(response) = Box::pin(forced_request_pipeline(
+            &state,
+            &provider,
+            &endpoint,
+            &runtime_config,
+            &cache_route,
+            &model_resolution,
+            &mut payload,
+            on_demand_compaction,
+        ))
+        .await
+        {
+            return response;
+        }
+    }
+
     if websearch::has_misnamed_native_web_search_tool(&payload) {
         let response = envelope::error_response(
             StatusCode::BAD_REQUEST,
@@ -8696,6 +8863,7 @@ async fn post_messages_inner(
         .route_features_for(&endpoint)
         .model_driven_web_search
         || (model_resolution.forced.is_some()
+            && websearch_supported_for_profile(runtime_config.compat_profile)
             && !runtime_config
                 .route_features
                 .defaults
@@ -9005,54 +9173,6 @@ async fn post_messages_inner(
         };
     }
 
-    // Forced model mapping: fit the request into the target window before conversion. The
-    // client keeps sending the history it would send the model it asked for; trimming here
-    // keeps every request inside the serving window without an upstream rejection first.
-    if let (Some(forced), Some(config)) = (
-        model_resolution.forced.as_ref(),
-        runtime_config.forced_model_mapping_for(&endpoint),
-    ) {
-        // The target cannot run Anthropic's hosted code execution; without the local executor
-        // for this route the tool would come back as a call nobody can run, so it is dropped.
-        if !runtime_config
-            .body_conversion
-            .code_execution
-            .enabled_for_route(&endpoint)
-        {
-            super::code_execution::drop_native_code_execution_tools(&mut payload);
-        }
-        let (cleared_by_edits, thinking_by_edits) =
-            super::forced_backoff::apply_context_edits(&mut payload);
-        if cleared_by_edits + thinking_by_edits > 0 {
-            tracing::info!(
-                endpoint,
-                cleared_tool_results = cleared_by_edits,
-                removed_thinking_blocks = thinking_by_edits,
-                "forced model mapping applied the client's context edits"
-            );
-        }
-        let budget = super::forced_backoff::input_budget(
-            forced.target_window_tokens,
-            payload.max_tokens,
-            &config.context_backoff,
-        );
-        let report =
-            super::forced_backoff::fit_to_budget(&mut payload, budget, &config.context_backoff);
-        if report.changed() {
-            tracing::info!(
-                endpoint,
-                budget_tokens = report.budget_tokens,
-                original_tokens = report.original_tokens,
-                final_tokens = report.final_tokens,
-                removed_thinking_blocks = report.removed_thinking_blocks,
-                cleared_tool_results = report.cleared_tool_results,
-                removed_messages = report.removed_messages,
-                truncated_blocks = report.truncated_blocks,
-                "forced model mapping fitted the request into the target context window"
-            );
-        }
-    }
-
     let local_cache_route = cache_route_for_local_request(
         cache_route,
         &payload,
@@ -9206,8 +9326,9 @@ async fn post_messages_inner(
     let response = if payload.stream {
         let claude_code_noop_delta_keepalive =
             should_use_claude_code_noop_delta_keepalive(request_user_agent(&headers));
-        // 流式响应
-        handle_stream_request(
+        // 流式响应。Boxed: the stream and non-stream handlers each hold a large future; inlined,
+        // both would sit in this handler's future (and overflow small debug-build stacks).
+        Box::pin(handle_stream_request(
             provider,
             &request_body,
             kiro_request,
@@ -9241,12 +9362,12 @@ async fn post_messages_inner(
             runtime_config.stream_pre_output_hold_secs,
             runtime_config.stream_first_output_timeout_secs,
             runtime_config.kiro_upstream_stream_max_duration_secs,
-        )
+        ))
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = should_extract_unsigned_thinking(&runtime_config, thinking_enabled);
-        handle_non_stream_request(
+        Box::pin(handle_non_stream_request(
             provider,
             &request_body,
             &kiro_request,
@@ -9273,7 +9394,7 @@ async fn post_messages_inner(
             external_fallback,
             LocalStreamRetryConfig::from_runtime_config(&runtime_config, &local_injections),
             capacity_weight_units,
-        )
+        ))
         .await
     };
     pre_response_usage_guard.disarm();
@@ -14703,6 +14824,9 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
+    // Forced mapping: the serving window filled up (reported as `max_tokens` unless the turn
+    // made tool calls, see below).
+    let mut forced_context_window_full = false;
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut metadata_usage: Option<crate::kiro::model::events::MetadataTokenUsage> = None;
@@ -14807,11 +14931,22 @@ async fn handle_non_stream_request(
                     } else {
                         match parse_non_stream_tool_input(&buffer) {
                             Ok(input) => input,
+                            // Forced mapping: the client's model would not fail the whole turn here;
+                            // the call goes out with an empty input and the client's tool reports
+                            // the missing arguments, which the model can see and retry.
+                            Err(error) if credential_usage.request.display_identity.is_some() => {
+                                tracing::warn!(
+                                    error = %error,
+                                    tool_use_id = %tool_use.tool_use_id,
+                                    "非流式工具输入 JSON 解析失败（强制模型收敛：以空入参下发）"
+                                );
+                                serde_json::json!({})
+                            }
                             Err(error) => {
                                 tracing::warn!(
-                                        error = %error,
-                                        tool_use_id = %tool_use.tool_use_id,
-                                        "非流式工具输入 JSON 解析失败"
+                                    error = %error,
+                                    tool_use_id = %tool_use.tool_use_id,
+                                    "非流式工具输入 JSON 解析失败"
                                 );
                                 credential_usage.record_failure(
                                     UsageRecordStatus::Error,
@@ -14880,12 +15015,13 @@ async fn handle_non_stream_request(
                     context_input_tokens = Some(actual_input_tokens);
                 }
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if percentage.is_finite()
-                    && percentage >= 100.0
-                    && content_filter_refusal.is_none()
-                    && credential_usage.request.display_identity.is_none()
+                if percentage.is_finite() && percentage >= 100.0 && content_filter_refusal.is_none()
                 {
-                    stop_reason = "model_context_window_exceeded".to_string();
+                    if credential_usage.request.display_identity.is_none() {
+                        stop_reason = "model_context_window_exceeded".to_string();
+                    } else {
+                        forced_context_window_full = true;
+                    }
                 }
                 tracing::debug!(
                     "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
@@ -15167,6 +15303,10 @@ async fn handle_non_stream_request(
     {
         stop_reason = "tool_use".to_string();
     }
+    // The client's model has a larger window: a cut-off answer is continued, not taken as done.
+    if forced_context_window_full && !has_tool_use && stop_reason == "end_turn" {
+        stop_reason = "max_tokens".to_string();
+    }
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
@@ -15399,15 +15539,20 @@ async fn handle_non_stream_request(
         thinking_tokens_from_content(&content, reported_usage.output_tokens),
     );
     let response_body = json!({
-        "id": envelope::message_id(),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": credential_usage.request.model.as_str(),
-        "stop_reason": stop_reason,
-        "stop_sequence": matched_stop_sequence,
-        "usage": usage_json
-    });
+           "id": envelope::message_id(),
+           "type": "message",
+           "role": "assistant",
+           "content": content,
+           "model": credential_usage.request.model.as_str(),
+    "stop_reason": stop_reason,
+           "stop_sequence": matched_stop_sequence,
+           "stop_details": content_filter_refusal
+        .as_deref()
+        .filter(|_| stop_reason == super::stream::REFUSAL_STOP_REASON)
+        .map(super::stream::refusal_stop_details)
+        .unwrap_or(serde_json::Value::Null),
+    "usage": usage_json
+       });
 
     envelope::json_response_with_id(
         StatusCode::OK,

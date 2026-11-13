@@ -1471,6 +1471,25 @@ pub async fn get_forced_model_targets(
     Json(state.service.forced_model_targets(query.models.as_deref()))
 }
 
+/// GET /api/admin/forced-model-mapping/knowledge?text=...
+/// 内置知识条目，以及一段用户文字会命中的条目（预览）
+pub async fn get_forced_model_knowledge(
+    State(state): State<AdminState>,
+    Query(query): Query<ForcedModelKnowledgeQuery>,
+) -> impl IntoResponse {
+    Json(
+        state
+            .service
+            .forced_model_knowledge(query.text.as_deref().filter(|text| !text.trim().is_empty())),
+    )
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ForcedModelKnowledgeQuery {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ForcedModelTargetsQuery {
     #[serde(default)]

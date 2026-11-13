@@ -1,5 +1,6 @@
 import { api } from '@/api/http'
 import type {
+  ForcedKnowledgeEntry,
   SubscriptionModelListsResponse,
   AdminAuditLogPage,
   AccountEventSummaryResponse,
@@ -271,6 +272,20 @@ export async function getForcedModelTargets(models: string[]): Promise<ForcedMod
     params: { models: models.join(',') },
   })
   return data.targets
+}
+
+export interface ForcedModelKnowledgeStatus {
+  builtin: ForcedKnowledgeEntry[]
+  configuredCount: number
+  preview: { text: string; facts: string[]; block: string | null } | null
+}
+
+/** 内置知识条目，以及一段用户文字会命中的条目。 */
+export async function getForcedModelKnowledge(text: string): Promise<ForcedModelKnowledgeStatus> {
+  const { data } = await api.get<ForcedModelKnowledgeStatus>('/forced-model-mapping/knowledge', {
+    params: text.trim() ? { text } : {},
+  })
+  return data
 }
 
 export async function getModelCapabilities(): Promise<ModelCapabilitiesStatus> {

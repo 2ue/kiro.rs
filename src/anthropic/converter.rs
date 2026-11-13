@@ -654,17 +654,6 @@ fn convert_request_with_model_id(
         content.push_str(&reminder);
         applied_injections.push(InjectionId::LanguageTurnReminder);
     }
-    // Forced model mapping: facts about topics the user asked about this turn, only on turns the
-    // user wrote text in, like the other turn reminders.
-    if let Some(block) = options
-        .forced
-        .as_ref()
-        .and_then(|forced| forced.knowledge_block.as_deref())
-        .filter(|_| turn_has_user_text)
-    {
-        content.push_str("\n\n");
-        content.push_str(block);
-    }
     if turn_has_user_text && options.allows(InjectionId::IdentityTurnReminder) {
         let reminder = options
             .injections
@@ -722,10 +711,20 @@ fn convert_request_with_model_id(
         && requested_native_reasoning(req)
         && !options.inject_thinking_prefix()
     {
-        return Err(ConversionError::UnsupportedContent(
-            "reasoning was requested, but both native reasoning fields and compatible thinking prompt controls are unavailable"
-                .to_string(),
-        ));
+        // Forced model mapping turns thinking on from the display model's defaults, not because
+        // the client asked for it; without a way to carry it on this route, the request goes out
+        // without thinking instead of failing.
+        if options.forced.is_some() {
+            tracing::warn!(
+                   model_id = %model_id,
+            "forced model mapping: no thinking control on this route, sending without thinking"
+               );
+        } else {
+            return Err(ConversionError::UnsupportedContent(
+         "reasoning was requested, but both native reasoning fields and compatible thinking prompt controls are unavailable"
+      .to_string(),
+     ));
+        }
     }
     if additional_model_request_fields.is_none() {
         if let Some(oc) = &req.output_config {
@@ -5515,7 +5514,7 @@ mod tests {
     }
 
     #[test]
-    fn named_tool_choice_rejects_ambiguous_normalized_fallback_across_modes() {
+    fn named_tool_choice_keeps_all_tools_on_ambiguous_normalized_fallback_across_modes() {
         for compat_profile in [CompatProfile::ClaudeCode, CompatProfile::AnthropicStrict] {
             for prompt_master_enabled in [false, true] {
                 let mut req = base_tool_choice_request(serde_json::json!({
@@ -5529,9 +5528,17 @@ mod tests {
                 };
                 options.injections = tool_choice_items(prompt_master_enabled, compat_profile);
 
-                let error = convert_request_with_options(&req, options)
-                    .expect_err("ambiguous normalized tool choice must fail locally");
-                assert!(error.to_string().contains("tool_choice name is ambiguous"));
+                // A name that only matches after normalization is a conversion artifact, not a
+                // client error: every tool stays, like the no-match case.
+                let result = convert_request_with_options(&req, options)
+                    .expect("ambiguous normalized tool choice keeps all tools");
+                let tools = &result
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tools;
+                assert_eq!(tools.len(), 2);
             }
         }
     }
@@ -7984,7 +7991,7 @@ mod tests {
             text.contains("snippet a") && text.contains("https://example.com/a"),
             "{text}"
         );
-        assert!(text.contains("[tool_reference block omitted]"), "{text}");
+        assert!(text.contains("[tool loaded: Grep]"), "{text}");
         assert!(
             !text.contains(&pdf_like_text),
             "base64 payload must not leak: {text}"

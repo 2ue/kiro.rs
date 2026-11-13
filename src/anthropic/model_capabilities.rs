@@ -523,6 +523,8 @@ impl ModelCapabilitiesCatalog {
                     max_tokens,
                     max_input_tokens,
                     context_window: max_input_tokens,
+                    official_max_input_tokens: None,
+                    capabilities: None,
                 },
             );
         }
@@ -1917,6 +1919,8 @@ pub fn static_anthropic_models() -> Vec<Model> {
             max_tokens,
             max_input_tokens: None,
             context_window: None,
+            official_max_input_tokens: None,
+            capabilities: None,
         })
         .collect()
 }

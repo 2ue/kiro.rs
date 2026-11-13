@@ -399,7 +399,7 @@ pub(super) fn prepare_with_plan(
             endpoint,
             model_resolution.upstream_model.as_deref(),
             &conversation_id,
-            should_expose_proxy_warnings(runtime_config)
+            (should_expose_proxy_warnings(runtime_config) && model_resolution.forced.is_none())
                 .then(|| conversion_result.warnings.encode_header())
                 .flatten(),
             model_resolution
@@ -498,14 +498,16 @@ pub(super) fn prepare_with_plan(
         0
     };
     let thinking_enabled = should_expose_downstream_thinking(payload, &kiro_request);
-    let warnings_header = if should_expose_proxy_warnings(runtime_config) {
-        merge_warning_headers(
-            conversion_result.warnings.encode_header(),
-            payload_guard_report.as_ref(),
-        )
-    } else {
-        None
-    };
+    // A forced mapping never writes the proxy warnings header: its name alone reveals the channel.
+    let warnings_header =
+        if should_expose_proxy_warnings(runtime_config) && model_resolution.forced.is_none() {
+            merge_warning_headers(
+                conversion_result.warnings.encode_header(),
+                payload_guard_report.as_ref(),
+            )
+        } else {
+            None
+        };
     let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
     let cache_point_retry = if plan.retry_payloads.is_enabled() {
         CachePointRetryRequest::new(

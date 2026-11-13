@@ -45,6 +45,8 @@ pub(super) async fn handle_messages_endpoint(
         shared_dispatch_max_wait_secs.max(1),
     ));
     let mut defaulted_max_tokens = None;
+    // `between_tools` is aliased to adaptive below; a forced mapping needs the original value.
+    let between_tools_requested = raw_thinking_type_is(&raw_body, "between_tools");
     let mut raw_probe = probe_raw_messages_body(&raw_body);
     if let Err(error) = apply_missing_max_tokens_policy_with_probe(
         &mut raw_body,
@@ -64,6 +66,9 @@ pub(super) async fn handle_messages_endpoint(
     }
     if defaulted_max_tokens.is_some() {
         raw_probe = probe_raw_messages_body(&raw_body);
+    }
+    if let Some(response) = forced_cache_prewarm_response(&raw_probe, &runtime_config, &endpoint) {
+        return response;
     }
     if let Some(probe_error) = raw_probe.scan_error() {
         let request_id = envelope::request_id();
@@ -308,6 +313,7 @@ pub(super) async fn handle_messages_endpoint(
             requires_normalized_body,
             attribution,
             raw_preflight_failure,
+            between_tools_requested,
         )
         .await;
     }
@@ -325,6 +331,7 @@ pub(super) async fn handle_messages_endpoint(
         requires_normalized_body,
         attribution,
         None,
+        between_tools_requested,
     )
     .await
 }
@@ -344,6 +351,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     requires_normalized_body: bool,
     attribution: Option<RequestRejectionAttribution>,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
+    between_tools_requested: bool,
 ) -> Response {
     let runtime_config = state
         .kiro_provider
@@ -381,6 +389,12 @@ async fn continue_messages_endpoint_after_raw_external_routes(
                     &raw_body,
                     &mut payload,
                 );
+                super::super::forced_model::apply_deferred_tool_loading(&raw_body, &mut payload);
+                super::super::forced_model::apply_tool_input_examples(&raw_body, &mut payload);
+                if between_tools_requested && let Some(thinking) = payload.thinking.as_mut() {
+                    // Restored for the forced mapping, which serves it as "no up-front thinking".
+                    thinking.thinking_type = "between_tools".to_string();
+                }
             }
             payload
         }
@@ -724,6 +738,97 @@ fn parse_messages_payload_with_probe(
     parse_messages_payload_with_probe_and_roles(raw_body, probe, request_id, compat, false)
 }
 
+/// `max_tokens: 0` (cache pre-warm) for a model the forced mapping serves: the official response
+/// is an empty message ending in `max_tokens`, so it is answered here instead of being rejected.
+fn forced_cache_prewarm_response(
+    probe: &RawMessagesBodyProbe,
+    runtime_config: &RequestRuntimeConfig,
+    endpoint: &str,
+) -> Option<Response> {
+    if probe.max_tokens != Some(0) || probe.scan_error().is_some() {
+        return None;
+    }
+    let model = probe.model.as_deref()?;
+    let config = runtime_config.forced_model_mapping_for(endpoint)?;
+    super::super::forced_model::resolve_forced_target(model, config)?;
+    let request_id = envelope::request_id();
+    let message_id = envelope::message_id();
+    let usage = serde_json::json!({
+           "input_tokens": 0,
+    "output_tokens": 0,
+           "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+       });
+    let message = serde_json::json!({
+           "id": message_id,
+    "type": "message",
+           "role": "assistant",
+    "model": model,
+    "content": [],
+           "stop_reason": "max_tokens",
+    "stop_sequence": null,
+           "usage": usage,
+       });
+    tracing::info!(
+        endpoint,
+        model,
+        "forced model mapping answered a max_tokens: 0 pre-warm request"
+    );
+    if probe.stream != Some(true) {
+        let mut response = Json(message).into_response();
+        if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert("request-id", value.clone());
+            response.headers_mut().insert("anthropic-request-id", value);
+        }
+        return Some(response);
+    }
+    let mut start = message.clone();
+    start["stop_reason"] = serde_json::Value::Null;
+    let events = [
+        super::super::stream::SseEvent::new(
+            "message_start",
+            serde_json::json!({"type": "message_start", "message": start}),
+        ),
+        super::super::stream::SseEvent::new(
+            "message_delta",
+            serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "max_tokens", "stop_sequence": null},
+            "usage": usage,
+               }),
+        ),
+        super::super::stream::SseEvent::new(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}),
+        ),
+    ];
+    let body: String = events.iter().map(|event| event.to_sse_string()).collect();
+    envelope::sse_builder_with_id(&request_id)
+        .body(axum::body::Body::from(body))
+        .ok()
+}
+
+/// Whether the top-level `thinking.type` of a raw request body is `kind`.
+fn raw_thinking_type_is(raw_body: &[u8], kind: &str) -> bool {
+    let needle = format!("\"{kind}\"");
+    if !raw_body
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+    {
+        return false;
+    }
+    serde_json::from_slice::<Value>(raw_body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("thinking")?
+                .get("type")?
+                .as_str()
+                .map(|value| value == kind)
+        })
+        .unwrap_or(false)
+}
+
 fn parse_messages_payload_with_probe_and_roles(
     raw_body: &Bytes,
     probe: &RawMessagesBodyProbe,
@@ -776,7 +881,7 @@ fn normalize_message_roles(payload: &mut MessagesRequest, keep_position: bool) {
             "system" | "developer" if keep_position && !kept.is_empty() => {
                 let text = message_content_text(&message.content);
                 if !text.trim().is_empty() {
-                    append_reminder_to_user_turn(&mut kept, &text);
+                    insert_instruction_turn(&mut kept, &text);
                 }
                 moved += 1;
             }
@@ -803,35 +908,58 @@ fn normalize_message_roles(payload: &mut MessagesRequest, keep_position: bool) {
     );
 }
 
-/// Appends an operator instruction as a reminder block to the user turn it follows. Folded into
-/// that turn, the model reads it as part of the current request, which it follows reliably; a
-/// separate trailing turn is often ignored. Without a user turn before it, a new one is added.
-fn append_reminder_to_user_turn(kept: &mut Vec<crate::anthropic::types::Message>, text: &str) {
-    let block = serde_json::json!({
-        "type": "text",
-        "text": format!("<system-reminder>\n{text}\n</system-reminder>"),
+/// Places a mid-conversation operator instruction where the client put it, as its own exchange:
+/// the instruction as a user turn and an assistant turn acknowledging it. The serving upstream
+/// has no system role, and a `<system-reminder>` block folded into a turn is read as background
+/// context and not followed (0 of 9 in A/B runs); the exchange is followed (6 of 6), after tool
+/// results too, and replays as a fixed prefix.
+fn insert_instruction_turn(kept: &mut Vec<crate::anthropic::types::Message>, text: &str) {
+    let message = |role: &str, content: String| crate::anthropic::types::Message {
+        role: role.to_string(),
+        content: Value::String(content),
+    };
+    let instruction = message("user", text.trim().to_string());
+    let acknowledgement = message(
+        "assistant",
+        super::super::forced_model::instruction_acknowledgement(text),
+    );
+    let follows_tool_results = kept.last().is_some_and(|last| {
+        last.role == "user"
+            && last.content.as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
     });
-    match kept.last_mut() {
-        Some(last) if last.role == "user" => {
-            let blocks = match std::mem::take(&mut last.content) {
-                Value::Array(blocks) => blocks,
-                Value::String(text) if text.is_empty() => Vec::new(),
-                Value::String(text) => vec![serde_json::json!({"type": "text", "text": text})],
-                Value::Null => Vec::new(),
-                other => {
-                    vec![serde_json::json!({"type": "text", "text": scalar_content_text(&other)})]
-                }
-            };
-            let mut blocks = blocks;
-            blocks.push(block);
-            last.content = Value::Array(blocks);
-        }
-        _ => kept.push(crate::anthropic::types::Message {
-            role: "user".to_string(),
-            content: Value::Array(vec![block]),
-        }),
+    if follows_tool_results {
+        // After tool results the tool turn stays where it is and the instruction follows it as
+        // its own exchange, then the agent turn continues: the result is acknowledged, the
+        // instruction is acknowledged, and a continue turn resumes the work with the results (A/B: 7–8 of 8, against
+        // 2 of 8 folded into the tool-result turn). Everything is appended, so earlier messages
+        // never change and the cache prefix stays valid.
+        kept.push(message(
+            "assistant",
+            TOOL_RESULT_ACKNOWLEDGEMENT.to_string(),
+        ));
+        kept.push(instruction);
+        kept.push(acknowledgement);
+        kept.push(message("user", CONTINUE_AFTER_INSTRUCTION.to_string()));
+        return;
     }
+    // In front of the user turn the instruction follows (the request it applies to); after an
+    // assistant turn, at the end.
+    let at = match kept.last() {
+        Some(last) if last.role == "user" => kept.len() - 1,
+        _ => kept.len(),
+    };
+    kept.insert(at, acknowledgement);
+    kept.insert(at, instruction);
 }
+
+/// The assistant turn closing tool results before a mid-conversation instruction.
+const TOOL_RESULT_ACKNOWLEDGEMENT: &str = "Got the result.";
+/// The user turn resuming the agent turn after a mid-conversation instruction.
+const CONTINUE_AFTER_INSTRUCTION: &str = "Continue with the task using the tool results above.";
 
 fn message_content_text(content: &Value) -> String {
     match content {
@@ -1209,7 +1337,7 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{}", error.message));
         let roles: Vec<&str> = payload.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, ["user", "assistant", "user"]);
+        assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"]);
         // A system message before any turn has no position to keep and joins the system prompt.
         let system: Vec<&str> = payload
             .system
@@ -1219,13 +1347,54 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(system, ["base", "leading"]);
-        // The trailing one is folded into the user turn it follows, as a reminder block.
-        let last = payload.messages.last().unwrap().content.as_array().unwrap();
-        assert_eq!(last.len(), 2);
-        assert_eq!(last[0]["text"], "again");
+        // The trailing one becomes its own exchange in front of the user turn it applies to.
+        assert_eq!(payload.messages[2].content, json!("answer in English"));
         assert_eq!(
-            last[1]["text"],
-            "<system-reminder>\nanswer in English\n</system-reminder>"
+            payload.messages[3].content,
+            json!("Understood: answer in English")
+        );
+        let last = payload.messages.last().unwrap().content.as_array().unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0]["text"], "again");
+    }
+
+    #[test]
+    fn forced_mid_conversation_instructions_never_split_tool_calls_from_results() {
+        let raw = Bytes::from_static(
+     br#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"pick a color"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"pick","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"green"}]},{"role":"system","content":"From now on answer only in French."}]}"#,
+        );
+        let probe = probe_raw_messages_body(&raw);
+        let payload = parse_messages_payload_with_probe_and_roles(
+            &raw,
+            &probe,
+            "req_forced_roles_tools",
+            &crate::model::config::LocalRequestCompatConfig::default(),
+            true,
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        let roles: Vec<&str> = payload.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            [
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user"
+            ]
+        );
+        // The tool call and its result stay adjacent and unchanged; the instruction follows as its
+        // own exchange and the agent turn continues.
+        assert_eq!(payload.messages[2].content[0]["type"], json!("tool_result"));
+        assert_eq!(
+            payload.messages[4].content,
+            json!("From now on answer only in French.")
+        );
+        assert_eq!(
+            payload.messages[6].content,
+            json!(CONTINUE_AFTER_INSTRUCTION)
         );
     }
 

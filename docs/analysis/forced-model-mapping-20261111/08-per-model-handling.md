@@ -42,7 +42,7 @@
 | refusal / stop_details | 分类器可能返回 `stop_reason: refusal` | 目标模型拒答时用文字说明，不模拟 refusal，按原样返回 |
 | fallbacks / inference_geo / speed | 服务端参数 | 接受并忽略 |
 | 工具版本 | `web_fetch_20260318`、`code_execution_20250825/_20260120/_20260521`、`tool_search_tool_*`、`computer_20251124`、advisor | web_fetch 补输入约定；code_execution 按前缀处理（本地执行未开启时移除）；tool_search 与 advisor 静默移除；computer 补输入约定并换算坐标 |
-| 中途 system 消息 | 支持，从该位置起生效 | 并入其后的当轮用户消息，作为提醒块 |
+| 中途 system 消息 | 支持，从该位置起生效 | 在原位置转成一对独立的指令 / 确认消息（03 篇） |
 | `clear_at: "next_user_message"`（beta） | 只在下一条用户消息之前生效，之后的副本不再渲染 | 已被后续用户消息清除的副本从提醒中移除，最新一条保留 |
 | 逐条消息 effort（beta `mid-conversation-output-config-2026-07-01`） | `content` 为空、只带 `output_config.effort` 的 system 消息，从该位置起改变 effort | 取最后一条的 effort 写入请求的 `output_config.effort`，再换算思考长度；消息本身不渲染 |
 | preserved thinking | thinking 块绑定生成它的模型与对话，编辑历史会失效 | 不模拟；历史中的合成签名照常回放，不报错 |

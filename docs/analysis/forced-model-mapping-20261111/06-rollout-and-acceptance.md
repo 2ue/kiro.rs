@@ -5,7 +5,7 @@
 | 期 | 内容 | 依赖 |
 |---|---|---|
 | P1 核心映射 | 配置结构、入口改写、`display_model` 贯穿所有对外字段、保存配置时校验目标模型、开关关闭时路径保持不变 | 无 |
-| P2 协议补全 | 03 篇第 1–3 节：替换模型前，按外显模型固定 thinking 和 display 的默认值；effort 换算成 enabled 和思考长度；中途 system 消息保留原位置，转成当轮文本块；在本地执行 context_management 的 clear 类操作 | P1 |
+| P2 协议补全 | 03 篇第 1–3 节：替换模型前，按外显模型固定 thinking 和 display 的默认值；effort 换算成 enabled 和思考长度；中途 system 消息保留原位置，转成一对指令 / 确认消息；在本地执行 context_management 的 clear 类操作 | P1 |
 | P3 上下文退避 | 04 篇：本地 token 预检；L0–L2、L4、L5；上游拒绝后内部重试；强制模式下不走 client_compaction，也不对外返回 prompt too long；`model_context_window_exceeded` 改为 `end_turn` | P1 |
 | P4 隐藏补全 | 05 篇：错误文案替换、`/v1/models` 口径、公开页、模型自述的提示词与输出改写 | P1 |
 | P5 工具补全 | 03 篇第 4 节：给 Anthropic 定义的工具补 schema；mcp_toolset 和 advisor 静默移除；tool_search 移除；本地执行未开启时移除 code_execution；强制模式下默认开启模型驱动的 web search | P2 |
@@ -23,7 +23,7 @@
 | 入口 | `src/anthropic/handlers/request_entry.rs`、`handlers/parsed_body_pipeline.rs` | 先按外显模型固定 thinking 和 display 的默认值，再改写模型并保存 `display_model`；`normalize_message_roles` 在强制模式下保留中途 system 消息的原位置 |
 | 对外字段 | `src/anthropic/handlers.rs`（流式模板、非流式响应、usage、错误） | 所有对外字段里用到 `payload.model` 的地方，统一改成 `display_model`。OpenAI 兼容出口已经用的是客户端模型，不需要改 |
 | thinking | `src/anthropic/converter/thinking.rs`、`handlers.rs`（`request_hides_reasoning`） | 强制模式下把 adaptive / effort 转成 enabled 加思考长度；display 默认值改为看外显模型 |
-| 历史 | `src/anthropic/converter/history.rs` | 保留原位置的中途 system 消息，渲染成当轮 user 文本块；处理 `clear_at` |
+| 历史 | `src/anthropic/converter/history.rs` | 保留原位置的中途 system 消息，渲染成一对指令 / 确认消息；处理 `clear_at` |
 | 工具 | `src/anthropic/converter/tools.rs`、`websearch.rs`、`code_execution.rs` | 补 schema、匹配版本前缀、静默移除 |
 | 上下文 | `src/anthropic/payload_guard*.rs`、`handlers/local_body_pipeline.rs`、`handlers.rs`（错误映射、压缩请求预算）、`stream.rs`（`model_context_window_exceeded`） | 本地预检，按级退避；强制模式下不对外返回 prompt too long，也不对外返回"窗口已满" |
 | 隐藏 | `src/anthropic/envelope.rs`、`model_capabilities.rs`（模型列表）、`src/admin/public_pool.rs`、`identity_guard.rs`、`prompt_injection` | 文案替换、模型列表口径、公开页、自述改写 |

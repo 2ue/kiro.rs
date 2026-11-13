@@ -333,9 +333,14 @@ fn selected_tool_indices(
                     Ok((0..tools.len()).collect())
                 }
                 1 => Ok(normalized),
-                _ => Err(ConversionError::UnsupportedContent(
-                    "tool_choice name is ambiguous after tool-name normalization".to_string(),
-                )),
+                _ => {
+                    tracing::warn!(
+                        requested_tool = requested_name,
+                        matches = normalized.len(),
+                        "tool_choice name matches several tools after normalization; preserving all tools for compatibility"
+                    );
+                    Ok((0..tools.len()).collect())
+                }
             }
         }
         ToolChoiceDirective::Auto | ToolChoiceDirective::Any | ToolChoiceDirective::Unknown => {

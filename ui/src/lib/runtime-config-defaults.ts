@@ -526,6 +526,10 @@ export const FORCED_CONTEXT_BACKOFF_LIMITS = {
   minReservedOutputTokens: { min: 1024, max: 64000 },
   keepRecentToolResults: { min: 1, max: 64 },
   stepTokens: { min: 1000, max: 500000 },
+  maxReservedOutputTokens: { min: 1024, max: 64000 },
+  summaryPrecompactRatio: { min: 0.3, max: 0.95 },
+  summaryTargetRatio: { min: 0.2, max: 0.85 },
+  summaryTimeoutSecs: { min: 5, max: 300 },
 } as const
 
 export function defaultForcedModelRules(): ForcedModelRule[] {
@@ -541,6 +545,11 @@ export function defaultForcedContextBackoff(): ForcedContextBackoffConfig {
     minReservedOutputTokens: 8000,
     keepRecentToolResults: 8,
     stepTokens: 50000,
+    maxReservedOutputTokens: 32000,
+    summaryEnabled: true,
+    summaryPrecompactRatio: 0.75,
+    summaryTargetRatio: 0.45,
+    summaryTimeoutSecs: 120,
   }
 }
 
@@ -619,6 +628,11 @@ export function normalizeForcedModelMapping(input?: Partial<ForcedModelMappingCo
     minReservedOutputTokens: clampBackoffNumber(backoffInput.minReservedOutputTokens, backoffBase.minReservedOutputTokens, limits.minReservedOutputTokens.min, limits.minReservedOutputTokens.max, true),
     keepRecentToolResults: clampBackoffNumber(backoffInput.keepRecentToolResults, backoffBase.keepRecentToolResults, limits.keepRecentToolResults.min, limits.keepRecentToolResults.max, true),
     stepTokens: clampBackoffNumber(backoffInput.stepTokens, backoffBase.stepTokens, limits.stepTokens.min, limits.stepTokens.max, true),
+    maxReservedOutputTokens: clampBackoffNumber(backoffInput.maxReservedOutputTokens, backoffBase.maxReservedOutputTokens, limits.maxReservedOutputTokens.min, limits.maxReservedOutputTokens.max, true),
+    summaryEnabled: typeof backoffInput.summaryEnabled === 'boolean' ? backoffInput.summaryEnabled : backoffBase.summaryEnabled,
+    summaryPrecompactRatio: clampBackoffNumber(backoffInput.summaryPrecompactRatio, backoffBase.summaryPrecompactRatio, limits.summaryPrecompactRatio.min, limits.summaryPrecompactRatio.max, false),
+    summaryTargetRatio: clampBackoffNumber(backoffInput.summaryTargetRatio, backoffBase.summaryTargetRatio, limits.summaryTargetRatio.min, limits.summaryTargetRatio.max, false),
+    summaryTimeoutSecs: clampBackoffNumber(backoffInput.summaryTimeoutSecs, backoffBase.summaryTimeoutSecs, limits.summaryTimeoutSecs.min, limits.summaryTimeoutSecs.max, true),
   }
 
   const knowledge: ForcedKnowledgeEntry[] = (input?.knowledge ?? [])

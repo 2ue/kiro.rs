@@ -383,6 +383,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/forced-model-mapping/targets",
             get(super::handlers::get_forced_model_targets),
         )
+        .route(
+            "/forced-model-mapping/knowledge",
+            get(super::handlers::get_forced_model_knowledge),
+        )
         .route("/model-capabilities/sync", post(sync_model_capabilities))
         .route("/model-capabilities/manual", post(upsert_manual_model))
         .route(

@@ -69,6 +69,12 @@ pub struct Model {
     pub max_input_tokens: Option<i32>,
     #[serde(rename = "contextWindow", skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i32>,
+    /// Official snake_case `max_input_tokens` and `capabilities`, set for the display models a
+    /// forced mapping lists (the camelCase fields above stay for existing clients).
+    #[serde(rename = "max_input_tokens", skip_serializing_if = "Option::is_none")]
+    pub official_max_input_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
 }
 
 /// 模型列表响应（Claude Code 协议分页字段 + 旧 `object` 字段）
@@ -376,6 +382,8 @@ mod tests {
                 max_tokens: 1,
                 max_input_tokens: None,
                 context_window: None,
+                official_max_input_tokens: None,
+                capabilities: None,
             })
             .collect()
     }

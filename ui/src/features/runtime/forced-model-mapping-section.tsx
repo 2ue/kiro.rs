@@ -42,7 +42,7 @@ import type {
   ForcedModelRule,
   ModelCapabilitiesStatus,
 } from '@/types/api'
-import { useForcedModelTargets } from '@/hooks/use-usage'
+import { useForcedModelKnowledge, useForcedModelTargets } from '@/hooks/use-usage'
 import { NumField, TogField } from './runtime-sections'
 
 const FAMILY_LABEL: Record<string, string> = {
@@ -607,6 +607,7 @@ function KnowledgeTable({ entries, onChange }: { entries: ForcedKnowledgeEntry[]
   const confirm = useConfirm()
   const [editing, setEditing] = useState<KnowledgeDraft | null>(null)
   const [dialogKey, setDialogKey] = useState(0)
+  const [builtinOpen, setBuiltinOpen] = useState(false)
   const enabledCount = entries.filter((entry) => entry.enabled).length
 
   const openDialog = (draft: KnowledgeDraft) => {
@@ -638,11 +639,26 @@ function KnowledgeTable({ entries, onChange }: { entries: ForcedKnowledgeEntry[]
         <div className="text-xs leading-5 text-muted-foreground">
           {entries.length === 0 ? '未配置条目，使用内置条目。' : `已配置 ${entries.length} 条，启用 ${enabledCount} 条。`}
         </div>
-        <Button size="sm" variant="outline" onClick={() => openDialog(emptyKnowledgeDraft())}>
-          <Plus />
-          新增条目
-        </Button>
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" onClick={() => setBuiltinOpen(true)}>
+     内置条目与预览
+   </Button>
+   <Button size="sm" variant="outline" onClick={() => openDialog(emptyKnowledgeDraft())}>
+     <Plus />
+     新增条目
+          </Button>
+        </div>
       </div>
+      <BuiltinKnowledgeDialog
+ open={builtinOpen}
+ onClose={() => setBuiltinOpen(false)}
+        configuredCount={entries.length}
+        onCopyAll={(builtin) => {
+   const taken = new Set(entries.map((entry) => entry.id))
+          onChange([...entries, ...builtin.filter((entry) => !taken.has(entry.id))])
+          setBuiltinOpen(false)
+        }}
+      />
       {entries.length > 0 && enabledCount === 0 && (
         <div className="text-xs leading-5 text-warning">所有条目都已停用：不会提供任何知识，也不会改用内置条目。</div>
       )}
@@ -826,8 +842,8 @@ export function ForcedModelMappingSection({
 
       <SubBlock title="响应结构">
         <TogField
-          label="Opus 5.5 工具间文字作为思考块"
-          desc="外显模型为 Opus 5.5 且思考内容隐藏时，紧挨在工具调用之前的文字作为内容为空的 thinking 块下发，和官方模型返回的结构一致；后面没有工具调用的最终回答照常下发。默认开启。"
+          label="工具间文字作为思考块"
+   desc="外显模型为 Fable 全系、Mythos 5.1/5.2、Opus 5.5 或 Sonnet 5.5 时，紧挨在工具调用之前的文字作为 thinking 块下发（思考隐藏时内容为空，display 为 updates 时保留文字），和官方模型返回的结构一致；最后没有工具调用的回答照常下发。默认开启。"
           checked={mapping.interleavedTextAsThinking}
           onChange={(interleavedTextAsThinking) => onChange({ ...mapping, interleavedTextAsThinking })}
         />
@@ -835,9 +851,54 @@ export function ForcedModelMappingSection({
 
       <SubBlock
         title="上下文退避"
-        desc="客户端按外显模型的窗口（多为 1M）发送历史。超出目标模型窗口时，在转换前依次去掉旧的思考块、清理旧的工具结果、从最早的轮次删除历史，最后截断最大的单个内容块，直到放得下。窗口取目标模型在模型目录里的输入上限，没有时按 200K。"
+ desc="客户端按外显模型的窗口（多为 1M）发送历史。超出目标模型窗口时，先把早期对话浓缩成一段工作记录（摘要检查点），放不下再依次去掉旧的思考块、清理旧的工具结果、从最早的轮次删除历史、截断最大的单个内容块。窗口取目标模型在模型目录里的输入上限，没有时按 200K。强制收敛开启时，没有显式配置的路由会默认使用模型驱动的 WebSearch。"
       >
-        <div className="grid gap-x-6 gap-y-5 md:grid-cols-2">
+ <div className="grid gap-x-6 gap-y-5 md:grid-cols-2">
+          <TogField
+     label="摘要检查点"
+     desc="超出预算时用目标模型把早期对话浓缩成工作记录，接在首条用户消息后面，保留目标、约定和进度；关闭时只做裁剪。摘要只计入内部成本，不进用户 usage。默认开启。"
+     checked={mapping.contextBackoff.summaryEnabled}
+     onChange={(summaryEnabled) => onChange({ ...mapping, contextBackoff: { ...mapping.contextBackoff, summaryEnabled } })}
+   />
+   <NumField
+     label="摘要等待上限"
+     desc={`同步等待摘要的最长时间，超时这一轮先裁剪发出，摘要在后台继续完成供下一轮使用。范围 ${limits.summaryTimeoutSecs.min}–${limits.summaryTimeoutSecs.max}，默认 120。`}
+     value={mapping.contextBackoff.summaryTimeoutSecs}
+     min={limits.summaryTimeoutSecs.min}
+     max={limits.summaryTimeoutSecs.max}
+     suffix="秒"
+     onChange={setBackoff('summaryTimeoutSecs')}
+          />
+          <NumField
+     label="预压缩比例"
+     desc={`估算超过 预算 × 该比例 时在后台预先生成下一个检查点，本次照常发送。范围 ${limits.summaryPrecompactRatio.min}–${limits.summaryPrecompactRatio.max}，默认 0.75。`}
+            value={mapping.contextBackoff.summaryPrecompactRatio}
+     min={limits.summaryPrecompactRatio.min}
+     max={limits.summaryPrecompactRatio.max}
+     step={0.05}
+     suffix="比例"
+     onChange={setBackoff('summaryPrecompactRatio')}
+   />
+   <NumField
+     label="压缩后目标比例"
+     desc={`新检查点让 首条消息 + 摘要 + 保留的尾部 落到 预算 × 该比例 以下。范围 ${limits.summaryTargetRatio.min}–${limits.summaryTargetRatio.max}，默认 0.45。`}
+     value={mapping.contextBackoff.summaryTargetRatio}
+     min={limits.summaryTargetRatio.min}
+     max={limits.summaryTargetRatio.max}
+     step={0.05}
+     suffix="比例"
+     onChange={setBackoff('summaryTargetRatio')}
+   />
+   <NumField
+     label="预留输出上限"
+            desc={`预留输出取客户端的 max_tokens，最多这个值。上游不接收 max_tokens，实际输出很少超过 32K，预留太多会挤占输入。范围 ${limits.maxReservedOutputTokens.min}–${limits.maxReservedOutputTokens.max}，默认 32000。`}
+     value={mapping.contextBackoff.maxReservedOutputTokens}
+     min={limits.maxReservedOutputTokens.min}
+     max={limits.maxReservedOutputTokens.max}
+     step={1000}
+     suffix="tokens"
+     onChange={setBackoff('maxReservedOutputTokens')}
+   />
           <NumField
             label="安全余量比例"
             desc={`输入预算 = 窗口 − 预留输出 − 安全余量，安全余量按剩余空间的比例留出，用来抵消本地估算和上游计数的偏差。范围 ${limits.safetyMarginRatio.min}–${limits.safetyMarginRatio.max}，默认 0.05。`}
@@ -850,7 +911,7 @@ export function ForcedModelMappingSection({
           />
           <NumField
             label="预留输出下限"
-            desc={`预留输出取客户端的 max_tokens（最多 64000），并且不低于这个值。范围 ${limits.minReservedOutputTokens.min}–${limits.minReservedOutputTokens.max}，默认 8000。`}
+     desc={`预留输出不低于这个值。范围 ${limits.minReservedOutputTokens.min}–${limits.minReservedOutputTokens.max}，默认 8000。`}
             value={mapping.contextBackoff.minReservedOutputTokens}
             min={limits.minReservedOutputTokens.min}
             max={limits.minReservedOutputTokens.max}
@@ -886,5 +947,99 @@ export function ForcedModelMappingSection({
         <KnowledgeTable entries={mapping.knowledge} onChange={(knowledge) => onChange({ ...mapping, knowledge })} />
       </SubBlock>
     </div>
+  )
+}
+
+/** 内置知识条目和预览：用一段用户文字看会命中哪些条目。 */
+function BuiltinKnowledgeDialog({
+  open,
+  onClose,
+  configuredCount,
+  onCopyAll,
+}: {
+  open: boolean
+  onClose: () => void
+  configuredCount: number
+  onCopyAll: (entries: ForcedKnowledgeEntry[]) => void
+}) {
+  const [text, setText] = useState('')
+  const [submitted, setSubmitted] = useState('')
+  const builtin = useForcedModelKnowledge(open, '')
+  const preview = useForcedModelKnowledge(open && submitted.trim().length > 0, submitted)
+  const entries = builtin.data?.builtin ?? []
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="内置知识条目"
+      description="配置列表为空时使用这些条目。可以一键复制到配置后再修改；配置了任意条目后，只使用配置里的条目。"
+      width="max-w-3xl"
+      footer={
+        <>
+          <Button variant="outline" size="sm" onClick={onClose}>
+     关闭
+   </Button>
+   <Button size="sm" disabled={entries.length === 0} onClick={() => onCopyAll(entries)}>
+     {configuredCount > 0 ? '追加到配置' : '复制到配置'}
+   </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+ <div className="space-y-2">
+   <Label htmlFor="knowledge-preview">命中预览</Label>
+          <div className="flex gap-2">
+     <Input
+       id="knowledge-preview"
+       value={text}
+       placeholder="输入一段用户可能问的话，例如：现在有哪些 Claude 模型？"
+       onChange={(event) => setText(event.target.value)}
+       onKeyDown={(event) => {
+  if (event.key === 'Enter') setSubmitted(text)
+       }}
+     />
+     <Button size="sm" variant="outline" onClick={() => setSubmitted(text)}>
+       预览
+     </Button>
+          </div>
+   {submitted.trim() && (
+     <div className="rounded-md border border-border/70 p-3 text-xs leading-5">
+       {preview.isLoading ? (
+  <span className="text-muted-foreground">加载中…</span>
+) : (preview.data?.preview?.facts ?? []).length === 0 ? (
+         <span className="text-muted-foreground">没有命中任何条目，这句话不会附带补充事实。</span>
+) : (
+  <ol className="list-decimal space-y-1 pl-4">
+           {(preview.data?.preview?.facts ?? []).map((fact, index) => (
+      <li key={index}>{fact}</li>
+    ))}
+  </ol>
+       )}
+     </div>
+   )}
+        </div>
+ <Table>
+          <TableHeader>
+     <TableRow>
+       <TableHead className="w-36">ID</TableHead>
+       <TableHead className="w-14">语言</TableHead>
+       <TableHead>关键词 / 内容</TableHead>
+            </TableRow>
+   </TableHeader>
+          <TableBody>
+     {entries.map((entry) => (
+       <TableRow key={entry.id}>
+         <TableCell className="align-top whitespace-normal break-all font-mono text-xs">{entry.id}</TableCell>
+         <TableCell className="align-top text-xs">{entry.locale ?? '不限'}</TableCell>
+  <TableCell className="space-y-1 whitespace-normal break-words text-xs leading-5">
+           <div className="text-muted-foreground">{entry.topics.join('、')}</div>
+           <div>{entry.fact}</div>
+         </TableCell>
+       </TableRow>
+     ))}
+   </TableBody>
+        </Table>
+      </div>
+    </ModalShell>
   )
 }

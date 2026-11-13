@@ -48,10 +48,7 @@ pub(crate) fn input_budget(
     config: &ForcedContextBackoffConfig,
 ) -> i32 {
     let reserved_output = max_tokens
-        .clamp(
-            1,
-            crate::anthropic::forced_model::FORCED_TARGET_MAX_OUTPUT_TOKENS,
-        )
+        .clamp(1, config.max_reserved_output_tokens.max(1))
         .max(config.min_reserved_output_tokens);
     let available = (window_tokens - reserved_output).max(1);
     let margin = (available as f64 * config.safety_margin_ratio).ceil() as i32;
@@ -123,6 +120,12 @@ pub(crate) fn fit_to_budget(
         report.removed_messages += removed;
         report.final_tokens = estimate(request);
     }
+    if report.removed_messages > 0 {
+        // Without a trace the model would not know earlier turns existed and could redo finished
+        // work; the note is fixed text, so it does not change between requests.
+        mark_omitted_turns(&mut request.messages);
+        report.final_tokens = estimate(request);
+    }
 
     while report.final_tokens > budget_tokens {
         let excess = report.final_tokens - budget_tokens;
@@ -135,8 +138,14 @@ pub(crate) fn fit_to_budget(
     report
 }
 
-/// 客户端的 `context_management.edits`：`clear_tool_uses_*` 与 `clear_thinking_*` 在本地执行，
-/// 其它类型忽略。返回 (清理的工具结果数, 删除的 thinking 块数)。
+/// 客户端的 `context_management.edits`，按官方参数在本地执行（`clear_thinking_*` 先于
+/// `clear_tool_uses_*`，与官方要求的顺序一致）。返回 (清理的工具结果数, 删除的 thinking 块数)。
+///
+/// - `clear_tool_uses_*`：输入达到 `trigger`（默认 100K input tokens，或按 tool_uses 计数）时才
+///   清理；保留最近 `keep` 个工具调用（默认 3）；`exclude_tools` 里的工具不清；`clear_tool_inputs`
+///   为 true（或列出工具名）时同时清空对应 tool_use 的入参；`clear_at_least` 不足时整条跳过。
+/// - `clear_thinking_*`：`keep: "all"` 不清；`{type: "thinking_turns", value: N}` 保留最近 N 个
+///   带 thinking 的 assistant 轮；不写 keep 时保留 1 轮。
 pub(crate) fn apply_context_edits(request: &mut MessagesRequest) -> (usize, usize) {
     let Some(edits) = request
         .context_management
@@ -149,21 +158,215 @@ pub(crate) fn apply_context_edits(request: &mut MessagesRequest) -> (usize, usiz
     };
     let mut cleared = 0;
     let mut removed_thinking = 0;
-    for edit in edits {
+    let (thinking_edits, other_edits): (Vec<&Value>, Vec<&Value>) =
+        edits.iter().partition(|edit| {
+            edit.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("clear_thinking_"))
+        });
+    for edit in thinking_edits {
+        let keep_turns = match edit.get("keep") {
+            Some(Value::String(all)) if all == "all" => continue,
+            Some(keep) => keep.get("value").and_then(Value::as_u64).unwrap_or(1) as usize,
+            None => 1,
+        };
+        removed_thinking += keep_recent_thinking_turns(&mut request.messages, keep_turns.max(1));
+    }
+    for edit in other_edits {
         let kind = edit.get("type").and_then(Value::as_str).unwrap_or_default();
-        if kind.starts_with("clear_tool_uses_") {
-            // `keep: {type: "tool_uses", value: N}`; the API keeps the 3 most recent by default.
-            let keep = edit
-                .get("keep")
-                .and_then(|keep| keep.get("value"))
-                .and_then(Value::as_u64)
-                .unwrap_or(3) as usize;
-            cleared += clear_old_tool_results(&mut request.messages, keep, usize::MAX);
-        } else if kind.starts_with("clear_thinking_") {
-            removed_thinking += drop_old_thinking(&mut request.messages);
+        if !kind.starts_with("clear_tool_uses_") {
+            continue;
         }
+        let positions = tool_result_positions(&request.messages);
+        let trigger = edit.get("trigger");
+        let trigger_kind = trigger
+            .and_then(|trigger| trigger.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("input_tokens");
+        let trigger_value = trigger
+            .and_then(|trigger| trigger.get("value"))
+            .and_then(Value::as_u64);
+        let reached = match trigger_kind {
+            "tool_uses" => positions.len() as u64 >= trigger_value.unwrap_or(0),
+            _ => estimate(request) as u64 >= trigger_value.unwrap_or(100_000),
+        };
+        if !reached {
+            continue;
+        }
+        let keep = edit
+            .get("keep")
+            .and_then(|keep| keep.get("value"))
+            .and_then(Value::as_u64)
+            .unwrap_or(3) as usize;
+        let excluded: Vec<String> = edit
+            .get("exclude_tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let clear_inputs = match edit.get("clear_tool_inputs") {
+            Some(Value::Bool(all)) => ClearInputs::All(*all),
+            Some(Value::Array(names)) => ClearInputs::Named(
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            _ => ClearInputs::All(false),
+        };
+        let clear_at_least = edit
+            .get("clear_at_least")
+            .and_then(|value| value.get("value"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let before = estimate(request);
+        let mut trial = request.messages.clone();
+        let count = clear_tool_uses(&mut trial, keep, &excluded, &clear_inputs);
+        if count == 0 {
+            continue;
+        }
+        let saved = before.saturating_sub(estimate_messages(request, &trial)) as u64;
+        if saved < clear_at_least {
+            continue;
+        }
+        request.messages = trial;
+        cleared += count;
     }
     (cleared, removed_thinking)
+}
+
+enum ClearInputs {
+    All(bool),
+    Named(Vec<String>),
+}
+
+impl ClearInputs {
+    fn applies_to(&self, name: &str) -> bool {
+        match self {
+            Self::All(all) => *all,
+            Self::Named(names) => names.iter().any(|candidate| candidate.as_str() == name),
+        }
+    }
+}
+
+fn estimate_messages(request: &MessagesRequest, messages: &[Message]) -> i32 {
+    crate::token::count_all_tokens_local(
+        request.system.as_deref(),
+        messages,
+        request.tools.as_deref(),
+    )
+    .min(i32::MAX as u64) as i32
+}
+
+/// 工具名（按 tool_use id 查）。
+fn tool_names_by_id(messages: &[Message]) -> std::collections::HashMap<String, String> {
+    messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|block| block_type(block) == Some("tool_use"))
+        .filter_map(|block| {
+            Some((
+                block.get("id")?.as_str()?.to_string(),
+                block.get("name")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// 清理较早的工具结果（官方 `clear_tool_uses`）：最近 `keep` 个保留，`excluded` 里的工具不清；
+/// 需要时把对应 tool_use 的入参清空。返回清理的条数。
+fn clear_tool_uses(
+    messages: &mut [Message],
+    keep: usize,
+    excluded: &[String],
+    clear_inputs: &ClearInputs,
+) -> usize {
+    let names = tool_names_by_id(messages);
+    let positions = tool_result_positions(messages);
+    let clearable = positions.len().saturating_sub(keep);
+    let mut cleared_ids = Vec::new();
+    for &(mi, bi) in positions.iter().take(clearable) {
+        let Some(block) = blocks_mut(&mut messages[mi]).and_then(|blocks| blocks.get_mut(bi))
+        else {
+            continue;
+        };
+        let id = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let name = names.get(&id).cloned().unwrap_or_default();
+        if excluded.contains(&name) || is_cleared(block) {
+            continue;
+        }
+        block["content"] = Value::String(CLEARED_TOOL_RESULT.to_string());
+        cleared_ids.push((id, name));
+    }
+    for (id, name) in &cleared_ids {
+        if !clear_inputs.applies_to(name) {
+            continue;
+        }
+        for message in messages.iter_mut().filter(|m| m.role == "assistant") {
+            let Some(blocks) = blocks_mut(message) else {
+                continue;
+            };
+            for block in blocks.iter_mut() {
+                if block_type(block) == Some("tool_use")
+                    && block.get("id").and_then(Value::as_str) == Some(id.as_str())
+                {
+                    block["input"] = serde_json::json!({});
+                }
+            }
+        }
+    }
+    cleared_ids.len()
+}
+
+/// 只保留最近 `keep_turns` 个带 thinking 的 assistant 轮的 thinking 块。返回删除的块数。
+fn keep_recent_thinking_turns(messages: &mut [Message], keep_turns: usize) -> usize {
+    let with_thinking: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "assistant")
+        .filter(|(_, m)| {
+            m.content.as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    matches!(
+                        block_type(block),
+                        Some("thinking") | Some("redacted_thinking")
+                    )
+                })
+            })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let drop = with_thinking.len().saturating_sub(keep_turns);
+    let mut removed = 0;
+    for &index in with_thinking.iter().take(drop) {
+        let Some(blocks) = blocks_mut(&mut messages[index]) else {
+            continue;
+        };
+        let before = blocks.len();
+        blocks.retain(|block| {
+            !matches!(
+                block_type(block),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        });
+        removed += before - blocks.len();
+        if blocks.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": " "}));
+        }
+    }
+    removed
 }
 
 fn blocks_mut(message: &mut Message) -> Option<&mut Vec<Value>> {
@@ -274,6 +477,38 @@ fn has_user_text(message: &Message) -> bool {
         }),
         _ => false,
     }
+}
+
+/// Text added to the first user message when earlier turns were dropped to fit the window.
+pub(crate) const OMITTED_TURNS_NOTE: &str = "<system-reminder>\nSome earlier turns of this conversation are not shown here. If something you need from them is missing, ask the user or check the files again instead of assuming.\n</system-reminder>";
+
+/// Adds [`OMITTED_TURNS_NOTE`] to the first user message once.
+fn mark_omitted_turns(messages: &mut [Message]) {
+    let Some(first) = messages
+        .first_mut()
+        .filter(|message| message.role == "user")
+    else {
+        return;
+    };
+    if first
+        .content
+        .to_string()
+        .contains("Some earlier turns of this conversation are not shown")
+    {
+        return;
+    }
+    let note = serde_json::json!({"type": "text", "text": OMITTED_TURNS_NOTE});
+    first.content = match std::mem::take(&mut first.content) {
+        Value::Array(mut blocks) => {
+            blocks.push(note);
+            Value::Array(blocks)
+        }
+        Value::String(text) if !text.is_empty() => Value::Array(vec![
+            serde_json::json!({"type": "text", "text": text}),
+            note,
+        ]),
+        _ => Value::Array(vec![note]),
+    };
 }
 
 /// 删除最早的一轮（首条用户消息之后的第一组 assistant + 回应它的 user），保持配对；
@@ -480,13 +715,14 @@ mod tests {
     fn context_edits_clear_tool_results_and_thinking() {
         let mut request = conversation(6, 50);
         request.context_management = Some(json!({"edits": [
-            {"type": "clear_tool_uses_20250919", "keep": {"type": "tool_uses", "value": 2}},
-            {"type": "clear_thinking_20251015"},
-            {"type": "compact_20260112"}
-        ]}));
+        {"type": "clear_tool_uses_20250919", "trigger": {"type": "tool_uses", "value": 1}, "keep": {"type": "tool_uses", "value": 2}},
+        {"type": "clear_thinking_20251015"},
+        {"type": "compact_20260112"}
+           ]}));
         let (cleared, thinking) = apply_context_edits(&mut request);
         assert_eq!(cleared, 4);
-        assert!(thinking > 0);
+        // Thinking is kept on the latest assistant turn with thinking only.
+        assert_eq!(thinking, 5);
         assert!(paired(&request));
         let results: Vec<&Value> = request
             .messages
@@ -503,10 +739,54 @@ mod tests {
     }
 
     #[test]
+    fn context_edits_follow_the_official_parameters() {
+        // Claude Code sends `keep: "all"` on every request: nothing is cleared.
+        let mut request = conversation(6, 50);
+        request.context_management = Some(json!({"edits": [
+        {"type": "clear_thinking_20251015", "keep": "all"}
+           ]}));
+        assert_eq!(apply_context_edits(&mut request), (0, 0));
+
+        // The default trigger is 100K input tokens: a small conversation is left alone.
+        let mut request = conversation(6, 50);
+        request.context_management = Some(json!({"edits": [
+        {"type": "clear_tool_uses_20250919"}
+           ]}));
+        assert_eq!(apply_context_edits(&mut request), (0, 0));
+
+        // Excluded tools keep their results; cleared tool inputs are emptied when asked.
+        let mut request = conversation(6, 50);
+        request.context_management = Some(json!({"edits": [
+                   {"type": "clear_tool_uses_20250919", "trigger": {"type": "input_tokens", "value": 1},
+             "keep": {"type": "tool_uses", "value": 1}, "exclude_tools": ["Read"],
+             "clear_tool_inputs": true}
+        ]}));
+        let (cleared, _) = apply_context_edits(&mut request);
+        assert_eq!(cleared, 5);
+        let first_use = request.messages[1]
+            .content
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| block_type(b) == Some("tool_use"))
+            .unwrap();
+        assert_eq!(first_use["input"], json!({}));
+        assert!(paired(&request));
+
+        // clear_at_least: skipped when clearing would not save enough.
+        let mut request = conversation(6, 5);
+        request.context_management = Some(json!({"edits": [
+        {"type": "clear_tool_uses_20250919", "trigger": {"type": "input_tokens", "value": 1},
+         "clear_at_least": {"type": "input_tokens", "value": 1000000}}
+           ]}));
+        assert_eq!(apply_context_edits(&mut request), (0, 0));
+    }
+
+    #[test]
     fn budget_reserves_output_and_margin() {
         let budget = input_budget(200_000, 128_000, &config());
-        // 64K reserved (target cap), 5% margin.
-        assert_eq!(budget, 129_200);
+        // 32K reserved (configured cap), 5% margin.
+        assert_eq!(budget, 159_600);
         assert_eq!(input_budget(200_000, 1_000, &config()), 182_400);
     }
 
@@ -527,7 +807,13 @@ mod tests {
             let report = fit_to_budget(&mut request, budget, &config());
             assert!(report.final_tokens <= budget, "{turns}x{words}: {report:?}");
             assert!(paired(&request), "{turns}x{words}: pairing broken");
-            assert_eq!(request.messages[0].content, json!("please fix the build"));
+            assert!(
+                request.messages[0]
+                    .content
+                    .to_string()
+                    .contains("please fix the build"),
+                "{turns}x{words}: first user message kept"
+            );
             assert_eq!(
                 request.messages.last().unwrap().content,
                 json!("now run the tests")
@@ -587,7 +873,10 @@ mod tests {
         assert!(report.final_tokens <= 30_000, "{report:?}");
         assert!(report.removed_messages > 0);
         assert!(paired(&request));
-        assert_eq!(request.messages[0].content, json!("refactor the module"));
+        assert_eq!(
+            request.messages[0].content[0]["text"],
+            json!("refactor the module")
+        );
         assert_eq!(request.messages.last().unwrap().role, "user");
         let roles: Vec<&str> = request.messages.iter().map(|m| m.role.as_str()).collect();
         assert!(
@@ -610,5 +899,25 @@ mod tests {
         assert!(text.starts_with("BEGIN"));
         assert!(text.ends_with("END"));
         assert!(text.contains("content truncated"));
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dropped_turns_leave_a_fixed_note_on_the_first_message() {
+        let mut messages: Vec<Message> = serde_json::from_value(json!([
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "a"}
+           ]))
+        .unwrap();
+        mark_omitted_turns(&mut messages);
+        mark_omitted_turns(&mut messages);
+        let text = messages[0].content.to_string();
+        assert_eq!(text.matches("Some earlier turns").count(), 1, "{text}");
+        assert!(text.contains("task"));
     }
 }

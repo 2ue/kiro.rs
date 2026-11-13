@@ -77,7 +77,7 @@ effort 到思考长度的换算表（与现有 `effort_from_budget_tokens` 的�
 | `temperature` / `top_p` / `top_k` | 本地路径丢弃 | 不变，不报错 |
 | assistant prefill（末尾是 assistant） | 静默丢弃，截到最后一条 user（`converter.rs:447`） | 不变。外显模型本身就拒绝 prefill，这里选择容忍并丢弃，不报错 |
 | `fallbacks` / `speed` / `inference_geo` / `output_config.task_budget` / `service_tier` / `container` | 结构里没有这些字段，丢弃 | 不变 |
-| 对话中途的 `role:"system"` / `developer` | 追加到顶层 system 末尾，丢失原位置（`request_entry.rs:721`） | 改为在原位置转成**当轮 user 文本块**，写法与现有轮次提醒一致。`clear_at:"next_user_message"` 只在当轮生效，之后的请求里不再渲染。理由：外显模型（Opus 5.5 / Fable）的中途 system 消息语义是"从此刻起生效的运营指令"，挪到顶层会让它看起来像是开头就给出的指令，而且每加一条都会改动 system 前缀，导致缓存全部失效 |
+| 对话中途的 `role:"system"` / `developer` | 追加到顶层 system 末尾，丢失原位置（`request_entry.rs:721`） | 改为在原位置转成**一对独立的消息**：指令作为 user 轮，紧跟一条复述指令的 assistant 确认（`Understood: …`）。出现在工具结果之后时，依次追加 `Got the result.`、指令、确认、`Continue with the task using the tool results above.`，工具轮本身不动。全部是追加，之前的消息不变，缓存前缀照常有效。理由：上游没有 system 角色；并进当轮的 `<system-reminder>` 会被当成背景信息，A/B 遵从率 0/9，独立消息 6/6，工具结果之后 7–8/8（并进工具结果轮为 2/8）；挪到顶层会让它像开头就给出的指令，并改动 system 前缀，导致缓存全部失效 |
 | `context_management.edits` | 本地路径丢弃 | `clear_tool_uses_*` 和 `clear_thinking_*` 在本地执行，手段与 04 篇 L1/L2 相同，并且尊重客户端给的 `keep`、`trigger` 参数。`compact_*` 并入 04 篇的退避流程，不返回 compaction 块 |
 | `output_config.format` / `output_format` | 转成内部 structured_output 工具（`structured_output.rs`） | 复用 |
 | `stop_sequences` | 代理在输出侧截断（`stop_sequence.rs`） | 复用 |

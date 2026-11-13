@@ -80,7 +80,17 @@ pub(super) fn process_message_content_with_dedup(
             for item in arr {
                 match item.get("type").and_then(|value| value.as_str()) {
                     Some("document") => {
-                        let document_text = document_block_to_text(item)?;
+                        let document_text = match document_block_to_text(item) {
+                            Ok(text) => text,
+                            // A document in the history that can't be converted would fail every
+                            // later turn of the session; it becomes a note. The current turn still
+                            // reports the error, since that is the document the user is asking about.
+                            Err(error) if image_mode == UserImageMode::History => {
+                                tracing::warn!(%error, "历史消息中的文档无法转换，已替换为占位文本");
+                                format!("[document omitted: {error}]")
+                            }
+                            Err(error) => return Err(error),
+                        };
                         if !document_text.is_empty() {
                             text_parts.push(document_text);
                         }
@@ -352,12 +362,21 @@ fn decode_document_to_text(media_type: &str, data: &str) -> Result<String, Conve
                 ))
             })?
         }
-        "application/pdf" => extract_text_from_pdf_bytes(&bytes).ok_or_else(|| {
-            ConversionError::UnsupportedContent(
-                "PDF document text could not be extracted (encrypted, image-only, or malformed PDF)"
-                    .to_string(),
-            )
-        })?,
+        // The API accepts scanned and encrypted PDFs, so a PDF without extractable text is not a bad
+        // request; the model is told the document can't be read instead of the whole turn failing.
+        "application/pdf" => match extract_text_from_pdf_bytes(&bytes) {
+            Some(text) => text,
+            None => {
+                tracing::warn!(
+                    pdf_bytes = bytes.len(),
+                    "PDF document has no extractable text; sending a note instead"
+                );
+                return Ok(format!(
+                    "<document media_type=\"application/pdf\">\n[This PDF ({} KB) has no extractable text: it is scanned, image-only or encrypted, so its contents can't be read here.]\n</document>",
+                    bytes.len().div_ceil(1024)
+                ));
+            }
+        },
         _ => {
             return Err(ConversionError::UnsupportedContent(format!(
                 "unsupported document media_type: {}",
@@ -813,6 +832,14 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
                         }
                     },
                     Some("search_result") => parts.push(render_search_result_block(item)),
+                    // Tool search results: the referenced tool definitions are sent with the
+                    // request, so the model only needs to know which tool became available.
+                    Some("tool_reference") => parts.push(format!(
+                        "[tool loaded: {}]",
+                        item.get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                    )),
                     _ => {
                         if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                             parts.push(text.to_string());
@@ -932,6 +959,18 @@ pub(super) fn render_server_tool_block(item: &serde_json::Value) -> Option<Strin
                             format!(" ({page_age})")
                         }
                     ));
+                    // Only snippets this proxy stored are readable; an official opaque value
+                    // stays unrendered.
+                    if let Some(snippet) = result
+                        .get("encrypted_content")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::anthropic::websearch::decode_proxy_snippet)
+                    {
+                        lines.push(format!(
+                            "   {}",
+                            truncate_chars(&snippet, SERVER_TOOL_FIELD_MAX_CHARS)
+                        ));
+                    }
                 }
                 if results.len() > SERVER_TOOL_MAX_RESULTS {
                     lines.push(format!(
@@ -961,6 +1000,60 @@ pub(super) fn render_server_tool_block(item: &serde_json::Value) -> Option<Strin
             }
         }
         "search_result" => render_search_result_block(item),
+        "code_execution_tool_result"
+        | "bash_code_execution_tool_result"
+        | "text_editor_code_execution_tool_result" => render_code_execution_result(item),
+        "tool_search_tool_result" => {
+            let names: Vec<&str> = item
+                .get("content")
+                .and_then(|content| content.get("tool_references"))
+                .and_then(|v| v.as_array())
+                .map(|refs| {
+                    refs.iter()
+                        .filter_map(|reference| reference.get("tool_name").and_then(|v| v.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if names.is_empty() {
+                "[tool_search: no tools found]".to_string()
+            } else {
+                format!("[tool_search loaded tools: {}]", names.join(", "))
+            }
+        }
+        "mcp_tool_use" => format!(
+            "[{} / {}] input: {}",
+            field(item, "server_name"),
+            field(item, "name"),
+            truncate_chars(
+                &item.get("input").cloned().unwrap_or_default().to_string(),
+                SERVER_TOOL_FIELD_MAX_CHARS
+            )
+        ),
+        "mcp_tool_result" => {
+            let body = match item.get("content") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            let is_error = item.get("is_error").and_then(|v| v.as_bool()) == Some(true);
+            format!(
+                "[mcp tool {}]\n{body}",
+                if is_error { "error" } else { "result" }
+            )
+        }
+        "advisor_tool_result" => match item
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(|v| v.as_str())
+        {
+            Some(text) => format!("[advisor]\n{text}"),
+            None => "[advisor result]".to_string(),
+        },
+        "container_upload" => format!("[file uploaded: {}]", field(item, "file_id")),
         _ => return None,
     };
     Some(truncate_chars(&rendered, SERVER_TOOL_TEXT_MAX_CHARS))
@@ -991,6 +1084,49 @@ fn render_search_result_block(item: &serde_json::Value) -> String {
         title.replace('"', "&quot;"),
         body
     )
+}
+
+/// Renders a code execution result (Python, Bash or the file editor) as bounded text: stdout,
+/// stderr, the return code and any created files, or the error code.
+fn render_code_execution_result(item: &serde_json::Value) -> String {
+    let content = item.get("content").cloned().unwrap_or_default();
+    let text = |key: &str| {
+        content
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    if let Some(code) = content.get("error_code").and_then(|v| v.as_str()) {
+        return format!("[code execution error: {code}]");
+    }
+    let mut lines = vec!["[code execution result]".to_string()];
+    let stdout = text("stdout");
+    if !stdout.is_empty() {
+        lines.push(format!("stdout:\n{stdout}"));
+    }
+    let stderr = text("stderr");
+    if !stderr.is_empty() {
+        lines.push(format!("stderr:\n{stderr}"));
+    }
+    if let Some(code) = content.get("return_code").and_then(|v| v.as_i64()) {
+        lines.push(format!("return code: {code}"));
+    }
+    // text_editor_code_execution results: viewed file content or an edit summary.
+    let file_content = text("content");
+    if !file_content.is_empty() {
+        lines.push(file_content);
+    }
+    if let Some(files) = content.get("content").and_then(|v| v.as_array()) {
+        let ids: Vec<&str> = files
+            .iter()
+            .filter_map(|file| file.get("file_id").and_then(|v| v.as_str()))
+            .collect();
+        if !ids.is_empty() {
+            lines.push(format!("files: {}", ids.join(", ")));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Converts the images inside a tool_result.
@@ -1358,5 +1494,90 @@ mod tests {
         ]);
         let err = process_message_content(&content).expect_err("user image stays strict");
         assert_empty_image_error(err);
+    }
+
+    #[test]
+    fn unreadable_pdf_becomes_a_note_instead_of_an_error() {
+        let data = BASE64_STANDARD.encode(MALFORMED_PDF);
+        let text = decode_document_to_text("application/pdf", &data).expect("not an error");
+        assert!(text.contains("no extractable text"), "{text}");
+        // Media types the API rejects still fail on the current turn.
+        assert!(decode_document_to_text("application/zip", &data).is_err());
+    }
+
+    #[test]
+    fn history_document_errors_degrade_and_the_current_turn_still_reports_them() {
+        let content = json!([
+        {"type": "text", "text": "see attached"},
+        {"type": "document", "source": {"type": "base64", "media_type": "application/zip", "data": "AAAA"}}
+           ]);
+        let (text, _, _) =
+            process_message_content_with_dedup(&content, UserImageMode::History, None).unwrap();
+        assert!(text.contains("[document omitted:"), "{text}");
+        assert!(process_message_content_with_dedup(&content, UserImageMode::Strict, None).is_err());
+    }
+
+    #[test]
+    fn tool_references_and_server_results_keep_their_context() {
+        let tool_result = Some(json!([
+        {"type": "tool_reference", "tool_name": "mcp__github__create_issue"}
+           ]));
+        assert_eq!(
+            extract_tool_result_content(&tool_result),
+            "[tool loaded: mcp__github__create_issue]"
+        );
+        let code = json!({"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1",
+     "content": {"type": "bash_code_execution_result", "stdout": "hello", "stderr": "", "return_code": 0}});
+        let rendered = render_server_tool_block(&code).unwrap();
+        assert!(
+            rendered.contains("stdout:\nhello") && rendered.contains("return code: 0"),
+            "{rendered}"
+        );
+        let search = json!({"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_2",
+     "content": {"type": "tool_search_tool_search_result", "tool_references": [
+  {"type": "tool_reference", "tool_name": "get_weather"}]}});
+        assert_eq!(
+            render_server_tool_block(&search).as_deref(),
+            Some("[tool_search loaded tools: get_weather]")
+        );
+        let mcp = json!({"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "is_error": false,
+     "content": [{"type": "text", "text": "issue #12 created"}]});
+        assert!(
+            render_server_tool_block(&mcp)
+                .unwrap()
+                .contains("issue #12 created")
+        );
+        let error = json!({"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_3",
+     "content": {"type": "code_execution_tool_result_error", "error_code": "execution_time_exceeded"}});
+        assert_eq!(
+            render_server_tool_block(&error).as_deref(),
+            Some("[code execution error: execution_time_exceeded]")
+        );
+    }
+
+    #[test]
+    fn proxy_written_search_snippets_are_replayed_and_official_values_are_not() {
+        let result = crate::anthropic::websearch::WebSearchResult {
+            title: "Rust".to_string(),
+            url: "https://www.rust-lang.org/".to_string(),
+            snippet: Some("A language empowering everyone.".to_string()),
+            encrypted_content: None,
+            encrypted_index: None,
+            published_date: None,
+            id: None,
+            domain: None,
+            max_verbatim_word_limit: None,
+            public_domain: None,
+        };
+        let block = crate::anthropic::websearch::web_search_result_block(&result);
+        let item = json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+            "content": [block, {"type": "web_search_result", "title": "Other", "url": "https://example.com",
+  "encrypted_content": "EqMCCkYIBhgCOPAQUE"}]});
+        let rendered = render_server_tool_block(&item).unwrap();
+        assert!(
+            rendered.contains("A language empowering everyone."),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("EqMCCkYIBhgCOPAQUE"), "{rendered}");
     }
 }

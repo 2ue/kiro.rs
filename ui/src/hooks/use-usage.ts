@@ -7,6 +7,7 @@ import {
   getAccountEventSummary,
   getAuditLogsPage,
   getUsageCleanupStatus,
+  getForcedModelKnowledge,
   getForcedModelTargets,
   getModelCapabilities,
   getModelPricing,
@@ -417,6 +418,14 @@ export function useForcedModelTargets(models: string[]) {
     queryFn: () => getForcedModelTargets(key),
     enabled: key.length > 0,
     refetchInterval: 60000,
+  })
+}
+
+export function useForcedModelKnowledge(enabled: boolean, text: string) {
+  return useQuery({
+    queryKey: ['forced-model-knowledge', text.trim()],
+    queryFn: () => getForcedModelKnowledge(text),
+    enabled,
   })
 }
 

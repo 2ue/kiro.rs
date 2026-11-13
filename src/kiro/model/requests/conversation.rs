@@ -97,6 +97,61 @@ impl ConversationState {
     /// credential, or context boundary. The retry must therefore keep the visible/tool history
     /// intact while omitting every opaque reasoning union value, including the latest assistant
     /// entry paired with current tool results.
+    /// Rewrite every history tool call and tool result as plain text, keeping the current message
+    /// untouched. A compatibility retry for upstream `Improperly formed request` rejections that
+    /// trimming did not fix: the content stays, only the structured form goes. Returns the number
+    /// of tool calls and results rewritten.
+    pub fn flatten_history_tool_uses_for_compatibility_retry(&mut self) -> usize {
+        let mut flattened = 0;
+        for message in &mut self.history {
+            match message {
+                Message::Assistant(assistant) => {
+                    let response = &mut assistant.assistant_response_message;
+                    let Some(tool_uses) = response.tool_uses.take() else {
+                        continue;
+                    };
+                    for tool_use in &tool_uses {
+                        if !response.content.is_empty() && !response.content.ends_with('\n') {
+                            response.content.push('\n');
+                        }
+                        response.content.push_str(&format!(
+                            "[called tool {} with input {}]",
+                            tool_use.name, tool_use.input
+                        ));
+                        flattened += 1;
+                    }
+                }
+                Message::User(user) => {
+                    let context = &mut user.user_input_message.user_input_message_context;
+                    if context.tool_results.is_empty() {
+                        continue;
+                    }
+                    let results = std::mem::take(&mut context.tool_results);
+                    let content = &mut user.user_input_message.content;
+                    for result in &results {
+                        let text = result
+                            .content
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !content.is_empty() && !content.ends_with('\n') {
+                            content.push('\n');
+                        }
+                        content.push_str(&format!(
+                            "[tool {} returned{}]\n{}",
+                            result.tool_use_id,
+                            if result.is_error { " an error" } else { "" },
+                            text
+                        ));
+                        flattened += 1;
+                    }
+                }
+            }
+        }
+        flattened
+    }
+
     pub fn clear_history_reasoning_content_for_compatibility_retry(&mut self) -> usize {
         self.history
             .iter_mut()

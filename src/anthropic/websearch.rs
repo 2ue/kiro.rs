@@ -949,18 +949,43 @@ pub(crate) fn result_page_age(result: &WebSearchResult) -> Option<String> {
     })
 }
 
+/// Prefix of `encrypted_content` values written by this proxy: the result snippet, base64
+/// encoded, so a replayed search result can show the model what it found again. An official
+/// opaque value (no prefix) is kept byte for byte and never decoded.
+const PROXY_SNIPPET_PREFIX: &str = "krs1:";
+
+fn encode_proxy_snippet(snippet: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "{PROXY_SNIPPET_PREFIX}{}",
+        base64::engine::general_purpose::STANDARD.encode(snippet.as_bytes())
+    )
+}
+
+/// The snippet stored in a proxy-written `encrypted_content`; `None` for official values.
+pub(crate) fn decode_proxy_snippet(value: &str) -> Option<String> {
+    use base64::Engine as _;
+    let encoded = value.strip_prefix(PROXY_SNIPPET_PREFIX)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|snippet| !snippet.trim().is_empty())
+}
+
 pub(crate) fn web_search_result_block(result: &WebSearchResult) -> Value {
     json!({
-        "type": "web_search_result",
-        "title": result.title,
-        "url": result.url,
-        "encrypted_content": result
-            .encrypted_content
-            .clone()
-            .or_else(|| result.snippet.clone())
-            .unwrap_or_default(),
-        "page_age": result_page_age(result)
-    })
+           "type": "web_search_result",
+           "title": result.title,
+           "url": result.url,
+    "encrypted_content": result
+        .encrypted_content
+        .clone()
+               .or_else(|| result.snippet.as_deref().map(encode_proxy_snippet))
+        .unwrap_or_default(),
+           "page_age": result_page_age(result)
+       })
 }
 
 pub(crate) fn web_search_error_block(error_code: &str) -> Value {

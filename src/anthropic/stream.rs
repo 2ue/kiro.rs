@@ -88,6 +88,32 @@ const TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS: usize = 128;
 /// Anthropic stop reason for an upstream content-filter refusal
 /// (`metadataEvent.stopReason = CONTENT_FILTERED`).
 pub(crate) const REFUSAL_STOP_REASON: &str = "refusal";
+
+/// `stop_details` for a refusal: `{type: "refusal", category, explanation}`. The upstream detail is
+/// `category: explanation` when it gives both; an unknown category is reported as null.
+pub(crate) fn refusal_stop_details(detail: &str) -> serde_json::Value {
+    const CATEGORIES: &[&str] = &[
+        "cyber",
+        "bio",
+        "frontier_llm",
+        "reasoning_extraction",
+        "general_harms",
+    ];
+    let (category, explanation) = match detail.split_once(':') {
+        Some((category, explanation)) => (category.trim(), Some(explanation.trim())),
+        None => (detail.trim(), None),
+    };
+    let category = CATEGORIES
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(category))
+        .map(|known| serde_json::Value::String((*known).to_string()))
+        .unwrap_or(serde_json::Value::Null);
+    let explanation = explanation
+        .filter(|text| !text.is_empty())
+        .map(|text| serde_json::Value::String(text.to_string()))
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({"type": "refusal", "category": category, "explanation": explanation})
+}
 pub(crate) const UPSTREAM_INVALID_TOOL_INPUT_DETAIL: &str =
     "upstream completed a tool call whose input is not valid JSON";
 pub(crate) const UPSTREAM_INCOMPLETE_TOOL_INPUT_DETAIL: &str =
@@ -1418,6 +1444,8 @@ pub struct SseStateManager {
     next_block_index: i32,
     /// 当前 stop_reason
     stop_reason: Option<String>,
+    /// Refusal detail (`category: explanation`) reported as `stop_details` on the final delta.
+    refusal_detail: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
 }
@@ -1437,6 +1465,7 @@ impl SseStateManager {
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
+            refusal_detail: None,
             has_tool_use: false,
         }
     }
@@ -1485,6 +1514,20 @@ impl SseStateManager {
             return;
         }
         self.stop_reason = Some(reason.into());
+    }
+
+    /// Records the refusal detail for `stop_details`; the stop reason is set separately.
+    pub fn set_refusal_detail(&mut self, detail: impl Into<String>) {
+        self.refusal_detail.get_or_insert_with(|| detail.into());
+    }
+
+    /// `stop_details` of the final `message_delta`: set for a refusal, `null` otherwise.
+    fn stop_details(&self) -> serde_json::Value {
+        match (self.is_refusal(), self.refusal_detail.as_deref()) {
+            (true, Some(detail)) => refusal_stop_details(detail),
+            (true, None) => refusal_stop_details(""),
+            _ => serde_json::Value::Null,
+        }
     }
 
     fn is_refusal(&self) -> bool {
@@ -1696,13 +1739,14 @@ impl SseStateManager {
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null
-                    },
-                    "usage": usage
-                }),
+                                 "type": "message_delta",
+                   "delta": {
+                "stop_reason": self.get_stop_reason(),
+                "stop_sequence": null,
+                "stop_details": self.stop_details()
+                   },
+                   "usage": usage
+                             }),
             ));
         }
 
@@ -2853,6 +2897,7 @@ impl StreamContext {
                 if let Some(refusal) = metadata.content_filter_refusal() {
                     tracing::warn!(refusal = %refusal, "上游内容过滤拒答，按 stop_reason=refusal 结束");
                     self.state_manager.set_stop_reason(REFUSAL_STOP_REASON);
+                    self.state_manager.set_refusal_detail(refusal.clone());
                     self.upstream_content_filter_refusal.get_or_insert(refusal);
                 }
                 if let Some(token_usage) = &metadata.token_usage {
@@ -2884,12 +2929,13 @@ impl StreamContext {
                     self.context_input_tokens = Some(actual_input_tokens);
                 }
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if percentage.is_finite()
-                    && percentage >= 100.0
-                    && !self.suppress_context_window_exceeded
-                {
-                    self.state_manager
-                        .set_stop_reason("model_context_window_exceeded");
+                if percentage.is_finite() && percentage >= 100.0 {
+                    if !self.suppress_context_window_exceeded {
+                        self.state_manager
+                            .set_stop_reason("model_context_window_exceeded");
+                    } else if !self.state_manager.has_tool_use() {
+                        self.state_manager.set_stop_reason("max_tokens");
+                    }
                 }
                 tracing::debug!(
                     "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
@@ -10344,5 +10390,21 @@ mod tests {
         );
         assert_eq!(final_stop_reason(&events).as_deref(), Some("tool_use"));
         assert_eq!(ctx.response_tool_gate().dropped_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+
+    #[test]
+    fn refusal_stop_details_follow_the_official_shape() {
+        let details = refusal_stop_details("cyber: request targets a live system");
+        assert_eq!(details["type"], "refusal");
+        assert_eq!(details["category"], "cyber");
+        assert_eq!(details["explanation"], "request targets a live system");
+        let unknown = refusal_stop_details("CONTENT_FILTERED");
+        assert_eq!(unknown["category"], serde_json::Value::Null);
+        assert_eq!(unknown["explanation"], serde_json::Value::Null);
     }
 }

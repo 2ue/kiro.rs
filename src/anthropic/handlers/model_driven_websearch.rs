@@ -637,10 +637,7 @@ fn display_identity(
     ctx: &ModelDrivenWebSearchContext,
 ) -> Option<super::super::identity_guard::DisplayIdentity> {
     ctx.model_resolution.forced.as_ref().map(|forced| {
-        super::super::identity_guard::DisplayIdentity {
-            name: forced.spec.display_name.to_string(),
-            id: forced.display_model.clone(),
-        }
+        super::super::identity_guard::DisplayIdentity::for_forced(forced, &ctx.payload)
     })
 }
 

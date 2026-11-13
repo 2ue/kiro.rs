@@ -836,6 +836,27 @@ impl Default for UsageCleanupRuntime {
 impl AdminService {
     /// Per target model of the forced mapping (or the given comma-separated models): whether the
     /// upstream catalog serves it, and how many enabled accounts may take it.
+    /// Built-in knowledge entries and, for `text`, the facts a user message would get.
+    pub fn forced_model_knowledge(&self, text: Option<&str>) -> serde_json::Value {
+        let configured = self
+            .token_manager
+            .runtime_config()
+            .forced_model_mapping
+            .clone()
+            .normalized()
+            .knowledge;
+        let preview = text.map(|text| {
+            let (facts, block) =
+                crate::anthropic::forced_model::preview_knowledge(text, &configured);
+            serde_json::json!({"text": text, "facts": facts, "block": block})
+        });
+        serde_json::json!({
+        "builtin": crate::anthropic::forced_model::builtin_knowledge_entries(),
+        "configuredCount": configured.len(),
+        "preview": preview,
+           })
+    }
+
     pub fn forced_model_targets(&self, models: Option<&str>) -> serde_json::Value {
         let runtime_config = self.token_manager.runtime_config();
         let targets: Vec<String> = match models {

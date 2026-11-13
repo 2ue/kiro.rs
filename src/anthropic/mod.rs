@@ -49,6 +49,7 @@ pub(crate) mod envelope;
 pub(crate) mod files;
 pub(crate) mod forced_backoff;
 pub(crate) mod forced_model;
+pub(crate) mod forced_summary;
 mod handlers;
 mod identity_guard;
 pub(crate) mod image_resize;

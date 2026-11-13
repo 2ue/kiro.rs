@@ -1815,6 +1815,11 @@ export interface ForcedContextBackoffConfig {
   minReservedOutputTokens: number
   keepRecentToolResults: number
   stepTokens: number
+  maxReservedOutputTokens: number
+  summaryEnabled: boolean
+  summaryPrecompactRatio: number
+  summaryTargetRatio: number
+  summaryTimeoutSecs: number
 }
 
 export type ForcedKnowledgeLocale = 'en' | 'zh'
