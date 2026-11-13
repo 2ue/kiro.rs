@@ -92,6 +92,7 @@ import type { BalanceResponse, CredentialStatusItem, ExternalPoolRouteMode, Usag
 import {
   accountInfoValue,
   authLabel,
+  providerLabel,
   credentialFlags,
   credentialLabel,
   credentialRouteSummary,
@@ -651,6 +652,7 @@ export function CredentialCard({
   })
   // 只有 IdC / External IdP 账号靠 ListAvailableProfiles 确定 profileArn。
   const usesProfileDiscovery = credential.authMethod === 'idc' || credential.authMethod === 'external_idp'
+  const providerText = providerLabel(credential.provider)
   const runSyncProfileArn = (mode: 'fill' | 'rediscover') => syncProfileArn.mutate(
     { ids: [credential.id], mode },
     {
@@ -733,6 +735,11 @@ export function CredentialCard({
           <span className={cn('inline-flex h-5 items-center rounded-full px-2 text-[0.68rem] font-semibold', AUTH_CLASS[credential.authMethod ?? ''] ?? 'bg-muted text-muted-foreground')}>
             {authLabel(credential.authMethod)}
           </span>
+          {providerText && (
+            <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-[0.68rem] font-medium text-muted-foreground" title="身份提供方">
+              {providerText}
+            </span>
+          )}
           {epLabel && (
             <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-[0.68rem] font-medium text-muted-foreground" title={credential.endpoint}>
               {epLabel}
@@ -958,6 +965,7 @@ export function CredentialCard({
             <SheetDescription className="flex flex-wrap items-center gap-1">
               <span className={cn('inline-flex h-5 items-center rounded-full px-2 text-[0.68rem] font-semibold', SUBSCRIPTION_CLASS[subMeta.key])}>{subMeta.label}</span>
               <span className={cn('inline-flex h-5 items-center rounded-full px-2 text-[0.68rem] font-semibold', AUTH_CLASS[credential.authMethod ?? ''] ?? 'bg-muted text-muted-foreground')}>{authLabel(credential.authMethod)}</span>
+              {providerText && <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-[0.68rem] font-medium" title="身份提供方">{providerText}</span>}
               {epLabel && <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-[0.68rem] font-medium">{epLabel}</span>}
             </SheetDescription>
           </SheetHeader>

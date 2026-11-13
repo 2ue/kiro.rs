@@ -29,17 +29,17 @@ docker compose -f docker-compose.local-infra.yml up -d
 再启动后端 API。debug 构建不需要构建前端 dist：
 
 ```bash
-cargo run -- -c config.json --credentials credentials.json
+cargo run -- -c config.json
 ```
 
-这样 `9022` 主要承担 API 后端职责。访问 `http://127.0.0.1:9022/ui` 会自动重定向到对应 Vite 服务。
+这样 `9022` 主要承担 API 后端职责。服务启动不读取凭据文件，本地库为空时在管理后台账号页导入凭据。访问 `http://127.0.0.1:9022/ui` 会自动重定向到对应 Vite 服务。
 
 如果你想直接跑 release 二进制但仍走 Vite，可显式指定：
 
 ```bash
 KIRO_NEW_UI_MODE=redirect \
 KIRO_NEW_UI_DEV_SERVER=http://127.0.0.1:9023/ui \
-  ./target/release/kiro-rs -c config.json --credentials credentials.json
+  ./target/release/kiro-rs -c config.json
 ```
 
 最后启动需要看的前端。通常只需要新版 UI：

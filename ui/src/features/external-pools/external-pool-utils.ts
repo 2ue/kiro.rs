@@ -366,6 +366,9 @@ export function streamRetryDescription(mode: ExternalPoolStreamRetryDraft): stri
   if (mode === 'disabled') {
     return '当前外部账号强制关闭：stream body 内错误保持现有流错误行为，不把本次请求重放到其他外部账号。'
   }
+  if (mode === 'early_commit') {
+    return '收到上游 message_start 后立即转发（usage 置 0）并持续发送 ping；首个内容前出错仍可换账号重试，下游只收到一次 message_start。此模式取消首个输出超时，保留空闲超时。首包前全部失败仍返回 HTTP 错误；首包后全部失败发送 SSE error，用量保持 0。成功时在 message_delta 返回完整用量。仅当本次请求所有可选外部账号都设为此模式时生效。'
+  }
   return '当前外部账号继承全局“流式首输出前错误换池”开关。'
 }
 
@@ -373,6 +376,7 @@ export function streamRetrySummary(pool: ExternalPool, config: ExternalPoolsConf
   const mode = pool.preOutputStreamRetryMode || 'inherit'
   if (mode === 'enabled') return '首输出恢复：启用'
   if (mode === 'disabled') return '首输出恢复：禁用'
+  if (mode === 'early_commit') return '首输出恢复：先提交首包'
   return config.externalPoolStreamPreOutputRetryEnabled
     ? '首输出恢复：继承启用'
     : '首输出恢复：继承禁用'

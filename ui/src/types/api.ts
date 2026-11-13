@@ -476,72 +476,6 @@ export interface ProfileArnSyncResponse {
   items: ProfileArnSyncItem[]
 }
 
-export interface ValidateExistingCredentialsRequest {
-  scope?: 'all' | 'enabled' | 'disabled' | 'selected'
-  ids?: number[]
-  force?: boolean
-}
-
-export interface ValidateExternalCredentialsRequest {
-  credentials: AddCredentialRequest[]
-  querySubscription?: boolean
-  queryUsage?: boolean
-  checkLiveness?: boolean
-  livenessModel?: string
-  livenessPrompt?: string
-}
-
-export interface CredentialValidationInfo {
-  subscriptionTitle: string | null
-  currentUsage: number
-  usageLimit: number
-  usagePercentage: number
-  checkedAt: string
-}
-
-export interface CredentialValidationItem {
-  id?: number | null
-  index?: number | null
-  email?: string | null
-  disabled?: boolean | null
-  ok: boolean
-  previous?: CredentialValidationInfo | null
-  current?: CredentialValidationInfo | null
-  changeKind: string
-  subscriptionKey: string
-  subscriptionTitle: string
-  error?: string | null
-  subscriptionChecked?: boolean
-  usageChecked?: boolean
-  livenessChecked?: boolean
-  subscriptionOk?: boolean | null
-  usageOk?: boolean | null
-  livenessOk?: boolean | null
-  usageError?: string | null
-  livenessError?: string | null
-  livenessModel?: string | null
-  livenessResponse?: string | null
-  matchedExistingCredentialId?: number | null
-  existingDisabled?: boolean | null
-}
-
-export interface CredentialValidationGroup {
-  key: string
-  title: string
-  count: number
-  items: CredentialValidationItem[]
-}
-
-export interface CredentialValidationResponse {
-  total: number
-  success: number
-  failed: number
-  downgraded: number
-  upgraded: number
-  unchanged: number
-  groups: CredentialValidationGroup[]
-}
-
 export interface SuccessResponse {
   success: boolean
   message: string
@@ -880,6 +814,7 @@ export interface UsageLatencyTrace {
   estimatedInputTokens?: number
   payloadGuardMs?: number
   upstreamHeaderMs?: number
+  downstreamFirstByteMs?: number
   firstUpstreamChunkMs?: number
   firstOutputDeltaMs?: number
   firstThinkingDeltaMs?: number
@@ -1762,7 +1697,7 @@ export type ExternalPoolWireProfile = 'default' | 'http1_title_case'
 export type ExternalPoolTlsProfile = 'default' | 'native_tls'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolStreamResponseMode = 'event_passthrough'
-export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled'
+export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled' | 'early_commit'
 export type ExternalPoolModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
 export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
 export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'

@@ -103,6 +103,8 @@ use crate::{
 
 #[path = "external_pool/body_pipeline.rs"]
 mod body_pipeline;
+#[path = "external_pool/early_commit.rs"]
+mod early_commit;
 #[path = "external_pool/model_pipeline.rs"]
 mod model_pipeline;
 #[path = "external_pool/retry_pipeline.rs"]
@@ -110,6 +112,9 @@ mod retry_pipeline;
 #[path = "external_pool/usage_projection.rs"]
 mod usage_projection;
 
+use early_commit::EarlyCommitTaskGuard;
+pub use early_commit::ExternalEarlyCommitDownstream;
+use early_commit::{EarlyCommitResponseReady, EarlyCommitTail, early_commit_response};
 use usage_projection::ExternalUsageProjectionContext;
 
 #[cfg(test)]
@@ -489,6 +494,9 @@ pub enum ExternalPoolStreamRetryMode {
     Inherit,
     Enabled,
     Disabled,
+    /// 立即把上游 message_start（usage 清零）和 ping 发给下游；首个内容前出错仍换池重放，
+    /// 重放成功时丢弃新一次的 message_start，全部失败时以 SSE error 事件收尾。
+    EarlyCommit,
 }
 
 impl ExternalPoolStreamRetryMode {
@@ -501,6 +509,7 @@ impl ExternalPoolStreamRetryMode {
             "inherit" => Some(Self::Inherit),
             "enabled" => Some(Self::Enabled),
             "disabled" => Some(Self::Disabled),
+            "early_commit" => Some(Self::EarlyCommit),
             _ => None,
         }
     }
@@ -510,6 +519,7 @@ impl ExternalPoolStreamRetryMode {
             Self::Inherit => "inherit",
             Self::Enabled => "enabled",
             Self::Disabled => "disabled",
+            Self::EarlyCommit => "early_commit",
         }
     }
 }
@@ -1092,6 +1102,9 @@ pub struct ExternalRouteRequest {
     /// 流式首个语义输出前最多静默保留多久（与本地 `streamPreOutputHoldSecs` 一致，从请求开始计）。
     /// 到期且已缓冲 message_start 时提前提交并开始保活，放弃之后的首输出前换池；None 表示一直保留。
     pub stream_pre_output_hold: Option<Duration>,
+    /// 提前提交模式下已打开的下游 SSE 通道。设置后，首个内容前的 message_start（usage 清零）
+    /// 和 ping 直接写入通道，换池重放时不再重复发送 message_start。
+    pub early_commit: Option<Arc<ExternalEarlyCommitDownstream>>,
     pub first_token_latency_ms: Arc<AtomicU64>,
     pub latency_trace: Arc<ExternalLatencyTraceState>,
     pub payload_breakdown: Option<PayloadByteBreakdown>,
@@ -1232,6 +1245,7 @@ fn requested_max_tokens_from_raw_body(body: &Bytes) -> Option<i32> {
 #[derive(Debug, Default)]
 pub struct ExternalLatencyTraceState {
     upstream_header_ms: AtomicU64,
+    downstream_first_byte_ms: AtomicU64,
     first_upstream_chunk_ms: AtomicU64,
     first_output_delta_ms: AtomicU64,
     stream_gap_to_first_output_ms: AtomicU64,
@@ -1253,6 +1267,10 @@ impl ExternalLatencyTraceState {
 
     fn mark_upstream_header(&self, started_at: Instant) {
         Self::store_once(&self.upstream_header_ms, Self::elapsed_ms(started_at));
+    }
+
+    fn mark_downstream_first_byte(&self, started_at: Instant) {
+        Self::store_once(&self.downstream_first_byte_ms, Self::elapsed_ms(started_at));
     }
 
     fn mark_first_upstream_chunk(&self, started_at: Instant) {
@@ -1282,6 +1300,7 @@ impl ExternalLatencyTraceState {
             upstream_header_ms: load_nonzero(&self.upstream_header_ms),
             credential_dispatch_elapsed_ms: None,
             upstream_header_wait_ms: None,
+            downstream_first_byte_ms: load_nonzero(&self.downstream_first_byte_ms),
             first_upstream_chunk_ms: load_nonzero(&self.first_upstream_chunk_ms),
             first_output_delta_ms,
             first_thinking_delta_ms: None,
@@ -1523,6 +1542,28 @@ impl From<ExternalPoolError> for ExternalForwardError {
         Self::new(err, None)
     }
 }
+
+/// 提前提交模式下下游客户端已断开：不再换池，也不计入池质量或冷却。
+fn external_early_commit_downstream_gone_error(
+    outbound_model: Option<String>,
+) -> ExternalForwardError {
+    ExternalForwardError::new(
+        ExternalPoolError {
+            status: None,
+            message: EXTERNAL_EARLY_COMMIT_CLIENT_GONE_MESSAGE.to_string(),
+            retryable: false,
+            auto_disable_reason: None,
+            cooldown: None,
+            protocol_error: Some(EXTERNAL_EARLY_COMMIT_CLIENT_GONE_REASON),
+            raw_upstream_error: None,
+        },
+        outbound_model,
+    )
+}
+
+const EXTERNAL_EARLY_COMMIT_CLIENT_GONE_REASON: &str = "early_commit_client_gone";
+const EXTERNAL_EARLY_COMMIT_CLIENT_GONE_MESSAGE: &str =
+    "downstream client disconnected before the external stream produced output";
 
 fn external_pool_lease_lost_forward_error(outbound_model: Option<String>) -> ExternalForwardError {
     ExternalForwardError::new(
@@ -6201,6 +6242,124 @@ impl ExternalPoolManager {
         config: ExternalPoolsConfig,
         route: ExternalRouteRequest,
     ) -> ExternalPoolForwardOutcome {
+        // 装箱：换池循环的 future 很大，直接内联会撑大所有调用方的栈帧。
+        if route.early_commit.is_some() || !route.is_stream() || !config.external_pools_enabled {
+            return Box::pin(self.forward_with_failover_inner(config, route, None)).await;
+        }
+        // 只加载一次权威快照并交给换池循环复用，不因判断模式多等一次。
+        let snapshot = self.load_authoritative_pool_snapshot().await;
+        let early_commit = snapshot
+            .as_ref()
+            .is_ok_and(|pools| route_prefers_early_commit(pools, &route));
+        if early_commit {
+            return Box::pin(self.forward_with_early_commit(config, route, snapshot)).await;
+        }
+        Box::pin(self.forward_with_failover_inner(config, route, Some(snapshot))).await
+    }
+
+    /// 收到首个上游 message_start 后返回 SSE，之前的失败保持 HTTP 错误语义。
+    /// 后台换池循环的后续内容接到同一个 body，下游断开后停止重试。
+    async fn forward_with_early_commit(
+        &self,
+        config: ExternalPoolsConfig,
+        mut route: ExternalRouteRequest,
+        snapshot: Result<Arc<Vec<ExternalPool>>, ExternalPoolSelectionUnavailable>,
+    ) -> ExternalPoolForwardOutcome {
+        let request_id = route.request_id.clone();
+        let error_id = route.error_id.clone();
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (downstream, receiver) = early_commit::ExternalEarlyCommitDownstream::new(
+            route.started_at,
+            route.latency_trace.clone(),
+            ready_sender,
+        );
+        route.early_commit = Some(downstream.clone());
+        let manager = self.clone();
+        let (tail_sender, tail_receiver) = tokio::sync::oneshot::channel::<EarlyCommitTail>();
+        let task_downstream = downstream.clone();
+        let task_request_id = request_id.clone();
+        let task_error_id = error_id.clone();
+        let task = tokio::spawn(async move {
+            let idle_timeout = (config.external_pool_stream_idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.external_pool_stream_idle_timeout_secs));
+            let mut keepalive =
+                tokio::time::interval(external_pool_stream_keepalive_interval(idle_timeout));
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let forward = manager.forward_with_failover_inner(config, route, Some(snapshot));
+            tokio::pin!(forward);
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut forward => break outcome,
+                    _ = keepalive.tick() => {
+                        if task_downstream.message_start_sent() {
+                            let _ = task_downstream.send_ping().await;
+                        }
+                    }
+                }
+            };
+            let tail = match outcome {
+                ExternalPoolForwardOutcome::Response(response) => {
+                    if !task_downstream.response_committed() {
+                        task_downstream.mark_response_committed();
+                    }
+                    EarlyCommitTail::Stream(response.into_body().into_data_stream().boxed())
+                }
+                ExternalPoolForwardOutcome::FinalError(err) => {
+                    if task_downstream.response_committed() {
+                        tracing::warn!(
+                            request_id = %task_request_id,
+                            error_id = %task_error_id,
+                            route_error_type = %err.route_error_type,
+                            attempts = err.attempts.len(),
+                            "external pool early-commit request failed after committing the stream; ending with an SSE error event"
+                        );
+                        task_downstream
+                            .send_terminal_error(&task_error_id, &task_request_id)
+                            .await;
+                    } else {
+                        let _ = task_downstream.fail_before_response_commit(err.clone());
+                    }
+                    EarlyCommitTail::Done
+                }
+            };
+            let _ = tail_sender.send(tail);
+        });
+        drop(downstream);
+        let mut task_guard = EarlyCommitTaskGuard::new(task);
+        match ready_receiver.await {
+            Ok(EarlyCommitResponseReady::Committed) => {
+                task_guard.detach();
+                ExternalPoolForwardOutcome::Response(early_commit_response(
+                    &request_id,
+                    receiver,
+                    tail_receiver,
+                ))
+            }
+            Ok(EarlyCommitResponseReady::Failed(error)) => {
+                ExternalPoolForwardOutcome::FinalError(error)
+            }
+            Err(_) => ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
+                status: StatusCode::BAD_GATEWAY,
+                response_error_type: "bad_gateway".to_string(),
+                route_error_type: "external_pool_early_commit_start_failed".to_string(),
+                message: "external pool early-commit response failed before commitment".to_string(),
+                error_id,
+                retryable: false,
+                attempts: Vec::new(),
+                pool_id: None,
+                pool_name: None,
+            }),
+        }
+    }
+
+    async fn forward_with_failover_inner(
+        &self,
+        config: ExternalPoolsConfig,
+        route: ExternalRouteRequest,
+        preloaded_snapshot: Option<
+            Result<Arc<Vec<ExternalPool>>, ExternalPoolSelectionUnavailable>,
+        >,
+    ) -> ExternalPoolForwardOutcome {
         let mut route = route;
         if !config.external_pools_enabled {
             self.record_external_failure(
@@ -6275,7 +6434,11 @@ impl ExternalPoolManager {
         let mut attempt_rejection = None;
         let mut preselected_pool: Option<ExternalPool> = None;
         let dispatch_deadline = external_dispatch_deadline(&route, &config);
-        let authoritative_pools = match self.load_authoritative_pool_snapshot().await {
+        let authoritative_pools = match preloaded_snapshot {
+            Some(snapshot) => snapshot,
+            None => self.load_authoritative_pool_snapshot().await,
+        };
+        let authoritative_pools = match authoritative_pools {
             Ok(pools) => pools,
             Err(unavailable) => {
                 let snapshot = selection_unavailable_snapshot(unavailable).availability;
@@ -6311,6 +6474,20 @@ impl ExternalPoolManager {
         let mut pre_output_failovers_left = EXTERNAL_POOL_PRE_OUTPUT_FAILOVERS_PAST_DEADLINE;
         let mut last_failure_was_pre_output = false;
         loop {
+            if route
+                .early_commit
+                .as_ref()
+                .is_some_and(|downstream| downstream.downstream_closed())
+            {
+                self.record_external_client_dropped(&route, None, attempts.clone());
+                let gone = external_early_commit_downstream_gone_error(None);
+                return ExternalPoolForwardOutcome::FinalError(external_final_error_from_error(
+                    None,
+                    attempts,
+                    &gone.err,
+                    &route.error_id,
+                ));
+            }
             let past_dispatch_deadline =
                 dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline);
             let pre_output_failover_allowed = past_dispatch_deadline
@@ -6690,6 +6867,32 @@ impl ExternalPoolManager {
                         return self
                             .external_attempt_rejection_outcome(&route, attempts, rejection);
                     }
+                    if forward_err.err.protocol_error
+                        == Some(EXTERNAL_EARLY_COMMIT_CLIENT_GONE_REASON)
+                    {
+                        // 提前提交模式下客户端已断开：不换池、不计入池质量或冷却，按客户端断开记录。
+                        attempts.push(ExternalPoolAttempt {
+                            attempt: send_attempt_index.saturating_add(1) as u32,
+                            pool_id,
+                            pool_name: pool.name.clone(),
+                            outbound_model: forward_err.outbound_model.clone(),
+                            status: None,
+                            action: "client_dropped".to_string(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            error_type: Some("client_dropped".to_string()),
+                            error_message: Some(forward_err.err.message.clone()),
+                            raw_upstream_error: None,
+                        });
+                        self.record_external_client_dropped(&route, Some(&pool), attempts.clone());
+                        return ExternalPoolForwardOutcome::FinalError(
+                            external_final_error_from_error(
+                                Some(&pool),
+                                attempts,
+                                &forward_err.err,
+                                &route.error_id,
+                            ),
+                        );
+                    }
                     send_attempt_index = send_attempt_index.saturating_add(1);
                     let outbound_model = forward_err.outbound_model;
                     let err = forward_err.err;
@@ -7062,6 +7265,9 @@ impl ExternalPoolManager {
                 rejection,
             ));
         }
+        if let Some(downstream) = route.early_commit.as_ref() {
+            downstream.reset_attempt_usage();
+        }
         if crate::diagnostics::capture::is_active() {
             if let Some(built) = request.try_clone().and_then(|builder| builder.build().ok()) {
                 crate::diagnostics::capture::record(
@@ -7116,6 +7322,14 @@ impl ExternalPoolManager {
             },
             _ = lease.wait_until_lost() => {
                 return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
+            }
+            _ = async {
+                match route.early_commit.as_ref() {
+                    Some(downstream) => downstream.wait_downstream_closed().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                return Err(external_early_commit_downstream_gone_error(outbound_model.clone()));
             }
         };
 
@@ -7205,6 +7419,7 @@ impl ExternalPoolManager {
             }));
             let stream_usage_capture = usage_capture.clone();
             let latency_trace = route.latency_trace.clone();
+            let early_commit_downstream = route.early_commit.clone();
             let route_started_at = route.started_at;
             let stream_error_mask = Arc::new(ExternalStreamErrorMask {
                 request_id: route.request_id.clone(),
@@ -7228,7 +7443,40 @@ impl ExternalPoolManager {
                 .as_ref()
                 .map(|_| route.request_id.clone());
             let capture_pool_id = pool.id;
-            if effective_external_pool_pre_output_stream_retry_enabled(pool, config) {
+            if let Some(downstream) = route.early_commit.as_ref() {
+                last_chunk_at = match Box::pin(early_commit::pre_read_early_commit(
+                    downstream,
+                    &mut body_stream,
+                    &mut buffer,
+                    &mut prefix,
+                    &lease,
+                    route,
+                    pool,
+                    config,
+                    projection_context.as_ref(),
+                    &usage_capture,
+                    stream_plan,
+                    stream_error_mask.as_ref(),
+                    &transcript_state,
+                    stream_idle_timeout,
+                    &outbound_model,
+                    upstream_chunk_index.as_deref(),
+                ))
+                .await
+                {
+                    Ok(early_commit::EarlyCommitPreRead::Committed(last_chunk_at)) => last_chunk_at,
+                    Ok(early_commit::EarlyCommitPreRead::DownstreamGone) => {
+                        drop(lease);
+                        return Err(external_early_commit_downstream_gone_error(
+                            outbound_model.clone(),
+                        ));
+                    }
+                    Err(err) => {
+                        drop(lease);
+                        return Err(err);
+                    }
+                };
+            } else if effective_external_pool_pre_output_stream_retry_enabled(pool, config) {
                 last_chunk_at = match pre_read_external_stream_before_commit(
                     &mut body_stream,
                     &mut buffer,
@@ -7279,6 +7527,7 @@ impl ExternalPoolManager {
                     let latency_trace = latency_trace.clone();
                     let stream_error_mask = stream_error_mask.clone();
                     let transcript_state = transcript_state.clone();
+                    let early_commit_downstream = early_commit_downstream.clone();
                     let upstream_chunk_index = upstream_chunk_index.clone();
                     let capture_request_id = capture_request_id.clone();
                     async move {
@@ -7302,7 +7551,8 @@ impl ExternalPoolManager {
                             ));
                         }
                         loop {
-                            let projected = drain_sse_events_with_transcript(
+                            let projected = drain_sse_events_for_downstream(
+                                early_commit_downstream.as_deref(),
                                 &mut buffer,
                                 projection_context.as_ref(),
                                 Some(&usage_capture),
@@ -7340,7 +7590,8 @@ impl ExternalPoolManager {
                                                 .mark_first_upstream_chunk(route_started_at);
                                             last_chunk_at = Instant::now();
                                             buffer.extend_from_slice(&chunk);
-                                            let projected = drain_sse_events_with_transcript(
+                                            let projected = drain_sse_events_for_downstream(
+                                                early_commit_downstream.as_deref(),
                                                 &mut buffer,
                                                 projection_context.as_ref(),
                                                 Some(&usage_capture),
@@ -9613,6 +9864,36 @@ impl ExternalPoolManager {
         );
     }
 
+    fn record_external_client_dropped(
+        &self,
+        route: &ExternalRouteRequest,
+        pool: Option<&ExternalPool>,
+        attempts: Vec<ExternalPoolAttempt>,
+    ) {
+        self.record_external(
+            route,
+            pool,
+            attempts,
+            UsageRecordStatus::ClientDropped,
+            Some("client_dropped".to_string()),
+            Some(EXTERNAL_EARLY_COMMIT_CLIENT_GONE_MESSAGE.to_string()),
+            Some(format!(
+                "client_dropped: {}",
+                EXTERNAL_EARLY_COMMIT_CLIENT_GONE_MESSAGE
+            )),
+            UsageErrorDiagnostics {
+                status_code: None,
+                source: Some("downstream_client".to_string()),
+                error_id: Some(route.error_id.clone()),
+                metadata: None,
+                public_error: None,
+                raw_upstream_error: None,
+            },
+            None,
+            None,
+        );
+    }
+
     fn record_external_failure(
         &self,
         route: &ExternalRouteRequest,
@@ -11122,12 +11403,40 @@ fn effective_external_pool_pre_output_stream_retry_enabled(
     config: &ExternalPoolsConfig,
 ) -> bool {
     match pool.pre_output_stream_retry_mode {
-        ExternalPoolStreamRetryMode::Enabled => true,
+        ExternalPoolStreamRetryMode::Enabled | ExternalPoolStreamRetryMode::EarlyCommit => true,
         ExternalPoolStreamRetryMode::Disabled => false,
         ExternalPoolStreamRetryMode::Inherit => {
             config.external_pool_stream_pre_output_retry_enabled
         }
     }
+}
+
+/// 只有流式请求、且本次请求所有可选池都设置了“提前提交首包”时才启用。
+/// 混合时不启用：普通池的首输出前语义（缓冲、首个输出超时）保持不变。
+fn route_prefers_early_commit(pools: &[ExternalPool], route: &ExternalRouteRequest) -> bool {
+    let support_candidates = normalize_external_pool_support_candidates(
+        route.model_candidates_for_support().into_iter().flatten(),
+    );
+    let eligible = pools
+        .iter()
+        .filter(|pool| {
+            pool.enabled
+                && !pool.is_auto_disabled_now()
+                && external_pool_route_allowed(pool, Some(&route.endpoint))
+                && external_pool_matches_supported_models_normalized(
+                    pool,
+                    Some(&support_candidates),
+                )
+        })
+        .collect::<Vec<_>>();
+    !eligible.is_empty()
+        && eligible
+            .iter()
+            .all(|pool| external_pool_stream_early_commit_enabled(pool))
+}
+
+fn external_pool_stream_early_commit_enabled(pool: &ExternalPool) -> bool {
+    pool.pre_output_stream_retry_mode == ExternalPoolStreamRetryMode::EarlyCommit
 }
 
 fn external_pre_output_stream_protocol_error(
@@ -15142,6 +15451,55 @@ fn drain_sse_events(
     plan: ExternalStreamProcessingPlan,
 ) -> Vec<u8> {
     drain_sse_events_with_transcript(buffer, projection, capture, stream_error_mask, plan, None)
+}
+
+/// 提交后流的 SSE 处理：普通模式等同 `drain_sse_events_with_transcript`；提前提交模式下额外
+/// 丢弃重复的 message_start（下游已经收到过），并用上游真实 message_start 的输入侧用量补全
+/// message_delta 缺失的字段（下游收到的 message_start 用量已清零）。
+fn drain_sse_events_for_downstream(
+    early_commit: Option<&ExternalEarlyCommitDownstream>,
+    buffer: &mut Vec<u8>,
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_error_mask: Option<&ExternalStreamErrorMask>,
+    plan: ExternalStreamProcessingPlan,
+    mut transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
+) -> Vec<u8> {
+    let Some(early_commit) = early_commit else {
+        return drain_sse_events_with_transcript(
+            buffer,
+            projection,
+            capture,
+            stream_error_mask,
+            plan,
+            transcript_state,
+        );
+    };
+    let mut out = Vec::new();
+    while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
+        let end = idx + delimiter_len;
+        let event = buffer.drain(..end).collect::<Vec<u8>>();
+        let processed = process_sse_event_with_plan_and_transcript(
+            &event,
+            projection,
+            capture,
+            stream_error_mask,
+            plan,
+            transcript_state.as_deref_mut(),
+        );
+        if early_commit.message_start_sent() && early_commit::sse_event_is_message_start(&processed)
+        {
+            continue;
+        }
+        match early_commit
+            .upstream_start_usage()
+            .and_then(|start| early_commit::backfill_message_delta_usage(&processed, &start))
+        {
+            Some(backfilled) => out.extend(backfilled),
+            None => out.extend(processed),
+        }
+    }
+    out
 }
 
 fn drain_sse_events_with_transcript(

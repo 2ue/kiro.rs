@@ -36,13 +36,14 @@
 - [开始](#开始)
   - [1. 编译](#1-编译)
   - [2. 最小配置](#2-最小配置)
-  - [3. 启动](#3-启动)
-  - [4. 验证](#4-验证)
+  - [3. 导入凭据](#3-导入凭据)
+  - [4. 启动](#4-启动)
+  - [5. 验证](#5-验证)
   - [Docker](#docker)
 - [前端开发预览](docs/frontend-dev-environment.md)
 - [配置详解](#配置详解)
   - [config.json](#configjson)
-  - [credentials.json](#credentialsjson)
+  - [凭据字段](#凭据字段)
   - [Region 配置](#region-配置)
   - [代理配置](#代理配置)
   - [认证方式](#认证方式)
@@ -69,11 +70,9 @@
 
 CI、Docker 和发布构建固定使用 Node.js `22.23.0`、pnpm `11.11.0` 与 Rust `1.92.0`。
 
-> **发布/嵌入式构建前置步骤**：从干净 checkout 构建二进制时，必须先生成新旧两套前端的 `dist`：
+> **发布/嵌入式构建前置步骤**：从干净 checkout 构建二进制时，必须先生成前端 `ui` 的 `dist`：
 > ```bash
 > npm install --global pnpm@11.11.0  # 仅用于安装 pnpm；项目命令统一使用 pnpm
-> pnpm --dir admin-ui install --frozen-lockfile
-> pnpm --dir admin-ui build
 > pnpm --dir ui install --frozen-lockfile
 > pnpm --dir ui build
 > ```
@@ -89,7 +88,7 @@ cargo +1.92.0 build --release --locked
 
 ### 构建门禁
 
-PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `admin-ui` 与 `ui`，检查 Rust 格式和 Clippy 告警基线，使用真实 PgSQL/Redis 分别执行默认 feature 与无默认 feature 测试，并用默认 feature 生成 release 二进制。发布 tag 必须严格等于 `v` 加 `Cargo.toml` 中的版本，例如 Cargo 版本 `0.0.101` 对应 `v0.0.101`。
+PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `ui`，检查 Rust 格式和 Clippy 告警基线，使用真实 PgSQL/Redis 分别执行默认 feature 与无默认 feature 测试，并用默认 feature 生成 release 二进制。发布 tag 必须严格等于 `v` 加 `Cargo.toml` 中的版本，例如 Cargo 版本 `0.0.101` 对应 `v0.0.101`。
 
 本地执行存储集成测试时必须显式提供测试实例；测试会在 PgSQL 中创建临时 schema，并在 Redis 中使用随机 key prefix：
 
@@ -125,54 +124,31 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
 }
 ```
 > PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
-> PgSQL 和业务 Redis 为必需依赖。首次启动时会把 `config.json` 和 `credentials.json` 导入 PgSQL；之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用、external fencing 和跨实例 Token 刷新锁只使用业务 `redis`。
+> PgSQL 和业务 Redis 为必需依赖。首次启动时会把 `config.json` 导入 PgSQL；凭据通过 Admin 管理后台或 `POST /api/admin/credentials`、`POST /api/admin/credentials/import` 导入，服务启动时不读取任何凭据文件。之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用、external fencing 和跨实例 Token 刷新锁只使用业务 `redis`。
 >
 > `observabilityRedis` 是可选的独立观测故障域，用于 usage 派生 materialization、Admin/余额缓存和 usage cleanup 的 Redis 阶段。未配置时这些能力使用 PostgreSQL/进程内状态，绝不会回落到业务 Redis。配置后必须使用不同的 Redis 网络 authority；只改 logical DB 或 `keyPrefix` 仍共享同一个 Redis 单线程，启动会拒绝这种伪隔离。也可以通过 `KIRO_RS_OBSERVABILITY_REDIS_URL` 和 `KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX` 设置。
 
-创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
-> PS: 可以前往 Web 管理面板配置跳过本步骤
-> 如果你对凭据地域有疑惑, 请查看 [Region 配置](#region-配置)
+### 3. 导入凭据
 
-Social 认证：
-```json
-{
-   "refreshToken": "你的刷新token",
-   "expiresAt": "2025-12-31T02:32:45.144Z",
-   "authMethod": "social"
-}
+服务启动后，在管理后台（`/ui`，需要配置 `adminApiKey`）的账号页导入凭据。导入会自动识别来源，也可以手动指定：本项目导出、KAM / Kiro-Go 导出包、kiro-manager-lite 导出和整库备份、Kiro-Go `config.json`、KAM / lite 的卡密 / CSV / TXT 文本、`ksk_xxx|region` 文本，以及通用 JSON / JSONL。也可以直接调用管理接口：
+
+```bash
+# 单个凭据
+curl http://127.0.0.1:8990/api/admin/credentials \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <adminApiKey>" \
+  -d '{"refreshToken": "你的刷新token", "authMethod": "social"}'
+
+# 批量导入
+curl http://127.0.0.1:8990/api/admin/credentials/import \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <adminApiKey>" \
+  -d '{"duplicateMode": "skip", "continueOnError": true, "credentials": [{"kiroApiKey": "ksk_xxxxxxxx|eu-central-1"}]}'
 ```
 
-Kiro API Key / headless 认证：
-```json
-{
-   "authMethod": "api_key",
-   "kiroApiKey": "ksk_xxxxxxxx",
-   "region": "eu-central-1",
-   "authRegion": "eu-central-1",
-   "apiRegion": "eu-central-1",
-   "endpoint": "cli"
-}
-```
+导入时会先刷新一次 Token 验证凭据，再写入 PgSQL。字段说明见 [凭据字段](#凭据字段)，地域说明见 [Region 配置](#region-配置)。只使用一个 Kiro API Key 时，也可以设置 `KIRO_API_KEY` 环境变量，服务启动时自动导入。
 
-也支持便捷纯文本格式，每行一组：
-```text
-ksk_xxxxxxxx|eu-central-1
-```
-
-API Key 凭据会直接作为 Kiro Bearer token 使用，不需要 `refreshToken`，默认走 `cli` endpoint。使用 `ksk_xxx|region` 形式导入时，服务会自动把 `region/authRegion/apiRegion` 补齐为同一个区域。
-
-IdC 认证：
-```json
-{
-   "refreshToken": "你的刷新token",
-   "expiresAt": "2025-12-31T02:32:45.144Z",
-   "authMethod": "idc",
-   "clientId": "你的clientId",
-   "clientSecret": "你的clientSecret"
-}
-```
-
-### 3. 启动
+### 4. 启动
 
 ```bash
 ./target/release/kiro-rs
@@ -181,12 +157,12 @@ IdC 认证：
 或指定配置文件路径：
 
 ```bash
-./target/release/kiro-rs -c /path/to/config.json --credentials /path/to/credentials.json
+./target/release/kiro-rs -c /path/to/config.json
 ```
 
 本地开发时，仓库里的 `config.json` 当前监听 `127.0.0.1:9022`。这个端口只作为后端 API 使用；前端页面使用 Vite 热更新地址预览。
 
-### 4. 验证
+### 5. 验证
 
 ```bash
 curl http://127.0.0.1:8990/v1/messages \
@@ -210,7 +186,7 @@ curl http://127.0.0.1:8990/v1/messages \
 docker compose -f docker-compose.database.yml up -d
 ```
 
-需要将首次导入用的 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.database.yml`。
+需要将首次导入用的 `config.json` 挂载到容器中，具体参见 `docker-compose.database.yml`。凭据在服务启动后通过管理后台导入。
 
 使用已发布镜像部署：
 
@@ -449,20 +425,19 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 
 全局默认和文本在新版控制台「提示词注入」页面（`/ui/prompt-injection`）编辑，可按路由和请求条件预览实际注入内容；单个路由在路由策略编辑弹窗的「提示词注入」「功能」分区设置。旧版 `promptSteering` 等配置加载时自动迁移为等价设置。注入项说明和默认值依据见 [提示词注入改造方案](feature/todo/prompt-injection-routes-20261023/README.md)。
 
-### credentials.json
+### 凭据字段
 
-支持单对象格式（向后兼容）或数组格式（多凭据）。
-
-#### 字段说明
+管理后台导入和 `POST /api/admin/credentials`、`POST /api/admin/credentials/import` 接受以下字段（同时接受 snake_case 写法）。
 
 | 字段             | 类型     | 描述                                          |
 |----------------|--------|---------------------------------------------|
-| `id`           | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填）        |
+| `id`           | number | 凭据唯一 ID（导入时由服务分配，不需要填写）        |
 | `accessToken`  | string | OAuth 访问令牌（可选，可自动刷新）                        |
 | `refreshToken` | string | OAuth 刷新令牌                                  |
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
-| `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
+| `authMethod`   | string | 认证方式：`social`、`idc`、`external_idp` 或 `api_key`；决定 Token 刷新协议 |
+| `provider`     | string | 身份提供方（`Github`、`Google`、`BuilderId`、`Enterprise` 等），用于展示和 Portal 查询；`authMethod` 缺失时参与推断认证方式。为空时，查询额度后用 Portal 返回的身份提供方补齐 |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
 | `kiroApiKey`   | string | Kiro API Key / headless 凭据，格式 `ksk_xxx`；也支持 `ksk_xxx|region` 便捷写法 |
@@ -480,58 +455,8 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
-
-#### 单凭据格式（旧格式，向后兼容）
-
-```json
-{
-   "accessToken": "请求token，一般有效期一小时，可选",
-   "refreshToken": "刷新token，一般有效期7-30天不等",
-   "profileArn": "arn:aws:codewhisperer:us-east-1:111112222233:profile/QWER1QAZSDFGH",
-   "expiresAt": "2025-12-31T02:32:45.144Z",
-   "authMethod": "social",
-   "clientId": "IdC 登录需要",
-   "clientSecret": "IdC 登录需要"
-}
-```
-
-#### 多凭据格式（支持故障转移和自动回写）
-
-```json
-[
-   {
-      "refreshToken": "第一个凭据的刷新token",
-      "expiresAt": "2025-12-31T02:32:45.144Z",
-      "authMethod": "social",
-      "priority": 0
-   },
-   {
-      "refreshToken": "第二个凭据的刷新token",
-      "expiresAt": "2025-12-31T02:32:45.144Z",
-      "authMethod": "idc",
-      "clientId": "xxxxxxxxx",
-      "clientSecret": "xxxxxxxxx",
-      "region": "us-east-2",
-      "priority": 1,
-      "proxyUrl": "socks5://proxy.example.com:1080",
-      "proxyUsername": "user",
-      "proxyPassword": "pass"
-   },
-   {
-      "refreshToken": "第三个凭据（显式不走代理）",
-      "expiresAt": "2025-12-31T02:32:45.144Z",
-      "authMethod": "social",
-      "priority": 2,
-      "proxyUrl": "direct"
-   }
-]
-```
-
-多凭据特性：
+- 显式的 `authMethod` 决定刷新协议；`provider` 只在 `authMethod` 缺失时参与推断。`authMethod: "IdC"` + `provider: "Enterprise"` 的组织 IdC 账号按 IdC（AWS OIDC）刷新
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
-- 单凭据最多重试 3 次，单请求最多重试 9 次
-- 自动故障转移到下一个可用凭据
-- 多凭据格式下 Token 刷新后自动回写到源文件
 
 ### Region 配置
 
@@ -603,31 +528,27 @@ RUST_LOG=debug ./target/release/kiro-rs
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
-| `KIRO_API_KEY` | - | 自动导入一个最高优先级的 Kiro API Key 凭据并写入 PgSQL，可用于不准备 `credentials.json` 的场景；支持 `ksk_xxx|region` |
+| `KIRO_API_KEY` | - | 启动时自动导入一个最高优先级的 Kiro API Key 凭据并写入 PgSQL；已存在时跳过；支持 `ksk_xxx|region` |
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
-| `KIRO_ADMIN_UI_MODE` | debug: `redirect`; release: `embedded` | 旧版 `/admin` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
-| `KIRO_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_ADMIN_UI_DEV_SERVER` | debug: `http://127.0.0.1:9025/admin` | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
-| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
 | `KIRO_NEW_UI_DIR` / `KIRO_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
 | `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | debug: `http://127.0.0.1:9023/ui` | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
 
-生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/admin` 和 `/ui` 会重定向到对应 Vite 服务；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
+生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/ui` 会重定向到 Vite 服务；旧的 `/admin` 及其子路径永久重定向到 `/ui`；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
 
 本地开发预览地址：
 
 | 前端 | 命令 | 浏览器地址 | 用途 |
 |------|------|------------|------|
-| 旧版 Admin UI | `bash scripts/dev-ui.sh admin` | `http://127.0.0.1:9025/admin/` | 旧版管理入口 |
-| 新版 UI | `bash scripts/dev-ui.sh ui` | `http://127.0.0.1:9023/ui/runtime` | 当前主要开发入口 |
+| UI | `bash scripts/dev-ui.sh ui` | `http://127.0.0.1:9023/ui/runtime` | 当前主要开发入口 |
 
 后端 API 示例：
 
 ```bash
 # 当前本地 config.json 监听 9022；config.example.json 的默认示例是 8990
-./target/release/kiro-rs -c config.json --credentials credentials.json
+./target/release/kiro-rs -c config.json
 ```
 
 前端默认把 `/api` 代理到 `http://127.0.0.1:9022`。如果后端不是 9022，用 `VITE_API_PROXY_TARGET` 覆盖：
@@ -636,7 +557,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 ```
 
-日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/admin` 或 `/ui`，后端也会自动重定向到对应 Vite 地址。release 二进制仍默认使用 embedded 页面。
+日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/ui`，后端也会自动重定向到 Vite 地址。release 二进制仍默认使用 embedded 页面。
 
 ## API 端点
 
@@ -742,13 +663,12 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
   - `POST /api/admin/model-pricing/sync` - 手动同步模型价格目录
   - `GET /api/admin/audit-logs` - 分页查询后台审计日志
 
-- **Admin UI**
-  - `GET /admin` - 访问旧版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
-  - `GET /ui` - 访问新版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
+- **管理后台 UI**
+  - `GET /ui` - 访问管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。旧的 `/admin` 及其子路径永久重定向到 `/ui`。
 
 ## 注意事项
 
-1. **凭证安全**: 请妥善保管首次导入用的 `credentials.json` 和 PgSQL 数据库，不要提交到版本控制
+1. **凭证安全**: 凭据保存在 PgSQL 中，请妥善保管数据库和管理后台的 `adminApiKey`；导出的凭据文件不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
 3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
 
@@ -797,7 +717,7 @@ kiro-rs/
 │   │   ├── types.rs            # 类型定义
 │   │   ├── middleware.rs       # 认证中间件
 │   │   └── error.rs            # 错误处理
-│   ├── admin_ui/               # Admin UI 静态文件服务
+│   ├── ui/                     # 管理后台 UI 静态文件服务（/ui）
 │   │   └── router.rs           # embedded / redirect / proxy / filesystem 路由
 │   ├── storage/                # PgSQL 和 Redis 存储
 │   │   ├── postgres.rs         # PgSQL 表结构和读写

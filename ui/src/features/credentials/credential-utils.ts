@@ -34,6 +34,18 @@ export function authLabel(authMethod: string | null | undefined) {
   return authMethod || 'Unknown'
 }
 
+/** 身份提供方（Google / Github / BuilderId / Enterprise 等）的显示名；没有时返回 undefined。 */
+export function providerLabel(provider: string | null | undefined) {
+  const value = provider?.trim()
+  if (!value) return undefined
+  const compact = value.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (compact === 'google') return 'Google'
+  if (compact === 'github') return 'GitHub'
+  if (compact === 'builderid') return 'Builder ID'
+  if (compact === 'enterprise' || compact === 'externalidp') return 'Enterprise'
+  return value
+}
+
 export type BadgeTone = 'neutral' | 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info'
 
 /** Short label for a credential's route policy; undefined when it accepts every route. */

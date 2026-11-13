@@ -707,6 +707,15 @@ mod tests {
             EndpointAuthKind::ExternalIdp
         );
 
+        let organization_idc = KiroCredentials {
+            auth_method: Some("IdC".to_string()),
+            provider: Some("Enterprise".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(endpoint_auth_kind(&organization_idc), EndpointAuthKind::Idc);
+
         let provider_only_builder_id = KiroCredentials {
             provider: Some("BuilderId".to_string()),
             ..Default::default()

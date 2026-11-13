@@ -246,6 +246,29 @@ fn credential_info_refresh_only_recognizes_local_coordination_rate_limits() {
 }
 
 #[test]
+fn credential_import_claim_rejects_the_same_account_until_released() {
+    let in_flight = Arc::new(Mutex::new(HashSet::new()));
+    let first = CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
+        .expect("first import claims the account");
+    let err = CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
+        .err()
+        .expect("second import of the same account is rejected");
+    assert!(matches!(err, AdminServiceError::Conflict(_)));
+    assert!(err.to_string().contains("凭据已存在"));
+
+    // 不同账号互不影响；空 token 不登记，交给后续校验报错。
+    let _other = CredentialImportClaim::acquire(&in_flight, Some("rt-other"), "refreshToken")
+        .expect("another account imports concurrently");
+    let _empty = CredentialImportClaim::acquire(&in_flight, Some(""), "refreshToken")
+        .expect("empty token is not claimed");
+    assert_eq!(in_flight.lock().len(), 2);
+
+    drop(first);
+    CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
+        .expect("released account can be imported again");
+}
+
+#[test]
 fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
     let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
         "refreshToken": "fake-refresh-token",
@@ -257,6 +280,33 @@ fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
     .unwrap();
 
     assert_eq!(resolve_add_credential_auth_method(&req), "idc");
+}
+
+#[test]
+fn enterprise_provider_with_client_secret_import_is_inferred_as_idc() {
+    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "refreshToken": "fake-refresh-token",
+        "provider": "Enterprise",
+        "clientId": "fake-client-id",
+        "clientSecret": "fake-client-secret"
+    }))
+    .unwrap();
+
+    assert_eq!(resolve_add_credential_auth_method(&req), "idc");
+}
+
+#[test]
+fn enterprise_provider_with_external_idp_endpoint_stays_external_idp() {
+    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "refreshToken": "fake-refresh-token",
+        "provider": "Enterprise",
+        "clientId": "fake-client-id",
+        "clientSecret": "fake-client-secret",
+        "tokenEndpoint": "https://login.example.invalid/token"
+    }))
+    .unwrap();
+
+    assert_eq!(resolve_add_credential_auth_method(&req), "external_idp");
 }
 
 #[test]
@@ -813,20 +863,15 @@ fn credit_snapshot_estimates_by_tier_only_without_an_upstream_limit() {
 }
 
 #[test]
-fn subscription_key_and_rank_distinguish_pro_max_from_pro() {
+fn subscription_key_distinguishes_pro_max_from_pro() {
     for title in ["Kiro Pro Max", "KIRO PRO_MAX", "pro-max", "promax"] {
         assert_eq!(subscription_key(Some(title)), "pro_max", "title={title}");
-        assert_eq!(subscription_rank(Some(title)), 5, "title={title}");
     }
     assert_eq!(subscription_key(Some("Kiro Pro")), "pro");
-    assert_eq!(subscription_rank(Some("Kiro Pro")), 3);
     assert_eq!(subscription_key(Some("Kiro Pro+")), "pro_plus");
-    assert_eq!(subscription_rank(Some("Kiro Pro+")), 4);
     assert_eq!(subscription_key(Some("Kiro Power")), "power");
-    assert_eq!(subscription_rank(Some("Kiro Power")), 6);
     assert_eq!(subscription_key(Some("KIRO STUDENT")), "students");
     assert_eq!(subscription_key(Some("Kiro Students")), "students");
-    assert_eq!(subscription_rank(Some("Kiro Students")), 2);
     assert_eq!(subscription_key(Some("legacy trial")), "free");
 }
 

@@ -105,6 +105,12 @@ EOF
 
 start_ready() {
   local binary=$1 log_file=$2 service_port=$3
+  # v0.0.101-v0.0.103 seed the fixture credential row from the file; the current binary no
+  # longer accepts --credentials and reads credentials only from PostgreSQL.
+  local credential_args=()
+  if [[ "$binary" != "$CURRENT_BINARY" ]]; then
+    credential_args=(--credentials "$FIXTURE_DIR/credentials.json")
+  fi
   local started finished response=""
   started=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
   env -u KIRO_API_KEY \
@@ -115,7 +121,7 @@ start_ready() {
     KIRO_RS_POSTGRES_MIGRATE_ON_START=true \
     KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
     RUST_LOG=info \
-    "$binary" -c "$FIXTURE_DIR/config.json" --credentials "$FIXTURE_DIR/credentials.json" >"$log_file" 2>&1 &
+    "$binary" -c "$FIXTURE_DIR/config.json" ${credential_args[@]+"${credential_args[@]}"} >"$log_file" 2>&1 &
   CURRENT_PID=$!
 
   for _ in $(seq 1 600); do
@@ -158,7 +164,7 @@ start_expected_checksum_failure() {
     KIRO_RS_POSTGRES_MIGRATE_ON_START=true \
     KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
     RUST_LOG=info \
-    "$CURRENT_BINARY" -c "$FIXTURE_DIR/config.json" --credentials "$FIXTURE_DIR/credentials.json" >"$log_file" 2>&1 &
+    "$CURRENT_BINARY" -c "$FIXTURE_DIR/config.json" >"$log_file" 2>&1 &
   CURRENT_PID=$!
 
   for _ in $(seq 1 200); do

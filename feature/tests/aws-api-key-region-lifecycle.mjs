@@ -34,14 +34,14 @@ const REPORT_FORBIDDEN_VALUES = new Set([
   'stale-secret-must-clear',
 ])
 const MALFORMED_CREDENTIAL_VARIANTS = [
-  { id: 'empty_key', plainFile: true, fields: () => ({ kiroApiKey: '|us-east-1' }) },
-  { id: 'multiple_pipe', plainFile: true, fields: (secret) => ({ kiroApiKey: `${secret}|us-east-1|extra` }) },
-  { id: 'region_whitespace', plainFile: true, fields: (secret) => ({ kiroApiKey: `${secret}|us east-1` }) },
-  { id: 'region_control', plainFile: true, fields: (secret) => ({ kiroApiKey: `${secret}|us-east-1\nextra` }) },
-  { id: 'region_host_unsafe', plainFile: true, fields: (secret) => ({ kiroApiKey: `${secret}|us-east-1.example` }) },
-  { id: 'explicit_region_whitespace', plainFile: false, fields: (secret) => ({ kiroApiKey: secret, region: 'us east-1' }) },
-  { id: 'explicit_auth_region_control', plainFile: false, fields: (secret) => ({ kiroApiKey: secret, authRegion: 'us-east-1\nextra' }) },
-  { id: 'explicit_api_region_host_unsafe', plainFile: false, fields: (secret) => ({ kiroApiKey: secret, apiRegion: 'us-east-1.example' }) },
+  { id: 'empty_key', fields: () => ({ kiroApiKey: '|us-east-1' }) },
+  { id: 'multiple_pipe', fields: (secret) => ({ kiroApiKey: `${secret}|us-east-1|extra` }) },
+  { id: 'region_whitespace', fields: (secret) => ({ kiroApiKey: `${secret}|us east-1` }) },
+  { id: 'region_control', fields: (secret) => ({ kiroApiKey: `${secret}|us-east-1\nextra` }) },
+  { id: 'region_host_unsafe', fields: (secret) => ({ kiroApiKey: `${secret}|us-east-1.example` }) },
+  { id: 'explicit_region_whitespace', fields: (secret) => ({ kiroApiKey: secret, region: 'us east-1' }) },
+  { id: 'explicit_auth_region_control', fields: (secret) => ({ kiroApiKey: secret, authRegion: 'us-east-1\nextra' }) },
+  { id: 'explicit_api_region_host_unsafe', fields: (secret) => ({ kiroApiKey: secret, apiRegion: 'us-east-1.example' }) },
 ]
 const RUN_ID = `f06-${new Date().toISOString().replace(/[-:.TZ]/g, '')}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = path.join(ARTIFACT_ROOT, 'runtime', 'f06', RUN_ID)
@@ -421,23 +421,6 @@ async function waitForHealth(baseUrl, processHandle, timeoutMs = 60_000) {
   throw new Error(`timeout waiting for ${baseUrl}/healthz`)
 }
 
-async function waitForRejectedStartup(baseUrl, processHandle, timeoutMs = 30_000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (processHandle.exitCode !== null) {
-      return { rejected: true, exitCode: processHandle.exitCode, becameHealthy: false }
-    }
-    try {
-      const response = await fetch(`${baseUrl}/healthz`)
-      if (response.ok) {
-        return { rejected: false, exitCode: null, becameHealthy: true }
-      }
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-  return { rejected: false, exitCode: processHandle.exitCode, becameHealthy: false }
-}
-
 function processResources(pid) {
   const ps = spawnSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' })
   const rssKb = Number.parseInt(String(ps.stdout || '').trim(), 10) || 0
@@ -460,9 +443,9 @@ async function stopService(handle) {
   ACTIVE_SERVICES.delete(handle)
 }
 
-function startService({ configPath, credentialsPath, logPath, port }) {
+function startService({ configPath, logPath, port }) {
   const log = fs.openSync(logPath, 'a')
-  const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
     env: minimalEnvironment({
       RUST_LOG: 'info',
@@ -785,72 +768,6 @@ function malformedCredentialFields(variant, entry, round) {
   return fields
 }
 
-async function runMalformedCredentialFileCases({ mode, upstreamPort, fake }) {
-  const results = []
-  const variants = MALFORMED_CREDENTIAL_VARIANTS.filter((variant) => mode !== 'plain_file' || variant.plainFile)
-  for (let round = 1; round <= 3; round += 1) {
-    for (const variant of variants) {
-      const caseId = `${mode}_invalid_${variant.id}_${round}`
-      const fields = malformedCredentialFields(variant, mode, round)
-      fake.setActiveCase(caseId)
-      const caseRoot = path.join(TEMP_ROOT, caseId)
-      fs.mkdirSync(caseRoot, { recursive: true })
-      const credentialsPath = path.join(caseRoot, mode === 'json_file' ? 'credentials.json' : 'credentials.txt')
-      const configPath = path.join(caseRoot, 'config.json')
-      const logPath = path.join(caseRoot, 'service.log')
-      const port = await reservePort()
-      assert.notEqual(port, 9022)
-      const baseUrl = `http://127.0.0.1:${port}`
-      const redisKeyPrefix = `${REDIS_PREFIX}:${caseId}`
-      const config = isolatedServiceConfig({
-        port,
-        upstreamPort,
-        redisKeyPrefix,
-      })
-      fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
-      if (mode === 'json_file') {
-        fs.writeFileSync(credentialsPath, `${JSON.stringify([{
-          authMethod: 'api_key',
-          ...fields,
-        }], null, 2)}\n`, { mode: 0o600 })
-      } else {
-        fs.writeFileSync(credentialsPath, `# malformed isolated fixture\n${fields.kiroApiKey}\n`, { mode: 0o600 })
-      }
-
-      const before = fake.records.length
-      const service = startService({ configPath, credentialsPath, logPath, port })
-      const outcome = await waitForRejectedStartup(baseUrl, service)
-      if (outcome.becameHealthy || service.exitCode === null) await stopService(service)
-      assert.equal(outcome.rejected, true, `${caseId} was not rejected before startup`)
-      assert.notEqual(outcome.exitCode, 0, `${caseId} exited successfully`)
-      const auxiliaryHits = countKinds(fake.records.slice(before))
-      assert.deepEqual(auxiliaryHits, {
-        model_discovery: 0,
-        balance: 0,
-        inference: 0,
-        overage: 0,
-        unknown: 0,
-      })
-      const dbState = databaseCredentialState()
-      assert.equal(dbState.activeRows, 0)
-      const log = fs.readFileSync(logPath, 'utf8')
-      for (const value of Object.values(fields)) {
-        assert.equal(log.includes(value), false, `${caseId} log exposed malformed credential input`)
-      }
-      if (mode === 'json_file') {
-        assert.ok(
-          log.includes('invalid API-key import fields') || log.includes('invalid kiroApiKey pipe format'),
-          `${caseId} lacked a classified error`,
-        )
-      }
-      await cleanupOwnedRedisKeys()
-      fs.rmSync(caseRoot, { recursive: true, force: true })
-      results.push({ caseId, variant: variant.id, round, rejected: true, auxiliaryHits, activeRows: 0 })
-    }
-  }
-  return results
-}
-
 async function runCase({ mode, round, upstreamPort, fake, latencies, statuses }) {
   const caseId = `${mode}-${round}`
   const region = REGION_MATRIX[(round - 1) % REGION_MATRIX.length]
@@ -862,7 +779,6 @@ async function runCase({ mode, round, upstreamPort, fake, latencies, statuses })
 
   const caseRoot = path.join(TEMP_ROOT, caseId)
   fs.mkdirSync(caseRoot, { recursive: true })
-  const credentialsPath = path.join(caseRoot, 'credentials.input')
   const configPath = path.join(caseRoot, 'config.json')
   const logPath = path.join(caseRoot, 'service.log')
   const port = await reservePort()
@@ -877,31 +793,15 @@ async function runCase({ mode, round, upstreamPort, fake, latencies, statuses })
   })
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
 
-  if (mode === 'admin_api') {
-    fs.writeFileSync(credentialsPath, '', { mode: 0o600 })
-  } else if (mode === 'json_file') {
-    fs.writeFileSync(credentialsPath, `${JSON.stringify([{
-      authMethod: 'API KEY',
-      kiroApiKey: ` ${secret}|${region} `,
-      refreshToken: 'stale-refresh-must-clear',
-      accessToken: 'stale-access-must-clear',
-      clientId: 'stale-client-must-clear',
-      clientSecret: 'stale-secret-must-clear',
-      profileArn: `arn:aws:codewhisperer:wrong-region:123:profile/STALE`,
-    }], null, 2)}\n`, { mode: 0o600 })
-  } else {
-    fs.writeFileSync(credentialsPath, `# isolated fake key\n ${secret}|${region} \n`, { mode: 0o600 })
-  }
-
   const recordStart = fake.records.length
-  let service = startService({ configPath, credentialsPath, logPath, port })
+  let service = startService({ configPath, logPath, port })
   await waitForHealth(baseUrl, service)
   const resourcesStart = processResources(service.pid)
 
   let credentialId
   let importCounts
   const malformedAdminApi = []
-  if (mode === 'admin_api') {
+  {
     for (const variant of MALFORMED_CREDENTIAL_VARIANTS) {
       const fields = malformedCredentialFields(variant, 'admin_api', round)
       const before = fake.records.length
@@ -954,15 +854,6 @@ async function runCase({ mode, round, upstreamPort, fake, latencies, statuses })
     importCounts = countKinds(fake.records.slice(before))
     assert.equal(importCounts.model_discovery, 1)
     assert.equal(importCounts.balance, 1)
-  } else {
-    const list = await timedRequest(`${baseUrl}/api/admin/credentials`, { headers: adminHeaders() })
-    statuses.push(list.status)
-    assert.equal(list.status, 200, list.text)
-    const parsed = JSON.parse(list.text)
-    credentialId = parsed.credentials?.[0]?.id
-    importCounts = countKinds(fake.records.slice(recordStart))
-    assert.ok(importCounts.model_discovery <= 1, `unexpected bootstrap model hits: ${JSON.stringify(importCounts)}`)
-    assert.equal(importCounts.balance, 0)
   }
   assert.ok(Number.isInteger(credentialId) && credentialId > 0)
 
@@ -1048,7 +939,7 @@ async function runCase({ mode, round, upstreamPort, fake, latencies, statuses })
   await stopService(service)
 
   const reloadStart = fake.records.length
-  service = startService({ configPath, credentialsPath, logPath, port })
+  service = startService({ configPath, logPath, port })
   await waitForHealth(baseUrl, service)
   await new Promise((resolve) => setTimeout(resolve, 150))
   const reloadList = await timedRequest(`${baseUrl}/api/admin/credentials`, { headers: adminHeaders() })
@@ -1185,8 +1076,6 @@ async function main() {
   const upstreamPort = await reservePort()
   const fake = createFakeUpstream()
   const cases = []
-  let malformedJsonFile = []
-  let malformedPlainFile = []
   const latencies = { headers: [], total: [], firstText: [] }
   const statuses = []
   let postgresInitialState = null
@@ -1202,17 +1091,8 @@ async function main() {
     await cleanupOwnedRedisKeys()
     await fake.listen(upstreamPort)
 
-    const modes = ['admin_api', 'json_file', 'plain_file']
-    malformedJsonFile = await runMalformedCredentialFileCases({
-      mode: 'json_file',
-      upstreamPort,
-      fake,
-    })
-    malformedPlainFile = await runMalformedCredentialFileCases({
-      mode: 'plain_file',
-      upstreamPort,
-      fake,
-    })
+    // Credentials enter only through the Admin API; the service reads no credentials file.
+    const modes = ['admin_api']
     for (const mode of modes) {
       for (let round = 1; round <= ROUNDS; round += 1) {
         process.stderr.write(`F06 ${mode} round ${round}/${ROUNDS}\n`)
@@ -1234,13 +1114,13 @@ async function main() {
     const dirty = run('git', ['status', '--porcelain=v1'])
     const diff = run('git', ['diff', '--binary'])
     const report = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       caseId: 'F06',
       runId: RUN_ID,
       generatedAt: new Date().toISOString(),
       result: 'pass',
       roundsPerEntry: ROUNDS,
-      entries: ['admin_api', 'json_file', 'plain_file'],
+      entries: ['admin_api'],
       gitRevision,
       dirty: Boolean(dirty),
       dirtyDiffSha256: sha256(diff),
@@ -1271,8 +1151,6 @@ async function main() {
       },
       malformedInput: {
         adminApi: cases.flatMap((item) => item.malformedAdminApi),
-        jsonFile: malformedJsonFile,
-        plainFile: malformedPlainFile,
       },
       cases,
       auxiliaryTotals: countKinds(fake.records),

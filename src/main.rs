@@ -1,5 +1,4 @@
 mod admin;
-mod admin_ui;
 mod anthropic;
 mod common;
 mod diagnostics;
@@ -9,6 +8,7 @@ mod kiro;
 mod model;
 mod storage;
 pub mod token;
+mod ui;
 
 // 发布镜像静态链接 musl，它自带的 malloc 对所有线程共用一把锁；并发处理多 MB 请求体时
 // CPU 大量耗在锁竞争、futex 和反复还页上（见 docs/analysis/prod-59137-cpu-musl-malloc-root-cause-20261104.md）。
@@ -29,13 +29,7 @@ use std::{
 
 use anyhow::Context as _;
 use axum::serve::ListenerExt as _;
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Redirect},
-    routing::get,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use chrono::Utc;
 use clap::Parser;
 use common::auth::RequestApiKeyStore;
@@ -44,10 +38,9 @@ use futures::StreamExt;
 use kiro::endpoint::{
     AmazonqEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
 };
-use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
-use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
+use model::arg::{Args, Command, MaintenanceCommand};
 use model::config::Config;
 use serde_json::{Value, json};
 use storage::postgres::{PostgresStore, PostgresUsageLifecycleGuard, PostgresUsageStore};
@@ -183,10 +176,7 @@ async fn async_main() {
     });
 
     if let Some(command) = args.command {
-        let credentials_path = args
-            .credentials
-            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-        if let Err(err) = handle_cli_command(command, &file_config, &credentials_path).await {
+        if let Err(err) = handle_cli_command(command, &file_config).await {
             tracing::error!("{}", err);
             std::process::exit(1);
         }
@@ -246,41 +236,6 @@ async fn async_main() {
             tracing::error!("从配置文件 bootstrap 运行配置到 PgSQL 失败: {}", e);
             std::process::exit(1);
         });
-    let credentials_exist = postgres_store
-        .credentials_exist()
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("检查 PgSQL 凭据是否存在失败: {}", e);
-            std::process::exit(1);
-        });
-    if !credentials_exist {
-        let credentials_path = args
-            .credentials
-            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-        match CredentialsConfig::load(&credentials_path) {
-            Ok(file_credentials) => {
-                let file_credentials_list = file_credentials.into_sorted_credentials();
-                postgres_store
-                    .bootstrap_credentials_from_file(&file_credentials_list)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!("从凭据文件 bootstrap 凭据到 PgSQL 失败: {}", e);
-                        std::process::exit(1);
-                    });
-            }
-            Err(err) if env_kiro_api_key.is_some() => {
-                tracing::warn!(
-                    "首次导入凭据文件不可用，将仅使用 KIRO_API_KEY 自动导入: {}",
-                    err
-                );
-            }
-            Err(err) => {
-                tracing::error!("加载首次导入凭据文件失败: {}", err);
-                std::process::exit(1);
-            }
-        }
-    }
-
     if let Some(kiro_api_key) = &env_kiro_api_key {
         postgres_store
             .ensure_api_key_credential(kiro_api_key)
@@ -783,20 +738,12 @@ async fn async_main() {
             let public_pool_app = admin::create_public_pool_router(admin_state.service.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
-            // 创建管理后台 UI 路由
-            let admin_ui_app = admin_ui::create_admin_ui_router();
-            let new_ui_app = admin_ui::create_new_ui_router();
-
             tracing::info!("Admin API 已启用");
-            tracing::info!("Admin UI 已启用: /admin");
-            tracing::info!("New UI 已启用: /ui");
+            tracing::info!("管理后台 UI 已启用: /ui");
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/api/public", public_pool_app)
-                .route("/admin/", get(admin_ui_index_redirect))
-                .route("/ui/", get(new_ui_index_redirect))
-                .nest("/admin", admin_ui_app)
-                .nest("/ui", new_ui_app)
+                .merge(ui::create_ui_router())
         }
     } else {
         anthropic_app
@@ -855,8 +802,7 @@ async fn async_main() {
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
         tracing::info!("Public API（默认关闭）:");
         tracing::info!("  GET  /api/public/pool");
-        tracing::info!("Admin UI:");
-        tracing::info!("  GET  /admin");
+        tracing::info!("管理后台 UI:");
         tracing::info!("  GET  /ui");
     }
 
@@ -1516,14 +1462,6 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
     )
 }
 
-async fn admin_ui_index_redirect() -> Redirect {
-    Redirect::permanent("/admin")
-}
-
-async fn new_ui_index_redirect() -> Redirect {
-    Redirect::permanent("/ui")
-}
-
 fn refresh_admin_api_key_from_runtime_config(
     config: &Config,
     admin_api_key_store: &admin::AdminApiKeyStore,
@@ -1746,17 +1684,8 @@ fn spawn_redis_runtime_event_listener(
     })
 }
 
-async fn handle_cli_command(
-    command: Command,
-    config: &Config,
-    credentials_path: &str,
-) -> anyhow::Result<()> {
+async fn handle_cli_command(command: Command, config: &Config) -> anyhow::Result<()> {
     match command {
-        Command::Credentials { command } => {
-            // CLI 凭据诊断仍然面向本地文件，用于首次导入前排查 credentials.json。
-            let credentials_config = CredentialsConfig::load(credentials_path)?;
-            handle_credentials_command(command, config, credentials_config, credentials_path)
-        }
         Command::Maintenance { command } => handle_maintenance_command(command, config).await,
     }
 }
@@ -1812,92 +1741,6 @@ async fn handle_maintenance_command(
         }
     }
     maintenance_guard.release().await?;
-    Ok(())
-}
-
-fn handle_credentials_command(
-    command: CredentialsCommand,
-    config: &Config,
-    credentials_config: CredentialsConfig,
-    credentials_path: &str,
-) -> anyhow::Result<()> {
-    let is_multiple = credentials_config.is_multiple();
-    let credentials = credentials_config.into_sorted_credentials();
-
-    match command {
-        CredentialsCommand::Stats => {
-            println!("credentials: {}", credentials.len());
-            println!(
-                "format: {}",
-                if is_multiple { "multiple" } else { "single" }
-            );
-            println!("loadBalancingMode: {}", config.load_balancing_mode);
-            println!(
-                "credentialRpm: {}",
-                config
-                    .credential_rpm
-                    .map(|rpm| rpm.to_string())
-                    .unwrap_or_else(|| "disabled".to_string())
-            );
-            for (index, credential) in credentials.iter().enumerate() {
-                let id = credential.id.unwrap_or((index + 1) as u64);
-                let label = credential
-                    .email
-                    .as_deref()
-                    .or_else(|| credential.endpoint.as_deref())
-                    .unwrap_or("-");
-                println!(
-                    "#{id} priority={} disabled={} auth={} label={}",
-                    credential.priority,
-                    credential.disabled,
-                    credential.auth_method.as_deref().unwrap_or(
-                        if credential.kiro_api_key.is_some() {
-                            "api_key"
-                        } else {
-                            "oauth"
-                        }
-                    ),
-                    label
-                );
-            }
-        }
-        CredentialsCommand::Diagnostics => {
-            println!("credentialsPath: {}", credentials_path);
-            println!("credentials: {}", credentials.len());
-            println!(
-                "format: {}",
-                if is_multiple { "multiple" } else { "single" }
-            );
-            if !is_multiple {
-                println!("warning: single credentials format cannot be rewritten by token refresh");
-            }
-            if let Err(err) = config
-                .load_balancing_mode
-                .parse::<kiro::token_manager::LoadBalancingMode>()
-            {
-                println!("error: loadBalancingMode: {err}");
-            }
-            let mut ids = std::collections::HashSet::new();
-            for (index, credential) in credentials.iter().enumerate() {
-                let id = credential.id.unwrap_or((index + 1) as u64);
-                if !ids.insert(id) {
-                    println!("error: duplicate credential id #{id}");
-                }
-                if credential.is_api_key_credential() && credential.kiro_api_key.is_none() {
-                    println!("error: credential #{id} authMethod=api_key but missing kiroApiKey");
-                }
-                if !credential.is_api_key_credential() && credential.refresh_token.is_none() {
-                    println!("warning: credential #{id} missing refreshToken");
-                }
-                if credential.machine_id.is_none() {
-                    println!(
-                        "info: credential #{id} missing machineId, it will be generated at startup"
-                    );
-                }
-            }
-        }
-    }
-
     Ok(())
 }
 

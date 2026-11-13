@@ -51,7 +51,6 @@ use super::{
         test_external_pool, test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
         update_credential_auth, update_external_pool, update_proxy_resource,
         update_request_api_key, update_runtime_config, upsert_manual_model,
-        validate_existing_credentials, validate_external_credentials,
     },
     inventory::http as inventory_http,
     middleware::{AdminState, admin_auth_middleware},
@@ -191,14 +190,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
-        .route(
-            "/credential-validation/existing",
-            post(validate_existing_credentials),
-        )
-        .route(
-            "/credential-validation/external",
-            post(validate_external_credentials),
-        )
         .route(
             "/proxy-resources",
             get(get_proxy_resources).post(create_proxy_resource),

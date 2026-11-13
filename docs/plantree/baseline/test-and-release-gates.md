@@ -27,7 +27,7 @@ Current workflows and README require:
 
 - pinned Rust `1.92.0`;
 - pinned Node.js `22.23.0` and pnpm `11.11.0` for release/embedded frontend builds;
-- both `admin-ui` and `ui` production builds;
+- the `ui` production build (the legacy `admin-ui` was removed after `v0.0.245`);
 - Rust formatting and checked-in Clippy warning baseline;
 - real PgSQL and Redis services;
 - default-feature and no-default-feature Rust test runs;
@@ -41,7 +41,6 @@ Storage-backed tests are configured to fail rather than silently pass when requi
 ```bash
 cargo +1.92.0 fmt --check
 node scripts/ci/check-clippy-baseline.mjs
-pnpm --dir admin-ui build
 pnpm --dir ui build
 cargo +1.92.0 test --locked --all-targets
 cargo +1.92.0 test --locked --all-targets --no-default-features

@@ -29,7 +29,6 @@ use super::{
         TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
         UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
         UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
-        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -939,30 +938,6 @@ pub async fn sync_credentials_profile_arn(
     Json(payload): Json<SyncProfileArnRequest>,
 ) -> impl IntoResponse {
     match state.service.sync_credentials_profile_arn(payload).await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// POST /api/admin/credential-validation/existing
-/// 校验系统已有凭据订阅信息
-pub async fn validate_existing_credentials(
-    State(state): State<AdminState>,
-    Json(payload): Json<ValidateExistingCredentialsRequest>,
-) -> impl IntoResponse {
-    match state.service.validate_existing_credentials(payload).await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// POST /api/admin/credential-validation/external
-/// 校验外部 JSON 凭据订阅信息
-pub async fn validate_external_credentials(
-    State(state): State<AdminState>,
-    Json(payload): Json<ValidateExternalCredentialsRequest>,
-) -> impl IntoResponse {
-    match state.service.validate_external_credentials(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

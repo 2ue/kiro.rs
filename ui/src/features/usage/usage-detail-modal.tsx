@@ -454,6 +454,9 @@ export function UsageDetailModal({
               <>
                 <MetricTile label="请求检查" value={formatLatency(record.latencyTrace.payloadGuardMs)} />
                 <MetricTile label="上游响应头" value={formatLatency(record.latencyTrace.upstreamHeaderMs)} />
+                {record.latencyTrace.downstreamFirstByteMs != null && (
+                  <MetricTile label="下游首字节" value={formatLatency(record.latencyTrace.downstreamFirstByteMs)} tone="info" />
+                )}
                 <MetricTile label="首个流分片" value={formatLatency(record.latencyTrace.firstUpstreamChunkMs)} />
                 <MetricTile label="首次输出" value={formatLatency(record.latencyTrace.firstOutputDeltaMs)} tone="success" />
                 <MetricTile label="首次思考" value={formatLatency(record.latencyTrace.firstThinkingDeltaMs)} />

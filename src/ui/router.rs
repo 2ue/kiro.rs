@@ -11,57 +11,32 @@ use axum::{
     body::Body,
     extract::State,
     http::{Response, StatusCode, Uri, header},
+    response::Redirect,
     routing::get,
 };
 
 #[cfg(not(debug_assertions))]
 use rust_embed::Embed;
 
-/// 嵌入旧版 Admin 前端构建产物
-#[cfg(not(debug_assertions))]
-#[derive(Embed)]
-#[folder = "admin-ui/dist"]
-struct AdminAsset;
-#[cfg(debug_assertions)]
-struct AdminAsset;
+const MOUNT_PREFIX: &str = "/ui";
+const ENV_PREFIX: &str = "KIRO_NEW_UI";
+const FALLBACK_ENV_PREFIX: &str = "KIRO_UI";
+const DEFAULT_DIR: &str = "ui/dist";
+const DEFAULT_DEV_SERVER: &str = "http://127.0.0.1:9023/ui";
+const BUILD_HINT: &str = "UI not built. Run 'pnpm build' in ui directory.";
 
-/// 嵌入新版前端构建产物(shadcn + Tailwind v4)
+/// 嵌入前端构建产物(shadcn + Tailwind v4)；`get` 由 rust-embed 派生生成。
 #[cfg(not(debug_assertions))]
 #[derive(Embed)]
 #[folder = "ui/dist"]
-struct NewUiAsset;
+struct UiAsset;
+
+/// debug 构建不嵌入 dist，默认跳转到 Vite 服务。
 #[cfg(debug_assertions)]
-struct NewUiAsset;
+struct UiAsset;
 
-trait UiAsset {
-    const BUILD_HINT: &'static str;
-
-    fn get(path: &str) -> Option<rust_embed::EmbeddedFile>;
-}
-
-impl UiAsset for AdminAsset {
-    const BUILD_HINT: &'static str = "Admin UI not built. Run 'pnpm build' in admin-ui directory.";
-
-    #[cfg(not(debug_assertions))]
-    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
-        <Self as rust_embed::RustEmbed>::get(path)
-    }
-
-    #[cfg(debug_assertions)]
-    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
-        None
-    }
-}
-
-impl UiAsset for NewUiAsset {
-    const BUILD_HINT: &'static str = "New UI not built. Run 'pnpm build' in ui directory.";
-
-    #[cfg(not(debug_assertions))]
-    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
-        <Self as rust_embed::RustEmbed>::get(path)
-    }
-
-    #[cfg(debug_assertions)]
+#[cfg(debug_assertions)]
+impl UiAsset {
     fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
         None
     }
@@ -101,30 +76,18 @@ impl UiServeMode {
 
 #[derive(Debug, Clone)]
 struct UiServeState {
-    name: &'static str,
-    mount_prefix: &'static str,
-    env_prefix: &'static str,
     mode: UiServeMode,
     filesystem_dir: PathBuf,
     external_url: Option<String>,
-    build_hint: &'static str,
 }
 
 impl UiServeState {
-    fn from_env(
-        name: &'static str,
-        mount_prefix: &'static str,
-        env_prefix: &'static str,
-        fallback_env_prefix: Option<&'static str>,
-        default_dir: &'static str,
-        default_dev_server: &'static str,
-        build_hint: &'static str,
-    ) -> Self {
-        let mode_from_env = read_ui_env(env_prefix, fallback_env_prefix, "MODE")
+    fn from_env() -> Self {
+        let mode_from_env = read_ui_env("MODE")
             .as_deref()
             .and_then(UiServeMode::from_env);
-        let external_url_from_env = read_ui_env(env_prefix, fallback_env_prefix, "DEV_SERVER")
-            .or_else(|| read_ui_env(env_prefix, fallback_env_prefix, "EXTERNAL_URL"));
+        let external_url_from_env =
+            read_ui_env("DEV_SERVER").or_else(|| read_ui_env("EXTERNAL_URL"));
         let mode = mode_from_env
             .or_else(|| {
                 external_url_from_env
@@ -132,17 +95,16 @@ impl UiServeState {
                     .map(|_| UiServeMode::Redirect)
             })
             .unwrap_or_else(default_ui_serve_mode);
-        let filesystem_dir = read_ui_env(env_prefix, fallback_env_prefix, "DIR")
+        let filesystem_dir = read_ui_env("DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(default_dir));
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
         let external_url = external_url_from_env
-            .or_else(|| default_dev_external_url(mode, default_dev_server))
+            .or_else(|| default_dev_external_url(mode, DEFAULT_DEV_SERVER))
             .map(|value| value.trim().trim_end_matches('/').to_string())
             .filter(|value| !value.is_empty());
 
         tracing::info!(
-            ui = name,
-            mount = mount_prefix,
+            mount = MOUNT_PREFIX,
             mode = mode.as_str(),
             dir = %filesystem_dir.display(),
             external_url = external_url.as_deref().unwrap_or(""),
@@ -150,13 +112,9 @@ impl UiServeState {
         );
 
         Self {
-            name,
-            mount_prefix,
-            env_prefix,
             mode,
             filesystem_dir,
             external_url,
-            build_hint,
         }
     }
 }
@@ -177,78 +135,54 @@ fn default_dev_external_url(mode: UiServeMode, default_dev_server: &str) -> Opti
     }
 }
 
-fn read_ui_env(
-    env_prefix: &str,
-    fallback_env_prefix: Option<&str>,
-    suffix: &str,
-) -> Option<String> {
-    let specific_key = format!("{env_prefix}_{suffix}");
-    env::var(&specific_key).ok().or_else(|| {
-        fallback_env_prefix.and_then(|prefix| env::var(format!("{prefix}_{suffix}")).ok())
-    })
+fn read_ui_env(suffix: &str) -> Option<String> {
+    env::var(format!("{ENV_PREFIX}_{suffix}"))
+        .ok()
+        .or_else(|| env::var(format!("{FALLBACK_ENV_PREFIX}_{suffix}")).ok())
 }
 
-/// 创建旧版 Admin UI 路由
-pub fn create_admin_ui_router() -> Router {
-    create_ui_router::<AdminAsset>(UiServeState::from_env(
-        "admin",
-        "/admin",
-        "KIRO_ADMIN_UI",
-        None,
-        "admin-ui/dist",
-        "http://127.0.0.1:9025/admin",
-        AdminAsset::BUILD_HINT,
-    ))
+/// 创建管理后台 UI 路由：`/ui` 及其子路径，外加旧版 `/admin` 书签的跳转。
+pub fn create_ui_router() -> Router {
+    ui_router(UiServeState::from_env())
 }
 
-/// 创建新版管理后台 UI 路由
-pub fn create_new_ui_router() -> Router {
-    create_ui_router::<NewUiAsset>(UiServeState::from_env(
-        "ui",
-        "/ui",
-        "KIRO_NEW_UI",
-        Some("KIRO_UI"),
-        "ui/dist",
-        "http://127.0.0.1:9023/ui",
-        NewUiAsset::BUILD_HINT,
-    ))
-}
-
-fn create_ui_router<A: UiAsset + Send + Sync + 'static>(state: UiServeState) -> Router {
+fn ui_router(state: UiServeState) -> Router {
+    let ui = Router::new()
+        .route("/", get(ui_index_handler))
+        .route("/{*file}", get(ui_static_handler))
+        .with_state(state);
     Router::new()
-        .route("/", get(ui_index_handler::<A>))
-        .route("/{*file}", get(ui_static_handler::<A>))
-        .with_state(state)
+        .route("/ui/", get(|| async { Redirect::permanent(MOUNT_PREFIX) }))
+        .nest(MOUNT_PREFIX, ui)
+        // 旧版 /admin 界面已移除，旧书签(含任意子路径)统一跳到 /ui。
+        .nest_service(
+            "/admin",
+            get(|| async { Redirect::permanent(MOUNT_PREFIX) }),
+        )
 }
 
-async fn ui_index_handler<A: UiAsset>(
-    State(state): State<UiServeState>,
-    uri: Uri,
-) -> Response<Body> {
+async fn ui_index_handler(State(state): State<UiServeState>, uri: Uri) -> Response<Body> {
     match state.mode {
-        UiServeMode::Embedded => serve_embedded_index::<A>(),
+        UiServeMode::Embedded => serve_embedded_index(),
         UiServeMode::Filesystem => serve_filesystem_index(&state).await,
         UiServeMode::Redirect => redirect_to_external(&state, &uri),
         UiServeMode::Proxy => proxy_external(&state, &uri).await,
-        UiServeMode::Disabled => ui_disabled_response(&state),
+        UiServeMode::Disabled => ui_disabled_response(),
     }
 }
 
-async fn ui_static_handler<A: UiAsset>(
-    State(state): State<UiServeState>,
-    uri: Uri,
-) -> Response<Body> {
+async fn ui_static_handler(State(state): State<UiServeState>, uri: Uri) -> Response<Body> {
     match state.mode {
-        UiServeMode::Embedded => serve_embedded_static::<A>(&uri),
+        UiServeMode::Embedded => serve_embedded_static(&uri),
         UiServeMode::Filesystem => serve_filesystem_static(&state, &uri).await,
         UiServeMode::Redirect => redirect_to_external(&state, &uri),
         UiServeMode::Proxy => proxy_external(&state, &uri).await,
-        UiServeMode::Disabled => ui_disabled_response(&state),
+        UiServeMode::Disabled => ui_disabled_response(),
     }
 }
 
 /// 处理静态文件请求
-fn serve_embedded_static<A: UiAsset>(uri: &Uri) -> Response<Body> {
+fn serve_embedded_static(uri: &Uri) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
 
     // 安全检查：拒绝包含 .. 的路径
@@ -260,7 +194,7 @@ fn serve_embedded_static<A: UiAsset>(uri: &Uri) -> Response<Body> {
     }
 
     // 尝试获取请求的文件
-    if let Some(content) = A::get(path) {
+    if let Some(content) = UiAsset::get(path) {
         let mime = mime_guess::from_path(path)
             .first_or_octet_stream()
             .to_string();
@@ -278,7 +212,7 @@ fn serve_embedded_static<A: UiAsset>(uri: &Uri) -> Response<Body> {
 
     // SPA fallback: 如果文件不存在且不是资源文件，返回 index.html
     if !is_asset_path(path) {
-        return serve_embedded_index::<A>();
+        return serve_embedded_index();
     }
 
     // 404
@@ -289,8 +223,8 @@ fn serve_embedded_static<A: UiAsset>(uri: &Uri) -> Response<Body> {
 }
 
 /// 提供 index.html
-fn serve_embedded_index<A: UiAsset>() -> Response<Body> {
-    match A::get("index.html") {
+fn serve_embedded_index() -> Response<Body> {
+    match UiAsset::get("index.html") {
         Some(content) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -299,7 +233,7 @@ fn serve_embedded_index<A: UiAsset>() -> Response<Body> {
             .expect("Failed to build response"),
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from(A::BUILD_HINT))
+            .body(Body::from(BUILD_HINT))
             .expect("Failed to build response"),
     }
 }
@@ -346,8 +280,7 @@ async fn serve_filesystem_file(state: &UiServeState, path: &str, index: bool) ->
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let body = if index {
                 format!(
-                    "{} Filesystem UI directory not found or not built: {}",
-                    state.build_hint,
+                    "{BUILD_HINT} Filesystem UI directory not found or not built: {}",
                     state.filesystem_dir.display()
                 )
             } else {
@@ -384,7 +317,7 @@ fn safe_join(base: &Path, path: &str) -> Option<PathBuf> {
 
 fn redirect_to_external(state: &UiServeState, uri: &Uri) -> Response<Body> {
     let Some(url) = external_ui_url(state, uri) else {
-        return missing_external_url_response(state);
+        return missing_external_url_response();
     };
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
@@ -396,7 +329,7 @@ fn redirect_to_external(state: &UiServeState, uri: &Uri) -> Response<Body> {
 
 async fn proxy_external(state: &UiServeState, uri: &Uri) -> Response<Body> {
     let Some(url) = external_ui_url(state, uri) else {
-        return missing_external_url_response(state);
+        return missing_external_url_response();
     };
     let client = proxy_client();
     match client.get(&url).send().await {
@@ -435,39 +368,30 @@ fn external_ui_url(state: &UiServeState, uri: &Uri) -> Option<String> {
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
-    let mount_prefix = state.mount_prefix.trim_end_matches('/');
-    let path_and_query = if path_and_query == "/" {
-        "/"
-    } else {
-        path_and_query
-    };
 
-    let mounted_path = if base.ends_with(mount_prefix) {
+    let mounted_path = if base.ends_with(MOUNT_PREFIX) {
         path_and_query.to_string()
     } else if path_and_query == "/" {
-        format!("{mount_prefix}/")
+        format!("{MOUNT_PREFIX}/")
     } else {
-        format!("{mount_prefix}{path_and_query}")
+        format!("{MOUNT_PREFIX}{path_and_query}")
     };
     Some(format!("{base}{mounted_path}"))
 }
 
-fn missing_external_url_response(state: &UiServeState) -> Response<Body> {
+fn missing_external_url_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .body(Body::from(format!(
-            "{} UI mode requires {}_DEV_SERVER or {}_EXTERNAL_URL",
-            state.name.to_uppercase(),
-            state.env_prefix,
-            state.env_prefix
+            "UI redirect/proxy mode requires {ENV_PREFIX}_DEV_SERVER or {ENV_PREFIX}_EXTERNAL_URL"
         )))
         .expect("Failed to build response")
 }
 
-fn ui_disabled_response(state: &UiServeState) -> Response<Body> {
+fn ui_disabled_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
-        .body(Body::from(format!("{} UI is disabled", state.name)))
+        .body(Body::from("UI is disabled"))
         .expect("Failed to build response")
 }
 
@@ -497,14 +421,15 @@ fn is_asset_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     #[cfg(not(debug_assertions))]
     #[test]
     fn embedded_ui_index_uses_expected_mount_prefix() {
-        let new_ui = <NewUiAsset as rust_embed::RustEmbed>::get("index.html")
-            .expect("ui index should be embedded");
-        let new_ui = std::str::from_utf8(new_ui.data.as_ref()).expect("ui index is utf-8");
-        assert!(new_ui.contains("/ui/assets/"));
+        let index = UiAsset::get("index.html").expect("ui index should be embedded");
+        let index = std::str::from_utf8(index.data.as_ref()).expect("ui index is utf-8");
+        assert!(index.contains("/ui/assets/"));
     }
 
     #[test]
@@ -512,29 +437,21 @@ mod tests {
         if cfg!(debug_assertions) {
             assert_eq!(default_ui_serve_mode(), UiServeMode::Redirect);
             assert_eq!(
-                default_dev_external_url(UiServeMode::Redirect, "http://127.0.0.1:9023/ui")
-                    .as_deref(),
-                Some("http://127.0.0.1:9023/ui")
+                default_dev_external_url(UiServeMode::Redirect, DEFAULT_DEV_SERVER).as_deref(),
+                Some(DEFAULT_DEV_SERVER)
             );
         } else {
             assert_eq!(default_ui_serve_mode(), UiServeMode::Embedded);
-            assert!(
-                default_dev_external_url(UiServeMode::Redirect, "http://127.0.0.1:9023/ui")
-                    .is_none()
-            );
+            assert!(default_dev_external_url(UiServeMode::Redirect, DEFAULT_DEV_SERVER).is_none());
         }
     }
 
     #[test]
     fn external_ui_url_keeps_mount_prefix_once() {
         let state = UiServeState {
-            name: "ui",
-            mount_prefix: "/ui",
-            env_prefix: "KIRO_UI",
             mode: UiServeMode::Redirect,
-            filesystem_dir: PathBuf::from("ui/dist"),
+            filesystem_dir: PathBuf::from(DEFAULT_DIR),
             external_url: Some("http://127.0.0.1:9023".to_string()),
-            build_hint: NewUiAsset::BUILD_HINT,
         };
         assert_eq!(
             external_ui_url(&state, &"/".parse::<Uri>().unwrap()).as_deref(),
@@ -556,12 +473,40 @@ mod tests {
 
     #[test]
     fn safe_join_rejects_parent_and_absolute_paths() {
-        let base = Path::new("ui/dist");
+        let base = Path::new(DEFAULT_DIR);
         assert_eq!(
             safe_join(base, "").as_deref(),
             Some(Path::new("ui/dist/index.html"))
         );
         assert!(safe_join(base, "../config.json").is_none());
         assert!(safe_join(base, "/etc/passwd").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_paths_and_ui_trailing_slash_redirect_to_ui() {
+        let app = ui_router(UiServeState {
+            mode: UiServeMode::Disabled,
+            filesystem_dir: PathBuf::from(DEFAULT_DIR),
+            external_url: None,
+        });
+        for path in ["/admin", "/admin/", "/admin/credentials?tab=1", "/ui/"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+            assert_eq!(
+                response.headers().get(header::LOCATION).unwrap(),
+                MOUNT_PREFIX,
+                "{path}"
+            );
+        }
+
+        let response = app
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -22,6 +22,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import { seedCredentialsBeforeStartup } from './postgres-credential-seed.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
@@ -538,16 +539,20 @@ async function startRedisProxy(target) {
   return { child, ...ready }
 }
 
-function startService(configPath, credentialsPath, logPath, servicePort) {
+function serviceEnvironment(servicePort) {
+  return validationChildEnvironment({
+    RUST_LOG: 'info',
+    KIRO_API_KEY: '',
+    KIRO_RS_HOST: '127.0.0.1',
+    KIRO_RS_PORT: String(servicePort),
+  })
+}
+
+function startService(configPath, logPath, servicePort) {
   const log = fs.openSync(logPath, 'a')
-  const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
-    env: validationChildEnvironment({
-      RUST_LOG: 'info',
-      KIRO_API_KEY: '',
-      KIRO_RS_HOST: '127.0.0.1',
-      KIRO_RS_PORT: String(servicePort),
-    }),
+    env: serviceEnvironment(servicePort),
     stdio: ['ignore', log, log],
   })
   ACTIVE_CHILDREN.add(handle)
@@ -722,7 +727,6 @@ async function runRound(round, target) {
   const caseRoot = path.join(TEMP_ROOT, `round-${round}`)
   fs.mkdirSync(caseRoot, { recursive: true, mode: 0o700 })
   const configPath = path.join(caseRoot, 'config.json')
-  const credentialsPath = path.join(caseRoot, 'credentials.json')
   const logPath = path.join(caseRoot, 'service.log')
   const baseUrl = `http://127.0.0.1:${servicePort}`
   const config = {
@@ -756,9 +760,16 @@ async function runRound(round, target) {
     },
   }
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
-  fs.writeFileSync(credentialsPath, `${JSON.stringify(credentials(), null, 2)}\n`, { mode: 0o600 })
+  seedCredentialsBeforeStartup({
+    binary: BINARY,
+    configPath,
+    serviceEnvironment: serviceEnvironment(servicePort),
+    postgresUrl: postgresUrlForRound(round),
+    credentials: credentials(),
+    cwd: ROOT,
+  })
 
-  service = startService(configPath, credentialsPath, logPath, servicePort)
+  service = startService(configPath, logPath, servicePort)
   await waitForHealth(baseUrl, service)
   const resourcesStart = processResources(service.pid)
 

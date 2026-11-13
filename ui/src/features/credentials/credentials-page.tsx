@@ -2,7 +2,6 @@ import {
   CheckCircle2,
   ChevronRight,
   Download,
-  FileUp,
   Filter,
   Fingerprint,
   Plus,
@@ -95,14 +94,13 @@ import type {
 } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import { CREDENTIAL_CARD_GRID, CredentialCard } from './credential-card'
+import { ImportCredentialsModal } from './credential-import-dialog'
 import {
   AddCredentialModal,
   BatchEditCredentialsModal,
-  BatchImportModal,
   BatchVerifyModal,
   CredentialExportModal,
   CredentialTestModal,
-  KamImportModal,
   type VerifyResult,
 } from './credential-dialogs'
 import {
@@ -247,7 +245,6 @@ export function CredentialsPage() {
   const [addOpen, setAddOpen] = useState(false)
   const [batchOpen, setBatchOpen] = useState(false)
   const [batchEditOpen, setBatchEditOpen] = useState(false)
-  const [kamOpen, setKamOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
   const [verifyOpen, setVerifyOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -328,7 +325,7 @@ export function CredentialsPage() {
     }
   )
   const allCredentials = useCredentials({
-    enabled: batchOpen || kamOpen || creditDetailsOpen || queryingCreditInfo,
+    enabled: batchOpen || creditDetailsOpen || queryingCreditInfo,
     refetchInterval: false,
   })
   const credentialSummary = useCredentialSummary()
@@ -969,11 +966,8 @@ export function CredentialsPage() {
               {queryingCreditInfo ? <Spinner size="sm" /> : <Wallet className="h-4 w-4" />}
               <span className="hidden sm:inline">查询全部积分</span>
             </Button>
-            <Button variant="outline" size="sm" onClick={() => setKamOpen(true)}>
-              <FileUp className="h-4 w-4" /><span className="hidden sm:inline">KAM</span>
-            </Button>
             <Button variant="outline" size="sm" onClick={() => setBatchOpen(true)}>
-              <Upload className="h-4 w-4" /><span className="hidden sm:inline">批量导入</span>
+              <Upload className="h-4 w-4" /><span className="hidden sm:inline">导入</span>
             </Button>
             <Button variant="outline" size="sm" onClick={() => setExportOpen(true)}>
               <Download className="h-4 w-4" /><span className="hidden sm:inline">导出</span>
@@ -1504,8 +1498,7 @@ export function CredentialsPage() {
       <AddCredentialModal open={addOpen} onClose={() => setAddOpen(false)} />
       <CredentialTestModal credential={testingCredential} open={Boolean(testingCredential)} onClose={() => setTestingCredential(null)} />
       <BatchEditCredentialsModal open={batchEditOpen} ids={Array.from(selectedIds)} onClose={() => setBatchEditOpen(false)} onDone={() => { invalidate(); setSelectedIds(new Set()) }} />
-      <BatchImportModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
-      <KamImportModal open={kamOpen} onClose={() => setKamOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
+      <ImportCredentialsModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
       <CredentialExportModal
         open={exportOpen}
         onClose={() => setExportOpen(false)}

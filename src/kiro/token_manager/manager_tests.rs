@@ -14419,6 +14419,78 @@ async fn postgres_add_credential_is_atomic_with_initial_runtime_state() {
     store.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_add_credential_assigns_unique_ids_and_rejects_same_account() {
+    run_isolated_postgres_fixture(|store| async move {
+        let manager = Arc::new(
+            MultiTokenManager::new_with_stores(
+                Config::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                Some(store.clone()),
+                None,
+            )
+            .unwrap(),
+        );
+
+        // 16 个不同账号同时导入：ID 由 PgSQL 序列分配，不能重复，也不能丢。
+        let start = Arc::new(tokio::sync::Barrier::new(16));
+        let tasks: Vec<_> = (0..16)
+            .map(|index| {
+                let manager = manager.clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    manager
+                        .add_credential(api_key_credential(&format!("ksk_concurrent_{index}")))
+                        .await
+                })
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.unwrap().expect("distinct accounts import"));
+        }
+        let unique: HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 16, "ids must be unique: {ids:?}");
+        assert_eq!(manager.total_count(), 16);
+        let persisted = store.load_credentials().await.unwrap();
+        let persisted_ids: HashSet<u64> = persisted.iter().filter_map(|c| c.id).collect();
+        assert_eq!(persisted_ids, unique);
+
+        // 同一账号同时提交 8 次：只有一次成功，其余都按重复拒绝，库里只多一行。
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let manager = manager.clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    manager
+                        .add_credential(api_key_credential("ksk_concurrent_same"))
+                        .await
+                })
+            })
+            .collect();
+        let mut succeeded = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => succeeded += 1,
+                Err(error) => assert!(
+                    error.to_string().contains("凭据已存在"),
+                    "unexpected error: {error:#}"
+                ),
+            }
+        }
+        assert_eq!(succeeded, 1);
+        assert_eq!(manager.total_count(), 17);
+        assert_eq!(store.load_credentials().await.unwrap().len(), 17);
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
     let Some(store) = test_postgres_store().await else {
