@@ -6282,9 +6282,8 @@ impl ExternalPoolManager {
         let task = tokio::spawn(async move {
             let idle_timeout = (config.external_pool_stream_idle_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.external_pool_stream_idle_timeout_secs));
-            let mut keepalive = tokio::time::interval(external_pool_stream_keepalive_interval(
-                idle_timeout,
-            ));
+            let mut keepalive =
+                tokio::time::interval(external_pool_stream_keepalive_interval(idle_timeout));
             keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let forward = manager.forward_with_failover_inner(config, route, Some(snapshot));
             tokio::pin!(forward);
@@ -6325,6 +6324,7 @@ impl ExternalPoolManager {
             };
             let _ = tail_sender.send(tail);
         });
+        drop(downstream);
         let mut task_guard = EarlyCommitTaskGuard::new(task);
         match ready_receiver.await {
             Ok(EarlyCommitResponseReady::Committed) => {
@@ -6474,7 +6474,11 @@ impl ExternalPoolManager {
         let mut pre_output_failovers_left = EXTERNAL_POOL_PRE_OUTPUT_FAILOVERS_PAST_DEADLINE;
         let mut last_failure_was_pre_output = false;
         loop {
-            if route.early_commit.as_ref().is_some_and(|downstream| downstream.downstream_closed()) {
+            if route
+                .early_commit
+                .as_ref()
+                .is_some_and(|downstream| downstream.downstream_closed())
+            {
                 self.record_external_client_dropped(&route, None, attempts.clone());
                 let gone = external_early_commit_downstream_gone_error(None);
                 return ExternalPoolForwardOutcome::FinalError(external_final_error_from_error(

@@ -403,7 +403,8 @@ where
                 Some(&mut transcript_state.lock()),
             );
             prefix.extend(
-                downstream.upstream_start_usage()
+                downstream
+                    .upstream_start_usage()
                     .and_then(|start| backfill_message_delta_usage(&processed, &start))
                     .unwrap_or(processed),
             );
