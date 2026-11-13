@@ -262,6 +262,7 @@ export function ExternalPoolFormModal({
                 <SelectItem value="inherit">继承全局</SelectItem>
                 <SelectItem value="enabled">启用</SelectItem>
                 <SelectItem value="disabled">禁用</SelectItem>
+                <SelectItem value="early_commit">先提交首包再换池</SelectItem>
               </SelectBox>
               <HintBox>{streamRetryDescription(draft.preOutputStreamRetryMode)}</HintBox>
             </div>

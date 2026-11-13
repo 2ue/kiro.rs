@@ -411,7 +411,7 @@ impl UsageLatencyTrace {
             && self.credential_dispatch_elapsed_ms.is_none()
             && self.upstream_header_wait_ms.is_none()
             && self.downstream_first_byte_ms.is_none()
-     && self.first_upstream_chunk_ms.is_none()
+            && self.first_upstream_chunk_ms.is_none()
             && self.first_output_delta_ms.is_none()
             && self.first_thinking_delta_ms.is_none()
             && self.first_visible_text_delta_ms.is_none()

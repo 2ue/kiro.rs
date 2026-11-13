@@ -11763,6 +11763,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
         started_at: Instant::now(),
         stream_pre_output_hold: None,
+        early_commit: None,
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         latency_trace: Arc::new(ExternalLatencyTraceState::default()),
         payload_breakdown: None,
@@ -13037,6 +13038,7 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
         started_at: Instant::now(),
         stream_pre_output_hold: None,
+        early_commit: None,
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         latency_trace: Arc::new(ExternalLatencyTraceState::default()),
         payload_breakdown: None,
@@ -20893,5 +20895,1120 @@ async fn l2_quality_composes_with_existing_transient_failure_penalty() {
         "健康池应承担全部流量，实际 {healthy_delta} 次"
     );
 
+    postgres.drop_test_schema().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 提前提交首包（early_commit）模式
+// ---------------------------------------------------------------------------
+
+async fn create_early_commit_pool(
+    postgres: &PostgresStore,
+    name: &str,
+    priority: i32,
+    base_url: &str,
+) -> ExternalPool {
+    let mut request = create_pool_request(name, priority, true);
+    request.base_url = base_url.to_string();
+    request.max_concurrent_requests = 4;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    request.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::EarlyCommit;
+    postgres.create_external_pool(request).await.unwrap()
+}
+
+fn early_commit_config_for_test() -> ExternalPoolsConfig {
+    ExternalPoolsConfig {
+        external_pool_stream_idle_timeout_secs: 3,
+        // 提前提交模式下这个超时不应该生效；设得很短以证明不会被切断。
+        external_pool_stream_first_output_timeout_secs: 1,
+        ..external_stream_config_for_test()
+    }
+}
+
+fn external_sse_message_start_with_cache(
+    id: &str,
+    input_tokens: i32,
+    cache_read: i32,
+    cache_creation: i32,
+) -> String {
+    external_sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": null,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": cache_creation,
+                        "ephemeral_1h_input_tokens": 0
+                    }
+                }
+            }
+        }),
+    )
+}
+
+/// message_delta 只带 output_tokens（部分上游如此），用于验证输入侧补全。
+fn external_sse_message_delta_output_only(output_tokens: i32) -> String {
+    external_sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": output_tokens}
+        }),
+    )
+}
+
+/// 按 SSE 事件拆分下游响应，返回 (事件名, data JSON)。
+fn parse_downstream_sse(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| {
+            let mut name = String::new();
+            let mut data = serde_json::Value::Null;
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event:") {
+                    name = value.trim().to_string();
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data = serde_json::from_str(value.trim()).unwrap_or(serde_json::Value::Null);
+                }
+            }
+            (name, data)
+        })
+        .collect()
+}
+
+fn downstream_events_named<'a>(
+    events: &'a [(String, serde_json::Value)],
+    name: &str,
+) -> Vec<&'a serde_json::Value> {
+    events
+        .iter()
+        .filter(|(event, _)| event == name)
+        .map(|(_, data)| data)
+        .collect()
+}
+
+/// 只断言“事件前缀”：首个事件必须是 message_start，且它的 usage 全部为 0。
+fn assert_single_zeroed_message_start(events: &[(String, serde_json::Value)], expected_id: &str) {
+    let starts = downstream_events_named(events, "message_start");
+    assert_eq!(
+        starts.len(),
+        1,
+        "downstream must see exactly one message_start: {events:?}"
+    );
+    assert_eq!(
+        events[0].0, "message_start",
+        "message_start must come first"
+    );
+    let message = &starts[0]["message"];
+    assert_eq!(message["id"], expected_id);
+    let usage = message["usage"].as_object().expect("message_start usage");
+    for (key, value) in usage {
+        match value {
+            serde_json::Value::Number(number) => {
+                assert_eq!(number.as_i64(), Some(0), "usage.{key} must be zeroed");
+            }
+            serde_json::Value::Object(inner) => {
+                for (inner_key, inner_value) in inner {
+                    if let Some(number) = inner_value.as_i64() {
+                        assert_eq!(number, 0, "usage.{key}.{inner_key} must be zeroed");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn forward_early_commit(
+    manager: &ExternalPoolManager,
+    config: ExternalPoolsConfig,
+    route: ExternalRouteRequest,
+) -> Response {
+    match timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("early-commit dispatch must return immediately")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("early-commit mode must always answer with a committed SSE stream: {error:?}")
+        }
+    }
+}
+
+async fn wait_for_usage_record(
+    recorder: &crate::anthropic::usage::UsageRecorder,
+    request_id: &str,
+) -> UsageRecord {
+    for _ in 0..100 {
+        let result = recorder.query(UsageRecordQuery {
+            request_id: Some(request_id.to_string()),
+            ..UsageRecordQuery::default()
+        });
+        if let Some(record) = result.records.into_iter().next() {
+            return record;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("usage record for {request_id} was not written");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_fails_over_after_message_start_and_downstream_sees_one_message() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_first",
+            111,
+            5_000,
+            300,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw first attempt secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_second",
+            222,
+            6_000,
+            400,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("ok-after-failover")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(222, 7)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    let pool_a = create_early_commit_pool(&postgres, "early-commit-a", 1, &failing.base_url).await;
+    let pool_b =
+        create_early_commit_pool(&postgres, "early-commit-b", 10, &succeeding.base_url).await;
+
+    let request_id = "req_early_commit_failover";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_failover");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    // 失败池优先级更高，先被选中：下游看到的是第一次尝试的 message_start（usage 清零），
+    // 第二次尝试的 message_start 被丢弃。
+    assert_single_zeroed_message_start(&events, "msg_first");
+    assert!(!body.contains("msg_second"), "{body}");
+    assert!(body.contains("ok-after-failover"), "{body}");
+    assert!(!body.contains("raw first attempt secret"));
+    assert!(
+        downstream_events_named(&events, "error").is_empty(),
+        "{body}"
+    );
+    assert_eq!(downstream_events_named(&events, "message_stop").len(), 1);
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    // message_delta 带上了第二次尝试的真实输入侧用量（第一次的 cache 值不能混进来）。
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    assert_eq!(delta["usage"]["input_tokens"], 222);
+    assert_eq!(delta["usage"]["output_tokens"], 7);
+    assert_eq!(delta["usage"]["cache_read_input_tokens"], 6_000);
+    assert_eq!(delta["usage"]["cache_creation_input_tokens"], 400);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].action, "retry_next");
+    assert_eq!(
+        record.external_attempts[0].error_type.as_deref(),
+        Some("protocol_error")
+    );
+    assert_eq!(record.external_attempts[1].action, "success");
+    assert_eq!(record.external_attempts[0].pool_id, pool_a.id);
+    assert_eq!(record.external_pool_id, Some(pool_b.id));
+    let billing = record.external_pool_billing.as_ref().expect("billing");
+    assert_eq!(billing.raw_usage.input_tokens, 222);
+    assert_eq!(billing.raw_usage.output_tokens, 7);
+    let trace = record.latency_trace.as_ref().expect("latency trace");
+    let first_byte = trace
+        .downstream_first_byte_ms
+        .expect("downstream first byte");
+    let first_output = trace.first_output_delta_ms.expect("first output");
+    assert!(
+        first_byte <= first_output,
+        "message_start must reach downstream before the first content ({first_byte} > {first_output})"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_ends_with_error_event_and_no_billable_usage_when_all_pools_fail() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing_a = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_fail_a",
+            9_999,
+            88_888,
+            777,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw failure a")),
+    ])
+    .await;
+    let failing_b = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_fail_b",
+            9_999,
+            88_888,
+            777,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw failure b")),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-fail-a", 1, &failing_a.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-fail-b", 1, &failing_b.base_url).await;
+
+    let request_id = "req_early_commit_all_fail";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_all_fail");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(
+        stream_error, None,
+        "the stream must end cleanly with an error event"
+    );
+    let events = parse_downstream_sse(&body);
+    let start_id = downstream_events_named(&events, "message_start")[0]["message"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_single_zeroed_message_start(&events, &start_id);
+    // 下游看不到任何非零的用量：不能被按 message_start 的输入 token 计费。
+    assert!(!body.contains("9999"), "{body}");
+    assert!(!body.contains("88888"), "{body}");
+    assert!(downstream_events_named(&events, "message_delta").is_empty());
+    assert!(downstream_events_named(&events, "message_stop").is_empty());
+    let errors = downstream_events_named(&events, "error");
+    assert_eq!(errors.len(), 1, "{body}");
+    assert_eq!(
+        events.last().unwrap().0,
+        "error",
+        "error must be the last event"
+    );
+    assert_eq!(errors[0]["error"]["type"], "api_error");
+    assert!(
+        errors[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("err_early_commit_all_fail")
+    );
+    assert!(!body.contains("raw failure"));
+    assert_eq!(failing_a.snapshot() + failing_b.snapshot(), 2);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.output_tokens, 0);
+    assert_eq!(record.cache_read_input_tokens, 0);
+    assert_eq!(record.estimated_cost_usd, 0.0);
+    assert!(record.external_pool_billing.is_none());
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_keeps_waiting_past_first_output_timeout_with_pings() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    // 首个内容在 2.5 秒后才出现，超过配置的 1 秒首个输出超时；上游期间只发 ping。
+    let slow = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_slow", 321)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_200)),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_300)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("slow-but-healthy")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(321, 3)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    let backup = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_backup",
+        "should-not-run",
+        1,
+        1,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-slow", 1, &slow.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-backup", 10, &backup.base_url).await;
+
+    let request_id = "req_early_commit_slow_first_output";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_slow");
+    let started = Instant::now();
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let mut stream = response.into_body().into_data_stream();
+    let first_chunk = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("message_start must reach downstream quickly")
+        .expect("first chunk")
+        .expect("first chunk ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "message_start must not wait for the first content"
+    );
+    assert!(String::from_utf8_lossy(&first_chunk).contains("msg_slow"));
+    let mut body = String::from_utf8_lossy(&first_chunk).into_owned();
+    while let Some(chunk) = stream.next().await {
+        body.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+    }
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_slow");
+    assert!(body.contains("slow-but-healthy"), "{body}");
+    assert!(
+        !downstream_events_named(&events, "ping").is_empty(),
+        "downstream must receive keepalive pings during the silent gap"
+    );
+    assert!(
+        downstream_events_named(&events, "error").is_empty(),
+        "{body}"
+    );
+    assert_eq!(slow.snapshot(), 1);
+    assert_eq!(
+        backup.snapshot(),
+        0,
+        "a slow but healthy attempt must not be abandoned"
+    );
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 1);
+    // message_delta 自带完整输入侧字段时原样保留。
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    assert_eq!(delta["usage"]["input_tokens"], 321);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_backfills_input_usage_missing_from_message_delta() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_backfill",
+            1_234,
+            50_000,
+            700,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("hello")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta_output_only(42)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-backfill", 1, &upstream.base_url).await;
+
+    let request_id = "req_early_commit_backfill";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_backfill");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_backfill");
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    assert_eq!(delta["usage"]["output_tokens"], 42);
+    assert_eq!(delta["usage"]["input_tokens"], 1_234);
+    assert_eq!(delta["usage"]["cache_read_input_tokens"], 50_000);
+    assert_eq!(delta["usage"]["cache_creation_input_tokens"], 700);
+    assert_eq!(
+        delta["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+        700
+    );
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_client_disconnect_stops_failover_and_records_client_dropped() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let stalled = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_stalled", 10)),
+        ExternalStreamFakeStep::delay(Duration::from_secs(30)),
+    ])
+    .await;
+    let backup = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_should_not_run",
+        "should-not-run",
+        1,
+        1,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-stalled", 1, &stalled.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-unused", 10, &backup.base_url).await;
+
+    let request_id = "req_early_commit_client_gone";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_client_gone");
+    let mut config = early_commit_config_for_test();
+    config.external_pool_stream_idle_timeout_secs = 30;
+    let response = forward_early_commit(&manager, config, route).await;
+    let mut stream = response.into_body().into_data_stream();
+    let first = timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("message_start")
+        .expect("chunk")
+        .expect("chunk ok");
+    assert!(String::from_utf8_lossy(&first).contains("msg_stalled"));
+    drop(stream);
+
+    let record = timeout(
+        Duration::from_secs(5),
+        wait_for_usage_record(&recorder, request_id),
+    )
+    .await
+    .expect("client drop must end the background attempt promptly");
+    assert_eq!(record.status, UsageRecordStatus::ClientDropped);
+    assert_eq!(record.error_type.as_deref(), Some("client_dropped"));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "client_dropped");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(backup.snapshot(), 0, "no failover after the client is gone");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_upstream_status_error_before_headers_still_fails_over() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let bad_gateway = ExternalStreamFakeServer::start_with_status(
+        StatusCode::BAD_GATEWAY,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"Upstream service temporarily unavailable"}}"#,
+        )],
+    )
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_502",
+        "served-after-502",
+        77,
+        4,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-502", 1, &bad_gateway.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-ok", 10, &healthy.base_url).await;
+
+    let request_id = "req_early_commit_502";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_502");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_after_502");
+    assert!(body.contains("served-after-502"), "{body}");
+    assert!(
+        downstream_events_named(&events, "error").is_empty(),
+        "{body}"
+    );
+    assert_eq!(bad_gateway.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].status, Some(502));
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_keeps_http_error_when_every_pool_fails_before_headers() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let bad_gateway_a = ExternalStreamFakeServer::start_with_status(
+        StatusCode::BAD_GATEWAY,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"bad gateway a"}}"#,
+        )],
+    )
+    .await;
+    let bad_gateway_b = ExternalStreamFakeServer::start_with_status(
+        StatusCode::SERVICE_UNAVAILABLE,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"bad gateway b"}}"#,
+        )],
+    )
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-http-fail-a",
+        1,
+        &bad_gateway_a.base_url,
+    )
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-http-fail-b",
+        2,
+        &bad_gateway_b.base_url,
+    )
+    .await;
+
+    let request_id = "req_early_commit_http_fail";
+    let (route, _recorder) = external_stream_route(request_id, "err_early_commit_http_fail");
+    let outcome = timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(early_commit_config_for_test(), route),
+    )
+    .await
+    .expect("early-commit HTTP failure must finish");
+    let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
+        panic!("all pre-header failures must remain an HTTP error");
+    };
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.attempts.len(), 2);
+    assert_eq!(bad_gateway_a.snapshot() + bad_gateway_b.snapshot(), 2);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_fails_over_on_read_error_eof_and_idle_before_first_content() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let read_error = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_read_error", 10)),
+        ExternalStreamFakeStep::error("connection reset"),
+    ])
+    .await;
+    let eof = ExternalStreamFakeServer::start(vec![ExternalStreamFakeStep::chunk(
+        external_sse_message_start("msg_eof", 10),
+    )])
+    .await;
+    let idle = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_idle", 10)),
+        ExternalStreamFakeStep::delay(Duration::from_secs(30)),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_healthy",
+        "served-by-healthy",
+        55,
+        6,
+    ))
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-read-error",
+        1,
+        &read_error.base_url,
+    )
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-eof", 2, &eof.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-idle", 3, &idle.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-healthy", 4, &healthy.base_url).await;
+
+    let request_id = "req_early_commit_transport_failures";
+    let (mut route, recorder) = external_stream_route(request_id, "err_early_commit_transport");
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+    let mut config = early_commit_config_for_test();
+    config.external_pool_retry_max_attempts = 5;
+    config.external_pool_stream_idle_timeout_secs = 1;
+    let response = forward_early_commit(&manager, config, route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    // 哪次失败尝试的 message_start 先到下游取决于读取时序（错误可能和 message_start 落在同一次
+    // 读取里，那次尝试在发出 message_start 前就失败）；不变的是：只有一个、已清零、来自失败的尝试。
+    let start_id = downstream_events_named(&events, "message_start")[0]["message"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        ["msg_read_error", "msg_eof", "msg_idle"].contains(&start_id.as_str()),
+        "{start_id}"
+    );
+    assert_single_zeroed_message_start(&events, &start_id);
+    assert!(body.contains("served-by-healthy"), "{body}");
+    for other in ["msg_read_error", "msg_eof", "msg_idle"] {
+        if other != start_id {
+            assert!(
+                !body.contains(other),
+                "only one message_start may reach downstream: {body}"
+            );
+        }
+    }
+    assert!(
+        !body.contains("msg_healthy"),
+        "retry message_start must be dropped"
+    );
+    assert_eq!(read_error.snapshot(), 1);
+    assert_eq!(eof.snapshot(), 1);
+    assert_eq!(idle.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 4);
+    assert!(
+        record.external_attempts[..3]
+            .iter()
+            .all(|attempt| attempt.action == "retry_next"),
+        "{:?}",
+        record.external_attempts
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_is_not_used_when_the_top_priority_pools_are_mixed() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let early = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_mixed_early", 10)),
+        ExternalStreamFakeStep::chunk(external_sse_error("mixed early failure")),
+    ])
+    .await;
+    let normal = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_mixed_normal", 10)),
+        ExternalStreamFakeStep::chunk(external_sse_error("mixed normal failure")),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "mixed-early", 1, &early.base_url).await;
+    create_messages_pool(&postgres, "mixed-normal", 1, &normal.base_url).await;
+
+    let request_id = "req_early_commit_mixed";
+    let (route, _recorder) = external_stream_route(request_id, "err_early_commit_mixed");
+    let outcome = timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(early_commit_config_for_test(), route),
+    )
+    .await
+    .expect("mixed dispatch must finish");
+    // 普通语义：首个内容前全部失败时返回最终错误（502），而不是已提交的 200 流。
+    match outcome {
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            assert_eq!(error.route_error_type, "protocol_error");
+        }
+        ExternalPoolForwardOutcome::Response(response) => {
+            panic!(
+                "mixed priority pools must keep the buffered semantics, got {}",
+                response.status()
+            );
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_does_not_change_non_stream_requests() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start_with_status(
+        StatusCode::BAD_GATEWAY,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"bad gateway"}}"#,
+        )],
+    )
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-non-stream", 1, &failing.base_url).await;
+
+    let request_id = "req_early_commit_non_stream";
+    let (mut route, _recorder) = external_stream_route(request_id, "err_early_commit_non_stream");
+    payload_mut(&mut route).stream = false;
+    refresh_test_route_derived_state(&mut route);
+    let outcome = timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(early_commit_config_for_test(), route),
+    )
+    .await
+    .expect("non-stream dispatch must finish");
+    assert!(
+        matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+        "a non-stream request must still return the upstream error status"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_mode_round_trips_through_postgres() {
+    let Some((_manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let created = create_early_commit_pool(
+        &postgres,
+        "early-commit-round-trip",
+        1,
+        "http://127.0.0.1:9",
+    )
+    .await;
+    assert_eq!(
+        created.pre_output_stream_retry_mode,
+        ExternalPoolStreamRetryMode::EarlyCommit
+    );
+    let listed = postgres.list_external_pools(false).await.unwrap();
+    let loaded = listed
+        .iter()
+        .find(|pool| pool.id == created.id)
+        .expect("created pool listed");
+    assert_eq!(
+        loaded.pre_output_stream_retry_mode,
+        ExternalPoolStreamRetryMode::EarlyCommit
+    );
+    let value = serde_json::to_value(loaded).unwrap();
+    assert_eq!(value["preOutputStreamRetryMode"], "early_commit");
+
+    // 混合模式不能把低优先级普通池误当成提前提交池：否则换池后会重复
+    // message_start，且普通池的首输出超时语义也会被覆盖。
+    let mut normal_request = create_pool_request("early-commit-normal", 10, true);
+    normal_request.base_url = "http://127.0.0.1:9".to_string();
+    normal_request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    normal_request.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::Disabled;
+    postgres.create_external_pool(normal_request).await.unwrap();
+    let (route, _recorder) =
+        external_stream_route("req_early_commit_mixed_mode", "err_early_commit_mixed_mode");
+    let pools = postgres.list_external_pools(false).await.unwrap();
+    assert!(!route_prefers_early_commit(&pools, &route));
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+fn external_sse_thinking_start() -> String {
+    external_sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+        }),
+    )
+}
+
+fn external_sse_thinking_delta(text: &str) -> String {
+    external_sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": text}
+        }),
+    )
+}
+
+fn external_sse_tool_use_start(id: &str, name: &str) -> String {
+    external_sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+        }),
+    )
+}
+
+fn external_sse_input_json_delta(partial_json: &str) -> String {
+    external_sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json}
+        }),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_streams_thinking_and_tool_use_after_message_start() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let thinking = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_thinking", 30)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(300)),
+        ExternalStreamFakeStep::chunk(external_sse_thinking_start()),
+        ExternalStreamFakeStep::chunk(external_sse_thinking_delta("let me think")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(30, 5)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-thinking", 1, &thinking.base_url).await;
+    let request_id = "req_early_commit_thinking";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_thinking");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_thinking");
+    assert!(body.contains("let me think"), "{body}");
+    assert_eq!(events[1].0, "content_block_start", "{body}");
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    postgres.drop_test_schema().await.unwrap();
+
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let tool = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_tool", 40)),
+        ExternalStreamFakeStep::chunk(external_sse_tool_use_start("toolu_1", "Read")),
+        ExternalStreamFakeStep::chunk(external_sse_input_json_delta("{\"file_path\":\"/a\"}")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_event(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                "usage": {"input_tokens": 40, "output_tokens": 9}
+            }),
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-tool", 1, &tool.base_url).await;
+    let request_id = "req_early_commit_tool";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_tool");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_tool");
+    assert!(body.contains("toolu_1"), "{body}");
+    assert!(body.contains("file_path"), "{body}");
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.downstream_stop_reason.as_deref(), Some("tool_use"));
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_error_in_the_same_chunk_as_message_start_still_fails_over() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    // message_start 与 error 落在同一次读取里：这次尝试可能连 message_start 都没发出去。
+    let same_chunk = ExternalStreamFakeServer::start(vec![ExternalStreamFakeStep::chunk(format!(
+        "{}{}",
+        external_sse_message_start("msg_same_chunk", 10),
+        external_sse_error("same chunk failure")
+    ))])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_same_chunk",
+        "served-after-same-chunk",
+        12,
+        2,
+    ))
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-same-chunk",
+        1,
+        &same_chunk.base_url,
+    )
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-same-ok", 10, &healthy.base_url).await;
+    let request_id = "req_early_commit_same_chunk";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_same_chunk");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    // message_start 先于 error 处理，所以下游拿到的是第一次尝试的 message_start。
+    assert_single_zeroed_message_start(&events, "msg_same_chunk");
+    assert!(!body.contains("msg_after_same_chunk"), "{body}");
+    assert!(body.contains("served-after-same-chunk"), "{body}");
+    assert!(!body.contains("same chunk failure"));
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_does_not_replay_after_content_was_forwarded() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let partial = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_partial", 10)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("partial-content")),
+        ExternalStreamFakeStep::chunk(external_sse_error("mid-stream failure")),
+    ])
+    .await;
+    let backup = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_should_not_replay",
+        "should-not-replay",
+        1,
+        1,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-partial", 1, &partial.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-no-replay", 10, &backup.base_url).await;
+    let request_id = "req_early_commit_mid_stream";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_mid_stream");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, _stream_error) = read_response_body_text_allow_error(response).await;
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_partial");
+    assert!(body.contains("partial-content"), "{body}");
+    assert!(!body.contains("should-not-replay"), "{body}");
+    assert!(!body.contains("mid-stream failure"));
+    // 提交内容后出错仍按原有语义以 error 事件结束，不计费。
+    assert_eq!(events.last().unwrap().0, "error", "{body}");
+    assert_eq!(backup.snapshot(), 0);
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_ne!(record.status, UsageRecordStatus::Success);
+    assert!(record.external_pool_billing.is_none());
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_commit_concurrent_requests_keep_their_streams_separate() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let mut steps = vec![ExternalStreamFakeStep::chunk(external_sse_message_start(
+        "msg_shared",
+        50,
+    ))];
+    steps.push(ExternalStreamFakeStep::delay(Duration::from_millis(200)));
+    steps.extend(
+        external_stream_success_steps("msg_unused", "shared-ok", 50, 3)
+            .into_iter()
+            .skip(1),
+    );
+    let upstream = ExternalStreamFakeServer::start(steps).await;
+    let mut request = create_pool_request("early-commit-concurrent", 1, true);
+    request.base_url = upstream.base_url.clone();
+    request.max_concurrent_requests = 16;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    request.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::EarlyCommit;
+    postgres.create_external_pool(request).await.unwrap();
+
+    let mut tasks = Vec::new();
+    let mut recorders = Vec::new();
+    for index in 0..8 {
+        let request_id = format!("req_early_commit_concurrent_{index}");
+        let (route, recorder) =
+            external_stream_route(request_id.clone(), format!("err_concurrent_{index}"));
+        recorders.push((request_id, recorder));
+        let manager = manager.clone();
+        tasks.push(tokio::spawn(async move {
+            let response =
+                forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+            read_response_body_text_allow_error(response).await
+        }));
+    }
+    for task in tasks {
+        let (body, stream_error) = task.await.unwrap();
+        assert_eq!(stream_error, None);
+        let events = parse_downstream_sse(&body);
+        assert_single_zeroed_message_start(&events, "msg_shared");
+        assert!(body.contains("shared-ok"), "{body}");
+        assert_eq!(downstream_events_named(&events, "message_stop").len(), 1);
+    }
+    for (request_id, recorder) in recorders {
+        let record = wait_for_usage_record(&recorder, &request_id).await;
+        assert_eq!(record.status, UsageRecordStatus::Success);
+    }
+    assert_eq!(upstream.snapshot(), 8);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_with_current_path_usage_projection_still_zeroes_message_start() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_projected",
+            2_000,
+            30_000,
+            500,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("projected-ok")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta_output_only(15)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    let mut request = create_pool_request("early-commit-projected", 1, true);
+    request.base_url = upstream.base_url.clone();
+    request.max_concurrent_requests = 4;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    request.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::EarlyCommit;
+    request.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    postgres.create_external_pool(request).await.unwrap();
+
+    let request_id = "req_early_commit_projected";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_projected");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_projected");
+    assert!(body.contains("projected-ok"), "{body}");
+    // 投影后的 message_delta 必须带非零输入：下游按它计费。
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    let delta_input = delta["usage"]["input_tokens"].as_i64().unwrap_or(0)
+        + delta["usage"]["cache_read_input_tokens"]
+            .as_i64()
+            .unwrap_or(0)
+        + delta["usage"]["cache_creation_input_tokens"]
+            .as_i64()
+            .unwrap_or(0);
+    assert!(
+        delta_input > 0,
+        "message_delta must carry the billable input: {delta}"
+    );
+    assert!(
+        delta["usage"]["output_tokens"].as_i64().unwrap_or(0) >= 15,
+        "{delta}"
+    );
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
     postgres.drop_test_schema().await.unwrap();
 }

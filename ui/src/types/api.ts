@@ -814,6 +814,7 @@ export interface UsageLatencyTrace {
   estimatedInputTokens?: number
   payloadGuardMs?: number
   upstreamHeaderMs?: number
+  downstreamFirstByteMs?: number
   firstUpstreamChunkMs?: number
   firstOutputDeltaMs?: number
   firstThinkingDeltaMs?: number
@@ -1696,7 +1697,7 @@ export type ExternalPoolWireProfile = 'default' | 'http1_title_case'
 export type ExternalPoolTlsProfile = 'default' | 'native_tls'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolStreamResponseMode = 'event_passthrough'
-export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled'
+export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled' | 'early_commit'
 export type ExternalPoolModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
 export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
 export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
