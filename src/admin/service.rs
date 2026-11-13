@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
@@ -126,6 +126,9 @@ const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const MAX_PROXY_RESOURCE_IMPORT_ITEMS: usize = 5_000;
+const MAX_RUNTIME_CONFIG_AUDIT_CHANGES: usize = 200;
+const MAX_RUNTIME_CONFIG_AUDIT_STRING_CHARS: usize = 160;
+const MAX_RUNTIME_CONFIG_AUDIT_ARRAY_ITEMS: usize = 20;
 
 fn claude_code_model_name(model: &str) -> String {
     let normalized = model.trim().to_ascii_lowercase();
@@ -2088,6 +2091,226 @@ impl AdminService {
         self.audit(action, object_type, Some(object_id), true, None, detail);
     }
 
+    fn runtime_config_audit_detail(before: &Config, after: &Config) -> Value {
+        let Ok(before) = serde_json::to_value(before) else {
+            return json!({
+                "kind": "runtime_config_change",
+                "changedCount": 0,
+                "changes": [],
+                "truncated": false,
+                "error": "无法序列化保存前配置",
+            });
+        };
+        let Ok(after) = serde_json::to_value(after) else {
+            return json!({
+                "kind": "runtime_config_change",
+                "changedCount": 0,
+                "changes": [],
+                "truncated": false,
+                "error": "无法序列化保存后配置",
+            });
+        };
+
+        let mut changes = Vec::new();
+        Self::append_runtime_config_changes("", &before, &after, &mut changes);
+        let truncated = changes.len() >= MAX_RUNTIME_CONFIG_AUDIT_CHANGES;
+        json!({
+            "kind": "runtime_config_change",
+            "changedCount": changes.len(),
+            "changes": changes,
+            "truncated": truncated,
+        })
+    }
+
+    fn append_runtime_config_changes(
+        path: &str,
+        before: &Value,
+        after: &Value,
+        changes: &mut Vec<Value>,
+    ) {
+        if before == after || changes.len() >= MAX_RUNTIME_CONFIG_AUDIT_CHANGES {
+            return;
+        }
+        if Self::runtime_config_audit_sensitive_path(path) {
+            changes.push(json!({
+                "path": path,
+                "before": "[已隐藏]",
+                "after": "[已隐藏]",
+                "redacted": true,
+            }));
+            return;
+        }
+
+        match (before, after) {
+            (Value::Object(before), Value::Object(after)) => {
+                let mut keys = BTreeSet::new();
+                keys.extend(before.keys());
+                keys.extend(after.keys());
+                for key in keys {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    let missing = Value::Null;
+                    Self::append_runtime_config_changes(
+                        &child_path,
+                        before.get(key).unwrap_or(&missing),
+                        after.get(key).unwrap_or(&missing),
+                        changes,
+                    );
+                    if changes.len() >= MAX_RUNTIME_CONFIG_AUDIT_CHANGES {
+                        return;
+                    }
+                }
+            }
+            (Value::Array(before), Value::Array(after)) => {
+                changes.push(json!({
+                    "path": path,
+                    "before": Self::summarize_runtime_config_array(before),
+                    "after": Self::summarize_runtime_config_array(after),
+                }));
+            }
+            _ => {
+                changes.push(json!({
+                    "path": path,
+                    "before": Self::summarize_runtime_config_value(before),
+                    "after": Self::summarize_runtime_config_value(after),
+                }));
+            }
+        }
+    }
+
+    fn runtime_config_audit_sensitive_path(path: &str) -> bool {
+        path.split('.')
+            .map(|segment| segment.split('[').next().unwrap_or(segment))
+            .any(|segment| {
+                matches!(
+                    segment,
+                    "apiKey"
+                        | "apiKeys"
+                        | "adminApiKey"
+                        | "countTokensApiKey"
+                        | "accessToken"
+                        | "apiToken"
+                        | "authorization"
+                        | "clientSecret"
+                        | "kiroApiKey"
+                        | "proxyPassword"
+                        | "password"
+                        | "refreshToken"
+                        | "secret"
+                        | "token"
+                )
+            })
+    }
+
+    fn summarize_runtime_config_value(value: &Value) -> Value {
+        match value {
+            Value::String(value) => {
+                let truncated: String = value
+                    .chars()
+                    .take(MAX_RUNTIME_CONFIG_AUDIT_STRING_CHARS)
+                    .collect();
+                if truncated.chars().count() < value.chars().count() {
+                    Value::String(format!("{truncated}…"))
+                } else {
+                    Value::String(truncated)
+                }
+            }
+            Value::Object(object) => json!({
+                "type": "object",
+                "keys": object.len(),
+            }),
+            Value::Array(array) => Self::summarize_runtime_config_array(array),
+            value => value.clone(),
+        }
+    }
+
+    fn summarize_runtime_config_array(array: &[Value]) -> Value {
+        let mut summary = serde_json::Map::new();
+        summary.insert("count".to_string(), json!(array.len()));
+        if array.len() <= MAX_RUNTIME_CONFIG_AUDIT_ARRAY_ITEMS
+            && array.iter().all(|item| {
+                matches!(
+                    item,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            })
+        {
+            summary.insert(
+                "items".to_string(),
+                Value::Array(
+                    array
+                        .iter()
+                        .map(Self::summarize_runtime_config_value)
+                        .collect(),
+                ),
+            );
+        }
+        Value::Object(summary)
+    }
+
+    fn normalize_audit_detail(value: Value) -> Value {
+        Self::normalize_audit_value("", value)
+    }
+
+    fn normalize_audit_value(path: &str, value: Value) -> Value {
+        if Self::runtime_config_audit_sensitive_path(path) {
+            return Value::String("[已隐藏]".to_string());
+        }
+        match value {
+            Value::String(value) => {
+                let truncated: String = value
+                    .chars()
+                    .take(MAX_RUNTIME_CONFIG_AUDIT_STRING_CHARS)
+                    .collect();
+                if truncated.chars().count() < value.chars().count() {
+                    Value::String(format!("{truncated}…"))
+                } else {
+                    Value::String(truncated)
+                }
+            }
+            Value::Array(values) => {
+                let count = values.len();
+                let item_limit = if path.ends_with("changes") {
+                    MAX_RUNTIME_CONFIG_AUDIT_CHANGES
+                } else {
+                    MAX_RUNTIME_CONFIG_AUDIT_ARRAY_ITEMS
+                };
+                let items = values
+                    .into_iter()
+                    .take(item_limit)
+                    .enumerate()
+                    .map(|(index, item)| {
+                        Self::normalize_audit_value(&format!("{path}[{index}]"), item)
+                    })
+                    .collect::<Vec<_>>();
+                if path.ends_with("changes") || count <= item_limit {
+                    return Value::Array(items);
+                }
+                let mut summary = serde_json::Map::new();
+                summary.insert("count".to_string(), json!(count));
+                summary.insert("items".to_string(), Value::Array(items));
+                summary.insert("truncated".to_string(), Value::Bool(true));
+                Value::Object(summary)
+            }
+            Value::Object(values) => {
+                let mut normalized = serde_json::Map::new();
+                for (key, item) in values.into_iter().take(MAX_RUNTIME_CONFIG_AUDIT_CHANGES) {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    normalized.insert(key, Self::normalize_audit_value(&child_path, item));
+                }
+                Value::Object(normalized)
+            }
+            value => value,
+        }
+    }
+
     pub(super) fn audit(
         &self,
         action: &'static str,
@@ -2097,6 +2320,7 @@ impl AdminService {
         error_message: Option<String>,
         detail: serde_json::Value,
     ) {
+        let detail = Self::normalize_audit_detail(detail);
         let store = self.postgres_store.clone();
         tokio::spawn(async move {
             if let Err(err) = store
@@ -7402,13 +7626,14 @@ impl AdminService {
         self.request_admission.update_config(request_admission);
         let updated_config = self.token_manager.runtime_config();
         self.refresh_request_api_key_runtime(&updated_config);
+        let audit_detail = Self::runtime_config_audit_detail(&current_config, &updated_config);
         self.audit(
             "update_runtime_config",
             "runtime_config",
             Some("default".to_string()),
             true,
             None,
-            json!({}),
+            audit_detail,
         );
         if external_pool_policy_changed {
             self.external_pool_manager

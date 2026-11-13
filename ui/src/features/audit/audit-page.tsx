@@ -52,6 +52,7 @@ import {
   summaryTiles,
   type AccountFilterState,
 } from './account-events'
+import { AuditChangeSummary, AuditDetailSummary } from './audit-detail'
 
 // ─── 标签映射 ─────────────────────────────────────────────────────────────────
 
@@ -181,12 +182,6 @@ const ACTION_TO_CATEGORY: Record<string, string> = {
 
 function actionLabel(action: string): string { return ACTION_LABELS[action] ?? action }
 function objectLabel(type: string): string { return OBJECT_LABELS[type] ?? type }
-function detailText(value: unknown): string {
-  if (value === null || value === undefined) return '-'
-  if (typeof value === 'string') return value
-  return JSON.stringify(value, null, 2)
-}
-
 const DEFAULT_PAGE_LIMIT = 20
 
 // ─── 详情弹窗 ─────────────────────────────────────────────────────────────────
@@ -234,10 +229,8 @@ function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow 
           </div>
         )}
         <div>
-          <div className="mb-1 text-xs font-semibold text-muted-foreground">详情</div>
-          <pre className="scrollbar-thin max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted p-3 font-mono text-xs">
-            {detailText(record.detail)}
-          </pre>
+          <div className="mb-1 text-xs font-semibold text-muted-foreground">变化摘要</div>
+          <AuditDetailSummary record={record} />
         </div>
       </div>
     </ModalShell>
@@ -605,8 +598,9 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
                   <TableHead>动作</TableHead>
                   <TableHead>对象</TableHead>
                   <TableHead>执行者</TableHead>
+                  <TableHead>变化摘要</TableHead>
                   <TableHead>结果</TableHead>
-                  <TableHead className="w-16 text-right">详情</TableHead>
+                  <TableHead className="w-16 text-right">查看</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -631,6 +625,7 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
                         </div>
                       </TableCell>
                       <TableCell className="text-xs">{record.actor}</TableCell>
+                      <TableCell className="max-w-[18rem]"><AuditChangeSummary record={record} /></TableCell>
                       <TableCell>
                         <Badge tone={record.success ? 'success' : 'error'}>
                           {record.success ? <CheckCircle2 className="size-3" /> : <XCircle className="size-3" />}

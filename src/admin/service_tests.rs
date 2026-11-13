@@ -18,6 +18,80 @@ fn cleanup_request() -> UsageCleanupRequest {
 }
 
 #[test]
+fn runtime_config_audit_detail_records_only_changed_fields() {
+    let before = crate::model::config::Config::default();
+    let mut after = before.clone();
+    after.credential_rpm = Some(42);
+    after.request_admission.rpm = 900;
+
+    let detail = AdminService::runtime_config_audit_detail(&before, &after);
+    assert_eq!(detail["kind"], "runtime_config_change");
+    assert_eq!(detail["changedCount"], 2);
+    let changes = detail["changes"].as_array().unwrap();
+    assert!(changes.iter().any(|change| {
+        change["path"] == "credentialRpm" && change["before"] == 100 && change["after"] == 42
+    }));
+    assert!(changes.iter().any(|change| {
+        change["path"] == "requestAdmission.rpm"
+            && change["before"] == 300
+            && change["after"] == 900
+    }));
+    let normalized = AdminService::normalize_audit_detail(detail);
+    assert!(normalized["changes"].is_array());
+}
+
+#[test]
+fn runtime_config_audit_detail_redacts_secret_values_and_bounds_arrays() {
+    let mut before = crate::model::config::Config::default();
+    before.api_keys = vec!["old-secret".to_string()];
+    let mut after = before.clone();
+    after.api_keys = (0..25).map(|index| format!("key-{index}")).collect();
+
+    let detail = AdminService::runtime_config_audit_detail(&before, &after);
+    let changes = detail["changes"].as_array().unwrap();
+    let keys = changes
+        .iter()
+        .find(|change| change["path"] == "apiKeys")
+        .unwrap();
+    assert_eq!(keys["before"], "[已隐藏]");
+    assert_eq!(keys["after"], "[已隐藏]");
+    assert_eq!(keys["redacted"], true);
+    assert!(!detail.to_string().contains("old-secret"));
+    assert!(!detail.to_string().contains("key-24"));
+}
+
+#[test]
+fn audit_detail_normalization_is_bounded_without_returning_an_error() {
+    let detail = AdminService::normalize_audit_detail(serde_json::json!({
+        "apiKey": "secret-value",
+        "supportedModels": (0..50).map(|index| format!("model-{index}")).collect::<Vec<_>>(),
+    }));
+    assert!(!detail.to_string().contains("secret-value"));
+    assert_eq!(detail["supportedModels"]["count"], 50);
+    assert_eq!(detail["supportedModels"]["truncated"], true);
+}
+
+#[test]
+fn runtime_config_audit_array_summary_survives_normalization() {
+    let detail = AdminService::normalize_audit_detail(serde_json::json!({
+        "kind": "runtime_config_change",
+        "changes": [{
+            "path": "kiroEndpointFallbackOrder",
+            "before": {"count": 0, "items": []},
+            "after": {"count": 2, "items": ["first", "second"]},
+        }],
+    }));
+    assert_eq!(
+        detail["changes"][0]["before"]["items"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        detail["changes"][0]["after"]["items"],
+        serde_json::json!(["first", "second"])
+    );
+}
+
+#[test]
 fn kiro_credit_unit_price_accepts_positive_values_and_treats_zero_as_unset() {
     assert_eq!(normalize_kiro_credit_unit_price_usd(None).unwrap(), None);
     assert_eq!(
