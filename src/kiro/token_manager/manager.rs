@@ -11460,6 +11460,10 @@ impl MultiTokenManager {
                 let Some(mutation) = mutation else {
                     continue;
                 };
+                let is_api_failure_mutation = matches!(
+                    &mutation,
+                    PendingCredentialRuntimeMutation::ApiFailure { .. }
+                );
                 attempted += 1;
                 let operation_id = mutation.operation_id();
                 let store = store.clone();
@@ -11485,6 +11489,23 @@ impl MultiTokenManager {
                         continue;
                     }
                 };
+                if is_api_failure_mutation
+                    && persisted.applied
+                    && persisted.state.failure_count == MAX_FAILURES_PER_CREDENTIAL
+                    && persisted.state.disabled_reason.as_deref()
+                        == Some(DisabledReason::TooManyFailures.as_str())
+                {
+                    self.record_scheduler_credential_audit(
+                        "auto_disable_credential",
+                        id,
+                        DisabledReason::TooManyFailures,
+                        "api_failure_threshold",
+                        "连续 API 调用失败达到阈值，已自动禁用凭据",
+                        serde_json::json!({
+                            "failureCount": persisted.state.failure_count,
+                        }),
+                    );
+                }
                 if !persisted.applied {
                     tracing::info!(
                         credential_id = id,
@@ -13225,7 +13246,7 @@ impl MultiTokenManager {
             let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
                 return Self::any_scheduler_available(&entries);
             };
-            if entry.disabled && !entry.runtime_persistence_degraded {
+            if entry.disabled {
                 return Self::any_scheduler_available(&entries);
             }
             entry.runtime_generation
@@ -13280,7 +13301,7 @@ impl MultiTokenManager {
                 None => return Self::any_scheduler_available(&entries),
             };
 
-            if entry.disabled && !entry.runtime_persistence_degraded {
+            if entry.disabled {
                 return Self::any_scheduler_available(&entries);
             }
 
@@ -13296,7 +13317,9 @@ impl MultiTokenManager {
             entry.last_used_at = Some(last_used_at.clone());
             let failure_count = entry.failure_count;
             let disabled = entry.disabled;
-            let auto_disabled = entry.disabled_reason == Some(DisabledReason::TooManyFailures);
+            let auto_disabled = entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                && failure_count == MAX_FAILURES_PER_CREDENTIAL
+                && persisted_state.as_ref().is_none_or(|result| result.applied);
 
             tracing::warn!(
                 "凭据 #{} API 调用失败（{}/{}）",
@@ -13327,7 +13350,12 @@ impl MultiTokenManager {
             self.select_highest_priority();
             self.clear_disabled_credential_request_state(id);
         }
-        if auto_disabled {
+        if auto_disabled
+            && (self.postgres_store.is_none()
+                || persisted_state
+                    .as_ref()
+                    .is_some_and(|result| result.applied))
+        {
             self.record_scheduler_credential_audit(
                 "auto_disable_credential",
                 id,
@@ -13356,7 +13384,7 @@ impl MultiTokenManager {
             let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
                 return Self::any_scheduler_available(&entries);
             };
-            if entry.disabled && !entry.runtime_persistence_degraded {
+            if entry.disabled {
                 return Self::any_scheduler_available(&entries);
             }
             entry.runtime_generation
@@ -13370,7 +13398,7 @@ impl MultiTokenManager {
                 Some(entry) => entry,
                 None => return Self::any_scheduler_available(&entries),
             };
-            if entry.disabled && !entry.runtime_persistence_degraded {
+            if entry.disabled {
                 return Self::any_scheduler_available(&entries);
             }
 
@@ -13382,7 +13410,8 @@ impl MultiTokenManager {
             entry.last_used_at = Some(last_used_at.clone());
             let failure_count = entry.failure_count;
             let disabled = entry.disabled;
-            let auto_disabled = entry.disabled_reason == Some(DisabledReason::TooManyFailures);
+            let auto_disabled = entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                && failure_count == MAX_FAILURES_PER_CREDENTIAL;
 
             tracing::warn!(
                 "凭据 #{} API 调用失败（{}/{}）",
@@ -13411,7 +13440,7 @@ impl MultiTokenManager {
             self.select_highest_priority();
             self.clear_disabled_credential_request_state(id);
         }
-        if auto_disabled {
+        if auto_disabled && self.postgres_store.is_none() {
             self.record_scheduler_credential_audit(
                 "auto_disable_credential",
                 id,
@@ -13887,7 +13916,7 @@ impl MultiTokenManager {
             let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
                 return Self::any_scheduler_available(&entries);
             };
-            if entry.disabled && !entry.runtime_persistence_degraded {
+            if entry.disabled {
                 return Self::any_scheduler_available(&entries);
             }
             entry.runtime_generation
@@ -13941,7 +13970,7 @@ impl MultiTokenManager {
                 Some(entry) => entry,
                 None => return Self::any_scheduler_available(&entries),
             };
-            if entry.disabled && !entry.runtime_persistence_degraded {
+            if entry.disabled {
                 return Self::any_scheduler_available(&entries);
             }
 
@@ -13957,8 +13986,9 @@ impl MultiTokenManager {
             entry.last_used_at = Some(last_used_at.clone());
 
             let refresh_failure_count = entry.refresh_failure_count;
-            let auto_disabled =
-                entry.disabled_reason == Some(DisabledReason::TooManyRefreshFailures);
+            let auto_disabled = entry.disabled_reason
+                == Some(DisabledReason::TooManyRefreshFailures)
+                && refresh_failure_count == MAX_FAILURES_PER_CREDENTIAL;
             tracing::warn!(
                 "凭据 #{} Token 刷新失败（{}/{}）",
                 id,

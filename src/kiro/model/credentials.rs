@@ -371,6 +371,17 @@ pub(crate) enum DeclaredAuthKind {
     Social,
 }
 
+impl DeclaredAuthKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::Idc => "idc",
+            Self::ExternalIdp => "external_idp",
+            Self::Social => "social",
+        }
+    }
+}
+
 fn auth_kind_of(value: &str) -> Option<DeclaredAuthKind> {
     match compact_protocol_value(value).as_str() {
         "apikey" => Some(DeclaredAuthKind::ApiKey),
@@ -390,20 +401,6 @@ pub(crate) fn is_external_idp_provider(value: &str) -> bool {
         compact_protocol_value(value).as_str(),
         "enterprise" | "externalidp" | "iamsso" | "awsidc" | "internal"
     )
-}
-
-fn is_ambiguous_enterprise_provider(value: &str) -> bool {
-    compact_protocol_value(value).as_str() == "enterprise"
-}
-
-fn canonicalize_auth_method_value(value: &str) -> &str {
-    match auth_kind_of(value) {
-        Some(DeclaredAuthKind::ApiKey) => "api_key",
-        Some(DeclaredAuthKind::Idc) => "idc",
-        Some(DeclaredAuthKind::ExternalIdp) => "external_idp",
-        Some(DeclaredAuthKind::Social) => "social",
-        None => value,
-    }
 }
 
 fn trimmed_non_empty(value: &Option<String>) -> Option<&str> {
@@ -575,14 +572,10 @@ impl KiroCredentials {
     }
 
     pub fn canonicalize_auth_method(&mut self) {
-        let auth_method = match &self.auth_method {
-            Some(m) => m,
-            None => return,
-        };
-
-        let canonical = canonicalize_auth_method_value(auth_method);
-        if canonical != auth_method {
-            self.auth_method = Some(canonical.to_string());
+        if self.auth_method.is_some()
+            && let Some(kind) = self.effective_auth_kind()
+        {
+            self.auth_method = Some(kind.as_str().to_string());
         }
     }
 
@@ -764,55 +757,63 @@ impl KiroCredentials {
         self.auth_method.as_deref().and_then(auth_kind_of)
     }
 
+    /// Exporters may label AWS OIDC credentials as social or Enterprise. Correct
+    /// only a complete AWS client tuple without external IdP configuration.
+    pub(crate) fn effective_auth_kind(&self) -> Option<DeclaredAuthKind> {
+        let declared = self.declared_auth_kind();
+        if self.kiro_api_key.is_some() || declared == Some(DeclaredAuthKind::ApiKey) {
+            return Some(DeclaredAuthKind::ApiKey);
+        }
+        let has_clients = trimmed_non_empty(&self.client_id).is_some()
+            && trimmed_non_empty(&self.client_secret).is_some();
+        let has_external_fields = trimmed_non_empty(&self.token_endpoint).is_some()
+            || trimmed_non_empty(&self.issuer_url).is_some()
+            || trimmed_non_empty(&self.scopes).is_some();
+        let aws_provider = self.provider.as_deref().is_some_and(|provider| {
+            matches!(
+                compact_protocol_value(provider).as_str(),
+                "builderid" | "enterprise" | "iamsso" | "awsidc" | "internal"
+            )
+        });
+        if has_clients
+            && aws_provider
+            && !has_external_fields
+            && declared == Some(DeclaredAuthKind::Social)
+        {
+            return Some(DeclaredAuthKind::Idc);
+        }
+        if declared.is_some() {
+            return declared;
+        }
+        if has_external_fields
+            || (!(has_clients && aws_provider)
+                && self
+                    .provider
+                    .as_deref()
+                    .is_some_and(is_external_idp_provider))
+        {
+            return Some(DeclaredAuthKind::ExternalIdp);
+        }
+        if has_clients {
+            return Some(DeclaredAuthKind::Idc);
+        }
+        None
+    }
+
     /// 检查是否应使用 AWS SSO OIDC refresh token 协议刷新。
     ///
-    /// 显式 `authMethod` 为 idc / builderid / iam 时成立，provider 不参与判断
-    /// （KAM、kiro-manager-lite、Kiro-Go 导出的组织 IdC 账号带 `provider: "Enterprise"`）。
-    /// `authMethod` 缺失或无法识别时，provider 不是外部 IdP 且同时带 clientId 和
-    /// clientSecret 才成立。
+    /// 使用与导入、持久化和协议头相同的有效认证类型。
     pub fn is_idc_refresh_credential(&self) -> bool {
-        if self.is_api_key_credential() {
-            return false;
-        }
-        match self.declared_auth_kind() {
-            Some(kind) => kind == DeclaredAuthKind::Idc,
-            None => {
-                !self.is_external_idp_refresh_credential()
-                    && self.client_id.is_some()
-                    && self.client_secret.is_some()
-            }
-        }
+        self.effective_auth_kind() == Some(DeclaredAuthKind::Idc)
     }
 
     /// 检查是否应使用外部 IdP 自带 token endpoint 刷新。
     ///
     /// 这类凭证来自企业 SSO，例如 Microsoft Entra ID，通常只有 public
     /// clientId、refreshToken、tokenEndpoint 和 scopes，不存在 AWS SSO
-    /// OIDC device-flow 的 clientSecret。显式 `authMethod` 决定结果；
-    /// 只有 `authMethod` 缺失或无法识别时才按 provider 推断。
+    /// OIDC device-flow 的 clientSecret。完整 AWS 凭证与旧标记冲突时纠正为 IdC。
     pub fn is_external_idp_refresh_credential(&self) -> bool {
-        if self.is_api_key_credential() {
-            return false;
-        }
-        match self.declared_auth_kind() {
-            Some(kind) => kind == DeclaredAuthKind::ExternalIdp,
-            None => {
-                let enterprise_idc_shape = self
-                    .provider
-                    .as_deref()
-                    .is_some_and(is_ambiguous_enterprise_provider)
-                    && trimmed_non_empty(&self.client_id).is_some()
-                    && trimmed_non_empty(&self.client_secret).is_some()
-                    && trimmed_non_empty(&self.token_endpoint).is_none()
-                    && trimmed_non_empty(&self.issuer_url).is_none()
-                    && trimmed_non_empty(&self.scopes).is_none();
-                !enterprise_idc_shape
-                    && self
-                        .provider
-                        .as_deref()
-                        .is_some_and(is_external_idp_provider)
-            }
-        }
+        self.effective_auth_kind() == Some(DeclaredAuthKind::ExternalIdp)
     }
 }
 
@@ -1281,6 +1282,23 @@ mod tests {
         };
         assert!(!social.is_external_idp_refresh_credential());
         assert!(!social.is_idc_refresh_credential());
+    }
+
+    #[test]
+    fn conflicting_social_builder_id_credentials_use_idc_protocol() {
+        let mut credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("BuilderId".to_string()),
+            refresh_token: Some("test_refresh".to_string()),
+            client_id: Some("client123".to_string()),
+            client_secret: Some("secret456".to_string()),
+            ..Default::default()
+        };
+
+        credentials.canonicalize_auth_method();
+        assert_eq!(credentials.auth_method.as_deref(), Some("idc"));
+        assert!(credentials.is_idc_refresh_credential());
+        assert!(!credentials.is_external_idp_refresh_credential());
     }
 
     #[test]

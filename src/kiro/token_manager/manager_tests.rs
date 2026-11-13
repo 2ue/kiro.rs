@@ -4528,6 +4528,7 @@ async fn postgres_failure_counts_are_atomic_across_managers() {
     assert!(manager_a.report_failure(1));
     assert!(manager_b.report_failure(1));
     assert!(!manager_a.report_failure(1));
+    assert!(!manager_b.report_failure(1));
 
     let runtime_state = store.load_credential_runtime_state().await.unwrap();
     let state = runtime_state.get(&1).unwrap();
@@ -4595,6 +4596,37 @@ async fn postgres_failure_deferred_queues_before_runtime_flush() {
     assert_eq!(manager.pending_persistence_backlog().runtime_mutations, 0);
 
     store.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn deferred_failure_does_not_recount_disabled_credential_during_persistence_recovery() {
+    let mut credential = api_key_credential("ksk_disabled_failure_guard");
+    credential.id = Some(1);
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+    {
+        let mut entries = manager.entries.lock();
+        let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+        entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+        entry.disabled = true;
+        entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+        entry.runtime_persistence_degraded = true;
+    }
+
+    assert!(!manager.report_failure_deferred(1));
+    let entry = manager
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == 1)
+        .unwrap();
+    assert_eq!(entry.failure_count, MAX_FAILURES_PER_CREDENTIAL);
+    assert!(entry.disabled);
+    assert_eq!(
+        entry.disabled_reason.as_deref(),
+        Some(DisabledReason::TooManyFailures.as_str())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

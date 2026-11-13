@@ -5,7 +5,8 @@
 // 以及 KAM / lite 的文本导出（卡密、CSV、TXT）。
 
 import type { AddCredentialRequest } from '@/types/api'
-import { parseAccountTextRows } from './text-formats'
+import { resolveCredentialAuthMethod } from '../credential-auth.ts'
+import { parseAccountTextRows } from './text-formats.ts'
 import {
   asBoolean,
   asCount,
@@ -16,7 +17,7 @@ import {
   pick,
   pickObject,
   type JsonObject,
-} from './values'
+} from './values.ts'
 
 export type ImportSource =
   | 'auto'
@@ -65,25 +66,12 @@ export interface ImportParseResult {
   skipped: string[]
 }
 
-type AuthMethod = NonNullable<AddCredentialRequest['authMethod']>
-
 // ----------------------------------------------------------------------------
 // 认证类型与 provider
 // ----------------------------------------------------------------------------
 
 function compact(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, '')
-}
-
-function authMethodFrom(value: unknown): AuthMethod | undefined {
-  const text = asString(value)
-  if (!text) return undefined
-  const key = compact(text)
-  if (key === 'social') return 'social'
-  if (key === 'idc' || key === 'builderid' || key === 'iam') return 'idc'
-  if (key === 'apikey') return 'api_key'
-  if (key === 'externalidp' || key === 'enterprise' || key === 'iamsso' || key === 'awsidc' || key === 'internal') return 'external_idp'
-  return undefined
 }
 
 /** provider 统一写法：Google / Github / BuilderId / Enterprise，其它值原样保留。 */
@@ -96,30 +84,6 @@ function providerFrom(value: unknown): string | undefined {
   if (key === 'builderid') return 'BuilderId'
   if (key === 'enterprise' || key === 'awsidc' || key === 'iamsso' || key === 'internal') return 'Enterprise'
   return text
-}
-
-/**
- * 认证类型：
- * - 有 tokenEndpoint（外部 IdP 自己的 token 地址）→ external_idp
- * - 显式 authMethod 优先，但标成 Enterprise 系又带 clientId + clientSecret 的按 idc
- * - 有 clientId + clientSecret → idc（Builder ID 与组织 IdC 都是 AWS OIDC）
- * - 只有 refreshToken → social
- */
-function resolveAuthMethod(input: {
-  authMethod?: AuthMethod
-  clientId?: string
-  clientSecret?: string
-  tokenEndpoint?: string
-  kiroApiKey?: string
-}): AuthMethod {
-  if (input.kiroApiKey) return 'api_key'
-  if (input.tokenEndpoint) return 'external_idp'
-  // KAM / lite / Kiro-Go 的 Enterprise 是 AWS IAM Identity Center 组织账号：带 clientId + clientSecret，
-  // 走 AWS OIDC 刷新，在本项目里属于 idc。只有带 tokenEndpoint 的才是外部 IdP。
-  if (input.authMethod === 'external_idp' && input.clientId && input.clientSecret) return 'idc'
-  if (input.authMethod) return input.authMethod
-  if (input.clientId && input.clientSecret) return 'idc'
-  return 'social'
 }
 
 // ----------------------------------------------------------------------------
@@ -245,13 +209,18 @@ function readAccount(item: JsonObject, lookup: NameLookup): ParsedImportAccount 
   const clientId = asString(field('clientId'))
   const clientSecret = asString(field('clientSecret'))
   const tokenEndpoint = asString(field('tokenEndpoint'))
+  const issuerUrl = asString(field('issuerUrl'))
+  const scopes = asString(field('scopes', 'scope'))
   // KAM 刷新账号时用 Portal GetUserInfo 的结果更新顶层 idp，不改 credentials.provider，所以顶层优先
   const provider = providerFrom(pick(item, 'idp') ?? field('provider', 'idp', 'loginProvider', 'loginOption'))
-  const authMethod = resolveAuthMethod({
-    authMethod: authMethodFrom(field('authMethod', 'authType')),
+  const authMethod = resolveCredentialAuthMethod({
+    authMethod: asString(field('authMethod', 'authType')),
+    provider,
     clientId,
     clientSecret,
     tokenEndpoint,
+    issuerUrl,
+    scopes,
   })
   const profileArn = asString(field('profileArn'))
 
@@ -262,10 +231,10 @@ function readAccount(item: JsonObject, lookup: NameLookup): ParsedImportAccount 
     accessToken: asString(field('accessToken')),
     expiresAt: asTimestamp(field('expiresAt', 'expired', 'expiry', 'expiration')),
     clientId: authMethod === 'social' ? undefined : clientId,
-    clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+    clientSecret: authMethod === 'social' ? undefined : clientSecret,
     tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint : undefined,
-    issuerUrl: authMethod === 'external_idp' ? asString(field('issuerUrl')) : undefined,
-    scopes: authMethod === 'external_idp' ? asString(field('scopes', 'scope')) : undefined,
+    issuerUrl: authMethod === 'external_idp' ? issuerUrl : undefined,
+    scopes: authMethod === 'external_idp' ? scopes : undefined,
     profileArn,
     email: asString(field('email', 'loginHint')),
     region: regionField,

@@ -384,21 +384,10 @@ fn proxy_resource_name_from_resources(
 }
 
 fn normalized_auth_method(credentials: &KiroCredentials) -> Option<String> {
-    if credentials.is_api_key_credential() {
-        return Some("api_key".to_string());
-    }
-    credentials.auth_method.as_deref().map(|method| {
-        if method.eq_ignore_ascii_case("builder-id") || method.eq_ignore_ascii_case("iam") {
-            "idc".to_string()
-        } else if method.eq_ignore_ascii_case("external-idp")
-            || method.eq_ignore_ascii_case("externalidp")
-            || method.eq_ignore_ascii_case("enterprise")
-        {
-            "external_idp".to_string()
-        } else {
-            method.to_string()
-        }
-    })
+    credentials
+        .effective_auth_kind()
+        .map(|kind| kind.as_str().to_string())
+        .or_else(|| credentials.auth_method.clone())
 }
 
 pub(super) fn base_snapshot_from_entry(

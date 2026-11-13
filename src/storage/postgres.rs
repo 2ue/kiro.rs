@@ -4148,8 +4148,19 @@ impl PostgresStore {
             CredentialRuntimeMutationPreparation::Apply {
                 next_revision,
                 credential_disabled,
+                state,
                 ..
-            } => (next_revision, credential_disabled),
+            } => {
+                if credential_disabled || state.disabled_reason.is_some() {
+                    tx.commit().await?;
+                    return Ok(CredentialRuntimeStateMutationResult {
+                        state,
+                        credential_disabled,
+                        applied: false,
+                    });
+                }
+                (next_revision, credential_disabled)
+            }
             CredentialRuntimeMutationPreparation::Duplicate {
                 state,
                 credential_disabled,
@@ -4268,8 +4279,19 @@ impl PostgresStore {
             CredentialRuntimeMutationPreparation::Apply {
                 next_revision,
                 credential_disabled,
+                state,
                 ..
-            } => (next_revision, credential_disabled),
+            } => {
+                if credential_disabled || state.disabled_reason.is_some() {
+                    tx.commit().await?;
+                    return Ok(CredentialRuntimeStateMutationResult {
+                        state,
+                        credential_disabled,
+                        applied: false,
+                    });
+                }
+                (next_revision, credential_disabled)
+            }
             CredentialRuntimeMutationPreparation::Duplicate {
                 state,
                 credential_disabled,
@@ -4440,6 +4462,7 @@ impl PostgresStore {
                     next_revision,
                     current_generation,
                     credential_disabled,
+                    ..
                 } => (next_revision, current_generation, credential_disabled),
                 CredentialRuntimeMutationPreparation::Duplicate {
                     state,
@@ -13142,6 +13165,7 @@ enum CredentialRuntimeMutationPreparation {
         next_revision: u64,
         current_generation: u64,
         credential_disabled: bool,
+        state: CredentialRuntimeStateRow,
     },
     Duplicate {
         state: CredentialRuntimeStateRow,
@@ -13273,6 +13297,7 @@ async fn prepare_credential_runtime_mutation(
             next_revision,
             current_generation: state.generation,
             credential_disabled,
+            state,
         });
     }
 

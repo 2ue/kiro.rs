@@ -762,7 +762,7 @@ pub(crate) async fn refresh_token_with_client(
 
     validate_refresh_token(credentials)?;
 
-    // 显式 authMethod 决定刷新协议；缺失或无法识别时按 provider、clientId/clientSecret 推断。
+    // 与导入和协议头共用认证判定，包括纠正 AWS 凭证的冲突标记。
     if credentials.is_external_idp_refresh_credential() {
         refresh_external_idp_token(credentials, config, &client, admission.as_ref()).await
     } else if credentials.is_idc_refresh_credential() {
