@@ -333,6 +333,7 @@ impl Drop for EarlyCommitTaskGuard {
 /// 与普通模式不同，这里不设“首个内容最长等待”：只要上游还在发 ping 或数据就一直等待，
 /// 避免放弃已在生成的尝试后上游仍按完整请求计费。
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 pub(super) async fn pre_read_early_commit<S>(
     downstream: &ExternalEarlyCommitDownstream,
     body_stream: &mut S,
@@ -454,6 +455,7 @@ where
 }
 
 /// 读取一次上游分片：成功返回字节，读错误或提前结束都转成可换池的错误。
+#[allow(clippy::result_large_err)]
 fn early_commit_upstream_chunk(
     chunk: Option<Result<Bytes, reqwest::Error>>,
     route: &ExternalRouteRequest,
