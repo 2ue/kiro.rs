@@ -283,6 +283,33 @@ fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
 }
 
 #[test]
+fn enterprise_provider_with_client_secret_import_is_inferred_as_idc() {
+    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "refreshToken": "fake-refresh-token",
+        "provider": "Enterprise",
+        "clientId": "fake-client-id",
+        "clientSecret": "fake-client-secret"
+    }))
+    .unwrap();
+
+    assert_eq!(resolve_add_credential_auth_method(&req), "idc");
+}
+
+#[test]
+fn enterprise_provider_with_external_idp_endpoint_stays_external_idp() {
+    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "refreshToken": "fake-refresh-token",
+        "provider": "Enterprise",
+        "clientId": "fake-client-id",
+        "clientSecret": "fake-client-secret",
+        "tokenEndpoint": "https://login.example.invalid/token"
+    }))
+    .unwrap();
+
+    assert_eq!(resolve_add_credential_auth_method(&req), "external_idp");
+}
+
+#[test]
 fn export_credentials_filter_keeps_selected_ids_and_rejects_missing_ids() {
     let mut credentials = vec![
         KiroCredentials {
