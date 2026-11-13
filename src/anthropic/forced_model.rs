@@ -1715,23 +1715,24 @@ mod tests {
     use crate::model::forced_model_mapping::ForcedModelRule;
 
     fn config() -> ForcedModelMappingConfig {
-        let mut config = ForcedModelMappingConfig::default();
-        config.enabled = true;
-        config.rules = vec![
-            ForcedModelRule {
-                families: vec!["haiku".to_string()],
-                target: "claude-haiku-4-5".to_string(),
-            },
-            ForcedModelRule {
-                families: ["opus", "fable", "mythos", "sonnet"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                target: "claude-sonnet-4-5".to_string(),
-            },
-        ];
-        config.default_target = "claude-sonnet-4-5".to_string();
-        config
+        ForcedModelMappingConfig {
+            enabled: true,
+            rules: vec![
+                ForcedModelRule {
+                    families: vec!["haiku".to_string()],
+                    target: "claude-haiku-4-5".to_string(),
+                },
+                ForcedModelRule {
+                    families: ["opus", "fable", "mythos", "sonnet"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    target: "claude-sonnet-4-5".to_string(),
+                },
+            ],
+            default_target: "claude-sonnet-4-5".to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
