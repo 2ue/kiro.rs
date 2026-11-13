@@ -33,6 +33,7 @@ import {
 } from '@/components/ui'
 import { Field, FieldGrid, ModalShell } from '@/components/patterns'
 import { parseImportText, readImportFiles } from '@/lib/credential-import/sources'
+import { resolveCredentialAuthMethod } from '@/lib/credential-auth'
 import {
   buildTestModelOptions,
   defaultTestModelForOptions,
@@ -134,7 +135,7 @@ function initialCredentialForm() {
 function formFromCredential(c: AddCredentialRequest) {
   return {
     ...initialCredentialForm(),
-    authMethod: (c.authMethod || (c.kiroApiKey ? 'api_key' : c.clientId && c.clientSecret ? 'idc' : 'social')) as AuthMethod,
+    authMethod: resolveCredentialAuthMethod(c),
     refreshToken: c.refreshToken || '', kiroApiKey: c.kiroApiKey || '', profileArn: c.profileArn || '',
     region: c.region || '', authRegion: c.authRegion || '', apiRegion: c.apiRegion || '',
     clientId: c.clientId || '', clientSecret: c.clientSecret || '', tokenEndpoint: c.tokenEndpoint || '',
@@ -416,7 +417,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           refreshToken: am === 'api_key' ? '' : prev.refreshToken,
           kiroApiKey: am === 'api_key' ? prev.kiroApiKey : '',
           clientId: am === 'idc' || am === 'external_idp' ? prev.clientId : '',
-          clientSecret: am === 'idc' ? prev.clientSecret : '',
+          clientSecret: am === 'idc' || am === 'external_idp' ? prev.clientSecret : '',
           tokenEndpoint: am === 'external_idp' ? prev.tokenEndpoint : '',
           issuerUrl: am === 'external_idp' ? prev.issuerUrl : '',
           scopes: am === 'external_idp' ? prev.scopes : '',
@@ -481,7 +482,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       authRegion: form.authRegion.trim() || undefined,
       apiRegion: form.apiRegion.trim() || undefined,
       clientId: isApiKey ? undefined : form.clientId.trim() || undefined,
-      clientSecret: form.authMethod === 'idc' ? form.clientSecret.trim() || undefined : undefined,
+      clientSecret: form.authMethod === 'idc' || form.authMethod === 'external_idp' ? form.clientSecret.trim() || undefined : undefined,
       tokenEndpoint: form.authMethod === 'external_idp' ? form.tokenEndpoint.trim() || undefined : undefined,
       issuerUrl: form.authMethod === 'external_idp' ? form.issuerUrl.trim() || undefined : undefined,
       scopes: form.authMethod === 'external_idp' ? form.scopes.trim() || undefined : undefined,
@@ -563,12 +564,13 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           </>}
           {form.authMethod === 'external_idp' && <>
             <Field label="Client ID"><Input value={form.clientId} disabled={add.isPending} onChange={(e) => update('clientId', e.target.value)} /></Field>
+            <Field label="Client Secret（可选）"><SecretInput value={form.clientSecret} onChange={(v) => update('clientSecret', v)} visible={showPp} onToggle={() => setShowPp((v) => !v)} disabled={add.isPending} /></Field>
             <Field label="Token Endpoint"><Input className="font-mono" value={form.tokenEndpoint} disabled={add.isPending} onChange={(e) => update('tokenEndpoint', e.target.value)} placeholder="https://.../oauth2/v2.0/token" /></Field>
             <Field label="Issuer URL（可选）"><Input className="font-mono" value={form.issuerUrl} disabled={add.isPending} onChange={(e) => update('issuerUrl', e.target.value)} placeholder="https://..." /></Field>
             <Field label="Scopes（可选）"><Input className="font-mono" value={form.scopes} disabled={add.isPending} onChange={(e) => update('scopes', e.target.value)} placeholder="offline_access ..." /></Field>
           </>}
           <Field label="邮箱（可选）"><Input value={form.email} disabled={add.isPending} onChange={(e) => update('email', e.target.value)} placeholder="user@example.com" /></Field>
-          <Field label="身份提供方（可选）" description="Google / Github / BuilderId / Enterprise，只用于展示和 Portal 查询"><Input value={form.provider} disabled={add.isPending} onChange={(e) => update('provider', e.target.value)} placeholder="留空则按认证方式推断" /></Field>
+          <Field label="身份提供方（可选）" description="Google / Github / BuilderId / Enterprise，用于识别账号来源和认证方式"><Input value={form.provider} disabled={add.isPending} onChange={(e) => update('provider', e.target.value)} placeholder="留空则按认证方式推断" /></Field>
           <div className="sm:col-span-2 space-y-1.5">
             <div className="text-sm font-medium">账号标签</div>
             <div className="text-xs leading-5 text-muted-foreground">可点击已有标签，也可以输入新标签后按 Enter。</div>

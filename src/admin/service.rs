@@ -8831,63 +8831,21 @@ fn batch_proxy_assignments(ids: &[u64], rotation: &[u64]) -> HashMap<u64, u64> {
 }
 
 fn resolve_add_credential_auth_method(req: &AddCredentialRequest) -> String {
-    let explicit = req.auth_method.trim();
-    if !explicit.is_empty() {
-        return explicit.to_string();
+    KiroCredentials {
+        auth_method: Some(req.auth_method.clone()),
+        provider: req.provider.clone(),
+        kiro_api_key: req.kiro_api_key.clone(),
+        client_id: req.client_id.clone(),
+        client_secret: req.client_secret.clone(),
+        token_endpoint: req.token_endpoint.clone(),
+        issuer_url: req.issuer_url.clone(),
+        scopes: req.scopes.clone(),
+        ..Default::default()
     }
-
-    if req.kiro_api_key.as_deref().is_some_and(has_text) {
-        return "api_key".to_string();
-    }
-
-    // Kiro Manager Lite and similar exporters use `provider: Enterprise` for
-    // AWS SSO OIDC credentials. External IdP fields disambiguate the same
-    // provider value when the credential actually carries its own endpoint.
-    let has_client_credentials = req.client_id.as_deref().is_some_and(has_text)
-        && req.client_secret.as_deref().is_some_and(has_text);
-    let enterprise_idc_shape = has_client_credentials
-        && req
-            .provider
-            .as_deref()
-            .is_some_and(|provider| compact_auth_value(provider).as_str() == "enterprise")
-        && !add_request_has_external_idp_fields(req);
-    if add_request_looks_external_idp(req) && !enterprise_idc_shape {
-        return "external_idp".to_string();
-    }
-
-    if has_client_credentials {
-        return "idc".to_string();
-    }
-
-    "social".to_string()
-}
-
-fn add_request_has_external_idp_fields(req: &AddCredentialRequest) -> bool {
-    req.token_endpoint.as_deref().is_some_and(has_text)
-        || req.issuer_url.as_deref().is_some_and(has_text)
-        || req.scopes.as_deref().is_some_and(has_text)
-}
-
-fn add_request_looks_external_idp(req: &AddCredentialRequest) -> bool {
-    add_request_has_external_idp_fields(req)
-        || req.provider.as_deref().is_some_and(|provider| {
-            matches!(
-                compact_auth_value(provider).as_str(),
-                "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
-            )
-        })
-}
-
-fn compact_auth_value(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
-}
-
-fn has_text(value: &str) -> bool {
-    !value.trim().is_empty()
+    .effective_auth_kind()
+    .map(|kind| kind.as_str())
+    .unwrap_or("social")
+    .to_string()
 }
 
 fn is_duplicate_credential_error(err: &AdminServiceError) -> bool {

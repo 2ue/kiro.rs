@@ -47,8 +47,7 @@ pub fn enterprise_fallback_profile_arn(region: &str) -> String {
 }
 
 /// Whether Kiro API calls carry the external IdP semantics (`TokenType: EXTERNAL_IDP`, real
-/// profile ARN). An explicit `authMethod` decides; `provider` is only consulted when
-/// `authMethod` is missing or unrecognised.
+/// profile ARN). Uses the same credential resolution as token refresh.
 pub fn is_external_idp_credentials(credentials: &KiroCredentials) -> bool {
     credentials.is_external_idp_refresh_credential()
 }
@@ -57,7 +56,7 @@ pub fn is_social_credentials(credentials: &KiroCredentials) -> bool {
     if credentials.is_api_key_credential() {
         return false;
     }
-    match credentials.declared_auth_kind() {
+    match credentials.effective_auth_kind() {
         Some(kind) => kind == DeclaredAuthKind::Social,
         None => credentials.provider.as_deref().is_some_and(|value| {
             matches!(compact_protocol_value(value).as_str(), "github" | "google")

@@ -436,6 +436,20 @@ fn explicit_social_auth_method_is_preserved() {
 }
 
 #[test]
+fn conflicting_social_builder_id_import_is_inferred_as_idc() {
+    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "refreshToken": "fake-refresh-token",
+        "provider": "BuilderId",
+        "authMethod": "social",
+        "clientId": "fake-client-id",
+        "clientSecret": "fake-client-secret"
+    }))
+    .unwrap();
+
+    assert_eq!(resolve_add_credential_auth_method(&req), "idc");
+}
+
+#[test]
 fn missing_auth_method_with_external_idp_fields_is_inferred_as_external_idp() {
     let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
         "refreshToken": "fake-refresh-token",
