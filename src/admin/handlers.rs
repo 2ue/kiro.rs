@@ -1437,6 +1437,12 @@ pub async fn get_model_capabilities(State(state): State<AdminState>) -> impl Int
     Json(state.service.get_model_capabilities())
 }
 
+/// GET /api/admin/forced-model-mapping/catalog
+/// 强制模型映射可选的官方 Claude、Kiro 和手动模型目录。
+pub async fn get_forced_model_catalog(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.forced_model_catalog())
+}
+
 /// GET /api/admin/forced-model-mapping/targets
 /// 强制模型收敛各目标模型的可承接账号数（目标模型取当前运行配置，或 `?models=a,b` 指定）。
 pub async fn get_forced_model_targets(

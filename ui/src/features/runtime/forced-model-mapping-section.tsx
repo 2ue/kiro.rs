@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactNode } from 'react'
-import { ChevronDown, Pencil, Plus, RotateCcw, Trash2 } from 'lucide-react'
+import { ChevronDown, Pencil, Plus, RotateCcw, Trash2, Zap } from 'lucide-react'
 import { ModalShell, useConfirm } from '@/components/patterns'
 import {
   Button,
@@ -28,6 +28,8 @@ import {
 import {
   canonicalForcedRoutePrefix,
   defaultForcedModelMapping,
+  DEFAULT_FORCED_HAIKU_TARGET,
+  DEFAULT_FORCED_SONNET_TARGET,
   FORCED_CONTEXT_BACKOFF_LIMITS,
   FORCED_MODEL_FAMILIES,
   forcedModelMappingAnyRouteEnabled,
@@ -38,11 +40,13 @@ import type {
   ForcedContextBackoffConfig,
   ForcedKnowledgeEntry,
   ForcedKnowledgeLocale,
+  ForcedModelCatalog,
+  ForcedModelCatalogItem,
   ForcedModelMappingConfig,
   ForcedModelRule,
   ModelCapabilitiesStatus,
 } from '@/types/api'
-import { useForcedModelKnowledge, useForcedModelTargets } from '@/hooks/use-usage'
+import { useForcedModelCatalog, useForcedModelKnowledge, useForcedModelTargets } from '@/hooks/use-usage'
 import { NumField, TogField } from './runtime-sections'
 
 const FAMILY_LABEL: Record<string, string> = {
@@ -77,24 +81,43 @@ function formatTokens(value?: number): string {
   return String(value)
 }
 
-type CatalogOption = { model: string; maxInputTokens?: number }
+type CatalogOption = { model: string; maxInputTokens?: number; source?: string }
 
-/** 上游模型目录（与“模型解析”共用 model-capabilities 数据），Claude 模型排在前面。 */
-function catalogOptions(capabilities?: ModelCapabilitiesStatus): CatalogOption[] {
+/** 官方 Claude、Kiro 同步和手动模型目录合并后供配置选择。 */
+function catalogOptions(capabilities?: ModelCapabilitiesStatus, catalog?: ForcedModelCatalog): CatalogOption[] {
   const seen = new Set<string>()
   const options: CatalogOption[] = []
-  for (const item of capabilities?.models ?? []) {
+  const add = (item: ForcedModelCatalogItem) => {
     const model = item.model.trim()
     const key = model.toLowerCase()
-    if (!model || seen.has(key)) continue
+    if (!model || seen.has(key)) return
     seen.add(key)
-    options.push({ model, maxInputTokens: item.maxInputTokens })
+    options.push({ model, maxInputTokens: item.maxInputTokens, source: item.source })
   }
+  for (const item of catalog?.official ?? []) add(item)
+  for (const item of catalog?.kiro ?? []) add(item)
+  for (const item of catalog?.custom ?? []) add(item)
+  for (const item of capabilities?.models ?? []) add(item)
   return options.sort((a, b) => {
     const ac = a.model.toLowerCase().startsWith('claude') ? 0 : 1
     const bc = b.model.toLowerCase().startsWith('claude') ? 0 : 1
     return ac - bc || a.model.localeCompare(b.model)
   })
+}
+
+function catalogSourceLabel(source?: string): string | null {
+  if (source === 'claude-official') return 'Claude 官方'
+  if (source === 'manual') return '自定义'
+  if (source) return 'Kiro 上游'
+  return null
+}
+
+function canonicalModelKey(model: string): string {
+  return looseModelKey(model).toLowerCase()
+}
+
+function hasCatalogModel(options: CatalogOption[], model: string): boolean {
+  return options.some((option) => canonicalModelKey(option.model) === canonicalModelKey(model))
 }
 
 function routeStatusSummary(mapping: ForcedModelMappingConfig): string {
@@ -173,7 +196,7 @@ function TargetModelInput({
   onChange: (next: string) => void
 }) {
   const trimmed = value.trim()
-  const inCatalog = !trimmed || options.length === 0 || options.some((option) => looseModelKey(option.model) === looseModelKey(trimmed))
+  const inCatalog = !trimmed || options.length === 0 || hasCatalogModel(options, trimmed)
   return (
     <div className="min-w-0 space-y-1">
       <div className="flex min-w-0 items-center gap-1.5">
@@ -202,6 +225,9 @@ function TargetModelInput({
             {options.map((option) => (
               <DropdownMenuItem key={option.model} onSelect={() => onChange(option.model)}>
                 <span className="min-w-0 flex-1 truncate font-mono text-xs">{option.model}</span>
+                {catalogSourceLabel(option.source) && (
+                  <span className="shrink-0 text-[11px] text-muted-foreground">{catalogSourceLabel(option.source)}</span>
+                )}
                 {option.maxInputTokens ? (
                   <span className="shrink-0 text-[11px] text-muted-foreground">输入 {formatTokens(option.maxInputTokens)}</span>
                 ) : null}
@@ -325,6 +351,111 @@ function RulesTable({
           {uncovered.map(familyLabel).join('、')} 没有对应规则，改发到默认目标模型。
         </div>
       )}
+    </div>
+  )
+}
+
+function ModelOverridesTable({
+  overrides,
+  options,
+  onChange,
+}: {
+  overrides: Record<string, string>
+  options: CatalogOption[]
+  onChange: (next: Record<string, string>) => void
+}) {
+  const [model, setModel] = useState('')
+  const [target, setTarget] = useState('')
+  const entries = Object.entries(overrides)
+
+  const add = () => {
+    const normalizedModel = canonicalModelKey(model)
+    const normalizedTarget = target.trim().toLowerCase()
+    if (!normalizedModel || !normalizedTarget) return
+    onChange({ ...overrides, [normalizedModel]: normalizedTarget })
+    setModel('')
+    setTarget('')
+  }
+
+  const updateModel = (previous: string, next: string) => {
+    const normalized = canonicalModelKey(next)
+    const previousTarget = overrides[previous]
+    const nextOverrides = { ...overrides }
+    delete nextOverrides[previous]
+    if (normalized) nextOverrides[normalized] = previousTarget ?? ''
+    onChange(nextOverrides)
+  }
+
+  const updateTarget = (modelKey: string, next: string) =>
+    onChange({ ...overrides, [modelKey]: next })
+
+  return (
+    <div className="space-y-2">
+      <div className="overflow-hidden rounded-lg border bg-card">
+        <Table className="min-w-[760px]">
+          <TableHeader>
+            <TableRow>
+              <TableHead>客户端模型</TableHead>
+              <TableHead>映射目标</TableHead>
+              <TableHead className="w-12" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {entries.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={3} className="py-6 text-center text-sm text-muted-foreground">
+                  没有单模型覆盖，所有模型按模型族规则或默认目标处理。
+                </TableCell>
+              </TableRow>
+            ) : (
+              entries.map(([modelKey, targetModel]) => (
+                <TableRow key={modelKey}>
+                  <TableCell className="align-top">
+                    <TargetModelInput
+                      value={modelKey}
+                      options={options}
+                      ariaLabel={`${modelKey} 的客户端模型`}
+                      onChange={(next) => updateModel(modelKey, next)}
+                    />
+                  </TableCell>
+                  <TableCell className="align-top">
+                    <TargetModelInput
+                      value={targetModel}
+                      options={options}
+                      ariaLabel={`${modelKey} 的映射目标`}
+                      onChange={(next) => updateTarget(modelKey, next)}
+                    />
+                  </TableCell>
+                  <TableCell className="align-top">
+                    <DeleteButton
+                      title="删除单模型覆盖"
+                      onClick={() => {
+                        const next = { ...overrides }
+                        delete next[modelKey]
+                        onChange(next)
+                      }}
+                    />
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </div>
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="min-w-[14rem] flex-1">
+          <div className="mb-1 text-[11px] text-muted-foreground">客户端模型</div>
+          <TargetModelInput value={model} options={options} ariaLabel="新增单模型覆盖的客户端模型" onChange={setModel} />
+        </div>
+        <div className="min-w-[14rem] flex-1">
+          <div className="mb-1 text-[11px] text-muted-foreground">映射目标</div>
+          <TargetModelInput value={target} options={options} ariaLabel="新增单模型覆盖的映射目标" onChange={setTarget} />
+        </div>
+        <Button size="sm" variant="outline" disabled={!model.trim() || !target.trim()} onClick={add}>
+          <Plus />
+          添加覆盖
+        </Button>
+      </div>
     </div>
   )
 }
@@ -740,14 +871,15 @@ export function ForcedModelMappingSection({
   routes: string[]
   onChange: (next: ForcedModelMappingConfig) => void
 }) {
-  const options = useMemo(() => catalogOptions(capabilities), [capabilities])
+  const catalog = useForcedModelCatalog()
+  const options = useMemo(() => catalogOptions(capabilities, catalog.data), [capabilities, catalog.data])
   const active = forcedModelMappingAnyRouteEnabled(mapping)
   const targetModels = useMemo(
-    () => [...mapping.rules.map((rule) => rule.target), mapping.defaultTarget],
-    [mapping.rules, mapping.defaultTarget],
+    () => [...mapping.rules.map((rule) => rule.target), ...Object.values(mapping.modelOverrides), mapping.defaultTarget],
+    [mapping.rules, mapping.modelOverrides, mapping.defaultTarget],
   )
   const targetStatus = useForcedModelTargets(targetModels)
-  const catalogEmpty = !capabilities || capabilities.models.length === 0
+  const catalogEmpty = !catalog.data?.kiro?.length && (!capabilities || capabilities.models.length === 0)
   const limits = FORCED_CONTEXT_BACKOFF_LIMITS
   const setBackoff =
     <K extends keyof ForcedContextBackoffConfig>(key: K) =>
@@ -755,8 +887,16 @@ export function ForcedModelMappingSection({
       onChange({ ...mapping, contextBackoff: { ...mapping.contextBackoff, [key]: value } })
   const restoreDefaultRules = () => {
     const defaults = defaultForcedModelMapping()
-    onChange({ ...mapping, rules: defaults.rules, defaultTarget: defaults.defaultTarget })
+    onChange({
+      ...mapping,
+      rules: defaults.rules,
+      modelOverrides: defaults.modelOverrides,
+      defaultTarget: defaults.defaultTarget,
+    })
   }
+
+  const applyGlobalTarget = (target: string) =>
+    onChange({ ...mapping, rules: [], modelOverrides: {}, defaultTarget: target })
 
   const targetSummary = targetStatus.data?.length ? (
     <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
@@ -798,10 +938,29 @@ export function ForcedModelMappingSection({
       </div>
 
       <SubBlock
+        title="单模型覆盖"
+        desc="按客户端请求的完整模型 ID 单独指定目标，优先级高于模型族规则。模型名支持点号和横杠写法，保存时统一为小写横杠。"
+      >
+        <ModelOverridesTable
+          overrides={mapping.modelOverrides}
+          options={options}
+          onChange={(modelOverrides) => onChange({ ...mapping, modelOverrides })}
+        />
+      </SubBlock>
+
+      <SubBlock
         title="收敛规则"
-        desc="按顺序匹配客户端请求的模型族，第一条命中的规则决定目标模型。目标模型必须在上游模型目录里，保存时后端会校验。"
+        desc="精确模型覆盖优先，然后按模型族规则匹配，最后使用默认目标。目标模型可以从 Claude 官方目录、Kiro 上游目录选择，也可以直接输入自定义模型名。"
         actions={
           <>
+            <Button size="sm" variant="outline" title="清空规则和单模型覆盖，全部映射到 Haiku 4.5" onClick={() => applyGlobalTarget(DEFAULT_FORCED_HAIKU_TARGET)}>
+              <Zap />
+              全部 → Haiku 4.5
+            </Button>
+            <Button size="sm" variant="outline" title="清空规则和单模型覆盖，全部映射到 Sonnet 4.5" onClick={() => applyGlobalTarget(DEFAULT_FORCED_SONNET_TARGET)}>
+              <Zap />
+              全部 → Sonnet 4.5
+            </Button>
             <Button
               size="sm"
               variant="outline"

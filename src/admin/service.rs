@@ -5387,6 +5387,41 @@ impl AdminService {
         self.model_capabilities.status()
     }
 
+    /// 返回强制映射配置使用的官方 Claude 目录、Kiro 同步目录和手动目录。
+    pub fn forced_model_catalog(&self) -> serde_json::Value {
+        let official = crate::anthropic::forced_model::display_model_listing()
+            .into_iter()
+            .map(|model| {
+                serde_json::json!({
+                    "model": model.id,
+                    "displayName": model.display_name,
+                    "maxInputTokens": model.max_input_tokens,
+                    "maxOutputTokens": model.max_tokens,
+                    "source": "claude-official",
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut kiro = Vec::new();
+        let mut custom = Vec::new();
+        for item in self.model_capabilities.status().models {
+            let value = serde_json::to_value(&item).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "model": item.model.clone(),
+                })
+            });
+            if item.source.as_deref() == Some(crate::anthropic::model_capabilities::MANUAL_SOURCE) {
+                custom.push(value);
+            } else {
+                kiro.push(value);
+            }
+        }
+        serde_json::json!({
+            "official": official,
+            "kiro": kiro,
+            "custom": custom,
+        })
+    }
+
     /// 手动同步 Kiro 模型能力。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_capabilities(
         &self,

@@ -563,10 +563,16 @@ pub(crate) fn resolve_forced_target(
     let family = display_family(&base)?;
     let spec = display_spec_for(display_model)?;
     let target_model = config
-        .rules
-        .iter()
-        .find(|rule| rule.families.iter().any(|candidate| candidate == family))
-        .map(|rule| rule.target.clone())
+        .model_overrides
+        .get(&base)
+        .cloned()
+        .or_else(|| {
+            config
+                .rules
+                .iter()
+                .find(|rule| rule.families.iter().any(|candidate| candidate == family))
+                .map(|rule| rule.target.clone())
+        })
         .unwrap_or_else(|| config.default_target.clone());
     if target_model.is_empty() || canonical_base(&target_model).0 == base {
         return None;
@@ -1706,12 +1712,26 @@ pub(crate) fn rewrite_self_identification(
 mod tests {
     use super::*;
     use crate::anthropic::types::ThinkingDisplay;
+    use crate::model::forced_model_mapping::ForcedModelRule;
 
     fn config() -> ForcedModelMappingConfig {
-        ForcedModelMappingConfig {
-            enabled: true,
-            ..ForcedModelMappingConfig::default()
-        }
+        let mut config = ForcedModelMappingConfig::default();
+        config.enabled = true;
+        config.rules = vec![
+            ForcedModelRule {
+                families: vec!["haiku".to_string()],
+                target: "claude-haiku-4-5".to_string(),
+            },
+            ForcedModelRule {
+                families: ["opus", "fable", "mythos", "sonnet"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                target: "claude-sonnet-4-5".to_string(),
+            },
+        ];
+        config.default_target = "claude-sonnet-4-5".to_string();
+        config
     }
 
     #[test]
@@ -1739,6 +1759,17 @@ mod tests {
             assert_eq!(forced.target_model, target, "{display}");
             assert_eq!(forced.display_model, display);
         }
+    }
+
+    #[test]
+    fn exact_model_override_wins_over_family_and_default() {
+        let mut config = config();
+        config.model_overrides.insert(
+            "claude-opus-5-5".to_string(),
+            "claude-haiku-4-5".to_string(),
+        );
+        let forced = resolve_forced_target("claude-opus-5.5-thinking", &config).unwrap();
+        assert_eq!(forced.target_model, "claude-haiku-4-5");
     }
 
     #[test]

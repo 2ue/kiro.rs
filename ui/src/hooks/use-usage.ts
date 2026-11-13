@@ -8,6 +8,7 @@ import {
   getAuditLogsPage,
   getUsageCleanupStatus,
   getForcedModelKnowledge,
+  getForcedModelCatalog,
   getForcedModelTargets,
   getModelCapabilities,
   getModelPricing,
@@ -426,6 +427,14 @@ export function useForcedModelKnowledge(enabled: boolean, text: string) {
     queryKey: ['forced-model-knowledge', text.trim()],
     queryFn: () => getForcedModelKnowledge(text),
     enabled,
+  })
+}
+
+export function useForcedModelCatalog() {
+  return useQuery({
+    queryKey: ['forced-model-catalog'],
+    queryFn: getForcedModelCatalog,
+    refetchInterval: 60000,
   })
 }
 

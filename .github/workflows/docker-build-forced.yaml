@@ -1,0 +1,275 @@
+name: Publish Forced Model Docker Images
+
+on:
+  push:
+    tags:
+      - 'forced-v*'
+
+concurrency:
+  group: docker-publish-forced-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: kiro-rs-forced
+
+jobs:
+  validate-version:
+    if: ${{ github.event.created == true && github.event.deleted == false && github.event.forced == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Validate forced release tag and Cargo version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^forced-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Forced model Docker releases require a forced-vMAJOR.MINOR.PATCH tag."
+            exit 1
+          fi
+          TAG_VERSION="${TAG#forced-v}"
+          CARGO_VERSION="$(node -e '
+            const fs = require("node:fs");
+            const text = fs.readFileSync("Cargo.toml", "utf8");
+            const match = text.match(/^version\s*=\s*"([^"]+)"/m);
+            if (!match) process.exit(2);
+            process.stdout.write(match[1]);
+          ')"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Forced release tag $TAG does not match Cargo package version $CARGO_VERSION."
+            exit 1
+          fi
+          echo "Forced release tag $TAG matches Cargo package version $CARGO_VERSION."
+
+  quality:
+    needs: validate-version
+    if: ${{ github.event.created == true && github.event.deleted == false && github.event.forced == false }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yaml
+    with:
+      profile: full
+
+  build:
+    needs: validate-version
+    if: ${{ github.event.created == true && github.event.deleted == false && github.event.forced == false }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^forced-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Forced model Docker releases require a forced-vMAJOR.MINOR.PATCH tag."
+            exit 1
+          fi
+          VERSION="${TAG#forced-}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_without_v=${VERSION#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set image names
+        id: images
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          DOCKERHUB_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
+          echo "ghcr_image=${GHCR_IMAGE,,}" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_image=${DOCKERHUB_IMAGE,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set platform pair
+        id: platform
+        shell: bash
+        run: |
+          PLATFORM_PAIR="${{ matrix.platform }}"
+          echo "pair=${PLATFORM_PAIR//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Docker Hub secrets
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::Docker Hub publish requires DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets."
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ env.IMAGE_NAME }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ env.IMAGE_NAME }}-${{ matrix.arch }}
+          provenance: false
+          outputs: |
+            type=image,name=${{ steps.images.outputs.ghcr_image }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=${{ steps.images.outputs.dockerhub_image }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Kiro.rs forced model mapping Docker Image
+            org.opencontainers.image.version=${{ steps.version.outputs.version_without_v }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Export digest
+        shell: bash
+        run: |
+          mkdir -p /tmp/forced-digests
+          digest="${{ steps.build.outputs.digest }}"
+          if [ -z "$digest" ]; then
+            echo "::error::Build did not return an image digest."
+            exit 1
+          fi
+          touch "/tmp/forced-digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: forced-digests-${{ steps.platform.outputs.pair }}
+          path: /tmp/forced-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs: [validate-version, quality, build]
+    if: ${{ github.event.created == true && github.event.deleted == false && github.event.forced == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^forced-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Forced model Docker releases require a forced-vMAJOR.MINOR.PATCH tag."
+            exit 1
+          fi
+          VERSION="${TAG#forced-}"
+          VERSION_WITHOUT_V="${VERSION#v}"
+          LATEST_STABLE_TAG="$(git tag --list 'forced-v*' --sort=-v:refname | awk '/^forced-v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
+          if [ "$TAG" = "$LATEST_STABLE_TAG" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version_without_v=${VERSION_WITHOUT_V}" >> "$GITHUB_OUTPUT"
+
+      - name: Set image names
+        id: images
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          DOCKERHUB_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
+          echo "ghcr_image=${GHCR_IMAGE,,}" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_image=${DOCKERHUB_IMAGE,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/forced-digests
+          pattern: forced-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifests
+        shell: bash
+        run: |
+          VERSION_WITHOUT_V="${{ steps.version.outputs.version_without_v }}"
+          GHCR_IMAGE="${{ steps.images.outputs.ghcr_image }}"
+          DOCKERHUB_IMAGE="${{ steps.images.outputs.dockerhub_image }}"
+
+          mapfile -t DIGESTS < <(find /tmp/forced-digests -maxdepth 1 -type f -exec basename {} \; | sort)
+          if [ "${#DIGESTS[@]}" -lt 2 ]; then
+            echo "::error::Expected both amd64 and arm64 image digests, got ${#DIGESTS[@]}."
+            exit 1
+          fi
+
+          create_manifest() {
+            local image="$1"
+            local refs=()
+            local tags=(-t "${image}:${VERSION_WITHOUT_V}")
+            for digest in "${DIGESTS[@]}"; do
+              if [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
+                echo "::error::Invalid digest artifact name: $digest"
+                exit 1
+              fi
+              refs+=("${image}@sha256:${digest}")
+            done
+            if [ "${{ steps.version.outputs.is_latest }}" = "true" ]; then
+              tags+=(-t "${image}:latest")
+            fi
+            docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          }
+
+          create_manifest "$GHCR_IMAGE"
+          create_manifest "$DOCKERHUB_IMAGE"

@@ -1,6 +1,6 @@
 //! 强制模型收敛配置。
 //!
-//! 打开后，所有 Claude 模型请求在入口按规则改写为配置的目标模型（默认 Sonnet 4.5 / Haiku 4.5），
+//! 打开后，所有 Claude 模型请求在入口按规则改写为配置的目标模型（默认 Haiku 4.5），
 //! 对外仍以客户端请求的模型（外显模型）表现。与 `modelMapping` 的兼容解析相互独立：
 //! 改写后的目标模型交给现有解析器，调度、冷却、转换沿用现状。默认关闭。
 
@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use super::config::reported_usage_path_matches;
 
-pub const DEFAULT_FORCED_SONNET_TARGET: &str = "claude-sonnet-4-5";
 pub const DEFAULT_FORCED_HAIKU_TARGET: &str = "claude-haiku-4-5";
 
 fn default_true() -> bool {
@@ -18,23 +17,11 @@ fn default_true() -> bool {
 }
 
 fn default_target() -> String {
-    DEFAULT_FORCED_SONNET_TARGET.to_string()
+    DEFAULT_FORCED_HAIKU_TARGET.to_string()
 }
 
 fn default_rules() -> Vec<ForcedModelRule> {
-    vec![
-        ForcedModelRule {
-            families: vec!["haiku".to_string()],
-            target: DEFAULT_FORCED_HAIKU_TARGET.to_string(),
-        },
-        ForcedModelRule {
-            families: ["opus", "fable", "mythos", "sonnet"]
-                .iter()
-                .map(|family| (*family).to_string())
-                .collect(),
-            target: DEFAULT_FORCED_SONNET_TARGET.to_string(),
-        },
-    ]
+    Vec::new()
 }
 
 /// 一条收敛规则：外显模型的族命中 `families` 时改发到 `target`。
@@ -212,6 +199,9 @@ pub struct ForcedModelMappingConfig {
     pub default_target: String,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, ForcedModelRouteOverride>,
+    /// 单个外显模型的精确覆盖，优先于模型族规则和默认目标。
+    #[serde(default)]
+    pub model_overrides: BTreeMap<String, String>,
     #[serde(default)]
     pub context_backoff: ForcedContextBackoffConfig,
     /// 外显模型为 Opus 5.5 且思考隐藏时，把工具调用之前的文字作为 thinking 块下发。
@@ -229,6 +219,7 @@ impl Default for ForcedModelMappingConfig {
             rules: default_rules(),
             default_target: default_target(),
             path_overrides: BTreeMap::new(),
+            model_overrides: BTreeMap::new(),
             context_backoff: ForcedContextBackoffConfig::default(),
             interleaved_text_as_thinking: true,
             knowledge: Vec::new(),
@@ -272,6 +263,15 @@ impl ForcedModelMappingConfig {
                 (value != ForcedModelRouteOverride::default()).then_some((path, value))
             })
             .collect();
+        self.model_overrides = self
+            .model_overrides
+            .into_iter()
+            .filter_map(|(model, target)| {
+                let model = model.trim().to_ascii_lowercase().replace('.', "-");
+                let target = target.trim().to_ascii_lowercase().replace('.', "-");
+                (!model.is_empty() && !target.is_empty()).then_some((model, target))
+            })
+            .collect();
         self.context_backoff = self.context_backoff.normalized();
         self.knowledge = self
             .knowledge
@@ -307,6 +307,7 @@ impl ForcedModelMappingConfig {
             .rules
             .iter()
             .map(|rule| rule.target.clone())
+            .chain(self.model_overrides.values().cloned())
             .chain(std::iter::once(self.default_target.clone()))
             .collect();
         targets.sort();
@@ -320,13 +321,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_off_and_route_haiku_and_the_rest_to_their_targets() {
+    fn defaults_are_off_and_route_every_model_to_haiku() {
         let config = ForcedModelMappingConfig::default();
         assert!(!config.enabled);
         assert!(!config.applies_to("/v1/messages"));
-        assert_eq!(config.rules[0].families, vec!["haiku"]);
-        assert_eq!(config.rules[0].target, DEFAULT_FORCED_HAIKU_TARGET);
-        assert_eq!(config.default_target, DEFAULT_FORCED_SONNET_TARGET);
+        assert!(config.rules.is_empty());
+        assert_eq!(config.default_target, DEFAULT_FORCED_HAIKU_TARGET);
+        assert!(config.model_overrides.is_empty());
         assert!(config.interleaved_text_as_thinking);
     }
 
@@ -395,6 +396,10 @@ mod tests {
                 },
             ],
             default_target: "  ".to_string(),
+            model_overrides: BTreeMap::from([(
+                " Claude-Opus-5.5 ".to_string(),
+                " Claude-Haiku-4.5 ".to_string(),
+            )]),
             knowledge: vec![
                 ForcedKnowledgeEntry {
                     id: "a".to_string(),
@@ -417,7 +422,11 @@ mod tests {
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].families, vec!["opus"]);
         assert_eq!(config.rules[0].target, "claude-sonnet-4-5");
-        assert_eq!(config.default_target, DEFAULT_FORCED_SONNET_TARGET);
+        assert_eq!(config.default_target, DEFAULT_FORCED_HAIKU_TARGET);
+        assert_eq!(
+            config.model_overrides.get("claude-opus-5-5"),
+            Some(&"claude-haiku-4-5".to_string())
+        );
         assert_eq!(config.knowledge.len(), 1);
         assert_eq!(config.knowledge[0].topics, vec!["opus 5.5"]);
         assert_eq!(config.knowledge[0].locale.as_deref(), Some("en"));
@@ -456,10 +465,7 @@ mod tests {
         let config = ForcedModelMappingConfig::default();
         assert_eq!(
             config.targets(),
-            vec![
-                DEFAULT_FORCED_HAIKU_TARGET.to_string(),
-                DEFAULT_FORCED_SONNET_TARGET.to_string()
-            ]
+            vec![DEFAULT_FORCED_HAIKU_TARGET.to_string()]
         );
     }
 }

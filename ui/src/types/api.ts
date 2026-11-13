@@ -1774,10 +1774,26 @@ export interface ForcedModelMappingConfig {
   rules: ForcedModelRule[]
   defaultTarget: string
   pathOverrides: Record<string, ForcedModelRouteOverride>
+  /** Exact display-model overrides. These take precedence over family rules. */
+  modelOverrides: Record<string, string>
   contextBackoff: ForcedContextBackoffConfig
   interleavedTextAsThinking: boolean
   /** Empty means the server uses its built-in entries. */
   knowledge: ForcedKnowledgeEntry[]
+}
+
+export interface ForcedModelCatalogItem {
+  model: string
+  displayName?: string
+  maxInputTokens?: number
+  maxOutputTokens?: number
+  source?: string
+}
+
+export interface ForcedModelCatalog {
+  official: ForcedModelCatalogItem[]
+  kiro: ForcedModelCatalogItem[]
+  custom: ForcedModelCatalogItem[]
 }
 
 export interface ReportedUsageFieldPolicy {

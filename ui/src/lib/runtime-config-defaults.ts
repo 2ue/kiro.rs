@@ -533,10 +533,7 @@ export const FORCED_CONTEXT_BACKOFF_LIMITS = {
 } as const
 
 export function defaultForcedModelRules(): ForcedModelRule[] {
-  return [
-    { families: ['haiku'], target: DEFAULT_FORCED_HAIKU_TARGET },
-    { families: ['opus', 'fable', 'mythos', 'sonnet'], target: DEFAULT_FORCED_SONNET_TARGET },
-  ]
+  return []
 }
 
 export function defaultForcedContextBackoff(): ForcedContextBackoffConfig {
@@ -557,8 +554,9 @@ export function defaultForcedModelMapping(): ForcedModelMappingConfig {
   return {
     enabled: false,
     rules: defaultForcedModelRules(),
-    defaultTarget: DEFAULT_FORCED_SONNET_TARGET,
+    defaultTarget: DEFAULT_FORCED_HAIKU_TARGET,
     pathOverrides: {},
+    modelOverrides: {},
     contextBackoff: defaultForcedContextBackoff(),
     interleavedTextAsThinking: true,
     knowledge: [],
@@ -620,6 +618,13 @@ export function normalizeForcedModelMapping(input?: Partial<ForcedModelMappingCo
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
   for (const [prefix, value] of overrideEntries) pathOverrides[prefix] = { enabled: value!.enabled }
 
+  const modelOverrides: Record<string, string> = {}
+  for (const [model, target] of Object.entries(input?.modelOverrides ?? {})) {
+    const normalizedModel = model.trim().toLowerCase().replace(/\./g, '-')
+    const normalizedTarget = String(target ?? '').trim().toLowerCase().replace(/\./g, '-')
+    if (normalizedModel && normalizedTarget) modelOverrides[normalizedModel] = normalizedTarget
+  }
+
   const backoffInput: Partial<ForcedContextBackoffConfig> = input?.contextBackoff ?? {}
   const backoffBase = base.contextBackoff
   const limits = FORCED_CONTEXT_BACKOFF_LIMITS
@@ -654,6 +659,7 @@ export function normalizeForcedModelMapping(input?: Partial<ForcedModelMappingCo
     rules,
     defaultTarget: String(input?.defaultTarget ?? '').trim().toLowerCase() || base.defaultTarget,
     pathOverrides,
+    modelOverrides,
     contextBackoff,
     interleavedTextAsThinking: input?.interleavedTextAsThinking ?? base.interleavedTextAsThinking,
     knowledge,

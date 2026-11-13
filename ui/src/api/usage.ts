@@ -6,6 +6,7 @@ import type {
   AccountEventSummaryResponse,
   AdminAuditLogPageQuery,
   ModelCapabilitiesStatus,
+  ForcedModelCatalog,
   SyncModelCapabilitiesRequest,
   ManualModelResponse,
   ModelPricingStatus,
@@ -290,6 +291,11 @@ export async function getForcedModelKnowledge(text: string): Promise<ForcedModel
 
 export async function getModelCapabilities(): Promise<ModelCapabilitiesStatus> {
   const { data } = await api.get<ModelCapabilitiesStatus>('/model-capabilities')
+  return data
+}
+
+export async function getForcedModelCatalog(): Promise<ForcedModelCatalog> {
+  const { data } = await api.get<ForcedModelCatalog>('/forced-model-mapping/catalog')
   return data
 }
 
