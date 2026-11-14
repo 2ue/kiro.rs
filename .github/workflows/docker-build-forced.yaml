@@ -60,7 +60,7 @@ jobs:
       profile: full
 
   build:
-    needs: validate-version
+    needs: [validate-version, quality]
     if: ${{ github.event.created == true && github.event.deleted == false && github.event.forced == false }}
     runs-on: ${{ matrix.runner }}
     strategy:
