@@ -1952,6 +1952,8 @@ pub struct StreamContext {
     /// Forced model mapping: the client asked for a model with a larger window, so a full upstream
     /// window is not reported as `model_context_window_exceeded`.
     suppress_context_window_exceeded: bool,
+    /// Forced model mapping target, used only to redact upstream model names from stream errors.
+    served_model: Option<String>,
     /// Forced model mapping to Opus 5.5 with hidden thinking: text written right before a tool
     /// call is sent as an empty thinking block, as that model returns it.
     interleaved_text_as_thinking: Option<super::interleaved_thinking::InterleavedTextAsThinking>,
@@ -2157,6 +2159,7 @@ impl StreamContext {
             control_block_cleaner: None,
             identity_guard: None,
             suppress_context_window_exceeded: false,
+            served_model: None,
             interleaved_text_as_thinking: None,
             structured_output: None,
             code_execution: None,
@@ -2230,6 +2233,10 @@ impl StreamContext {
     /// Forced model mapping: never report a full upstream window to the client.
     pub(crate) fn set_suppress_context_window_exceeded(&mut self, suppress: bool) {
         self.suppress_context_window_exceeded = suppress;
+    }
+
+    pub(crate) fn set_served_model(&mut self, served_model: Option<String>) {
+        self.served_model = served_model;
     }
 
     pub(crate) fn set_identity_guard_display(
@@ -4611,7 +4618,11 @@ impl StreamContext {
             let message = self.public_stream_error_message(&error_type, raw_message);
             // Forced model mapping: an upstream message naming the serving model names the client's.
             let message = if self.suppress_context_window_exceeded {
-                super::forced_model::conceal_target_model(&message, &self.model).into_owned()
+                super::forced_model::conceal_served_model(
+                    &message,
+                    self.served_model.as_deref().unwrap_or_default(),
+                    &self.model,
+                )
             } else {
                 message
             };
@@ -7568,6 +7579,29 @@ mod tests {
         assert!(!message.contains("upstream"));
         assert!(!message.contains("billing"));
         assert!(!message.contains("routing"));
+    }
+
+    #[test]
+    fn forced_mapping_stream_errors_hide_nonstandard_served_model_ids() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-5-5", 1, false, HashMap::new());
+        ctx.set_suppress_context_window_exceeded(true);
+        ctx.set_served_model(Some("fast-haiku-v2".to_string()));
+        ctx.record_stream_error(
+            "invalid_request_error",
+            "model fast-haiku-v2 is unavailable",
+        );
+
+        let events = ctx.generate_final_events();
+        let error = events
+            .iter()
+            .find(|event| event.event == "error")
+            .expect("error event should be emitted");
+        let message = error.data["error"]["message"]
+            .as_str()
+            .expect("message should be string");
+        assert!(message.contains("claude-sonnet-5-5"), "{message}");
+        assert!(!message.contains("fast-haiku-v2"), "{message}");
     }
 
     #[test]

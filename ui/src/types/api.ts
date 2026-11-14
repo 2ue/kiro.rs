@@ -2819,6 +2819,8 @@ export interface ModelPricingStatus {
   source: string
   sourceUrl: string
   modelCount: number
+  /** Claude 外显/计费目录中尚未配置价格的模型 ID */
+  unpricedModels: string[]
   lastSyncedAt?: string
   lastError?: string
   models: ModelPriceItem[]
@@ -2859,6 +2861,11 @@ export interface ManualModelPricingRequest {
   cacheCreationInputCostPerMillion?: number
   cacheCreation1hInputCostPerMillion?: number
   cacheReadInputCostPerMillion?: number
+}
+
+export interface UpsertManualModelPriceRequest {
+  model: string
+  pricing: ManualModelPricingRequest
 }
 
 export interface UpsertManualModelRequest {

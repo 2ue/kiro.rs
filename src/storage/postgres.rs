@@ -16,7 +16,8 @@ use crate::anthropic::model_capabilities::{
     KiroReasoningFieldCapability, MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
 };
 use crate::anthropic::pricing::{
-    MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
+    BUILTIN_PRICING_SOURCE_URL, FALLBACK_SOURCE, MANUAL_PRICING_SOURCE, ModelPriceItem,
+    ModelPricing, PricingStatus,
 };
 use crate::anthropic::usage::{
     CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem,
@@ -120,6 +121,14 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "credentials",
         column_name: "revision",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_pricing_manual_overrides",
+        column_name: "model",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_pricing_manual_overrides",
+        column_name: "input_cost_per_token",
     },
     RequiredPostgresColumn {
         table_name: "credential_runtime_state",
@@ -4641,15 +4650,22 @@ impl PostgresStore {
 
     pub async fn save_pricing_status(&self, status: &PricingStatus) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        let incoming_models: Vec<String> = status
-            .models
-            .iter()
-            .map(|item| item.model.clone())
-            .collect();
-        for item in &status.models {
+        let base_models = if status.persisted_base_models.is_empty() {
+            status
+                .models
+                .iter()
+                .filter(|item| item.source.as_deref() != Some(MANUAL_PRICING_SOURCE))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            status.persisted_base_models.clone()
+        };
+        let incoming_models: Vec<String> =
+            base_models.iter().map(|item| item.model.clone()).collect();
+        for item in &base_models {
             let item_source = item.source.as_deref().unwrap_or(&status.source);
-            let item_source_url = if item_source == MANUAL_PRICING_SOURCE {
-                "manual"
+            let item_source_url = if item_source == FALLBACK_SOURCE {
+                BUILTIN_PRICING_SOURCE_URL
             } else {
                 &status.source_url
             };
@@ -4689,18 +4705,14 @@ impl PostgresStore {
             .await?;
         }
         if incoming_models.is_empty() {
-            sqlx::query("DELETE FROM model_pricing WHERE source <> $1")
-                .bind(MANUAL_PRICING_SOURCE)
+            sqlx::query("DELETE FROM model_pricing")
                 .execute(&mut *tx)
                 .await?;
         } else {
-            sqlx::query(
-                "DELETE FROM model_pricing WHERE source <> $1 AND model <> ALL($2::text[])",
-            )
-            .bind(MANUAL_PRICING_SOURCE)
-            .bind(incoming_models)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query("DELETE FROM model_pricing WHERE model <> ALL($1::text[])")
+                .bind(incoming_models)
+                .execute(&mut *tx)
+                .await?;
         }
         sqlx::query(
             r#"
@@ -4760,7 +4772,7 @@ impl PostgresStore {
     }
 
     pub async fn load_pricing_status(&self) -> anyhow::Result<Option<PricingStatus>> {
-        let rows = sqlx::query(
+        let base_rows = sqlx::query(
             r#"
             SELECT model, input_cost_per_token, output_cost_per_token,
                    cache_creation_input_token_cost, cache_read_input_token_cost,
@@ -4772,7 +4784,18 @@ impl PostgresStore {
         )
         .fetch_all(&self.pool)
         .await?;
-        if rows.is_empty() {
+        let manual_rows = sqlx::query(
+            r#"
+            SELECT model, input_cost_per_token, output_cost_per_token,
+                   cache_creation_input_token_cost, cache_read_input_token_cost,
+                   cache_creation_1h_input_token_cost, source, source_url
+            FROM model_pricing_manual_overrides
+            ORDER BY model ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if base_rows.is_empty() && manual_rows.is_empty() {
             return Ok(None);
         }
 
@@ -4797,17 +4820,26 @@ impl PostgresStore {
                 row.try_get("last_synced_at")?,
                 row.try_get("last_error")?,
             )
-        } else {
+        } else if let Some(row) = base_rows.first() {
             (
-                rows[0].try_get("source")?,
-                rows[0].try_get("source_url")?,
-                rows[0].try_get("last_synced_at")?,
-                rows[0].try_get("last_error")?,
+                row.try_get("source")?,
+                row.try_get("source_url")?,
+                row.try_get("last_synced_at")?,
+                row.try_get("last_error")?,
+            )
+        } else {
+            let row = &manual_rows[0];
+            (
+                row.try_get("source")?,
+                row.try_get("source_url")?,
+                None,
+                None,
             )
         };
-        let mut models = Vec::with_capacity(rows.len());
-        for row in rows {
-            models.push(ModelPriceItem {
+        let mut persisted_base_models = Vec::with_capacity(base_rows.len());
+        let mut effective_models = BTreeMap::new();
+        for row in base_rows {
+            let item = ModelPriceItem {
                 model: row.try_get("model")?,
                 pricing: ModelPricing {
                     input_cost_per_token: row.try_get("input_cost_per_token")?,
@@ -4820,14 +4852,36 @@ impl PostgresStore {
                 }
                 .with_derived_cache_creation_1h_cost(),
                 source: Some(row.try_get("source")?),
-            });
+            };
+            effective_models.insert(item.model.clone(), item.clone());
+            persisted_base_models.push(item);
         }
+        for row in manual_rows {
+            let item = ModelPriceItem {
+                model: row.try_get("model")?,
+                pricing: ModelPricing {
+                    input_cost_per_token: row.try_get("input_cost_per_token")?,
+                    output_cost_per_token: row.try_get("output_cost_per_token")?,
+                    cache_creation_input_token_cost: row
+                        .try_get("cache_creation_input_token_cost")?,
+                    cache_creation_1h_input_token_cost: row
+                        .try_get("cache_creation_1h_input_token_cost")?,
+                    cache_read_input_token_cost: row.try_get("cache_read_input_token_cost")?,
+                }
+                .with_derived_cache_creation_1h_cost(),
+                source: Some(row.try_get("source")?),
+            };
+            effective_models.insert(item.model.clone(), item);
+        }
+        let models: Vec<ModelPriceItem> = effective_models.into_values().collect();
 
         Ok(Some(PricingStatus {
-            available: true,
+            available: !models.is_empty(),
             source,
             source_url,
             model_count: models.len(),
+            unpriced_models: Vec::new(),
+            persisted_base_models,
             last_synced_at,
             last_error,
             models,
@@ -5165,13 +5219,13 @@ RETURNING id
         if let Some(pricing) = pricing {
             sqlx::query(
                 r#"
-                INSERT INTO model_pricing (
+                INSERT INTO model_pricing_manual_overrides (
                     model, input_cost_per_token, output_cost_per_token,
                     cache_creation_input_token_cost, cache_read_input_token_cost,
-                    source, source_url, last_synced_at, last_error, updated_at,
+                    source, source_url, updated_at,
                     cache_creation_1h_input_token_cost
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, 'manual', NULL, NULL, now(), $7)
+                VALUES ($1, $2, $3, $4, $5, $6, 'manual', now(), $7)
                 ON CONFLICT (model) DO UPDATE
                 SET input_cost_per_token = EXCLUDED.input_cost_per_token,
                     output_cost_per_token = EXCLUDED.output_cost_per_token,
@@ -5180,7 +5234,6 @@ RETURNING id
                     cache_creation_1h_input_token_cost = EXCLUDED.cache_creation_1h_input_token_cost,
                     source = EXCLUDED.source,
                     source_url = EXCLUDED.source_url,
-                    last_error = NULL,
                     updated_at = now()
                 "#,
             )
@@ -5194,15 +5247,60 @@ RETURNING id
             .execute(&mut *tx)
             .await?;
         } else if clear_pricing {
-            sqlx::query("DELETE FROM model_pricing WHERE model = $1 AND source = $2")
+            sqlx::query("DELETE FROM model_pricing_manual_overrides WHERE model = $1")
                 .bind(&item.model)
-                .bind(MANUAL_PRICING_SOURCE)
                 .execute(&mut *tx)
                 .await?;
         }
 
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn save_manual_model_pricing(
+        &self,
+        model: &str,
+        pricing: ModelPricing,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(pricing.is_usable(), "manual model price is not usable");
+        sqlx::query(
+            r#"
+            INSERT INTO model_pricing_manual_overrides (
+                model, input_cost_per_token, output_cost_per_token,
+                cache_creation_input_token_cost, cache_read_input_token_cost,
+                source, source_url, updated_at,
+                cache_creation_1h_input_token_cost
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'manual', now(), $7)
+            ON CONFLICT (model) DO UPDATE
+            SET input_cost_per_token = EXCLUDED.input_cost_per_token,
+                output_cost_per_token = EXCLUDED.output_cost_per_token,
+                cache_creation_input_token_cost = EXCLUDED.cache_creation_input_token_cost,
+                cache_read_input_token_cost = EXCLUDED.cache_read_input_token_cost,
+                cache_creation_1h_input_token_cost = EXCLUDED.cache_creation_1h_input_token_cost,
+                source = EXCLUDED.source,
+                source_url = EXCLUDED.source_url,
+                updated_at = now()
+            "#,
+        )
+        .bind(model)
+        .bind(pricing.input_cost_per_token)
+        .bind(pricing.output_cost_per_token)
+        .bind(pricing.cache_creation_input_token_cost)
+        .bind(pricing.cache_read_input_token_cost)
+        .bind(MANUAL_PRICING_SOURCE)
+        .bind(pricing.cache_creation_1h_input_token_cost)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_manual_model_pricing(&self, model: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query("DELETE FROM model_pricing_manual_overrides WHERE model = $1")
+            .bind(model)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn delete_manual_model(&self, model: &str) -> anyhow::Result<bool> {
@@ -5213,9 +5311,8 @@ RETURNING id
             .execute(&mut *tx)
             .await?;
         if result.rows_affected() > 0 {
-            sqlx::query("DELETE FROM model_pricing WHERE model = $1 AND source = $2")
+            sqlx::query("DELETE FROM model_pricing_manual_overrides WHERE model = $1")
                 .bind(model)
-                .bind(MANUAL_PRICING_SOURCE)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -14264,6 +14361,32 @@ CREATE TABLE IF NOT EXISTS model_pricing (
 ALTER TABLE model_pricing
     ADD COLUMN IF NOT EXISTS cache_creation_1h_input_token_cost DOUBLE PRECISION NOT NULL DEFAULT 0;
 
+CREATE TABLE IF NOT EXISTS model_pricing_manual_overrides (
+    model TEXT PRIMARY KEY,
+    input_cost_per_token DOUBLE PRECISION NOT NULL,
+    output_cost_per_token DOUBLE PRECISION NOT NULL,
+    cache_creation_input_token_cost DOUBLE PRECISION NOT NULL,
+    cache_creation_1h_input_token_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cache_read_input_token_cost DOUBLE PRECISION NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    source_url TEXT NOT NULL DEFAULT 'manual',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO model_pricing_manual_overrides (
+    model, input_cost_per_token, output_cost_per_token,
+    cache_creation_input_token_cost, cache_creation_1h_input_token_cost,
+    cache_read_input_token_cost, source, source_url, updated_at
+)
+SELECT model, input_cost_per_token, output_cost_per_token,
+       cache_creation_input_token_cost, cache_creation_1h_input_token_cost,
+       cache_read_input_token_cost, source, source_url, updated_at
+FROM model_pricing
+WHERE source = 'manual'
+ON CONFLICT (model) DO NOTHING;
+
+DELETE FROM model_pricing WHERE source = 'manual';
+
 CREATE TABLE IF NOT EXISTS model_pricing_sync_status (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -14879,6 +15002,8 @@ mod tests {
             ("usage_records", "original_cost_usd"),
             ("usage_records", "kiro_metering_usage"),
             ("model_capabilities_sync_status", "reasoning_fields"),
+            ("model_pricing_manual_overrides", "model"),
+            ("model_pricing_manual_overrides", "input_cost_per_token"),
             ("credentials", "revision"),
             ("credential_runtime_state", "generation"),
             ("credential_runtime_mutations", "operation_id"),
@@ -14897,7 +15022,9 @@ mod tests {
             .iter()
             .filter(|required| {
                 !(required.table_name == "external_upstream_pools"
-                    && required.column_name == "revision")
+                    && required.column_name == "revision"
+                    || required.table_name == "model_pricing_manual_overrides"
+                        && required.column_name == "model")
             })
             .map(|required| {
                 (
@@ -14908,7 +15035,13 @@ mod tests {
             .collect();
 
         let missing = required_postgres_schema_missing_columns(&present);
-        assert_eq!(missing, vec!["external_upstream_pools.revision"]);
+        assert_eq!(
+            missing,
+            vec![
+                "model_pricing_manual_overrides.model",
+                "external_upstream_pools.revision"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -15290,6 +15423,7 @@ mod tests {
             "TRUNCATE TABLE usage_records",
             "TRUNCATE TABLE model_pricing_sync_status",
             "TRUNCATE TABLE model_pricing",
+            "TRUNCATE TABLE model_pricing_manual_overrides",
             "TRUNCATE TABLE credential_stats_delta_batches",
             "TRUNCATE TABLE credential_runtime_mutations",
             "TRUNCATE TABLE credential_runtime_state CASCADE",
@@ -18967,6 +19101,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_migrates_legacy_manual_prices_idempotently() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let pricing = ModelPricing {
+            input_cost_per_token: 0.00001,
+            output_cost_per_token: 0.00005,
+            cache_creation_input_token_cost: 0.0000125,
+            cache_creation_1h_input_token_cost: 0.00002,
+            cache_read_input_token_cost: 0.000001,
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO model_pricing (
+                model, input_cost_per_token, output_cost_per_token,
+                cache_creation_input_token_cost, cache_read_input_token_cost,
+                source, source_url, cache_creation_1h_input_token_cost
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7)
+            "#,
+        )
+        .bind("claude-fable-legacy-5-1")
+        .bind(pricing.input_cost_per_token)
+        .bind(pricing.output_cost_per_token)
+        .bind(pricing.cache_creation_input_token_cost)
+        .bind(pricing.cache_read_input_token_cost)
+        .bind(MANUAL_PRICING_SOURCE)
+        .bind(pricing.cache_creation_1h_input_token_cost)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        store.migrate_with_options(false).await.unwrap();
+        for _ in 0..2 {
+            let base_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM model_pricing WHERE model = 'claude-fable-legacy-5-1'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            let override_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM model_pricing_manual_overrides WHERE model = 'claude-fable-legacy-5-1'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(base_count, 0);
+            assert_eq!(override_count, 1);
+            store.migrate_with_options(false).await.unwrap();
+        }
+
+        let status = store.load_pricing_status().await.unwrap().unwrap();
+        let migrated = status
+            .models
+            .iter()
+            .find(|item| item.model == "claude-fable-legacy-5-1")
+            .unwrap();
+        assert_eq!(migrated.source.as_deref(), Some(MANUAL_PRICING_SOURCE));
+        assert_eq!(migrated.pricing, pricing);
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_persists_runtime_config_credentials_stats_usage_and_pricing() {
         let Some(mut config) = test_config() else {
             eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -19322,6 +19521,8 @@ mod tests {
             source: "test".to_string(),
             source_url: "local".to_string(),
             model_count: 1,
+            unpriced_models: Vec::new(),
+            persisted_base_models: Vec::new(),
             last_synced_at: Some(Utc::now().to_rfc3339()),
             last_error: None,
             models: vec![ModelPriceItem {
@@ -19461,6 +19662,80 @@ mod tests {
                 .any(|item| item.model == "claude-opus-5-manual"
                     && item.source.as_deref() == Some(MANUAL_PRICING_SOURCE))
         );
+        let mut fable_public_price = status.clone();
+        fable_public_price.source = "litellm".to_string();
+        fable_public_price.source_url = "public-test".to_string();
+        fable_public_price.model_count = 2;
+        fable_public_price.models.push(ModelPriceItem {
+            model: "claude-fable-5-1".to_string(),
+            pricing: ModelPricing {
+                input_cost_per_token: 0.000008,
+                output_cost_per_token: 0.00004,
+                cache_creation_input_token_cost: 0.00001,
+                cache_creation_1h_input_token_cost: 0.000016,
+                cache_read_input_token_cost: 0.0000002,
+            },
+            source: Some("litellm".to_string()),
+        });
+        store
+            .save_pricing_status(&fable_public_price)
+            .await
+            .unwrap();
+        store
+            .save_manual_model_pricing(
+                "claude-fable-5-1",
+                ModelPricing {
+                    input_cost_per_token: 0.00001,
+                    output_cost_per_token: 0.00005,
+                    cache_creation_input_token_cost: 0.0000125,
+                    cache_creation_1h_input_token_cost: 0.00002,
+                    cache_read_input_token_cost: 0.000001,
+                },
+            )
+            .await
+            .unwrap();
+        let with_manual_fable = store.load_pricing_status().await.unwrap().unwrap();
+        assert!(with_manual_fable.models.iter().any(|item| {
+            item.model == "claude-fable-5-1"
+                && item.source.as_deref() == Some(MANUAL_PRICING_SOURCE)
+        }));
+        let mut refreshed_public_price = fable_public_price.clone();
+        let refreshed_fable = refreshed_public_price
+            .models
+            .iter_mut()
+            .find(|item| item.model == "claude-fable-5-1")
+            .unwrap();
+        refreshed_fable.pricing.input_cost_per_token = 0.000009;
+        refreshed_fable.pricing.output_cost_per_token = 0.000045;
+        refreshed_fable.pricing.cache_creation_input_token_cost = 0.00001125;
+        refreshed_fable.pricing.cache_creation_1h_input_token_cost = 0.000018;
+        refreshed_fable.pricing.cache_read_input_token_cost = 0.00000045;
+        store
+            .save_pricing_status(&refreshed_public_price)
+            .await
+            .unwrap();
+        let after_public_refresh = store.load_pricing_status().await.unwrap().unwrap();
+        let still_manual = after_public_refresh
+            .models
+            .iter()
+            .find(|item| item.model == "claude-fable-5-1")
+            .unwrap();
+        assert_eq!(still_manual.source.as_deref(), Some(MANUAL_PRICING_SOURCE));
+        assert_eq!(still_manual.pricing.input_cost_per_token, 0.00001);
+        assert!(
+            store
+                .delete_manual_model_pricing("claude-fable-5-1")
+                .await
+                .unwrap()
+        );
+        let restored_public_price = store.load_pricing_status().await.unwrap().unwrap();
+        let restored_fable = restored_public_price
+            .models
+            .iter()
+            .find(|item| item.model == "claude-fable-5-1")
+            .unwrap();
+        assert_eq!(restored_fable.source.as_deref(), Some("litellm"));
+        assert_eq!(restored_fable.pricing.input_cost_per_token, 0.000009);
         let loaded_capabilities = store
             .load_model_capabilities_status()
             .await

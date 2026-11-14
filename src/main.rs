@@ -646,6 +646,7 @@ async fn async_main() {
         let pricing_catalog = pricing_catalog.clone();
         let status = model_capabilities.status();
         tokio::spawn(async move {
+            let _pricing_guard = pricing_catalog.mutation_guard().await;
             let capability_models = status.models.into_iter().map(|item| item.model);
             let pricing_status = pricing_catalog.sync_for_models(capability_models).await;
             if let Err(err) = postgres_store.save_pricing_status(&pricing_status).await {

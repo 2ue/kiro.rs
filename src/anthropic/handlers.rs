@@ -3376,6 +3376,14 @@ struct StreamCompletionObservability<'a> {
 }
 
 impl RequestUsageContext {
+    fn pricing_model(&self) -> &str {
+        request_pricing_model(
+            &self.model,
+            self.upstream_model.as_deref(),
+            self.display_identity.as_ref(),
+        )
+    }
+
     /// Forced model mapping: downstream input follows the client's request, before the identity
     /// card, knowledge and context backoff were applied, so the client sees the same context growth
     /// as with the model it asked for and compacts at the same point. Cache reads and writes keep
@@ -4254,6 +4262,17 @@ impl RequestUsageContext {
     }
 }
 
+fn request_pricing_model<'a>(
+    model: &'a str,
+    upstream_model: Option<&'a str>,
+    display_identity: Option<&'a super::identity_guard::DisplayIdentity>,
+) -> &'a str {
+    display_identity
+        .map(|identity| identity.id.as_str())
+        .or(upstream_model)
+        .unwrap_or(model)
+}
+
 fn is_first_token_output_event(event: &SseEvent) -> bool {
     if is_visible_text_delta_output_event(event) || is_thinking_delta_output_event(event) {
         return true;
@@ -4854,7 +4873,10 @@ impl CredentialUsageContext {
             ),
             None => amplified,
         };
-        let pricing = self.request.pricing_catalog.model_pricing(model);
+        let pricing = self
+            .request
+            .pricing_catalog
+            .model_pricing(self.request.pricing_model());
         let shaped = shaper.finalize(amplified, controlled, pricing, raw_usage);
         if let Some(config) = frequency.filter(|_| commit) {
             controller.record_final_creation_adjustment(
@@ -4940,7 +4962,7 @@ impl CredentialUsageContext {
             pricing: self
                 .request
                 .pricing_catalog
-                .model_pricing(self.creation_control_model()),
+                .model_pricing(self.request.pricing_model()),
             input_max_tokens: reported_policy
                 .map(|policy| policy.reported_input_max_tokens())
                 .unwrap_or(0),
@@ -4960,7 +4982,7 @@ impl CredentialUsageContext {
                     scope.as_ref(),
                     config,
                     credential_key.as_deref(),
-                    Some(self.creation_control_model()),
+                    Some(self.request.pricing_model()),
                 ),
             seed: self.request.cache_hit_shaping.seed,
         }
@@ -4986,7 +5008,7 @@ impl CredentialUsageContext {
                 scope.as_ref(),
                 self.request.prompt_cache_creation_control,
                 credential_key.as_deref(),
-                Some(self.creation_control_model()),
+                Some(self.request.pricing_model()),
                 floor_usd,
                 pricing.estimate(final_usage),
             );
@@ -5079,7 +5101,7 @@ impl CredentialUsageContext {
                 pricing: self
                     .request
                     .pricing_catalog
-                    .model_pricing(self.creation_control_model()),
+                    .model_pricing(self.request.pricing_model()),
                 reported_policy: reported_policy.as_ref(),
             },
         )
@@ -5646,22 +5668,13 @@ impl CredentialUsageContext {
         kiro_metering_usage: Option<f64>,
     ) {
         let standard_usage = standard_usage_for_status(status, usage);
-        let pricing = self.request.pricing_catalog.estimate(
-            self.request
-                .upstream_model
-                .as_deref()
-                .unwrap_or(&self.request.model),
-            standard_usage,
-        );
-        let original_pricing = raw_usage.map(|usage| {
-            self.request.pricing_catalog.estimate(
-                self.request
-                    .upstream_model
-                    .as_deref()
-                    .unwrap_or(&self.request.model),
-                usage,
-            )
-        });
+        let pricing_model = self.request.pricing_model();
+        let pricing = self
+            .request
+            .pricing_catalog
+            .estimate(pricing_model, standard_usage);
+        let original_pricing =
+            raw_usage.map(|usage| self.request.pricing_catalog.estimate(pricing_model, usage));
         let include_payload_diagnostics =
             should_persist_payload_diagnostics(status, self.request.payload_guard_report.as_ref());
         let payload_breakdown = if include_payload_diagnostics {
@@ -6980,6 +6993,8 @@ struct ProviderErrorContext<'a> {
     context_window_tokens: i32,
     /// Model id exactly as the client requested it.
     requested_model: Option<&'a str>,
+    /// Forced mapping target, used only to redact upstream model names from public errors.
+    served_model: Option<&'a str>,
     /// Forced model mapping: the client asked for a model with a larger window. An input-too-long
     /// rejection left after server-side backoff is reported as a transient overload, never as
     /// `prompt is too long` (which would reveal the serving window).
@@ -7046,8 +7061,16 @@ fn map_provider_error(
     match prompt_context.filter(|context| context.forced) {
         Some(ProviderErrorContext {
             requested_model: Some(display_model),
+            served_model,
             ..
-        }) => super::forced_model::conceal_target_model_in_response(response, display_model),
+        }) => match served_model {
+            Some(served_model) => super::forced_model::conceal_served_model_in_response(
+                response,
+                Some(served_model),
+                display_model,
+            ),
+            None => super::forced_model::conceal_target_model_in_response(response, display_model),
+        },
         _ => response,
     }
 }
@@ -9943,6 +9966,7 @@ async fn call_non_stream_local_rescue_after_external_error(
 #[derive(Clone)]
 struct StreamContextTemplate {
     model: String,
+    served_model: Option<String>,
     input_tokens: i32,
     context_window_tokens: i32,
     thinking_enabled: bool,
@@ -9990,6 +10014,7 @@ impl StreamContextTemplate {
         ctx.set_suppress_context_window_exceeded(
             credential_usage.request.display_identity.is_some(),
         );
+        ctx.set_served_model(self.served_model.clone());
         ctx.set_interleaved_text_as_thinking(credential_usage.request.interleaved_text_as_thinking);
 
         ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
@@ -10047,7 +10072,7 @@ impl CredentialUsageContext {
                 pricing: self
                     .request
                     .pricing_catalog
-                    .model_pricing(self.creation_control_model()),
+                    .model_pricing(self.request.pricing_model()),
                 reported_policy: reported_policy.as_ref(),
             },
         );
@@ -10256,10 +10281,12 @@ async fn handle_stream_request(
     stream_max_duration_secs: u64,
 ) -> Response {
     let requested_model = usage_context.model.clone();
+    let served_model = usage_context.upstream_model.clone();
     let prompt_too_long_context = ProviderErrorContext {
         estimated_input_tokens: input_tokens,
         context_window_tokens,
         requested_model: Some(requested_model.as_str()),
+        served_model: served_model.as_deref(),
         forced: usage_context.display_identity.is_some(),
     };
     // 调用 Kiro API（支持多凭据故障转移）
@@ -10859,6 +10886,7 @@ async fn handle_stream_request(
     let context_template = StreamContextTemplate {
         // The response reports the client's model; `model` is the dispatch model.
         model: credential_usage.request.model.clone(),
+        served_model: credential_usage.request.upstream_model.clone(),
         // message_start reports the client's input under a forced mapping, like the final usage.
         input_tokens: credential_usage
             .request
@@ -13773,10 +13801,12 @@ async fn handle_non_stream_request(
     capacity_weight_units: u32,
 ) -> Response {
     let requested_model = usage_context.model.clone();
+    let served_model = usage_context.upstream_model.clone();
     let prompt_too_long_context = ProviderErrorContext {
         estimated_input_tokens: input_tokens,
         context_window_tokens: usage_context.context_window_tokens,
         requested_model: Some(requested_model.as_str()),
+        served_model: served_model.as_deref(),
         forced: usage_context.display_identity.is_some(),
     };
     // 调用 Kiro API（支持多凭据故障转移）

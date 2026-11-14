@@ -28,7 +28,8 @@ use super::{
         SyncProfileArnRequest, SyncSubscriptionModelListRequest, SystemVersionResponse,
         TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
         UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
+        UpsertManualModelPriceRequest, UpsertManualModelRequest, UsageCleanupRequest,
+        UsageCleanupResumeRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -1557,6 +1558,29 @@ pub async fn delete_manual_model(
     Path(model): Path<String>,
 ) -> impl IntoResponse {
     match state.service.delete_manual_model(model).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/model-pricing/manual
+/// 独立维护任意 Claude/Kiro/公开模型的手动价格覆盖。
+pub async fn upsert_manual_model_price(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpsertManualModelPriceRequest>,
+) -> impl IntoResponse {
+    match state.service.upsert_manual_model_price(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/model-pricing/manual/:model
+pub async fn delete_manual_model_price(
+    State(state): State<AdminState>,
+    Path(model): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_manual_model_price(model).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

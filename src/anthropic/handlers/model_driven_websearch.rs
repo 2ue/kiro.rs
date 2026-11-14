@@ -806,6 +806,7 @@ async fn call_model(
             Some(ctx.provider.as_ref()),
             Some(ProviderErrorContext {
                 requested_model: Some(ctx.display_model.as_str()),
+                served_model: ctx.model_resolution.upstream_model.as_deref(),
                 forced: ctx.model_resolution.forced.is_some(),
                 ..Default::default()
             }),

@@ -10,6 +10,7 @@ import type {
   SyncModelCapabilitiesRequest,
   ManualModelResponse,
   ModelPricingStatus,
+  UpsertManualModelPriceRequest,
   UpsertManualModelRequest,
   UsageDashboardResponse,
   UsageDashboardAccountsResponse,
@@ -257,6 +258,16 @@ export async function getModelPricing(): Promise<ModelPricingStatus> {
 
 export async function syncModelPricing(): Promise<ModelPricingStatus> {
   const { data } = await api.post<ModelPricingStatus>('/model-pricing/sync')
+  return data
+}
+
+export async function upsertManualModelPrice(payload: UpsertManualModelPriceRequest): Promise<ManualModelResponse> {
+  const { data } = await api.post<ManualModelResponse>('/model-pricing/manual', payload)
+  return data
+}
+
+export async function deleteManualModelPrice(model: string): Promise<ManualModelResponse> {
+  const { data } = await api.delete<ManualModelResponse>(`/model-pricing/manual/${encodeURIComponent(model)}`)
   return data
 }
 

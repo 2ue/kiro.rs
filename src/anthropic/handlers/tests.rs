@@ -1178,6 +1178,7 @@ fn prompt_too_long_messages_use_claude_code_protocol_prefix() {
         estimated_input_tokens: 210_000,
         context_window_tokens: 200_000,
         requested_model: None,
+        served_model: None,
         forced: false,
     };
     assert_eq!(
@@ -1188,6 +1189,7 @@ fn prompt_too_long_messages_use_claude_code_protocol_prefix() {
         estimated_input_tokens: 150_000,
         context_window_tokens: 200_000,
         requested_model: None,
+        served_model: None,
         forced: false,
     };
     for (context, window_full) in [
@@ -1203,6 +1205,39 @@ fn prompt_too_long_messages_use_claude_code_protocol_prefix() {
             "no invented figures: {message}"
         );
     }
+}
+
+#[test]
+fn forced_mapping_billing_uses_the_requested_claude_code_model() {
+    let identity = super::super::identity_guard::DisplayIdentity {
+        name: "Claude Sonnet 4.5".to_string(),
+        id: "claude-sonnet-4-5".to_string(),
+        exempt_rules: Vec::new(),
+        prefers_zh: false,
+    };
+    let billing_model = request_pricing_model(
+        "external-sonnet-alias",
+        Some("claude-haiku-4-5"),
+        Some(&identity),
+    );
+    let usage = CacheUsage {
+        total_input_tokens: 100,
+        input_tokens: 100,
+        output_tokens: 100,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    };
+    let catalog = PricingCatalog::new();
+
+    let billed = catalog.estimate(billing_model, usage);
+    let requested = catalog.estimate("claude-sonnet-4-5", usage);
+    let served = catalog.estimate("claude-haiku-4-5", usage);
+
+    assert_eq!(billing_model, "claude-sonnet-4-5");
+    assert_eq!(billed.cost_usd, requested.cost_usd);
+    assert_ne!(billed.cost_usd, served.cost_usd);
 }
 
 #[tokio::test]
@@ -1227,6 +1262,7 @@ async fn upstream_too_long_errors_map_to_prompt_is_too_long_for_five_rounds() {
                     estimated_input_tokens: 250_000,
                     context_window_tokens: 200_000,
                     requested_model: None,
+                    served_model: None,
                     forced: false,
                 }),
             );

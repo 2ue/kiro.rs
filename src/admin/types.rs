@@ -2316,28 +2316,27 @@ impl ManualModelPricingRequest {
     pub fn to_pricing(&self) -> Option<ModelPricing> {
         let input = cost_per_token(self.input_cost_per_million)?;
         let output = cost_per_token(self.output_cost_per_million)?;
-        let cache_creation = self
-            .cache_creation_input_cost_per_million
-            .and_then(cost_per_token)
-            .unwrap_or(input * 1.25);
-        let cache_read = self
-            .cache_read_input_cost_per_million
-            .and_then(cost_per_token)
-            .unwrap_or(input * 0.1);
-        let cache_creation_1h = self
-            .cache_creation_1h_input_cost_per_million
-            .and_then(cost_per_token)
-            .unwrap_or(0.0);
-        Some(
-            ModelPricing {
-                input_cost_per_token: input,
-                output_cost_per_token: output,
-                cache_creation_input_token_cost: cache_creation,
-                cache_creation_1h_input_token_cost: cache_creation_1h,
-                cache_read_input_token_cost: cache_read,
-            }
-            .with_derived_cache_creation_1h_cost(),
-        )
+        let cache_creation = match self.cache_creation_input_cost_per_million {
+            Some(value) => cost_per_token(value)?,
+            None => input * 1.25,
+        };
+        let cache_read = match self.cache_read_input_cost_per_million {
+            Some(value) => cost_per_token(value)?,
+            None => input * 0.1,
+        };
+        let cache_creation_1h = match self.cache_creation_1h_input_cost_per_million {
+            Some(value) => cost_per_token(value)?,
+            None => 0.0,
+        };
+        let pricing = ModelPricing {
+            input_cost_per_token: input,
+            output_cost_per_token: output,
+            cache_creation_input_token_cost: cache_creation,
+            cache_creation_1h_input_token_cost: cache_creation_1h,
+            cache_read_input_token_cost: cache_read,
+        }
+        .with_derived_cache_creation_1h_cost();
+        pricing.is_usable().then_some(pricing)
     }
 }
 
@@ -2363,6 +2362,13 @@ pub struct UpsertManualModelRequest {
     pub clear_pricing: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertManualModelPriceRequest {
+    pub model: String,
+    pub pricing: ManualModelPricingRequest,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualModelResponse {
@@ -2382,7 +2388,7 @@ impl ManualModelResponse {
 }
 
 fn cost_per_token(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value.max(0.0) / 1_000_000.0)
+    (value.is_finite() && value >= 0.0).then_some(value / 1_000_000.0)
 }
 
 // ============ 通用响应 ============
@@ -2450,6 +2456,70 @@ impl AdminErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_model_pricing_rejects_negative_or_non_finite_optional_rates() {
+        let valid = ManualModelPricingRequest {
+            input_cost_per_million: 1.0,
+            output_cost_per_million: 2.0,
+            cache_creation_input_cost_per_million: None,
+            cache_creation_1h_input_cost_per_million: None,
+            cache_read_input_cost_per_million: None,
+        };
+        assert!(valid.to_pricing().is_some());
+
+        assert!(
+            ManualModelPricingRequest {
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                ..valid.clone()
+            }
+            .to_pricing()
+            .is_none()
+        );
+
+        for invalid_rate in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                ManualModelPricingRequest {
+                    input_cost_per_million: invalid_rate,
+                    ..valid.clone()
+                }
+                .to_pricing()
+                .is_none()
+            );
+            assert!(
+                ManualModelPricingRequest {
+                    output_cost_per_million: invalid_rate,
+                    ..valid.clone()
+                }
+                .to_pricing()
+                .is_none()
+            );
+        }
+
+        for invalid_rate in [-1.0, f64::NAN, f64::INFINITY] {
+            for field in 0..3 {
+                let request = ManualModelPricingRequest {
+                    cache_creation_input_cost_per_million: (field == 0).then_some(invalid_rate),
+                    cache_creation_1h_input_cost_per_million: (field == 1).then_some(invalid_rate),
+                    cache_read_input_cost_per_million: (field == 2).then_some(invalid_rate),
+                    ..valid.clone()
+                };
+                assert!(
+                    request.to_pricing().is_none(),
+                    "field={field}, rate={invalid_rate}"
+                );
+            }
+        }
+
+        let zero_one_hour = ManualModelPricingRequest {
+            cache_creation_1h_input_cost_per_million: Some(0.0),
+            ..valid
+        }
+        .to_pricing()
+        .unwrap();
+        assert_eq!(zero_one_hour.cache_creation_1h_input_token_cost, 0.000002);
+    }
 
     #[test]
     fn add_credential_request_accepts_snake_case_import_fields() {

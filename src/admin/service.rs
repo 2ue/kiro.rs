@@ -42,9 +42,10 @@ use super::types::{
     SyncProfileArnRequest, SyncSubscriptionModelListRequest, TestCredentialRequest,
     TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest,
     UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
-    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupResumeRequest,
-    UsageCleanupStatusResponse, UsageDashboardAccountItem, UsageDashboardAccountsResponse,
+    UpdateRuntimeConfigRequest, UpsertManualModelPriceRequest, UpsertManualModelRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupResumeRequest, UsageCleanupStatusResponse, UsageDashboardAccountItem,
+    UsageDashboardAccountsResponse,
 };
 use crate::anthropic::request_key_limits::{
     KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
@@ -5574,21 +5575,29 @@ impl AdminService {
 
     /// 获取模型价格同步状态。
     pub fn get_model_pricing(&self) -> PricingStatus {
-        self.pricing_catalog.status()
-    }
-
-    /// 手动同步模型价格。失败不影响调度，只体现在返回状态的 last_error。
-    pub async fn sync_model_pricing(&self) -> PricingStatus {
         let capability_models = self
             .model_capabilities
             .status()
             .models
             .into_iter()
             .map(|item| item.model);
-        let mut status = self
-            .pricing_catalog
-            .sync_for_models(capability_models)
+        self.pricing_catalog.status_for_models(capability_models)
+    }
+
+    /// 手动同步模型价格。失败不影响调度，只体现在返回状态的 last_error。
+    pub async fn sync_model_pricing(&self) -> PricingStatus {
+        let _pricing_guard = self.pricing_catalog.mutation_guard().await;
+        let capability_models = self
+            .model_capabilities
+            .status()
+            .models
+            .into_iter()
+            .map(|item| item.model)
+            .collect::<Vec<_>>();
+        self.pricing_catalog
+            .sync_for_models(capability_models.iter().cloned())
             .await;
+        let mut status = self.pricing_catalog.status_for_models(capability_models);
         if let Err(err) = self.postgres_store.save_pricing_status(&status).await {
             tracing::warn!("保存手动同步后的模型价格到 PgSQL 失败: {}", err);
             if status.last_error.is_none() {
@@ -5754,11 +5763,12 @@ impl AdminService {
         status
     }
 
-    /// 添加或更新手动模型补充。手动项参与模型解析和可选计价；后续上游同步同名模型会覆盖手动来源。
+    /// 添加或更新手动模型补充。手动项参与模型解析和可选计价。
     pub async fn upsert_manual_model(
         &self,
         req: UpsertManualModelRequest,
     ) -> Result<ManualModelResponse, AdminServiceError> {
+        let _pricing_guard = self.pricing_catalog.mutation_guard().await;
         let item = manual_model_item_from_request(req.clone())?;
         let clear_pricing = req.clear_pricing;
         let pricing = req
@@ -5809,6 +5819,7 @@ impl AdminService {
         &self,
         model: String,
     ) -> Result<ManualModelResponse, AdminServiceError> {
+        let _pricing_guard = self.pricing_catalog.mutation_guard().await;
         let model = normalize_model_id(&model);
         validate_manual_model_id(&model)?;
         let removed = self
@@ -5818,14 +5829,14 @@ impl AdminService {
             .map_err(|err| {
                 AdminServiceError::InternalError(format!("删除手动模型失败: {}", err))
             })?;
-        self.model_capabilities.delete_manual_model(&model);
-        self.pricing_catalog.delete_manual_price(&model);
         if !removed {
             return Err(AdminServiceError::InvalidCredential(format!(
                 "手动模型不存在或该模型不是手动添加: {}",
                 model
             )));
         }
+        self.model_capabilities.delete_manual_model(&model);
+        self.pricing_catalog.delete_manual_price(&model);
         self.audit(
             "delete_manual_model",
             "model_capabilities",
@@ -5835,6 +5846,71 @@ impl AdminService {
             json!({ "model": model, "source": MANUAL_SOURCE }),
         );
         Ok(ManualModelResponse::new(model, "手动模型已删除"))
+    }
+
+    pub async fn upsert_manual_model_price(
+        &self,
+        req: UpsertManualModelPriceRequest,
+    ) -> Result<ManualModelResponse, AdminServiceError> {
+        let _pricing_guard = self.pricing_catalog.mutation_guard().await;
+        let model = normalize_model_id(&req.model);
+        validate_manual_model_id(&model)?;
+        let pricing = req.pricing.to_pricing().ok_or_else(|| {
+            AdminServiceError::InvalidCredential("模型价格必须是有效的非负数字".to_string())
+        })?;
+        if !pricing.is_usable() {
+            return Err(AdminServiceError::InvalidCredential(
+                "输入价和输出价不能同时为 0".to_string(),
+            ));
+        }
+        self.postgres_store
+            .save_manual_model_pricing(&model, pricing)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InternalError(format!("保存模型价格失败: {}", err))
+            })?;
+        self.pricing_catalog.upsert_manual_price(&model, pricing);
+        self.audit(
+            "upsert_manual_model_price",
+            "model_pricing",
+            Some(model.clone()),
+            true,
+            None,
+            json!({ "model": model, "source": crate::anthropic::pricing::MANUAL_PRICING_SOURCE }),
+        );
+        Ok(ManualModelResponse::new(model, "模型价格已保存"))
+    }
+
+    pub async fn delete_manual_model_price(
+        &self,
+        model: String,
+    ) -> Result<ManualModelResponse, AdminServiceError> {
+        let _pricing_guard = self.pricing_catalog.mutation_guard().await;
+        let model = normalize_model_id(&model);
+        validate_manual_model_id(&model)?;
+        let removed = self
+            .postgres_store
+            .delete_manual_model_pricing(&model)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InternalError(format!("删除模型价格失败: {}", err))
+            })?;
+        self.pricing_catalog.delete_manual_price(&model);
+        if !removed {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "手动价格不存在或该模型不是手动价格: {}",
+                model
+            )));
+        }
+        self.audit(
+            "delete_manual_model_price",
+            "model_pricing",
+            Some(model.clone()),
+            true,
+            None,
+            json!({ "model": model, "source": crate::anthropic::pricing::MANUAL_PRICING_SOURCE }),
+        );
+        Ok(ManualModelResponse::new(model, "模型价格已删除"))
     }
 
     /// 订阅等级模型列表：每个已知等级一行，附带该等级的账号数。

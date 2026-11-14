@@ -4,6 +4,7 @@ import {
   clearUsageRecords,
   cancelUsageCleanup,
   deleteManualModel,
+  deleteManualModelPrice,
   getAccountEventSummary,
   getAuditLogsPage,
   getUsageCleanupStatus,
@@ -37,6 +38,7 @@ import {
   setSubscriptionModelList,
   syncModelCapabilities,
   syncModelPricing,
+  upsertManualModelPrice,
   syncSubscriptionModelList,
   upsertManualModel,
 } from '@/api/usage'
@@ -408,6 +410,22 @@ export function useSyncModelPricing() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: syncModelPricing,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['model-pricing'] }),
+  })
+}
+
+export function useUpsertManualModelPrice() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: upsertManualModelPrice,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['model-pricing'] }),
+  })
+}
+
+export function useDeleteManualModelPrice() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: deleteManualModelPrice,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['model-pricing'] }),
   })
 }

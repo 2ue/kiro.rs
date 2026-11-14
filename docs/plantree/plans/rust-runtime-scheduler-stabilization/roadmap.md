@@ -1,8 +1,19 @@
 # Roadmap
 
-Last reviewed: 2026-11-11 Asia/Shanghai
+Last reviewed: 2026-11-14 Asia/Shanghai
 
 ## Done
+
+- Model catalog and pricing source separation: Kiro capability discovery remains independent
+  from Claude/LiteLLM pricing; base prices and manual overrides persist in separate tables,
+  legacy manual rows migrate idempotently, and deleting an override restores the latest base
+  price. Admin exposes dynamic Kiro models without exact prices and a separate manual pricing
+  workflow. On 2026-11-15, pricing `24/24`, isolated PostgreSQL migration/persistence/schema
+  `3/3`, default and no-default Rust suites each `3206 passed / 18 ignored`, Clippy baseline,
+  release build, artifact inventory, formatting and UI production build passed. The Claude CLI
+  smoke reached the designated local service but was rejected with `401 Invalid API key`, so
+  live model response behavior remains unverified. See
+  [model catalog and pricing sources](topics/model-catalog-and-pricing-sources.md).
 
 - Per-request API Key admission management: managed Key list and per-Key RPM,
   concurrency, queue size and timeout now use digest-keyed independent admission

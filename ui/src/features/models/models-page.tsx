@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -43,14 +44,16 @@ import { formatNumber } from '@/lib/format'
 import { credentialSubscriptionLabel } from '@/features/credentials/credential-utils'
 import {
   useDeleteManualModel,
+  useDeleteManualModelPrice,
   useModelCapabilities,
   useModelPricing,
   useSyncModelCapabilities,
   useSyncModelPricing,
   useUpsertManualModel,
+  useUpsertManualModelPrice,
 } from '@/hooks/use-usage'
 import { useCredentialList } from '@/hooks/use-credentials'
-import type { ModelCapabilityItem, ModelPriceItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
+import type { ModelCapabilityItem, ModelPriceItem, ModelPricing, UpsertManualModelPriceRequest, UpsertManualModelRequest } from '@/types/api'
 import { SubscriptionModelListsSection } from './subscription-model-lists'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
@@ -74,7 +77,7 @@ function formatUsdPerM(perToken?: number): string {
 function sourceLabel(source?: string): string {
   if (!source) return '同步'
   if (source === 'manual') return '手动'
-  if (source === 'built-in') return '内置'
+  if (source === 'built-in') return 'Claude API 基线'
   if (source === 'litellm') return '价格源'
   return source
 }
@@ -95,11 +98,11 @@ function addModelKeyAliases(model: string, target: Set<string>) {
     target.add(normalized.slice(slashIndex + 1))
   }
   for (const value of Array.from(target)) {
-    const dotVersion = value.match(/^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)(-.+)?$/)
+    const dotVersion = value.match(/^(claude-(?:opus|sonnet|haiku|fable|mythos)-\d+)-(\d+)(-.+)?$/)
     if (dotVersion) {
       target.add(`${dotVersion[1]}.${dotVersion[2]}${dotVersion[3] ?? ''}`)
     }
-    const dashVersion = value.match(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)(-.+)?$/)
+    const dashVersion = value.match(/^(claude-(?:opus|sonnet|haiku|fable|mythos)-\d+)\.(\d+)(-.+)?$/)
     if (dashVersion) {
       target.add(`${dashVersion[1]}-${dashVersion[2]}${dashVersion[3] ?? ''}`)
     }
@@ -116,7 +119,10 @@ function pricingIndex(items: ModelPriceItem[]): Map<string, ModelPriceItem> {
   const map = new Map<string, ModelPriceItem>()
   for (const item of items) {
     for (const alias of modelKeyAliases(item.model)) {
-      if (!map.has(alias)) map.set(alias, item)
+      const existing = map.get(alias)
+      if (!existing || (item.source === 'manual' && existing.source !== 'manual')) {
+        map.set(alias, item)
+      }
     }
   }
   return map
@@ -424,11 +430,14 @@ export function ModelsPage() {
   const syncCap = useSyncModelCapabilities()
   const syncPrice = useSyncModelPricing()
   const deleteModel = useDeleteManualModel()
+  const upsertPrice = useUpsertManualModelPrice()
+  const deletePrice = useDeleteManualModelPrice()
   const confirm = useConfirm()
 
   const [editTarget, setEditTarget] = useState<ModelCapabilityItem | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [syncOpen, setSyncOpen] = useState(false)
+  const [priceDialogModel, setPriceDialogModel] = useState<string | null>(null)
 
   const models = capabilities.data?.models ?? []
   const priceIndex = useMemo(() => pricingIndex(pricing.data?.models ?? []), [pricing.data?.models])
@@ -443,6 +452,20 @@ export function ModelsPage() {
     if (!ok) return
     deleteModel.mutate(item.model, {
       onSuccess: () => toast.success(`已删除模型 ${item.model}`),
+      onError: (e) => toast.error(`删除失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  const handleDeletePrice = async (item: ModelPriceItem) => {
+    const ok = await confirm({
+      title: '删除手动价格',
+      message: `确定删除 ${item.model} 的手动价格覆盖？删除后将回退到公开价格或内置价格。`,
+      confirmText: '删除',
+      tone: 'danger',
+    })
+    if (!ok) return
+    deletePrice.mutate(item.model, {
+      onSuccess: () => toast.success(`已删除 ${item.model} 的手动价格`),
       onError: (e) => toast.error(`删除失败: ${extractErrorMessage(e)}`),
     })
   }
@@ -476,13 +499,16 @@ export function ModelsPage() {
               disabled={syncPrice.isPending}
               onClick={() =>
                 syncPrice.mutate(undefined, {
-                  onSuccess: () => toast.success('价格目录已同步'),
+                  onSuccess: (status) =>
+                    status.lastError
+                      ? toast.warning(`价格同步失败，继续使用当前价格: ${status.lastError}`)
+                      : toast.success('价格目录已同步'),
                   onError: (e) => toast.error(`同步失败: ${extractErrorMessage(e)}`),
                 })
               }
             >
               {syncPrice.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
-              同步价格
+              同步公开价格
             </Button>
             <Button size="sm" onClick={() => setAddOpen(true)}>
               <Plus className="h-4 w-4" />
@@ -526,6 +552,16 @@ export function ModelsPage() {
                 {pricing.data.lastError}
               </div>
             )}
+            {(pricing.data?.unpricedModels?.length ?? 0) > 0 && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/30 bg-warning/5 p-2 text-xs text-warning">
+                <span>未配置价格</span>
+                {pricing.data?.unpricedModels.map((model) => (
+                  <Button key={model} variant="outline" size="xs" onClick={() => setPriceDialogModel(model)}>
+                    {model}
+                  </Button>
+                ))}
+              </div>
+            )}
           </div>
         </SectionCard>
       </div>
@@ -533,7 +569,12 @@ export function ModelsPage() {
       {/* 模型能力清单 */}
       <SectionCard
         title="模型价格目录"
-        description={pricing.data?.sourceUrl || '同步后展示当前可用于计费和成本估算的模型价格'}
+        description="Claude API 规范价格与公开价格源的生效结果；手动覆盖优先级最高"
+        actions={
+          <Button size="sm" variant="outline" onClick={() => setPriceDialogModel('')}>
+            <Plus className="h-4 w-4" />添加价格
+          </Button>
+        }
         noPadding
       >
         {pricing.isLoading ? (
@@ -544,7 +585,7 @@ export function ModelsPage() {
           <EmptyState title="暂无价格数据" description="点击「同步价格」获取模型价格目录" />
         ) : (
           <div className="scrollbar-thin overflow-x-auto">
-            <Table className="min-w-[960px]">
+            <Table className="min-w-[1020px]">
               <TableHeader>
                 <TableRow>
                   <TableHead>模型 ID</TableHead>
@@ -554,6 +595,7 @@ export function ModelsPage() {
                   <TableHead className="text-right">缓存写入 5 分钟/M</TableHead>
                   <TableHead className="text-right">缓存写入 1 小时/M</TableHead>
                   <TableHead className="text-right">缓存读取/M</TableHead>
+                  <TableHead className="w-20" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -570,6 +612,25 @@ export function ModelsPage() {
                     <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.cacheCreationInputTokenCost)}</TableCell>
                     <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.cacheCreation1hInputTokenCost)}</TableCell>
                     <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.cacheReadInputTokenCost)}</TableCell>
+                    <TableCell>
+                      <div className="flex items-center justify-end gap-1">
+                        <Button variant="ghost" size="xs" title="编辑价格" onClick={() => setPriceDialogModel(item.model)}>
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                        {item.source === 'manual' && (
+                          <Button
+                            variant="ghost"
+                            size="xs"
+                            className="text-destructive hover:text-destructive"
+                            title="删除手动价格"
+                            disabled={deletePrice.isPending}
+                            onClick={() => void handleDeletePrice(item)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                      </div>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -714,6 +775,21 @@ export function ModelsPage() {
         />
       )}
       <SyncCapabilitiesDialog open={syncOpen} onClose={() => setSyncOpen(false)} />
+      {priceDialogModel !== null && (
+        <EditModelPriceDialog
+          initialModel={priceDialogModel}
+          initialPricing={priceDialogModel ? findPricing(priceIndex, priceDialogModel)?.pricing : undefined}
+          pending={upsertPrice.isPending}
+          onClose={() => setPriceDialogModel(null)}
+          onSave={(payload) => upsertPrice.mutate(payload, {
+            onSuccess: () => {
+              toast.success(`已保存 ${payload.model} 的价格`)
+              setPriceDialogModel(null)
+            },
+            onError: (error) => toast.error(`保存失败: ${extractErrorMessage(error)}`),
+          })}
+        />
+      )}
     </PageContainer>
   )
 }
@@ -929,5 +1005,116 @@ function EditModelDialog({ open, initial, initialPricing, onClose }: EditModelDi
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+interface EditModelPriceDialogProps {
+  initialModel: string
+  initialPricing?: ModelPricing
+  pending: boolean
+  onClose: () => void
+  onSave: (payload: UpsertManualModelPriceRequest) => void
+}
+
+function EditModelPriceDialog({
+  initialModel,
+  initialPricing,
+  pending,
+  onClose,
+  onSave,
+}: EditModelPriceDialogProps) {
+  const [model, setModel] = useState(initialModel)
+  const [input, setInput] = useState(dollarsPerMillion(initialPricing?.inputCostPerToken))
+  const [output, setOutput] = useState(dollarsPerMillion(initialPricing?.outputCostPerToken))
+  const [cache5m, setCache5m] = useState(dollarsPerMillion(initialPricing?.cacheCreationInputTokenCost))
+  const [cache1h, setCache1h] = useState(dollarsPerMillion(initialPricing?.cacheCreation1hInputTokenCost))
+  const [cacheRead, setCacheRead] = useState(dollarsPerMillion(initialPricing?.cacheReadInputTokenCost))
+
+  const handleSave = () => {
+    const modelId = model.trim().toLowerCase()
+    const values = [input, output, cache5m, cache1h, cacheRead].map(optionalNumber)
+    const [inputPrice, outputPrice, cache5mPrice, cache1hPrice, cacheReadPrice] = values
+    if (!modelId) return toast.error('模型 ID 不能为空')
+    if (
+      inputPrice === undefined || outputPrice === undefined ||
+      values.some((value) => value !== undefined && (!Number.isFinite(value) || value < 0)) ||
+      (inputPrice === 0 && outputPrice === 0)
+    ) {
+      return toast.error('输入价和输出价必须填写有效价格，且不能同时为 0')
+    }
+    onSave({
+      model: modelId,
+      pricing: {
+        inputCostPerMillion: inputPrice,
+        outputCostPerMillion: outputPrice,
+        cacheCreationInputCostPerMillion: cache5mPrice,
+        cacheCreation1hInputCostPerMillion: cache1hPrice,
+        cacheReadInputCostPerMillion: cacheReadPrice,
+      },
+    })
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent width="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{initialPricing ? '编辑模型价格' : '添加模型价格'}</DialogTitle>
+        </DialogHeader>
+        <DialogBody className="space-y-4">
+          <div className="space-y-1.5">
+            <Label>模型 ID</Label>
+            <Input
+              value={model}
+              placeholder="claude-fable-5-1"
+              disabled={pending || Boolean(initialModel)}
+              onChange={(event) => setModel(event.target.value)}
+            />
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <PriceInput label="输入 $/M" value={input} pending={pending} onChange={setInput} />
+            <PriceInput label="输出 $/M" value={output} pending={pending} onChange={setOutput} />
+            <PriceInput label="缓存写入 5 分钟 $/M" value={cache5m} pending={pending} placeholder="留空按输入 × 1.25" onChange={setCache5m} />
+            <PriceInput label="缓存写入 1 小时 $/M" value={cache1h} pending={pending} placeholder="留空按输入 × 2" onChange={setCache1h} />
+            <PriceInput label="缓存读取 $/M" value={cacheRead} pending={pending} placeholder="留空按输入 × 0.1" onChange={setCacheRead} />
+          </div>
+        </DialogBody>
+        <DialogFooter>
+          <Button variant="outline" size="sm" onClick={onClose}>取消</Button>
+          <Button size="sm" disabled={pending} onClick={handleSave}>
+            {pending ? <Spinner size="sm" /> : null}
+            保存价格
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function PriceInput({
+  label,
+  value,
+  pending,
+  placeholder,
+  onChange,
+}: {
+  label: string
+  value: string
+  pending: boolean
+  placeholder?: string
+  onChange: (value: string) => void
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label>{label}</Label>
+      <Input
+        type="number"
+        min={0}
+        step="0.000001"
+        value={value}
+        placeholder={placeholder}
+        disabled={pending}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </div>
   )
 }

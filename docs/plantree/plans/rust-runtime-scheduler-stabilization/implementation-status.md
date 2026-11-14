@@ -2,6 +2,13 @@
 
 Last reviewed: 2026-11-11 Asia/Shanghai
 
+## 本次交接：模型目录与价格来源分离（2026-11-15）
+
+- 实现和验证记录见[模型目录与价格来源专题](topics/model-catalog-and-pricing-sources.md)。Kiro 能力目录、Claude/LiteLLM 价格目录、内置基价和手动覆盖现已分开维护；手动价格覆盖优先，删除后恢复基础价格，缺价只在同 Claude 模型系列内回退。
+- 最终本地门禁：价格 `24/24`、手动价格输入 `1/1`、schema guard `2/2`、隔离 PostgreSQL 迁移/持久化/schema `3/3`；默认和无默认特性 Rust 全量测试各 `3206 passed / 18 ignored`，`kiro_loadtest` 各 `31/31`。最后一轮告警修复后，价格、输入校验和 schema guard 定向测试重跑通过。
+- 固定 Rust `1.92.0` 的 Clippy 基线、格式检查、locked release build、UI build 和 release inventory 均通过。Claude CLI `2.1.280` 已连接本地候选服务，但请求收到 `401 Invalid API key`，所以没有可报告的真实模型调用结果。
+- 本轮启动的 `127.0.0.1:19023` 候选服务已退出；隔离 PostgreSQL 容器已移除。工作树中的 `ui/node_modules` 是既有未跟踪目录，不属于本次提交。
+
 ## 当前交接：端点/Region/版本生命周期（2026-11-11）
 
 当前阶段：已实现并完成 FREE 账号真实上游验证，详见 [设计文档 §13](topics/endpoint-rotation-and-client-version-lifecycle.md#13-2026-11-11-真实上游验证矩阵)。

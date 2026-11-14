@@ -39,6 +39,7 @@ Authority:
    - [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md)
    - [端点轮换与 Kiro 客户端版本生命周期设计](topics/endpoint-rotation-and-client-version-lifecycle.md)
    - [导入账号标签属性](topics/credential-import-tags.md)
+   - [模型目录与价格来源](topics/model-catalog-and-pricing-sources.md)
    - [官方 Claude Code / Anthropic 与 Kiro 协议互操作审计](topics/official-claude-code-kiro-protocol-audit-20260928.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Decisions:

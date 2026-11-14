@@ -18,8 +18,8 @@ use super::{
         clear_external_pool_cooldown, clear_usage_records, create_external_pool,
         create_proxy_resource, create_request_api_key, delete_credential,
         delete_disabled_credentials, delete_external_pool, delete_manual_model,
-        delete_proxy_resource, delete_request_api_key, discover_credential_supported_models,
-        discover_external_pool_supported_models,
+        delete_manual_model_price, delete_proxy_resource, delete_request_api_key,
+        discover_credential_supported_models, discover_external_pool_supported_models,
         discover_external_pool_supported_models_from_request, export_credentials,
         force_refresh_token, get_access_keys, get_account_event_summary, get_all_credentials,
         get_audit_logs, get_credential_balance, get_credential_credit_summary,
@@ -52,6 +52,7 @@ use super::{
         test_external_pool, test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
         update_credential_auth, update_external_pool, update_proxy_resource,
         update_request_api_key, update_runtime_config, upsert_manual_model,
+        upsert_manual_model_price,
     },
     inventory::http as inventory_http,
     middleware::{AdminState, admin_auth_middleware},
@@ -370,6 +371,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/model-pricing", get(get_model_pricing))
         .route("/model-pricing/sync", post(sync_model_pricing))
+        .route("/model-pricing/manual", post(upsert_manual_model_price))
+        .route(
+            "/model-pricing/manual/{model}",
+            delete(delete_manual_model_price),
+        )
         .route("/model-capabilities", get(get_model_capabilities))
         .route(
             "/forced-model-mapping/catalog",
