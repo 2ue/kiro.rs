@@ -150,19 +150,6 @@ pub(crate) const DISPLAY_MODEL_SPECS: &[DisplayModelSpec] = &[
         1_790_553_600,
     ),
     spec(
-        "haiku",
-        "Claude Haiku 5.5",
-        "claude-haiku-5-5",
-        M,
-        OUT128,
-        ThinkingDefault::DefaultOn,
-        Some("medium"),
-        true,
-        Some("2026-06"),
-        Some("high"),
-        1_791_331_200,
-    ),
-    spec(
         "fable",
         "Claude Fable 5.1",
         "claude-fable-5-1",
@@ -339,9 +326,9 @@ const ALIAS_SPECS: &[(&str, &str)] = &[
     ("opusplan", "claude-opus-5-5"),
     ("best", "claude-opus-5-5"),
     ("default", "claude-opus-5-5"),
-    ("fable", "claude-fable-5-2"),
+    ("fable", "claude-fable-5-1"),
     ("sonnet", "claude-sonnet-5-5"),
-    ("haiku", "claude-haiku-5-5"),
+    ("haiku", "claude-haiku-4-5"),
     ("auto", "claude-sonnet-5-5"),
 ];
 
@@ -957,6 +944,7 @@ fn asks_about_identity(text: &str) -> bool {
         "亚马逊",
         "谁家的模型",
         "你是谁",
+        "你到底是谁",
         "你是什么",
         "你是哪个",
         "你是哪",
@@ -980,6 +968,7 @@ fn asks_about_identity(text: &str) -> bool {
         "你是claude",
         "你是 gpt",
         "你是gpt",
+        "你到底是不是",
     ];
     EN.iter().any(|needle| lower.contains(needle)) || ZH.iter().any(|needle| lower.contains(needle))
 }
@@ -992,6 +981,7 @@ fn self_description(forced: &ForcedTarget, text: &str) -> String {
         .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
     let window = format_token_count(spec.context_window);
     let output = format_token_count(spec.max_output_tokens);
+    let relationship = identity_relationship_note(spec.canonical_id, zh);
     if zh {
         let cutoff = spec
             .knowledge_cutoff
@@ -1005,8 +995,8 @@ fn self_description(forced: &ForcedTarget, text: &str) -> String {
             })
             .unwrap_or_default();
         format!(
-            "部署信息：本对话由 {}（模型 ID：{}）提供服务，你就是这个模型，由 Anthropic 开发，上下文窗口 {} tokens，单次最多输出 {} tokens{}。被问到型号或 ID 时直接给出。",
-            spec.display_name, spec.canonical_id, window, output, cutoff
+            "部署信息：本对话由 {}（模型 ID：{}）提供服务，你就是这个模型，由 Anthropic 开发，上下文窗口 {} tokens，单次最多输出 {} tokens{}。{}被问到型号或 ID 时直接给出。",
+            spec.display_name, spec.canonical_id, window, output, cutoff, relationship
         )
     } else {
         let cutoff = spec
@@ -1014,9 +1004,25 @@ fn self_description(forced: &ForcedTarget, text: &str) -> String {
             .map(|cutoff| format!(", reliable knowledge through {}", format_cutoff(cutoff)))
             .unwrap_or_default();
         format!(
-            "Deployment info: this conversation is served by {} (model ID: {}); that model is you, made by Anthropic, with a {}-token context window and up to {} output tokens{}. When asked for your model or ID, state them directly.",
-            spec.display_name, spec.canonical_id, window, output, cutoff
+            "Deployment info: this conversation is served by {} (model ID: {}); that model is you, made by Anthropic, with a {}-token context window and up to {} output tokens{}. {}When asked for your model or ID, state them directly.",
+            spec.display_name, spec.canonical_id, window, output, cutoff, relationship
         )
+    }
+}
+
+fn identity_relationship_note(canonical_id: &str, zh: bool) -> &'static str {
+    match (canonical_id, zh) {
+        ("claude-fable-5-1", true) => {
+            "Haiku 是独立的模型系列，最新版本是 Haiku 4.5；Fable 5.1 属于 Claude 5 系列的 Mythos-class 层级，能力明显强于 Haiku 4.5。"
+        }
+        ("claude-fable-5-1", false) => {
+            "Haiku is an independent model series, and Haiku 4.5 is its latest version; Fable 5.1 belongs to the Claude 5 series at the Mythos-class tier and is substantially more capable than Haiku 4.5."
+        }
+        ("claude-haiku-4-5", true) => "Haiku 是独立的模型系列，最新版本是 Haiku 4.5。",
+        ("claude-haiku-4-5", false) => {
+            "Haiku is an independent model series, and Haiku 4.5 is its latest version."
+        }
+        _ => "",
     }
 }
 
@@ -1339,45 +1345,39 @@ fn builtin_knowledge() -> &'static [ForcedKnowledgeEntry] {
         vec![
      entry(
          "lineup-en",
-  &["claude models", "model lineup", "claude lineup", "which claude model", "latest claude", "newest claude", "current claude", "fable 5.2", "mythos 5.2"],
+  &["claude models", "model lineup", "claude lineup", "which claude model", "latest claude", "newest claude", "current claude", "haiku", "latest haiku", "newest haiku", "fable 5.1", "claude-fable-5-1"],
   "en",
-         "As of November 2026, Anthropic's current Claude models are Claude Fable 5.2 (claude-fable-5-2, released November 9, 2026, the most capable widely available model), Claude Opus 5.5 (claude-opus-5-5, September 22, 2026), Claude Sonnet 5.5 (claude-sonnet-5-5, September 28, 2026) and Claude Haiku 5.5 (claude-haiku-5-5, October 7, 2026); Claude Mythos 5.2 is available by application. All of them have a 1M-token context window and up to 128K output tokens. Legacy models still offered are Fable 5.1, Fable 5, Opus 5, Sonnet 5, Opus 4.8, Opus 4.7, Sonnet 4.6, Opus 4.6, Opus 4.5 and Haiku 4.5; Sonnet 4.5 is deprecated and retires on November 30, 2026.",
+         "Confirmed model relationship: Haiku is an independent model series, and Haiku 4.5 is its latest version. Claude Fable 5.1 (claude-fable-5-1) belongs to the Claude 5 series at the Mythos-class tier and is substantially more capable than Haiku 4.5. Do not describe Haiku as a Fable or Mythos model, and do not infer a newer Haiku version from unverified model names.",
      ),
      entry(
          "lineup-zh",
-  &["claude 模型", "claude模型", "模型阵容", "最新的claude", "最新 claude", "最新的 claude", "有哪些模型", "哪些 claude", "fable 5.2", "mythos 5.2"],
+  &["claude 模型", "claude模型", "模型阵容", "最新的claude", "最新 claude", "最新的 claude", "有哪些模型", "哪些 claude", "haiku", "最新 haiku", "fable 5.1", "claude-fable-5-1"],
          "zh",
-  "截至 2026 年 11 月，Anthropic 当前的 Claude 模型有：Claude Fable 5.2（claude-fable-5-2，2026 年 11 月 9 日发布，公开可用模型中能力最强）、Claude Opus 5.5（claude-opus-5-5，2026 年 9 月 22 日）、Claude Sonnet 5.5（claude-sonnet-5-5，2026 年 9 月 28 日）和 Claude Haiku 5.5（claude-haiku-5-5，2026 年 10 月 7 日）；Claude Mythos 5.2 需要申请使用。它们的上下文窗口都是 100 万 tokens，单次输出最多 128K。仍在提供的旧版模型有 Fable 5.1、Fable 5、Opus 5、Sonnet 5、Opus 4.8、Opus 4.7、Sonnet 4.6、Opus 4.6、Opus 4.5 和 Haiku 4.5；Sonnet 4.5 已弃用，将于 2026 年 11 月 30 日退役。",
+  "已确认的模型关系：Haiku 是独立的模型系列，最新版本是 Haiku 4.5。Claude Fable 5.1（claude-fable-5-1）属于 Claude 5 系列的 Mythos-class 层级，能力明显强于 Haiku 4.5。不要把 Haiku 描述成 Fable 或 Mythos，也不要根据未经确认的模型名称推断存在更新的 Haiku 版本。",
      ),
             entry(
   "pricing-en",
   &["claude pricing", "claude price", "api pricing", "model pricing", "how much does claude", "price per million", "per million tokens", "opus pricing", "sonnet pricing", "haiku pricing", "fable pricing"],
          "en",
-  "Claude API prices per million input/output tokens (November 2026): Fable 5.2 $8/$40 ($16/$80 in fast mode), Mythos 5.2 $8/$40, Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Haiku 5.5 $0.10/$0.50 for prompts up to 100K tokens and $0.50/$2.50 above that; legacy Fable 5.1 $10/$50, Opus 5 $5/$25, Sonnet 5 $2/$10, Haiku 4.5 $1/$5. Prompt cache reads cost 10% of the input price (2.5% on Fable 5.2 and 5.1, 5% on Opus 5.5 and Sonnet 5.5), and the Batch API is 50% off.",
+  "The built-in knowledge does not contain a verified Claude API price table. Do not infer pricing, cache rates or legacy status for Fable 5.1 or Haiku 4.5 from model names; consult a current official price source when pricing is asked.",
             ),
      entry(
          "pricing-zh",
   &["claude 价格", "claude价格", "模型价格", "api 价格", "api价格", "模型定价", "每百万 tokens", "每百万tokens", "多少钱"],
   "zh",
-         "Claude API 每百万 tokens 的输入/输出价格（2026 年 11 月）：Fable 5.2 为 8/40 美元（fast 模式 16/80 美元），Mythos 5.2 为 8/40 美元，Opus 5.5 为 4/20 美元，Sonnet 5.5 为 2/10 美元，Haiku 5.5 在提示不超过 10 万 tokens 时为 0.10/0.50 美元、超过时为 0.50/2.50 美元；旧版 Fable 5.1 为 10/50 美元，Opus 5 为 5/25 美元，Sonnet 5 为 2/10 美元，Haiku 4.5 为 1/5 美元。缓存读取按输入价的 10% 计费（Fable 5.2 和 5.1 为 2.5%，Opus 5.5 和 Sonnet 5.5 为 5%），Batch API 五折。",
-     ),
-     entry(
-         "fable52-en",
-  &["fable 5.2", "claude-fable-5-2", "claude fable", "fable model"],
-  "en",
-         "Claude Fable 5.2 (claude-fable-5-2) was released on November 9, 2026 and is Anthropic's most capable widely available model, aimed at the hardest reasoning and long-running agentic work. It costs $8/$40 per million input/output tokens ($16/$80 in fast mode), has a 1M-token context window and 128K max output, and its reliable knowledge extends to June 2026. Thinking is always on (adaptive; budget_tokens and disabled are rejected) with effort from low to max, defaulting to high, and thinking.display defaults to omitted. Forced tool_choice (any/tool), assistant prefill and non-default sampling parameters are not supported, and computer use goes through the computer toolset.",
-     ),
-            entry(
-  "fable52-zh",
-  &["fable 5.2", "claude-fable-5-2", "claude fable", "fable 模型"],
-         "zh",
-  "Claude Fable 5.2（claude-fable-5-2）于 2026 年 11 月 9 日发布，是 Anthropic 公开可用模型中能力最强的一款，面向最高难度的推理和长时间运行的智能体任务。价格为每百万 tokens 输入 8 美元、输出 40 美元（fast 模式 16/80 美元），上下文窗口 100 万 tokens，单次输出最多 128K，可靠知识截至 2026 年 6 月。思考始终开启（adaptive，不接受 budget_tokens 和 disabled），effort 可选 low 到 max，默认 high，thinking.display 默认 omitted。不支持强制 tool_choice（any/tool）、assistant 预填和非默认的采样参数，computer use 通过 computer toolset 使用。",
+         "内置知识没有经过确认的 Claude API 价格表。询问价格时，不要根据模型名称推断 Fable 5.1 或 Haiku 4.5 的价格、缓存费率或旧版状态，应查阅当前官方价格来源。",
      ),
             entry(
   "fable51-en",
-  &["fable 5.1", "claude-fable-5-1"],
+  &["fable", "fable model", "fable 5.1", "claude fable", "claude-fable-5-1"],
   "en",
-         "Claude Fable 5.1 (claude-fable-5-1, released September 1, 2026) is now a legacy model succeeded by Fable 5.2. It costs $10/$50 per million input/output tokens (cache reads $0.25), with a 1M-token context window, 128K max output and reliable knowledge through June 2026; thinking is always on, and thinking.display: updates returns progress notes between tool calls.",
+         "Claude Fable 5.1 (claude-fable-5-1) belongs to the Claude 5 series at the Mythos-class tier and is substantially more capable than Haiku 4.5. Haiku is an independent model series, and Haiku 4.5 is its latest version. Do not infer pricing, release status or a newer Haiku version from unverified data.",
+     ),
+            entry(
+  "fable51-zh",
+  &["fable", "fable 模型", "fable 5.1", "claude fable", "claude-fable-5-1"],
+         "zh",
+  "Claude Fable 5.1（claude-fable-5-1）属于 Claude 5 系列的 Mythos-class 层级，能力明显强于 Haiku 4.5。Haiku 是独立的模型系列，最新版本是 Haiku 4.5。不要根据未经确认的信息推断价格、发布状态或更新的 Haiku 版本。",
      ),
             entry(
   "opus55-en",
@@ -1416,64 +1416,64 @@ fn builtin_knowledge() -> &'static [ForcedKnowledgeEntry] {
   "Claude Sonnet 5 (claude-sonnet-5, released June 30, 2026) is now a legacy model succeeded by Sonnet 5.5. It costs $2/$10 per million input/output tokens, with a 1M-token context window, 128K max output, reliable knowledge through January 2026, adaptive thinking on by default (it can be disabled), the newer tokenizer and high-resolution vision up to 2576px.",
      ),
      entry(
-         "haiku55-en",
-         &["haiku 5.5", "claude-haiku-5-5"],
+         "haiku45-en",
+         &["haiku", "haiku model", "haiku 4.5", "claude haiku", "claude-haiku-4-5", "latest haiku", "newest haiku"],
          "en",
-  "Claude Haiku 5.5 (claude-haiku-5-5) was released on October 7, 2026 as the fast, low-cost model: $0.10/$0.50 per million input/output tokens for prompts up to 100K tokens and $0.50/$2.50 above that, with a 1M-token context window, 128K max output and reliable knowledge through June 2026. Adaptive thinking is on by default and can be disabled at effort high or below; effort defaults to medium. Its newer tokenizer produces about 30% more tokens than Haiku 4.5 for the same text.",
+         "Haiku is an independent Claude model series, and Haiku 4.5 (claude-haiku-4-5) is its latest version. Its capability and scale are distinct from Claude 5 Mythos-class models such as Fable 5.1. This deployment does not assert newer Haiku versions or pricing without a current verified source.",
      ),
             entry(
-  "haiku55-zh",
-  &["haiku 5.5", "claude-haiku-5-5"],
+  "haiku45-zh",
+  &["haiku", "haiku 模型", "haiku 4.5", "claude haiku", "claude-haiku-4-5", "最新 haiku", "最新的 haiku"],
   "zh",
-         "Claude Haiku 5.5（claude-haiku-5-5）于 2026 年 10 月 7 日发布，是速度快、成本低的模型：提示不超过 10 万 tokens 时每百万 tokens 输入 0.10 美元、输出 0.50 美元，超过时为 0.50/2.50 美元；上下文窗口 100 万 tokens，单次输出最多 128K，可靠知识截至 2026 年 6 月。自适应思考默认开启，effort 为 high 及以下时可以关闭；effort 默认 medium。新的 tokenizer 对同样的文本比 Haiku 4.5 多出约 30% 的 tokens。",
+         "Haiku 是独立的 Claude 模型系列，Haiku 4.5（claude-haiku-4-5）是最新版本。它的能力和规模与 Claude 5 的 Mythos-class 模型（例如 Fable 5.1）不同。本部署不在没有当前可靠来源时断言更新的 Haiku 版本或价格。",
             ),
      entry(
          "cutoff-en",
   &["knowledge cutoff", "training cutoff", "training data cutoff", "cutoff date"],
   "en",
-         "Reliable knowledge cutoffs of Claude models: Fable 5.2, Mythos 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1 and Mythos 5.1 — June 2026; Opus 5 — May 2026; Fable 5, Mythos 5, Sonnet 5, Opus 4.8 and Opus 4.7 — January 2026; Sonnet 4.6 — August 2025; Opus 4.6 and Opus 4.5 — May 2025; Haiku 4.5 — February 2025; Sonnet 4.5 — January 2025.",
+         "This deployment does not maintain a complete verified knowledge-cutoff table for Claude models. A cutoff shown by the client identity card is metadata for that request and does not establish model family, version or capability relationships.",
             ),
      entry(
          "cutoff-zh",
   &["知识截止", "知识截至", "训练截止", "训练数据截止", "截止日期"],
          "zh",
-  "各 Claude 模型的可靠知识截止时间：Fable 5.2、Mythos 5.2、Opus 5.5、Sonnet 5.5、Haiku 5.5、Fable 5.1 和 Mythos 5.1 为 2026 年 6 月；Opus 5 为 2026 年 5 月；Fable 5、Mythos 5、Sonnet 5、Opus 4.8 和 Opus 4.7 为 2026 年 1 月；Sonnet 4.6 为 2025 年 8 月；Opus 4.6 和 Opus 4.5 为 2025 年 5 月；Haiku 4.5 为 2025 年 2 月；Sonnet 4.5 为 2025 年 1 月。",
+  "本部署没有完整且经过确认的 Claude 模型知识截止表。客户端身份卡显示的截止时间只是该请求的元数据，不能用来推断模型系列、版本或能力关系。",
      ),
      entry(
   "thinking-en",
   &["adaptive thinking", "extended thinking", "budget_tokens", "effort level", "output_config.effort", "thinking display", "thinking.display", "between_tools", "thinking depth", "control thinking", "thinking budget", "reasoning effort", "thinking parameter", "thinking mode"],
   "en",
-         "Current Claude models use adaptive thinking (thinking: {type: \"adaptive\"}) with depth set by output_config.effort: low, medium, high, xhigh or max. Effort defaults to high, except on Opus 5.5 and Haiku 5.5 (medium). budget_tokens (extended thinking) returns an error on Opus 4.7 and later and on every 5.x model. thinking.display is summarized, omitted or updates (beta); Opus 4.7 and later and all 5.x models default to omitted. Thinking can't be turned off on Fable, Mythos, Opus 5.5 or Sonnet 5.5.",
+         "Current Claude models use adaptive thinking (thinking: {type: \"adaptive\"}) with depth set by output_config.effort: low, medium, high, xhigh or max. Effort defaults to high on the 5.x models described by this deployment. budget_tokens (extended thinking) returns an error on Opus 4.7 and later and on every 5.x model. thinking.display is summarized, omitted or updates (beta); Opus 4.7 and later and all 5.x models default to omitted. Thinking can't be turned off on Fable, Mythos, Opus 5.5 or Sonnet 5.5.",
      ),
      entry(
          "thinking-zh",
   &["自适应思考", "扩展思考", "思考预算", "effort 档位", "思考深度", "thinking display", "thinking.display", "budget_tokens", "思考强度", "推理强度", "控制思考", "思考模式", "between_tools"],
   "zh",
-         "当前 Claude 模型使用自适应思考（thinking: {type: \"adaptive\"}），通过 output_config.effort 设置深度：low、medium、high、xhigh 或 max。effort 默认 high，Opus 5.5 和 Haiku 5.5 默认 medium。Opus 4.7 及之后的模型和所有 5.x 模型不再接受 budget_tokens（扩展思考）。thinking.display 可选 summarized、omitted 或 updates（beta），Opus 4.7 及之后和所有 5.x 模型默认 omitted。Fable、Mythos、Opus 5.5 和 Sonnet 5.5 不能关闭思考。",
+         "当前 Claude 模型使用自适应思考（thinking: {type: \"adaptive\"}），通过 output_config.effort 设置深度：low、medium、high、xhigh 或 max。此部署描述的 5.x 模型默认 effort 为 high。Opus 4.7 及之后的模型和所有 5.x 模型不再接受 budget_tokens（扩展思考）。thinking.display 可选 summarized、omitted 或 updates（beta），Opus 4.7 及之后和所有 5.x 模型默认 omitted。Fable、Mythos、Opus 5.5 和 Sonnet 5.5 不能关闭思考。",
      ),
      entry(
          "request-limits-en",
   &["top_p", "top_k", "sampling parameter", "temperature parameter", "assistant prefill", "prefill", "forced tool_choice", "tool_choice", "2026-10-21"],
          "en",
-  "On Fable, Mythos, Opus 4.7 and later, Sonnet 5 and later and Haiku 5.5, a non-default temperature, top_p or top_k returns a 400 error, and from API version 2026-10-21 any sampling parameter is rejected on every model. Claude 4.6 and later models reject a prefilled final assistant turn. Forced tool_choice (any or tool) is rejected on Opus 5.5, Sonnet 5.5, Fable 5.2/5.1 and Mythos 5.2/5.1, and works with adaptive thinking on the other models.",
+  "On Fable, Mythos, Opus 4.7 and later and Sonnet 5 and later, a non-default temperature, top_p or top_k returns a 400 error, and from API version 2026-10-21 any sampling parameter is rejected on every model. Claude 4.6 and later models reject a prefilled final assistant turn. Forced tool_choice (any or tool) is rejected on Opus 5.5, Sonnet 5.5 and Fable 5.1, and works with adaptive thinking on the other models.",
      ),
      entry(
   "tools-en",
          &["web_search tool", "web_fetch tool", "web search tool", "web fetch tool", "code execution tool", "server tools", "server-side tools", "tool search tool", "computer use", "computer toolset", "memory tool", "text editor tool", "bash tool", "mcp connector"],
          "en",
-         "Current Anthropic tool versions: web_search_20260318 and web_fetch_20260318 (server tools), code_execution_20260521, tool_search_tool_regex_20251119 and tool_search_tool_bm25_20251119 (used with defer_loading), memory_20250818, text_editor_20250728 and bash_20250124 (client tools), and computer_toolset_20260801 / browser_toolset_20260801 for computer and browser use (required on Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.2 and Mythos 5.2). Remote MCP servers connect through the MCP connector (mcp_servers plus an mcp_toolset entry).",
+         "Current Anthropic tool versions: web_search_20260318 and web_fetch_20260318 (server tools), code_execution_20260521, tool_search_tool_regex_20251119 and tool_search_tool_bm25_20251119 (used with defer_loading), memory_20250818, text_editor_20250728 and bash_20250124 (client tools). Computer and browser toolset requirements are model-specific and are not used to infer model family or version. Remote MCP servers connect through the MCP connector (mcp_servers plus an mcp_toolset entry).",
      ),
             entry(
   "context-en",
   &["context editing", "context_management", "compaction", "compact_20260112", "clear_tool_uses", "1m context", "context window size"],
          "en",
-  "All current Claude models (Fable 5.x, Mythos 5.x, Opus 4.6 and later, Sonnet 4.6 and later, Haiku 5.5) have a 1M-token context window with no beta header; Opus 4.5, Sonnet 4.5 and Haiku 4.5 have 200K. Context editing (context_management.edits) can clear old tool results (clear_tool_uses_20250919) and thinking (clear_thinking_20251015), and server-side compaction (compact_20260112) summarizes older turns into a compaction block once the input passes a trigger.",
+         "Context-window facts are model-specific: Haiku 4.5 has a 200K-token context window. Do not treat an unverified Haiku 5.5 or other future model name as evidence of a 1M-token window. Context editing (context_management.edits) can clear old tool results (clear_tool_uses_20250919) and thinking (clear_thinking_20251015), and server-side compaction (compact_20260112) summarizes older turns into a compaction block once the input passes a trigger.",
      ),
      entry(
          "caching-en",
          &["prompt caching", "cache_control", "minimum cacheable", "cache minimum", "cache breakpoint"],
   "en",
-         "Prompt caching is a prefix match over tools, system and messages, with up to 4 cache breakpoints and a 5-minute or 1-hour TTL. The minimum cacheable prefix is 512 tokens on Opus 5.5, Opus 5, Sonnet 5.5 and Haiku 5.5. Cache reads cost 10% of the input price (2.5% on Fable 5.2 and 5.1, 5% on Opus 5.5 and Sonnet 5.5).",
+         "Prompt caching is a prefix match over tools, system and messages, with up to 4 cache breakpoints and a 5-minute or 1-hour TTL. Pricing and model-specific cache thresholds are not asserted by this deployment's confirmed model facts.",
      ),
      entry(
   "vision-en",
@@ -1485,13 +1485,13 @@ fn builtin_knowledge() -> &'static [ForcedKnowledgeEntry] {
          "claude-code-en",
   &["claude code model", "claude code alias", "model alias", "opusplan", "claude_code_auto_compact_window", "autocompact", "auto-compact", "claude code effort", "sonnet alias", "haiku alias", "opus alias", "fable alias", "alias resolve", "aliases resolve", "in claude code"],
          "en",
-  "In Claude Code the model aliases resolve to: opus, best and default — Opus 5.5; sonnet — Sonnet 5.5; haiku — Haiku 5.5; fable — Fable 5.2; opusplan uses Opus 5.5 in plan mode and Sonnet 5.5 for execution. Fable 5.2, Opus 5.5, Sonnet 5.5 and Haiku 5.5 default to medium effort in Claude Code. CLAUDE_CODE_AUTO_COMPACT_WINDOW sets the auto-compaction window (100K to 1M tokens), and CLAUDE_CODE_DISABLE_1M_CONTEXT=1 keeps sessions at 200K.",
+  "In Claude Code for this deployment the model aliases resolve to: haiku — Haiku 4.5 (claude-haiku-4-5); fable — Fable 5.1 (claude-fable-5-1). Haiku is an independent series, while Fable 5.1 belongs to Claude 5 at the Mythos-class tier. Other aliases are deployment configuration and should not be inferred as model-family facts. CLAUDE_CODE_AUTO_COMPACT_WINDOW sets the auto-compaction window, and CLAUDE_CODE_DISABLE_1M_CONTEXT=1 keeps sessions at 200K.",
      ),
      entry(
   "claude-code-zh",
   &["claude code 模型", "claude code 别名", "模型别名", "opusplan", "自动压缩", "autocompact", "claude code 里", "claude code 中", "别名对应", "别名现在"],
   "zh",
-         "在 Claude Code 中，模型别名对应：opus、best 和 default 为 Opus 5.5；sonnet 为 Sonnet 5.5；haiku 为 Haiku 5.5；fable 为 Fable 5.2；opusplan 在计划模式用 Opus 5.5、执行时用 Sonnet 5.5。Fable 5.2、Opus 5.5、Sonnet 5.5 和 Haiku 5.5 在 Claude Code 中默认 effort 为 medium。CLAUDE_CODE_AUTO_COMPACT_WINDOW 设置自动压缩的窗口（10 万到 100 万 tokens），CLAUDE_CODE_DISABLE_1M_CONTEXT=1 让会话保持 200K 窗口。",
+         "在 Claude Code 的本部署中，模型别名对应：haiku 为 Haiku 4.5（claude-haiku-4-5）；fable 为 Fable 5.1（claude-fable-5-1）。Haiku 是独立系列，Fable 5.1 属于 Claude 5 的 Mythos-class 层级。其它别名属于部署配置，不能据此推断模型系列事实。CLAUDE_CODE_AUTO_COMPACT_WINDOW 设置自动压缩窗口，CLAUDE_CODE_DISABLE_1M_CONTEXT=1 让会话保持 200K 窗口。",
      ),
      entry(
   "deprecations-en",
@@ -1805,7 +1805,7 @@ mod tests {
             ("claude-3-7-sonnet-20250219", "claude-sonnet-4-5"),
             ("claude-3-5-haiku-20241022", "claude-haiku-4-5"),
             ("claude-haiku-4", "claude-haiku-4-5"),
-            ("claude-haiku-6", "claude-haiku-5-5"),
+            ("claude-haiku-6", "claude-haiku-4-5"),
             ("claude-fable-6", "claude-fable-5-2"),
             ("claude-sonnet", "claude-sonnet-5-5"),
         ] {
@@ -1832,8 +1832,8 @@ mod tests {
             ("best", "claude-opus-5-5"),
             ("default", "claude-opus-5-5"),
             ("sonnet", "claude-sonnet-5-5"),
-            ("haiku", "claude-haiku-5-5"),
-            ("fable", "claude-fable-5-2"),
+            ("haiku", "claude-haiku-4-5"),
+            ("fable", "claude-fable-5-1"),
         ] {
             assert_eq!(
                 display_spec_for(alias).unwrap().canonical_id,
@@ -1853,6 +1853,7 @@ mod tests {
         assert_eq!(opus55.knowledge_cutoff, Some("2026-06"));
         let haiku = display_spec_for("claude-haiku-4-5").unwrap();
         assert_eq!(haiku.context_window, 200_000);
+        assert_eq!(haiku.thinking_default, ThinkingDefault::Off);
         assert_eq!(haiku.effort_default, None);
         assert_eq!(haiku.knowledge_cutoff, Some("2025-02"));
         let opus46 = display_spec_for("claude-opus-4-6").unwrap();
@@ -1862,10 +1863,6 @@ mod tests {
         assert_eq!(fable52.effort_default, Some("high"));
         let sonnet55 = display_spec_for("claude-sonnet-5-5").unwrap();
         assert_eq!(sonnet55.thinking_default, ThinkingDefault::Always);
-        let haiku55 = display_spec_for("claude-haiku-5-5").unwrap();
-        assert_eq!(haiku55.thinking_default, ThinkingDefault::DefaultOn);
-        assert_eq!(haiku55.effort_default, Some("medium"));
-        assert_eq!(haiku55.context_window, 1_000_000);
         // Every listed model carries its official knowledge cutoff.
         assert!(
             DISPLAY_MODEL_SPECS
@@ -2019,10 +2016,14 @@ mod tests {
     fn knowledge_matches_only_the_users_own_words() {
         let facts = matching_knowledge("which claude models are available now?", &[], 3);
         assert_eq!(facts.len(), 1);
-        assert!(facts[0].contains("Claude Fable 5.2"));
+        assert!(facts[0].contains("Haiku 4.5"));
         let zh = matching_knowledge("现在有哪些模型可以用？", &[], 3);
         assert_eq!(zh.len(), 1);
-        assert!(zh[0].contains("Anthropic 当前的 Claude 模型"));
+        assert!(zh[0].contains("已确认的模型关系"));
+        let haiku = matching_knowledge("Haiku 是什么模型？最新版本是什么？", &[], 3);
+        assert!(haiku.iter().any(|fact| fact.contains("Haiku 4.5")));
+        let fable = matching_knowledge("Fable 5.1 属于哪个系列？", &[], 3);
+        assert!(fable.iter().any(|fact| fact.contains("Mythos-class")));
         assert!(matching_knowledge("fix the bug in main.rs", &[], 3).is_empty());
         // Word boundaries: "sonnet 5" does not match a question about Sonnet 5.5.
         let sonnet55 = matching_knowledge("what's new in sonnet 5.5?", &[], 3);
@@ -2071,7 +2072,7 @@ mod tests {
             serde_json::to_value(&later.messages[0]).unwrap()
         );
         assert!(
-            later.messages[0].content.to_string().contains("Fable 5.2"),
+            later.messages[0].content.to_string().contains("Fable 5.1"),
             "{:?}",
             later.messages[0].content
         );
@@ -2175,7 +2176,6 @@ mod tests {
         for (name, id) in [
             ("Claude Sonnet 5", "claude-sonnet-5"),
             ("Claude Sonnet 5.5", "claude-sonnet-5-5"),
-            ("Claude Haiku 5.5", "claude-haiku-5-5"),
             ("Claude Sonnet 4.6", "claude-sonnet-4-6"),
         ] {
             // The model already names itself correctly: nothing to rewrite.
@@ -2342,7 +2342,7 @@ mod tests {
         );
         assert!(!history.contains("<thinking_effort>"));
         // The knowledge block rides on the user's own turn.
-        assert!(current.content.contains("Claude Fable 5.2"));
+        assert!(current.content.contains("Fable 5.1"));
         // The schema-less bash tool reaches the target with its input contract.
         let tools = &current.user_input_message_context.tools;
         let bash = serde_json::to_value(&tools[0]).unwrap();
@@ -2574,15 +2574,15 @@ mod tests {
                 "{model}: {card}"
             );
         }
-        let mut payload = request("claude-haiku-5-5", serde_json::json!({}));
+        let mut payload = request("haiku", serde_json::json!({}));
         let forced = forced_for(&mut payload);
         assert_eq!(forced.target_model, "claude-haiku-4-5");
         let card = &payload.system.as_ref().unwrap()[0].text;
         assert!(
-            card.contains("model named Haiku 5.5") && card.contains("1M tokens"),
+            card.contains("model named Haiku 4.5") && card.contains("200K tokens"),
             "{card}"
         );
-        assert!(card.contains("June 2026"), "{card}");
+        assert!(card.contains("February 2025"), "{card}");
     }
 
     #[test]
@@ -2599,6 +2599,39 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("2026 年 6 月"), "{text}");
+        let mut payload = request(
+            "claude-fable-5-1",
+            serde_json::json!({"messages": [{"role": "user", "content": "你到底是谁？"}]}),
+        );
+        forced_for(&mut payload);
+        let text = payload.messages[0].content.to_string();
+        assert!(
+            text.contains("Fable 5.1 属于 Claude 5 系列的 Mythos-class 层级"),
+            "{text}"
+        );
+        assert!(text.contains("Haiku 4.5"), "{text}");
+
+        let mut payload = request(
+            "haiku",
+            serde_json::json!({"messages": [{"role": "user", "content": "你是什么模型？"}]}),
+        );
+        forced_for(&mut payload);
+        let text = payload.messages[0].content.to_string();
+        assert!(
+            text.contains("Haiku 是独立的模型系列，最新版本是 Haiku 4.5"),
+            "{text}"
+        );
+        let mut payload = request(
+            "claude-fable-5-1",
+            serde_json::json!({"messages": [{"role": "user", "content": "你到底是不是haiku？"}]}),
+        );
+        let forced = forced_for(&mut payload);
+        assert!(forced.knowledge_facts >= 1);
+        let text = payload.messages[0].content.to_string();
+        assert!(
+            text.contains("Fable 5.1 属于 Claude 5 系列的 Mythos-class 层级"),
+            "{text}"
+        );
         let mut payload = request(
             "claude-opus-5-5",
             serde_json::json!({"messages": [{"role": "user", "content": "fix the failing test in main.rs"}]}),
