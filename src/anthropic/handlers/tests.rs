@@ -17273,6 +17273,92 @@ fn hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round() {
     );
 }
 
+#[tokio::test]
+async fn forced_models_http_listing_retrieve_pagination_and_custom_config_agree() {
+    use crate::model::forced_model_mapping::ForcedModelMappingConfig;
+    async fn get(app: &Router, path: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("x-api-key", "b07-handler-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+    let mut config = Config::default();
+    config.forced_model_mapping.enabled = true;
+    let (app, _) = multimodal_handler_test_router_from_config(config.clone());
+    let (status, listed) = get(&app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<_> = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 25);
+    assert!(ids.contains(&"claude-haiku-5-5"));
+    // The two dated Sonnet 3.5 IDs are separate selectable entries.
+    assert!(ids.contains(&"claude-3-5-sonnet-20240620"));
+    assert!(ids.contains(&"claude-3-5-sonnet-20241022"));
+    assert_eq!(listed["has_more"], false);
+    for model in listed["data"].as_array().unwrap() {
+        let id = model["id"].as_str().unwrap();
+        let (status, retrieved) = get(&app, &format!("/v1/models/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id}");
+        assert_eq!(&retrieved, model);
+    }
+    let (_, first) = get(&app, "/v1/models?limit=2").await;
+    assert_eq!(first["data"].as_array().unwrap().len(), 2);
+    assert_eq!(first["has_more"], true);
+    let (_, next) = get(&app, &format!("/v1/models?limit=2&after_id={}", ids[1])).await;
+    assert_eq!(next["first_id"], ids[2]);
+
+    config.forced_model_mapping.listed_models = vec![
+        "claude-haiku-5-5".to_string(),
+        "claude-fable-6-1".to_string(),
+    ];
+    let (app, _) = multimodal_handler_test_router_from_config(config.clone());
+    let (_, custom) = get(&app, "/v1/models").await;
+    assert_eq!(custom["data"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        get(&app, "/v1/models/claude-fable-6-1").await.1["id"],
+        "claude-fable-6-1"
+    );
+    assert_eq!(
+        get(&app, "/v1/models/claude-opus-5-5").await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&app, "/v1/models/deepseek-3.2").await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    config.forced_model_mapping.listed_models.clear();
+    let (app, _) = multimodal_handler_test_router_from_config(config.clone());
+    assert_eq!(get(&app, "/v1/models").await.1["data"], json!([]));
+
+    config.forced_model_mapping = ForcedModelMappingConfig::default();
+    let (app, _) = multimodal_handler_test_router_from_config(config);
+    let (_, standard) = get(&app, "/v1/models").await;
+    assert!(
+        !standard["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "claude-haiku-5-5")
+    );
+}
+
 #[test]
 fn claude_only_listing_keeps_claude_ids_and_aliases() {
     for id in [

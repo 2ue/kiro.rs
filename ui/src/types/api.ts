@@ -1770,6 +1770,8 @@ export interface ForcedKnowledgeEntry {
 
 /** Forced model convergence; independent of `modelMapping`. */
 export interface ForcedModelMappingConfig {
+  /** Names published by /v1/models while forced mapping is active. */
+  listedModels: string[]
   enabled: boolean
   rules: ForcedModelRule[]
   defaultTarget: string

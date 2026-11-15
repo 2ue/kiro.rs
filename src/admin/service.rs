@@ -943,6 +943,18 @@ impl AdminService {
         &self,
         config: &crate::model::forced_model_mapping::ForcedModelMappingConfig,
     ) -> Result<(), AdminServiceError> {
+        for model in &config.listed_models {
+            if model.len() > 200
+                || !model
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-[]".contains(&b))
+                || crate::anthropic::forced_model::display_spec_for(model).is_none()
+            {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "强制模型收敛的对外模型名称无法解析: {model}"
+                )));
+            }
+        }
         let status = self.model_capabilities.status();
         let synced = status.models.iter().any(|item| {
             item.source.as_deref() != Some(crate::anthropic::model_capabilities::SEED_SOURCE)

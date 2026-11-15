@@ -8234,8 +8234,10 @@ fn models_list_response(state: &AppState, query: &ModelsQuery) -> Response {
     if claude_models_only(state) {
         models.retain(|model| is_listed_claude_model(&model.id));
     }
-    if forced_model_listing_applies(state) {
-        models = with_display_model_listing(models);
+    let runtime = live_runtime_config(state);
+    if runtime.forced_model_mapping.any_route_enabled() {
+        models =
+            super::forced_model::configured_display_model_listing(&runtime.forced_model_mapping);
     }
     Json(ModelsResponse::paginate(models, query)).into_response()
 }
@@ -8248,31 +8250,6 @@ pub(crate) fn missing_max_tokens_default_value(state: &AppState) -> i32 {
         .missing_max_tokens
         .normalized()
         .default_value
-}
-
-/// Live runtime config so admin changes apply without a restart.
-/// Forced model mapping: the listing shows the public Claude models with their official limits,
-/// whatever the serving accounts' catalog says, so clients see the same windows as on the
-/// Anthropic API.
-fn forced_model_listing_applies(state: &AppState) -> bool {
-    live_runtime_config(state)
-        .forced_model_mapping
-        .any_route_enabled()
-}
-
-/// The public Claude models only: other upstream models (DeepSeek, GLM, ...) and serving-side
-/// spellings would reveal the channel behind the forced mapping.
-fn with_display_model_listing(models: Vec<super::types::Model>) -> Vec<super::types::Model> {
-    let display = super::forced_model::display_model_listing();
-    let mut merged: Vec<super::types::Model> = models
-        .into_iter()
-        .filter(|model| !display.iter().any(|listed| listed.id == model.id))
-        .filter(|model| super::forced_model::display_spec_for(&model.id).is_none())
-        .filter(|model| is_listed_claude_model(&model.id))
-        .collect();
-    merged.extend(display);
-    merged.sort_by(|a, b| a.id.cmp(&b.id));
-    merged
 }
 
 fn live_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
@@ -8307,20 +8284,17 @@ fn is_listed_claude_model(id: &str) -> bool {
 }
 
 fn model_retrieve_response(state: &AppState, model_id: &str) -> Response {
-    let forced_listing = forced_model_listing_applies(state)
-        .then(|| super::forced_model::display_spec_for(model_id))
-        .flatten()
-        .and_then(|spec| {
-            super::forced_model::display_model_listing()
-                .into_iter()
-                .find(|model| model.id == spec.canonical_id)
-        });
-    let listed = forced_listing.or_else(|| {
+    let runtime = live_runtime_config(state);
+    let listed = if runtime.forced_model_mapping.any_route_enabled() {
+        super::forced_model::configured_display_model_listing(&runtime.forced_model_mapping)
+            .into_iter()
+            .find(|model| model.id == model_id)
+    } else {
         state
             .model_capabilities
             .standard_anthropic_model(model_id)
-            .filter(|model| !claude_models_only(state) || is_listed_claude_model(&model.id))
-    });
+            .filter(|model| !runtime.claude_models_only || is_listed_claude_model(&model.id))
+    };
     match listed {
         Some(model) => Json(model).into_response(),
         None => envelope::error_response(

@@ -422,27 +422,64 @@ pub(crate) fn returns_interleaved_text_as_thinking(spec: &DisplayModelSpec) -> b
         )
 }
 
-/// 模型列表中外显模型的公开条目：窗口与输出上限按官方值，不随目标模型变化。
+/// 管理端的内置 Claude 规格目录，独立于可配置的对外列表。
 pub(crate) fn display_model_listing() -> Vec<crate::anthropic::types::Model> {
-    DISPLAY_MODEL_SPECS
+    configured_display_model_listing(&ForcedModelMappingConfig {
+        listed_models: DISPLAY_MODEL_SPECS
+            .iter()
+            .filter(|spec| spec.family != "mythos")
+            .map(|spec| spec.canonical_id.to_string())
+            .collect(),
+        ..Default::default()
+    })
+}
+
+/// 对外条目保留配置名称；未收录版本的能力沿用同族的兼容规格。
+pub(crate) fn configured_display_model_listing(
+    config: &ForcedModelMappingConfig,
+) -> Vec<crate::anthropic::types::Model> {
+    let mut models: Vec<_> = config
+        .listed_models
         .iter()
-        // Mythos is offered only through Project Glasswing; requests naming it are still served.
-        .filter(|spec| spec.family != "mythos")
-        .map(|spec| crate::anthropic::types::Model {
-            id: spec.canonical_id.to_string(),
-            object: "model".to_string(),
-            created: spec.created_at,
-            created_at: crate::anthropic::types::model_created_at_rfc3339(spec.created_at),
-            owned_by: "anthropic".to_string(),
-            display_name: spec.display_name.to_string(),
-            model_type: "model".to_string(),
-            max_tokens: spec.max_output_tokens,
-            max_input_tokens: Some(spec.context_window),
-            context_window: Some(spec.context_window),
-            official_max_input_tokens: Some(spec.context_window),
-            capabilities: Some(display_model_capabilities(spec)),
+        .filter_map(|id| {
+            let spec = display_spec_for(id)?;
+            let (base, _) = canonical_base(id);
+            let display_name = if base == spec.canonical_id || !base.starts_with("claude-") {
+                spec.display_name.to_string()
+            } else {
+                let name = base.strip_prefix("claude-").unwrap_or(&base);
+                let words: Vec<_> = name
+                    .split('-')
+                    .map(|part| match part {
+                        "haiku" => "Haiku",
+                        "sonnet" => "Sonnet",
+                        "opus" => "Opus",
+                        "fable" => "Fable",
+                        "mythos" => "Mythos",
+                        _ => part,
+                    })
+                    .collect();
+                format!("Claude {}", words.join(" "))
+            };
+            Some(crate::anthropic::types::Model {
+                id: id.clone(),
+                object: "model".to_string(),
+                created: spec.created_at,
+                created_at: crate::anthropic::types::model_created_at_rfc3339(spec.created_at),
+                owned_by: "anthropic".to_string(),
+                display_name,
+                model_type: "model".to_string(),
+                max_tokens: spec.max_output_tokens,
+                max_input_tokens: Some(spec.context_window),
+                context_window: Some(spec.context_window),
+                official_max_input_tokens: Some(spec.context_window),
+                capabilities: Some(display_model_capabilities(&spec)),
+            })
         })
-        .collect()
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    models
 }
 
 /// Claude API model IDs that belong in the billing catalog, including access-limited families.
@@ -587,9 +624,13 @@ pub(crate) fn resolve_forced_target(
     let (base, display_requested_thinking) = canonical_base(display_model);
     let family = display_family(&base)?;
     let spec = display_spec_for(display_model)?;
+    let exact = display_model.to_ascii_lowercase().replace('.', "-");
+    let (without_compat_suffixes, _) = strip_model_compat_suffixes(&exact);
     let target_model = config
         .model_overrides
-        .get(&base)
+        .get(&exact)
+        .or_else(|| config.model_overrides.get(&without_compat_suffixes))
+        .or_else(|| config.model_overrides.get(&base))
         .cloned()
         .or_else(|| {
             config
@@ -2735,6 +2776,109 @@ mod tests {
             payload.output_config.as_ref().unwrap().effort.as_deref(),
             Some("high")
         );
+    }
+
+    #[test]
+    fn every_listed_model_and_compat_suffix_converts_to_both_targets() {
+        use crate::anthropic::converter::{ConverterOptions, convert_request_with_resolved_model};
+        use crate::anthropic::model_capabilities::{ModelResolution, ModelResolutionSource};
+        for target in ["claude-haiku-4-5", "claude-sonnet-4-5"] {
+            let config = ForcedModelMappingConfig {
+                enabled: true,
+                default_target: target.to_string(),
+                ..Default::default()
+            };
+            for model in &config.listed_models {
+                for suffix in ["", "-thinking", "[1m]", "-thinking[1m]", "[1m]-thinking"] {
+                    let display = format!("{model}{suffix}");
+                    let mut payload = request(&display, serde_json::json!({}));
+                    let forced = apply_forced_mapping(&mut payload, &config);
+                    assert_eq!(
+                        canonical_base(&payload.model).0,
+                        target,
+                        "{display} -> {target}"
+                    );
+                    if let Some(forced) = &forced {
+                        assert_eq!(forced.display_model, display);
+                        assert_eq!(forced.target_model, target);
+                    }
+                    let mut resolution = ModelResolution::resolved(
+                        payload.model.clone(),
+                        target.replace("-4-5", "-4.5"),
+                        ModelResolutionSource::Alias,
+                    );
+                    resolution.forced = forced.clone();
+                    let converted = convert_request_with_resolved_model(
+                        &payload,
+                        ConverterOptions {
+                            forced,
+                            ..Default::default()
+                        },
+                        &resolution,
+                    );
+                    converted.unwrap_or_else(|error| panic!("{display} -> {target}: {error}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dated_overrides_take_precedence_and_keep_canonical_fallback() {
+        let config = ForcedModelMappingConfig {
+            default_target: "claude-haiku-4-5".to_string(),
+            model_overrides: [
+                (
+                    "claude-3-5-sonnet-20240620".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                ),
+                (
+                    "claude-3-5-sonnet".to_string(),
+                    "claude-haiku-4-5".to_string(),
+                ),
+                (
+                    "claude-haiku-5-5".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }
+        .normalized();
+        for model in [
+            "claude-3-5-sonnet-20240620",
+            "claude-3-5-sonnet-20240620-thinking[1m]",
+            "Claude-Haiku-5.5",
+        ] {
+            assert_eq!(
+                resolve_forced_target(model, &config).unwrap().target_model,
+                "claude-sonnet-4-5"
+            );
+        }
+        assert_eq!(
+            resolve_forced_target("claude-3-5-sonnet-20241022", &config)
+                .unwrap()
+                .target_model,
+            "claude-haiku-4-5"
+        );
+    }
+
+    #[test]
+    fn listing_preserves_configured_ids_without_affecting_pricing_catalog() {
+        let pricing_before = pricing_catalog_model_ids();
+        let config = ForcedModelMappingConfig {
+            listed_models: vec![
+                "claude-haiku-5-5".to_string(),
+                "claude-3-5-sonnet-20240620".to_string(),
+            ],
+            ..Default::default()
+        };
+        let listing = configured_display_model_listing(&config);
+        assert_eq!(listing.len(), 2);
+        assert_eq!(listing[0].id, "claude-3-5-sonnet-20240620");
+        assert_eq!(listing[1].id, "claude-haiku-5-5");
+        assert!(listing[1].display_name.contains("Haiku 5 5"));
+        assert_eq!(pricing_catalog_model_ids(), pricing_before);
     }
 
     #[test]

@@ -33,6 +33,7 @@ import {
   FORCED_CONTEXT_BACKOFF_LIMITS,
   FORCED_MODEL_FAMILIES,
   forcedModelMappingAnyRouteEnabled,
+  isForcedListedModel,
   parseForcedKnowledgeTopics,
   shadowedForcedFamilies,
 } from '@/lib/runtime-config-defaults'
@@ -188,11 +189,13 @@ function TargetModelInput({
   value,
   options,
   ariaLabel,
+  clientModel = false,
   onChange,
 }: {
   value: string
   options: CatalogOption[]
   ariaLabel: string
+  clientModel?: boolean
   onChange: (next: string) => void
 }) {
   const trimmed = value.trim()
@@ -214,14 +217,14 @@ function TargetModelInput({
               size="sm"
               className="shrink-0"
               disabled={options.length === 0}
-              title={options.length === 0 ? '模型目录为空，请直接输入模型名' : '从上游模型目录选择'}
+              title={options.length === 0 ? '模型目录为空，请直接输入模型名' : clientModel ? '从对外模型列表及模型目录选择' : '从上游模型目录选择'}
             >
               选择
               <ChevronDown />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-80">
-            <DropdownMenuLabel>上游模型目录</DropdownMenuLabel>
+            <DropdownMenuLabel>{clientModel ? '对外模型及模型目录' : '上游模型目录'}</DropdownMenuLabel>
             {options.map((option) => (
               <DropdownMenuItem key={option.model} onSelect={() => onChange(option.model)}>
                 <span className="min-w-0 flex-1 truncate font-mono text-xs">{option.model}</span>
@@ -236,8 +239,8 @@ function TargetModelInput({
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
-      {!trimmed && <div className="text-[11px] leading-4 text-destructive">目标模型不能为空</div>}
-      {!inCatalog && <div className="text-[11px] leading-4 text-warning">模型目录里没有同名模型，保存时后端会校验是否可用。</div>}
+      {!trimmed && <div className="text-[11px] leading-4 text-destructive">{clientModel ? '客户端模型不能为空' : '目标模型不能为空'}</div>}
+      {!inCatalog && !clientModel && <div className="text-[11px] leading-4 text-warning">模型目录里没有同名模型，保存时后端会校验是否可用。</div>}
     </div>
   )
 }
@@ -358,10 +361,12 @@ function RulesTable({
 function ModelOverridesTable({
   overrides,
   options,
+  sourceOptions,
   onChange,
 }: {
   overrides: Record<string, string>
   options: CatalogOption[]
+  sourceOptions: CatalogOption[]
   onChange: (next: Record<string, string>) => void
 }) {
   const [model, setModel] = useState('')
@@ -413,8 +418,9 @@ function ModelOverridesTable({
                   <TableCell className="align-top">
                     <TargetModelInput
                       value={modelKey}
-                      options={options}
+                      options={sourceOptions}
                       ariaLabel={`${modelKey} 的客户端模型`}
+                      clientModel
                       onChange={(next) => updateModel(modelKey, next)}
                     />
                   </TableCell>
@@ -445,7 +451,7 @@ function ModelOverridesTable({
       <div className="flex flex-wrap items-end gap-2">
         <div className="min-w-[14rem] flex-1">
           <div className="mb-1 text-[11px] text-muted-foreground">客户端模型</div>
-          <TargetModelInput value={model} options={options} ariaLabel="新增单模型覆盖的客户端模型" onChange={setModel} />
+          <TargetModelInput value={model} options={sourceOptions} ariaLabel="新增单模型覆盖的客户端模型" clientModel onChange={setModel} />
         </div>
         <div className="min-w-[14rem] flex-1">
           <div className="mb-1 text-[11px] text-muted-foreground">映射目标</div>
@@ -857,6 +863,43 @@ function KnowledgeTable({ entries, onChange }: { entries: ForcedKnowledgeEntry[]
   )
 }
 
+function ListedModelsEditor({ models, onChange }: { models: string[]; onChange: (models: string[]) => void }) {
+  const [draft, setDraft] = useState('')
+  const additions = [...new Set(draft.split(/[\s,，]+/).map(canonicalModelKey).filter(Boolean))]
+  const invalid = additions.find((model) => !isForcedListedModel(model))
+  const add = () => {
+    if (!additions.length || invalid) return
+    onChange([...new Set([...models, ...additions])])
+    setDraft('')
+  }
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-2">
+        {models.map((model) => (
+          <div key={model} className="flex items-center gap-1 rounded-md border bg-card py-1 pl-2">
+            <span className="font-mono text-xs">{model}</span>
+            <DeleteButton title={`移除 ${model}`} onClick={() => onChange(models.filter((id) => id !== model))} />
+          </div>
+        ))}
+        {models.length === 0 && <div className="text-xs text-muted-foreground">当前不公布任何模型；仍可直接请求兼容的 Claude 模型名称。</div>}
+      </div>
+      <div className="flex items-start gap-2">
+        <Textarea
+          aria-label="添加对外模型"
+          placeholder="输入 Claude 模型 ID，多个名称用换行、空格或逗号分隔"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          className="min-h-20 font-mono text-xs"
+        />
+        <Button size="sm" variant="outline" disabled={!additions.length || !!invalid} onClick={add}>
+          <Plus />添加模型
+        </Button>
+      </div>
+      {invalid && <div className="text-xs text-destructive">无法解析模型名称：{invalid}</div>}
+    </div>
+  )
+}
+
 // ─── 配置区 ──────────────────────────────────────────────────────────────────
 
 export function ForcedModelMappingSection({
@@ -873,6 +916,10 @@ export function ForcedModelMappingSection({
 }) {
   const catalog = useForcedModelCatalog()
   const options = useMemo(() => catalogOptions(capabilities, catalog.data), [capabilities, catalog.data])
+  const sourceOptions = useMemo(
+    () => [...mapping.listedModels.map((model) => ({ model })), ...options.filter((option) => !mapping.listedModels.includes(option.model))],
+    [mapping.listedModels, options],
+  )
   const active = forcedModelMappingAnyRouteEnabled(mapping)
   const targetModels = useMemo(
     () => [...mapping.rules.map((rule) => rule.target), ...Object.values(mapping.modelOverrides), mapping.defaultTarget],
@@ -938,12 +985,25 @@ export function ForcedModelMappingSection({
       </div>
 
       <SubBlock
+        title="对外模型列表"
+        desc="强制收敛开启时，/v1/models 只返回这里的模型。默认包含 sub2api 的 Claude 列表、已有型号及 Haiku 5.5。可以添加兼容名称或移除条目；此列表不限制直接请求的模型名称，映射仍按单模型覆盖、模型族规则和默认目标处理。"
+        actions={
+          <Button size="sm" variant="outline" onClick={() => onChange({ ...mapping, listedModels: defaultForcedModelMapping().listedModels })}>
+            <RotateCcw />恢复默认列表
+          </Button>
+        }
+      >
+        <ListedModelsEditor models={mapping.listedModels} onChange={(listedModels) => onChange({ ...mapping, listedModels })} />
+      </SubBlock>
+
+      <SubBlock
         title="单模型覆盖"
         desc="按客户端请求的完整模型 ID 单独指定目标，优先级高于模型族规则。模型名支持点号和横杠写法，保存时统一为小写横杠。"
       >
         <ModelOverridesTable
           overrides={mapping.modelOverrides}
           options={options}
+          sourceOptions={sourceOptions}
           onChange={(modelOverrides) => onChange({ ...mapping, modelOverrides })}
         />
       </SubBlock>

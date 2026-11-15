@@ -519,6 +519,41 @@ export function normalizeModelMapping(config?: Partial<ModelMappingConfig> | nul
 export const FORCED_MODEL_FAMILIES: ForcedModelFamily[] = ['opus', 'fable', 'mythos', 'sonnet', 'haiku']
 export const DEFAULT_FORCED_SONNET_TARGET = 'claude-sonnet-4-5'
 export const DEFAULT_FORCED_HAIKU_TARGET = 'claude-haiku-4-5'
+export const DEFAULT_FORCED_LISTED_MODELS = [
+  'claude-3-5-sonnet-20241022',
+  'claude-3-5-sonnet-20240620',
+  'claude-3-5-haiku-20241022',
+  'claude-3-7-sonnet-20250219',
+  'claude-sonnet-4-20250514',
+  'claude-opus-4-20250514',
+  'claude-opus-4-1-20250805',
+  'claude-sonnet-4-5-20250929',
+  'claude-haiku-4-5-20251001',
+  'claude-opus-4-5-20251101',
+  'claude-opus-4-6',
+  'claude-opus-4-7',
+  'claude-opus-4-8',
+  'claude-opus-5',
+  'claude-sonnet-4-6',
+  'claude-sonnet-5',
+  'claude-fable-5-1',
+  'claude-fable-5',
+  'claude-fable-5-2',
+  'claude-haiku-4-5',
+  'claude-haiku-5-5',
+  'claude-opus-4-5',
+  'claude-opus-5-5',
+  'claude-sonnet-4-5',
+  'claude-sonnet-5-5',
+]
+
+export function isForcedListedModel(model: string): boolean {
+  const id = model.trim().toLowerCase().replace(/\./g, '-')
+  if (!/^[a-z0-9\[\]-]{1,200}$/.test(id)) return false
+  const base = id.replace(/\[1m\](?=-thinking$|$)/i, '').replace(/-thinking$/, '')
+  return ['opus', 'sonnet', 'haiku', 'opusplan', 'auto'].includes(base)
+    || (base.startsWith('claude-') && base.slice(7).split('-').some((part) => ['opus', 'sonnet', 'haiku', 'fable', 'mythos'].includes(part)))
+}
 
 /** 后端对退避参数的取值范围（超出时后端会夹紧，前端保存前先按同样范围夹紧）。 */
 export const FORCED_CONTEXT_BACKOFF_LIMITS = {
@@ -554,6 +589,7 @@ export function defaultForcedModelMapping(): ForcedModelMappingConfig {
   return {
     enabled: false,
     rules: defaultForcedModelRules(),
+    listedModels: [...DEFAULT_FORCED_LISTED_MODELS],
     defaultTarget: DEFAULT_FORCED_HAIKU_TARGET,
     pathOverrides: {},
     modelOverrides: {},
@@ -656,6 +692,7 @@ export function normalizeForcedModelMapping(input?: Partial<ForcedModelMappingCo
 
   return {
     enabled: input?.enabled === true,
+    listedModels: uniqueLowercase((input?.listedModels ?? base.listedModels).map((model) => model.replace(/\./g, '-'))),
     rules,
     defaultTarget: String(input?.defaultTarget ?? '').trim().toLowerCase() || base.defaultTarget,
     pathOverrides,
@@ -668,6 +705,9 @@ export function normalizeForcedModelMapping(input?: Partial<ForcedModelMappingCo
 
 /** 保存前的校验：后端会静默丢弃不完整的规则，这里改为明确提示，避免用户以为规则已生效。 */
 export function forcedModelMappingError(config: ForcedModelMappingConfig): string | null {
+  for (const model of config.listedModels) {
+    if (!isForcedListedModel(model)) return `对外模型名称无法解析：${model || '空名称'}`
+  }
   for (const [index, rule] of config.rules.entries()) {
     if (rule.families.length === 0) return `强制模型收敛第 ${index + 1} 条规则没有选择模型族`
     if (!rule.target.trim()) return `强制模型收敛第 ${index + 1} 条规则没有填写目标模型`

@@ -12,6 +12,42 @@ use super::config::reported_usage_path_matches;
 
 pub const DEFAULT_FORCED_HAIKU_TARGET: &str = "claude-haiku-4-5";
 
+/// sub2api 的 Claude 列表，加上已有外显型号及 Haiku 5.5 兼容名称。
+pub const DEFAULT_FORCED_LISTED_MODELS: &[&str] = &[
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-sonnet-20240620",
+    "claude-3-5-haiku-20241022",
+    "claude-3-7-sonnet-20250219",
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
+    "claude-opus-4-1-20250805",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-5-20251101",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "claude-fable-5-2",
+    "claude-haiku-4-5",
+    "claude-haiku-5-5",
+    "claude-opus-4-5",
+    "claude-opus-5-5",
+    "claude-sonnet-4-5",
+    "claude-sonnet-5-5",
+];
+
+fn default_listed_models() -> Vec<String> {
+    DEFAULT_FORCED_LISTED_MODELS
+        .iter()
+        .map(|model| (*model).to_string())
+        .collect()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -197,6 +233,9 @@ pub struct ForcedModelMappingConfig {
     /// 规则都没命中的 Claude 模型（含短别名）改发到这里。
     #[serde(default = "default_target")]
     pub default_target: String,
+    /// 强制收敛开启时 /v1/models 公布的名称；不限制请求可用的兼容名称。
+    #[serde(default = "default_listed_models")]
+    pub listed_models: Vec<String>,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, ForcedModelRouteOverride>,
     /// 单个外显模型的精确覆盖，优先于模型族规则和默认目标。
@@ -218,6 +257,7 @@ impl Default for ForcedModelMappingConfig {
             enabled: false,
             rules: default_rules(),
             default_target: default_target(),
+            listed_models: default_listed_models(),
             path_overrides: BTreeMap::new(),
             model_overrides: BTreeMap::new(),
             context_backoff: ForcedContextBackoffConfig::default(),
@@ -248,6 +288,13 @@ impl ForcedModelMappingConfig {
         if self.default_target.is_empty() {
             self.default_target = default_target();
         }
+        let mut seen = std::collections::BTreeSet::new();
+        self.listed_models = self
+            .listed_models
+            .into_iter()
+            .map(|model| model.trim().to_ascii_lowercase().replace('.', "-"))
+            .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+            .collect();
         self.path_overrides = self
             .path_overrides
             .into_iter()
@@ -338,6 +385,27 @@ mod tests {
         let config: ForcedModelMappingConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
         assert!(config.enabled);
         assert_eq!(config.rules, default_rules());
+    }
+
+    #[test]
+    fn listed_models_migrate_normalize_and_preserve_explicit_empty() {
+        let old: ForcedModelMappingConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(old.listed_models, default_listed_models());
+        assert_eq!(old.listed_models.len(), 25);
+        let config: ForcedModelMappingConfig = serde_json::from_str(
+            r#"{"listedModels":[" Claude-Haiku-5.5 ","claude-haiku-5-5","", "claude-opus-4-5-20251101"]}"#,
+        ).unwrap();
+        let config = config.normalized();
+        assert_eq!(
+            config.listed_models,
+            ["claude-haiku-5-5", "claude-opus-4-5-20251101"]
+        );
+        let round_trip: ForcedModelMappingConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(round_trip, config);
+        let empty: ForcedModelMappingConfig =
+            serde_json::from_str(r#"{"listedModels":[]}"#).unwrap();
+        assert!(empty.normalized().listed_models.is_empty());
     }
 
     #[test]
