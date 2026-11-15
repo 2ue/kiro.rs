@@ -13,22 +13,24 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
-        BatchDeleteCredentialsRequest, BatchProxyResourceImportRequest,
-        BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
-        CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
+        AddCredentialRequest, AdminErrorResponse, BatchCreateKiroApiKeysRequest,
+        BatchCredentialImportRequest, BatchDeleteCredentialsRequest,
+        BatchProxyResourceImportRequest, BatchUpdateCredentialsRequest, ClearInFlightRequest,
+        CreateKiroApiKeyRequest, CreateProxyResourceRequest, CreateRequestApiKeyRequest,
+        DeleteKiroApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
         ExportCredentialsQuery, ExternalPoolTestRequest, KiroVersionApplyRequest,
-        KiroVersionPinRequest, PromptInjectionPreviewBody, ProxyResourceTestRequest,
-        RefreshCredentialInfoRequest, ResetRequestKeyUsageRequest, SetCredentialConcurrencyRequest,
-        SetCredentialFastRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
-        SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
-        SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetSubscriptionModelListRequest,
-        SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse, SyncModelCapabilitiesRequest,
-        SyncProfileArnRequest, SyncSubscriptionModelListRequest, SystemVersionResponse,
-        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
+        KiroVersionPinRequest, ListKiroApiKeysRequest, PromptInjectionPreviewBody,
+        ProxyResourceTestRequest, RefreshCredentialInfoRequest, ResetRequestKeyUsageRequest,
+        SetCredentialConcurrencyRequest, SetCredentialFastRequest, SetCredentialOverageRequest,
+        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+        SetCredentialRegionsRequest, SetCredentialRoutePolicyRequest, SetCredentialRpmRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
+        SuccessResponse, SyncModelCapabilitiesRequest, SyncProfileArnRequest,
+        SyncSubscriptionModelListRequest, SystemVersionResponse, TestCredentialRequest,
+        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+        UsageCleanupRequest, UsageCleanupResumeRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -1072,6 +1074,60 @@ pub async fn add_credential(
 ) -> impl IntoResponse {
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/kiro-api-key
+/// 为单个 OAuth 账号创建 Kiro 官方 API Key。
+pub async fn create_kiro_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateKiroApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.create_kiro_api_key(payload).await {
+        Ok(response) => ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/kiro-api-keys/batch
+/// 串行批量创建 Kiro 官方 API Key，已有 API Key 的账号由服务端跳过。
+pub async fn batch_create_kiro_api_keys(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchCreateKiroApiKeysRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_create_kiro_api_keys(payload).await {
+        Ok(response) => ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn list_kiro_api_keys(
+    State(state): State<AdminState>,
+    Json(payload): Json<ListKiroApiKeysRequest>,
+) -> impl IntoResponse {
+    match state.service.list_kiro_api_keys(payload).await {
+        Ok(response) => ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn save_kiro_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::storage::kiro_api_keys::StoredKiroApiKey>,
+) -> impl IntoResponse {
+    match state.service.save_kiro_api_key(payload).await {
+        Ok(response) => ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn delete_kiro_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<DeleteKiroApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.delete_kiro_api_key(payload).await {
+        Ok(()) => Json(SuccessResponse::new("官方 Key 已删除")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

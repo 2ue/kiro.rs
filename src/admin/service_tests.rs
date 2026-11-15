@@ -2161,3 +2161,54 @@ fn degrade_settings_keep_current_values_and_clamp_bad_input() {
     assert_eq!(clamped.empty_turn_weight, 100.0);
     assert_eq!(clamped.stream_weight, 0.0);
 }
+
+#[tokio::test]
+async fn official_kiro_key_batch_skips_key_accounts_and_continues_after_failure() {
+    let accounts = HashMap::from([
+        (1, (None, true)),
+        (2, (Some("failed@example.invalid".to_string()), false)),
+        (3, (None, false)),
+    ]);
+    let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let response =
+        run_kiro_api_key_batch(vec![1, 2, 99, 3], "batch", &accounts, move |id, label| {
+            recorded.lock().push(id);
+            async move {
+                if id == 2 {
+                    return Err(AdminServiceError::UpstreamError("HTTP 429".to_string()));
+                }
+                Ok(CreateKiroApiKeyItem {
+                    key: crate::storage::kiro_api_keys::StoredKiroApiKey {
+                        credential_id: id,
+                        key_id: "key-id".to_string(),
+                        label,
+                        api_key: "ksk_full_test_value".to_string(),
+                        key_prefix: "ksk_full".to_string(),
+                        region: "us-east-1".to_string(),
+                        profile_arn: "profile".to_string(),
+                        created_at: 1786856404260,
+                    },
+                    email: None,
+                    persisted: true,
+                    warning: None,
+                })
+            }
+        })
+        .await;
+    assert_eq!(*calls.lock(), vec![2, 3]);
+    assert_eq!(
+        (
+            response.total,
+            response.success,
+            response.skipped,
+            response.failed
+        ),
+        (4, 1, 1, 2)
+    );
+    assert!(response.items[0].skipped);
+    assert!(!response.items[1].ok);
+    assert!(!response.items[2].ok);
+    assert_eq!(response.keys[0].key.credential_id, 3);
+    assert_eq!(response.keys[0].key.label, "batch-3");
+}

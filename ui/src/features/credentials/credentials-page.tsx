@@ -4,6 +4,7 @@ import {
   Download,
   Filter,
   Fingerprint,
+  KeyRound,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -100,6 +101,7 @@ import {
   BatchEditCredentialsModal,
   BatchVerifyModal,
   CredentialExportModal,
+  KiroApiKeyModal,
   CredentialTestModal,
   type VerifyResult,
 } from './credential-dialogs'
@@ -246,6 +248,7 @@ export function CredentialsPage() {
   const [batchOpen, setBatchOpen] = useState(false)
   const [batchEditOpen, setBatchEditOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
+  const [kiroApiKeyOpen, setKiroApiKeyOpen] = useState(false)
   const [verifyOpen, setVerifyOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
@@ -325,7 +328,7 @@ export function CredentialsPage() {
     }
   )
   const allCredentials = useCredentials({
-    enabled: batchOpen || creditDetailsOpen || queryingCreditInfo,
+    enabled: batchOpen || creditDetailsOpen || queryingCreditInfo || kiroApiKeyOpen,
     refetchInterval: false,
   })
   const credentialSummary = useCredentialSummary()
@@ -972,6 +975,9 @@ export function CredentialsPage() {
             <Button variant="outline" size="sm" onClick={() => setExportOpen(true)}>
               <Download className="h-4 w-4" /><span className="hidden sm:inline">导出</span>
             </Button>
+            <Button variant="outline" size="sm" onClick={() => setKiroApiKeyOpen(true)}>
+              <KeyRound className="h-4 w-4" /><span className="hidden sm:inline">官方 Key 管理</span>
+            </Button>
             <Button size="sm" onClick={() => setAddOpen(true)}>
               <Plus className="h-4 w-4" />添加账号
             </Button>
@@ -1514,6 +1520,13 @@ export function CredentialsPage() {
           cooling: credentialSummary.data?.cooling ?? credentialSummary.data?.coolingDown,
           disabled: credentialSummary.data ? disabledCount : undefined,
         }}
+      />
+      <KiroApiKeyModal
+        open={kiroApiKeyOpen}
+        credentials={selectedIds.size > 0 ? selectedCredentials : (allCredentials.data?.credentials || [])}
+        loading={selectedIds.size === 0 && allCredentials.isFetching}
+        loadError={selectedIds.size === 0 && allCredentials.error ? extractErrorMessage(allCredentials.error) : undefined}
+        onClose={() => setKiroApiKeyOpen(false)}
       />
       <BatchVerifyModal
         open={verifyOpen}

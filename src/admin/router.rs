@@ -12,14 +12,14 @@ use tower_http::compression::{
 use super::{
     capture_handlers::{download_capture, get_capture_overview, start_capture, stop_capture},
     handlers::{
-        add_credential, apply_kiro_client_version, batch_delete_credentials,
-        batch_import_credentials, batch_update_credentials, cancel_usage_cleanup,
-        check_kiro_client_version, clear_credential_in_flight, clear_external_pool_auto_disabled,
-        clear_external_pool_cooldown, clear_usage_records, create_external_pool,
-        create_proxy_resource, create_request_api_key, delete_credential,
-        delete_disabled_credentials, delete_external_pool, delete_manual_model,
-        delete_proxy_resource, delete_request_api_key, discover_credential_supported_models,
-        discover_external_pool_supported_models,
+        add_credential, apply_kiro_client_version, batch_create_kiro_api_keys,
+        batch_delete_credentials, batch_import_credentials, batch_update_credentials,
+        cancel_usage_cleanup, check_kiro_client_version, clear_credential_in_flight,
+        clear_external_pool_auto_disabled, clear_external_pool_cooldown, clear_usage_records,
+        create_external_pool, create_kiro_api_key, create_proxy_resource, create_request_api_key,
+        delete_credential, delete_disabled_credentials, delete_external_pool, delete_kiro_api_key,
+        delete_manual_model, delete_proxy_resource, delete_request_api_key,
+        discover_credential_supported_models, discover_external_pool_supported_models,
         discover_external_pool_supported_models_from_request, export_credentials,
         force_refresh_token, get_access_keys, get_account_event_summary, get_all_credentials,
         get_audit_logs, get_credential_balance, get_credential_credit_summary,
@@ -36,11 +36,12 @@ use super::{
         get_usage_dashboard_overview_rankings, get_usage_dashboard_overview_series,
         get_usage_dashboard_overview_summary, get_usage_dashboard_series, get_usage_dashboard_top,
         get_usage_dashboard_windows, get_usage_records, get_usage_records_page, get_usage_summary,
-        get_usage_writer_stats, import_proxy_resources, pin_kiro_client_version,
-        preview_prompt_injection, preview_usage_cleanup, refresh_credentials_info,
-        reset_failure_count, reset_request_key_usage, resume_usage_cleanup,
-        rollback_kiro_client_version, set_credential_concurrency, set_credential_disabled,
-        set_credential_fast, set_credential_overage, set_credential_priority, set_credential_proxy,
+        get_usage_writer_stats, import_proxy_resources, list_kiro_api_keys,
+        pin_kiro_client_version, preview_prompt_injection, preview_usage_cleanup,
+        refresh_credentials_info, reset_failure_count, reset_request_key_usage,
+        resume_usage_cleanup, rollback_kiro_client_version, save_kiro_api_key,
+        set_credential_concurrency, set_credential_disabled, set_credential_fast,
+        set_credential_overage, set_credential_priority, set_credential_proxy,
         set_credential_rate_limit_auto_disable, set_credential_regions,
         set_credential_route_policy, set_credential_rpm, set_credential_supported_models,
         set_credential_warmup, set_external_pool_enabled, set_external_pool_supported_models,
@@ -87,6 +88,17 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/import", post(batch_import_credentials))
+        .route("/credentials/kiro-api-key", post(create_kiro_api_key))
+        .route("/credentials/kiro-api-keys/list", post(list_kiro_api_keys))
+        .route("/credentials/kiro-api-keys/save", post(save_kiro_api_key))
+        .route(
+            "/credentials/kiro-api-keys/delete",
+            post(delete_kiro_api_key),
+        )
+        .route(
+            "/credentials/kiro-api-keys/batch",
+            post(batch_create_kiro_api_keys),
+        )
         .route("/inventory", get(inventory_http::list))
         .route("/inventory/import", post(inventory_http::import))
         .route("/inventory/check", post(inventory_http::check))

@@ -644,6 +644,48 @@ export interface AddCredentialResponse {
   warning?: string
 }
 
+export interface CreateKiroApiKeyRequest {
+  credentialId: number
+  label: string
+}
+
+export interface CreateKiroApiKeyItem {
+  keyId: string
+  keyPrefix: string
+  profileArn: string
+  persisted: boolean
+  warning?: string
+  credentialId: number
+  email?: string | null
+  label: string
+  apiKey: string
+  region: string
+  createdAt: number
+}
+
+export interface BatchCreateKiroApiKeysRequest {
+  credentialIds?: number[]
+  labelPrefix?: string
+}
+
+export interface BatchCreateKiroApiKeyItem {
+  credentialId: number
+  email?: string | null
+  ok: boolean
+  skipped: boolean
+  result?: CreateKiroApiKeyItem
+  error?: string
+}
+
+export interface BatchCreateKiroApiKeysResponse {
+  total: number
+  success: number
+  skipped: number
+  failed: number
+  items: BatchCreateKiroApiKeyItem[]
+  keys: CreateKiroApiKeyItem[]
+}
+
 export interface TestCredentialRequest {
   model: string
   prompt?: string

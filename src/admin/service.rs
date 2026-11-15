@@ -16,35 +16,38 @@ use sha2::{Digest, Sha256};
 use super::error::AdminServiceError;
 use super::types::{
     AccessKeysResponse, AddCredentialRequest, AddCredentialResponse,
-    AuxiliaryUpstreamRuntimeResponse, BalanceResponse, BatchCredentialImportDefaults,
+    AuxiliaryUpstreamRuntimeResponse, BalanceResponse, BatchCreateKiroApiKeyItem,
+    BatchCreateKiroApiKeysRequest, BatchCreateKiroApiKeysResponse, BatchCredentialImportDefaults,
     BatchCredentialImportDuplicateMode, BatchCredentialImportItem, BatchCredentialImportRequest,
     BatchCredentialImportResponse, BatchDeleteCredentialsRequest, BatchProxyResourceImportItem,
     BatchProxyResourceImportRequest, BatchProxyResourceImportResponse, BatchUpdateCredentialItem,
     BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, BulkCredentialActionError,
-    BulkCredentialActionResponse, ClearInFlightRequest, CreateProxyResourceRequest,
-    CreateRequestApiKeyRequest, CredentialAccountInfo, CredentialAccountInfoItem,
-    CredentialAccountInfoListResponse, CredentialCooldown, CredentialCreditSummaryResponse,
-    CredentialDiagnosticsResponse, CredentialInfoRefreshItem, CredentialInfoRefreshResponse,
-    CredentialListItem, CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse,
-    CredentialStatusItem, CredentialSummaryResponse, CredentialUsageSummaryItem,
-    CredentialUsageSummaryResponse, CredentialsPageResponse, CredentialsStatusResponse,
-    DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest, LoadBalancingModeResponse,
-    ManualModelResponse, ProfileArnSyncItem, ProfileArnSyncMode, ProfileArnSyncResponse,
-    ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse, ProxyResourceImportEntry,
-    ProxyResourceResponse, ProxyResourceTestRequest, ProxyResourceTestResponse,
-    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem,
-    RequestKeyUsageLimitItem, RequestKeyUsageLimitsResponse, RuntimeConfigResponse,
-    SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
-    SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
-    SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
-    SetSubscriptionModelListRequest, SetSupportedModelsRequest, SetWarmupRequest,
-    SubscriptionModelListItem, SubscriptionModelListsResponse, SupportedModelsResponse,
-    SyncProfileArnRequest, SyncSubscriptionModelListRequest, TestCredentialRequest,
-    TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest,
-    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
-    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupResumeRequest,
-    UsageCleanupStatusResponse, UsageDashboardAccountItem, UsageDashboardAccountsResponse,
+    BulkCredentialActionResponse, ClearInFlightRequest, CreateKiroApiKeyItem,
+    CreateKiroApiKeyRequest, CreateProxyResourceRequest, CreateRequestApiKeyRequest,
+    CredentialAccountInfo, CredentialAccountInfoItem, CredentialAccountInfoListResponse,
+    CredentialCooldown, CredentialCreditSummaryResponse, CredentialDiagnosticsResponse,
+    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialListItem,
+    CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
+    CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
+    CredentialsPageResponse, CredentialsStatusResponse, DeleteKiroApiKeyRequest,
+    DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest, ListKiroApiKeysRequest,
+    LoadBalancingModeResponse, ManualModelResponse, ProfileArnSyncItem, ProfileArnSyncMode,
+    ProfileArnSyncResponse, ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse,
+    ProxyResourceImportEntry, ProxyResourceResponse, ProxyResourceTestRequest,
+    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
+    RequestApiKeyItem, RequestKeyUsageLimitItem, RequestKeyUsageLimitsResponse,
+    RuntimeConfigResponse, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
+    SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+    SetCredentialRegionsRequest, SetCredentialRoutePolicyRequest, SetCredentialRpmRequest,
+    SetLoadBalancingModeRequest, SetSubscriptionModelListRequest, SetSupportedModelsRequest,
+    SetWarmupRequest, SubscriptionModelListItem, SubscriptionModelListsResponse,
+    SupportedModelsResponse, SyncProfileArnRequest, SyncSubscriptionModelListRequest,
+    TestCredentialRequest, TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse,
+    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupResumeRequest, UsageCleanupStatusResponse, UsageDashboardAccountItem,
+    UsageDashboardAccountsResponse,
 };
 use crate::anthropic::request_key_limits::{
     KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
@@ -109,6 +112,77 @@ use crate::storage::postgres::{
     ProxyResourceRow, UpdateProxyResourceRow, UsageCleanupJobProgress, UsageCleanupJobRow,
 };
 use crate::storage::redis_cache::{RedisPatternDeleteStats, RedisStore};
+
+async fn run_kiro_api_key_batch<F, Fut>(
+    ids: Vec<u64>,
+    prefix: &str,
+    accounts: &HashMap<u64, (Option<String>, bool)>,
+    mut create: F,
+) -> BatchCreateKiroApiKeysResponse
+where
+    F: FnMut(u64, String) -> Fut,
+    Fut: std::future::Future<Output = Result<CreateKiroApiKeyItem, AdminServiceError>>,
+{
+    let total = ids.len();
+    let mut items = Vec::with_capacity(total);
+    let mut keys = Vec::new();
+    for id in ids {
+        let (email, is_api_key) = match accounts.get(&id) {
+            Some(account) => account.clone(),
+            None => {
+                items.push(BatchCreateKiroApiKeyItem {
+                    credential_id: id,
+                    email: None,
+                    ok: false,
+                    skipped: false,
+                    result: None,
+                    error: Some(AdminServiceError::NotFound { id }.to_string()),
+                });
+                continue;
+            }
+        };
+        if is_api_key {
+            items.push(BatchCreateKiroApiKeyItem {
+                credential_id: id,
+                email,
+                ok: true,
+                skipped: true,
+                result: None,
+                error: Some("账号本身已经是 Kiro API Key，已跳过".to_string()),
+            });
+            continue;
+        }
+        match create(id, format!("{prefix}-{id}")).await {
+            Ok(result) => {
+                keys.push(result.clone());
+                items.push(BatchCreateKiroApiKeyItem {
+                    credential_id: id,
+                    email,
+                    ok: true,
+                    skipped: false,
+                    result: Some(result),
+                    error: None,
+                });
+            }
+            Err(error) => items.push(BatchCreateKiroApiKeyItem {
+                credential_id: id,
+                email,
+                ok: false,
+                skipped: false,
+                result: None,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    BatchCreateKiroApiKeysResponse {
+        total,
+        success: keys.len(),
+        skipped: items.iter().filter(|item| item.skipped).count(),
+        failed: items.iter().filter(|item| !item.ok).count(),
+        items,
+        keys,
+    }
+}
 
 /// 账号信息缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -3619,6 +3693,327 @@ impl AdminService {
         let auto_discover_supported_models = req.auto_discover_supported_models.unwrap_or(true);
         self.add_credential_with_model_discovery(req, auto_discover_supported_models)
             .await
+    }
+
+    fn credential_email_and_is_api_key(
+        &self,
+        id: u64,
+    ) -> Result<(Option<String>, bool), AdminServiceError> {
+        let entry = self
+            .token_manager
+            .base_snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        Ok((
+            entry.email,
+            entry.api_key_hash.is_some()
+                || entry
+                    .auth_method
+                    .as_deref()
+                    .is_some_and(|method| method.eq_ignore_ascii_case("api_key")),
+        ))
+    }
+
+    async fn create_kiro_api_key_item(
+        &self,
+        credential_id: u64,
+        label: String,
+        email: Option<String>,
+    ) -> Result<CreateKiroApiKeyItem, AdminServiceError> {
+        if label.trim().is_empty() || label.trim().chars().count() > 64 {
+            return Err(AdminServiceError::InvalidCredential(
+                "密钥名称须为 1–64 个字符".to_string(),
+            ));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::storage::kiro_api_keys::check_available(self.postgres_store.pool()),
+        )
+        .await
+        .map_err(|_| {
+            AdminServiceError::InternalError("官方 Key 存储不可用，未发起创建".to_string())
+        })?
+        .map_err(|_| {
+            AdminServiceError::InternalError("官方 Key 存储不可用，未发起创建".to_string())
+        })?;
+        let created = self
+            .kiro_provider
+            .create_kiro_api_key_for_credential(credential_id, &label)
+            .await
+            .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+        let key = crate::storage::kiro_api_keys::StoredKiroApiKey {
+            credential_id,
+            key_id: created.key_id,
+            api_key: created.api_key,
+            label: created.label,
+            key_prefix: created.key_prefix,
+            region: created.region,
+            profile_arn: created.profile_arn,
+            created_at: created.created_at,
+        };
+        Ok(self.persist_kiro_api_key_result(key, email).await)
+    }
+
+    async fn persist_kiro_api_key_result(
+        &self,
+        key: crate::storage::kiro_api_keys::StoredKiroApiKey,
+        email: Option<String>,
+    ) -> CreateKiroApiKeyItem {
+        let saved = if key.key_id.trim().is_empty() {
+            false
+        } else {
+            matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::storage::kiro_api_keys::save(self.postgres_store.pool(), &key)
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        };
+        let warning = if saved {
+            None
+        } else {
+            Some(if key.key_id.trim().is_empty() {
+                "官方 Key 已创建，但上游缺少 Key ID，无法保存管理；请立即导出，并在官方控制台管理删除".to_string()
+            } else {
+                "官方 Key 已创建但保存失败；请立即导出或重试保存，勿重复创建".to_string()
+            })
+        };
+        CreateKiroApiKeyItem {
+            key,
+            email,
+            persisted: saved,
+            warning,
+        }
+    }
+
+    pub async fn save_kiro_api_key(
+        &self,
+        key: crate::storage::kiro_api_keys::StoredKiroApiKey,
+    ) -> Result<CreateKiroApiKeyItem, AdminServiceError> {
+        let (email, is_key) = self.credential_email_and_is_api_key(key.credential_id)?;
+        if is_key
+            || key.key_id.trim().is_empty()
+            || key.key_id.len() > 512
+            || !key.api_key.starts_with("ksk_")
+            || key.api_key.len() <= 4
+            || key.api_key.len() > 8192
+            || !matches!(key.region.as_str(), "us-east-1" | "eu-central-1")
+            || key.profile_arn.len() > 2048
+            || key.label.chars().count() > 64
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "无效的官方 Key 保存记录或来源账号".to_string(),
+            ));
+        }
+        Ok(self.persist_kiro_api_key_result(key, email).await)
+    }
+
+    pub async fn list_kiro_api_keys(
+        &self,
+        req: ListKiroApiKeysRequest,
+    ) -> Result<Vec<CreateKiroApiKeyItem>, AdminServiceError> {
+        let requested = req.credential_ids.into_iter().collect::<HashSet<_>>();
+        let accounts = self
+            .token_manager
+            .base_snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                (requested.is_empty() || requested.contains(&entry.id))
+                    && entry.api_key_hash.is_none()
+                    && !entry
+                        .auth_method
+                        .as_deref()
+                        .is_some_and(|method| method.eq_ignore_ascii_case("api_key"))
+            })
+            .map(|entry| (entry.id, entry.email))
+            .collect::<HashMap<_, _>>();
+        let ids = accounts.keys().copied().collect::<Vec<_>>();
+        let keys = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::storage::kiro_api_keys::list(self.postgres_store.pool(), &ids, req.offset),
+        )
+        .await
+        .map_err(|_| AdminServiceError::InternalError("读取官方 Key 超时".to_string()))?
+        .map_err(|_| AdminServiceError::InternalError("读取官方 Key 失败".to_string()))?;
+        Ok(keys
+            .into_iter()
+            .map(|key| CreateKiroApiKeyItem {
+                email: accounts.get(&key.credential_id).cloned().flatten(),
+                key,
+                persisted: true,
+                warning: None,
+            })
+            .collect())
+    }
+
+    pub async fn delete_kiro_api_key(
+        &self,
+        req: DeleteKiroApiKeyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let (_, is_key) = self.credential_email_and_is_api_key(req.credential_id)?;
+        if is_key {
+            return Err(AdminServiceError::InvalidCredential(
+                "API Key 导入账号不能管理官方 Key".to_string(),
+            ));
+        }
+        let key = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::storage::kiro_api_keys::get(
+                self.postgres_store.pool(),
+                req.credential_id,
+                &req.key_id,
+            ),
+        )
+        .await
+        .map_err(|_| AdminServiceError::InternalError("读取官方 Key 超时".to_string()))?
+        .map_err(|_| AdminServiceError::InternalError("读取官方 Key 失败".to_string()))?;
+        let Some(key) = key else {
+            return Ok(());
+        };
+        self.kiro_provider
+            .delete_kiro_api_key_for_credential(
+                req.credential_id,
+                &key.key_id,
+                &key.region,
+                &key.profile_arn,
+            )
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::storage::kiro_api_keys::remove(
+                self.postgres_store.pool(),
+                req.credential_id,
+                &req.key_id,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            AdminServiceError::InternalError(
+                "官方 Key 已撤销，本地清理超时，请重试删除".to_string(),
+            )
+        })?
+        .map_err(|_| {
+            AdminServiceError::InternalError(
+                "官方 Key 已撤销，本地清理失败，请重试删除".to_string(),
+            )
+        })?;
+        self.audit(
+            "delete_kiro_api_key",
+            "credential",
+            Some(req.credential_id.to_string()),
+            true,
+            None,
+            json!({"label":key.label,"region":key.region}),
+        );
+        Ok(())
+    }
+
+    /// 为单个 OAuth 账号创建一个 Kiro 官方 API Key。
+    pub async fn create_kiro_api_key(
+        &self,
+        req: CreateKiroApiKeyRequest,
+    ) -> Result<CreateKiroApiKeyItem, AdminServiceError> {
+        let (email, is_api_key) = self.credential_email_and_is_api_key(req.credential_id)?;
+        if is_api_key {
+            return Err(AdminServiceError::InvalidCredential(
+                "该账号本身已经是 Kiro API Key".to_string(),
+            ));
+        }
+        let result = self
+            .create_kiro_api_key_item(req.credential_id, req.label, email)
+            .await?;
+        self.audit(
+            "create_kiro_api_key",
+            "credential",
+            Some(req.credential_id.to_string()),
+            true,
+            None,
+            json!({ "region": result.key.region, "label": result.key.label, "persisted": result.persisted }),
+        );
+        Ok(result)
+    }
+
+    /// 串行批量创建官方 API Key。已是 API Key 的账号会记录为 skipped，
+    /// 单个账号失败只影响该条，继续处理后续账号。
+    pub async fn batch_create_kiro_api_keys(
+        &self,
+        req: BatchCreateKiroApiKeysRequest,
+    ) -> Result<BatchCreateKiroApiKeysResponse, AdminServiceError> {
+        let snapshot = self.token_manager.base_snapshot();
+        let mut ids = if req.credential_ids.is_empty() {
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        } else {
+            req.credential_ids
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "没有可创建官方 API Key 的账号".to_string(),
+            ));
+        }
+        if ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多创建 {} 个官方 API Key",
+                MAX_CREDENTIALS_PAGE_LIMIT
+            )));
+        }
+
+        let prefix = req
+            .label_prefix
+            .filter(|prefix| !prefix.trim().is_empty())
+            .unwrap_or_else(|| "kiro-key".to_string())
+            .trim()
+            .to_string();
+        if prefix.chars().count() > 43 {
+            return Err(AdminServiceError::InvalidCredential(
+                "密钥名称前缀不能超过 43 个字符".to_string(),
+            ));
+        }
+
+        let accounts = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let is_api_key = entry.api_key_hash.is_some()
+                    || entry
+                        .auth_method
+                        .as_deref()
+                        .is_some_and(|method| method.eq_ignore_ascii_case("api_key"));
+                (entry.id, (entry.email, is_api_key))
+            })
+            .collect::<HashMap<_, _>>();
+        let response = run_kiro_api_key_batch(ids, &prefix, &accounts, |id, label| {
+            let email = accounts.get(&id).and_then(|(email, _)| email.clone());
+            self.create_kiro_api_key_item(id, label, email)
+        })
+        .await;
+        let BatchCreateKiroApiKeysResponse {
+            total,
+            success,
+            skipped,
+            failed,
+            ..
+        } = &response;
+        self.audit(
+            "batch_create_kiro_api_keys",
+            "credential",
+            None,
+            *failed == 0,
+            (*failed > 0).then(|| format!("{} 条创建失败", failed)),
+            json!({ "total": total, "success": success, "skipped": skipped, "failed": failed }),
+        );
+        Ok(response)
     }
 
     async fn add_credential_with_model_discovery(

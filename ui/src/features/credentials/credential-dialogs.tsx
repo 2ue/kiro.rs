@@ -7,9 +7,14 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
+  batchCreateKiroApiKeys,
+  createKiroApiKey,
+  listKiroApiKeys,
+  deleteKiroApiKey,
+  saveKiroApiKey,
   exportCredentials,
   getCredentialBalance,
   getRouteScenarioOptions,
@@ -34,6 +39,7 @@ import {
 import { Field, FieldGrid, ModalShell } from '@/components/patterns'
 import { parseImportText, readImportFiles } from '@/lib/credential-import/sources'
 import { resolveCredentialAuthMethod } from '@/lib/credential-auth'
+import { isKiroApiKeyAccount, runKiroApiKeyBatch, serializeKiroApiKeys, type KiroKeyExportFormat } from '@/lib/kiro-api-keys'
 import {
   buildTestModelOptions,
   defaultTestModelForOptions,
@@ -46,12 +52,14 @@ import { useAddCredential, useBatchUpdateCredentials, useCredentials, useProxyRe
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
   AddCredentialRequest,
+  BatchCreateKiroApiKeysResponse,
   BatchCredentialImportDefaults,
   BatchUpdateCredentialsRequest,
   CredentialExportFilter,
   CredentialExportFormat,
   CredentialExportScope,
   CredentialStatusItem,
+  CreateKiroApiKeyItem,
   ExternalPoolRouteMode,
   ProxyResource,
   TestCredentialResponse,
@@ -613,6 +621,286 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           <Button type="submit" size="sm" disabled={add.isPending}>{add.isPending && <Spinner size="sm" />}添加</Button>
         </div>
       </form>
+    </ModalShell>
+  )
+}
+
+function downloadKiroApiKeys(keys: CreateKiroApiKeyItem[], format: KiroKeyExportFormat): void {
+  const content = serializeKiroApiKeys(keys, format)
+  const blob = new Blob([content], { type: format === 'json' ? 'application/json;charset=utf-8' : format === 'csv' ? 'text/csv;charset=utf-8' : 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `kiro-official-api-keys-${new Date().toISOString().replace(/[:.]/g, '-')}.${format === 'json' || format === 'csv' ? format : 'txt'}`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+/** 官方 Key 与来源 OAuth 账号关联保存，来源账号的认证方式保持不变。 */
+export function KiroApiKeyModal({
+  open,
+  credentials,
+  loading,
+  loadError,
+  onClose,
+}: {
+  open: boolean
+  credentials: CredentialStatusItem[]
+  loading: boolean
+  loadError?: string
+  onClose: () => void
+}) {
+  const queryClient = useQueryClient()
+  const [mode, setMode] = useState<'single' | 'batch'>('batch')
+  const [singleId, setSingleId] = useState('')
+  const [label, setLabel] = useState('kiro-key')
+  const [labelPrefix, setLabelPrefix] = useState('kiro-key')
+  const [running, setRunning] = useState(false)
+  const [keys, setKeys] = useState<CreateKiroApiKeyItem[]>([])
+  const [exportFormat, setExportFormat] = useState<KiroKeyExportFormat>('txt')
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [managing, setManaging] = useState(false)
+  const [summary, setSummary] = useState<BatchCreateKiroApiKeysResponse | null>(null)
+  const [progress, setProgress] = useState({ current: 0, total: 0 })
+  const [stopping, setStopping] = useState(false)
+  const runningRef = useRef(false)
+  const stopRef = useRef(false)
+  const initializedRef = useRef(false)
+
+  const oauthCredentials = useMemo(
+    () => credentials.filter((credential) => !isKiroApiKeyAccount(credential)),
+    [credentials],
+  )
+
+  const scopeIds = oauthCredentials.map((credential) => credential.id).sort((a, b) => a - b)
+  const scopeKey = scopeIds.join(',')
+  const scopeSet = useMemo(() => new Set(scopeKey.split(',').filter(Boolean).map(Number)), [scopeKey])
+  const storedKeys = useQuery({
+    queryKey: ['kiro-official-keys', scopeKey],
+    enabled: open && !loading && scopeIds.length > 0,
+    queryFn: async () => {
+      const records: CreateKiroApiKeyItem[] = []
+      for (let offset = 0; ; offset += 500) {
+        const page = await listKiroApiKeys(scopeIds, offset)
+        records.push(...page)
+        if (page.length < 500) return records
+      }
+    },
+    refetchOnWindowFocus: false,
+    staleTime: 0,
+  })
+  const availableKeys = useMemo(() => {
+    const merged = new Map<string, CreateKiroApiKeyItem>()
+    for (const key of [...(storedKeys.data || []), ...keys]) {
+      if (scopeSet.has(key.credentialId)) merged.set(`${key.credentialId}:${key.keyId || key.apiKey}`, key)
+    }
+    return [...merged.values()].sort((a, b) => b.createdAt - a.createdAt)
+  }, [storedKeys.data, keys, scopeSet])
+  const visibleKeys = mode === 'single' ? availableKeys.filter((key) => key.credentialId === Number(singleId)) : availableKeys
+
+  const manageKey = async (key: CreateKiroApiKeyItem, remove: boolean) => {
+    if (runningRef.current || managing) return
+    setManaging(true)
+    try {
+      if (remove) {
+        await deleteKiroApiKey(key.credentialId, key.keyId)
+        setKeys((previous) => previous.filter((item) => item.credentialId !== key.credentialId || item.keyId !== key.keyId))
+        queryClient.setQueryData<CreateKiroApiKeyItem[]>(['kiro-official-keys', scopeKey], (previous) =>
+          previous?.filter((item) => item.credentialId !== key.credentialId || item.keyId !== key.keyId))
+        setPendingDelete(null)
+        toast.success('官方 Key 已撤销')
+      } else {
+        const result = await saveKiroApiKey(key)
+        setKeys((previous) => previous.map((item) => item === key ? result : item))
+        if (result.warning) toast.warning(result.warning)
+        else toast.success('官方 Key 已保存到账号')
+      }
+      await storedKeys.refetch()
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    } finally { setManaging(false) }
+  }
+
+  useEffect(() => {
+    if (!open) initializedRef.current = false
+    if (open && !runningRef.current) {
+      if (!oauthCredentials.some((credential) => String(credential.id) === singleId)) {
+        setSingleId(oauthCredentials[0] ? String(oauthCredentials[0].id) : '')
+      }
+      if (!loading && !initializedRef.current && credentials.length > 0) {
+        setMode(credentials.length === 1 && oauthCredentials.length === 1 ? 'single' : 'batch')
+        initializedRef.current = true
+      }
+    }
+  }, [open, credentials, oauthCredentials, singleId, loading])
+
+  useEffect(() => () => { stopRef.current = true }, [])
+
+  const close = () => {
+    if (!runningRef.current && !managing) onClose()
+  }
+
+  const run = async () => {
+    if (runningRef.current || loading || managing) return
+    runningRef.current = true
+    stopRef.current = false
+    setRunning(true)
+    setStopping(false)
+    setSummary(null)
+    try {
+      if (mode === 'single') {
+        const id = Number(singleId)
+        if (!Number.isSafeInteger(id) || id <= 0 || !oauthCredentials.some((credential) => credential.id === id)) throw new Error('请选择 OAuth 账号')
+        if (!label.trim()) throw new Error('请输入密钥名称')
+        const result = await createKiroApiKey({ credentialId: id, label: label.trim() })
+        setKeys((previous) => [...previous, result])
+        if (result.warning) toast.warning(result.warning)
+        else toast.success(`账号 #${id} 的官方 Key 已创建并保存`)
+      } else {
+        const ids = credentials.map((credential) => credential.id)
+        if (ids.length === 0) throw new Error('没有可处理的账号')
+        setProgress({ current: 0, total: ids.length })
+        const aggregate: BatchCreateKiroApiKeysResponse = { total: 0, success: 0, skipped: 0, failed: 0, items: [], keys: [] }
+        await runKiroApiKeyBatch(ids, labelPrefix.trim() || 'kiro-key', async (id, prefix) => {
+          try {
+            return await batchCreateKiroApiKeys({ credentialIds: [id], labelPrefix: prefix })
+          } catch (error) {
+            throw new Error(extractErrorMessage(error))
+          }
+        }, (result) => {
+          aggregate.total += result.total
+          aggregate.success += result.success
+          aggregate.skipped += result.skipped
+          aggregate.failed += result.failed
+          aggregate.items.push(...result.items)
+          setKeys((previous) => [...previous, ...result.keys])
+          result.keys.filter((key) => key.warning).forEach((key) => toast.warning(key.warning))
+          setSummary({ ...aggregate, items: [...aggregate.items] })
+          setProgress({ current: aggregate.total, total: ids.length })
+        }, () => stopRef.current)
+        const message = `${stopRef.current ? '已停止' : '批量创建完成'}：成功 ${aggregate.success}，跳过 ${aggregate.skipped}，失败 ${aggregate.failed}`
+        if (aggregate.failed === 0) toast.success(message)
+        else toast.warning(message)
+      }
+    } catch (error) {
+      toast.error(`创建官方 Key 失败: ${extractErrorMessage(error)}`)
+    } finally {
+      runningRef.current = false
+      setRunning(false)
+      const refreshed = scopeIds.length > 0 ? await storedKeys.refetch() : null
+      if (refreshed?.isSuccess) {
+        const saved = new Set(refreshed.data.map((key) => `${key.credentialId}:${key.keyId}`))
+        setKeys((previous) => previous.filter((key) => !key.persisted || !saved.has(`${key.credentialId}:${key.keyId}`)))
+      }
+    }
+  }
+
+  return (
+    <ModalShell open={open} title="官方 Key 管理" width="max-w-3xl" onClose={close}>
+      <div className="space-y-4">
+        <div className="rounded-lg bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
+          为 OAuth / JSON 账号新增 Kiro 官方 <span className="font-mono">ksk_...</span> 密钥。生成结果保存在来源账号下，可随时删除和导出；来源账号继续使用原有认证。批量自动跳过 API Key 导入账号。
+        </div>
+        <Field label="创建方式">
+          <Select value={mode} onValueChange={(value) => setMode(value as 'single' | 'batch')} disabled={running}>
+            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="single">单个账号</SelectItem>
+              <SelectItem value="batch">批量账号（{credentials.length} 个，含跳过项）</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        {mode === 'single' ? (
+          <FieldGrid>
+            <Field label="OAuth 账号">
+              <Select value={singleId} onValueChange={setSingleId} disabled={running || oauthCredentials.length === 0}>
+                <SelectTrigger size="sm"><SelectValue placeholder="选择账号" /></SelectTrigger>
+                <SelectContent>
+                  {oauthCredentials.map((credential) => (
+                    <SelectItem key={credential.id} value={String(credential.id)}>
+                      #{credential.id} · {credential.email || '未命名账号'}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field label="密钥名称"><Input value={label} onChange={(event) => setLabel(event.target.value)} disabled={running} maxLength={64} /></Field>
+          </FieldGrid>
+        ) : (
+          <Field label="密钥名称前缀" description="实际名称会自动追加账号 ID，例如 kiro-key-12；API Key 账号仍会跳过。">
+            <Input value={labelPrefix} onChange={(event) => setLabelPrefix(event.target.value)} disabled={running} maxLength={43} />
+          </Field>
+        )}
+
+        {loading && <div className="text-sm text-muted-foreground">正在加载完整账号列表…</div>}
+        {loadError && <div className="text-sm text-destructive">账号列表加载失败：{loadError}。请关闭后重新打开。</div>}
+        {!loading && !loadError && credentials.length === 0 && <div className="text-sm text-muted-foreground">当前没有可处理的账号。</div>}
+        {!loading && mode === 'single' && oauthCredentials.length === 0 && <div className="text-sm text-destructive">当前选择范围内没有 OAuth 账号，无法创建官方 Key。</div>}
+
+        {mode === 'batch' && progress.total > 0 && (
+          <div className="space-y-2 text-xs text-muted-foreground">
+            <div>处理进度：{progress.current} / {progress.total}{stopping && running ? '，当前账号完成后停止' : ''}</div>
+            <Progress value={progress.current / progress.total * 100} />
+          </div>
+        )}
+        {storedKeys.isFetching && <div className="text-xs text-muted-foreground">正在读取已保存的官方 Key…</div>}
+        {storedKeys.isError && <div className="text-sm text-destructive">读取已保存 Key 失败：{extractErrorMessage(storedKeys.error)} <Button variant="outline" size="xs" onClick={() => void storedKeys.refetch()}>重试读取</Button></div>}
+        <div className="space-y-3 rounded-lg border border-border/60 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm font-semibold">{mode === 'single' ? '当前账号' : '当前范围'}的官方 Key（{visibleKeys.length}）</div>
+            <div className="flex flex-wrap gap-2">
+              <Select value={exportFormat} onValueChange={(value) => setExportFormat(value as KiroKeyExportFormat)}>
+                <SelectTrigger size="sm" className="w-52"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="txt">纯 Key（每行一个，默认）</SelectItem>
+                  <SelectItem value="email-txt">邮箱 + Key（制表符分隔）</SelectItem>
+                  <SelectItem value="region-txt">Key + 服务区域</SelectItem>
+                  <SelectItem value="csv">CSV（邮箱及完整信息）</SelectItem>
+                  <SelectItem value="json">JSON（完整信息）</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button variant="outline" size="sm" disabled={visibleKeys.length === 0 || managing} onClick={() => downloadKiroApiKeys(visibleKeys, exportFormat)}><Download className="h-3.5 w-3.5" />导出文件</Button>
+            </div>
+          </div>
+          {visibleKeys.length === 0 && <div className="text-xs text-muted-foreground">暂无关联的官方 Key。</div>}
+          <div className="max-h-72 space-y-2 overflow-auto">
+            {visibleKeys.map((key) => {
+              const identity = `${key.credentialId}:${key.keyId || key.apiKey}`
+              return <div key={identity} className="space-y-2 rounded border border-border/50 p-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>#{key.credentialId} · {key.email || '未填写邮箱'} · {key.label} · {key.region} · {new Date(key.createdAt).toLocaleString()}</div>
+                  {key.persisted ? <div className="flex items-center gap-2">
+                    {pendingDelete === identity && <span className="text-destructive">确认撤销？立即失效。</span>}
+                    <Button variant="outline" size="xs" disabled={running || managing} onClick={() => pendingDelete === identity ? void manageKey(key, true) : setPendingDelete(identity)}>{pendingDelete === identity ? '确认删除' : '删除 Key'}</Button>
+                    {pendingDelete === identity && <Button variant="ghost" size="xs" disabled={managing} onClick={() => setPendingDelete(null)}>取消</Button>}
+                  </div> : <Button variant="outline" size="xs" disabled={running || managing || !key.keyId} onClick={() => void manageKey(key, false)}>重试保存</Button>}
+                </div>
+                {key.warning && <div className="text-destructive">{key.warning}</div>}
+                <details><summary className="cursor-pointer font-mono text-muted-foreground">{key.keyPrefix}… · {key.persisted ? '已保存' : '未保存'} · 展开完整 Key</summary><div className="select-all break-all pt-1 font-mono">{key.apiKey}</div></details>
+              </div>
+            })}
+          </div>
+        </div>
+        {summary && (
+          <div className="max-h-40 space-y-1 overflow-auto text-xs text-muted-foreground">
+            <div>批量结果：成功 {summary.success}，跳过 {summary.skipped}，失败 {summary.failed}</div>
+            {summary.items.filter((item) => item.error).map((item) => (
+              <div key={item.credentialId} className={item.skipped ? 'text-muted-foreground' : 'text-destructive'}>
+                #{item.credentialId}：{item.error}
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex justify-end gap-2 pt-2">
+          {running && mode === 'batch' && <Button type="button" variant="outline" size="sm" disabled={stopping} onClick={() => { stopRef.current = true; setStopping(true) }}>停止后续创建</Button>}
+          <Button type="button" variant="ghost" size="sm" onClick={close} disabled={running}>关闭</Button>
+          <Button type="button" size="sm" onClick={() => void run()} disabled={running || managing || loading || (mode === 'single' ? oauthCredentials.length === 0 || !label.trim() : credentials.length === 0)}>
+            {running && <Spinner size="sm" />}{mode === 'batch' ? '批量创建官方 Key' : '创建官方 Key'}
+          </Button>
+        </div>
+      </div>
     </ModalShell>
   )
 }
