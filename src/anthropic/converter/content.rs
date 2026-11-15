@@ -202,6 +202,41 @@ pub(super) fn process_message_content_with_dedup(
     Ok((text_parts.join("\n"), images, tool_results))
 }
 
+/// Returns whether a message contains an Anthropic document block. The forced-model adapter uses
+/// this only to add an explicit note after the converter has extracted the document text.
+pub(super) fn contains_document_block(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::Array(items) => items.iter().any(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("document")
+                || item.get("content").is_some_and(contains_document_block)
+        }),
+        serde_json::Value::Object(object) => object.values().any(contains_document_block),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod document_detection_tests {
+    use super::contains_document_block;
+    use serde_json::json;
+
+    #[test]
+    fn detects_top_level_and_nested_documents_without_matching_plain_text() {
+        assert!(contains_document_block(&json!([{
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": "x"}
+        }])));
+        assert!(contains_document_block(&json!([{
+            "type": "tool_result",
+            "content": [{"type": "document", "source": {"type": "content"}}]
+        }])));
+        assert!(!contains_document_block(&json!([{
+            "type": "text",
+            "text": "a document is mentioned here"
+        }])));
+    }
+}
+
 /// A `url` image source that is not an inline data URL (i.e. it was not downloaded).
 fn is_remote_image_url_source(source: &ImageSource) -> bool {
     source.source_type == "url"

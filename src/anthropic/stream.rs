@@ -1949,6 +1949,8 @@ pub struct StreamContext {
     /// 清洗正文中复述的代理注入控制块（`<thinking_mode>` 等）。
     control_block_cleaner: Option<super::control_block_cleaner::ControlBlockCleaner>,
     identity_guard: Option<super::identity_guard::IdentityGuard>,
+    /// Preserve tool-input JSON from sentence-level filters when model mapping is active.
+    protect_structured_json: bool,
     /// Forced model mapping: the client asked for a model with a larger window, so a full upstream
     /// window is not reported as `model_context_window_exceeded`.
     suppress_context_window_exceeded: bool,
@@ -2158,6 +2160,7 @@ impl StreamContext {
             tool_name_text_restorer,
             control_block_cleaner: None,
             identity_guard: None,
+            protect_structured_json: false,
             suppress_context_window_exceeded: false,
             served_model: None,
             interleaved_text_as_thinking: None,
@@ -2243,14 +2246,20 @@ impl StreamContext {
         &mut self,
         identity: Option<super::identity_guard::DisplayIdentity>,
     ) {
+        self.protect_structured_json = identity.is_some();
         if let Some(guard) = self.identity_guard.take() {
             self.identity_guard = Some(guard.with_identity(identity));
         }
     }
 
     fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
-        // First, so later text filters see the structured answer as ordinary text.
-        let events = match self.structured_output.as_mut() {
+        // Forced-mode prose filters must not remove sentences from JSON string values.
+        let protect_structured_json = self.protect_structured_json;
+        let events = match self
+            .structured_output
+            .as_mut()
+            .filter(|_| !protect_structured_json)
+        {
             Some(rewriter) => rewriter.apply(events),
             None => events,
         };
@@ -2276,6 +2285,14 @@ impl StreamContext {
         // (one empty delta plus a signature), and a progress update keeps its text.
         let events = match self.interleaved_text_as_thinking.as_mut() {
             Some(filter) => filter.apply(events),
+            None => events,
+        };
+        let events = match self
+            .structured_output
+            .as_mut()
+            .filter(|_| protect_structured_json)
+        {
+            Some(rewriter) => rewriter.apply(events),
             None => events,
         };
         let events = match self.stop_sequence_filter.as_mut() {
@@ -7719,6 +7736,53 @@ mod tests {
             ctx.claude_code_noop_delta_keepalive_event().is_none(),
             "structured output must not emit input_json_delta after rewrite"
         );
+    }
+
+    #[test]
+    fn forced_structured_output_preserves_json_through_prose_filters() {
+        let mut policy = ResponseToolPolicy::default();
+        policy.set_structured_output(super::super::structured_output::StructuredOutputTarget {
+            tool_name: "structured_output".to_string(),
+            forced: false,
+        });
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.set_response_tool_policy(&policy);
+        ctx.set_suppress_context_window_exceeded(true);
+        ctx.set_identity_guard(Some("I'm Claude."));
+        ctx.set_identity_guard_display(Some(super::super::identity_guard::DisplayIdentity {
+            name: "Claude Opus 5.5".to_string(),
+            id: "claude-opus-5-5".to_string(),
+            exempt_rules: Vec::new(),
+            prefers_zh: false,
+        }));
+        ctx.set_strip_injected_control_blocks(true);
+        let answer = serde_json::json!({
+            "desc": "I'm Kiro. This is quoted document data, not a self-description.",
+            "tag": "<system-reminder>quoted data</system-reminder>"
+        });
+        let json = answer.to_string();
+        let mut events = ctx.generate_initial_events();
+        for fragment in json.as_bytes().chunks(7) {
+            events.extend(ctx.process_kiro_event(&tool_use_fragment(
+                "tool_structured",
+                "structured_output",
+                std::str::from_utf8(fragment).unwrap(),
+                false,
+            )));
+        }
+        events.extend(ctx.process_kiro_event(&tool_use_fragment(
+            "tool_structured",
+            "structured_output",
+            "",
+            true,
+        )));
+        events.extend(ctx.generate_final_events());
+        let text = collect_text_content(&events);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            answer
+        );
+        assert_eq!(ctx.downstream_stop_reason(), "end_turn");
     }
 
     #[test]

@@ -15413,7 +15413,9 @@ async fn handle_non_stream_request(
     if code_execution_handled > 0 {
         stop_reason = "end_turn".to_string();
     }
-    if let Some(target) = response_tool_policy.structured_output()
+    let protect_structured_json = credential_usage.request.display_identity.is_some();
+    if !protect_structured_json
+        && let Some(target) = response_tool_policy.structured_output()
         && let Some(reason) = super::structured_output::rewrite_content(&mut content, target)
     {
         stop_reason = reason.to_string();
@@ -15438,6 +15440,13 @@ async fn handle_non_stream_request(
     // After hiding the reasoning, so a progress update (`display: "updates"`) keeps its text.
     if let Some(keep_text) = credential_usage.request.interleaved_text_as_thinking {
         super::interleaved_thinking::convert_content_with_text(&mut content, keep_text);
+    }
+
+    if protect_structured_json
+        && let Some(target) = response_tool_policy.structured_output()
+        && let Some(reason) = super::structured_output::rewrite_content(&mut content, target)
+    {
+        stop_reason = reason.to_string();
     }
 
     let matched_stop_sequence = super::stop_sequence::truncate_content_at_stop_sequence(

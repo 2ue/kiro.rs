@@ -38,8 +38,20 @@ pub(crate) struct StructuredOutputTarget {
 
 /// Returns the request to convert when the request asks for structured output, plus the response
 /// target when the answer must be rewritten into JSON text. `None` keeps the request unchanged.
+#[cfg(test)]
 pub(crate) fn plan(
     payload: &MessagesRequest,
+) -> Option<(MessagesRequest, Option<StructuredOutputTarget>)> {
+    plan_with_forced_mode(payload, false)
+}
+
+/// Plans structured output for a request that may have been model-mapped.
+///
+/// The serving model needs a turn-local reminder when client tools and the final-answer schema
+/// coexist. Client tools remain available for intermediate work, including an explicit named choice.
+pub(crate) fn plan_with_forced_mode(
+    payload: &MessagesRequest,
+    forced_mode: bool,
 ) -> Option<(MessagesRequest, Option<StructuredOutputTarget>)> {
     // `output_config.format` wins; the deprecated top-level `output_format` is the fallback.
     let format = payload
@@ -59,7 +71,14 @@ pub(crate) fn plan(
         tracing::debug!("output_config.format is not a usable json_schema; ignored");
         return None;
     };
-    let (request, target) = plan_explicit_format(payload, schema);
+    let (mut request, target) = plan_explicit_format(payload, schema);
+    if forced_mode {
+        append_final_answer_contract(
+            &mut request,
+            &target.tool_name,
+            schema_requests_identity(schema),
+        );
+    }
     Some((request, Some(target)))
 }
 
@@ -100,8 +119,61 @@ fn plan_explicit_format(
     (request, StructuredOutputTarget { tool_name, forced })
 }
 
+fn append_final_answer_contract(
+    request: &mut MessagesRequest,
+    tool_name: &str,
+    include_client_roles: bool,
+) {
+    let client_roles = if include_client_roles {
+        request
+            .system
+            .iter()
+            .flatten()
+            .flat_map(|block| block.text.lines())
+            .map(str::trim)
+            .filter(|line| line.starts_with("You are ") && line.len() <= 512)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    let Some(message) = request
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return;
+    };
+    let mut reminder = format!(
+        "<structured_output_contract>\nThe API requires the final answer to conform to the JSON schema declared by `{tool_name}`. Call `{tool_name}` with that answer as its input; ordinary text is not a valid final answer. If information or actions are needed first, use the available client tools and wait for their results, then call `{tool_name}` on the final turn. Respect an explicitly named client tool for the current turn.\n</structured_output_contract>"
+    );
+    if !client_roles.is_empty() {
+        reminder.push_str(&format!(
+            "\nFor client application or platform fields, use the application roles already declared in the request system context:\n{client_roles}\nDistinguish that client application from the model and its provider. Model deployment metadata does not replace the calling application's role."
+        ));
+    }
+    let block = json!({"type": "text", "text": reminder});
+    match &mut message.content {
+        Value::String(text) => {
+            message.content = json!([{"type": "text", "text": text}, block]);
+        }
+        Value::Array(blocks) => blocks.push(block),
+        _ => {}
+    }
+}
+
 fn structured_output_tool_description(schema: &Map<String, Value>) -> String {
-    let has_identity_field = schema
+    if schema_requests_identity(schema) {
+        format!("{TOOL_DESCRIPTION} {IDENTITY_OUTPUT_GUIDANCE}")
+    } else {
+        TOOL_DESCRIPTION.to_string()
+    }
+}
+
+fn schema_requests_identity(schema: &Map<String, Value>) -> bool {
+    schema
         .get("properties")
         .and_then(Value::as_object)
         .is_some_and(|properties| {
@@ -109,12 +181,7 @@ fn structured_output_tool_description(schema: &Map<String, Value>) -> String {
                 let name = name.to_ascii_lowercase();
                 name.contains("identity") || name.contains("platform")
             })
-        });
-    if has_identity_field {
-        format!("{TOOL_DESCRIPTION} {IDENTITY_OUTPUT_GUIDANCE}")
-    } else {
-        TOOL_DESCRIPTION.to_string()
-    }
+        })
 }
 
 /// Claude Code 2.1.x sends `output_config.effort` plus its own `StructuredOutput` tool. The client
@@ -487,6 +554,73 @@ mod tests {
         assert_eq!(
             plan(&parallel).unwrap().0.tool_choice,
             Some(json!({"type": "any", "disable_parallel_tool_use": true}))
+        );
+    }
+
+    #[test]
+    fn forced_mode_reminds_final_schema_without_removing_client_tool_choices() {
+        let tools = json!([{
+            "name": "search",
+            "description": "search the user's corpus",
+            "input_schema": {"type": "object", "properties": {}}
+        }]);
+        let mut request = schema_request(Some(tools));
+        for choice in [None, Some(json!({"type": "tool", "name": "search"}))] {
+            request.tool_choice = choice;
+            let (converted, target) =
+                plan_with_forced_mode(&request, true).expect("structured plan");
+            assert!(!target.expect("explicit format target").forced);
+            assert_eq!(converted.tools.as_ref().expect("tools").len(), 2);
+            assert_eq!(
+                converted.tool_choice,
+                request.tool_choice.clone().or(Some(json!({"type": "any"})))
+            );
+            assert!(
+                converted
+                    .messages
+                    .last()
+                    .unwrap()
+                    .content
+                    .to_string()
+                    .contains("structured_output_contract")
+            );
+            let (normal, _) = plan_with_forced_mode(&request, false).unwrap();
+            assert_eq!(
+                serde_json::to_value(normal.messages).unwrap(),
+                serde_json::to_value(&request.messages).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn forced_identity_format_keeps_the_clients_declared_application_role() {
+        let request = request(json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 512,
+            "system": [
+                {"type": "text", "text": "You are Orbit, a terminal coding client."},
+                {"type": "text", "text": "Model deployment metadata identifies the model provider."}
+            ],
+            "messages": [{"role": "user", "content": "Identify the client and model."}],
+            "output_config": {"format": {
+                "type": "json_schema",
+                "schema": {"type": "object", "properties": {
+                    "identity_platform": {"type": "string"}
+                }}
+            }}
+        }));
+        let (mapped, _) = plan_with_forced_mode(&request, true).unwrap();
+        let reminder = mapped.messages.last().unwrap().content.to_string();
+        assert!(reminder.contains("You are Orbit, a terminal coding client."));
+        assert!(reminder.contains("Model deployment metadata does not replace"));
+        assert_eq!(
+            serde_json::to_value(&mapped.system).unwrap(),
+            serde_json::to_value(&request.system).unwrap()
+        );
+        let (normal, _) = plan_with_forced_mode(&request, false).unwrap();
+        assert_eq!(
+            serde_json::to_value(normal.messages).unwrap(),
+            serde_json::to_value(&request.messages).unwrap()
         );
     }
 

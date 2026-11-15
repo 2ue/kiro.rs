@@ -272,7 +272,10 @@ pub(super) fn prepare_with_plan(
     debug_assert_eq!(plan.conversion, BodyStageState::Enabled);
     // Structured output is served through an internal tool, so every later stage (conversion,
     // retries, token counting) sees the request that is actually sent to Kiro.
-    let structured_output = crate::anthropic::structured_output::plan(payload);
+    let structured_output = crate::anthropic::structured_output::plan_with_forced_mode(
+        payload,
+        model_resolution.forced.is_some(),
+    );
     let payload = structured_output
         .as_ref()
         .map(|(request, _)| request)
