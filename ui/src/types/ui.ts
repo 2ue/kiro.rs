@@ -1,17 +1,17 @@
 import type { LucideIcon } from 'lucide-react'
 import {
-  LayoutDashboard,
-  Server,
-  Boxes,
-  BarChart3,
-  FileClock,
-  SlidersHorizontal,
-  Boxes as ModelsIcon,
-  ShieldCheck,
-  Gauge,
-  Zap,
-  Route,
-  MessageSquareText,
+BarChart3,
+Boxes,
+FileClock,
+FileInput,
+Gauge,
+LayoutDashboard,
+Boxes as ModelsIcon,
+Route,
+Server,
+ShieldCheck,
+SlidersHorizontal,
+Zap,
 } from 'lucide-react'
 
 export const CONSOLE_BASE_PATH = '/ui'
@@ -27,8 +27,9 @@ export type PageKey =
   | 'accountRisk'
   | 'audit'
   | 'runtime'
-  | 'cachePolicies'
-  | 'promptInjection'
+  | 'routes'
+  | 'policyTemplates'
+  | 'configTransfer'
   | 'routeScenarios'
   | 'models'
   | 'security'
@@ -72,8 +73,9 @@ export const navPages: NavPage[] = [
 
   // 设置域
   { key: 'runtime', path: 'runtime', label: '运行', description: '调度、限流、冷却、缓存、兼容', icon: SlidersHorizontal, domain: 'settings' },
-  { key: 'cachePolicies', path: 'cache-policies', label: '路由策略', description: '按路由管理缓存、提示词注入和功能', icon: Zap, domain: 'settings' },
-  { key: 'promptInjection', path: 'prompt-injection', label: '提示词注入', description: '每段注入的默认开关、文本和预览', icon: MessageSquareText, domain: 'settings' },
+  { key: 'routes', path: 'routes', label: '路由', description: '入口策略、功能与规则', icon: Route, domain: 'resources' },
+  { key: 'policyTemplates', path: 'policy-templates', label: '策略模板', description: '全局缓存与注入默认值', icon: Zap, domain: 'settings' },
+  { key: 'configTransfer', path: 'settings/transfer', label: '配置迁移', description: '导出、预览与导入配置', icon: FileInput, domain: 'settings' },
   { key: 'routeScenarios', path: 'route-scenarios', label: '路由场景', description: '保存多套路由规则并一键切换', icon: Route, domain: 'settings' },
   { key: 'models', path: 'models', label: '模型', description: '模型能力与价格目录', icon: ModelsIcon, domain: 'settings' },
   { key: 'security', path: 'security', label: '安全', description: 'Admin Key、客户端接入 Key', icon: ShieldCheck, domain: 'settings' },
@@ -90,9 +92,10 @@ export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   accountRisk: { title: '账号风控', subtitle: '检查账号缓存分布与成本风险' },
   audit: { title: '审计', subtitle: '关键操作与变更记录' },
   runtime: { title: '运行配置', subtitle: '调度、限流、冷却、缓存与兼容策略' },
-  cachePolicies: { title: '路由策略', subtitle: '按路由管理缓存、提示词注入和功能' },
-  promptInjection: { title: '提示词注入', subtitle: '代理写进上游请求的每段提示词：默认开关、文本、关闭影响和预览' },
-  routeScenarios: { title: '路由场景', subtitle: '把本地、外部和各账号的路由规则存成多套场景，一键切换' },
-  models: { title: '模型', subtitle: '模型能力与价格目录,支持同步与手动维护' },
+  routes: {title:'路由',subtitle:'入口前缀、策略、功能与账号和模型规则'},
+  policyTemplates: {title:'策略模板',subtitle:'全局缓存模板、usage 默认值与注入文案'},
+  configTransfer: {title:'配置迁移',subtitle:'导出配置并预览全量覆盖差异'},
+  routeScenarios: { title: '路由场景', subtitle: '保存路由定义与账号规则快照，一键切换' },
+  models: { title: '模型', subtitle: '模型能力与价格目录,支持发现与手动维护' },
   security: { title: '安全', subtitle: 'Admin Key 与客户端接入 Key 管理' },
 }

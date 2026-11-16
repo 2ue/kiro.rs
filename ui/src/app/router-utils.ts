@@ -1,4 +1,4 @@
-import { navPages, navDomains, type PageKey } from '@/types/ui'
+import { navDomains,navPages,type PageKey } from '@/types/ui'
 
 const segmentToPage = navPages.reduce<Record<string, PageKey>>((acc, page) => {
   acc[page.path] = page.key
@@ -7,11 +7,12 @@ const segmentToPage = navPages.reduce<Record<string, PageKey>>((acc, page) => {
 
 /**
  * 从 pathname 解析当前页面 key。
- * 传入 react-router `useLocation().pathname`(basename /ui 已被剥离),如 `/credentials`。
+ * 传入 react-router `useLocation().pathname`(basename /ui 已被剥离),如 `/accounts`。
  */
 export function getPageFromPathname(pathname: string): PageKey {
-  const segment = pathname.replace(/^\/+/, '').split('/')[0]
-  return segmentToPage[segment] ?? 'overview'
+  const path = pathname.replace(/^\/+|\/+$/g, '')
+  const page = navPages.find(page => path === page.path || path.startsWith(`${page.path}/`))
+  return page?.key ?? segmentToPage[path] ?? 'overview'
 }
 
 /** 当前页所属域的标签 */

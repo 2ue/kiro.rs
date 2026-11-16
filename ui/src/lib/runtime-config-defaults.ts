@@ -1,23 +1,21 @@
 import type {
-  CacheHitShapingPolicyPatch,
-  CachePolicyConfig,
-  CacheRoutePolicyPatch,
-  BodyConversionConfig,
-  ImageProcessingConfig,
-  MissingMaxTokensConfig,
-  LocalRequestCompatConfig,
-  RequestCaptureConfig,
-  ModelMappingConfig,
-  PayloadShapingConfig,
-  PromptCacheCreationControlConfig,
-  PromptInjectionConfig,
-  RouteFeaturesConfig,
-  ReportedUsageConfig,
-  ReportedUsageFieldMode,
-  ReportedUsageFieldPolicy,
-  ReportedUsagePathPolicy,
-  RuntimeConfig,
-  WeightedCapacityConfig,
+CacheHitShapingPolicyPatch,
+CachePolicyConfig,
+ImageProcessingConfig,
+LocalRequestCompatConfig,
+MissingMaxTokensConfig,
+ModelMappingConfig,
+PayloadShapingConfig,
+PromptCacheCreationControlConfig,
+PromptInjectionConfig,
+ReportedUsageConfig,
+ReportedUsageFieldMode,
+ReportedUsageFieldPolicy,
+ReportedUsagePathPolicy,
+RequestCaptureConfig,
+RouteFeaturesConfig,
+RuntimeConfig,
+WeightedCapacityConfig
 } from '@/types/api'
 
 const DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS = 1000
@@ -80,15 +78,7 @@ export function pathPolicy(
   }
 }
 
-export function defaultReportedUsage(): ReportedUsageConfig {
-  return {
-    default: pathPolicy(),
-    pathOverrides: {
-      '/cc': pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000)),
-      '/ha': pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
-    },
-  }
-}
+export function defaultReportedUsage(): ReportedUsageConfig { return { default: pathPolicy(false) } }
 
 export function defaultCachePolicy(): CachePolicyConfig {
   return {
@@ -98,7 +88,6 @@ export function defaultCachePolicy(): CachePolicyConfig {
     stableSegmentCache: {},
     prefixToolPlus: {},
     boundedHighCache: {},
-    pathOverrides: {},
   }
 }
 
@@ -142,55 +131,11 @@ export function defaultImageProcessing(): ImageProcessingConfig {
   }
 }
 
-export function defaultBodyConversion(): BodyConversionConfig {
-  return {
-    toolSchemaNormalization: true,
-    toolNameMapping: true,
-    toolSchemaKeyMapping: 'sanitize',
-    toolSchemaKeyValidationRegex: '^[a-zA-Z0-9_.-]{1,64}$',
-    toolChoiceSteering: true,
-    nativeReasoningFields: true,
-    syntheticThinkingSignatures: true,
-    toolPairingRepair: true,
-    historyPlaceholderTools: true,
-    historyImageDedup: false,
-    codeExecution: { enabled: false, pathOverrides: {}, timeoutMs: 5000, maxOutputBytes: 16384, maxCodeBytes: 65536 },
-  }
-}
-
-export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | null): BodyConversionConfig {
-  const base = defaultBodyConversion()
-  return {
-    toolSchemaNormalization: input?.toolSchemaNormalization ?? base.toolSchemaNormalization,
-    toolNameMapping: input?.toolNameMapping ?? base.toolNameMapping,
-    toolSchemaKeyMapping: input?.toolSchemaKeyMapping ?? base.toolSchemaKeyMapping,
-    toolSchemaKeyValidationRegex: input?.toolSchemaKeyValidationRegex ?? base.toolSchemaKeyValidationRegex,
-    toolChoiceSteering: input?.toolChoiceSteering ?? base.toolChoiceSteering,
-    nativeReasoningFields: input?.nativeReasoningFields ?? base.nativeReasoningFields,
-    syntheticThinkingSignatures: input?.syntheticThinkingSignatures ?? base.syntheticThinkingSignatures,
-    toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
-    historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
-    historyImageDedup: input?.historyImageDedup ?? base.historyImageDedup,
-    codeExecution: {
-      enabled: input?.codeExecution?.enabled ?? base.codeExecution.enabled,
-      pathOverrides: { ...(input?.codeExecution?.pathOverrides ?? base.codeExecution.pathOverrides) },
-      timeoutMs: input?.codeExecution?.timeoutMs ?? base.codeExecution.timeoutMs,
-      maxOutputBytes: input?.codeExecution?.maxOutputBytes ?? base.codeExecution.maxOutputBytes,
-      maxCodeBytes: input?.codeExecution?.maxCodeBytes ?? base.codeExecution.maxCodeBytes,
-    },
-  }
-}
-
-/**
- * Placeholder until the runtime config loads; the backend always returns the full structure.
- * Item defaults come from the catalog endpoint, so nothing here duplicates backend text.
- */
 export function emptyPromptInjection(): PromptInjectionConfig {
   return {
     applyToCountTokens: true,
     defaults: {} as PromptInjectionConfig['defaults'],
     texts: {},
-    pathOverrides: {},
   }
 }
 
@@ -200,42 +145,18 @@ export function normalizePromptInjection(input?: Partial<PromptInjectionConfig> 
   for (const [key, value] of Object.entries(input?.texts ?? {})) {
     if (typeof value === 'string' && value.trim()) texts[key as keyof typeof texts] = value
   }
-  const pathOverrides: PromptInjectionConfig['pathOverrides'] = {}
-  for (const [prefix, items] of Object.entries(input?.pathOverrides ?? {})) {
-    const kept = Object.fromEntries(
-      Object.entries(items ?? {}).filter(([, item]) => item && (item.enabled !== undefined || item.account !== undefined)),
-    )
-    if (Object.keys(kept).length > 0) pathOverrides[prefix] = kept
-  }
   return {
     applyToCountTokens: input?.applyToCountTokens ?? base.applyToCountTokens,
     defaults: { ...base.defaults, ...(input?.defaults ?? {}) },
     texts,
-    pathOverrides,
   }
 }
 
 export function defaultRouteFeatures(): RouteFeaturesConfig {
-  return {
-    defaults: {
-      thinkingModelName: true,
-      thinkingTrigger: 'real_request',
-      channelLeakGuard: false,
-      channelLeakGuardStream: true,
-      modelDrivenWebSearch: false,
-    },
-    pathOverrides: {},
-  }
+return { defaults: { thinkingModelName: false, thinkingTrigger: 'off', historySanitize: false, missingMaxTokens: null, reasoningCompat: null, payloadGuard: null, payloadShaping: null, imageProcessing: null } }
 }
-
 export function normalizeRouteFeatures(input?: Partial<RouteFeaturesConfig> | null): RouteFeaturesConfig {
-  const base = defaultRouteFeatures()
-  const pathOverrides: RouteFeaturesConfig['pathOverrides'] = {}
-  for (const [prefix, route] of Object.entries(input?.pathOverrides ?? {})) {
-    const kept = Object.fromEntries(Object.entries(route ?? {}).filter(([, value]) => value !== undefined && value !== null))
-    if (Object.keys(kept).length > 0) pathOverrides[prefix] = kept
-  }
-  return { defaults: { ...base.defaults, ...(input?.defaults ?? {}) }, pathOverrides }
+return { defaults: { ...defaultRouteFeatures().defaults, ...input?.defaults } }
 }
 
 export function defaultMissingMaxTokens(): MissingMaxTokensConfig {
@@ -263,7 +184,6 @@ export function defaultLocalRequestCompat(): LocalRequestCompatConfig {
     normalizeMessageContent: true,
     normalizeEffortCase: true,
     dropUnknownEffort: true,
-    zeroUsageOnHoldExpiredMessageStart: true,
   }
 }
 
@@ -280,7 +200,7 @@ export function normalizeLocalRequestCompat(input?: Partial<LocalRequestCompatCo
 
 export function defaultRequestCapture(): RequestCaptureConfig {
   return {
-    enabled: false,
+    enabled: true,
     dir: 'logs/request-capture',
     usageOnly: true,
     toolChoice: true,
@@ -390,12 +310,12 @@ export function defaultPromptCacheCreationControl(): PromptCacheCreationControlC
   }
 }
 
-export function defaultAccountsConfig() {
+export function defaultAccountsConfig(): import('@/types/api').AccountsConfig {
   return {
+ wireDebugEnabled: false, wireDebugDir: "diagnostics/wire", wireDebugMaxBodyBytes: 1048576, wireDebugMaxFiles: 50,
     enabled: false,
     globalMaxConcurrentRequests: 0,
     maxQueuedRequests: 0,
-    accountMaxInputTokens: 1000000,
     capacityMode: 'fail_fast' as const,
     dispatchMaxWaitSecs: 30,
     retryMaxAttempts: 0,
@@ -406,7 +326,6 @@ export function defaultAccountsConfig() {
     samePoolRetryStatusCodes: [401, 403, 429, 500, 502, 503, 504],
     samePoolRetryDelayMs: 500,
     transientFailurePriorityPenalty: 20,
-    accountTransientFailureCooldownThreshold: 0,
     qualityAwareSchedulingEnabled: false,
     qualityEwmaAlpha: 0.2,
     qualitySampleTtlSecs: 600,
@@ -423,32 +342,6 @@ export function defaultAccountsConfig() {
     maxProbationSecs: 900,
     probeSharePercent: 5,
     recoveryRampSecs: 60,
-    externalDirectPolicyEnabled: false,
-    directExternalOnLocalMaintenance: false,
-    directExternalModelRules: [],
-    directExternalPathRules: [],
-    accountRouteMode: 'allow_all' as const,
-    accountRouteRules: [],
-    localPoolRouteMode: 'allow_all' as const,
-    localPoolRouteRules: [],
-    fallbackOnLocalCapacityExhausted: true,
-    fallbackOnSchedulerRedisDegraded: true,
-    fallbackOnNoAvailableCredentials: true,
-    fallbackOnLocalTransientExhausted: true,
-    fallbackOnUnsupportedModel: false,
-    localPoolPreflightEnabled: true,
-    accountLocalRescueEnabled: true,
-    accountLocalRescueOnRateLimit: true,
-    accountLocalRescueOnTimeout: true,
-    accountLocalRescueOnCapacity: true,
-    accountLocalRescueMaxWaitSecs: 15,
-    localPoolCircuitEnabled: false,
-    localPoolCircuitWindowSecs: 300,
-    localPoolCircuitOpenAfterFailures: 5,
-    localPoolCircuitRequireDistinctCredentials: 5,
-    localPoolCircuitMinRatioPercent: 30,
-    localPoolCircuitOpenSecs: 30,
-    localPoolCircuitHalfOpenProbes: 3,
     autoDisableEnabled: false,
     autoDisableOnAuthError: true,
     autoDisableOnSecurityLock: true,
@@ -509,123 +402,21 @@ export function normalizeModelMapping(config?: Partial<ModelMappingConfig> | nul
 }
 
 export const emptyRuntimeConfig: RuntimeConfig = {
+ tlsBackend: 'rustls',
+ usageRecordLimit: 5000,
   proxyUrl: null,
   proxyUsername: null,
   proxyPassword: null,
-  credentialRpm: 0,
   requestAdmission: {
     rpm: 300,
     maxConcurrentRequests: 32,
     maxQueuedRequests: 64,
     queueTimeoutMs: 1000,
   },
-  credentialMaxConcurrentRequests: 0,
-  credentialInfoRefreshConcurrency: 3,
-  credentialTransientCooldownSecs: 10,
-  credentialRateLimitCooldownSecs: 30,
-  credentialServerErrorCooldownSecs: 5,
-  credentialNetworkErrorCooldownSecs: 5,
-  credentialStreamErrorCooldownSecs: 5,
-  credentialEmptyTurnCooldownEnabled: false,
-  credentialUpstreamFailureCooldownEnabled: false,
-  credentialDegradeEnabled: true,
-  credentialDegradeSuspendScore: 5,
-  credentialDegradeResumeRatio: 0.4,
-  credentialDegradeHalfLifeSecs: 120,
-  credentialDegradeSuccessDecay: 0.5,
-  credentialDegradeProbePercent: 2,
-  credentialDegradeEmptyTurnWeight: 2,
-  credentialDegradeStreamWeight: 1,
-  emptyTurnErrorStatusCode: 502,
-  emptyTurnRetryBackoffMode: 'none',
-  emptyTurnRetryBaseDelayMs: 100,
-  emptyTurnRetryMaxDelayMs: 2000,
-  emptyTurnRetryJitterPercent: 20,
-  credentialAutoHealMinIntervalSecs: 300,
-  credentialAutoHealMaxConsecutiveRounds: 5,
-  credentialProtocolErrorCooldownSecs: 10,
-  credentialAuthErrorCooldownSecs: 10,
-  credentialCooldownBackoffMultiplier: 2,
-  credentialCooldownJitterPercent: 20,
-  credentialProbationSecs: 30,
-  credentialMaxCooldownSecs: 300,
-  credentialDispatchMaxWaitSecs: 5,
-  credentialSessionMaxConcurrentRequests: 0,
-  streamKeepaliveIntervalSecs: 5,
   streamPreOutputHoldSecs: 15,
-  streamFirstOutputTimeoutSecs: 0,
   inferenceUpstreamMaxAttempts: 4,
-  auxiliaryUpstreamMaxAttempts: 2,
-  auxiliaryUpstreamMaxConcurrentRequests: 16,
-  tokenRefreshMaxRpm: 60,
-  tokenRefreshBurst: 8,
-  tokenRefreshBackgroundEnabled: true,
-  tokenRefreshBackgroundIntervalSecs: 60,
-  tokenRefreshBackgroundLeadSecs: 600,
-  tokenRefreshAdmissionRuntime: {
-    authority: 'process_local',
-    configuredRpm: 60,
-    configuredBurst: 8,
-    admitted: 0,
-    rateLimited: 0,
-    coordinationRejected: 0,
-    redisErrors: 0,
-    lastRetryAfterMs: 0,
-    remainingMilliTokens: 8000,
-  },
-  auxiliaryUpstreamRuntime: {
-    configuredLimit: 16,
-    inFlight: 0,
-    peakInFlight: 0,
-    rejected: 0,
-    refreshClientCacheEntries: 0,
-    refreshClientCacheMaxEntries: 256,
-    refreshClientBuilds: 0,
-    refreshClientHits: 0,
-    refreshClientMisses: 0,
-    refreshClientCacheSaturated: 0,
-  },
-  credentialRetryMaxAttempts: 0,
-  credentialPromptLogicRetryEnabled: false,
-  credentialPromptLogicRetryMaxAttempts: 0,
-  localBerserkModeEnabled: false,
-  localBerserkMaxRounds: 1,
-  localBerserkRoundDelayMs: 1000,
-  credentialInFlightLeaseMaxSecs: 900,
-  dispatchGlobalMaxConcurrentRequests: 0,
-  dispatchMaxQueuedRequests: 0,
-  weightedCapacity: defaultWeightedCapacity(),
-  credentialWarmupRequests: 3,
-  credentialWarmupSelectionPercent: 5,
-  credentialWarmupMaxSelectionPercent: 50,
-  schedulerErrorEwmaAlpha: 0.2,
-  schedulerPriorityWeight: 1,
-  schedulerLoadWeight: 100,
-  schedulerErrorWeight: 100,
-  schedulerLatencyWeight: 0.01,
-  schedulerProbationWeight: 50,
-  schedulerSelectionPressureWeight: 25,
-  schedulerTotalSelectionWeight: 0,
-  schedulerTopK: 3,
-  selectionFailureSampleLimit: 20,
-  selectionFailureRecordEnabled: true,
-  compressionEnabled: false,
-  whitespaceCompression: true,
-  imageProcessing: defaultImageProcessing(),
-  bodyConversion: defaultBodyConversion(),
   promptInjection: emptyPromptInjection(),
   routeFeatures: defaultRouteFeatures(),
-  claudeModelsOnly: false,
-  missingMaxTokens: defaultMissingMaxTokens(),
-  localRequestCompat: defaultLocalRequestCompat(),
-  requestCapture: defaultRequestCapture(),
-  payloadGuardEnabled: true,
-  payloadGuardMode: 'preemptive',
-  payloadGuardMaxBytes: 460800,
-  payloadGuardSafetyMarginBytes: 32768,
-  payloadGuardTrimHistory: true,
-  payloadGuardExternalEnabled: true,
-  payloadShaping: defaultPayloadShaping(),
   promptCacheTargetReadRatio: 0.98,
   promptCacheTokenScale: 1.6,
   promptCacheMaxSimulatedInputTokens: 300000,
@@ -644,11 +435,8 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   compatProfile: 'claude-code',
   modelResolutionMode: 'compatible',
   modelMapping: defaultModelMappingConfig(),
-  extractThinking: true,
-  exposeProxyWarnings: false,
   auditLogRetentionEnabled: false,
   auditLogRetentionDays: 15,
-  definedCacheRoutes: [],
 }
 
 export function reportedUsageModeDescription(mode: ReportedUsageFieldMode): string {
@@ -694,144 +482,8 @@ export function toScale(value: number): number {
   return Math.min(3, Math.max(1, Number(value.toFixed(2))))
 }
 
-function toMultiplier(value: number): number {
-  if (!Number.isFinite(value)) return 1.1
-  return Math.max(1, Number(value.toFixed(2)))
-}
-
-function normalizeFieldPolicy(policy: ReportedUsageFieldPolicy): ReportedUsageFieldPolicy {
-  return {
-    ...policy,
-    maxTokens: toWhole(policy.maxTokens),
-    targetTokens: toWhole(policy.targetTokens),
-    normalMaxMultiplier: toMultiplier(policy.normalMaxMultiplier),
-  }
-}
-
-function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePathPolicy {
-  const finalCacheReadMaxTokens = toWhole(policy.finalCacheReadMaxTokens ?? 700000)
-  const finalCacheReadJitterMaxTokens =
-    finalCacheReadMaxTokens > 0
-      ? toWhole(policy.finalCacheReadJitterMaxTokens ?? 0, 0, finalCacheReadMaxTokens)
-      : 0
-  const finalCacheReadJitterMinTokens = toWhole(
-    policy.finalCacheReadJitterMinTokens ?? 0,
-    0,
-    finalCacheReadJitterMaxTokens
-  )
-  const finalCacheCreationMaxTokens = toWhole(
-    policy.finalCacheCreationMaxTokens ?? DEFAULT_FINAL_CACHE_CREATION_MAX_TOKENS
-  )
-  const finalCacheCreationJitterMaxTokens =
-    finalCacheCreationMaxTokens > 0
-      ? toWhole(
-          policy.finalCacheCreationJitterMaxTokens ?? DEFAULT_FINAL_CACHE_CREATION_JITTER_MAX_TOKENS,
-          0,
-          finalCacheCreationMaxTokens
-        )
-      : 0
-  const finalCacheCreationJitterMinTokens = toWhole(
-    policy.finalCacheCreationJitterMinTokens ?? DEFAULT_FINAL_CACHE_CREATION_JITTER_MIN_TOKENS,
-    0,
-    finalCacheCreationJitterMaxTokens
-  )
-  const finalOutputMaxTokens = toWhole(policy.finalOutputMaxTokens ?? DEFAULT_FINAL_OUTPUT_MAX_TOKENS)
-  const finalOutputJitterMaxTokens =
-    finalOutputMaxTokens > 0
-      ? toWhole(
-          policy.finalOutputJitterMaxTokens ?? DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS,
-          0,
-          finalOutputMaxTokens
-        )
-      : 0
-  const finalOutputJitterMinTokens = toWhole(
-    policy.finalOutputJitterMinTokens ?? DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS,
-    0,
-    finalOutputJitterMaxTokens
-  )
-  return {
-    ...policy,
-    skipNonStreamUsageProjection: Boolean(policy.skipNonStreamUsageProjection),
-    strictCacheEligibilityStream: Boolean(policy.strictCacheEligibilityStream),
-    strictCacheEligibilityNonStream: Boolean(policy.strictCacheEligibilityNonStream),
-    finalCacheReadMaxTokens,
-    finalCacheReadJitterMinTokens,
-    finalCacheReadJitterMaxTokens,
-    finalCacheCreationMaxTokens,
-    finalCacheCreationJitterMinTokens,
-    finalCacheCreationJitterMaxTokens,
-    finalOutputGuardEnabled: policy.finalOutputGuardEnabled ?? true,
-    outputUpliftMinTokens: toWhole(policy.outputUpliftMinTokens ?? DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS),
-    outputUpliftPercent: toWhole(policy.outputUpliftPercent ?? DEFAULT_OUTPUT_UPLIFT_PERCENT, 0, 200),
-    finalOutputMaxTokens,
-    finalOutputJitterMinTokens,
-    finalOutputJitterMaxTokens,
-    input: normalizeFieldPolicy(policy.input),
-    output: normalizeFieldPolicy(policy.output),
-    cacheRead: normalizeFieldPolicy(policy.cacheRead),
-    cacheCreation: normalizeFieldPolicy(policy.cacheCreation),
-  }
-}
-
-export function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsageConfig {
-  const pathOverrides = Object.fromEntries(
-    Object.entries(config.pathOverrides)
-      .map(([prefix, policy]) => {
-        const trimmed = prefix.trim()
-        if (!trimmed) return null
-        const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
-        const normalizedPrefix = withSlash.replace(/\/+$/, '') || '/'
-        return [normalizedPrefix, normalizePathPolicy(policy)] as const
-      })
-      .filter((entry): entry is readonly [string, ReportedUsagePathPolicy] => Boolean(entry))
-  )
-  return {
-    default: normalizePathPolicy(config.default),
-    pathOverrides,
-  }
-}
-
-function normalizeCachePolicyPathPrefix(prefix: string): string | null {
-  const trimmed = prefix.trim()
-  if (!trimmed) return null
-  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
-  return canonicalCachePolicyPath(withSlash.replace(/\/+$/, '') || '/')
-}
-
-function canonicalCachePolicyPath(prefix: string): string {
-  const normalized = prefix.replace(/\/+$/, '') || '/'
-  const lower = normalized.toLowerCase()
-  if (lower === '/cc/v1' || lower === '/cc/v1/messages') return '/cc'
-  if (lower === '/ha/v1' || lower === '/ha/v1/messages') return '/ha'
-  if (lower === '/na/v1' || lower === '/na/v1/messages') return '/na'
-  return normalized
-}
-
-function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.prefixTool && !policy.prefixToolPlus && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard
-}
-
-export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
-  const source = config ?? defaultCachePolicy()
-  const pathOverrides = Object.fromEntries(
-    Object.entries(source.pathOverrides ?? {})
-      .map(([prefix, policy]) => {
-        const normalizedPrefix = normalizeCachePolicyPathPrefix(prefix)
-        if (!normalizedPrefix || isEmptyCachePolicyPatch(policy)) return null
-        return [normalizedPrefix, policy] as const
-      })
-      .filter((entry): entry is readonly [string, CacheRoutePolicyPatch] => Boolean(entry))
-  )
-  return {
-    default: source.default ?? {},
-    currentHighCache: source.currentHighCache ?? {},
-    prefixTool: source.prefixTool ?? {},
-    stableSegmentCache: source.stableSegmentCache ?? {},
-    prefixToolPlus: source.prefixToolPlus ?? {},
-    boundedHighCache: source.boundedHighCache ?? {},
-    pathOverrides,
-  }
-}
+export function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsageConfig { return { default: { ...pathPolicy(false), ...config.default } } }
+export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig { return { ...defaultCachePolicy(), ...config } }
 
 export function normalizePromptCacheCreationControl(
   config: PromptCacheCreationControlConfig

@@ -1,37 +1,29 @@
 import { api } from '@/api/http'
 import type {
-  AdminAuditLogPage,
-  AccountEventSummaryResponse,
-  AdminAuditLogPageQuery,
-  ModelCapabilitiesStatus,
-  SyncModelCapabilitiesRequest,
-  ManualModelResponse,
-  ModelPricingStatus,
-  UpsertManualModelRequest,
-  UsageDashboardResponse,
-  UsageDashboardAccountsResponse,
-  UsageDashboardBreakdownResponse,
-  UsageDashboardAccountBillingResponse,
-  UsageDashboardSeriesResponse,
-  UsageDashboardTopResponse,
-  UsageDashboardWindowsResponse,
-  UsageOverviewResponse,
-  UsageOverviewExternalResponse,
-  UsageOverviewLocalResponse,
-  UsageOverviewRankingsResponse,
-  UsageOverviewSeriesResponse,
-  UsageOverviewSummaryResponse,
-  UsageCleanupPreviewResponse,
-  UsageCleanupRequest,
-  UsageCleanupStatusResponse,
-  UsageAccountRiskQuery,
-  UsageAccountRiskResponse,
-  UsageRecorderStats,
-  UsageRecordsPageQuery,
-  UsageRecordsPageResult,
-  UsageRecordsQuery,
-  UsageRecordsResult,
-  UsageSummary,
+AccountEventSummaryResponse,
+AdminAuditLogPage,
+AdminAuditLogPageQuery,
+UsageAccountRiskQuery,
+UsageAccountRiskResponse,
+UsageCleanupPreviewResponse,
+UsageCleanupRequest,
+UsageCleanupStatusResponse,
+UsageDashboardAccountBillingResponse,
+UsageDashboardBreakdownResponse,
+UsageDashboardResponse,
+UsageDashboardSeriesResponse,
+UsageDashboardTopResponse,
+UsageDashboardWindowsResponse,
+UsageOverviewRankingsResponse,
+UsageOverviewResponse,
+UsageOverviewSeriesResponse,
+UsageOverviewSummaryResponse,
+UsageRecorderStats,
+UsageRecordsPageQuery,
+UsageRecordsPageResult,
+UsageRecordsQuery,
+UsageRecordsResult,
+UsageSummary
 } from '@/types/api'
 
 export async function getUsageRecords(query: UsageRecordsQuery = {}): Promise<UsageRecordsResult> {
@@ -110,20 +102,6 @@ export async function getUsageOverviewSeries(params: UsageOverviewQuery = {}): P
   return data
 }
 
-export async function getUsageOverviewLocal(params: UsageOverviewQuery = {}): Promise<UsageOverviewLocalResponse> {
-  const { data } = await api.get<UsageOverviewLocalResponse>('/usage-dashboard/overview/local', {
-    params: usageOverviewParams(params),
-  })
-  return data
-}
-
-export async function getUsageOverviewExternal(params: UsageOverviewQuery = {}): Promise<UsageOverviewExternalResponse> {
-  const { data } = await api.get<UsageOverviewExternalResponse>('/usage-dashboard/overview', {
-    params: usageOverviewParams(params),
-  })
-  return data
-}
-
 export async function getUsageOverviewRankings(params: UsageOverviewQuery = {}): Promise<UsageOverviewRankingsResponse> {
   const { data } = await api.get<UsageOverviewRankingsResponse>('/usage-dashboard/overview/rankings', {
     params: usageOverviewParams(params),
@@ -151,27 +129,6 @@ export async function getUsageDashboardTop(
 ): Promise<UsageDashboardTopResponse> {
   const { data } = await api.get<UsageDashboardTopResponse>('/usage-dashboard/top', {
     params: { timezone, windowKey },
-  })
-  return data
-}
-
-export async function getUsageDashboardAccounts(params: {
-  timezone?: string
-  windowKey?: string
-  page?: number
-  pageSize?: number
-  q?: string
-  status?: string
-  sortBy?: string
-  sortOrder?: 'asc' | 'desc'
-} = {}): Promise<UsageDashboardAccountsResponse> {
-  const { data } = await api.get<UsageDashboardAccountsResponse>('/usage-dashboard/accounts', {
-    params: {
-      timezone: 'Asia/Shanghai',
-      page: 1,
-      pageSize: 50,
-      ...params,
-    },
   })
   return data
 }
@@ -244,37 +201,5 @@ export async function getAccountEventSummary(hours: number, accountSource?: stri
   const { data } = await api.get<AccountEventSummaryResponse>('/audit-logs/account-summary', {
     params: { hours, accountSource: accountSource || undefined },
   })
-  return data
-}
-
-export async function getModelPricing(): Promise<ModelPricingStatus> {
-  const { data } = await api.get<ModelPricingStatus>('/model-pricing')
-  return data
-}
-
-export async function syncModelPricing(): Promise<ModelPricingStatus> {
-  const { data } = await api.post<ModelPricingStatus>('/model-pricing/sync')
-  return data
-}
-
-export async function getModelCapabilities(): Promise<ModelCapabilitiesStatus> {
-  const { data } = await api.get<ModelCapabilitiesStatus>('/model-capabilities')
-  return data
-}
-
-export async function syncModelCapabilities(
-  payload: SyncModelCapabilitiesRequest = {},
-): Promise<ModelCapabilitiesStatus> {
-  const { data } = await api.post<ModelCapabilitiesStatus>('/model-capabilities/sync', payload)
-  return data
-}
-
-export async function upsertManualModel(payload: UpsertManualModelRequest): Promise<ManualModelResponse> {
-  const { data } = await api.post<ManualModelResponse>('/model-capabilities/manual', payload)
-  return data
-}
-
-export async function deleteManualModel(model: string): Promise<ManualModelResponse> {
-  const { data } = await api.delete<ManualModelResponse>(`/model-capabilities/manual/${encodeURIComponent(model)}`)
   return data
 }

@@ -1,31 +1,30 @@
-import type { ReactNode } from 'react'
-import { cn } from '@/lib/utils'
-import { formatDate, formatNumber } from '@/lib/format'
-import type { UsageRecord } from '@/types/api'
-import { Badge } from '@/components/ui'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui'
 import { ModalShell } from '@/components/patterns'
 import {
-  formatExternalAttemptChain,
-  formatLatency,
-  attemptActionLabel,
-  routeLabel,
-  routeTone,
-  resolvedModelLabel,
-  sourceLabel,
-  statusLabel,
-  statusTone,
-  upstreamModelLabel,
-} from './usage-helpers'
-import { UsageCostBreakdown, UsageCostTiles, usageRecordCostModel } from './usage-billing'
+Badge,Table,
+TableBody,
+TableCell,
+TableHead,
+TableHeader,
+TableRow
+} from '@/components/ui'
+import { formatUsd,formatDate,formatNumber } from '@/lib/format'
+import { cn } from '@/lib/utils'
+import type { UsageRecord } from '@/types/api'
+import type { ReactNode } from 'react'
 import { RequestApiKeyIdDisplay } from './request-api-key-id'
+import { UsageCostBreakdown,UsageCostTiles,usageRecordCostModel } from './usage-billing'
+import {
+attemptActionLabel,
+formatExternalAttemptChain,
+formatLatency,
+resolvedModelLabel,
+routeLabel,
+routeTone,
+sourceLabel,
+statusLabel,
+statusTone,
+upstreamModelLabel,
+} from './usage-helpers'
 
 function MetricTile({
   label,
@@ -320,6 +319,7 @@ export function UsageDetailModal({
         <div>
           <SectionTitle>基础信息</SectionTitle>
           <div className="grid gap-3 sm:grid-cols-2">
+            <DetailField label="账号成本" value={formatUsd(record.accountCostUsd)} />
             <DetailField label="时间" value={formatDate(record.createdAt)} />
             <DetailField label="请求 ID" value={record.id} mono />
             <div>
@@ -338,7 +338,7 @@ export function UsageDetailModal({
                 <DetailField label="模型解析说明" value={record.modelResolutionNote} />
               </div>
             )}
-            <DetailField label="账号" value={record.credentialId != null ? `#${record.credentialId}${record.credentialLabel ? ' ' + record.credentialLabel : ''}` : '-'} />
+            <DetailField label="账号" value={record.accountId != null ? `#${record.accountId}${record.accountName ? ' ' + record.accountName : ''}` : '-'} />
             {record.routeKind === 'account' && (
               <DetailField label="外部账号" value={`#${record.accountId ?? '-'}${record.accountName ? ' ' + record.accountName : ''}`} />
             )}
@@ -446,7 +446,7 @@ export function UsageDetailModal({
                   <MetricTile label="推理发送" value={`${formatNumber(record.latencyTrace.inferenceAttempts.consumed)} / ${formatNumber(record.latencyTrace.inferenceAttempts.maxAttempts)}`} tone={record.latencyTrace.inferenceAttempts.exhausted ? 'warning' : 'info'} />
                 )}
                 {record.latencyTrace.inferenceAttempts && (
-                  <MetricTile label="推理发送分项" value={`本地 ${formatNumber(record.latencyTrace.inferenceAttempts.localAttempts)} / 外部 ${formatNumber(record.latencyTrace.inferenceAttempts.externalAttempts)} / MCP ${formatNumber(record.latencyTrace.inferenceAttempts.mcpAttempts)}`} />
+                  <MetricTile label="推理发送分项" value={`账号 ${formatNumber(record.latencyTrace.inferenceAttempts.externalAttempts)}`} />
                 )}
                 {record.latencyTrace.auxiliaryAttempts && (
                   <MetricTile label="辅助发送" value={`${formatNumber(record.latencyTrace.auxiliaryAttempts.consumed)} / ${formatNumber(record.latencyTrace.auxiliaryAttempts.maxAttempts)}`} tone={record.latencyTrace.auxiliaryAttempts.exhausted ? 'warning' : 'info'} />

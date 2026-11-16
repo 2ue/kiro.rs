@@ -44,9 +44,9 @@ export function RouteSelector({
           {route}
           {!known.has(route) && '（已不存在）'}
           {!disabled && (
-            <button type="button" className="ml-0.5 rounded hover:bg-black/10" aria-label={`移除 ${route}`} onClick={() => toggle(route, false)}>
+            <Button variant="ghost" type="button" className="ml-0.5 rounded hover:bg-black/10" aria-label={`移除 ${route}`} onClick={() => toggle(route, false)}>
               <X className="size-3" />
-            </button>
+            </Button>
           )}
         </Badge>
       ))}

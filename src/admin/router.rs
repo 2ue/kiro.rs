@@ -28,6 +28,30 @@ use super::{
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
         .route(
+            "/routes",
+            get(super::service::management::routes).put(super::service::management::put_routes),
+        )
+        .route(
+            "/routes/effective",
+            get(super::service::management::route_effective),
+        )
+        .route(
+            "/accounts/{id}/effective",
+            get(super::service::management::account_effective),
+        )
+        .route(
+            "/model-capabilities/{model}/listed",
+            axum::routing::patch(super::service::management::model_listed),
+        )
+        .route(
+            "/config/export",
+            get(super::service::management::export_config),
+        )
+        .route(
+            "/config/import",
+            post(super::service::management::import_config),
+        )
+        .route(
             "/route-scenarios",
             get(route_scenario_http::list).post(route_scenario_http::create),
         )
@@ -110,7 +134,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route(
             "/usage-dashboard/overview",
-            get(get_usage_dashboard_overview_external),
+            get(super::service::management::usage_overview),
         )
         .route(
             "/usage-dashboard/overview/rankings",

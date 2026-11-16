@@ -1,1829 +1,221 @@
-import type { ReactNode } from 'react'
-import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
-import {
-  Gauge,
-  Eye,
-  EyeOff,
-  Router,
-  Save,
-  Shield,
-  Sparkles,
-  Wand2,
-} from 'lucide-react'
-import { toast } from 'sonner'
 import {
   ErrorState,
   LoadingState,
   PageContainer,
   PageHeader,
-} from '@/components/patterns'
+} from "@/components/patterns";
+import { ConfigFields } from "@/components/patterns/config-fields";
 import {
   Button,
   Input,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  Spinner,
   Switch,
-} from '@/components/ui'
-import { extractErrorMessage } from '@/lib/utils'
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui";
+import { useModelCapabilities } from "@/hooks/use-models";
 import {
-  defaultImageProcessing,
-  defaultBodyConversion,
-  defaultAccountsConfig,
-  defaultMissingMaxTokens,
-  defaultLocalRequestCompat,
-  defaultRequestCapture,
-  defaultPromptCacheCreationControl,
-  defaultReportedUsage,
-  defaultWeightedCapacity,
-  emptyRuntimeConfig,
-  normalizeCachePolicy,
-  normalizeBodyConversion,
-  normalizeImageProcessing,
-  normalizeMissingMaxTokens,
-  normalizeLocalRequestCompat,
-  normalizeRequestCapture,
-  normalizeModelMapping,
-  normalizePayloadShaping,
-  normalizePromptInjection,
-  normalizeRouteFeatures,
-  normalizePromptCacheCreationControl,
-  normalizeReportedUsage,
-  normalizeWeightedCapacity,
-  toRatio,
-  toScale,
-  clampFloat,
-  toWhole,
-} from '@/lib/runtime-config-defaults'
-import {
-  useLoadBalancingMode,
   useRuntimeConfig,
-  useSetLoadBalancingMode,
   useUpdateRuntimeConfig,
-} from '@/hooks/use-credentials'
-import { useModelCapabilities } from '@/hooks/use-usage'
-import type { LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
-import {
-  normalizeDefinedCacheRoute,
-  normalizeDefinedCacheRoutes,
-  ModelMappingSection,
-  PayloadFallbackSection,
-  PayloadHistorySection,
-} from './runtime-sections'
-
-type RuntimeSectionKey =
-  | 'loadBalancing'
-  | 'capacity'
-  | 'accounts'
-  | 'cooldown'
-  | 'scheduler'
-  | 'warmup'
-  | 'payload'
-  | 'modelMapping'
-  | 'startupProxy'
-  | 'compat'
-  | 'requestCompat'
-
-const runtimeSections: Array<{
-  key: RuntimeSectionKey
-  title: string
-  desc: string
-  icon: ReactNode
-}> = [
-  { key: 'loadBalancing', title: '负载均衡模式', desc: '请求分配给账号的策略', icon: <Gauge className="h-4 w-4" /> },
-  { key: 'capacity', title: '请求容量', desc: '并发、排队、重试、超时', icon: <Gauge className="h-4 w-4" /> },
-  { key: 'accounts', title: '路由策略', desc: '控制哪些入口进入本地账号或账号', icon: <Router className="h-4 w-4" /> },
-  { key: 'cooldown', title: '错误恢复 / 冷却', desc: '不同错误类型的暂停策略与退避', icon: <Shield className="h-4 w-4" /> },
-  { key: 'scheduler', title: '账号选择权重', desc: '优先使用哪些账号的调度参数', icon: <Gauge className="h-4 w-4" /> },
-  { key: 'warmup', title: '新账号预热', desc: '新账号逐步参与请求，稳定后恢复正常', icon: <Sparkles className="h-4 w-4" /> },
-  { key: 'payload', title: '请求体处理', desc: '协议转换、大小保护、历史清理和当前请求兜底', icon: <Wand2 className="h-4 w-4" /> },
-  { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
-  { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
-  { key: 'compat', title: '接口兼容', desc: '兼容模式、上游 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
-  { key: 'requestCompat', title: '参数兼容', desc: '客户端参数写法不规范时改写还是拒绝', icon: <Wand2 className="h-4 w-4" /> },
-]
-
-
-// ─── 原子组件 ──────────────────────────────────────────────────────────────────
-
-function numberValue(value: string, fallback: number): number {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
-
-function routePolicySummary(mode: string, rules: string[] = []): string {
-  if (mode === 'allow_list') return `仅允许 ${rules.join('、') || '（未设置）'}`
-  if (mode === 'deny_list') return `禁止 ${rules.join('、') || '（未设置）'}`
-  return '不限制'
-}
-
-function normalizeRouteRuleMode(value?: string): RuntimeConfig['accounts']['accountRouteMode'] {
-  if (value === 'allow_list' || value === 'deny_list') return value
-  return 'allow_all'
-}
-
-function normalizeRuleList(value?: string[] | null): string[] {
-  return (value ?? []).map((rule) => rule.trim()).filter(Boolean)
-}
-
-function parseStatusCodeList(value: string): number[] {
-  const seen = new Set<number>()
-  const codes: number[] = []
-  for (const raw of value.split(/[\s,，;；]+/)) {
-    const code = Number(raw.trim())
-    if (!Number.isInteger(code) || code < 100 || code > 599 || seen.has(code)) continue
-    seen.add(code)
-    codes.push(code)
-  }
-  return codes
-}
-
-function joinStatusCodeList(value: number[] = []): string {
-  return value
-    .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
-    .join(', ')
-}
-
-function NumField({
-  label,
-  desc,
-  value,
-  min,
-  max,
-  step,
-  suffix,
-  disabled,
-  onChange,
-}: {
-  label: string
-  desc: string
-  value: number
-  min?: number
-  max?: number
-  step?: number
-  suffix: string
-  disabled?: boolean
-  onChange: (v: number) => void
-}) {
-  return (
-    <div className="space-y-1.5">
-      <div className="text-sm font-semibold text-foreground">{label}</div>
-      <div className="text-xs text-muted-foreground leading-relaxed">{desc}</div>
-      <div className="flex items-center gap-2">
-        <Input
-          type="number"
-          className="w-full"
-          value={value}
-          min={min}
-          max={max}
-          step={step}
-          inputMode={step && step < 1 ? 'decimal' : 'numeric'}
-          disabled={disabled}
-          onChange={(e) => onChange(numberValue(e.target.value, min ?? 0))}
-        />
-        <span className="min-w-[5rem] shrink-0 text-sm text-muted-foreground">{suffix}</span>
-      </div>
-    </div>
-  )
-}
-
-function TogField({
-  label,
-  desc,
-  checked,
-  disabled,
-  onChange,
-}: {
-  label: string
-  desc: string
-  checked: boolean
-  disabled?: boolean
-  onChange: (v: boolean) => void
-}) {
-  return (
-    <div className="flex items-start justify-between gap-4">
-      <div className="min-w-0">
-        <div className="text-sm font-semibold text-foreground">{label}</div>
-        <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{desc}</div>
-      </div>
-      <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} className="mt-0.5 shrink-0" />
-    </div>
-  )
-}
-
-function TwoCol({ children }: { children: ReactNode }) {
-  return <div className="grid gap-4 md:grid-cols-2">{children}</div>
-}
-
-function maskSecret(value?: string | null): string {
-  if (!value) return '-'
-  if (value.length <= 6) return '******'
-  return `${value.slice(0, 3)}...${value.slice(-3)}`
-}
-
-function ReadOnlySecretField({
-  label,
-  value,
-}: {
-  label: string
-  value?: string | null
-}) {
-  const [visible, setVisible] = useState(false)
-  return (
-    <div className="space-y-1.5">
-      <div className="text-sm font-semibold">{label}</div>
-      <div className="relative">
-        <Input readOnly className="pr-10 font-mono text-xs" value={visible ? value || '-' : maskSecret(value)} />
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          className="absolute right-1 top-1/2 -translate-y-1/2"
-          onClick={() => setVisible((v) => !v)}
-          title={visible ? '隐藏' : '显示'}
-        >
-          {visible ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-        </Button>
-      </div>
-    </div>
-  )
-}
-
-function StartupProxySection({ config }: { config: RuntimeConfig }) {
-  const hasGlobalProxy = Boolean(config.proxyUrl)
-  return (
-    <div className="space-y-4">
-      <div className="rounded-xl border bg-card p-4">
-        <div className="mb-4 flex flex-wrap items-center gap-2">
-          <div>
-            <div className="text-sm font-semibold">全局代理（启动期配置，只读）</div>
-            <div className="mt-1 text-xs leading-5 text-muted-foreground">
-              它作为未配置账号直连代理、也未绑定代理资源时的默认代理；修改需要调整启动配置并重启服务。
-            </div>
-          </div>
-          <span className={`ml-auto rounded-lg border px-2 py-1 text-xs font-medium ${hasGlobalProxy ? 'border-success/30 bg-success/10 text-success' : 'bg-muted text-muted-foreground'}`}>
-            {hasGlobalProxy ? '已配置' : '未配置'}
-          </span>
-          <span className="rounded-lg border bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">只读</span>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2">
-          <div className="space-y-1.5 md:col-span-2">
-            <div className="text-sm font-semibold">代理 URL</div>
-            <Input readOnly className="font-mono text-xs" value={config.proxyUrl || '-'} />
-          </div>
-          <ReadOnlySecretField label="代理用户名" value={config.proxyUsername} />
-          <ReadOnlySecretField label="代理密码" value={config.proxyPassword} />
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── normalizeConfig ──────────────────────────────────────────────────────────
-
-function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
-  const next: RuntimeConfig = {
-    ...draft,
-    credentialRpm: toWhole(draft.credentialRpm),
-    requestAdmission: {
-      rpm: toWhole(draft.requestAdmission.rpm, 0, 1_000_000),
-      maxConcurrentRequests: toWhole(draft.requestAdmission.maxConcurrentRequests, 0, 10_000),
-      maxQueuedRequests: toWhole(draft.requestAdmission.maxQueuedRequests, 0, 100_000),
-      queueTimeoutMs: toWhole(draft.requestAdmission.queueTimeoutMs, 0, 300_000),
-    },
-    credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
-    credentialInfoRefreshConcurrency: toWhole(draft.credentialInfoRefreshConcurrency, 1, 16),
-    credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
-    credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
-    credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
-    credentialNetworkErrorCooldownSecs: toWhole(draft.credentialNetworkErrorCooldownSecs, 1),
-    credentialStreamErrorCooldownSecs: toWhole(draft.credentialStreamErrorCooldownSecs, 1),
-    credentialAutoHealMinIntervalSecs: toWhole(draft.credentialAutoHealMinIntervalSecs, 0),
-    credentialAutoHealMaxConsecutiveRounds: toWhole(draft.credentialAutoHealMaxConsecutiveRounds, 0),
-    credentialEmptyTurnCooldownEnabled: Boolean(draft.credentialEmptyTurnCooldownEnabled),
-    credentialUpstreamFailureCooldownEnabled: Boolean(draft.credentialUpstreamFailureCooldownEnabled),
-    credentialDegradeEnabled: Boolean(draft.credentialDegradeEnabled),
-    credentialDegradeSuspendScore: Math.min(1000, Math.max(0, Number(draft.credentialDegradeSuspendScore) || 0)),
-    credentialDegradeResumeRatio: Math.min(1, Math.max(0, Number(draft.credentialDegradeResumeRatio) || 0)),
-    credentialDegradeHalfLifeSecs: Math.min(86400, Math.max(1, Math.round(Number(draft.credentialDegradeHalfLifeSecs) || 1))),
-    credentialDegradeSuccessDecay: Math.min(1, Math.max(0, Number(draft.credentialDegradeSuccessDecay) || 0)),
-    credentialDegradeProbePercent: Math.min(100, Math.max(0, Math.round(Number(draft.credentialDegradeProbePercent) || 0))),
-    credentialDegradeEmptyTurnWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeEmptyTurnWeight) || 0)),
-    credentialDegradeStreamWeight: Math.min(100, Math.max(0, Number(draft.credentialDegradeStreamWeight) || 0)),
-    emptyTurnErrorStatusCode: [502, 503, 529].includes(Number(draft.emptyTurnErrorStatusCode)) ? Number(draft.emptyTurnErrorStatusCode) : 502,
-    emptyTurnRetryBackoffMode: (['none', 'fixed', 'exponential'] as const).includes(draft.emptyTurnRetryBackoffMode) ? draft.emptyTurnRetryBackoffMode : 'none',
-    emptyTurnRetryBaseDelayMs: Math.min(10000, Math.max(0, Math.round(Number(draft.emptyTurnRetryBaseDelayMs) || 0))),
-    emptyTurnRetryMaxDelayMs: Math.min(30000, Math.max(0, Math.round(Number(draft.emptyTurnRetryMaxDelayMs) || 0))),
-    emptyTurnRetryJitterPercent: Math.min(100, Math.max(0, Math.round(Number(draft.emptyTurnRetryJitterPercent) || 0))),
-    credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
-    credentialAuthErrorCooldownSecs: toWhole(draft.credentialAuthErrorCooldownSecs, 1),
-    credentialCooldownBackoffMultiplier: Math.max(1, Number(draft.credentialCooldownBackoffMultiplier.toFixed(2))),
-    credentialCooldownJitterPercent: toWhole(draft.credentialCooldownJitterPercent, 0, 100),
-    credentialProbationSecs: toWhole(draft.credentialProbationSecs),
-    credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
-    credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
-    credentialSessionMaxConcurrentRequests: toWhole(draft.credentialSessionMaxConcurrentRequests),
-    streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
-    streamPreOutputHoldSecs: toWhole(draft.streamPreOutputHoldSecs, 0, 60),
-    streamFirstOutputTimeoutSecs: toWhole(draft.streamFirstOutputTimeoutSecs, 0, 3600),
-    inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
-    auxiliaryUpstreamMaxAttempts: toWhole(draft.auxiliaryUpstreamMaxAttempts, 1, 10),
-    auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
-    tokenRefreshMaxRpm: toWhole(draft.tokenRefreshMaxRpm, 1, 6000),
-    tokenRefreshBurst: toWhole(draft.tokenRefreshBurst, 1, 256),
-    tokenRefreshBackgroundEnabled: Boolean(draft.tokenRefreshBackgroundEnabled),
-    tokenRefreshBackgroundIntervalSecs: toWhole(draft.tokenRefreshBackgroundIntervalSecs, 10, 3600),
-    tokenRefreshBackgroundLeadSecs: toWhole(draft.tokenRefreshBackgroundLeadSecs, 60, 3600),
-    credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
-    credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
-    credentialPromptLogicRetryMaxAttempts: toWhole(draft.credentialPromptLogicRetryMaxAttempts),
-    localBerserkModeEnabled: Boolean(draft.localBerserkModeEnabled),
-    localBerserkMaxRounds: toWhole(draft.localBerserkMaxRounds, 1, 10),
-    localBerserkRoundDelayMs: toWhole(draft.localBerserkRoundDelayMs, 0, 60_000),
-    credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
-    dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
-    dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
-    weightedCapacity: normalizeWeightedCapacity(draft.weightedCapacity),
-    credentialWarmupRequests: toWhole(draft.credentialWarmupRequests),
-    credentialWarmupSelectionPercent: toWhole(draft.credentialWarmupSelectionPercent, 0, 100),
-    credentialWarmupMaxSelectionPercent: toWhole(draft.credentialWarmupMaxSelectionPercent, 0, 100),
-    schedulerErrorEwmaAlpha: Math.min(1, Math.max(0.01, Number(draft.schedulerErrorEwmaAlpha.toFixed(2)))),
-    schedulerPriorityWeight: Math.max(0, Number(draft.schedulerPriorityWeight.toFixed(2))),
-    schedulerLoadWeight: Math.max(0, Number(draft.schedulerLoadWeight.toFixed(2))),
-    schedulerErrorWeight: Math.max(0, Number(draft.schedulerErrorWeight.toFixed(2))),
-    schedulerLatencyWeight: Math.max(0, Number(draft.schedulerLatencyWeight.toFixed(4))),
-    schedulerProbationWeight: Math.max(0, Number(draft.schedulerProbationWeight.toFixed(2))),
-    schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
-    schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
-    schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
-    selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
-    payloadShaping: normalizePayloadShaping(draft.payloadShaping),
-    payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
-    payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
-    promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
-    promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
-    promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
-    promptCacheCapJitterMinTokens: toWhole(draft.promptCacheCapJitterMinTokens),
-    promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
-    promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
-    promptCacheMaxEntriesPerAccount: toWhole(draft.promptCacheMaxEntriesPerAccount),
-    promptCacheMaxEntriesGlobal: toWhole(draft.promptCacheMaxEntriesGlobal),
-    promptCacheEntryTtlSecs: toWhole(draft.promptCacheEntryTtlSecs, 1),
-    promptCacheEstimatedBytesLimit: toWhole(draft.promptCacheEstimatedBytesLimit),
-    highCacheThreshold: toWhole(draft.highCacheThreshold),
-    promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
-    imageProcessing: normalizeImageProcessing(draft.imageProcessing),
-    bodyConversion: normalizeBodyConversion(draft.bodyConversion),
-    promptInjection: normalizePromptInjection(draft.promptInjection),
-    routeFeatures: normalizeRouteFeatures(draft.routeFeatures),
-    missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
-    localRequestCompat: normalizeLocalRequestCompat(draft.localRequestCompat),
-    requestCapture: normalizeRequestCapture(draft.requestCapture),
-    reportedUsage: normalizeReportedUsage(draft.reportedUsage),
-    cachePolicy: normalizeCachePolicy(draft.cachePolicy),
-    definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
-    modelMapping: normalizeModelMapping(draft.modelMapping),
-    accounts: {
-      ...defaultAccountsConfig(),
-      ...draft.accounts,
-      globalMaxConcurrentRequests: toWhole(draft.accounts.globalMaxConcurrentRequests),
-      maxQueuedRequests: toWhole(draft.accounts.maxQueuedRequests),
-      accountMaxInputTokens: toWhole(draft.accounts.accountMaxInputTokens),
-      dispatchMaxWaitSecs: toWhole(draft.accounts.dispatchMaxWaitSecs, 1),
-      retryMaxAttempts: toWhole(draft.accounts.retryMaxAttempts),
-      retryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.accounts.retryStatusCodes)),
-      retryOnNetworkError: Boolean(draft.accounts.retryOnNetworkError),
-      retryOnProtocolError: Boolean(draft.accounts.retryOnProtocolError),
-      samePoolRetryCount: toWhole(draft.accounts.samePoolRetryCount),
-      samePoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.accounts.samePoolRetryStatusCodes)),
-      samePoolRetryDelayMs: toWhole(draft.accounts.samePoolRetryDelayMs),
-      transientFailurePriorityPenalty: toWhole(draft.accounts.transientFailurePriorityPenalty),
-      accountTransientFailureCooldownThreshold: toWhole(draft.accounts.accountTransientFailureCooldownThreshold),
-      qualityAwareSchedulingEnabled: Boolean(draft.accounts.qualityAwareSchedulingEnabled),
-      qualityEwmaAlpha: clampFloat(draft.accounts.qualityEwmaAlpha, 0.01, 1),
-      qualitySampleTtlSecs: toWhole(draft.accounts.qualitySampleTtlSecs, 1, 86_400),
-      qualityMinSamples: toWhole(draft.accounts.qualityMinSamples, 1, 10_000),
-      qualityPriorityWeight: clampFloat(draft.accounts.qualityPriorityWeight, 0, 1_000_000),
-      qualityLoadWeight: clampFloat(draft.accounts.qualityLoadWeight, 0, 1_000_000),
-      qualityErrorWeight: clampFloat(draft.accounts.qualityErrorWeight, 0, 1_000_000),
-      qualityLatencyWeight: clampFloat(draft.accounts.qualityLatencyWeight, 0, 1_000_000),
-      qualityProbationWeight: clampFloat(draft.accounts.qualityProbationWeight, 0, 1_000_000),
-      qualityTopK: toWhole(draft.accounts.qualityTopK, 1, 100),
-      degradeWindowSecs: toWhole(draft.accounts.degradeWindowSecs, 1, 86_400),
-      degradeErrorRateThreshold: clampFloat(draft.accounts.degradeErrorRateThreshold, 0, 1),
-      degradeProbationSecs: toWhole(draft.accounts.degradeProbationSecs, 1, 86_400),
-      // 避让上限不得低于单次避让时长，与后端 validate_accounts_config 的跨字段校验保持一致，
-      // 避免用户在前端就提交一个必然被后端拒绝的组合。
-      maxProbationSecs: Math.max(
-        toWhole(draft.accounts.maxProbationSecs, 1, 86_400),
-        toWhole(draft.accounts.degradeProbationSecs, 1, 86_400),
+} from "@/hooks/use-runtime-config";
+import { extractErrorMessage } from "@/lib/utils";
+import type { AccountsConfig, RuntimeConfig } from "@/types/api";
+import { Save } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { toast } from "sonner";
+import { ModelMappingSection } from "./runtime-sections";
+const accountSections: Array<[string, string, (key: string) => boolean]> = [
+  [
+    "capacity",
+    "容量与重试",
+    (k) =>
+      /^(enabled|globalMax|maxQueued|capacityMode|dispatch|retry|samePool|transient)/.test(
+        k,
       ),
-      probeSharePercent: toWhole(draft.accounts.probeSharePercent, 0, 100),
-      recoveryRampSecs: toWhole(draft.accounts.recoveryRampSecs, 0, 86_400),
-      accountLocalRescueMaxWaitSecs: toWhole(draft.accounts.accountLocalRescueMaxWaitSecs),
-      localPoolCircuitWindowSecs: toWhole(draft.accounts.localPoolCircuitWindowSecs, 1),
-      localPoolCircuitOpenAfterFailures: toWhole(draft.accounts.localPoolCircuitOpenAfterFailures, 1),
-      localPoolCircuitRequireDistinctCredentials: toWhole(draft.accounts.localPoolCircuitRequireDistinctCredentials),
-      localPoolCircuitMinRatioPercent: toWhole(draft.accounts.localPoolCircuitMinRatioPercent),
-      localPoolCircuitOpenSecs: toWhole(draft.accounts.localPoolCircuitOpenSecs, 1),
-      localPoolCircuitHalfOpenProbes: toWhole(draft.accounts.localPoolCircuitHalfOpenProbes, 1),
-      autoDisableFailureThreshold: toWhole(draft.accounts.autoDisableFailureThreshold, 1),
-      autoDisableWindowSecs: toWhole(draft.accounts.autoDisableWindowSecs, 1),
-      autoDisableDurationSecs: toWhole(draft.accounts.autoDisableDurationSecs),
-      rateLimitCooldownSecs: toWhole(draft.accounts.rateLimitCooldownSecs, 1),
-      serverErrorCooldownSecs: toWhole(draft.accounts.serverErrorCooldownSecs, 1),
-      networkErrorCooldownSecs: toWhole(draft.accounts.networkErrorCooldownSecs, 1),
-      protocolErrorCooldownSecs: toWhole(draft.accounts.protocolErrorCooldownSecs, 1),
-      modelUnavailableCooldownMode: draft.accounts.modelUnavailableCooldownMode,
-      modelUnavailableCooldownSecs: toWhole(draft.accounts.modelUnavailableCooldownSecs, 1),
-      requestTimeoutSecs: toWhole(draft.accounts.requestTimeoutSecs),
-      streamRequestTimeoutSecs: toWhole(draft.accounts.streamRequestTimeoutSecs),
-      streamIdleTimeoutSecs: toWhole(draft.accounts.streamIdleTimeoutSecs),
-      streamFirstOutputTimeoutSecs: toWhole(draft.accounts.streamFirstOutputTimeoutSecs),
-      accountRouteMode: normalizeRouteRuleMode(draft.accounts.accountRouteMode),
-      accountRouteRules: normalizeRuleList(draft.accounts.accountRouteRules),
-      localPoolRouteMode: normalizeRouteRuleMode(draft.accounts.localPoolRouteMode),
-      localPoolRouteRules: normalizeRuleList(draft.accounts.localPoolRouteRules),
-      usageProjectionUpliftPercent: toWhole(draft.accounts.usageProjectionUpliftPercent),
-      usageProjectionCostFloorEnabled: Boolean(draft.accounts.usageProjectionCostFloorEnabled),
-      usageProjectionCostFloorMarginPercent: toWhole(draft.accounts.usageProjectionCostFloorMarginPercent),
-      usageProjectionOutputUpliftMinTokens: toWhole(draft.accounts.usageProjectionOutputUpliftMinTokens),
-      usageProjectionOutputUpliftPercent: toWhole(draft.accounts.usageProjectionOutputUpliftPercent),
-      usageDebugEnabled: Boolean(draft.accounts.usageDebugEnabled),
-      usageDebugDir: String(draft.accounts.usageDebugDir || '').trim(),
-      usageDebugMaxBodyBytes: toWhole(draft.accounts.usageDebugMaxBodyBytes),
-      usageDebugMaxFiles: toWhole(draft.accounts.usageDebugMaxFiles),
-    },
-  }
-  return next
-}
-
-function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
-  return config
-}
-
-function runtimeConfigDraftFingerprint(config: RuntimeConfig): string {
-  return JSON.stringify(stripReadOnlyRuntimeFields(config))
-}
-
-// ─── RuntimePage ──────────────────────────────────────────────────────────────
-
+  ],
+  [
+    "quality",
+    "质量调度",
+    (k) => /^(quality|degrade|probation|maxProbation|probe|recovery)/.test(k),
+  ],
+  ["disable", "自动禁用", (k) => k.startsWith("autoDisable")],
+  ["cooldown", "冷却", (k) => /Cooldown/.test(k)],
+  [
+    "timeouts",
+    "超时与流式",
+    (k) => /Timeout|streamResponseMode|streamPreOutput/.test(k),
+  ],
+  ["uplift", "用量放大", (k) => k.startsWith("usageProjection")],
+  ["diagnostics", "诊断", (k) => /Debug/.test(k)],
+];
 export function RuntimePage() {
-  const config = useRuntimeConfig()
-  const updateConfig = useUpdateRuntimeConfig()
-  const loadBalancing = useLoadBalancingMode()
-  const setLbMode = useSetLoadBalancingMode()
-  const modelCapabilities = useModelCapabilities()
-  const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
-  const [savedDraft, setSavedDraft] = useState<RuntimeConfig | null>(null)
-  const [activeSection, setActiveSection] = useState<RuntimeSectionKey>('loadBalancing')
-
+  const query = useRuntimeConfig(),
+    update = useUpdateRuntimeConfig(),
+    models = useModelCapabilities(),
+    [draft, setDraft] = useState<RuntimeConfig | null>(null);
   useEffect(() => {
-    if (config.data) {
-      const bodyConversion = normalizeBodyConversion(config.data.bodyConversion ?? defaultBodyConversion())
-      const hydratedDraft: RuntimeConfig = {
-        ...emptyRuntimeConfig,
-        ...config.data,
-        requestAdmission: {
-          ...emptyRuntimeConfig.requestAdmission,
-          ...config.data.requestAdmission,
-        },
-        auxiliaryUpstreamRuntime: {
-          ...emptyRuntimeConfig.auxiliaryUpstreamRuntime,
-          ...config.data.auxiliaryUpstreamRuntime,
-        },
-        tokenRefreshAdmissionRuntime: {
-          ...emptyRuntimeConfig.tokenRefreshAdmissionRuntime,
-          ...config.data.tokenRefreshAdmissionRuntime,
-        },
-        imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
-        bodyConversion,
-        promptInjection: normalizePromptInjection(config.data.promptInjection),
-        routeFeatures: normalizeRouteFeatures(config.data.routeFeatures),
-        missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens ?? defaultMissingMaxTokens()),
-        localRequestCompat: normalizeLocalRequestCompat(config.data.localRequestCompat),
-        requestCapture: normalizeRequestCapture(config.data.requestCapture),
-        weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
-        accounts: {
-          ...defaultAccountsConfig(),
-          ...config.data.accounts,
-          accountRouteMode: normalizeRouteRuleMode(config.data.accounts?.accountRouteMode),
-          accountRouteRules: normalizeRuleList(config.data.accounts?.accountRouteRules),
-          localPoolRouteMode: normalizeRouteRuleMode(config.data.accounts?.localPoolRouteMode),
-          localPoolRouteRules: normalizeRuleList(config.data.accounts?.localPoolRouteRules),
-        },
-        payloadShaping: normalizePayloadShaping(config.data.payloadShaping),
-        promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
-        reportedUsage: normalizeReportedUsage(config.data.reportedUsage ?? defaultReportedUsage()),
-        cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
-        definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
-        modelMapping: normalizeModelMapping(config.data.modelMapping),
-      }
-      setDraft(hydratedDraft)
-      setSavedDraft(hydratedDraft)
-    }
-  }, [config.data])
-
-  const set = <K extends keyof RuntimeConfig>(k: K) => (v: RuntimeConfig[K]) =>
-    setDraft((prev) => ({ ...prev, [k]: v }))
-
-
-  const setRequestAdmission = <K extends keyof RuntimeConfig['requestAdmission']>(k: K) => (v: RuntimeConfig['requestAdmission'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      requestAdmission: { ...prev.requestAdmission, [k]: v },
-    }))
-
-  const setImageProcessing = <K extends keyof RuntimeConfig['imageProcessing']>(k: K) => (v: RuntimeConfig['imageProcessing'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      imageProcessing: {
-        ...defaultImageProcessing(),
-        ...prev.imageProcessing,
-        [k]: v,
-      },
-    }))
-
-  const setAccounts = <K extends keyof RuntimeConfig['accounts']>(k: K) => (v: RuntimeConfig['accounts'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      accounts: {
-        ...defaultAccountsConfig(),
-        ...prev.accounts,
-        [k]: v,
-      },
-    }))
-
-  const setBodyConversion = <K extends keyof RuntimeConfig['bodyConversion']>(k: K) => (v: RuntimeConfig['bodyConversion'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      bodyConversion: {
-        ...defaultBodyConversion(),
-        ...prev.bodyConversion,
-        [k]: v,
-      },
-    }))
-
-  const setRouteFeatureDefault =
-    <K extends keyof RuntimeConfig['routeFeatures']['defaults']>(k: K) =>
-    (v: RuntimeConfig['routeFeatures']['defaults'][K]) =>
-      setDraft((prev) => ({
-        ...prev,
-        routeFeatures: { ...prev.routeFeatures, defaults: { ...prev.routeFeatures.defaults, [k]: v } },
-      }))
-
-  const setMissingMaxTokens = <K extends keyof RuntimeConfig['missingMaxTokens']>(k: K) => (v: RuntimeConfig['missingMaxTokens'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      missingMaxTokens: {
-        ...defaultMissingMaxTokens(),
-        ...prev.missingMaxTokens,
-        [k]: v,
-      },
-    }))
-
-  const setLocalRequestCompat = (k: keyof RuntimeConfig['localRequestCompat']) => (v: boolean) =>
-    setDraft((prev) => ({
-      ...prev,
-      localRequestCompat: { ...defaultLocalRequestCompat(), ...prev.localRequestCompat, [k]: v },
-    }))
-
-  const setRequestCapture = <K extends keyof RuntimeConfig['requestCapture']>(k: K) => (v: RuntimeConfig['requestCapture'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      requestCapture: { ...defaultRequestCapture(), ...prev.requestCapture, [k]: v },
-    }))
-
-  const hasDraftChanges = savedDraft !== null && runtimeConfigDraftFingerprint(draft) !== runtimeConfigDraftFingerprint(savedDraft)
-
-  const save = () => {
-    if (!hasDraftChanges) return
-    const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
-    if (invalidDefinedCacheRoute)
-      return toast.error('缓存策略里的 /dfcache 路径必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
-    const next = normalizeConfig(draft)
-    if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs)
-      return toast.error('临时冷却秒数不能大于最大冷却秒数')
-    if ([next.credentialRateLimitCooldownSecs, next.credentialServerErrorCooldownSecs, next.credentialNetworkErrorCooldownSecs, next.credentialStreamErrorCooldownSecs, next.credentialProtocolErrorCooldownSecs, next.credentialAuthErrorCooldownSecs].some((value) => value > next.credentialMaxCooldownSecs))
-      return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
-    if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens)
-      return toast.error('触顶扣减下限不能大于上限')
-    if (next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536)
-      return toast.error('处理阈值必须为 0 或不小于 65536 字节')
-    if (next.payloadGuardMaxBytes - next.payloadGuardSafetyMarginBytes < 65536 && next.payloadGuardMaxBytes > 0)
-      return toast.error('安全余量不能过大,处理阈值减去安全余量需不小于 65536 字节')
-    if (next.missingMaxTokens.defaultValue < 1 || next.missingMaxTokens.defaultValue > 200000)
-      return toast.error('缺失 max_tokens 的补充值必须在 1 到 200000 之间')
-    const editable = stripReadOnlyRuntimeFields(next)
-    updateConfig.mutate(editable, {
-      onSuccess: () => {
-        setDraft(next)
-        setSavedDraft(next)
-        toast.success('配置已保存，新请求立即生效')
-      },
-      onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),
-    })
-  }
-
-  const handleLbMode = (mode: LoadBalancingMode) => {
-    const label = mode === 'priority'
-      ? '优先级'
-      : mode === 'balanced'
-        ? '均衡负载'
-        : mode === 'health_balanced'
-          ? '健康均衡'
-          : '低负载优先'
-    setLbMode.mutate(mode, {
-      onSuccess: () => toast.success(`已切换为${label}模式`),
-      onError: (e) => toast.error(`切换失败: ${extractErrorMessage(e)}`),
-    })
-  }
-
-  if (config.isLoading) return <LoadingState text="加载运行配置..." />
-  if (config.error) return <ErrorState message={extractErrorMessage(config.error)} />
-
-  const payloadSizeLimitEnabled = draft.payloadGuardEnabled && draft.payloadGuardMaxBytes > 0
-  const payloadGuardMode = (draft.payloadGuardMode ?? 'preemptive') as PayloadGuardMode
-  const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
-  const activeMeta = runtimeSections.find((section) => section.key === activeSection) ?? runtimeSections[0]!
-  const saveDisabled = updateConfig.isPending || !hasDraftChanges
-
-  return (
-    <PageContainer className="pb-24">
-      <PageHeader
-        title="运行配置"
-        subtitle="调度、限流、冷却、缓存与兼容等运行时参数，保存后新请求立即生效"
-        actions={
-          <Button asChild variant="outline" size="sm">
-            <Link to="/cache-policies">
-              <Router className="size-4" />
-              管理路由策略
-            </Link>
+    if (query.data) setDraft(structuredClone(query.data));
+  }, [query.data]);
+  if (query.isLoading) return <LoadingState />;
+  if (query.error || !draft)
+    return (
+      <ErrorState
+        title="读取运行配置失败"
+        action={
+          <Button variant="outline" onClick={() => query.refetch()}>
+            重试
           </Button>
         }
       />
-
-      <div className="grid gap-4 lg:grid-cols-[17rem_minmax(0,1fr)]">
-        <aside className="rounded-xl bg-card p-2 shadow-sm lg:sticky lg:top-4 lg:self-start" aria-label="运行配置分类">
-          <div className="flex gap-2 overflow-x-auto lg:flex-col lg:overflow-visible" role="tablist" aria-label="运行配置分类">
-            {runtimeSections.map((section) => {
-              const active = section.key === activeSection
-              return (
-                <button
-                  key={section.key}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  className={`flex min-w-[12rem] items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors lg:min-w-0 ${
-                    active ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
-                  }`}
-                  onClick={() => setActiveSection(section.key)}
-                >
-                  <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md ${
-                    active ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'
-                  }`}>
-                    {section.icon}
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block truncate text-sm font-semibold">{section.title}</span>
-                    <span className={`mt-0.5 block truncate text-xs ${active ? 'text-primary/70' : 'text-muted-foreground'}`}>
-                      {section.desc}
-                    </span>
-                  </span>
-                </button>
-              )
-            })}
-          </div>
-        </aside>
-
-        <section className="rounded-xl bg-card p-4 shadow-sm">
-          <div className="mb-5 flex items-start gap-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground [&_svg]:size-4">
-              {activeMeta.icon}
-            </span>
-            <div className="min-w-0">
-              <h2 className="text-base font-semibold text-foreground">{activeMeta.title}</h2>
-              <p className="mt-1 text-xs leading-5 text-muted-foreground">{activeMeta.desc}</p>
-            </div>
-          </div>
-
-          <div className="space-y-4">
-            {activeSection === 'loadBalancing' && (
-              <div className="space-y-3">
-                <div className="text-xs text-muted-foreground">
-                  切换后立即生效，无需点击保存。
-                </div>
-                <Select
-                  value={loadBalancing.data?.mode ?? 'priority'}
-                  onValueChange={(v) => handleLbMode(v as LoadBalancingMode)}
-                  disabled={setLbMode.isPending || loadBalancing.isLoading}
-                >
-                  <SelectTrigger className="w-56">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="priority">优先级模式 — 高优先级账号优先</SelectItem>
-                    <SelectItem value="balanced">均衡负载 — 平均分配请求</SelectItem>
-                    <SelectItem value="health_balanced">健康均衡 — 综合健康度平衡</SelectItem>
-                    <SelectItem value="weighted_least_inflight">低负载优先 — 高并发时优先空闲账号</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-
-            {activeSection === 'capacity' && (
-              <TwoCol>
-                <NumField label="每实例 · 每 Key RPM" desc="每个实例分别限制每个已认证请求 API Key；多实例总量最多可近似放大为实例数倍。0 表示关闭。" value={draft.requestAdmission.rpm} min={0} max={1_000_000} suffix="次/分钟" onChange={setRequestAdmission('rpm')} />
-                <NumField label="每实例 · 每 Key 并发" desc="每个实例分别统计同一请求 API Key 持有的 /messages response body；多实例不是全局聚合。0 表示关闭。" value={draft.requestAdmission.maxConcurrentRequests} min={0} max={10_000} suffix="并发" onChange={setRequestAdmission('maxConcurrentRequests')} />
-                <NumField label="每实例 · 每 Key 队列" desc="每个实例内同一 Key 并发占满时最多等待的请求数；0 表示不排队并立即返回 429。" value={draft.requestAdmission.maxQueuedRequests} min={0} max={100_000} suffix="请求" onChange={setRequestAdmission('maxQueuedRequests')} />
-                <NumField label="每实例 · 每 Key 等待" desc="每个实例内同一 Key 等待并发名额的最长时间；0 表示不排队并立即返回 429。" value={draft.requestAdmission.queueTimeoutMs} min={0} max={300_000} suffix="毫秒" onChange={setRequestAdmission('queueTimeoutMs')} />
-                <NumField label="单账号每分钟请求上限" desc="每个账号一分钟最多接多少个请求；0 表示不做本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={set('credentialRpm')} />
-                <NumField label="单账号最大并发" desc="每个账号同一时间最多处理多少个请求；0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={set('credentialMaxConcurrentRequests')} />
-                <NumField label="积分查询上游并发" desc="管理端强制查询积分时，同时向 上游 请求账号额度的数量；与推理并发独立。建议保持 1 到 3，避免批量查询触发上游限流。" value={draft.credentialInfoRefreshConcurrency} min={1} max={16} suffix="并发" onChange={set('credentialInfoRefreshConcurrency')} />
-
-                <NumField label="全局最大并发" desc="整个服务同一时间最多处理多少个请求；0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={set('dispatchGlobalMaxConcurrentRequests')} />
-                <NumField label="最大排队请求数" desc="账号忙不过来时最多让多少个请求排队；0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={set('dispatchMaxQueuedRequests')} />
-                <TogField
-                  label="按 token 重量计算本地容量"
-                  desc="默认关闭。关闭时不改变本地并发/RPM 口径；开启后只使用请求链路已有的粗略输入 token，不为容量单独遍历 body。"
-                  checked={draft.weightedCapacity.enabled}
-                  onChange={(enabled) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      weightedCapacity: { ...prev.weightedCapacity, enabled },
-                    }))
-                  }
-                />
-                <NumField
-                  label="单请求最大容量单位"
-                  desc="限制超长上下文最多占用多少本地并发/RPM 单位；只影响本地账号，不影响外部账号。"
-                  value={draft.weightedCapacity.maxUnitsPerRequest}
-                  min={1}
-                  max={64}
-                  suffix="单位"
-                  disabled={!draft.weightedCapacity.enabled}
-                  onChange={(maxUnitsPerRequest) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      weightedCapacity: {
-                        ...prev.weightedCapacity,
-                        maxUnitsPerRequest,
-                        tiers: prev.weightedCapacity.tiers.map((tier) => ({
-                          ...tier,
-                          units: Math.min(Math.max(1, tier.units), Math.max(1, maxUnitsPerRequest)),
-                        })),
-                      },
-                    }))
-                  }
-                />
-                <div className="space-y-3 rounded-lg border bg-muted/20 p-4 md:col-span-2">
-                  <div>
-                    <div className="text-sm font-semibold">容量分档</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      命中不超过当前输入 token 的最高分档。默认 0=1、100k=2、300k=4、700k=8。
-                    </div>
-                  </div>
-                  <div className="grid gap-3 md:grid-cols-2">
-                    {draft.weightedCapacity.tiers.map((tier, index) => (
-                      <div key={index} className="grid grid-cols-2 gap-3 rounded-lg border bg-background p-3">
-                        <NumField
-                          label="起始 token"
-                          desc="大于等于该值"
-                          value={tier.minTokens}
-                          min={0}
-                          suffix="token"
-                          disabled={!draft.weightedCapacity.enabled}
-                          onChange={(minTokens) =>
-                            setDraft((prev) => ({
-                              ...prev,
-                              weightedCapacity: {
-                                ...prev.weightedCapacity,
-                                tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
-                                  itemIndex === index ? { ...item, minTokens } : item,
-                                ),
-                              },
-                            }))
-                          }
-                        />
-                        <NumField
-                          label="容量单位"
-                          desc="并发/RPM 权重"
-                          value={tier.units}
-                          min={1}
-                          max={draft.weightedCapacity.maxUnitsPerRequest}
-                          suffix="单位"
-                          disabled={!draft.weightedCapacity.enabled}
-                          onChange={(units) =>
-                            setDraft((prev) => ({
-                              ...prev,
-                              weightedCapacity: {
-                                ...prev.weightedCapacity,
-                                tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
-                                  itemIndex === index ? { ...item, units } : item,
-                                ),
-                              },
-                            }))
-                          }
-                        />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。建议 30 到 60 秒，过载时快速返回，避免请求一直挂起。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
-                <NumField label="单会话单账号最大并发" desc="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。0 表示等于账号自身的并发上限。" value={draft.credentialSessionMaxConcurrentRequests} min={0} max={1000} suffix="个" onChange={set('credentialSessionMaxConcurrentRequests')} />
-
-
-
-
-                <NumField label="流式保活间隔" desc="上游暂时没有新内容时，每隔多久向客户端发一次保活心跳，防止客户端或中间代理因空闲断开；默认 5 秒。" value={draft.streamKeepaliveIntervalSecs} min={1} max={300} suffix="秒" onChange={set('streamKeepaliveIntervalSecs')} />
-                <NumField label="首输出前静默保留" desc="上游还没有输出时，最多多少秒内不向客户端写入，以便失败时无感换号；超过后开始下发并保活，不再换号。0 表示一直保留到首个输出；默认 15 秒。" value={draft.streamPreOutputHoldSecs} min={0} max={60} suffix="秒" onChange={set('streamPreOutputHoldSecs')} />
-                <NumField label="首输出等待上限" desc="上游返回响应头后最多等待多少秒出现首个内容；超时断开上游并释放账号，未写入时换号重试，已写入时返回过载错误让客户端重试。0 表示关闭（默认）。开启时应大于慢模型的首输出耗时，建议不低于 300 秒。" value={draft.streamFirstOutputTimeoutSecs} min={0} max={3600} suffix="秒" onChange={set('streamFirstOutputTimeoutSecs')} />
-
-
-
-                <NumField label="单请求推理发送硬上限" desc="本地换号、首输出前重试、请求体重试、账号故障转移和本地救援共享；默认 4，与账号数量无关。" value={draft.inferenceUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('inferenceUpstreamMaxAttempts')} />
-                <NumField label="单请求辅助发送硬上限" desc="Token 刷新与企业 Profile 探测共享；默认 2，与账号数量无关，不计入推理发送次数。" value={draft.auxiliaryUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('auxiliaryUpstreamMaxAttempts')} />
-                <NumField label="单实例辅助并发上限" desc="限制同时进行的 Token 刷新、Profile 探测和模型目录请求；饱和时立即拒绝，不进入无界等待队列。" value={draft.auxiliaryUpstreamMaxConcurrentRequests} min={1} max={256} suffix="路" onChange={set('auxiliaryUpstreamMaxConcurrentRequests')} />
-                <NumField label="Token 刷新 RPM 上限" desc="Redis 可用时为跨实例共享上限；未配置 Redis 时为单进程上限。" value={draft.tokenRefreshMaxRpm} min={1} max={6000} suffix="RPM" onChange={set('tokenRefreshMaxRpm')} />
-                <NumField label="Token 刷新突发容量" desc="允许立即发送的刷新数量；之后按 RPM 速率补充。" value={draft.tokenRefreshBurst} min={1} max={256} suffix="次" onChange={set('tokenRefreshBurst')} />
-                <TogField label="闲置账号后台刷新" desc="服务端定期扫描长期未调用的 OAuth/外部 IdP 账号，在过期前主动轮换 Token；关闭后仅保留请求触发刷新。" checked={draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundEnabled')} />
-                <NumField label="后台刷新扫描间隔" desc="后台扫描账号的间隔；范围 10 到 3600 秒。" value={draft.tokenRefreshBackgroundIntervalSecs} min={10} max={3600} suffix="秒" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundIntervalSecs')} />
-                <NumField label="后台刷新提前量" desc="Token 剩余多少秒时进入主动刷新窗口；范围 60 到 3600 秒。" value={draft.tokenRefreshBackgroundLeadSecs} min={60} max={3600} suffix="秒" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundLeadSecs')} />
-                <div className="rounded-lg border bg-muted/20 p-4 text-xs leading-5 text-muted-foreground md:col-span-2">
-                  当前辅助通道：进行中 {draft.auxiliaryUpstreamRuntime.inFlight}，历史峰值 {draft.auxiliaryUpstreamRuntime.peakInFlight}，饱和拒绝 {draft.auxiliaryUpstreamRuntime.rejected}。Refresh client 缓存 {draft.auxiliaryUpstreamRuntime.refreshClientCacheEntries}/{draft.auxiliaryUpstreamRuntime.refreshClientCacheMaxEntries}，构建 {draft.auxiliaryUpstreamRuntime.refreshClientBuilds}，命中 {draft.auxiliaryUpstreamRuntime.refreshClientHits}，未命中 {draft.auxiliaryUpstreamRuntime.refreshClientMisses}，容量拒绝 {draft.auxiliaryUpstreamRuntime.refreshClientCacheSaturated}。
-                  <br />Token refresh authority {draft.tokenRefreshAdmissionRuntime.authority}，准入 {draft.tokenRefreshAdmissionRuntime.admitted}，RPM 拒绝 {draft.tokenRefreshAdmissionRuntime.rateLimited}，协调拒绝 {draft.tokenRefreshAdmissionRuntime.coordinationRejected}，Redis 错误 {draft.tokenRefreshAdmissionRuntime.redisErrors}，剩余 {draft.tokenRefreshAdmissionRuntime.remainingMilliTokens / 1000} tokens。
-                </div>
-
-
-
-                <NumField label="本地 provider 尝试上限" desc="单次本地调用最多尝试多少个凭据；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
-                <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
-                <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />
-
-
-                <TogField label="狂暴模式（429 暴力轮换）" desc="仅作用于本地账号。开启后遇到普通 429 会优先换号重试，把所有账号轮一遍后再换端点，直到成功或轮次耗尽。会显著放大上游请求量，默认关闭。风控型 429 与带 Retry-After 的 429 不受影响。" checked={draft.localBerserkModeEnabled} onChange={set('localBerserkModeEnabled')} />
-                <NumField label="狂暴模式最多轮换几轮" desc="仅在狂暴模式开启时生效。一轮 = 所有账号 × 所有端点各试一遍。" value={draft.localBerserkMaxRounds} min={1} max={10} suffix="轮" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkMaxRounds')} />
-                <NumField label="狂暴模式轮次间隔" desc="仅在狂暴模式开启时生效。同一轮内换号不等待；只有进入下一轮时才退避这么久。0 表示完全不等待。" value={draft.localBerserkRoundDelayMs} min={0} max={60000} suffix="毫秒" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkRoundDelayMs')} />
-                <NumField label="异常并发自动回收" desc="请求长时间没有结束时自动释放占用，避免账号并发数被卡住；0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={set('credentialInFlightLeaseMaxSecs')} />
-              </TwoCol>
-            )}
-
-            {activeSection === 'accounts' && (
-              <div className="space-y-4">
-                <TwoCol>
-                  <TogField
-                    label="启用账号"
-                    desc="允许请求在本地凭据不可调度或策略命中时进入账号；下方路由规则会继续限制入口。"
-                    checked={draft.accounts.enabled}
-                    onChange={setAccounts('enabled')}
-                  />
-                  <TogField
-                    label="外部直连策略"
-                    desc="开启后命中直连模型或路径规则的请求直接走账号；关闭时账号只作为本地不可用后的兜底。"
-                    checked={draft.accounts.externalDirectPolicyEnabled}
-                    onChange={setAccounts('externalDirectPolicyEnabled')}
-                  />
-                  <TogField
-                    label="本地不可调度时预检账号"
-                    desc="本地账号容量不足、无可用账号或调度 Redis 退化时，允许请求在解析后优先尝试账号。"
-                    checked={draft.accounts.localPoolPreflightEnabled}
-                    onChange={setAccounts('localPoolPreflightEnabled')}
-                  />
-                  <TogField
-                    label="账号失败后本地救援"
-                    desc="账号作为兜底路径失败后，允许最后再尝试一次本地凭据；外部直连策略命中时不会启用该救援。"
-                    checked={draft.accounts.accountLocalRescueEnabled}
-                    onChange={setAccounts('accountLocalRescueEnabled')}
-                  />
-                </TwoCol>
-
-                <div className="rounded-lg border border-warning/30 bg-warning/5 p-4">
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <TogField
-                      label="账号 usage 原始数据诊断"
-                      desc="临时记录账号上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；默认关闭。"
-                      checked={draft.accounts.usageDebugEnabled}
-                      onChange={setAccounts('usageDebugEnabled')}
-                    />
-                    <label className="space-y-1.5 text-sm">
-                      <span className="text-muted-foreground">诊断目录</span>
-                      <Input
-                        className="font-mono text-xs"
-                        value={draft.accounts.usageDebugDir}
-                        placeholder="/tmp/claude-pool/account-usage-debug"
-                        onChange={(event) => setAccounts('usageDebugDir')(event.target.value)}
-                      />
-                      <span className="block text-xs leading-4 text-muted-foreground">
-                        写入容器内路径；记录失败只写服务日志，不影响请求。
-                      </span>
-                    </label>
-                    <NumField
-                      label="单条原始片段上限"
-                      desc="限制原始请求/响应 body 与 SSE 前缀保存大小。"
-                      value={draft.accounts.usageDebugMaxBodyBytes}
-                      min={0}
-                      max={1024 * 1024}
-                      suffix="Bytes"
-                      disabled={!draft.accounts.usageDebugEnabled}
-                      onChange={setAccounts('usageDebugMaxBodyBytes')}
-                    />
-                    <NumField
-                      label="最多诊断文件"
-                      desc="进程启动后最多写入的诊断 JSON 文件数；超出后跳过写入。"
-                      value={draft.accounts.usageDebugMaxFiles}
-                      min={0}
-                      max={100_000}
-                      suffix="个"
-                      disabled={!draft.accounts.usageDebugEnabled}
-                      onChange={setAccounts('usageDebugMaxFiles')}
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-3 rounded-md border bg-muted/30 p-4">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-sm font-semibold">路由限制</div>
-                    <div className="flex flex-wrap gap-2">
-                      <Button asChild variant="outline" size="sm"><Link to="/accounts">在账号页修改</Link></Button>
-                      <Button asChild variant="outline" size="sm"><Link to="/route-scenarios">路由场景</Link></Button>
-                    </div>
-                  </div>
-                  <div className="grid gap-2 text-sm md:grid-cols-2">
-                    <div><span className="text-muted-foreground">本地账号：</span>{routePolicySummary(draft.accounts.localPoolRouteMode, draft.accounts.localPoolRouteRules)}</div>
-                    <div><span className="text-muted-foreground">外部账号：</span>{routePolicySummary(draft.accounts.accountRouteMode, draft.accounts.accountRouteRules)}</div>
-                  </div>
-                  <p className="text-xs leading-5 text-muted-foreground">
-                    本地和外部的整体路由限制统一在账号页的“路由策略”里修改；要整套切换本地、外部和各账号的路由规则，用路由场景。
-                  </p>
-                </div>
-
-                <TwoCol>
-                  <NumField
-                    label="账号全局最大并发"
-                    desc="所有账号合计同时处理的请求上限；0 表示不限制。"
-                    value={draft.accounts.globalMaxConcurrentRequests}
-                    min={0}
-                    max={100_000}
-                    suffix="并发"
-                    onChange={setAccounts('globalMaxConcurrentRequests')}
-                  />
-                  <NumField
-                    label="账号最大排队请求数"
-                    desc="账号并发占满时最多允许排队的请求数；0 表示不排队。"
-                    value={draft.accounts.maxQueuedRequests}
-                    min={0}
-                    max={100_000}
-                    suffix="请求"
-                    onChange={setAccounts('maxQueuedRequests')}
-                  />
-                  <NumField
-                    label="账号最长排队等待"
-                    desc="账号等待并发名额的最长时间；0 会按后端安全默认值处理。"
-                    value={draft.accounts.dispatchMaxWaitSecs}
-                    min={0}
-                    max={86_400}
-                    suffix="秒"
-                    onChange={setAccounts('dispatchMaxWaitSecs')}
-                  />
-                  <NumField
-                    label="账号最多故障转移"
-                    desc="同一请求在多个账号之间最多尝试多少次；0 表示不重试其它账号。"
-                    value={draft.accounts.retryMaxAttempts}
-                    min={0}
-                    max={10_000}
-                    suffix="次"
-                    onChange={setAccounts('retryMaxAttempts')}
-                  />
-                  <TogField
-                    label="网络错误跨池重试"
-                    desc="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他账号。"
-                    checked={draft.accounts.retryOnNetworkError}
-                    onChange={setAccounts('retryOnNetworkError')}
-                  />
-                  <TogField
-                    label="协议错误跨池重试"
-                    desc="上游返回成功状态码但内容是错误信封或协议污染时，是否允许切换其他账号。"
-                    checked={draft.accounts.retryOnProtocolError}
-                    onChange={setAccounts('retryOnProtocolError')}
-                  />
-                  <label className="space-y-1.5 text-sm md:col-span-2">
-                    <span className="text-muted-foreground">跨池重试状态码</span>
-                    <Input
-                      className="font-mono text-xs"
-                      value={joinStatusCodeList(draft.accounts.retryStatusCodes)}
-                      onChange={(event) => setAccounts('retryStatusCodes')(parseStatusCodeList(event.target.value))}
-                    />
-                    <span className="block text-xs leading-4 text-muted-foreground">
-                      控制普通 HTTP 错误是否继续尝试其他账号；认证、配额、渠道禁用等已分类错误仍按错误分类切换。
-                    </span>
-                  </label>
-                  <NumField
-                    label="同池重试次数"
-                    desc="命中下面状态码时，先在同一个账号上重试；重试耗尽后才冷却并尝试其他账号。"
-                    value={draft.accounts.samePoolRetryCount}
-                    min={0}
-                    max={10}
-                    suffix="次"
-                    onChange={setAccounts('samePoolRetryCount')}
-                  />
-                  <NumField
-                    label="同池重试间隔"
-                    desc="同一个账号重试之间的等待时间。"
-                    value={draft.accounts.samePoolRetryDelayMs}
-                    min={0}
-                    max={60_000}
-                    suffix="毫秒"
-                    onChange={setAccounts('samePoolRetryDelayMs')}
-                  />
-                  <NumField
-                    label="失败池临时降权"
-                    desc="账号出现可重试瞬态失败后，在失败窗口内临时增加有效优先级；默认 20 可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。"
-                    value={draft.accounts.transientFailurePriorityPenalty}
-                    min={0}
-                    max={10_000}
-                    suffix="优先级"
-                    onChange={setAccounts('transientFailurePriorityPenalty')}
-                  />
-                  <NumField
-                      label="连续失败计数（兼容）"
-                      desc="保留旧配置字段；普通瞬态失败只降低调度优先级，不会触发池级冷却。池级冷却仅用于模型不可用、端点错误或自动禁用等极端状态。"
-                    value={draft.accounts.accountTransientFailureCooldownThreshold}
-                    min={0}
-                    max={1000}
-                    suffix="次"
-                    onChange={setAccounts('accountTransientFailureCooldownThreshold')}
-                  />
-                  <label className="space-y-1.5 text-sm md:col-span-2">
-                    <span className="text-muted-foreground">同池重试状态码</span>
-                    <Input
-                      className="font-mono text-xs"
-                      value={joinStatusCodeList(draft.accounts.samePoolRetryStatusCodes)}
-                      onChange={(event) => setAccounts('samePoolRetryStatusCodes')(parseStatusCodeList(event.target.value))}
-                    />
-                    <span className="block text-xs leading-4 text-muted-foreground">支持用逗号、空格或换行分隔；默认值用于 401、403、429、500、502、503、504。</span>
-                  </label>
-                  <NumField
-                    label="账号失败后本地等待"
-                    desc="触发本地救援时，最多等待本地账号空闲多久。"
-                    value={draft.accounts.accountLocalRescueMaxWaitSecs}
-                    min={0}
-                    max={300}
-                    suffix="秒"
-                    disabled={!draft.accounts.accountLocalRescueEnabled}
-                    onChange={setAccounts('accountLocalRescueMaxWaitSecs')}
-                  />
-                  <NumField
-                    label="账号估算输入上限（兼容）"
-                    desc="保留历史配置；当前不再用它做本地发送前拒绝，真实上下文超限以上游响应和请求大小保护为准。"
-                    value={draft.accounts.accountMaxInputTokens}
-                    min={0}
-                    suffix="tokens"
-                    onChange={setAccounts('accountMaxInputTokens')}
-                  />
-                </TwoCol>
-
-                <div className="rounded-lg border p-4">
-                  <div className="mb-3 space-y-1">
-                    <div className="text-sm font-medium">质量感知调度</div>
-                    <div className="text-xs leading-5 text-muted-foreground">
-                      根据真实请求观测到的失败率、首字延迟和总耗时，在**同优先级的账号之间**选择更好的那个。
-                      全部数据来自用户真实流量，不做任何主动探测；优先级本身是硬分层，质量分不会把低优先级账号提上来。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <TogField
-                      label="启用质量感知调度"
-                      desc="关闭后完全退回“优先级 → 负载”的旧排序；质量状态仍随运行态快照读取，但不参与选择、不展示，也不会写入新的质量样本，可作为线上快速回退手段。"
-                      checked={draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityAwareSchedulingEnabled')}
-                    />
-                    <NumField
-                      label="候选池大小 K"
-                      desc="在评分最优的 K 个账号里加权随机挑选，避免多实例同时扑向同一个账号。1 表示总是选最优。"
-                      value={draft.accounts.qualityTopK}
-                      min={1}
-                      max={100}
-                      suffix="个"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityTopK')}
-                    />
-                    <NumField
-                      label="质量平滑系数"
-                      desc="EWMA 系数，有效窗口约为最近 1/系数 个请求。越大越灵敏，越小越稳定。"
-                      value={draft.accounts.qualityEwmaAlpha}
-                      min={0.01}
-                      max={1}
-                      step={0.01}
-                      suffix="系数"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityEwmaAlpha')}
-                    />
-                    <NumField
-                      label="最少样本数"
-                      desc="累计样本不足时按中性处理，不加分也不减分；避免新账号因冷启动数据难看而永远起不来。"
-                      value={draft.accounts.qualityMinSamples}
-                      min={1}
-                      max={10_000}
-                      suffix="次"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityMinSamples')}
-                    />
-                    <NumField
-                      label="质量数据有效期"
-                      desc="超过该时长没有新请求，质量数据过期并回到中性值。"
-                      value={draft.accounts.qualitySampleTtlSecs}
-                      min={1}
-                      max={86_400}
-                      suffix="秒"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualitySampleTtlSecs')}
-                    />
-                  </TwoCol>
-                </div>
-
-                <div className="rounded-lg border p-4">
-                  <div className="mb-3 space-y-1">
-                    <div className="text-sm font-medium">评分权重</div>
-                    <div className="text-xs leading-5 text-muted-foreground">
-                      分数越低越优先。延迟类指标按“相对候选集中位数”计算，只惩罚明显比同伴差的账号——
-                      因此全体一起变慢时不会有账号被无端降权，候选集也不会被清空。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <NumField
-                      label="失败率权重"
-                      desc="量级刻意远高于延迟权重：报错比“慢”严重得多，必须能压过首字延迟的倾向。默认 100。"
-                      value={draft.accounts.qualityErrorWeight}
-                      min={0}
-                      max={1_000_000}
-                      step={1}
-                      suffix="权重"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityErrorWeight')}
-                    />
-                    <NumField
-                      label="延迟权重"
-                      desc="首字延迟与总耗时各自相对中位数归一化后共用该权重；慢一倍贡献 1 个权重单位。"
-                      value={draft.accounts.qualityLatencyWeight}
-                      min={0}
-                      max={1_000_000}
-                      step={1}
-                      suffix="权重"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityLatencyWeight')}
-                    />
-                    <NumField
-                      label="负载权重"
-                      desc="账号当前并发占用率的权重，用于在质量相近时摊平负载。"
-                      value={draft.accounts.qualityLoadWeight}
-                      min={0}
-                      max={1_000_000}
-                      step={1}
-                      suffix="权重"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityLoadWeight')}
-                    />
-                    <NumField
-                      label="临时降级权重"
-                      desc="被临时降级的账号额外增加的分数，使其排到末尾但不移出候选集。"
-                      value={draft.accounts.qualityProbationWeight}
-                      min={0}
-                      max={1_000_000}
-                      step={1}
-                      suffix="权重"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityProbationWeight')}
-                    />
-                    <NumField
-                      label="优先级权重"
-                      desc="仅用于管理端展示分数构成；优先级是硬分层，同层内该项为常数，不影响实际比较。"
-                      value={draft.accounts.qualityPriorityWeight}
-                      min={0}
-                      max={1_000_000}
-                      step={1}
-                      suffix="权重"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('qualityPriorityWeight')}
-                    />
-                  </TwoCol>
-                </div>
-
-                <div className="rounded-lg border p-4">
-                  <div className="mb-3 space-y-1">
-                    <div className="text-sm font-medium">劣化与恢复</div>
-                    <div className="text-xs leading-5 text-muted-foreground">
-                      持续失败的账号会被<strong>临时降低调度优先级</strong>，这不是真正的冷却——
-                      它仍会保留一小部分探测流量，否则永远产生不了新数据来自证恢复。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <NumField
-                      label="降级失败率阈值"
-                      desc="失败率达到该比例即临时降级。设为 1 表示只在全部失败时才降级。"
-                      value={draft.accounts.degradeErrorRateThreshold}
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      suffix="比例"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('degradeErrorRateThreshold')}
-                    />
-                    <NumField
-                      label="劣化判定窗口"
-                      desc="失败率的观察窗口长度。"
-                      value={draft.accounts.degradeWindowSecs}
-                      min={1}
-                      max={86_400}
-                      suffix="秒"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('degradeWindowSecs')}
-                    />
-                    <NumField
-                      label="单次降级时长"
-                      desc="首次触发降级持续多久；连续再次触发会按 2 倍逐次延长。"
-                      value={draft.accounts.degradeProbationSecs}
-                      min={1}
-                      max={86_400}
-                      suffix="秒"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('degradeProbationSecs')}
-                    />
-                    <NumField
-                      label="最长降级时长"
-                      desc="连续降级指数退避的上限，不得低于单次降级时长。"
-                      value={draft.accounts.maxProbationSecs}
-                      min={draft.accounts.degradeProbationSecs}
-                      max={86_400}
-                      suffix="秒"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('maxProbationSecs')}
-                    />
-                    <NumField
-                      label="降级期探测流量"
-                      desc="被降级账号仍保留的流量比例。设为 0 会让降级变成硬避让，账号将无法自证恢复，除非它重新进入候选前列。"
-                      value={draft.accounts.probeSharePercent}
-                      min={0}
-                      max={100}
-                      suffix="%"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('probeSharePercent')}
-                    />
-                    <NumField
-                      label="恢复爬坡时长"
-                      desc="降级到期后流量线性回升的时长，避免账号刚恢复就被瞬间打满。0 表示立即全量恢复。"
-                      value={draft.accounts.recoveryRampSecs}
-                      min={0}
-                      max={86_400}
-                      suffix="秒"
-                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
-                      onChange={setAccounts('recoveryRampSecs')}
-                    />
-                  </TwoCol>
-                </div>
-              </div>
-            )}
-
-            {activeSection === 'cooldown' && (
-              <TwoCol>
-                <NumField label="默认暂停时间" desc="临时错误后暂停多久" value={draft.credentialTransientCooldownSecs} min={1} suffix="秒" onChange={set('credentialTransientCooldownSecs')} />
-                <NumField label="限流后暂停" desc="收到 429 限流响应后的初始冷却，受最大冷却时长约束" value={draft.credentialRateLimitCooldownSecs} min={1} suffix="秒" onChange={set('credentialRateLimitCooldownSecs')} />
-                <NumField label="服务繁忙后暂停" desc="收到 5xx 服务端错误后的初始冷却" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialServerErrorCooldownSecs')} />
-                <NumField label="网络错误基础冷却" desc="连接超时、DNS 失败等网络层错误后的冷却" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialNetworkErrorCooldownSecs')} />
-                <NumField label="流式中断后暂停" desc="流式响应中途中断后的冷却" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
-                <TogField label="空回也让账号冷却" desc="空回指上游返回成功但没有任何内容：只有用量统计、一帧数据都没有、或响应体为空。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求。打开后按「流式中断后暂停」冷却该账号。" checked={draft.credentialEmptyTurnCooldownEnabled} onChange={set('credentialEmptyTurnCooldownEnabled')} />
-                <TogField label="上游故障也让账号冷却" desc="上游故障指换任何账号都可能遇到的错误：上游 5xx、响应里的异常或错误事件、数据流解码或读取失败、网络超时。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求；账号走自己的代理时，网络超时仍会冷却。限流、鉴权、额度、风控这类账号问题不受影响，照常冷却。打开后恢复旧行为：上游故障也按各自的暂停时长冷却。" checked={draft.credentialUpstreamFailureCooldownEnabled} onChange={set('credentialUpstreamFailureCooldownEnabled')} />
-                <TogField label="空回时暂时摘除账号" desc="账号反复空回（上游返回成功但没有内容）或流被截断时，累计一个「劣化分」。分数到线后，这个账号暂时不接新请求，流量自动转给同档或下一档的健康账号；它仍保留少量试探流量，连续成功后自动回来。不会冷却账号，也不改账号的 Fast 和优先级。所有账号都劣化时照常全部使用，不会因此排队。" checked={draft.credentialDegradeEnabled} onChange={set('credentialDegradeEnabled')} />
-                <NumField label="让出流量的分数线" desc="分数到这条线就让出流量。默认 5：空回记 2 分、流截断记 1 分，大约连续三次空回触发。0 表示只记分不让出。" value={draft.credentialDegradeSuspendScore} min={0} max={1000} step={0.5} suffix="分" onChange={set('credentialDegradeSuspendScore')} />
-                <NumField label="恢复线比例" desc="分数降到「分数线 × 这个比例」以下才恢复接流量。比例越小越不容易来回切换。默认 0.4，即 5 分要降到 2 分以下。" value={draft.credentialDegradeResumeRatio} min={0} max={1} step={0.05} suffix="倍" onChange={set('credentialDegradeResumeRatio')} />
-                <NumField label="分数自然减半时间" desc="没有新请求时，分数每过这么久减一半，长时间没出错的账号会自己恢复。" value={draft.credentialDegradeHalfLifeSecs} min={1} max={86400} suffix="秒" onChange={set('credentialDegradeHalfLifeSecs')} />
-                <NumField label="每次成功保留比例" desc="每成功一次，分数乘以这个比例。默认 0.5：两次成功基本恢复。" value={draft.credentialDegradeSuccessDecay} min={0} max={1} step={0.05} suffix="倍" onChange={set('credentialDegradeSuccessDecay')} />
-                <NumField label="让出期间试探比例" desc="让出流量的账号仍接这个比例的请求，用来判断它是否恢复。设 0 会让它永远回不来，不建议。" value={draft.credentialDegradeProbePercent} min={0} max={100} suffix="%" onChange={set('credentialDegradeProbePercent')} />
-                <NumField label="空回记分" desc="一次空回加多少分。" value={draft.credentialDegradeEmptyTurnWeight} min={0} max={100} step={0.5} suffix="分" onChange={set('credentialDegradeEmptyTurnWeight')} />
-                <NumField label="流截断记分" desc="一次流被截断或读取失败加多少分。这类错误更偏上游，默认比空回低。" value={draft.credentialDegradeStreamWeight} min={0} max={100} step={0.5} suffix="分" onChange={set('credentialDegradeStreamWeight')} />
-                <div className="space-y-1.5">
-                  <div className="text-sm font-semibold">空回对外状态码</div>
-                  <Select value={String(draft.emptyTurnErrorStatusCode)} onValueChange={(v) => set('emptyTurnErrorStatusCode')(Number(v))}>
-                    <SelectTrigger size="sm" className="w-56"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="502">502（默认）</SelectItem>
-                      <SelectItem value="503">503</SelectItem>
-                      <SelectItem value="529">529（客户端自动重试）</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <div className="text-xs leading-5 text-muted-foreground">空回指上游返回成功、但整条回复从头到尾没有任何文字、思考或工具调用（回复过程中某一帧为空不算）。换号重试用尽仍为空时，按这个状态码返回错误，不会返回 200，也不计费。默认 502；529 会让 Claude Code 自动静默重试，但部分下游网关收到 529 会把账号标成过载。</div>
-                </div>
-                <div className="space-y-1.5">
-                  <div className="text-sm font-semibold">空回重试等待方式</div>
-                  <Select value={draft.emptyTurnRetryBackoffMode} onValueChange={(v) => set('emptyTurnRetryBackoffMode')(v as 'none' | 'fixed' | 'exponential')}>
-                    <SelectTrigger size="sm" className="w-56"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="none">不等待（默认）</SelectItem>
-                      <SelectItem value="fixed">固定间隔</SelectItem>
-                      <SelectItem value="exponential">指数递增</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <div className="text-xs leading-5 text-muted-foreground">空回后换号重试之前等多久。不等待：立即换号（默认）；固定：每次等同样的时间；指数：每次翻倍直到上限。等待时不占用账号，且不会超过首个输出前的静默保留时间。</div>
-                </div>
-                <NumField label="空回重试首次等待" desc="固定模式下每次都等这么久；指数模式下这是第一次的等待。" value={draft.emptyTurnRetryBaseDelayMs} min={0} max={10000} suffix="毫秒" disabled={draft.emptyTurnRetryBackoffMode === 'none'} onChange={set('emptyTurnRetryBaseDelayMs')} />
-                <NumField label="空回重试最长等待" desc="指数模式下单次等待的上限。" value={draft.emptyTurnRetryMaxDelayMs} min={0} max={30000} suffix="毫秒" disabled={draft.emptyTurnRetryBackoffMode !== 'exponential'} onChange={set('emptyTurnRetryMaxDelayMs')} />
-                <NumField label="空回重试随机抖动" desc="在等待时间上下浮动的比例，避免一批请求同时重发。" value={draft.emptyTurnRetryJitterPercent} min={0} max={100} suffix="%" disabled={draft.emptyTurnRetryBackoffMode === 'none'} onChange={set('emptyTurnRetryJitterPercent')} />
-                <NumField label="自愈最小间隔" desc="所有账号都不可用时，因连续失败被禁用的账号会自动恢复。同一个账号两次自愈至少隔这么久；0 表示不限。" value={draft.credentialAutoHealMinIntervalSecs} min={0} max={86400} suffix="秒" onChange={set('credentialAutoHealMinIntervalSecs')} />
-                <NumField label="最多连续自愈" desc="自愈后一次都没成功就又被禁用，算连续一轮；达到上限后不再自动恢复，等人工处理。成功一次或手动启用后清零；0 表示不限。" value={draft.credentialAutoHealMaxConsecutiveRounds} min={0} max={1000} suffix="轮" onChange={set('credentialAutoHealMaxConsecutiveRounds')} />
-                <NumField label="格式异常后暂停" desc="响应格式/协议异常后的冷却" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />
-                <NumField label="授权异常后暂停" desc="收到 401/403 授权失败后的冷却" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialAuthErrorCooldownSecs')} />
-                <NumField label="最大冷却时长" desc="连续出错时最多暂停多久" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={set('credentialMaxCooldownSecs')} />
-                <NumField label="退避倍率" desc="连续出错时逐步延长" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={set('credentialCooldownBackoffMultiplier')} />
-                <NumField label="恢复时间错开比例" desc="给恢复时间加一点随机错开，避免多个账号同时恢复后又同时出错。" value={draft.credentialCooldownJitterPercent} min={0} max={100} suffix="%" onChange={set('credentialCooldownJitterPercent')} />
-                <NumField label="恢复观察时间" desc="账号刚恢复时先少量使用，稳定后再恢复正常调度。" value={draft.credentialProbationSecs} min={0} suffix="秒" onChange={set('credentialProbationSecs')} />
-              </TwoCol>
-            )}
-
-            {activeSection === 'scheduler' && (
-              <TwoCol>
-                <NumField label="近期错误敏感度" desc="越高，刚发生的错误越快影响账号选择；不确定就保持默认。" value={draft.schedulerErrorEwmaAlpha} min={0.01} max={1} step={0.01} suffix="系数" onChange={set('schedulerErrorEwmaAlpha')} />
-                <NumField label="优先级权重" desc="数值越大，账号优先级越能影响选择结果。" value={draft.schedulerPriorityWeight} min={0} step={0.1} suffix="权重" onChange={set('schedulerPriorityWeight')} />
-                <NumField label="当前负载权重" desc="数值越大，当前更空闲的账号越容易被选中。" value={draft.schedulerLoadWeight} min={0} step={1} suffix="权重" onChange={set('schedulerLoadWeight')} />
-                <NumField label="近期错误权重" desc="数值越大，最近出错多的账号越不容易被选中。" value={draft.schedulerErrorWeight} min={0} step={1} suffix="权重" onChange={set('schedulerErrorWeight')} />
-                <NumField label="响应耗时权重" desc="数值越大，响应慢的账号越少被选中；通常设较小值" value={draft.schedulerLatencyWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerLatencyWeight')} />
-                <NumField label="恢复期降权" desc="账号刚从错误中恢复时，数值越大越少被选中。" value={draft.schedulerProbationWeight} min={0} step={1} suffix="权重" onChange={set('schedulerProbationWeight')} />
-                <NumField label="短时集中降权" desc="短时间内同一个账号被选得太多时，数值越大越快分散到其他账号。" value={draft.schedulerSelectionPressureWeight} min={0} step={1} suffix="权重" onChange={set('schedulerSelectionPressureWeight')} />
-                <NumField label="长期使用次数权重" desc="数值越大，历史调度次数多的账号越少被选中，促进均衡" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerTotalSelectionWeight')} />
-                <NumField label="候选账号数量" desc="每次从前几个合适账号里挑选；数值越大越分散，但也会让选择更宽松。" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={set('schedulerTopK')} />
-                <NumField label="失败诊断样本数" desc="调度失败时最多记录多少个账号样本，用于后台排查；0 表示不记录样本。" value={draft.selectionFailureSampleLimit} min={0} max={1000} suffix="个" onChange={set('selectionFailureSampleLimit')} />
-                <TogField label="记录失败样本" desc="关闭后只保留失败原因统计，不记录具体账号样本。" checked={draft.selectionFailureRecordEnabled} onChange={set('selectionFailureRecordEnabled')} />
-              </TwoCol>
-            )}
-
-            {activeSection === 'warmup' && (
-              <TwoCol>
-                <NumField label="预热请求数" desc="0 表示不预热" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={set('credentialWarmupRequests')} />
-                <NumField label="预热起始比例" desc="新账号起步流量占同档位普通账号平均流量的比例，随预热进度升到 100%；普通账号全满时新账号照常接溢出流量" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupSelectionPercent')} />
-                <NumField label="预热账号总占比上限" desc="所有预热中账号合计流量不超过此比例；普通账号很少时自动放宽" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupMaxSelectionPercent')} />
-              </TwoCol>
-            )}
-
-            {activeSection === 'payload' && (
-              <div className="space-y-6">
-                <div className="space-y-4">
-                  <div>
-                    <div className="text-sm font-semibold">请求大小保护</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      负责发送前的大小判断、压缩和过大请求处理，和缓存策略分开配置。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <TogField label="启用请求压缩" desc="发送前尽量去掉冗余内容，减少请求体积。" checked={draft.compressionEnabled} onChange={set('compressionEnabled')} />
-                    <TogField label="仅压缩空白字符" desc="只处理多余空格和换行，改动最小，风险较低。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={set('whitespaceCompression')} />
-                    <TogField label="启用大小保护" desc="发送前检查请求大小，超过限制时按规则清理内容。" checked={draft.payloadGuardEnabled} onChange={set('payloadGuardEnabled')} />
-                    <TogField label="外部账号也应用大小保护" desc="请求转发到外部账号前，也执行同样的大小保护。" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={set('payloadGuardExternalEnabled')} />
-                    <TogField label="优先裁剪旧历史" desc="内容太长时，优先缩短较早的对话历史，尽量保留当前请求" checked={draft.payloadGuardTrimHistory} disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardTrimHistory')} />
-                  </TwoCol>
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">过大请求处理方式</div>
-                    <Select
-                      value={payloadGuardMode}
-                      disabled={!draft.payloadGuardEnabled}
-                      onValueChange={(v) => set('payloadGuardMode')(v as PayloadGuardMode)}
-                    >
-                      <SelectTrigger size="sm" className="w-72"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="preemptive">发送前先处理</SelectItem>
-                        <SelectItem value="on_too_long">失败后再处理并重试</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <div className="text-xs leading-5 text-muted-foreground">
-                      发送前先处理更稳；失败后再处理会尽量保留原文，但可能多一次重试。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <NumField label="请求大小阈值" desc="超过此大小才触发处理（如 1048576 = 1 MB）；0 表示不按大小处理" value={draft.payloadGuardMaxBytes} min={0} suffix="字节" onChange={set('payloadGuardMaxBytes')} />
-
-                    <NumField label="安全余量" desc="处理目标比阈值小出的缓冲（如 65536 = 64 KB），避免裁剪后仍超限" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="字节" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardSafetyMarginBytes')} />
-                  </TwoCol>
-                </div>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">图片处理</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      控制图片、文件和远程资源在发送上游前是否由本地展开或修正。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">处理模式</div>
-                      <Select
-                        value={imageProcessingMode}
-                        onValueChange={(v) => setImageProcessing('mode')(v as RuntimeConfig['imageProcessing']['mode'])}
-                      >
-                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="safe">Safe：兼容修复</SelectItem>
-                          <SelectItem value="light">Light：轻量透传</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <div className="text-xs leading-5 text-muted-foreground">
-                        {imageProcessingMode === 'light'
-                          ? '不展开 file_id，不下载远程 URL，不解码修正 base64 媒体类型；只接受 inline base64 或 data URL。'
-                          : '保持现有兼容行为，可按下面开关展开文件、下载远程资源和修正图片 media_type。'}
-                      </div>
-                    </div>
-                    <TogField
-                      label="展开本地文件 source"
-                      desc="把已上传文件引用展开为可发送给 上游 的 inline 内容。"
-                      checked={Boolean(draft.imageProcessing?.safeMaterializeFileSources)}
-                      disabled={imageProcessingMode !== 'safe'}
-                      onChange={setImageProcessing('safeMaterializeFileSources')}
-                    />
-                    <TogField
-                      label="下载远程图片和文档"
-                      desc="把请求里的远程 URL 下载后转成 inline 内容，便于上游识别。"
-                      checked={Boolean(draft.imageProcessing?.safeDownloadRemoteSources)}
-                      disabled={imageProcessingMode !== 'safe'}
-                      onChange={setImageProcessing('safeDownloadRemoteSources')}
-                    />
-                    <TogField
-                      label="修正 base64 图片类型"
-                      desc="根据图片字节修正错误的 image/png、image/jpeg 等 media_type。"
-                      checked={Boolean(draft.imageProcessing?.safeNormalizeBase64MediaTypes)}
-                      disabled={imageProcessingMode !== 'safe'}
-                      onChange={setImageProcessing('safeNormalizeBase64MediaTypes')}
-                    />
-                    <TogField
-                      label="压缩过大的图片"
-                      desc="默认关闭。打开后，长边或体积超限的 PNG/JPEG/WebP 会等比缩小并重新编码为 JPEG 再发给上游，可减少请求体积和输入 token；GIF 不处理，失败时保留原图。只作用于经过本地处理的请求（含本地处理后转账号兜底的请求）；直接转发给账号的请求保持原样。"
-                      checked={Boolean(draft.imageProcessing?.resizeEnabled)}
-                      onChange={setImageProcessing('resizeEnabled')}
-                    />
-                    <NumField label="压缩后长边上限" desc="超过这个像素数的图片会被等比缩小；默认 1568。" value={draft.imageProcessing?.resizeMaxLongSide ?? 1568} min={256} max={8000} suffix="像素" disabled={!draft.imageProcessing?.resizeEnabled} onChange={setImageProcessing('resizeMaxLongSide')} />
-                    <NumField label="压缩后体积上限" desc="按 base64 编码后的长度计；默认 400000。" value={draft.imageProcessing?.resizeMaxBytes ?? 400000} min={32768} max={5242880} suffix="字节" disabled={!draft.imageProcessing?.resizeEnabled} onChange={setImageProcessing('resizeMaxBytes')} />
-                    <NumField label="压缩画质" desc="重新编码为 JPEG 时的初始画质，体积仍超限时会逐步降低；默认 85。" value={draft.imageProcessing?.resizeJpegQuality ?? 85} min={40} max={100} suffix="" disabled={!draft.imageProcessing?.resizeEnabled} onChange={setImageProcessing('resizeJpegQuality')} />
-                  </TwoCol>
-                </div>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">提示词注入</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      代理写进上游请求的提示词（任务质量、语言、身份、分块写入、thinking 与 tool_choice 兼容标签等）每一项单独设置，统一在提示词注入页编辑；和路由的关联在路由策略里设置。
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button asChild variant="outline" size="sm"><Link to="/prompt-injection">打开提示词注入</Link></Button>
-                    <Button asChild variant="outline" size="sm"><Link to="/cache-policies">打开路由策略</Link></Button>
-                  </div>
-                </div>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">本地协议转换</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      这些开关会改变本地凭据路径最终发往 上游 的请求体；账号 raw body 透传不会进入这些阶段。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <TogField label="工具 schema 规范化" desc="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
-                    <TogField label="工具名映射" desc="清洗或缩短不符合 上游 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
-                    <div className="rounded-md border bg-background p-4">
-                      <div className="mb-3">
-                        <div className="text-sm font-medium">schema key 映射</div>
-                        <div className="mt-1 text-xs leading-5 text-muted-foreground">sanitize 只清洗不符合正则的 property key 并在响应中映射回原 key；reject 明确拒绝；disabled 保持旧行为。</div>
-                      </div>
-                      <Select value={draft.bodyConversion.toolSchemaKeyMapping} onValueChange={(v) => setBodyConversion('toolSchemaKeyMapping')(v as RuntimeConfig['bodyConversion']['toolSchemaKeyMapping'])}>
-                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="sanitize">sanitize：清洗并反向映射</SelectItem>
-                          <SelectItem value="reject">reject：非法 key 明确报错</SelectItem>
-                          <SelectItem value="disabled">disabled：不处理</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="rounded-md border bg-background p-4">
-                      <div className="mb-3">
-                        <div className="text-sm font-medium">schema key 合法性正则</div>
-                        <div className="mt-1 text-xs leading-5 text-muted-foreground">仅 schema key 映射为 sanitize/reject 时使用。默认来自问题分析文档。</div>
-                      </div>
-                      <Input
-                        className="font-mono text-xs"
-                        value={draft.bodyConversion.toolSchemaKeyValidationRegex}
-                        onChange={(event) => setBodyConversion('toolSchemaKeyValidationRegex')(event.target.value)}
-                      />
-                    </div>
-                    <TogField label="原生 reasoning 字段" desc="对支持的 上游 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
-                    <TogField label="Thinking 兼容签名" desc="上游 没有原生签名时，为 Claude Code 输出确定性的兼容签名；历史回放到 上游 前会自动剥离。" checked={draft.bodyConversion.syntheticThinkingSignatures} onChange={setBodyConversion('syntheticThinkingSignatures')} />
-                    <TogField label="结构化 tool_choice" desc="按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用（含 disable_parallel_tool_use）。对应的提示词在提示词注入页单独控制。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
-                    <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
-                    <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
-                    <TogField label="历史图片去重" desc="默认关闭。打开后，历史里重复出现的同一张图片（包括工具结果里的截图）只发第一次，之后换成一行文字说明，减少请求体积和输入 token；当前这一轮的图片总是原样发送。只按图片数据完全相同判断。" checked={draft.bodyConversion.historyImageDedup} onChange={setBodyConversion('historyImageDedup')} />
-                    <TogField label="代码执行（默认关闭）" desc="仅在路由开启时执行 Anthropic code_execution 的 Python 代码，并返回 bash_code_execution 服务端工具结果。" checked={draft.bodyConversion.codeExecution.enabled} onChange={(enabled) => setBodyConversion('codeExecution')({ ...draft.bodyConversion.codeExecution, enabled })} />
-                  </TwoCol>
-                </div>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">历史消息清理</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      负责历史消息和旧工具结果的体积优化。
-                    </div>
-                  </div>
-                  <PayloadHistorySection shaping={draft.payloadShaping} payloadSizeLimitEnabled={payloadSizeLimitEnabled} onChange={set('payloadShaping')} />
-                </div>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">当前请求兜底</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      当前请求仍然超过限制时，按这里的规则处理当前内容。
-                    </div>
-                  </div>
-                  <PayloadFallbackSection shaping={draft.payloadShaping} payloadShapingBranchEnabled={payloadSizeLimitEnabled && draft.payloadShaping.enabled} onChange={set('payloadShaping')} />
-                </div>
-              </div>
-            )}
-
-            {activeSection === 'modelMapping' && (
-              <div className="space-y-6">
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">模型解析策略</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      控制请求模型名在发送上游前如何匹配，不改变响应格式，也不改变账号调度规则。
-                    </div>
-                  </div>
-                  <div className="space-y-1.5">
-                    <Select value={draft.modelResolutionMode} onValueChange={(v) => set('modelResolutionMode')(v as RuntimeConfig['modelResolutionMode'])}>
-                      <SelectTrigger size="sm" className="w-72"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="compatible">默认兼容解析</SelectItem>
-                        <SelectItem value="alias_only">仅精确与显式别名</SelectItem>
-                        <SelectItem value="exact_only">仅完整模型名</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      {draft.modelResolutionMode === 'compatible'
-                        ? '允许常见别名和版本写法，兼容性最好。'
-                        : draft.modelResolutionMode === 'alias_only'
-                          ? '只接受完整模型名和明确配置过的别名。'
-                          : '只接受完整模型名，最严格。'}
-                    </p>
-                  </div>
-                </div>
-                <ModelMappingSection
-                  mapping={draft.modelMapping}
-                  capabilities={modelCapabilities.data}
-                  onChange={(m: ModelMappingConfig) => set('modelMapping')(m)}
-                />
-              </div>
-            )}
-
-            {activeSection === 'startupProxy' && (
-              <StartupProxySection config={draft} />
-            )}
-
-            {activeSection === 'requestCompat' && (
-              <div className="space-y-4">
-                <p className="text-xs leading-5 text-muted-foreground">
-                  客户端发了严格校验不收的写法时：开着就改写后继续，关掉就按协议拒绝（多数返回 400）。
-                  改写在请求入口、选路之前完成。前五项是已有行为，默认开着，与之前一致。
-                </p>
-                <div className="text-sm font-semibold text-foreground">已有兼容</div>
-                <TwoCol>
-                  <TogField
-                    label="effort 为 none 时删除"
-                    desc={'output_config.effort 写成 "none"（不区分大小写）时视为未指定，删掉该字段。'}
-                    checked={draft.localRequestCompat.dropEffortNone}
-                    onChange={setLocalRequestCompat('dropEffortNone')}
-                  />
-                  <TogField
-                    label="thinking 类型别名"
-                    desc="thinking.type 为 between_tools 时改成 adaptive。"
-                    checked={draft.localRequestCompat.thinkingTypeAliases}
-                    onChange={setLocalRequestCompat('thinkingTypeAliases')}
-                  />
-                  <TogField
-                    label="修复 thinking 预算"
-                    desc="预算与 max_tokens 不匹配时自动修复：过小抬到 1024，超出时扩大 max_tokens 或收紧预算；adaptive / disabled 去掉 budget_tokens。"
-                    checked={draft.localRequestCompat.repairThinkingBudget}
-                    onChange={setLocalRequestCompat('repairThinkingBudget')}
-                  />
-                  <TogField
-                    label="归一非标准消息角色"
-                    desc="messages 里的 system / developer 并入系统提示词，其他未知角色丢弃。"
-                    checked={draft.localRequestCompat.normalizeMessageRoles}
-                    onChange={setLocalRequestCompat('normalizeMessageRoles')}
-                  />
-                  <TogField
-                    label="归一消息内容形状"
-                    desc="content 为数字、布尔、null、单个对象，或数组里有非对象元素时，转成标准的文本或块列表。"
-                    checked={draft.localRequestCompat.normalizeMessageContent}
-                    onChange={setLocalRequestCompat('normalizeMessageContent')}
-                  />
-                </TwoCol>
-                <div className="border-t border-border/70 pt-4 text-sm font-semibold text-foreground">新增兼容</div>
-                <TwoCol>
-                  <TogField
-                    label="effort 大小写纠正"
-                    desc={'output_config.effort 大小写或首尾空白不规范时改成标准值，例如 " High " 改为 high。'}
-                    checked={draft.localRequestCompat.normalizeEffortCase}
-                    onChange={setLocalRequestCompat('normalizeEffortCase')}
-                  />
-                  <TogField
-                    label="未知 effort 删除"
-                    desc="output_config.effort 为空串或不认识的值时删掉，按未指定处理，不再返回 400。关掉时拒绝记录会带上客户端传的原值。"
-                    checked={draft.localRequestCompat.dropUnknownEffort}
-                    onChange={setLocalRequestCompat('dropUnknownEffort')}
-                  />
-                  <TogField
-                    label="保留期后 message_start 不带用量"
-                    desc="流式请求超过首输出静默保留期时会先发出 message_start；打开后它的 usage 全为 0，空回不会留下可计费的用量。正常请求的最终用量仍以 message_delta 为准。"
-                    checked={draft.localRequestCompat.zeroUsageOnHoldExpiredMessageStart}
-                    onChange={setLocalRequestCompat('zeroUsageOnHoldExpiredMessageStart')}
-                  />
-                </TwoCol>
-              </div>
-            )}
-
-
-
-            {activeSection === 'compat' && (
-              <div className="space-y-4">
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">兼容模式</div>
-                    <Select value={draft.compatProfile} onValueChange={(v) => set('compatProfile')(v as RuntimeConfig['compatProfile'])}>
-                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="claude-code">Claude Code 兼容</SelectItem>
-                        <SelectItem value="anthropic-strict">Anthropic 严格模式</SelectItem>
-                        <SelectItem value="debug">调试模式</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      {draft.compatProfile === 'claude-code'
-                        ? '面向 Claude Code CLI，尽量按它期望的格式返回。'
-                        : draft.compatProfile === 'anthropic-strict'
-                          ? '尽量保持 Anthropic 原始接口格式，少做兼容修正。'
-                          : '保留更多排查信息，适合本地调试，不建议用于正式流量。'}
-                    </p>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">思考触发（默认值）</div>
-                    <Select
-                      value={draft.routeFeatures.defaults.thinkingTrigger}
-                      onValueChange={(v) => setRouteFeatureDefault('thinkingTrigger')(v as RuntimeConfig['routeFeatures']['defaults']['thinkingTrigger'])}
-                    >
-                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="real_request">按请求触发</SelectItem>
-                        <SelectItem value="always">总是触发</SelectItem>
-                        <SelectItem value="off">不自动开启</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-muted-foreground">
-                      {draft.routeFeatures.defaults.thinkingTrigger === 'always'
-                        ? '除非请求明确关闭，否则每次调用都会输出思考内容。'
-                        : draft.routeFeatures.defaults.thinkingTrigger === 'off'
-                          ? '只看客户端自己的 thinking 参数，代理不自动开启，也不强制可见输出。'
-                          : '按 Claude Code CLI 的习惯触发：请求明确需要深度思考时，才会输出思考内容。'}
-                      {' '}路由策略里可以按路由单独设置。
-                    </p>
-                  </div>
-                  <div className="space-y-1.5">
-                    <TogField
-                      label="模型列表只显示 Claude"
-                      desc="/v1/models 只列出 Claude 模型，避免非 Claude 的上游模型目录暴露渠道。直接请求未列出的模型不受影响。"
-                      checked={draft.claudeModelsOnly}
-                      onChange={set('claudeModelsOnly')}
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">缺失 max_tokens</div>
-                    <Select
-                      value={draft.missingMaxTokens.policy}
-                      onValueChange={(v) =>
-                        setMissingMaxTokens('policy')(v as RuntimeConfig['missingMaxTokens']['policy'])
-                      }
-                    >
-                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="default_value">自动补全</SelectItem>
-                        <SelectItem value="reject">直接拒绝</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      自动补全只处理顶层缺少 max_tokens 的 Messages 请求；无效 JSON 和空模型仍会拒绝并记录到用量日志。
-                    </p>
-                  </div>
-                  <NumField
-                    label="max_tokens 补充值"
-                    desc="自动补全时写入的输出上限；默认 20480，避免补 0 或过大值改变客户端语义。"
-                    value={draft.missingMaxTokens.defaultValue}
-                    min={1}
-                    max={200000}
-                    suffix="tokens"
-                    disabled={draft.missingMaxTokens.policy === 'reject'}
-                    onChange={setMissingMaxTokens('defaultValue')}
-                  />
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">账号默认流式 SSE 转发</div>
-                    <Select
-                      value={draft.accounts.streamResponseMode}
-                      onValueChange={(v) =>
-                        setAccounts('streamResponseMode')(
-                          v as RuntimeConfig['accounts']['streamResponseMode'],
-                        )
-                      }
-                    >
-                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="event_passthrough">SSE 事件级透传</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      作为账号默认值；单个外部账号可以覆盖。只决定 stream=true 的 SSE 事件转发方式；usage 是透传上游还是按入口路径整理，由外部账号的“下游 usage 口径”决定。
-                    </p>
-                  </div>
-                </div>
-                <TwoCol>
-                  <TogField label="整理思考内容" desc="把响应里的思考内容单独整理出来，方便客户端按固定格式展示。" checked={draft.extractThinking} onChange={set('extractThinking')} />
-                  <TogField label="显示处理告警" desc="把代理处理中的提醒返回给客户端，方便排查问题。" checked={draft.exposeProxyWarnings} onChange={set('exposeProxyWarnings')} />
-                </TwoCol>
-                <div className="space-y-4 border-t border-border/70 pt-4">
-                  <TogField
-                    label="请求诊断抓取"
-                    desc="把需要排查的请求写成文件，用于本地回放。文件里有完整请求体，只在排查时打开，用完关闭。"
-                    checked={draft.requestCapture.enabled}
-                    onChange={setRequestCapture('enabled')}
-                  />
-                  <TwoCol>
-                    <TogField
-                      label="抓取空回请求"
-                      desc="首输出前重试用完仍只返回用量统计的本地请求：保存客户端请求体和发给 上游 的请求体。"
-                      checked={draft.requestCapture.usageOnly}
-                      disabled={!draft.requestCapture.enabled}
-                      onChange={setRequestCapture('usageOnly')}
-                    />
-                    <TogField
-                      label="抓取 tool_choice 回复"
-                      desc="注入了 tool_choice 指令的请求：保存客户端收到的回复，并标出提到策略或注入的回复。"
-                      checked={draft.requestCapture.toolChoice}
-                      disabled={!draft.requestCapture.enabled}
-                      onChange={setRequestCapture('toolChoice')}
-                    />
-                    <NumField
-                      label="每类最多保留"
-                      desc="空回和 tool_choice 各自的文件数上限，超出后删除最旧的。"
-                      value={draft.requestCapture.maxFiles}
-                      min={1}
-                      max={2000}
-                      suffix="个文件"
-                      disabled={!draft.requestCapture.enabled}
-                      onChange={setRequestCapture('maxFiles')}
-                    />
-                    <NumField
-                      label="单个请求体上限"
-                      desc="每个请求体或回复正文最多保留的字节数，超出部分截断并在文件里标记。"
-                      value={draft.requestCapture.maxBodyBytes}
-                      min={1024}
-                      max={8388608}
-                      suffix="字节"
-                      disabled={!draft.requestCapture.enabled}
-                      onChange={setRequestCapture('maxBodyBytes')}
-                    />
-                  </TwoCol>
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold text-foreground">抓取目录</div>
-                    <div className="text-xs leading-relaxed text-muted-foreground">
-                      工作目录内的相对路径（Docker 中是 /app 下）。空回写到 usage-only/，tool_choice 写到 tool-choice/。
-                    </div>
-                    <Input
-                      className="font-mono text-xs"
-                      value={draft.requestCapture.dir}
-                      disabled={!draft.requestCapture.enabled}
-                      onChange={(e) => setRequestCapture('dir')(e.target.value)}
-                    />
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-      </div>
-
-      <div className="fixed inset-x-0 bottom-0 z-40 border-t border-border/80 bg-background/95 px-4 py-3 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur lg:left-[15rem] lg:px-5">
-        <div className="flex w-full flex-wrap items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-semibold">
-              {hasDraftChanges ? '运行配置有未保存改动' : '运行配置已是最新'}
-            </div>
-            <div className="mt-0.5 text-xs text-muted-foreground">保存后，新的请求会立即使用这些配置。</div>
-          </div>
-          <Button size="sm" onClick={save} disabled={saveDisabled}>
-            {updateConfig.isPending ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}
+    );
+  const set = <K extends keyof RuntimeConfig>(
+    key: K,
+    value: RuntimeConfig[K],
+  ) => setDraft({ ...draft, [key]: value });
+  const save = async () => {
+    try {
+      const {
+        cachePolicy: _cache,
+        reportedUsage: _usage,
+        promptInjection: _injection,
+        ...runtime
+      } = draft;
+      await update.mutateAsync(runtime);
+      toast.success("运行配置已保存");
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    }
+  };
+  return (
+    <PageContainer>
+      <PageHeader
+        actions={
+          <Button onClick={save} disabled={update.isPending}>
+            <Save />
             保存配置
           </Button>
-        </div>
-      </div>
+        }
+      />
+      <Tabs defaultValue="admission">
+        <TabsList className="flex-wrap">
+          {[
+            ["admission", "请求准入"],
+            ["accounts", "账号池"],
+            ["models", "模型解析"],
+            ["proxy", "代理与 TLS"],
+            ["retention", "数据保留"],
+            ["features", "路由功能默认参数"],
+          ].map(([key, label]) => (
+            <TabsTrigger key={key} value={key}>
+              {label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent value="admission">
+          <ConfigFields
+            value={{
+              requestAdmission: draft.requestAdmission,
+              inferenceUpstreamMaxAttempts: draft.inferenceUpstreamMaxAttempts,
+              streamPreOutputHoldSecs: draft.streamPreOutputHoldSecs,
+            }}
+            onChange={(next) => setDraft({ ...draft, ...next })}
+          />
+        </TabsContent>
+        <TabsContent value="accounts" className="space-y-6">
+          {accountSections.map(([key, label, matches]) => (
+            <section key={key} className="space-y-4 border-b pb-6">
+              <h3 className="font-semibold">{label}</h3>
+              <ConfigFields
+                prefix={`accounts-${key}`}
+                value={Object.fromEntries(
+                  Object.entries(draft.accounts).filter(([key]) =>
+                    matches(key),
+                  ),
+                )}
+                onChange={(next) =>
+                  set("accounts", {
+                    ...draft.accounts,
+                    ...next,
+                  } as AccountsConfig)
+                }
+              />
+            </section>
+          ))}
+        </TabsContent>
+        <TabsContent value="models">
+          <ConfigFields
+            value={{ modelResolutionMode: draft.modelResolutionMode }}
+            onChange={(next) =>
+              set(
+                "modelResolutionMode",
+                next.modelResolutionMode as RuntimeConfig["modelResolutionMode"],
+              )
+            }
+          />
+          <ModelMappingSection
+            mapping={draft.modelMapping}
+            capabilities={models.data}
+            onChange={(v) => set("modelMapping", v)}
+          />
+        </TabsContent>
+        <TabsContent value="proxy" className="space-y-5">
+          <label className="block space-y-2">
+            代理地址
+            <Input
+              value={draft.proxyUrl ?? ""}
+              onChange={(e) => set("proxyUrl", e.target.value || null)}
+            />
+          </label>
+          <label className="block space-y-2">
+            代理用户名
+            <Input
+              value={draft.proxyUsername ?? ""}
+              onChange={(e) => set("proxyUsername", e.target.value || null)}
+            />
+          </label>
+          <label className="block space-y-2">
+            代理密码
+            <Input
+              type="password"
+              value={draft.proxyPassword ?? ""}
+              onChange={(e) => set("proxyPassword", e.target.value || null)}
+            />
+          </label>
+          <ConfigFields
+            value={{ tlsBackend: draft.tlsBackend }}
+            onChange={(next) =>
+              set("tlsBackend", next.tlsBackend as RuntimeConfig["tlsBackend"])
+            }
+          />
+        </TabsContent>
+        <TabsContent value="retention" className="space-y-5">
+          <label className="flex gap-3">
+            <Switch
+              checked={draft.auditLogRetentionEnabled}
+              onCheckedChange={(v) => set("auditLogRetentionEnabled", v)}
+            />
+            启用审计自动清理
+          </label>
+          <ConfigFields
+            value={{
+              auditLogRetentionDays: draft.auditLogRetentionDays,
+              usageRecordLimit: draft.usageRecordLimit,
+            }}
+            onChange={(next) => setDraft({ ...draft, ...next })}
+          />
+        </TabsContent>
+        <TabsContent value="features" className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Payload、请求兼容、图片处理与 max_tokens
+            的参数在各路由的“路由功能”中编辑。全局默认值作为继承来源；新增功能默认关闭。
+          </p>
+          <Button variant="outline" asChild>
+            <Link to="/routes">管理路由功能</Link>
+          </Button>
+        </TabsContent>
+      </Tabs>
     </PageContainer>
-  )
+  );
 }

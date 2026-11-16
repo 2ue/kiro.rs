@@ -603,6 +603,37 @@ pub async fn auth_middleware(
     let identity = presented_key.and_then(|key| state.request_api_keys.authenticate(&key));
     match identity {
         Some(identity) => {
+            let config = state.runtime.snapshot();
+            let endpoint = request
+                .extensions()
+                .get::<axum::extract::OriginalUri>()
+                .map(|uri| uri.0.path())
+                .unwrap_or_else(|| request.uri().path());
+            if let Some(policy) = config
+                .request_api_key_policies()
+                .iter()
+                .find(|policy| auth::request_api_key_id(&policy.api_key) == identity.stable_id())
+            {
+                if !policy.allowed_routes.is_empty() {
+                    let prefix = config
+                        .compiled_routes
+                        .as_ref()
+                        .and_then(|routes| routes.match_endpoint(endpoint))
+                        .map(|route| route.config.prefix.as_str());
+                    let allowed = prefix.is_some_and(|prefix| {
+                        policy.allowed_routes.iter().any(|rule| {
+                            crate::model::routes::normalize_route_prefix(rule) == prefix
+                        })
+                    });
+                    if !allowed {
+                        return envelope::error_response(
+                            StatusCode::FORBIDDEN,
+                            "permission_error",
+                            "API key is not allowed to access this route",
+                        );
+                    }
+                }
+            }
             request.extensions_mut().insert(identity);
             let mut response = next.run(request).await;
             if !response.headers().contains_key("request-id") {
@@ -670,6 +701,51 @@ mod tests {
             0.98,
             CompatProfile::ClaudeCode,
         )
+    }
+
+    #[tokio::test]
+    async fn admin_allowed_routes_rejects_disallowed_route_with_permission_error() {
+        let state = test_state();
+        state.runtime.install_local(|config| {
+            config.request_api_key_policies = vec![crate::model::config::RequestApiKeyPolicy {
+                api_key: "middleware-413-key".into(),
+                name: "restricted".into(),
+                enabled: true,
+                request_admission: None,
+                usage_limits: vec![],
+                allowed_routes: vec!["cc/".into()],
+            }];
+        });
+        let app = Router::new()
+            .route("/cc/v1/messages", get(|| async { "ok" }))
+            .route("/ha/v1/messages", get(|| async { "ok" }))
+            .route("/v1/messages", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+        for (path, expected) in [
+            ("/cc/v1/messages", StatusCode::OK),
+            ("/ha/v1/messages", StatusCode::FORBIDDEN),
+            ("/v1/messages", StatusCode::FORBIDDEN),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("x-api-key", "middleware-413-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::FORBIDDEN {
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"]["type"], "permission_error");
+            }
+        }
     }
 
     async fn json_413() -> Response {

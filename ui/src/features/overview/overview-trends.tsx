@@ -519,7 +519,7 @@ function SegmentedViews({
       {views.map((item) => {
         const selected = item.key === value
         return (
-          <button
+          <Button variant="ghost"
             key={item.key}
             type="button"
             role="tab"
@@ -533,7 +533,7 @@ function SegmentedViews({
             onClick={() => onChange(item.key)}
           >
             {item.label}
-          </button>
+          </Button>
         )
       })}
     </div>
@@ -869,7 +869,7 @@ export function OverviewTrendCard({
           {legendItems.map((item) => {
             const off = hidden.has(item.key)
             return (
-              <button
+              <Button variant="ghost"
                 key={item.key}
                 type="button"
                 className={cn(
@@ -893,7 +893,7 @@ export function OverviewTrendCard({
                 {item.total != null && (
                   <span className="font-medium tabular-nums text-foreground">{formatSummaryValue(item.total, view.format)}</span>
                 )}
-              </button>
+              </Button>
             )
           })}
         </div>

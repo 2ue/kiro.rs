@@ -1,4 +1,4 @@
-import type { CredentialStatusItem, Account, AccountStatus } from '@/types/api'
+import type { Account, AccountStatus } from '@/types/api'
 
 /**
  * 账号/账号列表的排序分层：正在使用的排最前，其次可用，再次冷却，最后不可用。
@@ -12,16 +12,6 @@ export const USAGE_TIER_RANK: Record<UsageTier, number> = {
   ready: 1,
   cooling: 2,
   unavailable: 3,
-}
-
-export function credentialUsageTier(
-  credential: Pick<CredentialStatusItem, 'disabled' | 'inFlightRequests' | 'cooldownRemainingSecs'>,
-  creditAvailable: boolean,
-): UsageTier {
-  if (credential.disabled || !creditAvailable) return 'unavailable'
-  if ((credential.inFlightRequests ?? 0) > 0) return 'active'
-  if ((credential.cooldownRemainingSecs ?? 0) > 0) return 'cooling'
-  return 'ready'
 }
 
 export function accountUsageTier(

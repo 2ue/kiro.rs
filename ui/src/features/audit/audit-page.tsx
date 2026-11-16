@@ -1,85 +1,65 @@
-import { useMemo, useState } from 'react'
-import { Activity, CheckCircle2, Eye, FileClock, Filter, RefreshCw, Settings2, X, XCircle } from 'lucide-react'
-import { toast } from 'sonner'
-import { formatDate } from '@/lib/format'
-import { extractErrorMessage } from '@/lib/utils'
-import { useAccountEventSummary, useAuditLogsPage } from '@/hooks/use-usage'
-import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
-import type { AdminAuditLogPageQuery, AdminAuditLogRow } from '@/types/api'
 import {
-  Callout,
-  PageContainer,
-  PageHeader,
-  SectionCard,
-  EmptyState,
-  ErrorState,
-  LoadingState,
-  ModalShell,
-  StatCard,
-  StatGrid,
-  Toolbar,
-  ToolbarSearch,
-  ToolbarActions,
-  useConfirm,
-  PageSizeSelect,
+Callout,
+EmptyState,
+ErrorState,
+LoadingState,
+ModalShell,
+PageContainer,
+PageHeader,
+PageSizeSelect,
+SectionCard,
+StatCard,
+StatGrid,
+Toolbar,
+ToolbarActions,
+ToolbarSearch,
+useConfirm,
 } from '@/components/patterns'
 import {
-  Badge,
-  Button,
-  Input,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-  Tabs,
-  TabsList,
-  TabsTrigger,
+Badge,
+Button,
+Input,
+Select,
+SelectContent,
+SelectItem,
+SelectTrigger,
+SelectValue,
+Switch,
+Table,
+TableBody,
+TableCell,
+TableHead,
+TableHeader,
+TableRow,
+Tabs,
+TabsList,
+TabsTrigger,
 } from '@/components/ui'
+import { useRuntimeConfig,useUpdateRuntimeConfig } from '@/hooks/use-runtime-config'
+import { useAccountEventSummary,useAuditLogsPage } from '@/hooks/use-usage'
+import { formatDate } from '@/lib/format'
+import { extractErrorMessage } from '@/lib/utils'
+import type { AdminAuditLogPageQuery,AdminAuditLogRow } from '@/types/api'
+import { Activity,CheckCircle2,Eye,FileClock,Filter,RefreshCw,Settings2,X,XCircle } from 'lucide-react'
+import { useMemo,useState } from 'react'
+import { toast } from 'sonner'
 import {
-  ACCOUNT_EVENT_ORDER,
-  TIME_RANGES,
-  accountEventMeta,
-  accountEventQuery,
-  accountEventView,
-  summaryTiles,
-  type AccountFilterState,
+ACCOUNT_EVENT_ORDER,
+TIME_RANGES,
+accountEventMeta,
+accountEventQuery,
+accountEventView,
+summaryTiles,
+type AccountFilterState,
 } from './account-events'
-import { AuditChangeSummary, AuditDetailSummary } from './audit-detail'
+import { AuditChangeSummary,AuditDetailSummary } from './audit-detail'
 
 // ─── 标签映射 ─────────────────────────────────────────────────────────────────
 
 const ACTION_LABELS: Record<string, string> = {
-  add_credential: '新增账号',
-  delete_credential: '删除账号',
-  set_credential_disabled: '设置启用状态',
-  set_credential_priority: '设置优先级',
-  set_credential_concurrency: '设置账号并发',
-  set_credential_rpm: '设置账号限速',
-  set_credential_rate_limit_auto_disable: '设置429自动禁用',
-  set_credential_regions: '设置账号区域',
-  set_credential_proxy: '设置账号代理',
-  reset_credential: '重置账号',
-  update_credential_auth: '更新账号认证',
   force_refresh_token: '强制刷新 Token',
-  set_credential_warmup: '设置预热次数',
-  clear_credential_in_flight: '清理并发占用',
-  auto_disable_credential: '自动禁用账号',
-  auto_enable_credential: '自动恢复账号',
-  credential_account_event: '账号异动',
   account_account_event: '账号异动',
   clear_account_cooldown: '清除账号池冷却',
-  batch_import_credentials: '批量导入账号',
-  batch_update_credentials: '批量修改账号',
-  delete_disabled_credentials: '删除已禁用账号',
-  batch_delete_credentials: '批量删除账号',
   set_load_balancing_mode: '切换负载模式',
   update_runtime_config: '更新运行配置',
   create_request_api_key: '新增请求 Key',
@@ -88,7 +68,6 @@ const ACTION_LABELS: Record<string, string> = {
   update_admin_api_key: '修改登录 Key',
   sync_model_pricing: '同步模型价格',
   sync_model_capabilities: '同步模型能力',
-  export_credentials: '导出账号',
   clear_usage_records: '清空用量展示',
   start_usage_cleanup: '启动清理任务',
   cancel_usage_cleanup: '取消清理任务',
@@ -105,7 +84,6 @@ const ACTION_LABELS: Record<string, string> = {
 }
 
 const OBJECT_LABELS: Record<string, string> = {
-  credential: '账号',
   runtime_config: '运行配置',
   model_pricing: '模型价格',
   model_capability: '模型能力',
@@ -123,7 +101,6 @@ const OBJECT_LABELS: Record<string, string> = {
 
 const ACTION_CATEGORIES = [
   { value: '__all__', label: '全部动作' },
-  { value: 'credential', label: '账号管理' },
   { value: 'config', label: '配置变更' },
   { value: 'security', label: '密钥管理' },
   { value: 'pricing', label: '价格同步' },
@@ -133,27 +110,6 @@ const ACTION_CATEGORIES = [
 ]
 
 const ACTION_TO_CATEGORY: Record<string, string> = {
-  add_credential: 'credential',
-  delete_credential: 'credential',
-  set_credential_disabled: 'credential',
-  set_credential_priority: 'credential',
-  set_credential_concurrency: 'credential',
-  set_credential_rpm: 'credential',
-  set_credential_rate_limit_auto_disable: 'credential',
-  set_credential_regions: 'credential',
-  set_credential_proxy: 'credential',
-  reset_credential: 'credential',
-  update_credential_auth: 'credential',
-  force_refresh_token: 'credential',
-  set_credential_warmup: 'credential',
-  clear_credential_in_flight: 'credential',
-  auto_disable_credential: 'credential',
-  auto_enable_credential: 'credential',
-  batch_import_credentials: 'credential',
-  batch_update_credentials: 'credential',
-  delete_disabled_credentials: 'credential',
-  batch_delete_credentials: 'credential',
-  export_credentials: 'credential',
   set_load_balancing_mode: 'config',
   update_runtime_config: 'config',
   create_request_api_key: 'security',
@@ -176,7 +132,6 @@ const ACTION_TO_CATEGORY: Record<string, string> = {
   set_account_enabled: 'account',
   clear_account_auto_disabled: 'account',
   clear_account_cooldown: 'account',
-  credential_account_event: 'credential',
   account_account_event: 'account',
 }
 
@@ -200,7 +155,7 @@ function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow 
             {
               label: event ? '账号' : '对象',
               value: event
-                ? `${event.source === 'external' ? '账号' : '本地'} #${event.accountId} · ${event.accountLabel}`
+                ? `账号 #${event.accountId} · ${event.accountLabel}`
                 : `${objectLabel(record.objectType)}${record.objectId ? ` #${record.objectId}` : ''}`,
             },
             ...(event?.reason ? [{ label: '原因', value: event.reason }] : []),
@@ -390,14 +345,6 @@ function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) 
             {ACCOUNT_EVENT_ORDER.map((kind) => <SelectItem key={kind} value={kind}>{accountEventMeta(kind).label}</SelectItem>)}
           </SelectContent>
         </Select>
-        <Select value={filter.source} onValueChange={(source) => update({ source })}>
-          <SelectTrigger size="sm" className="w-32" aria-label="账号来源"><SelectValue /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__all__">全部来源</SelectItem>
-            <SelectItem value="local">本地账号</SelectItem>
-            <SelectItem value="external">账号</SelectItem>
-          </SelectContent>
-        </Select>
         <div className="min-w-48 flex-1">
           <ToolbarSearch value={filter.account} onChange={(account) => update({ account })} placeholder="账号邮箱、名称或 #ID" />
         </div>
@@ -452,7 +399,7 @@ function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) 
                         >
                           {event.accountLabel}
                         </button>
-                        <div className="text-[0.62rem] text-muted-foreground/70">{event.source === 'external' ? '账号' : '本地'} #{event.accountId}</div>
+                        <div className="text-[0.62rem] text-muted-foreground/70">账号 #{event.accountId}</div>
                       </TableCell>
                       <TableCell><Badge tone={event.tone}>{event.label}</Badge></TableCell>
                       <TableCell className="max-w-72 truncate text-xs" title={event.reason}>{event.reason || '—'}</TableCell>
@@ -496,7 +443,6 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
     page,
     limit: pageSize,
     success: successFilter === '__all__' ? undefined : successFilter === 'success',
-    objectType: categoryFilter === 'credential' || categoryFilter === 'account' ? categoryFilter : undefined,
   }), [page, pageSize, successFilter, categoryFilter])
   const logs = useAuditLogsPage(query)
   const pending = logs.isPlaceholderData || logs.isFetching
@@ -517,7 +463,7 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
           (r.errorMessage && r.errorMessage.toLowerCase().includes(lower))
       )
     }
-    if (categoryFilter !== '__all__' && categoryFilter !== 'credential' && categoryFilter !== 'account') {
+    if (categoryFilter !== '__all__' && categoryFilter !== 'account') {
       filtered = filtered.filter((r) => ACTION_TO_CATEGORY[r.action] === categoryFilter)
     }
     return filtered

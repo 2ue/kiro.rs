@@ -32,12 +32,12 @@ test('account event rows read label, reason and actor from the detail', () => {
   })
 })
 
-test('older scheduler rows fall back to credentialLabel and message', () => {
-  const view = accountEventView(row({ accountEvent: 'auto_disabled', credentialLabel: 'old@example.com', message: '连续失败' }))
+test('older scheduler rows fall back to accountLabel and message', () => {
+  const view = accountEventView(row({ accountEvent: 'auto_disabled', accountLabel: 'old@example.com', message: '连续失败' }))
   assert.equal(view?.accountLabel, 'old@example.com')
   assert.equal(view?.reason, '连续失败')
   // External rows without an explicit source are recognised by object type.
-  assert.equal(accountEventView(row({ accountEvent: 'auto_disabled' }, { objectType: 'account' }))?.source, 'external')
+  assert.equal(accountEventView(row({ accountEvent: 'auto_disabled' }, { objectType: 'account' }))?.source, 'account')
 })
 
 test('rows that are not account events are skipped', () => {

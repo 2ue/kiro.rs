@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import { cn } from '@/lib/utils'
 import { navDomains, pagesOfDomain, type NavPage, type PageKey } from '@/types/ui'
-import { useSystemVersion } from '@/hooks/use-credentials'
+import { useSystemVersion } from '@/hooks/use-runtime-config'
 
 interface SidebarProps {
   onNavigate?: () => void

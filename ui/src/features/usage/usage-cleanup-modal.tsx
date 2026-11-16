@@ -74,7 +74,7 @@ function KindPicker({ value, onChange, disabled }: { value: CleanupKind; onChang
       {KIND_OPTIONS.map((option) => {
         const selected = option.value === value
         return (
-          <button
+          <Button variant="ghost"
             key={option.value}
             type="button"
             role="radio"
@@ -98,7 +98,7 @@ function KindPicker({ value, onChange, disabled }: { value: CleanupKind; onChang
               <span className={`text-[13px] font-semibold ${option.danger && selected ? 'text-destructive' : 'text-foreground'}`}>{option.title}</span>
             </span>
             <span className="mt-1 block text-[11px] leading-4 text-muted-foreground">{option.desc}</span>
-          </button>
+          </Button>
         )
       })}
     </div>
@@ -321,7 +321,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
         )}
 
         <section>
-          <button
+          <Button variant="ghost"
             type="button"
             className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
             aria-expanded={showAdvanced}
@@ -329,7 +329,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
           >
             <ChevronDown className={`size-3.5 transition-transform ${showAdvanced ? 'rotate-180' : ''}`} aria-hidden="true" />
             执行速度
-          </button>
+          </Button>
           {showAdvanced && (
             <div className="mt-2 grid gap-3 sm:grid-cols-2">
               <label className="space-y-1">

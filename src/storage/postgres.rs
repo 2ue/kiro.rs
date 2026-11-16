@@ -1214,6 +1214,261 @@ impl PostgresStore {
         Ok(version)
     }
 
+    pub async fn replace_current_configuration_transaction(
+        &self,
+        config: &Config,
+        accounts: &[serde_json::Value],
+        scenarios: &[serde_json::Value],
+        pricing: &[serde_json::Value],
+        capabilities: &[serde_json::Value],
+    ) -> anyhow::Result<i64> {
+        config
+            .routes
+            .validate_with_config(config)
+            .map_err(anyhow::Error::msg)?;
+        let mut config = config.clone();
+        let mut scenarios = scenarios.to_vec();
+        let mut id_map = std::collections::BTreeMap::new();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("LOCK TABLE accounts, runtime_config, route_scenarios, model_pricing, model_capabilities IN EXCLUSIVE MODE")
+            .execute(&mut *tx).await?;
+        let mut account_ids = Vec::new();
+        for value in accounts {
+            let request: CreateAccountRequest = serde_json::from_value(serde_json::Value::Object(
+                value
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("账号必须为对象"))?
+                    .iter()
+                    .map(|(key, value)| {
+                        let mut parts = key.split('_');
+                        let mut name = parts.next().unwrap_or_default().to_string();
+                        for part in parts {
+                            let mut chars = part.chars();
+                            if let Some(first) = chars.next() {
+                                name.extend(first.to_uppercase());
+                                name.extend(chars);
+                            }
+                        }
+                        (name, value.clone())
+                    })
+                    .collect(),
+            ))?;
+            validate_account_input(
+                &request.name,
+                &request.base_url,
+                request.max_concurrent_requests,
+            )?;
+            validate_account_route_rules(&request.route_rules)?;
+            normalize_account_header_overrides(request.header_overrides.clone())?;
+            crate::account::validate_account_fields(
+                request.proxy_url.as_deref(),
+                request.cost_multiplier,
+                &request.overrides,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM accounts WHERE name = $1 ORDER BY (deleted_at IS NULL) DESC, id LIMIT 1")
+                .bind(&request.name).fetch_optional(&mut *tx).await?;
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('accounts', 'id'))")
+                        .fetch_one(&mut *tx)
+                        .await?
+                }
+            };
+            if let Some(old) = value["id"].as_u64() {
+                id_map.insert(old, id as u64);
+            }
+            let mut record = serde_json::json!({
+                "tags": request.tags,
+                "proxy_url": request.proxy_url,
+                "cost_multiplier": request.cost_multiplier,
+                "overrides": request.overrides,
+                "name": request.name,
+                "base_url": request.base_url,
+                "api_key": request.api_key,
+                "auth_type": request.auth_type,
+                "header_profile": request.header_profile,
+                "append_beta_query": request.append_beta_query,
+                "header_overrides": request.header_overrides,
+                "wire_profile": request.wire_profile,
+                "tls_profile": request.tls_profile,
+                "enabled": request.enabled,
+                "priority": request.priority,
+                "max_concurrent_requests": request.max_concurrent_requests,
+                "usage_projection_mode": request.usage_projection_mode,
+                "stream_response_mode": request.stream_response_mode,
+                "auto_disable_policy": request.auto_disable_policy,
+                "pre_output_stream_retry_mode": request.pre_output_stream_retry_mode,
+                "normalize_model_version_dots": request.normalize_model_version_dots,
+                "model_mapping_mode": request.model_mapping_mode,
+                "model_mapping_require_match": request.model_mapping_require_match,
+                "model_mapping_rules": request.model_mapping_rules,
+                "supported_models": request.supported_models,
+                "route_mode": request.route_mode,
+                "route_rules": request.route_rules,
+                "notes": request.notes
+            });
+            let fields = record.as_object_mut().unwrap();
+            fields.insert("id".into(), serde_json::json!(id));
+            // 只写明确允许的列；不导入旧表的状态、主键和机器配置。
+            sqlx::query(r#"
+                INSERT INTO accounts (
+                    id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
+                    header_overrides, wire_profile, tls_profile, enabled, priority,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                    auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
+                    model_mapping_mode, model_mapping_require_match, model_mapping_rules,
+                    supported_models, route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides
+                ) SELECT id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
+                    header_overrides, wire_profile, tls_profile, enabled, priority,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                    auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
+                    model_mapping_mode, model_mapping_require_match, model_mapping_rules,
+                    supported_models, route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides
+                  FROM jsonb_populate_record(NULL::accounts, $1)
+                ON CONFLICT (id) DO UPDATE SET
+                    name=EXCLUDED.name, base_url=EXCLUDED.base_url, api_key=EXCLUDED.api_key,
+                    auth_type=EXCLUDED.auth_type, header_profile=EXCLUDED.header_profile,
+                    append_beta_query=EXCLUDED.append_beta_query, header_overrides=EXCLUDED.header_overrides,
+                    wire_profile=EXCLUDED.wire_profile, tls_profile=EXCLUDED.tls_profile,
+                    enabled=EXCLUDED.enabled, priority=EXCLUDED.priority,
+                    max_concurrent_requests=EXCLUDED.max_concurrent_requests,
+                    usage_projection_mode=EXCLUDED.usage_projection_mode,
+                    stream_response_mode=EXCLUDED.stream_response_mode,
+                    auto_disable_policy=EXCLUDED.auto_disable_policy,
+                    pre_output_stream_retry_mode=EXCLUDED.pre_output_stream_retry_mode,
+                    normalize_model_version_dots=EXCLUDED.normalize_model_version_dots,
+                    model_mapping_mode=EXCLUDED.model_mapping_mode,
+                    model_mapping_require_match=EXCLUDED.model_mapping_require_match,
+                    model_mapping_rules=EXCLUDED.model_mapping_rules, supported_models=EXCLUDED.supported_models,
+                    route_mode=EXCLUDED.route_mode, route_rules=EXCLUDED.route_rules, notes=EXCLUDED.notes,
+                    tags=EXCLUDED.tags, proxy_url=EXCLUDED.proxy_url, cost_multiplier=EXCLUDED.cost_multiplier, overrides=EXCLUDED.overrides,
+                    auto_disabled=false, auto_disabled_reason=NULL, auto_disabled_at=NULL,
+                    auto_disabled_until=NULL, auto_disabled_last_error=NULL, deleted_at=NULL,
+                    revision=accounts.revision+1, updated_at=now()
+            "#).bind(record).execute(&mut *tx).await?;
+            account_ids.push(id);
+        }
+        sqlx::query("DELETE FROM accounts WHERE id <> ALL($1::bigint[])")
+            .bind(&account_ids)
+            .execute(&mut *tx)
+            .await?;
+        remap_configuration_account_ids(&mut config, &mut scenarios, &id_map)?;
+        let mut scenario_ids = Vec::new();
+        for value in &scenarios {
+            let name = value["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("场景缺少 name"))?;
+            let existing: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM route_scenarios WHERE name=$1 ORDER BY id LIMIT 1",
+            )
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let id = if let Some(id) = existing {
+                sqlx::query("UPDATE route_scenarios SET description=$2, content=$3, revision=revision+1, updated_at=now() WHERE id=$1")
+                    .bind(id).bind(value["description"].as_str()).bind(&value["content"]).execute(&mut *tx).await?;
+                id
+            } else {
+                sqlx::query_scalar("INSERT INTO route_scenarios (name,description,content) VALUES ($1,$2,$3) RETURNING id")
+                    .bind(name).bind(value["description"].as_str()).bind(&value["content"]).fetch_one(&mut *tx).await?
+            };
+            scenario_ids.push(id);
+        }
+        sqlx::query("DELETE FROM route_scenarios WHERE id <> ALL($1::bigint[])")
+            .bind(&scenario_ids)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM model_pricing")
+            .execute(&mut *tx)
+            .await?;
+        for value in pricing {
+            sqlx::query(r#"
+                INSERT INTO model_pricing (model,input_cost_per_token,output_cost_per_token,
+                    cache_creation_input_token_cost,cache_creation_1h_input_token_cost,
+                    cache_read_input_token_cost,source,source_url,last_synced_at,last_error,updated_at)
+                SELECT model,input_cost_per_token,output_cost_per_token,cache_creation_input_token_cost,
+                    COALESCE(cache_creation_1h_input_token_cost,0),cache_read_input_token_cost,
+                    source,source_url,last_synced_at,last_error,COALESCE(updated_at,now())
+                FROM jsonb_populate_record(NULL::model_pricing,$1)
+            "#).bind(value).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "DELETE FROM model_capabilities WHERE source IN ('manual','account_discovery')",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for value in capabilities {
+            sqlx::query(r#"
+                INSERT INTO model_capabilities (model,display_name,description,max_input_tokens,
+                    max_output_tokens,supports_prompt_caching,supported_input_types,source,
+                    last_synced_at,last_error,listed,updated_at)
+                SELECT model,display_name,description,max_input_tokens,max_output_tokens,
+                    supports_prompt_caching,supported_input_types,source,last_synced_at,last_error,COALESCE(listed,true),COALESCE(updated_at,now())
+                FROM jsonb_populate_record(NULL::model_capabilities,$1)
+                ON CONFLICT (model) DO UPDATE SET display_name=EXCLUDED.display_name,
+                    description=EXCLUDED.description,max_input_tokens=EXCLUDED.max_input_tokens,
+                    max_output_tokens=EXCLUDED.max_output_tokens,
+                    supports_prompt_caching=EXCLUDED.supports_prompt_caching,
+                    supported_input_types=EXCLUDED.supported_input_types,source=EXCLUDED.source,
+                    last_synced_at=EXCLUDED.last_synced_at,last_error=EXCLUDED.last_error,
+                    listed=EXCLUDED.listed,updated_at=EXCLUDED.updated_at
+            "#).bind(value).execute(&mut *tx).await?;
+        }
+        let version = sqlx::query_scalar(
+            r#"
+            INSERT INTO runtime_config (id,config,updated_at) VALUES ('default',$1,now())
+            ON CONFLICT (id) DO UPDATE SET config=EXCLUDED.config,
+                version=runtime_config.version+1,updated_at=now() RETURNING version
+        "#,
+        )
+        .bind(serde_json::to_value(&config)?)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+
+    pub async fn export_current_configuration(&self) -> anyhow::Result<serde_json::Value> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let mut result = serde_json::Map::new();
+        for (key, query) in [
+            (
+                "accounts",
+                "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.name), '[]'::jsonb) FROM accounts t WHERE deleted_at IS NULL",
+            ),
+            (
+                "routeScenarios",
+                "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.name), '[]'::jsonb) FROM route_scenarios t",
+            ),
+            (
+                "modelPricing",
+                "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.model), '[]'::jsonb) FROM model_pricing t",
+            ),
+            (
+                "manualModels",
+                "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.model), '[]'::jsonb) FROM model_capabilities t WHERE source IN ('manual','account_discovery')",
+            ),
+        ] {
+            let value: serde_json::Value = sqlx::query_scalar(query).fetch_one(&mut *tx).await?;
+            result.insert(key.to_string(), value);
+        }
+        let config: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT config FROM runtime_config WHERE id='default'")
+                .fetch_optional(&mut *tx)
+                .await?;
+        result.insert(
+            "runtimeConfig".into(),
+            config.unwrap_or(serde_json::to_value(Config::default())?),
+        );
+        tx.commit().await?;
+        Ok(serde_json::Value::Object(result))
+    }
+
     pub async fn bootstrap_runtime_config_from_file(
         &self,
         file_config: &Config,
@@ -13432,4 +13687,48 @@ mod tests {
 
         store.drop_test_schema().await.unwrap();
     }
+}
+
+fn remap_configuration_account_ids(
+    config: &mut Config,
+    scenarios: &mut [serde_json::Value],
+    ids: &std::collections::BTreeMap<u64, u64>,
+) -> anyhow::Result<()> {
+    fn remap_routes(
+        routes: &mut crate::model::routes::RoutesConfig,
+        ids: &std::collections::BTreeMap<u64, u64>,
+    ) -> anyhow::Result<()> {
+        for route in &mut routes.routes {
+            for rule in &mut route.account_rule.rules {
+                if rule == "*" {
+                    continue;
+                }
+                let id = rule.parse::<u64>()?;
+                *rule = ids
+                    .get(&id)
+                    .ok_or_else(|| anyhow::anyhow!("路由引用了导入包中不存在的账号: {id}"))?
+                    .to_string();
+            }
+        }
+        Ok(())
+    }
+    remap_routes(&mut config.routes, ids)?;
+    for value in scenarios {
+        let mut routes: crate::model::routes::RoutesConfig =
+            serde_json::from_value(value["content"]["routes"].clone())?;
+        remap_routes(&mut routes, ids)?;
+        value["content"]["routes"] = serde_json::to_value(routes)?;
+        if let Some(accounts) = value["content"]["externalAccounts"].as_array_mut() {
+            for account in accounts {
+                let id = account["id"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("场景账号缺少 id"))?;
+                account["id"] = serde_json::json!(
+                    ids.get(&id)
+                        .ok_or_else(|| anyhow::anyhow!("场景引用了导入包中不存在的账号: {id}"))?
+                );
+            }
+        }
+    }
+    Ok(())
 }

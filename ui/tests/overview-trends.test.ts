@@ -10,7 +10,6 @@ import {
 } from '../src/features/overview/cache-hit-rate.ts'
 import {
   compareUsageTier,
-  credentialUsageTier,
   accountUsageTier,
 } from '../src/features/overview/usage-order.ts'
 
@@ -30,29 +29,6 @@ test('cache hit rate levels follow the sub2api thresholds', () => {
   assert.equal(cacheHitRateLevel(CACHE_HIT_RATE_WARNING), 'ok')
   assert.equal(cacheHitRateLevel(0.7), 'warning')
   assert.equal(cacheHitRateLevel(CACHE_HIT_RATE_CRITICAL - 0.01), 'critical')
-})
-
-test('local accounts: in use first, disabled or credit-blocked last', () => {
-  const base = { disabled: false, inFlightRequests: 0, cooldownRemainingSecs: 0 }
-  assert.equal(credentialUsageTier({ ...base, inFlightRequests: 3 }, true), 'active')
-  assert.equal(credentialUsageTier(base, true), 'ready')
-  assert.equal(credentialUsageTier({ ...base, cooldownRemainingSecs: 20 }, true), 'cooling')
-  assert.equal(credentialUsageTier({ ...base, inFlightRequests: 2, cooldownRemainingSecs: 20 }, true), 'active')
-  assert.equal(credentialUsageTier({ ...base, disabled: true, inFlightRequests: 1 }, true), 'unavailable')
-  assert.equal(credentialUsageTier(base, false), 'unavailable')
-})
-
-test('tier order is stable and ignores the in-flight count within a tier', () => {
-  const tiers = ['unavailable', 'cooling', 'active', 'ready'] as const
-  assert.deepEqual([...tiers].sort(compareUsageTier), ['active', 'ready', 'cooling', 'unavailable'])
-  const base = { disabled: false, cooldownRemainingSecs: 0 }
-  assert.equal(
-    compareUsageTier(
-      credentialUsageTier({ ...base, inFlightRequests: 1 }, true),
-      credentialUsageTier({ ...base, inFlightRequests: 9 }, true),
-    ),
-    0,
-  )
 })
 
 test('accounts: deleted, disabled or auto-disabled pools are unavailable', () => {

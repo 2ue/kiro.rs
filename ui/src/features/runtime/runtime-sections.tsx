@@ -1,21 +1,20 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { Check, Plus, Trash2 } from 'lucide-react'
-import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
-import { defaultCacheHitShaping, defaultPromptCacheCreationControl, inputSamplePolicy, pathPolicy, preserveFieldPolicy, writerSamplePolicy } from '@/lib/runtime-config-defaults'
+import { Button,Input,Select,SelectContent,SelectItem,SelectTrigger,SelectValue,Switch,Textarea } from '@/components/ui'
+import { defaultCacheHitShaping,defaultPromptCacheCreationControl,inputSamplePolicy,pathPolicy,preserveFieldPolicy,writerSamplePolicy } from '@/lib/runtime-config-defaults'
 import type {
-  ModelCapabilitiesStatus,
-  CachePolicyConfig,
-  CacheRoutePolicyPatch,
-  CacheTtlMode,
-  CacheTtlPolicyPatch,
-  ModelMappingConfig,
-  ModelMappingRule,
-  PayloadShapingConfig,
-  PromptCacheCreationControlConfig,
-  ReportedUsageFieldPolicy,
-  ReportedUsagePathPolicy,
-  RuntimeConfig,
+CachePolicyConfig,
+CacheRoutePolicyPatch,
+CacheTtlMode,
+CacheTtlPolicyPatch,
+ModelCapabilitiesStatus,
+ModelMappingConfig,
+ModelMappingRule,
+PayloadShapingConfig,
+PromptCacheCreationControlConfig,
+ReportedUsageFieldPolicy,
+ReportedUsagePathPolicy,
 } from '@/types/api'
+import { Check,Trash2 } from 'lucide-react'
+import { useEffect,useMemo,useState,type ReactNode } from 'react'
 
 // ─── 共用原子 ─────────────────────────────────────────────────────────────────
 
@@ -140,7 +139,6 @@ export function isHighCacheStrategy(cacheType: CacheStrategyType): cacheType is 
   return cacheType === 'current_high_cache' || cacheType === 'bounded_high_cache'
 }
 
-const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
 const DFCACHE_ROUTE_PREFIX = '/dfcache/'
 const CACHE_ENDPOINT_LABELS: Record<string, string> = {
   '/v1': '/v1/messages',
@@ -298,10 +296,6 @@ function defaultRouteNamespace(prefix: string): boolean {
   return Boolean(normalizeDefinedCacheRoute(prefix))
 }
 
-function builtinDefaultCacheType(prefix: string): CacheStrategyType {
-  return prefix === '/na' ? 'no_cache' : 'current_high_cache'
-}
-
 export function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') {
     return { cacheType: 'no_cache' }
@@ -409,7 +403,7 @@ function StrategyChoice({
       {CACHE_STRATEGY_OPTIONS.map((option) => {
         const selected = option.value === value
         return (
-          <button
+          <Button variant="ghost"
             key={option.value}
             type="button"
             role="radio"
@@ -429,15 +423,11 @@ function StrategyChoice({
                 <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">{option.desc}</span>
               </span>
             </div>
-          </button>
+          </Button>
         )
       })}
     </div>
   )
-}
-
-function isBuiltInCachePrefix(prefix: string): boolean {
-  return (BUILT_IN_CACHE_PREFIXES as readonly string[]).includes(prefix)
 }
 
 export function canonicalCachePolicyPath(prefix: string): string {
@@ -486,34 +476,6 @@ export function deletePrefixAliases<T>(record: Record<string, T>, prefix: string
 
 function cacheEndpointLabel(prefix: string): string {
   return CACHE_ENDPOINT_LABELS[prefix] ?? `${prefix}/v1/messages`
-}
-
-function compareCachePrefix(a: string, b: string): number {
-  const aIndex = (BUILT_IN_CACHE_PREFIXES as readonly string[]).indexOf(a)
-  const bIndex = (BUILT_IN_CACHE_PREFIXES as readonly string[]).indexOf(b)
-  if (aIndex >= 0 || bIndex >= 0) {
-    if (aIndex < 0) return 1
-    if (bIndex < 0) return -1
-    return aIndex - bIndex
-  }
-  return a.localeCompare(b)
-}
-
-function normalizedDefinedRoutesWith(routes: string[], prefix: string, enabled: boolean): string[] {
-  const normalizedRoute = normalizeDefinedCacheRoute(prefix)
-  if (!normalizedRoute) return normalizeDefinedCacheRoutes(routes)
-  const next = routes.filter((route) => normalizeDefinedCacheRoute(route) !== normalizedRoute)
-  if (enabled) next.push(normalizedRoute)
-  return normalizeDefinedCacheRoutes(next)
-}
-
-function moveDefinedRoute(routes: string[], oldPrefix: string, nextPrefix: string): string[] {
-  const oldRoute = normalizeDefinedCacheRoute(oldPrefix)
-  if (!oldRoute || !routes.some((route) => normalizeDefinedCacheRoute(route) === oldRoute)) {
-    return normalizeDefinedCacheRoutes(routes)
-  }
-  const withoutOld = normalizedDefinedRoutesWith(routes, oldPrefix, false)
-  return normalizedDefinedRoutesWith(withoutOld, nextPrefix, Boolean(normalizeDefinedCacheRoute(nextPrefix)))
 }
 
 export function normalizeDefinedCacheRouteName(name: string): string | null {
@@ -1773,17 +1735,6 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
   }
 }
 
-function currentHighCachePathDefaults(prefix: string, reportedUsage?: ReportedUsagePathPolicy): CacheRoutePolicyPatch {
-  return {
-    cacheType: 'current_high_cache',
-    routeNamespace: defaultRouteNamespace(prefix),
-    simulation: defaultSimulationPatch(),
-    creationControl: defaultPromptCacheCreationControl(),
-    reportedUsage: reportedUsage ?? defaultUsagePatch(prefix),
-    hitShaping: defaultCacheHitShaping(),
-  }
-}
-
 export function StrategyTemplateEditor({
   title,
   desc,
@@ -2228,285 +2179,6 @@ export function PathStrategyBindingCard({
   )
 }
 
-export function CachePolicySettingsSection({
-  config,
-  onChange,
-}: {
-  config: RuntimeConfig
-  onChange: (next: RuntimeConfig) => void
-}) {
-  const [newPath, setNewPath] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const cachePolicy = config.cachePolicy
-  const setPrefixToolPlusTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({ ...cachePolicy, prefixToolPlus: next })
-  }
-  const prefixToolTemplate = cachePolicyForStrategyTemplate(cachePolicy.prefixTool ?? {}, 'prefix_tool')
-  const prefixToolPlusTemplate = cachePolicyForStrategyTemplate(cachePolicy.prefixToolPlus ?? {}, 'prefix_tool_plus')
-  const setPrefixToolTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({ ...cachePolicy, prefixTool: next })
-  }
-  const paths = Array.from(new Set([
-    ...BUILT_IN_CACHE_PREFIXES,
-    ...Object.keys(cachePolicy.pathOverrides ?? {}).map(canonicalCachePolicyPath),
-    ...Object.keys(config.reportedUsage.pathOverrides ?? {}).map(canonicalCachePolicyPath),
-    ...config.definedCacheRoutes.map(canonicalCachePolicyPath),
-  ])).sort(compareCachePrefix)
-
-  const updateCachePolicy = (
-    nextCachePolicy: CachePolicyConfig,
-    nextReportedUsage = config.reportedUsage,
-    nextDefinedRoutes = config.definedCacheRoutes
-  ) => {
-    onChange({
-      ...config,
-      cachePolicy: nextCachePolicy,
-      reportedUsage: nextReportedUsage,
-      definedCacheRoutes: nextDefinedRoutes,
-    })
-  }
-
-  const mergedPolicyForPath = (prefix: string): CacheRoutePolicyPatch => {
-    const normalizedPrefix = canonicalCachePolicyPath(prefix)
-    const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
-    const legacyReportedUsage = reportedUsageForPrefix(config.reportedUsage.pathOverrides, normalizedPrefix)
-    if (existing) {
-      if (existing.cacheType === 'no_cache' || existing.cacheType === 'prefix_tool' || existing.cacheType === 'prefix_tool_plus' || existing.cacheType === 'stable_segment_cache' || existing.cacheType === 'bounded_high_cache') {
-        return existing
-      }
-      return legacyReportedUsage ? { ...existing, reportedUsage: existing.reportedUsage ?? legacyReportedUsage } : existing
-    }
-    if (legacyReportedUsage) {
-      return currentHighCachePathDefaults(normalizedPrefix, legacyReportedUsage)
-    }
-    if (isBuiltInCachePrefix(normalizedPrefix)) {
-      return defaultPathCachePatch(normalizedPrefix, builtinDefaultCacheType(normalizedPrefix))
-    }
-    const normalizedRoute = normalizeDefinedCacheRoute(normalizedPrefix)
-    if (normalizedRoute && config.definedCacheRoutes.includes(normalizedRoute)) {
-      return currentHighCachePathDefaults(normalizedPrefix)
-    }
-    return { cacheType: 'no_cache' }
-  }
-
-  const setPathPolicy = (prefix: string, nextPolicy: CacheRoutePolicyPatch) => {
-    const normalizedPrefix = canonicalCachePolicyPath(prefix)
-    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
-    const reportedPathOverrides = { ...config.reportedUsage.pathOverrides }
-    deletePrefixAliases(pathOverrides, normalizedPrefix)
-    deletePrefixAliases(reportedPathOverrides, normalizedPrefix)
-    pathOverrides[normalizedPrefix] = sanitizeCacheRoutePolicy(nextPolicy)
-    updateCachePolicy(
-      { ...cachePolicy, pathOverrides },
-      { ...config.reportedUsage, pathOverrides: reportedPathOverrides }
-    )
-  }
-
-  const addPath = () => {
-    const prefix = buildDefinedCacheRoute(newPath)
-    if (!prefix) {
-      setError('请输入路径名，例如 team-a')
-      return
-    }
-    if (paths.includes(prefix)) {
-      setError(`${prefix} 已存在`)
-      return
-    }
-    setError(null)
-    setNewPath('')
-    updateCachePolicy(
-      {
-        ...cachePolicy,
-        pathOverrides: {
-          ...(cachePolicy.pathOverrides ?? {}),
-          [prefix]: { cacheType: 'no_cache' },
-        },
-      },
-      config.reportedUsage,
-      normalizedDefinedRoutesWith(config.definedCacheRoutes, prefix, Boolean(normalizeDefinedCacheRoute(prefix)))
-    )
-  }
-
-  const renamePath = (oldPrefix: string, nextPrefix: string) => {
-    const normalizedOld = canonicalCachePolicyPath(oldPrefix)
-    const normalizedNext = canonicalCachePolicyPath(nextPrefix)
-    if (normalizedOld === normalizedNext) return
-    if (paths.includes(normalizedNext)) {
-      setError(`${nextPrefix} 已存在`)
-      return
-    }
-    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
-    const reportedPathOverrides = { ...config.reportedUsage.pathOverrides }
-    const policy = mergedPolicyForPath(normalizedOld)
-    deletePrefixAliases(pathOverrides, normalizedOld)
-    deletePrefixAliases(reportedPathOverrides, normalizedOld)
-    pathOverrides[normalizedNext] = policy.cacheType === 'no_cache' ? { cacheType: 'no_cache' } : policy
-    setError(null)
-    updateCachePolicy(
-      { ...cachePolicy, pathOverrides },
-      { ...config.reportedUsage, pathOverrides: reportedPathOverrides },
-      moveDefinedRoute(config.definedCacheRoutes, normalizedOld, normalizedNext)
-    )
-  }
-
-  const deletePath = (prefix: string) => {
-    const normalizedPrefix = canonicalCachePolicyPath(prefix)
-    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
-    const reportedPathOverrides = { ...config.reportedUsage.pathOverrides }
-    deletePrefixAliases(pathOverrides, normalizedPrefix)
-    deletePrefixAliases(reportedPathOverrides, normalizedPrefix)
-    updateCachePolicy(
-      { ...cachePolicy, pathOverrides },
-      { ...config.reportedUsage, pathOverrides: reportedPathOverrides },
-      normalizedDefinedRoutesWith(config.definedCacheRoutes, normalizedPrefix, false)
-    )
-  }
-
-  const setDefinedRoute = (prefix: string, enabled: boolean) => {
-    const normalizedPrefix = canonicalCachePolicyPath(prefix)
-    updateCachePolicy(cachePolicy, config.reportedUsage, normalizedDefinedRoutesWith(config.definedCacheRoutes, normalizedPrefix, enabled))
-  }
-
-  const setCurrentTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({
-      ...cachePolicy,
-      currentHighCache: next,
-      default: { ...cachePolicy.default, ...next },
-    })
-  }
-
-  const currentTemplate = cachePolicyForStrategyTemplate(
-    { ...(cachePolicy.default ?? {}), ...(cachePolicy.currentHighCache ?? {}) },
-    'current_high_cache'
-  )
-  const setStableSegmentTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({ ...cachePolicy, stableSegmentCache: next })
-  }
-  const stableSegmentTemplate = cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, 'stable_segment_cache')
-  const boundedTemplate = cachePolicyForStrategyTemplate(cachePolicy.boundedHighCache ?? {}, 'bounded_high_cache')
-  const setBoundedTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({ ...cachePolicy, boundedHighCache: next })
-  }
-
-  return (
-    <div className="space-y-6">
-      <div className="grid gap-4">
-        <StrategyTemplateEditor
-          title="本地模拟缓存策略默认参数"
-          desc="使用本策略的路径会先读取这里的参数，再合并路径自己的参数。"
-          cacheType="current_high_cache"
-          policy={currentTemplate}
-          onChange={setCurrentTemplate}
-        />
-        <StrategyTemplateEditor
-          title="前缀追踪 缓存策略默认参数"
-          desc="使用本策略的路径只读取这里属于 前缀追踪 的参数，不读取本地模拟策略参数。"
-          cacheType="prefix_tool"
-          policy={prefixToolTemplate}
-          onChange={setPrefixToolTemplate}
-        />
-        <StrategyTemplateEditor
-          title="稳定片段缓存策略默认参数"
-          desc="使用本策略的路径只读取这里属于稳定片段缓存的参数，再合并路径自己的参数。"
-          cacheType="stable_segment_cache"
-          policy={stableSegmentTemplate}
-          onChange={setStableSegmentTemplate}
-        />
-        <StrategyTemplateEditor
-          title="前缀追踪 Plus 缓存策略默认参数"
-          desc="使用本策略且没有单独配置参数的路径读取这里的参数。可分别控制输入、输出、缓存读取、缓存写入的放大倍数和上下限，并限制写入频次。"
-          cacheType="prefix_tool_plus"
-          policy={prefixToolPlusTemplate}
-          onChange={setPrefixToolPlusTemplate}
-        />
-        <StrategyTemplateEditor
-          title="上下限优先缓存策略默认参数"
-          desc="参数与本地模拟缓存相同，但不读取本地模拟策略的模板。各字段上下限是最终约束，计费只在范围内补，补不上的差额在之后放行写入的请求上补。"
-          cacheType="bounded_high_cache"
-          policy={boundedTemplate}
-          onChange={setBoundedTemplate}
-        />
-      </div>
-
-      <div className="space-y-4">
-        <div>
-          <div className="text-sm font-semibold">路径绑定</div>
-          <div className="mt-1 text-xs leading-5 text-muted-foreground">
-            每个路径都显式选择无缓存、本地模拟缓存策略、上下限优先缓存策略、前缀追踪 缓存策略、前缀追踪 Plus 缓存策略或稳定片段缓存策略。
-          </div>
-        </div>
-        <div className="flex flex-col gap-2 md:flex-row md:items-end">
-          <div className="min-w-0 flex-1 space-y-1.5">
-            <div className="text-sm font-semibold">新增自定义路径</div>
-            <div className="text-xs leading-5 text-muted-foreground">
-              /dfcache/ 是固定前缀，用来和内置路径分开，不能修改。
-            </div>
-            <div className="flex items-stretch overflow-hidden rounded-md border border-input bg-background">
-              <div className="flex items-center border-r border-input bg-muted/30 px-3 font-mono text-sm text-muted-foreground">
-                {DFCACHE_ROUTE_PREFIX}
-              </div>
-              <Input
-                className="border-0 shadow-none focus-visible:ring-0"
-                placeholder="team-a"
-                value={newPath}
-                onChange={(event) => setNewPath(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') addPath()
-                }}
-              />
-            </div>
-            <div className="text-xs text-muted-foreground">
-              这里只填后缀，例如 team-a，最终路径是 /dfcache/team-a。
-            </div>
-          </div>
-          <Button type="button" onClick={addPath}>
-            <Plus className="mr-1 h-4 w-4" />
-            新增路径
-          </Button>
-        </div>
-        {error && <div className="text-xs text-destructive">{error}</div>}
-        <div className="space-y-4">
-          {paths.map((prefix) => (
-            <PathStrategyBindingCard
-              key={prefix}
-              prefix={prefix}
-              policy={mergedPolicyForPath(prefix)}
-              cachePolicy={cachePolicy}
-              definedRoutes={config.definedCacheRoutes}
-              builtIn={isBuiltInCachePrefix(prefix)}
-              onPrefixChange={(nextPrefix) => renamePath(prefix, nextPrefix)}
-              onDelete={() => deletePath(prefix)}
-              onChange={(nextPolicy) => setPathPolicy(prefix, nextPolicy)}
-              onDefinedRouteChange={(enabled) => setDefinedRoute(prefix, enabled)}
-            />
-          ))}
-        </div>
-      </div>
-
-      <div className="space-y-4">
-        <div>
-          <div className="text-sm font-semibold">统计展示</div>
-          <div className="mt-1 text-xs leading-5 text-muted-foreground">
-            只影响后台列表里是否标记为缓存命中较高，不改变请求处理，也不改变返回给客户端的用量数字。
-          </div>
-        </div>
-        <TwoCol>
-          <NumField
-            label="缓存命中判定阈值"
-            desc="缓存读取达到多少 Token 后，在后台统计里认为这次请求缓存命中较高。"
-            value={config.highCacheThreshold}
-            min={0}
-            suffix="Token"
-            onChange={(highCacheThreshold) => onChange({ ...config, highCacheThreshold })}
-          />
-        </TwoCol>
-      </div>
-    </div>
-  )
-}
-
-// ─── 旧内容清理(payloadHistory) ───────────────────────────────────────────────
-
 export function PayloadHistorySection({
   shaping, payloadSizeLimitEnabled, onChange,
 }: {
@@ -2947,7 +2619,7 @@ function FinalOutputGuardForm({
   )
 }
 
-function PathPolicyEditor({
+export function PathPolicyEditor({
   policy, onChange,
 }: {
   policy: ReportedUsagePathPolicy

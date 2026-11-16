@@ -8,6 +8,7 @@ import {
   filterRows,
   initialBatchPolicy,
   policyKey,
+  policySummary,
   selectByClick,
 } from '../src/features/route-scenarios/account-rules.ts'
 
@@ -83,4 +84,12 @@ test('batch dialog starts from the shared rule, otherwise from an empty deny lis
   assert.deepEqual(initialBatchPolicy(rows.slice(0, 2)), deny('/cc', '/ha'))
   assert.deepEqual(initialBatchPolicy(rows), deny())
   assert.deepEqual(initialBatchPolicy(rows.slice(2)), deny())
+})
+
+test('三态规则文案准确解释空列表', () => {
+  assert.equal(policySummary({ routeMode: 'allow_all', routeRules: ['/cc'] }), '不限制')
+  assert.equal(policySummary(allow()), '不允许任何路由')
+  assert.equal(policySummary(deny()), '不限制')
+  assert.equal(policySummary(allow('/cc')), '仅允许 /cc')
+  assert.equal(policySummary(deny('/cc')), '禁止 /cc')
 })

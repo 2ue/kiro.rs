@@ -3969,6 +3969,8 @@ const MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS: u64 = 300_000;
 #[serde(rename_all = "camelCase")]
 pub struct RequestApiKeyPolicy {
     #[serde(default)]
+    pub allowed_routes: Vec<String>,
+    #[serde(default)]
     pub api_key: String,
     #[serde(default)]
     pub name: String,
@@ -5828,6 +5830,7 @@ mod tests {
         let mut file = Config::default();
         file.set_request_api_keys(["sk-file", "sk-extra"]);
         file.set_request_api_key_policies([RequestApiKeyPolicy {
+            allowed_routes: Vec::new(),
             usage_limits: Vec::new(),
             api_key: "sk-extra".to_string(),
             name: "file-managed".to_string(),
@@ -5858,6 +5861,7 @@ mod tests {
         let mut file = Config::default();
         file.set_request_api_keys(["sk-legacy", "sk-removed"]);
         file.set_request_api_key_policies([RequestApiKeyPolicy {
+            allowed_routes: Vec::new(),
             usage_limits: Vec::new(),
             api_key: "sk-removed".to_string(),
             name: "stale-file-entry".to_string(),

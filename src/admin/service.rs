@@ -1,5 +1,8 @@
 //! Admin API 业务逻辑服务
 
+#[path = "management.rs"]
+pub(crate) mod management;
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -258,6 +261,7 @@ fn request_api_key_items(
                     .unwrap_or_else(|| format!("请求 Key {}", index + 1)),
                 enabled: policy.map(|policy| policy.enabled).unwrap_or(true),
                 request_admission: policy.and_then(|policy| policy.request_admission),
+                allowed_routes: policy.map(|p| p.allowed_routes.clone()).unwrap_or_default(),
                 usage_limits: policy
                     .map(|policy| policy.usage_limits.clone())
                     .unwrap_or_default(),
@@ -587,7 +591,7 @@ impl AdminService {
     fn persist_request_api_keys(
         &self,
         keys: Vec<String>,
-        policies: Vec<RequestApiKeyPolicy>,
+        mut policies: Vec<RequestApiKeyPolicy>,
         action: &'static str,
         detail: serde_json::Value,
     ) -> Result<(), AdminServiceError> {
@@ -595,6 +599,25 @@ impl AdminService {
             return Err(AdminServiceError::InvalidCredential(
                 "至少需要保留一个调用 API Key".to_string(),
             ));
+        }
+        let routes = self.runtime.config().routes;
+        for policy in &mut policies {
+            policy.allowed_routes = policy
+                .allowed_routes
+                .iter()
+                .map(|prefix| crate::model::routes::normalize_route_prefix(prefix))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if policy
+                .allowed_routes
+                .iter()
+                .any(|prefix| !routes.routes.iter().any(|route| &route.prefix == prefix))
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "允许路由中包含未定义的前缀".into(),
+                ));
+            }
         }
         validate_request_api_key_policies(&keys, &policies)
             .map_err(AdminServiceError::InvalidCredential)?;
@@ -764,6 +787,7 @@ impl AdminService {
             enabled: req.enabled.unwrap_or(true),
             request_admission: Some(admission),
             usage_limits,
+            allowed_routes: req.allowed_routes.unwrap_or_default(),
         });
         self.persist_request_api_keys(
             keys,
@@ -839,6 +863,9 @@ impl AdminService {
             if let Some(admission) = req.request_admission {
                 policy.request_admission = Some(admission);
             }
+            if let Some(routes) = req.allowed_routes.clone() {
+                policy.allowed_routes = routes;
+            }
             if let Some(usage_limits) = req.usage_limits.clone() {
                 policy.usage_limits = usage_limits;
             }
@@ -846,6 +873,7 @@ impl AdminService {
             || req.enabled.is_some()
             || req.request_admission.is_some()
             || req.usage_limits.is_some()
+            || req.allowed_routes.is_some()
         {
             policies.push(RequestApiKeyPolicy {
                 api_key: next_key.clone(),
@@ -853,6 +881,7 @@ impl AdminService {
                 enabled: req.enabled.unwrap_or(true),
                 request_admission: req.request_admission,
                 usage_limits: req.usage_limits.clone().unwrap_or_default(),
+                allowed_routes: req.allowed_routes.clone().unwrap_or_default(),
             });
         }
         self.persist_request_api_keys(
@@ -890,12 +919,16 @@ impl AdminService {
     pub fn list_accounts(&self) -> Result<Vec<Account>, AdminServiceError> {
         let cache_key = admin_account_list_cache_key();
         if let Some(cached) = self.read_admin_cache::<Vec<Account>>(cache_key) {
-            return Ok(cached);
+            return Ok(cached.into_iter().map(management::mask_account).collect());
         }
 
         let store = self.postgres_store.clone();
         let pools = block_on_admin_store(async move { store.list_accounts(true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let pools = pools
+            .into_iter()
+            .map(management::mask_account)
+            .collect::<Vec<_>>();
         self.write_admin_cache(
             cache_key.to_string(),
             pools.clone(),
@@ -923,7 +956,7 @@ impl AdminService {
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
         self.invalidate_account_admin_cache_with_pool("create", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(management::mask_account(pool.masked_for_admin_response()))
     }
 
     pub fn update_account(
@@ -948,7 +981,7 @@ impl AdminService {
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
         self.invalidate_account_admin_cache_with_pool("update", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(management::mask_account(pool.masked_for_admin_response()))
     }
 
     pub fn set_account_supported_models(
@@ -1192,7 +1225,7 @@ impl AdminService {
             json!({ "enabled": request.enabled }),
         );
         self.invalidate_account_admin_cache_with_pool("enabled", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(management::mask_account(pool.masked_for_admin_response()))
     }
 
     pub fn clear_account_auto_disabled(&self, id: u64) -> Result<Account, AdminServiceError> {
@@ -1213,7 +1246,7 @@ impl AdminService {
             json!({}),
         );
         self.invalidate_account_admin_cache_with_pool("clear_auto_disabled", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(management::mask_account(pool.masked_for_admin_response()))
     }
 
     pub fn clear_account_cooldown(&self, id: u64) -> Result<Account, AdminServiceError> {
@@ -1233,12 +1266,15 @@ impl AdminService {
             json!({ "deletedKeys": deleted }),
         );
         self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
-        Ok(pool.masked_for_admin_response())
+        Ok(management::mask_account(pool.masked_for_admin_response()))
     }
 
     pub fn get_account_status(&self) -> Result<AccountsStatusResponse, AdminServiceError> {
         let cache_key = admin_account_status_cache_key();
-        if let Some(cached) = self.read_admin_cache::<AccountsStatusResponse>(cache_key) {
+        if let Some(mut cached) = self.read_admin_cache::<AccountsStatusResponse>(cache_key) {
+            for status in &mut cached.pools {
+                status.pool = management::mask_account(status.pool.clone());
+            }
             return Ok(cached);
         }
 
@@ -1246,6 +1282,13 @@ impl AdminService {
         let config = self.runtime.config().accounts;
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let pools = pools
+            .into_iter()
+            .map(|mut status| {
+                status.pool = management::mask_account(status.pool);
+                status
+            })
+            .collect();
         let response = AccountsStatusResponse { pools };
         self.write_admin_cache(
             cache_key.to_string(),
@@ -2485,7 +2528,6 @@ impl AdminService {
             prompt_cache_estimated_bytes_limit: config.prompt_cache_estimated_bytes_limit.clone(),
             reported_usage: config.reported_usage.clone(),
             cache_policy: config.cache_policy.clone(),
-            routes: config.routes.clone(),
             accounts: config.accounts.clone(),
             high_cache_threshold: config.high_cache_threshold.clone(),
             compat_profile: config.compat_profile.clone(),
@@ -2493,6 +2535,8 @@ impl AdminService {
             model_mapping: config.model_mapping.clone(),
             audit_log_retention_enabled: config.audit_log_retention_enabled.clone(),
             audit_log_retention_days: config.audit_log_retention_days.clone(),
+            tls_backend: config.tls_backend,
+            usage_record_limit: config.usage_record_limit,
         }
     }
 
@@ -2591,9 +2635,6 @@ impl AdminService {
             if let Some(value) = req.cache_policy {
                 config.cache_policy = value;
             }
-            if let Some(value) = req.routes {
-                config.routes = value;
-            }
             if let Some(value) = req.accounts {
                 config.accounts = value;
             }
@@ -2615,6 +2656,21 @@ impl AdminService {
             if let Some(value) = req.audit_log_retention_days {
                 config.audit_log_retention_days = value;
             }
+        }
+        if let Some(value) = req.proxy_url {
+            candidate.proxy_url = value;
+        }
+        if let Some(value) = req.proxy_username {
+            candidate.proxy_username = value;
+        }
+        if let Some(value) = req.proxy_password {
+            candidate.proxy_password = value;
+        }
+        if let Some(value) = req.tls_backend {
+            candidate.tls_backend = value;
+        }
+        if let Some(value) = req.usage_record_limit {
+            candidate.usage_record_limit = value;
         }
         normalize_and_validate_runtime_config(&mut candidate)
             .map_err(AdminServiceError::InvalidCredential)?;

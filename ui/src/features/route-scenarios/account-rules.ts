@@ -1,10 +1,11 @@
 // Pure helpers behind the scenario account editor. Kept free of runtime imports so they can be
 // unit tested with `node --test` (see ui/tests/).
-import type { AccountRoutePolicy, RoutePolicy, RouteScenarioAccountOption } from '@/types/api'
+import type { AccountRoutePolicy,RoutePolicy,RouteScenarioAccountOption } from '@/types/api'
 
 export function policySummary(policy: RoutePolicy): string {
   if (policy.routeMode === 'allow_all') return '不限制'
-  const routes = policy.routeRules.join('、') || '（未选路由）'
+  if (!policy.routeRules.length) return policy.routeMode === 'allow_list' ? '不允许任何路由' : '不限制'
+  const routes = policy.routeRules.join('、')
   return policy.routeMode === 'allow_list' ? `仅允许 ${routes}` : `禁止 ${routes}`
 }
 

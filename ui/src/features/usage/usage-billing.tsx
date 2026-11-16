@@ -69,7 +69,7 @@ function CostMetric({
     error: 'text-destructive',
   }[tone]
   return (
-    <div className="rounded-lg bg-muted/30 p-3">
+    <div className="border-b py-3">
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className={cn('mt-1 font-mono text-sm font-semibold tabular-nums', cls)}>{value}</div>
       {detail && <div className="mt-1 text-xs text-muted-foreground/60">{detail}</div>}
@@ -290,7 +290,7 @@ export function AccountBillingPanel({
             <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
           </div>
           {visiblePools.length === 0 ? (
-            <div className="rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground/60">
+            <div className="border-b py-3 text-sm text-muted-foreground/60">
               当前窗口没有账号计费样本；发生账号请求后，这里会按池列出原始成本、差额占比和原始/整形倍率。
             </div>
           ) : (

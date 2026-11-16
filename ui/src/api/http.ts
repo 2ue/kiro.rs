@@ -1,5 +1,5 @@
-import axios from 'axios'
 import { storage } from '@/lib/storage'
+import axios from 'axios'
 
 export const api = axios.create({
   baseURL: '/api/admin',
@@ -29,7 +29,7 @@ api.interceptors.response.use(
 )
 
 export async function validateAdminApiKey(adminApiKey: string): Promise<void> {
-  await axios.get('/api/admin/config/load-balancing', {
+  await axios.get('/api/admin/config/runtime', {
     headers: {
       'x-api-key': adminApiKey,
     },

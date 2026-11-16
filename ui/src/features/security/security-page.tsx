@@ -1,83 +1,77 @@
-import { useEffect, useState } from 'react'
+import { useAccessKeys, useRequestKeyUsageLimits } from '@/hooks/use-security'
+import { createRequestApiKey,deleteRequestApiKey,resetRequestKeyUsage,updateAdminApiKey,updateRequestApiKey } from '@/api/security'
 import {
-  Copy,
-  Edit3,
-  Eye,
-  EyeOff,
-  KeyRound,
-  Plus,
-  RotateCcw,
-  Save,
-  Trash2,
-  Wand2,
-  X,
-} from 'lucide-react'
-import { toast } from 'sonner'
-import {
-  Callout,
-  LoadingState,
-  PageContainer,
-  PageHeader,
-  SectionCard,
-  useConfirm,
+Callout,
+LoadingState,
+PageContainer,
+PageHeader,
+SectionCard,
+useConfirm,
 } from '@/components/patterns'
 import {
-  Badge,
-  Button,
-  Dialog,
-  DialogBody,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  Input,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  Spinner,
-  Switch,
-  Tooltip,
+Badge,
+Button,
+Checkbox,
+Dialog,
+DialogBody,
+DialogContent,
+DialogDescription,
+DialogFooter,
+DialogHeader,
+DialogTitle,
+Input,
+Select,
+SelectContent,
+SelectItem,
+SelectTrigger,
+SelectValue,
+Spinner,
+Switch,
+Tooltip,
 } from '@/components/ui'
-import { extractErrorMessage } from '@/lib/utils'
+import { useRoutes } from '@/hooks/use-routes'
+import { formatDate } from '@/lib/format'
 import { storage } from '@/lib/storage'
-import { usePublicPoolConfig, useSetPublicPoolConfig } from '@/hooks/use-credentials'
-import {
-  createRequestApiKey,
-  deleteRequestApiKey,
-  getAccessKeys,
-  getRequestKeyUsageLimits,
-  resetRequestKeyUsage,
-  updateAdminApiKey,
-  updateRequestApiKey,
-} from '@/api/credentials'
+import { extractErrorMessage } from '@/lib/utils'
 import type {
-  AccessKeysResponse,
-  KeyLimitMetric,
-  KeyLimitPeriod,
-  KeyUsageLimit,
-  PublicPoolFreeAccounts,
-  RequestAdmissionConfig,
-  RequestApiKeyItem,
-  RequestKeyUsageLimitItem,
+AccessKeysResponse,
+KeyLimitMetric,
+KeyLimitPeriod,
+KeyUsageLimit,
+RequestAdmissionConfig,
+RequestApiKeyItem,
+RequestKeyUsageLimitItem,
 } from '@/types/api'
 import {
-  METRIC_OPTIONS,
-  PERIOD_OPTIONS,
-  formatLimitValue,
-  metricLabel,
-  nextDraft,
-  parseDrafts,
-  periodLabel,
-  toDrafts,
-  usageView,
-  type LimitDraft,
+Copy,
+Edit3,
+Eye,
+EyeOff,
+KeyRound,
+Plus,
+RotateCcw,
+Save,
+Trash2,
+Wand2,
+X,
+} from 'lucide-react'
+import { useEffect,useState } from 'react'
+import { toast } from 'sonner'
+import {
+METRIC_OPTIONS,
+PERIOD_OPTIONS,
+formatLimitValue,
+metricLabel,
+nextDraft,
+parseDrafts,
+periodLabel,
+toDrafts,
+usageView,
+type LimitDraft,
 } from './key-limits'
-import { formatDate } from '@/lib/format'
 
 interface RequestKeyPolicyDraft {
+  allowedRoutes: string[]
   apiKey: string
   name: string
   enabled: boolean
@@ -125,6 +119,7 @@ function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[
   }
   if (!response.requestApiKey) return []
   return [{
+    allowedRoutes: [],
     id: 'legacy-primary',
     apiKey: response.requestApiKey,
     maskedApiKey: response.maskedRequestApiKey,
@@ -162,6 +157,8 @@ function RequestApiKeyDialog({
   onOpenChange: (open: boolean) => void
   onSave: (policy: RequestKeyPolicyDraft) => void
 }) {
+  const routes = useRoutes()
+  const [allowedRoutes, setAllowedRoutes] = useState<string[]>((item?.allowedRoutes ?? []).map(prefix => prefix || '/'))
   const isEdit = Boolean(item)
   const admission = item?.requestAdmission ?? defaultAdmission
   const [apiKey, setApiKey] = useState(initialApiKey ?? item?.apiKey ?? '')
@@ -174,6 +171,7 @@ function RequestApiKeyDialog({
   const [limitDrafts, setLimitDrafts] = useState<LimitDraft[]>(() => toDrafts(item?.usageLimits))
 
   useEffect(() => {
+    setAllowedRoutes((item?.allowedRoutes ?? []).map(prefix => prefix || '/'))
     setLimitDrafts(toDrafts(item?.usageLimits))
   }, [open, item?.id, item?.usageLimits])
 
@@ -302,6 +300,7 @@ function RequestApiKeyDialog({
               用量在请求结束后计入，并发请求可能让用量略超上限；计数服务不可用时，设置了限额的 Key 会被拒绝。
             </p>
           </div>
+          <section className="space-y-3"><h3 className="text-sm font-medium">允许的路由（未选表示全部）</h3><div className="grid gap-3 sm:grid-cols-2">{routes.data?.map(route => <label key={route.prefix} className="flex items-center gap-2 text-sm"><Checkbox checked={allowedRoutes.includes(route.prefix || '/')} onCheckedChange={checked => setAllowedRoutes(prev => checked ? [...prev, route.prefix || '/'] : prev.filter(prefix => prefix !== (route.prefix || '/')))}/>{route.prefix || '/'} {route.name}</label>)}</div></section>
         </DialogBody>
         <DialogFooter>
           <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>取消</Button>
@@ -319,6 +318,7 @@ function RequestApiKeyDialog({
                 queueTimeoutMs: timeout,
               },
               usageLimits: parsedLimits.limits,
+              allowedRoutes,
             })}
           >
             {saving ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}保存
@@ -474,9 +474,9 @@ function RequestKeysSection({
                   />
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                  <span className="rounded border bg-muted/50 px-2 py-1">RPM {admission.rpm || '不限'}</span>
-                  <span className="rounded border bg-muted/50 px-2 py-1">并发 {admission.maxConcurrentRequests || '不限'}</span>
-                  <span className="rounded border bg-muted/50 px-2 py-1">队列 {admission.maxQueuedRequests || 0}</span>
+                  <span className="px-2 py-1">RPM {admission.rpm || '不限'}</span>
+                  <span className="px-2 py-1">并发 {admission.maxConcurrentRequests || '不限'}</span>
+                  <span className="px-2 py-1">队列 {admission.maxQueuedRequests || 0}</span>
                   {item.usageLimits.length > 0 && (
                     <span className="rounded border border-primary/30 bg-primary/5 px-2 py-1 text-primary">限额 {item.usageLimits.length} 项</span>
                   )}
@@ -508,96 +508,11 @@ function RequestKeysSection({
 
 // ─── SecurityPage ─────────────────────────────────────────────────────────────
 
-const FREE_ACCOUNT_OPTIONS: ReadonlyArray<{ value: PublicPoolFreeAccounts; label: string }> = [
-  { value: 'power', label: '显示为 Power' },
-  { value: 'pro_max', label: '显示为 Pro Max' },
-  { value: 'pro_plus', label: '显示为 Pro+' },
-  { value: 'hide', label: '不展示' },
-]
-
-/** The switch for the public read-only pool page at `/ui/pool`; off by default. */
-function PublicPoolSection() {
-  const config = usePublicPoolConfig()
-  const update = useSetPublicPoolConfig()
-  const confirm = useConfirm()
-  const enabled = config.data?.enabled ?? false
-  const freeAccounts = config.data?.freeAccounts ?? 'power'
-  const url = typeof window === 'undefined' ? '/ui/pool' : `${window.location.origin}/ui/pool`
-
-  const toggle = async (next: boolean) => {
-    if (next) {
-      const ok = await confirm({
-        title: '开放只读号池页面？',
-        message: '开放后，任何拿到链接的人都能免登录查看账号状态、额度和调度负载。页面不返回 token、代理、完整邮箱、错误原文、费用和每个账号的使用积分，也不能做任何操作。',
-        confirmText: '开放',
-      })
-      if (!ok) return
-    }
-    update.mutate({ enabled: next, freeAccounts }, {
-      onSuccess: () => toast.success(next ? '只读号池页面已开放' : '只读号池页面已关闭'),
-      onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),
-    })
-  }
-
-  const setFreeAccounts = (next: PublicPoolFreeAccounts) => {
-    update.mutate({ enabled, freeAccounts: next }, {
-      onSuccess: () => toast.success('Free 账号展示方式已保存'),
-      onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),
-    })
-  }
-
-  return (
-    <SectionCard
-      title="只读号池页面"
-      description="给下级代理看的免登录账号列表。默认关闭，关闭时页面和接口都返回 404。"
-    >
-      <div className="flex flex-col gap-3">
-        <label className="flex items-center justify-between gap-3 rounded-lg border p-3">
-          <span className="min-w-0">
-            <span className="block text-sm font-medium">开放页面</span>
-            <span className="block text-xs text-muted-foreground">
-              只展示状态、额度和调度负载；邮箱中间打码，按钮都不可用。
-            </span>
-          </span>
-          <Switch
-            checked={enabled}
-            disabled={config.isLoading || update.isPending}
-            onCheckedChange={(next) => void toggle(next)}
-            aria-label="开放只读号池页面"
-          />
-        </label>
-        <div className="flex items-center justify-between gap-3 rounded-lg border p-3">
-          <span className="min-w-0">
-            <span className="block text-sm font-medium">Free 账号</span>
-            <span className="block text-xs text-muted-foreground">
-              显示为付费档位时，额度按该档位上限显示，已用积分取本系统记录的使用积分，超过上限只显示余数；不展示时，账号不出现在列表和各项计数里。只影响这个页面。
-            </span>
-          </span>
-          <Select
-            value={freeAccounts}
-            disabled={config.isLoading || update.isPending}
-            onValueChange={(next) => setFreeAccounts(next as PublicPoolFreeAccounts)}
-          >
-            <SelectTrigger size="sm" className="w-36 shrink-0" aria-label="Free 账号展示方式"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {FREE_ACCOUNT_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="flex flex-col gap-2 sm:flex-row">
-          <Input readOnly aria-label="只读号池页面地址" className="w-full min-w-0 flex-1 font-mono text-xs" value={url} />
-          <Button size="sm" variant="outline" className="sm:shrink-0" onClick={() => copyText('页面地址', url)}>
-            <Copy className="h-4 w-4" />复制
-          </Button>
-        </div>
-      </div>
-    </SectionCard>
-  )
-}
-
 export function SecurityPage() {
   const [keys, setKeys] = useState<AccessKeysResponse | null>(null)
-  const [loading, setLoading] = useState(true)
+  const accessKeysQuery = useAccessKeys()
+  const usageQuery = useRequestKeyUsageLimits()
+  const loading = accessKeysQuery.isLoading
   const [saving, setSaving] = useState(false)
   const [showAdminKey, setShowAdminKey] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -611,20 +526,13 @@ export function SecurityPage() {
   const confirm = useConfirm()
   const [usageByKey, setUsageByKey] = useState<Map<string, RequestKeyUsageLimitItem>>(new Map())
 
-  const loadUsage = async () => {
-    try {
-      const response = await getRequestKeyUsageLimits()
-      setUsageByKey(new Map(response.items.map((entry) => [entry.keyId, entry])))
-    } catch {
-      // Usage bars just stay on the last value; the key list itself is unaffected.
-    }
-  }
-
+  const loadUsage = () => usageQuery.refetch()
   useEffect(() => {
-    void loadUsage()
-    const timer = window.setInterval(() => { void loadUsage() }, 30_000)
-    return () => window.clearInterval(timer)
-  }, [])
+    if (usageQuery.data) setUsageByKey(new Map(usageQuery.data.items.map(entry => [entry.keyId, entry])))
+  }, [usageQuery.data])
+  useEffect(() => {
+    if (accessKeysQuery.data) setKeys(accessKeysQuery.data)
+  }, [accessKeysQuery.data])
 
   const handleResetUsage = async (item: RequestApiKeyItem, period: KeyLimitPeriod) => {
     const ok = await confirm({
@@ -640,15 +548,6 @@ export function SecurityPage() {
       void loadUsage()
     } catch (e) { toast.error(`清零失败: ${extractErrorMessage(e)}`) }
   }
-
-  const loadKeys = async () => {
-    setLoading(true)
-    try { setKeys(await getAccessKeys()) }
-    catch (e) { toast.error(`读取访问密钥失败: ${extractErrorMessage(e)}`) }
-    finally { setLoading(false) }
-  }
-
-  useEffect(() => { void loadKeys() }, [])
 
   const setKeysAndReset = (response: AccessKeysResponse) => {
     setKeys(response)
@@ -842,7 +741,6 @@ export function SecurityPage() {
         </div>
       </SectionCard>
 
-      <PublicPoolSection />
 
       {/* 接入说明 */}
       <SectionCard title="客户端接入说明" description="如何配置客户端使用本代理">

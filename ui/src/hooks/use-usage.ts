@@ -1,40 +1,7 @@
-import { useEffect, useRef } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  clearUsageRecords,
-  cancelUsageCleanup,
-  deleteManualModel,
-  getAccountEventSummary,
-  getAuditLogsPage,
-  getUsageCleanupStatus,
-  getModelCapabilities,
-  getModelPricing,
-  getUsageDashboard,
-  getUsageOverview,
-  getUsageOverviewExternal,
-  getUsageOverviewLocal,
-  getUsageOverviewRankings,
-  getUsageOverviewSeries,
-  getUsageOverviewSummary,
-  getUsageDashboardAccounts,
-  getUsageDashboardBreakdown,
-  getUsageDashboardAccountBilling,
-  getUsageDashboardAccountRisk,
-  getUsageDashboardSeries,
-  getUsageDashboardTop,
-  getUsageDashboardWindows,
-  getUsageRecords,
-  getUsageRecordsPage,
-  getUsageSummary,
-  getUsageWriterStats,
-  previewUsageCleanup,
-  resumeUsageCleanup,
-  startUsageCleanup,
-  syncModelCapabilities,
-  syncModelPricing,
-  upsertManualModel,
-} from '@/api/usage'
-import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageAccountRiskQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import { cancelUsageCleanup,clearUsageRecords,getAccountEventSummary,getAuditLogsPage,getUsageCleanupStatus,getUsageDashboard,getUsageDashboardAccountBilling,getUsageDashboardAccountRisk,getUsageDashboardBreakdown,getUsageDashboardSeries,getUsageDashboardTop,getUsageDashboardWindows,getUsageOverview,getUsageOverviewRankings,getUsageOverviewSeries,getUsageOverviewSummary,getUsageRecords,getUsageRecordsPage,getUsageSummary,getUsageWriterStats,previewUsageCleanup,resumeUsageCleanup,startUsageCleanup } from '@/api/usage-dashboard'
+import type { AdminAuditLogPageQuery,UsageAccountRiskQuery,UsageCleanupRequest,UsageCleanupStatusResponse,UsageRecordsPageQuery,UsageRecordsQuery } from '@/types/api'
+import { useMutation,useQuery,useQueryClient } from '@tanstack/react-query'
+import { useEffect,useRef } from 'react'
 
 type RefetchInterval = number | false
 
@@ -137,34 +104,6 @@ export function useUsageOverviewSeries(
   })
 }
 
-export function useUsageOverviewLocal(
-  params: UsageOverviewQuery = {},
-  refetchInterval: RefetchInterval = false,
-  enabled = true,
-) {
-  return useQuery({
-    queryKey: ['usage-overview-local', params],
-    queryFn: () => getUsageOverviewLocal(params),
-    refetchInterval,
-    enabled,
-    placeholderData: (previousData) => previousData,
-  })
-}
-
-export function useUsageOverviewExternal(
-  params: UsageOverviewQuery = {},
-  refetchInterval: RefetchInterval = false,
-  enabled = true,
-) {
-  return useQuery({
-    queryKey: ['usage-overview-external', params],
-    queryFn: () => getUsageOverviewExternal(params),
-    refetchInterval,
-    enabled,
-    placeholderData: (previousData) => previousData,
-  })
-}
-
 export function useUsageOverviewRankings(
   params: UsageOverviewQuery = {},
   refetchInterval: RefetchInterval = false,
@@ -211,29 +150,6 @@ export function useUsageDashboardTop(
     queryFn: () => getUsageDashboardTop(timezone, windowKey),
     refetchInterval,
     enabled,
-  })
-}
-
-export function useUsageDashboardAccounts(
-  params: {
-    timezone?: string
-    windowKey?: string
-    page?: number
-    pageSize?: number
-    q?: string
-    status?: string
-    sortBy?: string
-    sortOrder?: 'asc' | 'desc'
-  } = {},
-  refetchInterval: RefetchInterval = false,
-  enabled = true
-) {
-  return useQuery({
-    queryKey: ['usage-dashboard-accounts', params],
-    queryFn: () => getUsageDashboardAccounts(params),
-    refetchInterval,
-    enabled,
-    placeholderData: (previousData) => previousData,
   })
 }
 
@@ -390,56 +306,4 @@ export function useAccountEventSummary(hours: number, accountSource?: string) {
   })
 }
 
-export function useModelPricing(refetchInterval: RefetchInterval = 60000) {
-  return useQuery({
-    queryKey: ['model-pricing'],
-    queryFn: getModelPricing,
-    refetchInterval,
-  })
-}
-
-export function useSyncModelPricing() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: syncModelPricing,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['model-pricing'] }),
-  })
-}
-
-export function useModelCapabilities() {
-  return useQuery({
-    queryKey: ['model-capabilities'],
-    queryFn: getModelCapabilities,
-    refetchInterval: 60000,
-  })
-}
-
-export function useSyncModelCapabilities() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: { credentialIds?: number[] } = {}) => syncModelCapabilities(payload),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['model-capabilities'] }),
-  })
-}
-
-export function useUpsertManualModel() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: UpsertManualModelRequest) => upsertManualModel(payload),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
-      queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
-    },
-  })
-}
-
-export function useDeleteManualModel() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: deleteManualModel,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
-      queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
-    },
-  })
-}
+export { useDeleteManualModel,useModelCapabilities,useModelPricing,useSyncModelPricing,useUpsertManualModel } from './use-models'

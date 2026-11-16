@@ -1,51 +1,53 @@
-import { useEffect, useMemo, useState } from 'react'
 import {
-  Plus,
-  RefreshCw,
-  Trash2,
-} from 'lucide-react'
-import { toast } from 'sonner'
-import {
-  EmptyState,
-  ErrorState,
-  LoadingState,
-  PageContainer,
-  PageHeader,
-  SectionCard,
-  useConfirm,
+EmptyState,
+ErrorState,
+LoadingState,
+PageContainer,
+PageHeader,
+SectionCard,
+useConfirm,
 } from '@/components/patterns'
 import {
-  Badge,
-  Button,
-  Checkbox,
-  Dialog,
-  DialogBody,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  Input,
-  Label,
-  Spinner,
-  Switch,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-  Textarea,
+Badge,
+Button,
+Checkbox,
+Dialog,
+DialogBody,
+DialogContent,
+DialogFooter,
+DialogHeader,
+DialogTitle,
+Input,
+Label,
+Spinner,
+Switch,
+Table,
+TableBody,
+TableCell,
+TableHead,
+TableHeader,
+TableRow,
+Textarea,
 } from '@/components/ui'
-import { extractErrorMessage } from '@/lib/utils'
-import { formatNumber } from '@/lib/format'
+import { useSetModelListed } from '@/hooks/use-models'
 import {
-  useDeleteManualModel,
-  useModelCapabilities,
-  useModelPricing,
-  useSyncModelPricing,
-  useUpsertManualModel,
+useDeleteManualModel,
+useModelCapabilities,
+useModelPricing,
+useSyncModelPricing,
+useUpsertManualModel,
 } from '@/hooks/use-usage'
-import type { ModelCapabilityItem, ModelPriceItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
+import { formatNumber } from '@/lib/format'
+import { extractErrorMessage } from '@/lib/utils'
+import type { ModelCapabilityItem,ModelPriceItem,ModelPricing,UpsertManualModelRequest } from '@/types/api'
+import {
+Plus,
+RefreshCw,
+Trash2,
+} from 'lucide-react'
+import { useEffect,useMemo,useState } from 'react'
+import { Link } from 'react-router-dom'
+import { toast } from 'sonner'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
 
@@ -254,6 +256,7 @@ function buildManualPayload(form: ManualModelForm): UpsertManualModelRequest {
 // ─── ModelsPage ───────────────────────────────────────────────────────────────
 
 export function ModelsPage() {
+  const listedMutation = useSetModelListed()
   const capabilities = useModelCapabilities()
   const pricing = useModelPricing()
   const syncPrice = useSyncModelPricing()
@@ -289,6 +292,7 @@ export function ModelsPage() {
 
   return (
     <PageContainer>
+      <Button variant="outline" asChild><Link to="/accounts">从账号发现加入目录</Link></Button>
       <PageHeader
         title="模型能力"
         subtitle="查看同步来的模型列表、手动维护能力参数；价格会用于用量页的成本估算和明细分析"
@@ -372,6 +376,7 @@ export function ModelsPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>模型 ID</TableHead>
+                  <TableHead>listed</TableHead>
                   <TableHead>来源</TableHead>
                   <TableHead className="text-right">输入价格/M</TableHead>
                   <TableHead className="text-right">输出价格/M</TableHead>
@@ -439,6 +444,7 @@ export function ModelsPage() {
                   <TableHead className="text-right">缓存写入 5 分钟/M</TableHead>
                   <TableHead className="text-right">缓存写入 1 小时/M</TableHead>
                   <TableHead className="text-right">缓存读取/M</TableHead>
+                  <TableHead>listed</TableHead>
                   <TableHead>来源</TableHead>
                   <TableHead className="w-20" />
                 </TableRow>
@@ -489,6 +495,7 @@ export function ModelsPage() {
                       <TableCell className="text-right font-mono text-xs tabular-nums">
                         {formatUsdPerM(price?.cacheReadInputTokenCost)}
                       </TableCell>
+                      <TableCell><Switch checked={item.listed} disabled={listedMutation.isPending} onCheckedChange={listed => listedMutation.mutate({model:item.model,listed}, {onError:error=>toast.error(extractErrorMessage(error))})}/></TableCell>
                       <TableCell>
                         <Badge tone={sourceTone(item.source)}>
                           {sourceLabel(manual ? 'manual' : item.source)}

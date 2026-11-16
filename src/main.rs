@@ -416,8 +416,20 @@ async fn async_main() {
             }
         }
     }));
+    runtime.subscribe(Arc::new(move |_previous, current, reason| {
+        if reason == model::runtime::RuntimeConfigChangeReason::Updated {
+            let config = current.clone();
+            tokio::spawn(async move {
+                admin::service::management::publish_runtime_change(&config).await;
+            });
+        }
+    }));
     let admin_api_key_store =
         admin::AdminApiKeyStore::new(config.admin_api_key.clone().unwrap_or_default());
+    let admin_key_updates = admin_api_key_store.clone();
+    runtime.subscribe(Arc::new(move |_previous, current, _reason| {
+        admin_key_updates.replace(current.admin_api_key.clone().unwrap_or_default());
+    }));
     let runtime_event_health = Arc::new(RuntimeEventHealth::default());
     let runtime_event_listener = spawn_redis_runtime_event_listener(
         runtime.clone(),

@@ -3,7 +3,7 @@ export interface TestModelOption {
   label: string
 }
 
-// Local credential tests send 上游 upstream model names.
+// Account tests send 上游 upstream model names.
 export const TEST_MODELS: TestModelOption[] = [
   { id: 'claude-sonnet-4.5', label: 'Claude Sonnet 4.5 (上游)' },
   { id: 'claude-haiku-4.5', label: 'Claude Haiku 4.5 (上游)' },

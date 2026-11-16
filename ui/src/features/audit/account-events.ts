@@ -1,5 +1,5 @@
 // Account change view helpers. No runtime imports so they can be tested with `node --test`.
-import type { AccountEventSummaryRow, AdminAuditLogPageQuery, AdminAuditLogRow } from '@/types/api'
+import type { AccountEventSummaryRow,AdminAuditLogPageQuery,AdminAuditLogRow } from '@/types/api';
 
 export type EventTone = 'error' | 'warning' | 'success' | 'info' | 'neutral'
 
@@ -51,7 +51,7 @@ export interface AccountEventView {
   kind: string
   label: string
   tone: EventTone
-  source: 'local' | 'external' | string
+  source: string
   accountId: string
   accountLabel: string
   reason: string
@@ -72,9 +72,9 @@ export function accountEventView(record: AdminAuditLogRow): AccountEventView | n
     kind,
     label: meta.label,
     tone: meta.tone,
-    source: text(detail.accountSource) || (record.objectType === 'account' ? 'external' : 'local'),
+    source: text(detail.accountSource) || 'account',
     accountId: record.objectId ?? '',
-    accountLabel: text(detail.accountLabel) || text(detail.credentialLabel) || (record.objectId ? `#${record.objectId}` : '—'),
+    accountLabel: text(detail.accountLabel) || (record.objectId ? `#${record.objectId}` : '—'),
     reason: text(detail.reasonLabel) || text(detail.message) || text(detail.reason),
     actor: ACTOR_LABELS[record.actor] ?? record.actor,
   }

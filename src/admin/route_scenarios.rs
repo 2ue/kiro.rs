@@ -250,7 +250,7 @@ fn validate_policy(policy: &RoutePolicy, label: &str) -> Result<(), AdminService
     Ok(())
 }
 
-fn validate_request(
+pub(super) fn validate_request(
     req: &SaveRouteScenarioRequest,
 ) -> Result<(String, Option<String>, RouteScenarioContent), AdminServiceError> {
     let name = req.name.trim().to_string();

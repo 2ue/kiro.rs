@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckCircle2, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
-import { testAccount } from '@/api/credentials'
+import { testAccount } from '@/api/accounts'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import {

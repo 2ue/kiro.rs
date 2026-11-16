@@ -211,6 +211,7 @@ pub struct RequestApiKeyItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_admission: Option<RequestAdmissionConfig>,
     pub usage_limits: Vec<crate::anthropic::request_key_limits::KeyUsageLimit>,
+    pub allowed_routes: Vec<String>,
 }
 
 /// Usage against every limit of one request key.
@@ -253,6 +254,8 @@ pub struct CreateRequestApiKeyRequest {
     /// Replaces the key's usage limits; an empty list removes them.
     #[serde(default)]
     pub usage_limits: Option<Vec<crate::anthropic::request_key_limits::KeyUsageLimit>>,
+    #[serde(default)]
+    pub allowed_routes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,6 +272,8 @@ pub struct UpdateRequestApiKeyRequest {
     /// Replaces the key's usage limits; an empty list removes them.
     #[serde(default)]
     pub usage_limits: Option<Vec<crate::anthropic::request_key_limits::KeyUsageLimit>>,
+    #[serde(default)]
+    pub allowed_routes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -307,7 +312,6 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_estimated_bytes_limit: u64,
     pub reported_usage: ReportedUsageConfig,
     pub cache_policy: CachePolicyConfig,
-    pub routes: crate::model::routes::RoutesConfig,
     pub accounts: AccountsConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
@@ -315,6 +319,8 @@ pub struct RuntimeConfigResponse {
     pub model_mapping: ModelMappingConfig,
     pub audit_log_retention_enabled: bool,
     pub audit_log_retention_days: u32,
+    pub tls_backend: crate::model::config::TlsBackend,
+    pub usage_record_limit: usize,
 }
 
 /// 预览请求：请求条件，加上可选的未保存草稿（只用于这次预览）。
@@ -386,8 +392,6 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub cache_policy: Option<CachePolicyConfig>,
     #[serde(default)]
-    pub routes: Option<crate::model::routes::RoutesConfig>,
-    #[serde(default)]
     pub accounts: Option<AccountsConfig>,
     #[serde(default)]
     pub high_cache_threshold: Option<i32>,
@@ -401,6 +405,16 @@ pub struct UpdateRuntimeConfigRequest {
     pub audit_log_retention_enabled: Option<bool>,
     #[serde(default)]
     pub audit_log_retention_days: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_nullable_update")]
+    pub proxy_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_update")]
+    pub proxy_username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_update")]
+    pub proxy_password: Option<Option<String>>,
+    #[serde(default)]
+    pub tls_backend: Option<crate::model::config::TlsBackend>,
+    #[serde(default)]
+    pub usage_record_limit: Option<usize>,
 }
 
 // ============ 手动模型补充 ============
@@ -561,4 +575,10 @@ impl AdminErrorResponse {
 
 fn default_manual_model_listed() -> bool {
     true
+}
+
+fn deserialize_nullable_update<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }

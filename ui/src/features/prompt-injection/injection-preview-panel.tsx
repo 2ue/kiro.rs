@@ -3,7 +3,7 @@ import { Eye } from 'lucide-react'
 import { Badge, Button, Switch } from '@/components/ui'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Callout, Field } from '@/components/patterns'
-import { usePromptInjectionPreview } from '@/hooks/use-credentials'
+import { usePromptInjectionPreview } from '@/hooks/use-runtime-config'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   InjectionCatalogEntry,
