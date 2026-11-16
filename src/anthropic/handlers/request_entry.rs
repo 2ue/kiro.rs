@@ -5,7 +5,7 @@ const MAX_ENTRY_ERROR_MESSAGE_CHARS: usize = 512;
 pub(super) async fn handle_messages_endpoint(
     state: AppState,
     headers: HeaderMap,
-    mut raw_body: Bytes,
+    raw_body: Bytes,
     endpoint: String,
     request_api_key_id: Option<String>,
     ingress_id: Option<String>,
@@ -22,27 +22,7 @@ pub(super) async fn handle_messages_endpoint(
             .effective_dispatch_max_wait_secs()
             .max(1),
     ));
-    let mut defaulted_max_tokens = None;
-    let mut raw_probe = probe_raw_messages_body(&raw_body);
-    if let Err(error) = apply_missing_max_tokens_policy_with_probe(
-        &mut raw_body,
-        &raw_probe,
-        runtime_config.missing_max_tokens,
-        &mut defaulted_max_tokens,
-    ) {
-        let request_id = envelope::request_id();
-        record_entry_request_error(
-            attribution.as_ref(),
-            &endpoint,
-            &request_id,
-            &error,
-            Some(&raw_probe),
-        );
-        return error.to_response(&request_id);
-    }
-    if defaulted_max_tokens.is_some() {
-        raw_probe = probe_raw_messages_body(&raw_body);
-    }
+    let raw_probe = probe_raw_messages_body(&raw_body);
     if let Some(probe_error) = raw_probe.scan_error() {
         let request_id = envelope::request_id();
         let error = entry_error_from_raw_probe(probe_error);
@@ -55,186 +35,23 @@ pub(super) async fn handle_messages_endpoint(
         );
         return error.to_response(&request_id);
     }
-    let mut requires_normalized_body = false;
-    let compat = runtime_config.local_request_compat;
-    match normalize_raw_client_reasoning_aliases_with_switches(&raw_body, &raw_probe, &compat) {
-        Ok(Some(rewrite)) => {
-            let (effort_action, original_effort) = match &rewrite.effort {
-                None => (None, None),
-                Some(EffortRewrite::DroppedNone) => (Some("dropped_none"), None),
-                Some(EffortRewrite::Normalized { original, .. }) => {
-                    (Some("normalized_case"), Some(original.as_str()))
-                }
-                Some(EffortRewrite::DroppedUnknown { original }) => {
-                    (Some("dropped_unknown"), Some(original.as_str()))
-                }
-            };
-            tracing::info!(
-                endpoint,
-                model = ?raw_probe.model,
-                effort_action,
-                original_effort,
-                thinking_type_alias = ?rewrite.thinking_type,
-                "normalized client reasoning aliases before routing"
-            );
-            raw_body = rewrite.body;
-            raw_probe = probe_raw_messages_body(&raw_body);
-            requires_normalized_body = true;
-        }
-        Ok(None) => {}
-        Err(message) => {
-            let request_id = envelope::request_id();
-            let error = EntryRequestError::invalid(message, "reasoning_alias_normalization_failed");
-            record_entry_request_error(
-                attribution.as_ref(),
-                &endpoint,
-                &request_id,
-                &error,
-                Some(&raw_probe),
-            );
-            return error.to_response(&request_id);
-        }
-    }
-    let model_max_output_tokens = raw_probe
-        .model
-        .as_deref()
-        .filter(|_| compat.repair_thinking_budget)
-        .and_then(|model| {
-            let resolution = state.model_capabilities.resolve_model_with_mapping(
-                model,
-                runtime_config.model_resolution_mode,
-                &runtime_config.model_mapping,
-            );
-            resolution
-                .upstream_model
-                .as_deref()
-                .and_then(|resolved| state.model_capabilities.max_output_tokens_for(resolved))
-                .or_else(|| state.model_capabilities.max_output_tokens_for(model))
-        });
-    let budget_repair = if compat.repair_thinking_budget {
-        normalize_raw_reasoning_protocol_with_probe_and_limit(
-            &raw_body,
-            &raw_probe,
-            model_max_output_tokens,
-        )
-    } else {
-        Ok(None)
-    };
-    match budget_repair {
-        Ok(Some(normalization)) => {
-            tracing::info!(
-                endpoint,
-                model = ?raw_probe.model,
-                model_max_output_tokens,
-                thinking_type = normalization.thinking_type,
-                original_max_tokens = ?normalization.original_max_tokens,
-                normalized_max_tokens = ?normalization.normalized_max_tokens,
-                original_budget_tokens = ?normalization.original_budget_tokens,
-                normalized_budget_tokens = ?normalization.normalized_budget_tokens,
-                normalization_reason = %normalization.normalization_reason,
-                "normalized recoverable thinking token controls before routing"
-            );
-            raw_body = normalization.body;
-            raw_probe = probe_raw_messages_body(&raw_body);
-            requires_normalized_body = true;
-        }
-        Ok(None) => {}
-        Err(message) => {
-            let request_id = envelope::request_id();
-            let error = EntryRequestError::invalid(message, "reasoning_normalization_failed");
-            record_entry_request_error(
-                attribution.as_ref(),
-                &endpoint,
-                &request_id,
-                &error,
-                Some(&raw_probe),
-            );
-            return error.to_response(&request_id);
-        }
-    }
-
-    // Raw external routes preserve the request after missing-max-token and
-    // recoverable-thinking normalization. Requests that needed any rewrite
-    // bypass raw passthrough so all routes use the same parsed body.
-    let effective_raw_body = raw_body.clone();
-
-    if let Err(message) =
-        validate_raw_reasoning_protocol_with_probe(&effective_raw_body, &raw_probe)
-    {
-        let request_id = envelope::request_id();
-        let original_effort = message
-            .starts_with("output_config.effort")
-            .then(|| {
-                super::super::request_facts::raw_output_effort_for_record(
-                    &effective_raw_body,
-                    &raw_probe,
-                )
-            })
-            .flatten();
-        let error = EntryRequestError::invalid(message, "invalid_reasoning_protocol")
-            .with_original_effort(original_effort);
-        record_entry_request_error(
-            attribution.as_ref(),
-            &endpoint,
-            &request_id,
-            &error,
-            Some(&raw_probe),
-        );
-        return error.to_response(&request_id);
-    }
-
-    let raw_history_sanitization =
-        super::super::transcript_sanitizer::sanitize_raw_request_assistant_history_with_probe(
-            &raw_body, &raw_probe,
-        );
-    let raw_history_sanitization = match raw_history_sanitization {
-        Ok(sanitization) => sanitization,
-        Err(error) => {
-            let request_id = envelope::request_id();
-            let error = EntryRequestError::invalid(
-                format!("Invalid JSON body: {error}"),
-                "request_history_inspection_failed",
-            );
-            record_entry_request_error(
-                attribution.as_ref(),
-                &endpoint,
-                &request_id,
-                &error,
-                Some(&raw_probe),
-            );
-            return error.to_response(&request_id);
-        }
-    };
-    if raw_history_sanitization.requires_normalized_body {
-        requires_normalized_body = true;
-    }
-    let effective_raw_probe = Arc::new(raw_probe);
-    if let Some((sanitized_body, report)) = raw_history_sanitization.sanitized_body {
-        if runtime_config.compat_profile.is_strict() && report.blocks > 0 {
-            let request_id = envelope::request_id();
-            let error = EntryRequestError::invalid(
-                envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
-                "strict_request_protocol_contamination",
-            );
-            record_entry_request_error(
-                attribution.as_ref(),
-                &endpoint,
-                &request_id,
-                &error,
-                Some(&effective_raw_probe),
-            );
-            return envelope::error_response_with_id_and_headers(
-                error.status,
-                error.error_type,
-                envelope::public_message_with_error_id(&error.message, &request_id),
-                &request_id,
-                [("x-error-id", request_id.clone())],
-            );
-        }
-        raw_body = Bytes::from(sanitized_body);
-        requires_normalized_body = true;
-    }
-
+    let patches =
+        match route_body_patches(&state, &headers, &endpoint, &raw_body, &runtime_config).await {
+            Ok(patches) => patches,
+            Err(error) => {
+                let request_id = envelope::request_id();
+                record_entry_request_error(
+                    attribution.as_ref(),
+                    &endpoint,
+                    &request_id,
+                    &error,
+                    Some(&raw_probe),
+                );
+                return error.to_response(&request_id);
+            }
+        };
+    let effective_raw_body = patches.apply(&raw_body);
+    let effective_raw_probe = Arc::new(probe_raw_messages_body(&effective_raw_body));
     post_messages_inner(
         state,
         headers,
@@ -245,10 +62,340 @@ pub(super) async fn handle_messages_endpoint(
         inference_attempt_budget,
         request_api_key_id,
         ingress_id,
-        requires_normalized_body,
         attribution,
     )
     .await
+}
+
+pub(super) async fn route_body_patches(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    raw: &Bytes,
+    runtime: &RequestRuntimeConfig,
+) -> Result<super::super::body_patch::BodyPatchSet, EntryRequestError> {
+    use super::super::body_patch::BodyPatchSet;
+    let features = runtime.route_features_for(endpoint);
+    let injections = runtime.injections_for(endpoint, UpstreamKind::ExternalPool);
+    let inject = InjectionId::ALL.iter().any(|id| injections.allows(*id));
+    let mut patches = BodyPatchSet::default();
+    if features.is_empty() && !inject {
+        return Ok(patches);
+    }
+    let mut value: Value = serde_json::from_slice(raw)
+        .map_err(|error| EntryRequestError::invalid(error.to_string(), "invalid_json_body"))?;
+    let mut previous = value.clone();
+    if let Some(config) = features.missing_max_tokens
+        && value.get("max_tokens").is_none()
+    {
+        if config.policy == MissingMaxTokensPolicy::Reject {
+            return Err(EntryRequestError::invalid(
+                "max_tokens: field is required",
+                "missing_max_tokens",
+            ));
+        }
+        value["max_tokens"] = json!(config.normalized().default_value);
+    }
+    collect_value_patches(&previous, &value, "", &mut patches, "missing_max_tokens");
+    previous = value.clone();
+    if let Some(compat) = features.reasoning_compat {
+        super::super::request_facts::normalize_reasoning_value(
+            &mut value,
+            &compat,
+            value_model_limit(state, runtime, raw),
+        )
+        .map_err(|error| EntryRequestError::invalid(error, "reasoning_normalization_failed"))?;
+        normalize_value_roles_and_content(&mut value, &compat);
+    }
+    collect_value_patches(&previous, &value, "", &mut patches, "reasoning_compat");
+    previous = value.clone();
+    if features.history_sanitize {
+        let report = super::super::transcript_sanitizer::sanitize_request_history_value(&mut value);
+        if runtime.compat_profile.is_strict() && report.blocks > 0 {
+            return Err(EntryRequestError::invalid(
+                envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
+                "strict_request_protocol_contamination",
+            ));
+        }
+    }
+    collect_value_patches(&previous, &value, "", &mut patches, "history_sanitize");
+    previous = value.clone();
+    for (source, model_name, trigger) in [
+        (
+            "thinking_model_name",
+            features.thinking_model_name,
+            ThinkingTriggerMode::Off,
+        ),
+        ("thinking_trigger", false, features.thinking_trigger),
+    ] {
+        if !model_name && trigger == ThinkingTriggerMode::Off {
+            continue;
+        }
+        let mut payload = feature_payload(&value)?;
+        let original_thinking = serde_json::to_value(&payload.thinking).unwrap();
+        if model_name {
+            override_thinking_from_model_name(&mut payload)
+                .map_err(|error| EntryRequestError::invalid(error, "invalid_thinking_model"))?;
+        }
+        apply_thinking_trigger_mode(&mut payload, trigger);
+        if model_name {
+            payload.model = payload.model.trim_end_matches("-thinking").to_string();
+        }
+        value["model"] = json!(payload.model);
+        if let Some(thinking) = payload.thinking {
+            let processed = serde_json::to_value(thinking).unwrap();
+            if value.get("thinking").is_none() {
+                value["thinking"] = processed;
+            } else if let Some(object) = processed.as_object() {
+                for (key, new) in object {
+                    if original_thinking.get(key) != Some(new) {
+                        value["thinking"][key] = new.clone();
+                    }
+                }
+            }
+        }
+        collect_value_patches(&previous, &value, "", &mut patches, source);
+        previous = value.clone();
+    }
+    if let Some(config) = features.image_processing {
+        let mut payload = feature_payload(&value)?;
+        body_processing::prepare_multimodal_sources(
+            &mut payload,
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            config,
+        )
+        .await
+        .map_err(|error| {
+            EntryRequestError::invalid(error.to_string(), "image_processing_failed")
+        })?;
+        for (index, message) in payload.messages.iter().enumerate() {
+            if let (Some(original), Some(processed)) = (
+                value.pointer_mut(&format!("/messages/{index}/content")),
+                message.content.as_array(),
+            ) {
+                if let Some(blocks) = original.as_array_mut() {
+                    for (block, processed) in blocks.iter_mut().zip(processed) {
+                        if let Some(source) = processed.get("source") {
+                            block["source"] = source.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    collect_value_patches(&previous, &value, "", &mut patches, "image_processing");
+    previous = value.clone();
+    if inject {
+        let mut system = match value.get("system") {
+            Some(Value::String(text)) => Some(vec![super::super::types::SystemMessage {
+                text: text.clone(),
+                cache_control: None,
+            }]),
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|error| {
+                EntryRequestError::invalid(error.to_string(), "invalid_system")
+            })?),
+            None => None,
+        };
+        super::super::prompt_injection::apply_to_system(&mut system, &injections);
+        let mut processed = serde_json::to_value(system).unwrap();
+        if let (Some(original), Some(blocks)) = (
+            value.get("system").and_then(Value::as_array),
+            processed.as_array_mut(),
+        ) {
+            for block in blocks {
+                if let Some(text) = block.get("text") {
+                    if let Some(existing) =
+                        original.iter().find(|old| old.get("text") == Some(text))
+                    {
+                        *block = existing.clone();
+                    }
+                }
+            }
+        }
+        value["system"] = processed;
+    }
+    collect_value_patches(&previous, &value, "", &mut patches, "prompt_injection");
+    previous = value.clone();
+    if let Some(config) = features.payload_shaping {
+        let mut payload = feature_payload(&value)?;
+        let before = payload.clone();
+        super::super::payload_guard::shape_route_payload(&mut payload, config);
+        for (index, (old, new)) in before.messages.iter().zip(&payload.messages).enumerate() {
+            if old.content != new.content {
+                value["messages"][index]["content"] = new.content.clone();
+            }
+        }
+        if serde_json::to_value(&before.tools).unwrap()
+            != serde_json::to_value(&payload.tools).unwrap()
+        {
+            if let (Some(original), Some(tools)) = (
+                value.get_mut("tools").and_then(Value::as_array_mut),
+                payload.tools,
+            ) {
+                for (original, tool) in original.iter_mut().zip(tools) {
+                    let processed = serde_json::to_value(tool).unwrap();
+                    for key in ["description", "input_schema"] {
+                        if let Some(new) = processed.get(key) {
+                            original[key] = new.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    collect_value_patches(&previous, &value, "", &mut patches, "payload_shaping");
+    previous = value.clone();
+    if let Some(config) = features
+        .payload_guard
+        .filter(|config| config.enabled && config.mode == PayloadGuardMode::Preemptive)
+    {
+        let guard = route_guard_config(config, None);
+        if let Some(messages) = super::super::payload_guard::trim_route_messages(&value, guard) {
+            value["messages"] = messages;
+        }
+    }
+    collect_value_patches(&previous, &value, "", &mut patches, "payload_guard");
+    Ok(patches)
+}
+
+fn value_model_limit(state: &AppState, runtime: &RequestRuntimeConfig, raw: &Bytes) -> Option<i32> {
+    let probe = probe_raw_messages_body(raw);
+    let model = probe.model.as_deref()?;
+    let resolution = state.model_capabilities.resolve_model_with_mapping(
+        model,
+        runtime.model_resolution_mode,
+        &runtime.model_mapping,
+    );
+    resolution
+        .upstream_model
+        .as_deref()
+        .and_then(|model| state.model_capabilities.max_output_tokens_for(model))
+        .or_else(|| state.model_capabilities.max_output_tokens_for(model))
+}
+
+fn feature_payload(value: &Value) -> Result<MessagesRequest, EntryRequestError> {
+    let mut view = value.clone();
+    if view.get("max_tokens").is_none() {
+        view["max_tokens"] = json!(DEFAULT_MISSING_MAX_TOKENS_VALUE);
+    }
+    serde_json::from_value(view)
+        .map_err(|error| EntryRequestError::invalid(error.to_string(), "invalid_feature_payload"))
+}
+
+pub(super) fn route_guard_config(
+    config: crate::model::prompt_injection::RoutePayloadGuardConfig,
+    shaping: Option<PayloadShapingConfig>,
+) -> PayloadGuardConfig {
+    let mut shaping_config = shaping.unwrap_or_default();
+    shaping_config.enabled = shaping.is_some() && shaping_config.enabled;
+    PayloadGuardConfig {
+        enabled: config.enabled,
+        max_bytes: config.max_bytes.saturating_sub(config.safety_margin_bytes),
+        trim_history: config.trim_history,
+        shaping: shaping_config,
+    }
+}
+
+fn collect_value_patches(
+    before: &Value,
+    after: &Value,
+    path: &str,
+    patches: &mut super::super::body_patch::BodyPatchSet,
+    source: &'static str,
+) {
+    if before == after {
+        return;
+    }
+    match (before, after) {
+        (Value::Object(old), Value::Object(new)) => {
+            for (key, value) in new {
+                let pointer = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
+                if let Some(old) = old.get(key) {
+                    collect_value_patches(old, value, &pointer, patches, source);
+                } else {
+                    patches.set(pointer, value.clone(), source);
+                }
+            }
+            for key in old.keys().filter(|key| !new.contains_key(*key)) {
+                patches.remove(
+                    format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
+                    source,
+                );
+            }
+        }
+        (Value::Array(old), Value::Array(new)) if old.len() == new.len() => {
+            for (index, (old, new)) in old.iter().zip(new).enumerate() {
+                collect_value_patches(old, new, &format!("{path}/{index}"), patches, source);
+            }
+        }
+        _ => patches.set(path, after.clone(), source),
+    }
+}
+
+fn normalize_value_roles_and_content(value: &mut Value, config: &LocalRequestCompatConfig) {
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut system_texts = Vec::new();
+    if config.normalize_message_roles {
+        messages.retain(|message| {
+            match message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "user" | "assistant" => true,
+                "system" | "developer" => {
+                    let text = message_content_text(&message["content"]);
+                    if !text.trim().is_empty() {
+                        system_texts.push(text);
+                    }
+                    false
+                }
+                _ => false,
+            }
+        });
+    }
+    if config.normalize_message_content {
+        for message in messages {
+            let content = &mut message["content"];
+            *content = match content.take() {
+                Value::Array(blocks) => Value::Array(
+                    blocks
+                        .into_iter()
+                        .filter_map(|block| match block {
+                            Value::Object(_) => Some(block),
+                            Value::Null => None,
+                            other => {
+                                Some(json!({"type":"text","text":scalar_content_text(&other)}))
+                            }
+                        })
+                        .collect(),
+                ),
+                Value::Null => Value::Array(Vec::new()),
+                object @ Value::Object(_) => Value::Array(vec![object]),
+                text @ Value::String(_) => text,
+                other => Value::String(scalar_content_text(&other)),
+            };
+        }
+    }
+    if !system_texts.is_empty() {
+        let mut system = match value.get("system") {
+            Some(Value::Array(blocks)) => blocks.clone(),
+            Some(Value::String(text)) => vec![json!({"type":"text","text":text})],
+            _ => vec![],
+        };
+        system.extend(
+            system_texts
+                .into_iter()
+                .map(|text| json!({"type":"text","text":text})),
+        );
+        value["system"] = Value::Array(system);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,11 +427,12 @@ impl EntryRequestError {
     }
 
     pub(super) fn to_response(&self, request_id: &str) -> Response {
-        envelope::error_response_with_id(
+        envelope::error_response_with_id_and_headers(
             self.status,
             self.error_type,
-            self.message.clone(),
+            envelope::public_message_with_error_id(&self.message, request_id),
             request_id,
+            [("x-error-id", request_id.to_string())],
         )
     }
 
@@ -1101,6 +1249,12 @@ mod tests {
     #[tokio::test]
     async fn messages_entry_normalizes_omitted_or_conflicting_thinking_controls_before_dispatch() {
         let state = test_state(Arc::new(UsageRecorder::new(10)));
+        state.runtime.install_local(|config| {
+            config.route_features.defaults.missing_max_tokens =
+                Some(MissingMaxTokensConfig::default());
+            config.route_features.defaults.reasoning_compat =
+                Some(LocalRequestCompatConfig::default());
+        });
         let cases = [
             (
                 "both controls omitted",
@@ -1141,7 +1295,7 @@ mod tests {
                     .await;
                     assert_eq!(
                         response.status(),
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        StatusCode::from_u16(529).unwrap(),
                         "round {round}, {case_name}, {endpoint}: request must pass entry validation before the intentionally providerless dispatch"
                     );
                     let response_body = axum::body::to_bytes(response.into_body(), 32 * 1024)

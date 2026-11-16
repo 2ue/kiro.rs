@@ -15,8 +15,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::model::config::{
-    CompatProfile, ThinkingTriggerMode, normalize_reported_usage_path_prefix,
-    reported_usage_path_matches,
+    CompatProfile, ImageProcessingConfig, LocalRequestCompatConfig, MissingMaxTokensConfig,
+    PayloadGuardMode, PayloadShapingConfig, PayloadTooLongHandling, ThinkingTriggerMode,
+    normalize_reported_usage_path_prefix, reported_usage_path_matches,
 };
 
 /// 单项文本上限（字符）。
@@ -151,17 +152,9 @@ fn default_item_settings() -> BTreeMap<InjectionId, ItemSetting> {
         .collect()
 }
 
-/// 新装时任务质量只在 `/cc` 上开启，这是一条可见、可改的路由设置。
+/// 内置路由默认不注入提示词。
 fn default_injection_path_overrides() -> BTreeMap<String, BTreeMap<InjectionId, ItemOverride>> {
-    BTreeMap::from([(
-        "/cc".to_string(),
-        BTreeMap::from([(
-            InjectionId::TaskQuality,
-            ItemOverride {
-                enabled: Some(true),
-            },
-        )]),
-    )])
+    BTreeMap::new()
 }
 
 impl Default for PromptInjectionConfig {
@@ -450,35 +443,91 @@ impl Default for ResolvedInjections {
     }
 }
 
-/// 按路由控制的功能。这些功能以前和提示词开关绑在一起，本身不注入提示词。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RouteFeatureSet {
-    /// `claude-xxx-thinking` 这类模型名自动补上 thinking 参数。
-    #[serde(default = "default_true")]
-    pub thinking_model_name: bool,
-    #[serde(default)]
-    pub thinking_trigger: ThinkingTriggerMode,
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct RoutePayloadGuardConfig {
+    pub enabled: bool,
+    pub mode: PayloadGuardMode,
+    pub max_bytes: usize,
+    pub safety_margin_bytes: usize,
+    pub trim_history: bool,
+    pub external_enabled: bool,
+    pub too_long_handling: PayloadTooLongHandling,
 }
-
-impl Default for RouteFeatureSet {
+impl Default for RoutePayloadGuardConfig {
     fn default() -> Self {
         Self {
-            thinking_model_name: true,
-            thinking_trigger: ThinkingTriggerMode::default(),
+            enabled: true,
+            mode: PayloadGuardMode::default(),
+            max_bytes: 4 * 1024 * 1024,
+            safety_margin_bytes: 64 * 1024,
+            trim_history: true,
+            external_enabled: true,
+            too_long_handling: PayloadTooLongHandling::default(),
         }
     }
 }
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RouteFeatureOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_model_name: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_trigger: Option<ThinkingTriggerMode>,
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct RouteFeatureSet {
+    pub missing_max_tokens: Option<MissingMaxTokensConfig>,
+    pub reasoning_compat: Option<LocalRequestCompatConfig>,
+    pub history_sanitize: bool,
+    pub thinking_model_name: bool,
+    pub thinking_trigger: ThinkingTriggerMode,
+    pub payload_guard: Option<RoutePayloadGuardConfig>,
+    pub payload_shaping: Option<PayloadShapingConfig>,
+    pub image_processing: Option<ImageProcessingConfig>,
 }
-
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct RouteFeatureOverride {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_feature_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub missing_max_tokens: Option<Option<MissingMaxTokensConfig>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_feature_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_compat: Option<Option<LocalRequestCompatConfig>>,
+    pub history_sanitize: Option<bool>,
+    pub thinking_model_name: Option<bool>,
+    pub thinking_trigger: Option<ThinkingTriggerMode>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_feature_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub payload_guard: Option<Option<RoutePayloadGuardConfig>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_feature_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub payload_shaping: Option<Option<PayloadShapingConfig>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_feature_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_processing: Option<Option<ImageProcessingConfig>>,
+}
+impl RouteFeatureSet {
+    pub fn is_empty(&self) -> bool {
+        self.missing_max_tokens.is_none()
+            && self.reasoning_compat.is_none()
+            && !self.history_sanitize
+            && !self.thinking_model_name
+            && self.thinking_trigger == ThinkingTriggerMode::Off
+            && !self.payload_guard.is_some_and(|config| config.enabled)
+            && !self.payload_shaping.is_some_and(|config| config.enabled)
+            && self.image_processing.is_none()
+    }
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RouteFeaturesConfig {
@@ -495,6 +544,30 @@ impl RouteFeatureOverride {
 }
 
 impl RouteFeaturesConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for feature in
+            std::iter::once(self.defaults).chain(self.path_overrides.values().map(|override_| {
+                let mut feature = RouteFeatureSet::default();
+                feature.missing_max_tokens = override_.missing_max_tokens.flatten();
+                feature.payload_guard = override_.payload_guard.flatten();
+                feature
+            }))
+        {
+            if let Some(config) = feature.missing_max_tokens {
+                config.validate()?;
+            }
+            if let Some(config) = feature.payload_guard {
+                if config.enabled
+                    && config.max_bytes > 0
+                    && config.max_bytes.saturating_sub(config.safety_margin_bytes) < 64 * 1024
+                {
+                    return Err("payloadGuard 实际裁剪目标不能小于 65536".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn normalized(mut self) -> Self {
         self.path_overrides = std::mem::take(&mut self.path_overrides)
             .into_iter()
@@ -517,11 +590,29 @@ impl RouteFeaturesConfig {
         matching.sort_by_key(|(prefix, _)| prefix.len());
         let mut resolved = self.defaults;
         for (_, route) in matching {
+            if let Some(value) = route.missing_max_tokens {
+                resolved.missing_max_tokens = value;
+            }
+            if let Some(value) = route.reasoning_compat {
+                resolved.reasoning_compat = value;
+            }
+            if let Some(value) = route.history_sanitize {
+                resolved.history_sanitize = value;
+            }
             if let Some(value) = route.thinking_model_name {
                 resolved.thinking_model_name = value;
             }
             if let Some(value) = route.thinking_trigger {
                 resolved.thinking_trigger = value;
+            }
+            if let Some(value) = route.payload_guard {
+                resolved.payload_guard = value;
+            }
+            if let Some(value) = route.payload_shaping {
+                resolved.payload_shaping = value;
+            }
+            if let Some(value) = route.image_processing {
+                resolved.image_processing = value;
             }
         }
         resolved
@@ -586,5 +677,55 @@ mod tests {
             format!("  {}  ", catalog::DEFAULT_TASK_QUALITY_PROMPT),
         );
         assert!(config.normalized().texts.is_empty());
+    }
+}
+
+fn deserialize_feature_override<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod passthrough_route_tests {
+    use super::*;
+    #[test]
+    fn passthrough_features_default_off_and_longest_prefix_can_disable_defaults() {
+        let defaults = RouteFeaturesConfig::default();
+        for path in [
+            "/v1/messages",
+            "/cc/v1/messages",
+            "/ha/v1/messages",
+            "/na/v1/messages",
+        ] {
+            assert!(defaults.resolve(path).is_empty());
+        }
+        let config: RouteFeaturesConfig = serde_json::from_value(serde_json::json!({
+            "defaults":{"reasoningCompat":{},"imageProcessing":{},"missingMaxTokens":{}},
+            "pathOverrides":{
+                "/cc":{"reasoningCompat":null,"historySanitize":true},
+                "/cc/nested":{"historySanitize":false,"imageProcessing":null}
+            }
+        }))
+        .unwrap();
+        let config: RouteFeaturesConfig =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        let broad = config.resolve("/cc/v1/messages");
+        assert!(broad.reasoning_compat.is_none());
+        assert!(broad.image_processing.is_some());
+        assert!(broad.history_sanitize);
+        let nested = config.resolve("/cc/nested/v1/messages");
+        assert!(nested.reasoning_compat.is_none());
+        assert!(nested.image_processing.is_none());
+        assert!(!nested.history_sanitize);
+        assert!(nested.missing_max_tokens.is_some());
+        assert!(
+            config
+                .resolve("/ccc/v1/messages")
+                .reasoning_compat
+                .is_some()
+        );
     }
 }

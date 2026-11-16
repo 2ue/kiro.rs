@@ -522,42 +522,36 @@ impl AppState {
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
-        self.runtime
-            .install_local(|config| config.payload_guard_enabled = self.payload_guard_enabled);
         self.payload_guard_mode = mode;
-        self.runtime
-            .install_local(|config| config.payload_guard_mode = self.payload_guard_mode);
         self.payload_guard_max_bytes = max_bytes;
-        self.runtime
-            .install_local(|config| config.payload_guard_max_bytes = self.payload_guard_max_bytes);
-
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
-        self.runtime.install_local(|config| {
-            config.payload_guard_safety_margin_bytes = self.payload_guard_safety_margin_bytes
-        });
         self.payload_guard_trim_history = trim_history;
-        self.runtime.install_local(|config| {
-            config.payload_guard_trim_history = self.payload_guard_trim_history
-        });
         self.payload_guard_external_enabled = external_enabled;
-        self.runtime.install_local(|config| {
-            config.payload_guard_external_enabled = self.payload_guard_external_enabled
-        });
-
         self.image_processing = image_processing.normalized();
-        self.runtime
-            .install_local(|config| config.image_processing = self.image_processing);
-
         self.payload_shaping = payload_shaping;
-        self.runtime
-            .install_local(|config| config.payload_shaping = self.payload_shaping);
+        self.runtime.install_local(|config| {
+            config.route_features.defaults.payload_guard =
+                enabled.then_some(crate::model::prompt_injection::RoutePayloadGuardConfig {
+                    enabled,
+                    mode,
+                    max_bytes,
+                    safety_margin_bytes,
+                    trim_history,
+                    external_enabled,
+                    ..Default::default()
+                });
+            config.route_features.defaults.image_processing = Some(self.image_processing);
+            config.route_features.defaults.payload_shaping =
+                payload_shaping.enabled.then_some(payload_shaping);
+        });
         self
     }
 
     pub fn with_missing_max_tokens(mut self, config: MissingMaxTokensConfig) -> Self {
         self.missing_max_tokens = config.normalized();
-        self.runtime
-            .install_local(|config| config.missing_max_tokens = self.missing_max_tokens);
+        self.runtime.install_local(|config| {
+            config.route_features.defaults.missing_max_tokens = Some(self.missing_max_tokens)
+        });
         self
     }
 

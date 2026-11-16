@@ -2463,19 +2463,8 @@ impl AdminService {
             request_admission: config.request_admission.clone(),
             stream_pre_output_hold_secs: config.stream_pre_output_hold_secs.clone(),
             inference_upstream_max_attempts: config.inference_upstream_max_attempts.clone(),
-            image_processing: config.image_processing.clone(),
             prompt_injection: config.prompt_injection.clone(),
             route_features: config.route_features.clone(),
-            missing_max_tokens: config.missing_max_tokens.clone(),
-            local_request_compat: config.local_request_compat.clone(),
-            payload_guard_enabled: config.payload_guard_enabled.clone(),
-            payload_guard_mode: config.payload_guard_mode.clone(),
-            payload_guard_max_bytes: config.payload_guard_max_bytes.clone() as u64,
-            payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes.clone()
-                as u64,
-            payload_guard_trim_history: config.payload_guard_trim_history.clone(),
-            payload_guard_external_enabled: config.payload_guard_external_enabled.clone(),
-            payload_shaping: config.payload_shaping.clone(),
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio.clone(),
             prompt_cache_token_scale: config.prompt_cache_token_scale.clone(),
             prompt_cache_max_simulated_input_tokens: config
@@ -2554,41 +2543,11 @@ impl AdminService {
             if let Some(value) = req.inference_upstream_max_attempts {
                 config.inference_upstream_max_attempts = value;
             }
-            if let Some(value) = req.image_processing {
-                config.image_processing = value;
-            }
             if let Some(value) = req.prompt_injection {
                 config.prompt_injection = value;
             }
             if let Some(value) = req.route_features {
                 config.route_features = value;
-            }
-            if let Some(value) = req.missing_max_tokens {
-                config.missing_max_tokens = value;
-            }
-            if let Some(value) = req.local_request_compat {
-                config.local_request_compat = value;
-            }
-            if let Some(value) = req.payload_guard_enabled {
-                config.payload_guard_enabled = value;
-            }
-            if let Some(value) = req.payload_guard_mode {
-                config.payload_guard_mode = value;
-            }
-            if let Some(value) = req.payload_guard_max_bytes {
-                config.payload_guard_max_bytes = value as usize;
-            }
-            if let Some(value) = req.payload_guard_safety_margin_bytes {
-                config.payload_guard_safety_margin_bytes = value as usize;
-            }
-            if let Some(value) = req.payload_guard_trim_history {
-                config.payload_guard_trim_history = value;
-            }
-            if let Some(value) = req.payload_guard_external_enabled {
-                config.payload_guard_external_enabled = value;
-            }
-            if let Some(value) = req.payload_shaping {
-                config.payload_shaping = value.apply_to(config.payload_shaping);
             }
             if let Some(value) = req.prompt_cache_target_read_ratio {
                 config.prompt_cache_target_read_ratio = value;
@@ -2682,7 +2641,7 @@ impl AdminService {
 
 fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), String> {
     config.request_admission.validate()?;
-    config.missing_max_tokens.validate()?;
+    config.route_features.validate()?;
     config.prompt_injection.validate()?;
     config.reported_usage.validate()?;
     config.prompt_cache_creation_control.validate()?;
@@ -2716,21 +2675,6 @@ fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), Stri
         || !config.prompt_cache_target_read_ratio.is_finite()
     {
         return Err("promptCacheTargetReadRatio 必须在 0 到 0.99 之间".to_string());
-    }
-    if config.payload_guard_enabled
-        && config.payload_guard_max_bytes > 0
-        && config.payload_guard_max_bytes < 64 * 1024
-    {
-        return Err("payloadGuardMaxBytes 启用时必须为 0 或不小于 65536".to_string());
-    }
-    if config.payload_guard_enabled
-        && config.payload_guard_max_bytes > 0
-        && config
-            .payload_guard_max_bytes
-            .saturating_sub(config.payload_guard_safety_margin_bytes)
-            < 64 * 1024
-    {
-        return Err("payloadGuardSafetyMarginBytes 不能让实际裁剪目标小于 65536".to_string());
     }
     if !(1.0..=3.0).contains(&config.prompt_cache_token_scale)
         || !config.prompt_cache_token_scale.is_finite()
@@ -2786,8 +2730,6 @@ fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), Stri
         .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
         .normalized();
     config.request_admission = config.request_admission.normalized();
-    config.image_processing = config.image_processing.normalized();
-    config.missing_max_tokens = config.missing_max_tokens.normalized();
     config.prompt_injection = config.prompt_injection.clone().normalized();
     config.route_features = config.route_features.clone().normalized();
     config.reported_usage = config.reported_usage.normalized();

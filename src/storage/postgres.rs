@@ -35,10 +35,9 @@ use crate::anthropic::usage::{
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
     ExternalPoolEligibility, ExternalPoolHeaderProfile, ExternalPoolModelMappingMode,
-    ExternalPoolRawModelMode, ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode,
-    ExternalPoolTlsProfile, ExternalPoolUsageProjectionMode, ExternalPoolWireProfile,
-    UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_header_overrides,
-    normalize_external_pool_model_mapping_rules,
+    ExternalPoolStreamRetryMode, ExternalPoolTlsProfile, ExternalPoolUsageProjectionMode,
+    ExternalPoolWireProfile, UpdateExternalPoolRequest, mask_external_pool_key,
+    normalize_external_pool_header_overrides, normalize_external_pool_model_mapping_rules,
 };
 use crate::model::config::{
     Config, ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ModelMappingRule,
@@ -49,11 +48,11 @@ use crate::model::model_support::normalize_supported_models;
 const EXTERNAL_POOL_SELECT_SQL: &str = r#"
 SELECT id, name, base_url, api_key, auth_type, enabled, priority,
        max_concurrent_requests, usage_projection_mode, stream_response_mode,
-       request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+       auto_disable_policy, pre_output_stream_retry_mode,
        header_profile, append_beta_query, header_overrides,
        wire_profile, tls_profile,
        auto_disabled, auto_disabled_reason, auto_disabled_at,
-       auto_disabled_until, auto_disabled_last_error, preserve_path,
+       auto_disabled_until, auto_disabled_last_error,
        normalize_model_version_dots, model_mapping_mode,
        model_mapping_require_match, model_mapping_rules, supported_models,
        route_mode, route_rules, notes,
@@ -1080,7 +1079,7 @@ impl PostgresStore {
             SELECT id, revision, enabled, base_url,
                    (btrim(api_key) <> '') AS api_key_present,
                    auth_type, max_concurrent_requests, usage_projection_mode,
-                   stream_response_mode, request_body_mode, raw_model_mode,
+                   stream_response_mode,
                    auto_disable_policy, pre_output_stream_retry_mode,
                    header_profile, append_beta_query, header_overrides,
                    wire_profile, tls_profile, model_mapping_mode,
@@ -1133,11 +1132,11 @@ impl PostgresStore {
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                   request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                   auto_disable_policy, pre_output_stream_retry_mode,
                    header_profile, append_beta_query, header_overrides,
                    wire_profile, tls_profile,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
-                   auto_disabled_until, auto_disabled_last_error, preserve_path,
+                   auto_disabled_until, auto_disabled_last_error,
                    normalize_model_version_dots, model_mapping_mode,
                    model_mapping_require_match, model_mapping_rules, supported_models,
                    route_mode, route_rules, notes,
@@ -1229,21 +1228,21 @@ impl PostgresStore {
             INSERT INTO external_upstream_pools (
                 name, base_url, api_key, auth_type, enabled, priority,
                 max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                auto_disable_policy, pre_output_stream_retry_mode,
                 header_profile, append_beta_query, header_overrides,
                 wire_profile, tls_profile,
-                preserve_path, normalize_model_version_dots, model_mapping_mode,
+                normalize_model_version_dots, model_mapping_mode,
                 model_mapping_require_match, model_mapping_rules, supported_models,
                 route_mode, route_rules, notes, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                      auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
                       route_mode, route_rules, notes,
@@ -1259,8 +1258,6 @@ impl PostgresStore {
         .bind(request.max_concurrent_requests as i32)
         .bind(request.usage_projection_mode.as_str())
         .bind(request.stream_response_mode.map(|mode| mode.as_str()))
-        .bind(request.request_body_mode.as_str())
-        .bind(request.raw_model_mode.as_str())
         .bind(request.auto_disable_policy.as_str())
         .bind(request.pre_output_stream_retry_mode.as_str())
         .bind(request.header_profile.as_str())
@@ -1268,7 +1265,6 @@ impl PostgresStore {
         .bind(header_overrides_value)
         .bind(request.wire_profile.as_str())
         .bind(request.tls_profile.as_str())
-        .bind(request.preserve_path)
         .bind(request.normalize_model_version_dots)
         .bind(request.model_mapping_mode.as_str())
         .bind(request.model_mapping_require_match)
@@ -1334,10 +1330,6 @@ impl PostgresStore {
         let stream_response_mode = request
             .stream_response_mode
             .unwrap_or(current.stream_response_mode);
-        let request_body_mode = request
-            .request_body_mode
-            .unwrap_or(current.request_body_mode);
-        let raw_model_mode = request.raw_model_mode.unwrap_or(current.raw_model_mode);
         let auto_disable_policy = request
             .auto_disable_policy
             .unwrap_or(current.auto_disable_policy);
@@ -1356,7 +1348,6 @@ impl PostgresStore {
         let header_overrides_value = serde_json::to_value(&header_overrides)?;
         let wire_profile = request.wire_profile.unwrap_or(current.wire_profile);
         let tls_profile = request.tls_profile.unwrap_or(current.tls_profile);
-        let preserve_path = request.preserve_path.unwrap_or(current.preserve_path);
         let normalize_model_version_dots = request
             .normalize_model_version_dots
             .unwrap_or(current.normalize_model_version_dots);
@@ -1400,34 +1391,31 @@ impl PostgresStore {
                 max_concurrent_requests = $8,
                 usage_projection_mode = $9,
                 stream_response_mode = $10,
-                request_body_mode = $11,
-                raw_model_mode = $12,
-                auto_disable_policy = $13,
-                pre_output_stream_retry_mode = $14,
-                header_profile = $15,
-                append_beta_query = $16,
-                header_overrides = $17,
-                wire_profile = $18,
-                tls_profile = $19,
-                preserve_path = $20,
-                normalize_model_version_dots = $21,
-                model_mapping_mode = $22,
-                model_mapping_require_match = $23,
-                model_mapping_rules = $24,
-                supported_models = $25,
-                route_mode = $26,
-                route_rules = $27,
-                notes = $28,
+                auto_disable_policy = $11,
+                pre_output_stream_retry_mode = $12,
+                header_profile = $13,
+                append_beta_query = $14,
+                header_overrides = $15,
+                wire_profile = $16,
+                tls_profile = $17,
+                normalize_model_version_dots = $18,
+                model_mapping_mode = $19,
+                model_mapping_require_match = $20,
+                model_mapping_rules = $21,
+                supported_models = $22,
+                route_mode = $23,
+                route_rules = $24,
+                notes = $25,
                 revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                      auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
                       route_mode, route_rules, notes,
@@ -1444,8 +1432,6 @@ impl PostgresStore {
         .bind(max_concurrent_requests as i32)
         .bind(usage_projection_mode.as_str())
         .bind(stream_response_mode.map(|mode| mode.as_str()))
-        .bind(request_body_mode.as_str())
-        .bind(raw_model_mode.as_str())
         .bind(auto_disable_policy.as_str())
         .bind(pre_output_stream_retry_mode.as_str())
         .bind(header_profile.as_str())
@@ -1453,7 +1439,6 @@ impl PostgresStore {
         .bind(header_overrides_value)
         .bind(wire_profile.as_str())
         .bind(tls_profile.as_str())
-        .bind(preserve_path)
         .bind(normalize_model_version_dots)
         .bind(model_mapping_mode.as_str())
         .bind(model_mapping_require_match)
@@ -1501,11 +1486,11 @@ impl PostgresStore {
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                      auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
                       route_mode, route_rules, notes,
@@ -1556,11 +1541,11 @@ impl PostgresStore {
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                      auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
                       route_mode, route_rules, notes,
@@ -1620,9 +1605,9 @@ impl PostgresStore {
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                      auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
                       route_mode, route_rules, notes,
@@ -8670,14 +8655,6 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     {
         anyhow::bail!("stream_response_mode 值无效");
     }
-    let request_body_mode: String = row
-        .try_get("request_body_mode")
-        .map_err(|_| anyhow::anyhow!("request_body_mode 字段类型无效"))?;
-    let _request_body_mode = ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
-        .ok_or_else(|| anyhow::anyhow!("request_body_mode 值无效"))?;
-    let raw_model_mode: String = row.try_get("raw_model_mode")?;
-    ExternalPoolRawModelMode::parse_known(&raw_model_mode)
-        .ok_or_else(|| anyhow::anyhow!("raw_model_mode 值无效"))?;
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
     ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
         .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?;
@@ -8787,18 +8764,6 @@ fn external_pool_from_row_with_policy(
         row.try_get("stream_response_mode")?
     } else {
         row.try_get("stream_response_mode").unwrap_or(None)
-    };
-    let request_body_mode: String = if strict_dispatch {
-        row.try_get("request_body_mode")?
-    } else {
-        row.try_get("request_body_mode")
-            .unwrap_or_else(|_| "normalized".to_string())
-    };
-    let raw_model_mode: String = if strict_dispatch {
-        row.try_get("raw_model_mode")?
-    } else {
-        row.try_get("raw_model_mode")
-            .unwrap_or_else(|_| "none".to_string())
     };
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
     let pre_output_stream_retry_mode: String = if strict_dispatch {
@@ -8913,18 +8878,6 @@ fn external_pool_from_row_with_policy(
         Some(value) => Some(ExternalPoolStreamResponseMode::parse(value)),
         None => None,
     };
-    let request_body_mode = if strict_dispatch {
-        ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
-            .ok_or_else(|| anyhow::anyhow!("request_body_mode 值无效"))?
-    } else {
-        ExternalPoolRequestBodyMode::parse(&request_body_mode)
-    };
-    let raw_model_mode = if strict_dispatch {
-        ExternalPoolRawModelMode::parse_known(&raw_model_mode)
-            .ok_or_else(|| anyhow::anyhow!("raw_model_mode 值无效"))?
-    } else {
-        ExternalPoolRawModelMode::parse(&raw_model_mode)
-    };
     let auto_disable_policy = if strict_dispatch {
         ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
             .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?
@@ -9013,8 +8966,6 @@ fn external_pool_from_row_with_policy(
         max_concurrent_requests: max_concurrent_requests.max(1) as u32,
         usage_projection_mode,
         stream_response_mode,
-        request_body_mode,
-        raw_model_mode,
         auto_disable_policy,
         pre_output_stream_retry_mode,
         auto_disabled: row.try_get("auto_disabled")?,
@@ -9022,7 +8973,6 @@ fn external_pool_from_row_with_policy(
         auto_disabled_at: row.try_get("auto_disabled_at")?,
         auto_disabled_until: row.try_get("auto_disabled_until")?,
         auto_disabled_last_error: row.try_get("auto_disabled_last_error")?,
-        preserve_path: row.try_get("preserve_path")?,
         normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
         model_mapping_mode,
         model_mapping_require_match,
@@ -9140,8 +9090,6 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through',
     stream_response_mode TEXT,
     skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false,
-    request_body_mode TEXT NOT NULL DEFAULT 'normalized',
-    raw_model_mode TEXT NOT NULL DEFAULT 'none',
     auto_disable_policy TEXT NOT NULL DEFAULT 'inherit',
     pre_output_stream_retry_mode TEXT NOT NULL DEFAULT 'inherit',
     header_profile TEXT NOT NULL DEFAULT 'generic',
@@ -9154,7 +9102,6 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     auto_disabled_at TIMESTAMPTZ,
     auto_disabled_until TIMESTAMPTZ,
     auto_disabled_last_error TEXT,
-    preserve_path BOOLEAN NOT NULL DEFAULT true,
     normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false,
     model_mapping_mode TEXT NOT NULL DEFAULT 'passthrough_mapping',
     model_mapping_require_match BOOLEAN NOT NULL DEFAULT false,
@@ -9192,11 +9139,7 @@ ALTER TABLE external_upstream_pools
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false;
 
-ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS request_body_mode TEXT NOT NULL DEFAULT 'normalized';
 
-ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS raw_model_mode TEXT NOT NULL DEFAULT 'none';
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS auto_disable_policy TEXT NOT NULL DEFAULT 'inherit';
@@ -9234,8 +9177,6 @@ ALTER TABLE external_upstream_pools
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS auto_disabled_last_error TEXT;
 
-ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS preserve_path BOOLEAN NOT NULL DEFAULT true;
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false;
@@ -12990,11 +12931,8 @@ mod tests {
                 max_concurrent_requests: 2,
                 usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
                 stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
-                request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
-                raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
                 auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
                 pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Enabled,
-                preserve_path: true,
                 normalize_model_version_dots: false,
                 model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
                 model_mapping_require_match: false,
@@ -13014,14 +12952,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            created.request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
-        );
-        assert_eq!(
-            created.raw_model_mode,
-            ExternalPoolRawModelMode::RewriteTopLevel
-        );
-        assert_eq!(
             created.stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
@@ -13038,14 +12968,6 @@ mod tests {
         let listed = store.list_external_pools(false).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
-            listed[0].request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
-        );
-        assert_eq!(
-            listed[0].raw_model_mode,
-            ExternalPoolRawModelMode::RewriteTopLevel
-        );
-        assert_eq!(
             listed[0].stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
@@ -13059,14 +12981,6 @@ mod tests {
             .await
             .unwrap()
             .expect("pool should exist");
-        assert_eq!(
-            loaded.request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
-        );
-        assert_eq!(
-            loaded.raw_model_mode,
-            ExternalPoolRawModelMode::RewriteTopLevel
-        );
         assert_eq!(
             loaded.stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
@@ -13088,8 +13002,7 @@ mod tests {
                     stream_response_mode: Some(Some(
                         ExternalPoolStreamResponseMode::EventPassthrough,
                     )),
-                    request_body_mode: Some(ExternalPoolRequestBodyMode::RawPassthrough),
-                    raw_model_mode: Some(ExternalPoolRawModelMode::None),
+
                     pre_output_stream_retry_mode: Some(ExternalPoolStreamRetryMode::Disabled),
                     route_mode: Some(ExternalPoolRouteMode::DenyList),
                     route_rules: Some(vec!["/V1".to_string()]),
@@ -13099,11 +13012,6 @@ mod tests {
             .await
             .unwrap()
             .expect("pool should update");
-        assert_eq!(
-            updated.request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
-        );
-        assert_eq!(updated.raw_model_mode, ExternalPoolRawModelMode::None);
         assert_eq!(
             updated.stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)

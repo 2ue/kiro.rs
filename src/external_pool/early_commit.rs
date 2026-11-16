@@ -347,7 +347,7 @@ pub(super) async fn pre_read_early_commit<S>(
     usage_capture: &Arc<SyncMutex<ExternalUsageCapture>>,
     stream_plan: ExternalStreamProcessingPlan,
     stream_error_mask: &ExternalStreamErrorMask,
-    transcript_state: &Arc<SyncMutex<ExternalAnthropicTranscriptState>>,
+    transcript_state: &Arc<SyncMutex<Option<ExternalAnthropicTranscriptState>>>,
     stream_idle_timeout: Option<Duration>,
     outbound_model: &Option<String>,
     upstream_chunk_index: Option<&AtomicU64>,
@@ -383,7 +383,7 @@ where
                     Some(usage_capture),
                     Some(stream_error_mask),
                     stream_plan,
-                    Some(&mut transcript_state.lock()),
+                    transcript_state.lock().as_mut(),
                 );
                 if !downstream.forward_message_start(&processed).await {
                     return Ok(EarlyCommitPreRead::DownstreamGone);
@@ -401,7 +401,7 @@ where
                 Some(usage_capture),
                 Some(stream_error_mask),
                 stream_plan,
-                Some(&mut transcript_state.lock()),
+                transcript_state.lock().as_mut(),
             );
             prefix.extend(
                 downstream

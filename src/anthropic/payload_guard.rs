@@ -3601,3 +3601,68 @@ mod tests {
         assert!(find_oversized_current_image(&url_image).is_none());
     }
 }
+
+/// Route-only shaping does not run the legacy tool pairing repair pipeline.
+pub(crate) fn shape_route_payload(request: &mut MessagesRequest, config: PayloadShapingConfig) {
+    if config.enabled {
+        apply_anthropic_payload_shaping(request, config);
+        apply_anthropic_payload_safety_shaping(request, config);
+    }
+}
+
+/// Keep complete turns and all unmodeled JSON nodes while trimming by serialized bytes.
+pub(crate) fn trim_route_messages(value: &Value, config: PayloadGuardConfig) -> Option<Value> {
+    if !config.enabled || !config.trim_history || config.max_bytes == 0 {
+        return None;
+    }
+    let messages = value.get("messages")?.as_array()?;
+    let current_bytes = serde_json::to_vec(value).ok()?.len();
+    if current_bytes <= config.max_bytes || messages.len() <= 1 {
+        return None;
+    }
+    let mut remaining_bytes = current_bytes;
+    let mut prefix = 0;
+    while remaining_bytes > config.max_bytes {
+        let next = messages
+            .iter()
+            .enumerate()
+            .skip(prefix + 1)
+            .find_map(|(index, message)| {
+                (message.get("role").and_then(Value::as_str) == Some("user")
+                    && !has_anthropic_tool_result(&message["content"]))
+                .then_some(index)
+            });
+        let Some(next) = next else { break };
+        for message in &messages[prefix..next] {
+            remaining_bytes =
+                remaining_bytes.saturating_sub(serde_json::to_vec(message).ok()?.len() + 1);
+        }
+        prefix = next;
+    }
+    (prefix > 0).then(|| Value::Array(messages[prefix..].to_vec()))
+}
+
+pub(crate) fn route_trim_report(
+    before: &Value,
+    after: &Value,
+    config: PayloadGuardConfig,
+) -> PayloadGuardReport {
+    let original_count = before
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let final_count = after
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let mut report = new_payload_guard_report(
+        config.max_bytes,
+        serde_json::to_vec(before).map_or(0, |body| body.len()),
+        original_count.saturating_sub(1),
+    );
+    report.final_bytes = serde_json::to_vec(after).map_or(0, |body| body.len());
+    report.final_history_entries = final_count.saturating_sub(1);
+    report.trimmed_history_entries = original_count.saturating_sub(final_count);
+    report.still_oversized = config.max_bytes > 0 && report.final_bytes > config.max_bytes;
+    report
+}

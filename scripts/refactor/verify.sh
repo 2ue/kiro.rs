@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 任务验收：按任务 id 执行对应检查，输出到 stdout，失败返回非 0。
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "$ROOT"
+ROOT="${REFACTOR_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || cd "$(dirname "$0")/../.." && pwd)}"
+cd "$ROOT" || exit 2
+echo "仓库根: $ROOT"
 TASK_ID="$1"
 fail=0
 step() { echo; echo "== $1"; }

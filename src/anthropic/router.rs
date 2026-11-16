@@ -103,15 +103,59 @@ impl AnthropicRouterConfig {
             route_features: config.route_features.clone().normalized(),
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
-            payload_guard_enabled: config.payload_guard_enabled,
-            payload_guard_mode: config.payload_guard_mode,
-            payload_guard_max_bytes: config.payload_guard_max_bytes,
-            payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
-            payload_guard_trim_history: config.payload_guard_trim_history,
-            payload_guard_external_enabled: config.payload_guard_external_enabled,
-            image_processing: config.image_processing.normalized(),
-            missing_max_tokens: config.missing_max_tokens.normalized(),
-            payload_shaping: config.payload_shaping,
+            payload_guard_enabled: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.enabled)
+                .unwrap_or(false),
+            payload_guard_mode: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.mode)
+                .unwrap_or(Default::default()),
+            payload_guard_max_bytes: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.max_bytes)
+                .unwrap_or(0),
+            payload_guard_safety_margin_bytes: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.safety_margin_bytes)
+                .unwrap_or(0),
+            payload_guard_trim_history: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.trim_history)
+                .unwrap_or(false),
+            payload_guard_external_enabled: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.external_enabled)
+                .unwrap_or(false),
+            image_processing: config
+                .route_features
+                .defaults
+                .image_processing
+                .unwrap_or_default()
+                .normalized(),
+            missing_max_tokens: config
+                .route_features
+                .defaults
+                .missing_max_tokens
+                .unwrap_or_default()
+                .normalized(),
+            payload_shaping: config
+                .route_features
+                .defaults
+                .payload_shaping
+                .unwrap_or_default(),
             external_pools: config.external_pools.clone(),
         }
     }
@@ -179,6 +223,7 @@ pub fn create_router(
     } = config;
     let request_admission_state =
         RequestAdmissionMiddlewareState::new(request_admission, usage_recorder.clone());
+    let configured_features = route_features.clone();
     let mut base_state = AppState::new(
         request_api_keys,
         usage_recorder,
@@ -217,6 +262,10 @@ pub fn create_router(
     .with_external_pools(external_pools)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
+
+    base_state
+        .runtime
+        .install_local(|config| config.route_features = configured_features);
 
     if let Some(manager) = external_pool_manager {
         base_state = base_state.with_external_pool_manager(manager);

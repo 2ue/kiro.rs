@@ -2511,3 +2511,161 @@ mod tests {
         assert_eq!(probe.model.as_deref(), Some("same"));
     }
 }
+
+pub(crate) fn normalize_reasoning_value(
+    value: &mut serde_json::Value,
+    switches: &crate::model::config::LocalRequestCompatConfig,
+    model_max_output_tokens: Option<i32>,
+) -> Result<(), String> {
+    if let Some(effort) = value
+        .pointer("/output_config/effort")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|effort| effort_rewrite(effort, switches))
+    {
+        match effort {
+            EffortRewrite::Normalized { normalized, .. } => {
+                value["output_config"]["effort"] = normalized.into()
+            }
+            _ => {
+                value["output_config"]
+                    .as_object_mut()
+                    .unwrap()
+                    .shift_remove("effort");
+            }
+        }
+    }
+    if switches.thinking_type_aliases
+        && let Some(kind) = value
+            .pointer("/thinking/type")
+            .and_then(serde_json::Value::as_str)
+    {
+        let lowered = kind.trim().to_ascii_lowercase();
+        if let Some((_, target)) = COMPATIBLE_THINKING_TYPE_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == lowered)
+        {
+            value["thinking"]["type"] = (*target).into();
+        }
+    }
+    if !switches.repair_thinking_budget {
+        return Ok(());
+    }
+    let Some(mut thinking) = value
+        .get("thinking")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let Some(thinking_type) = thinking
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    let original_max_tokens = value.get("max_tokens").and_then(serde_json::Value::as_i64);
+    let Some(mut normalized_max_tokens) = original_max_tokens.and_then(|v| i32::try_from(v).ok())
+    else {
+        return Ok(());
+    };
+    let mut original_budget_tokens = None;
+    let mut rewrite_thinking = false;
+    let mut rewrite_max_tokens = false;
+    let mut normalization_reason = String::new();
+    let normalized_budget_tokens = match thinking_type.as_str() {
+        "enabled" => {
+            original_budget_tokens = thinking
+                .get("budget_tokens")
+                .and_then(serde_json::Value::as_i64);
+            if thinking.contains_key("budget_tokens") && original_budget_tokens.is_none() {
+                // Preserve malformed user input for the strict validator. It
+                // remains a public 400 with the established error semantics.
+                return Ok(());
+            }
+            let requested_budget = original_budget_tokens.unwrap_or_else(|| {
+                let conservative_max =
+                    normalized_max_tokens.saturating_sub(MIN_ENABLED_THINKING_BUDGET_TOKENS);
+                i64::from(
+                    DEFAULT_ENABLED_THINKING_BUDGET_TOKENS
+                        .min(conservative_max.max(MIN_ENABLED_THINKING_BUDGET_TOKENS)),
+                )
+            });
+            let mut budget = match i32::try_from(requested_budget) {
+                Ok(budget) => budget.max(MIN_ENABLED_THINKING_BUDGET_TOKENS),
+                Err(_) => return Ok(()),
+            };
+            if original_budget_tokens.is_some()
+                && requested_budget < i64::from(MIN_ENABLED_THINKING_BUDGET_TOKENS)
+            {
+                normalization_reason = "raise_budget_to_minimum".to_string();
+            }
+
+            if normalized_max_tokens <= MIN_ENABLED_THINKING_BUDGET_TOKENS {
+                // There is no valid enabled-thinking pair below this threshold.
+                // Keep the repair bounded to the smallest compatible values
+                // instead of expanding max_tokens to a large requested budget.
+                normalized_max_tokens = MIN_ENABLED_THINKING_BUDGET_TOKENS + 1;
+                budget = MIN_ENABLED_THINKING_BUDGET_TOKENS;
+                rewrite_max_tokens = true;
+                normalization_reason = "raise_small_max_to_minimum_pair".to_string();
+            } else if budget == normalized_max_tokens {
+                budget = normalized_max_tokens - 1;
+                normalization_reason = "clamp_equal_budget_to_max_minus_one".to_string();
+            } else if budget > normalized_max_tokens {
+                let candidate_max = i64::from(budget).saturating_add(1);
+                let current_max = i64::from(normalized_max_tokens);
+                let model_limit = i64::from(
+                    model_max_output_tokens
+                        .filter(|tokens| *tokens > 0)
+                        .unwrap_or(DEFAULT_BOUNDED_EXPANSION_MAX_TOKENS),
+                );
+                let ratio_limit = current_max.saturating_mul(2).saturating_add(1);
+                let expansion_delta = candidate_max.saturating_sub(current_max);
+                let can_expand = candidate_max <= model_limit
+                    && candidate_max <= i64::from(DEFAULT_BOUNDED_EXPANSION_MAX_TOKENS)
+                    && candidate_max <= ratio_limit
+                    && expansion_delta <= MAX_BOUNDED_EXPANSION_DELTA_TOKENS
+                    && candidate_max <= i64::from(i32::MAX);
+                if can_expand {
+                    normalized_max_tokens = candidate_max as i32;
+                    rewrite_max_tokens = true;
+                    normalization_reason = "bounded_expand_max_to_preserve_budget".to_string();
+                } else {
+                    budget = normalized_max_tokens - 1;
+                    normalization_reason = "clamp_budget_to_max_minus_one".to_string();
+                }
+            }
+
+            if original_budget_tokens != Some(i64::from(budget)) {
+                thinking.insert("budget_tokens".to_string(), serde_json::Value::from(budget));
+                rewrite_thinking = true;
+            }
+            if original_budget_tokens.is_none() && normalization_reason.is_empty() {
+                normalization_reason = "default_missing_budget".to_string();
+            }
+            Some(budget)
+        }
+        "adaptive" | "disabled" => {
+            if thinking.shift_remove("budget_tokens").is_some() {
+                rewrite_thinking = true;
+                normalization_reason = "remove_budget_for_non_enabled_thinking".to_string();
+            }
+            None
+        }
+        _ => return Ok(()),
+    };
+
+    let _ = (
+        original_budget_tokens,
+        normalization_reason,
+        normalized_budget_tokens,
+    );
+    if rewrite_thinking {
+        value["thinking"] = serde_json::Value::Object(thinking);
+    }
+    if rewrite_max_tokens {
+        value["max_tokens"] = normalized_max_tokens.into();
+    }
+    Ok(())
+}

@@ -3374,7 +3374,7 @@ pub enum ThinkingTriggerMode {
 
 impl Default for ThinkingTriggerMode {
     fn default() -> Self {
-        Self::RealRequest
+        Self::Off
     }
 }
 
@@ -4364,13 +4364,6 @@ pub struct Config {
     #[serde(default = "default_inference_upstream_max_attempts")]
     pub inference_upstream_max_attempts: u32,
 
-    /// 多模态图片/文件预处理配置。
-    ///
-    /// safe 下载安全远程 URL、识别并修正 base64 图片媒体类型。
-    /// light 不下载、不 decode 校正图片，保留 inline base64/data URL。
-    #[serde(default)]
-    pub image_processing: ImageProcessingConfig,
-
     /// 代理写进上游请求的提示词：每一项的全局默认、可编辑文本和按路由的显式设置。
     #[serde(default)]
     pub prompt_injection: PromptInjectionConfig,
@@ -4378,56 +4371,6 @@ pub struct Config {
     /// 按路由控制的功能（`-thinking` 模型名、thinking 触发、历史清洗）。
     #[serde(default)]
     pub route_features: RouteFeaturesConfig,
-
-    /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略。
-    #[serde(default)]
-    pub missing_max_tokens: MissingMaxTokensConfig,
-
-    /// 请求参数兼容开关，见 [`LocalRequestCompatConfig`]。
-    #[serde(default)]
-    pub local_request_compat: LocalRequestCompatConfig,
-
-    /// Payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
-    #[serde(default)]
-    pub payload_shaping: PayloadShapingConfig,
-
-    /// 发送上游前启用按字节计算的 payload 防护。
-    #[serde(default = "default_payload_guard_enabled")]
-    pub payload_guard_enabled: bool,
-
-    /// payload guard 大小裁剪触发模式。
-    #[serde(default = "default_payload_guard_mode")]
-    pub payload_guard_mode: PayloadGuardMode,
-
-    /// 上游输入过长后的处理方式，见 [`PayloadTooLongHandling`]。
-    #[serde(default)]
-    pub payload_too_long_handling: PayloadTooLongHandling,
-
-    /// 通用 payload 的 byte soft target 和按大小处理总开关。
-    /// `0` 表示不按大小整形或裁剪。该字段不是入站 hard limit；无法安全裁剪时
-    /// 会记录 `still_oversized` 并由上游裁决。
-    #[serde(default = "default_payload_guard_max_bytes")]
-    pub payload_guard_max_bytes: usize,
-
-    /// 外部/Anthropic byte guard 的安全余量字节数。
-    ///
-    /// 当 `payloadGuardMaxBytes > 0` 时，外部/Anthropic byte path 的实际裁剪目标为
-    /// `payloadGuardMaxBytes - payloadGuardSafetyMarginBytes`。
-    #[serde(default = "default_payload_guard_safety_margin_bytes")]
-    pub payload_guard_safety_margin_bytes: usize,
-
-    /// payload 超限时是否允许裁剪最旧历史。关闭后只执行轻量协议修复；
-    /// 仍超预算的请求会标记 `still_oversized` 并继续透传给上游。
-    #[serde(default = "default_payload_guard_trim_history")]
-    pub payload_guard_trim_history: bool,
-
-    /// 外部备用池请求是否复用同一套 payload guard / shaping 配置。
-    ///
-    /// 开启后，外部池转发 Anthropic 请求前也会按 `payloadGuardMode`、
-    /// `payloadGuardMaxBytes` 和 `payloadShaping` 处理超长上下文；不会为外部池复制
-    /// 第二套阈值或裁剪规则。关闭后外部池保持原始请求体透传。
-    #[serde(default = "default_payload_guard_external_enabled")]
-    pub payload_guard_external_enabled: bool,
 
     /// Anthropic 兼容 profile（默认 claude-code）。
     #[serde(default = "default_compat_profile")]
@@ -5219,19 +5162,8 @@ impl Default for Config {
             request_api_key_policies: Vec::new(),
             stream_pre_output_hold_secs: default_stream_pre_output_hold_secs(),
             inference_upstream_max_attempts: default_inference_upstream_max_attempts(),
-            image_processing: ImageProcessingConfig::default(),
             prompt_injection: PromptInjectionConfig::default(),
             route_features: RouteFeaturesConfig::default(),
-            missing_max_tokens: MissingMaxTokensConfig::default(),
-            local_request_compat: LocalRequestCompatConfig::default(),
-            payload_shaping: PayloadShapingConfig::default(),
-            payload_guard_enabled: default_payload_guard_enabled(),
-            payload_guard_mode: default_payload_guard_mode(),
-            payload_too_long_handling: PayloadTooLongHandling::default(),
-            payload_guard_max_bytes: default_payload_guard_max_bytes(),
-            payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
-            payload_guard_trim_history: default_payload_guard_trim_history(),
-            payload_guard_external_enabled: default_payload_guard_external_enabled(),
             compat_profile: default_compat_profile(),
             model_resolution_mode: default_model_resolution_mode(),
             model_mapping: ModelMappingConfig::default(),

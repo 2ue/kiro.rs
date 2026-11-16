@@ -21,7 +21,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 webpki-roots = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["unbounded_depth"] }
+serde_json = { version = "1.0", features = ["unbounded_depth", "preserve_order"] }
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -274,42 +274,29 @@ pub(crate) fn sanitize_raw_request_assistant_history_with_probe(
     deserializer
         .end()
         .map_err(|_| RawAssistantHistorySanitizationError::InvalidJson)?;
-    let known_tool_names = collect_known_tool_names_from_value(&value);
-    let Some(messages) = value
-        .get_mut("messages")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return Ok(RawAssistantHistoryInspection::default());
-    };
-    let mut projected = messages
-        .iter()
-        .map(|message| AnthropicMessage {
-            role: message
-                .get("role")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            content: message
-                .get("content")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        })
-        .collect::<Vec<_>>();
-
-    let report = sanitize_assistant_message_runs(&mut projected, known_tool_names);
-    let requires_normalized_body =
-        report.blocks > 0 || request_has_authenticated_reasoning(&projected);
+    let report = sanitize_request_history_value(&mut value);
+    let requires_normalized_body = report.blocks > 0
+        || value
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    let projected = AnthropicMessage {
+                        role: message
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        content: message.get("content").cloned().unwrap_or_default(),
+                    };
+                    request_has_authenticated_reasoning(&[projected])
+                })
+            });
     if report.blocks == 0 {
         return Ok(RawAssistantHistoryInspection {
             sanitized_body: None,
             requires_normalized_body,
         });
-    }
-
-    for (message, sanitized) in messages.iter_mut().zip(projected) {
-        if message.get("role").and_then(serde_json::Value::as_str) == Some("assistant") {
-            message["content"] = sanitized.content;
-        }
     }
     serde_json::to_vec(&value)
         .map(|body| RawAssistantHistoryInspection {
@@ -2186,4 +2173,38 @@ mod tests {
         );
         assert!(suppressed_chars > 0);
     }
+}
+
+pub(crate) fn sanitize_request_history_value(
+    value: &mut serde_json::Value,
+) -> AssistantHistorySanitization {
+    let known_tool_names = collect_known_tool_names_from_value(value);
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return AssistantHistorySanitization::default();
+    };
+    let mut projected = messages
+        .iter()
+        .map(|message| AnthropicMessage {
+            role: message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            content: message
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        })
+        .collect::<Vec<_>>();
+
+    let report = sanitize_assistant_message_runs(&mut projected, known_tool_names);
+    for (message, sanitized) in messages.iter_mut().zip(projected) {
+        if message.get("role").and_then(serde_json::Value::as_str) == Some("assistant") {
+            message["content"] = sanitized.content;
+        }
+    }
+    report
 }

@@ -17,32 +17,28 @@ pub(super) fn payload_guard_retry_route(
     route: &ExternalRouteRequest,
 ) -> Option<ExternalRouteRequest> {
     let config = route.payload_guard_retry_config?;
-    let mut payload = route.payload.clone()?;
-    let (body, report) = match guard_anthropic_messages_request_reusing_body(
-        &mut payload,
-        config,
-        &route.raw_body,
-    ) {
-        Ok(result) => result,
-        Err(err) => {
-            tracing::warn!(
-                request_id = %route.request_id,
-                error = %err,
-                "external pool payload guard retry failed to build trimmed request"
-            );
-            return None;
-        }
-    };
-    let breakdown = breakdown_anthropic_messages_request(&payload, body.len());
-    let request_input_tokens = count_external_route_input_tokens(&payload);
+    let original: serde_json::Value = serde_json::from_slice(&route.effective_raw_body).ok()?;
+    let messages = crate::anthropic::payload_guard::trim_route_messages(&original, config)?;
+    let mut patches = crate::anthropic::body_patch::BodyPatchSet::default();
+    patches.set("/messages", messages, "payload_guard");
     let mut next = route.clone();
     next.reset_preparation_cache();
-    next.raw_body = body;
-    next.payload = Some(payload);
-    next.request_input_tokens = request_input_tokens;
-    next.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
-    next.payload_breakdown = Some(breakdown);
-    next.payload_guard_report = Some(report);
+    next.effective_raw_body = patches.apply(&route.effective_raw_body);
+    next.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&next.effective_raw_body)));
+    next.payload = serde_json::from_slice(&next.effective_raw_body).ok();
+    next.request_input_tokens = next
+        .payload
+        .as_ref()
+        .map(count_external_route_input_tokens)
+        .unwrap_or(0);
+    let breakdown = next.payload.as_ref().map(|payload| {
+        breakdown_anthropic_messages_request(payload, next.effective_raw_body.len())
+    });
+    next.payload_breakdown = breakdown;
+    let after = serde_json::from_slice(&next.effective_raw_body).ok()?;
+    next.payload_guard_report = Some(crate::anthropic::payload_guard::route_trim_report(
+        &original, &after, config,
+    ));
     next.payload_guard_retry_config = None;
     Some(next)
 }

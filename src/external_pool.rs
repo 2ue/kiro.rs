@@ -37,12 +37,8 @@ use crate::{
         },
         model_capabilities::ModelCapabilitiesCatalog,
         payload_guard::{
-            PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
-            breakdown_anthropic_messages_request, guard_anthropic_messages_request_reusing_body,
-            sanitize_anthropic_messages_for_external_forwarding,
-        },
-        payload_guard_runtime::{
-            PreparedExternalMessagesPayload, prepare_external_messages_payload,
+            PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardReport,
+            breakdown_anthropic_messages_request,
         },
         pricing::PricingCatalog,
         prompt_cache::{
@@ -52,7 +48,6 @@ use crate::{
         prompt_cache_creation_control::PromptCacheCreationController,
         request_facts::{
             RawMessagesBodyProbe, deserialize_messages_request_with_probe, probe_raw_messages_body,
-            rewrite_raw_top_level_model_with_probe,
         },
         transcript_sanitizer::{
             RESPONSE_PROTOCOL_CONTAMINATION_DETAIL, ToolTranscriptSanitizer,
@@ -118,10 +113,7 @@ use early_commit::{EarlyCommitResponseReady, EarlyCommitTail, early_commit_respo
 use usage_projection::ExternalUsageProjectionContext;
 
 #[cfg(test)]
-use crate::anthropic::request_facts::{
-    raw_body_probe_invocations_for_current_thread, raw_messages_body_hints,
-    rewrite_raw_top_level_model,
-};
+use crate::anthropic::request_facts::{raw_messages_body_hints, rewrite_raw_top_level_model};
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
@@ -381,77 +373,6 @@ impl ExternalPoolUsageProjectionMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ExternalPoolRequestBodyMode {
-    Normalized,
-    RawPassthrough,
-}
-
-impl Default for ExternalPoolRequestBodyMode {
-    fn default() -> Self {
-        Self::Normalized
-    }
-}
-
-impl ExternalPoolRequestBodyMode {
-    pub fn parse(value: &str) -> Self {
-        Self::parse_known(value).unwrap_or_default()
-    }
-
-    pub(crate) fn parse_known(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "normalized" => Some(Self::Normalized),
-            "raw_passthrough" | "raw" | "passthrough_body" => Some(Self::RawPassthrough),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Normalized => "normalized",
-            Self::RawPassthrough => "raw_passthrough",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ExternalPoolRawModelMode {
-    None,
-    ProbeOnly,
-    RewriteTopLevel,
-}
-
-impl Default for ExternalPoolRawModelMode {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl ExternalPoolRawModelMode {
-    pub fn parse(value: &str) -> Self {
-        Self::parse_known(value).unwrap_or_default()
-    }
-
-    pub(crate) fn parse_known(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "none" => Some(Self::None),
-            "probe_only" | "probe" => Some(Self::ProbeOnly),
-            "rewrite_top_level" | "rewrite" | "model_rewrite" => Some(Self::RewriteTopLevel),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::ProbeOnly => "probe_only",
-            Self::RewriteTopLevel => "rewrite_top_level",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ExternalPoolAutoDisablePolicy {
     Inherit,
     Disabled,
@@ -605,10 +526,6 @@ pub struct ExternalPool {
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
-    #[serde(default)]
-    pub request_body_mode: ExternalPoolRequestBodyMode,
-    #[serde(default)]
-    pub raw_model_mode: ExternalPoolRawModelMode,
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
     #[serde(default)]
     pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
@@ -621,7 +538,6 @@ pub struct ExternalPool {
     pub auto_disabled_until: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_disabled_last_error: Option<String>,
-    pub preserve_path: bool,
     #[serde(default)]
     pub normalize_model_version_dots: bool,
     #[serde(default)]
@@ -734,15 +650,9 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
     #[serde(default)]
-    pub request_body_mode: ExternalPoolRequestBodyMode,
-    #[serde(default)]
-    pub raw_model_mode: ExternalPoolRawModelMode,
-    #[serde(default)]
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
     #[serde(default)]
     pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
-    #[serde(default = "default_true")]
-    pub preserve_path: bool,
     #[serde(default)]
     pub normalize_model_version_dots: bool,
     #[serde(default)]
@@ -796,15 +706,9 @@ pub struct UpdateExternalPoolRequest {
     )]
     pub stream_response_mode: Option<Option<ExternalPoolStreamResponseMode>>,
     #[serde(default)]
-    pub request_body_mode: Option<ExternalPoolRequestBodyMode>,
-    #[serde(default)]
-    pub raw_model_mode: Option<ExternalPoolRawModelMode>,
-    #[serde(default)]
     pub auto_disable_policy: Option<ExternalPoolAutoDisablePolicy>,
     #[serde(default)]
     pub pre_output_stream_retry_mode: Option<ExternalPoolStreamRetryMode>,
-    #[serde(default)]
-    pub preserve_path: Option<bool>,
     #[serde(default)]
     pub normalize_model_version_dots: Option<bool>,
     #[serde(default)]
@@ -927,7 +831,6 @@ pub struct ExternalPoolTestResponse {
 
 #[derive(Default)]
 pub(crate) struct ExternalRouteRequestPreparationCache {
-    normalized_base: OnceLock<Result<Arc<body_pipeline::NormalizedRequestBase>, PayloadGuardError>>,
     raw_projection_payload: OnceLock<Option<Arc<MessagesRequest>>>,
     known_tool_names: OnceLock<Arc<Vec<String>>>,
     usage_projection_template:
@@ -1049,17 +952,17 @@ impl ExternalRouteRequestPreparationCache {
 
 #[derive(Clone)]
 pub struct ExternalRouteRequest {
-    /// Immutable bytes after entry defaults, before compatibility/body transformations.
+    /// Final entry bytes after optional route patches.
     pub effective_raw_body: Bytes,
     /// Probe bound to `effective_raw_body`; shared across every failover candidate.
     pub(crate) effective_raw_probe: Option<Arc<RawMessagesBodyProbe>>,
     pub(crate) preparation_cache: Arc<ExternalRouteRequestPreparationCache>,
-    /// Mutable working serialization used by normalized processing.
+    /// Original downstream bytes, retained for diagnostics and usage records.
     pub raw_body: Bytes,
     pub headers: HeaderMap,
     pub endpoint: String,
     pub payload: Option<MessagesRequest>,
-    pub body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+    pub history_sanitize_enabled: bool,
     pub model_hint: Option<String>,
     pub stream_hint: Option<bool>,
     pub request_input_tokens: i32,
@@ -1700,7 +1603,7 @@ impl ExternalPoolFinalError {
             return StatusCode::BAD_REQUEST;
         }
         if self.status == StatusCode::SERVICE_UNAVAILABLE || self.is_capacity_like() {
-            return StatusCode::SERVICE_UNAVAILABLE;
+            return StatusCode::from_u16(529).unwrap();
         }
         StatusCode::BAD_GATEWAY
     }
@@ -1711,6 +1614,9 @@ impl ExternalPoolFinalError {
         }
         if self.is_public_invalid_request() {
             return "invalid_request_error";
+        }
+        if self.status == StatusCode::SERVICE_UNAVAILABLE || self.is_capacity_like() {
+            return "overloaded_error";
         }
         "api_error"
     }
@@ -2267,13 +2173,10 @@ fn external_pool_wire_debug_route_context(
             "id": pool.id,
             "name": pool.name.as_str(),
             "usageProjectionMode": pool.usage_projection_mode.as_str(),
-            "requestBodyMode": pool.request_body_mode.as_str(),
-            "rawModelMode": pool.raw_model_mode.as_str(),
             "streamResponseMode": effective_stream_response_mode.as_str(),
             "streamResponseModeSource": stream_response_mode_source,
             "preOutputStreamRetryMode": pool.pre_output_stream_retry_mode.as_str(),
             "effectivePreOutputStreamRetryEnabled": effective_external_pool_pre_output_stream_retry_enabled(pool, config),
-            "preservePath": pool.preserve_path,
             "normalizeModelVersionDots": pool.normalize_model_version_dots,
             "modelMappingMode": pool.model_mapping_mode.as_str(),
             "modelMappingRequireMatch": pool.model_mapping_require_match,
@@ -5855,8 +5758,7 @@ impl ExternalPoolManager {
 
     #[cfg(test)]
     pub async fn has_eligible_pool(&self, config: &ExternalPoolsConfig) -> bool {
-        self.has_eligible_pool_matching(config, None, None, None)
-            .await
+        self.has_eligible_pool_matching(config, None, None).await
     }
 
     #[cfg(test)]
@@ -5866,7 +5768,7 @@ impl ExternalPoolManager {
         model: &str,
     ) -> bool {
         let model_candidates = normalize_external_pool_support_candidates([model]);
-        self.has_eligible_pool_matching(config, None, Some(&model_candidates), None)
+        self.has_eligible_pool_matching(config, Some(&model_candidates), None)
             .await
     }
 
@@ -5877,19 +5779,7 @@ impl ExternalPoolManager {
         model: &str,
     ) -> bool {
         let model_candidates = normalize_external_pool_support_candidates([model]);
-        self.has_eligible_pool_matching(config, None, Some(&model_candidates), Some(endpoint))
-            .await
-    }
-
-    #[cfg(test)]
-    pub async fn has_eligible_pool_for_body_mode_and_model(
-        &self,
-        config: &ExternalPoolsConfig,
-        body_mode: ExternalPoolRequestBodyMode,
-        model: Option<&str>,
-    ) -> bool {
-        let model_candidates = normalize_external_pool_support_candidates(model);
-        self.has_eligible_pool_matching(config, Some(body_mode), Some(&model_candidates), None)
+        self.has_eligible_pool_matching(config, Some(&model_candidates), Some(endpoint))
             .await
     }
 
@@ -5900,22 +5790,15 @@ impl ExternalPoolManager {
         model: &str,
     ) -> bool {
         let model_candidates = normalize_external_pool_support_candidates([model]);
-        self.has_cached_eligible_pool_matching(
-            config,
-            None,
-            Some(&model_candidates),
-            Some(endpoint),
-        )
+        self.has_cached_eligible_pool_matching(config, Some(&model_candidates), Some(endpoint))
     }
 
     fn has_cached_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
-        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
         model_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> bool {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return false;
         }
@@ -5941,7 +5824,6 @@ impl ExternalPoolManager {
         let model_candidates = normalize_external_pool_support_candidates([model]);
         self.has_immediately_available_pool_matching(
             config,
-            None,
             Some(&model_candidates),
             None,
             max_wait,
@@ -5959,7 +5841,6 @@ impl ExternalPoolManager {
         let model_candidates = normalize_external_pool_support_candidates([model]);
         self.has_immediately_available_pool_matching(
             config,
-            None,
             Some(&model_candidates),
             Some(endpoint),
             max_wait,
@@ -5974,12 +5855,7 @@ impl ExternalPoolManager {
         model: &str,
     ) -> bool {
         let model_candidates = normalize_external_pool_support_candidates([model]);
-        self.has_cached_immediately_available_pool_matching(
-            config,
-            None,
-            Some(&model_candidates),
-            None,
-        )
+        self.has_cached_immediately_available_pool_matching(config, Some(&model_candidates), None)
     }
 
     pub fn has_cached_immediately_available_pool_for_route_and_model(
@@ -5991,7 +5867,6 @@ impl ExternalPoolManager {
         let model_candidates = normalize_external_pool_support_candidates([model]);
         self.has_cached_immediately_available_pool_matching(
             config,
-            None,
             Some(&model_candidates),
             Some(endpoint),
         )
@@ -6000,11 +5875,9 @@ impl ExternalPoolManager {
     async fn has_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
-        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
         model_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> bool {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return false;
         }
@@ -6021,11 +5894,9 @@ impl ExternalPoolManager {
     fn has_cached_immediately_available_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
-        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
         model_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> bool {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return false;
         }
@@ -6076,7 +5947,6 @@ impl ExternalPoolManager {
     async fn has_immediately_available_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
-        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
         model_candidates: Option<&[String]>,
         endpoint: Option<&str>,
         max_wait: Duration,
@@ -6104,7 +5974,6 @@ impl ExternalPoolManager {
                     &HashSet::new(),
                     config,
                     true,
-                    body_mode_filter,
                     model_candidates,
                     Some(cooldown_candidates),
                     endpoint,
@@ -6809,11 +6678,9 @@ impl ExternalPoolManager {
                         error_message: Some(err.message.clone()),
                         raw_upstream_error: err.raw_upstream_error.clone(),
                     });
-                    if let Some(retry_route) = (pool.request_body_mode
-                        == ExternalPoolRequestBodyMode::Normalized
-                        && should_retry_external_payload_guard(&route, &err))
-                    .then(|| external_payload_guard_retry_route(&route))
-                    .flatten()
+                    if let Some(retry_route) = should_retry_external_payload_guard(&route, &err)
+                        .then(|| external_payload_guard_retry_route(&route))
+                        .flatten()
                     {
                         if let Some(last) = attempts.last_mut() {
                             last.action = "payload_guard_retry".to_string();
@@ -7322,13 +7189,14 @@ impl ExternalPoolManager {
                 pool_id: pool.id,
                 pool_name: pool.name.clone(),
             });
-            let transcript_state = Arc::new(SyncMutex::new(
-                ExternalAnthropicTranscriptState::new_with_error_context(
-                    known_tool_names.iter().cloned(),
-                    Some(route.request_id.clone()),
-                    Some(route.error_id.clone()),
-                ),
-            ));
+            let transcript_state =
+                Arc::new(SyncMutex::new(route.history_sanitize_enabled.then(|| {
+                    ExternalAnthropicTranscriptState::new_with_error_context(
+                        known_tool_names.iter().cloned(),
+                        Some(route.request_id.clone()),
+                        Some(route.error_id.clone()),
+                    )
+                })));
             let mut prefix = Vec::<u8>::new();
             let mut buffer = Vec::<u8>::new();
             let mut last_chunk_at = Instant::now();
@@ -7453,7 +7321,7 @@ impl ExternalPoolManager {
                                 Some(&usage_capture),
                                 Some(stream_error_mask.as_ref()),
                                 stream_plan,
-                                Some(&mut transcript_state.lock()),
+                                transcript_state.lock().as_mut(),
                             );
                             if !projected.is_empty() {
                                 last_keepalive_at = Instant::now();
@@ -7492,7 +7360,7 @@ impl ExternalPoolManager {
                                                 Some(&usage_capture),
                                                 Some(stream_error_mask.as_ref()),
                                                 stream_plan,
-                                                Some(&mut transcript_state.lock()),
+                                                transcript_state.lock().as_mut(),
                                             );
                                             if !projected.is_empty() {
                                                 last_keepalive_at = Instant::now();
@@ -7571,15 +7439,12 @@ impl ExternalPoolManager {
                                                     Some(&usage_capture),
                                                     Some(stream_error_mask.as_ref()),
                                                     stream_plan,
-                                                    Some(&mut transcript_state.lock()),
+                                                    transcript_state.lock().as_mut(),
                                                 )
                                             };
                                             {
                                                 let mut transcript_state = transcript_state.lock();
-                                                let finished_tail = finish_external_transcript_state(
-                                                    &mut transcript_state,
-                                                    Some(&usage_capture),
-                                                );
+                                                let finished_tail = transcript_state.as_mut().map(|state| finish_external_transcript_state(state, Some(&usage_capture))).unwrap_or_default();
                                                 record_external_wire_debug_sse_bytes(
                                                     &finished_tail,
                                                     Some(&usage_capture),
@@ -7858,7 +7723,7 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
     ) -> Option<ExternalPool> {
-        self.scan_pool_availability_uncached(excluded, config, true, None, None, None)
+        self.scan_pool_availability_uncached(excluded, config, true, None, None)
             .await
             .selected_pool
     }
@@ -7879,7 +7744,6 @@ impl ExternalPoolManager {
             excluded,
             config,
             true,
-            None,
             Some(&support_candidates),
             Some(&cooldown_candidates),
             Some(&route.endpoint),
@@ -7960,7 +7824,6 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
         include_selection: bool,
-        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
         model_candidates: Option<&[Option<&str>]>,
         model_cooldown_candidates: Option<&[String]>,
     ) -> PoolSelectionSnapshot {
@@ -7979,7 +7842,6 @@ impl ExternalPoolManager {
             excluded,
             config,
             include_selection,
-            body_mode_filter,
             normalized_candidates.as_deref(),
             model_cooldown_candidates,
             None,
@@ -7993,12 +7855,10 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
         include_selection: bool,
-        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
         model_candidates: Option<&[String]>,
         model_cooldown_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> PoolSelectionSnapshot {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return PoolSelectionSnapshot::default();
         }
@@ -8214,7 +8074,7 @@ impl ExternalPoolManager {
         }
 
         let snapshot = self
-            .scan_pool_availability_uncached(excluded, config, false, None, None, None)
+            .scan_pool_availability_uncached(excluded, config, false, None, None)
             .await
             .availability;
         if cacheable {
@@ -11545,7 +11405,7 @@ async fn pre_read_external_stream_before_commit<S>(
     usage_capture: &Arc<SyncMutex<ExternalUsageCapture>>,
     stream_plan: ExternalStreamProcessingPlan,
     stream_error_mask: &ExternalStreamErrorMask,
-    transcript_state: &Arc<SyncMutex<ExternalAnthropicTranscriptState>>,
+    transcript_state: &Arc<SyncMutex<Option<ExternalAnthropicTranscriptState>>>,
     stream_idle_timeout: Option<Duration>,
     outbound_model: &Option<String>,
     upstream_chunk_index: Option<&AtomicU64>,
@@ -11597,7 +11457,7 @@ where
                 Some(usage_capture),
                 Some(stream_error_mask),
                 stream_plan,
-                Some(&mut transcript_state.lock()),
+                transcript_state.lock().as_mut(),
             ));
             if prefix.len() > EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES {
                 tracing::warn!(
@@ -11947,14 +11807,6 @@ fn external_pool_outbound_body(
     pool: &ExternalPool,
 ) -> Result<Bytes, ExternalPoolError> {
     external_pool_prepare_request(route, pool).map(|prepared| prepared.body)
-}
-
-#[cfg(test)]
-fn external_pool_matches_body_mode_filter(
-    pool: &ExternalPool,
-    filter: Option<ExternalPoolRequestBodyMode>,
-) -> bool {
-    filter.is_none_or(|mode| pool.request_body_mode == mode)
 }
 
 fn normalize_external_pool_support_candidates<'a>(
@@ -12445,24 +12297,6 @@ fn normalize_external_pool_outbound_model(model: &str) -> String {
     model_pipeline::normalize_outbound_model(model)
 }
 
-fn normalize_external_pool_thinking_value(value: &mut serde_json::Value) -> bool {
-    let Some(thinking) = value
-        .get_mut("thinking")
-        .and_then(|value| value.as_object_mut())
-    else {
-        return false;
-    };
-    let thinking_type = thinking
-        .get("type")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(thinking_type.as_str(), "adaptive" | "disabled") {
-        return false;
-    }
-    thinking.remove("budget_tokens").is_some()
-}
-
 const EXTERNAL_POOL_HEADER_OVERRIDE_MAX_ENTRIES: usize = 64;
 const EXTERNAL_POOL_HEADER_OVERRIDE_MAX_NAME_LEN: usize = 200;
 const EXTERNAL_POOL_HEADER_OVERRIDE_MAX_VALUE_LEN: usize = 8192;
@@ -12653,18 +12487,15 @@ fn sanitize_anthropic_body_for_beta_header(body: &Bytes, headers: &HeaderMap) ->
     {
         return body.clone();
     }
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
     };
-    let Some(object) = value.as_object_mut() else {
-        return body.clone();
-    };
-    if object.remove("context_management").is_none() {
+    if value.get("context_management").is_none() {
         return body.clone();
     }
-    serde_json::to_vec(&value)
-        .map(Bytes::from)
-        .unwrap_or_else(|_| body.clone())
+    let mut patches = crate::anthropic::body_patch::BodyPatchSet::default();
+    patches.remove("/context_management", "beta_compat");
+    patches.apply(body)
 }
 
 fn sync_claude_code_session_header(headers: &mut HeaderMap, body: &[u8]) {
@@ -13663,8 +13494,8 @@ fn process_non_stream_response_usage(
         return ProjectedNonStreamBody::without_protocol_contamination(bytes, usage_capture);
     };
     usage_capture.downstream_stop_reason = external_stop_reason_from_value(&value);
-    let sanitization = sanitize_response_content(&mut value, known_tool_names);
-    let sanitized = sanitization.blocks > 0;
+    let sanitized = route.is_none_or(|route| route.history_sanitize_enabled)
+        && sanitize_response_content(&mut value, known_tool_names).blocks > 0;
 
     if let Some((candidate_path, pointer)) = select_non_stream_usage_candidate(&value) {
         usage_capture.usage_candidate_path = Some(candidate_path.to_string());
@@ -16594,4 +16425,16 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
 mod golden_tests;
 #[cfg(test)]
 #[path = "external_pool/tests.rs"]
-mod tests;
+pub(crate) mod tests;
+
+#[cfg(test)]
+pub(crate) fn passthrough_test_prepare(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    headers: &HeaderMap,
+) -> (Bytes, HeaderMap) {
+    (
+        external_pool_prepare_request(route, pool).unwrap().body,
+        forward_headers(headers, pool, false).unwrap(),
+    )
+}

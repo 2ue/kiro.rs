@@ -149,6 +149,10 @@ async fn parse_messages_payload_rejects_empty_model_before_routing() {
         let response = parse_messages_payload(&body).expect_err("empty model rejected");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error_id = response.headers()["x-error-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read error body");
@@ -156,8 +160,12 @@ async fn parse_messages_payload_rejects_empty_model_before_routing() {
         assert_eq!(value["error"]["type"], "invalid_request_error");
         assert_eq!(
             value["error"]["message"],
-            "model: field is required and cannot be empty"
+            envelope::public_message_with_error_id(
+                "model: field is required and cannot be empty",
+                &error_id,
+            )
         );
+        assert_eq!(value["request_id"], error_id);
         assert!(
             value["request_id"]
                 .as_str()
@@ -300,10 +308,6 @@ fn raw_external_route_request_is_preparse_raw_only() {
     assert_eq!(route.raw_body, raw_body);
     assert_eq!(route.effective_raw_body, raw_body);
     assert!(route.payload.is_none());
-    assert_eq!(
-        route.body_mode_filter,
-        Some(ExternalPoolRequestBodyMode::RawPassthrough)
-    );
     assert_eq!(route.model_hint.as_deref(), Some("client-model"));
     assert_eq!(route.stream_hint, Some(true));
     assert_eq!(route.request_input_tokens, 0);
@@ -788,8 +792,8 @@ fn thinking_trigger_real_request_uses_claude_code_ultrathink_signal() {
 }
 
 #[tokio::test]
-async fn messages_without_external_manager_return_503_for_raw_and_normalized_paths() {
-    for normalized in [false, true] {
+async fn messages_without_external_manager_return_529() {
+    {
         let state = AppState::new(
             Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
             Arc::new(UsageRecorder::new(10)),
@@ -811,16 +815,15 @@ async fn messages_without_external_manager_return_503_for_raw_and_normalized_pat
             Arc::new(InferenceAttemptBudget::new(4)),
             None,
             None,
-            normalized,
             None,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status().as_u16(), 529);
         let body = axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["type"], "overloaded_error");
         assert!(
             body["error"]["message"]
                 .as_str()
@@ -1600,6 +1603,7 @@ async fn run_strict_request_protocol_contamination_fails_closed_before_upstream_
     let mut config = Config::default();
 
     config.compat_profile = CompatProfile::AnthropicStrict;
+    config.route_features.defaults.history_sanitize = true;
     let (app, usage_recorder) = handler_test_router(config, None);
 
     for round in 1..=5 {
@@ -1758,7 +1762,12 @@ async fn run_oversized_current_image_is_resized_when_switched_on() {
     for resize in [false, true] {
         let upstream = MultimodalHandlerUpstream::start().await;
         let mut config = Config::default();
-        config.image_processing.resize_enabled = resize;
+        config
+            .route_features
+            .defaults
+            .image_processing
+            .get_or_insert_with(Default::default)
+            .resize_enabled = resize;
         let Some((app, _usage_recorder)) =
             multimodal_handler_test_router_from_config(config, &upstream.base_url).await
         else {
@@ -1904,9 +1913,7 @@ async fn multimodal_handler_test_router_from_config(
     mut config: Config,
     base_url: &str,
 ) -> Option<(Router, Arc<UsageRecorder>)> {
-    let manager =
-        test_external_pool_manager_for_handlers(base_url, ExternalPoolRequestBodyMode::Normalized)
-            .await?;
+    let manager = test_external_pool_manager_for_handlers(base_url).await?;
     config.external_pools.external_pools_enabled = true;
     config.external_pools.external_pool_same_pool_retry_count = 0;
     Some(handler_test_router(config, Some(manager)))
@@ -1937,7 +1944,6 @@ fn handler_test_router(
 
 async fn test_external_pool_manager_for_handlers(
     base_url: &str,
-    body_mode: ExternalPoolRequestBodyMode,
 ) -> Option<Arc<ExternalPoolManager>> {
     let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
     else {
@@ -1971,7 +1977,7 @@ async fn test_external_pool_manager_for_handlers(
     let manager = Arc::new(ExternalPoolManager::new(postgres.clone(), redis));
     postgres
         .create_external_pool(CreateExternalPoolRequest {
-            name: format!("handler-messages-{body_mode:?}"),
+            name: "handler-messages".to_string(),
             base_url: base_url.to_string(),
             api_key: "sk-handler-external-test".to_string(),
             auth_type: ExternalPoolAuthType::XApiKey,
@@ -1985,11 +1991,10 @@ async fn test_external_pool_manager_for_handlers(
             max_concurrent_requests: 10,
             usage_projection_mode: ExternalPoolUsageProjectionMode::CurrentPathPolicy,
             stream_response_mode: None,
-            request_body_mode: body_mode,
-            raw_model_mode: ExternalPoolRawModelMode::None,
+
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
             pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
-            preserve_path: true,
+
             normalize_model_version_dots: false,
             model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
             model_mapping_require_match: false,
@@ -2068,12 +2073,7 @@ async fn prompt_too_long_error_maps_to_input_length_message() {
 #[tokio::test]
 async fn external_pool_endpoint_gate_applies_global_enable_and_route_policy() {
     let upstream = MultimodalHandlerUpstream::start().await;
-    let Some(manager) = test_external_pool_manager_for_handlers(
-        &upstream.base_url,
-        ExternalPoolRequestBodyMode::Normalized,
-    )
-    .await
-    else {
+    let Some(manager) = test_external_pool_manager_for_handlers(&upstream.base_url).await else {
         return;
     };
     let mut config = ExternalPoolsConfig::default();

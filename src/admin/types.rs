@@ -4,10 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ImageProcessingConfig,
-    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PayloadShapingConfigPatch, PromptCacheCreationControlConfig,
-    PromptInjectionConfig, ReportedUsageConfig, RequestAdmissionConfig, RouteFeaturesConfig,
+    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
+    PromptCacheCreationControlConfig, PromptInjectionConfig, ReportedUsageConfig,
+    RequestAdmissionConfig, RouteFeaturesConfig,
 };
 
 // ============ 凭据状态 ============
@@ -293,18 +292,8 @@ pub struct RuntimeConfigResponse {
     pub request_admission: RequestAdmissionConfig,
     pub stream_pre_output_hold_secs: u64,
     pub inference_upstream_max_attempts: u32,
-    pub image_processing: ImageProcessingConfig,
     pub prompt_injection: PromptInjectionConfig,
     pub route_features: RouteFeaturesConfig,
-    pub missing_max_tokens: MissingMaxTokensConfig,
-    pub local_request_compat: crate::model::config::LocalRequestCompatConfig,
-    pub payload_guard_enabled: bool,
-    pub payload_guard_mode: PayloadGuardMode,
-    pub payload_guard_max_bytes: u64,
-    pub payload_guard_safety_margin_bytes: u64,
-    pub payload_guard_trim_history: bool,
-    pub payload_guard_external_enabled: bool,
-    pub payload_shaping: PayloadShapingConfig,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
     pub prompt_cache_max_simulated_input_tokens: i32,
@@ -367,29 +356,9 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub inference_upstream_max_attempts: Option<u32>,
     #[serde(default)]
-    pub image_processing: Option<ImageProcessingConfig>,
-    #[serde(default)]
     pub prompt_injection: Option<PromptInjectionConfig>,
     #[serde(default)]
     pub route_features: Option<RouteFeaturesConfig>,
-    #[serde(default)]
-    pub missing_max_tokens: Option<MissingMaxTokensConfig>,
-    #[serde(default)]
-    pub local_request_compat: Option<crate::model::config::LocalRequestCompatConfig>,
-    #[serde(default)]
-    pub payload_guard_enabled: Option<bool>,
-    #[serde(default)]
-    pub payload_guard_mode: Option<PayloadGuardMode>,
-    #[serde(default)]
-    pub payload_guard_max_bytes: Option<u64>,
-    #[serde(default)]
-    pub payload_guard_safety_margin_bytes: Option<u64>,
-    #[serde(default)]
-    pub payload_guard_trim_history: Option<bool>,
-    #[serde(default)]
-    pub payload_guard_external_enabled: Option<bool>,
-    #[serde(default)]
-    pub payload_shaping: Option<PayloadShapingConfigPatch>,
     #[serde(default)]
     pub prompt_cache_target_read_ratio: Option<f64>,
     #[serde(default)]

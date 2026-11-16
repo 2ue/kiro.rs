@@ -1,6 +1,5 @@
 //! Anthropic Messages 入口与外部池编排。
 use super::{
-    body_capabilities::ParsedAnthropicBodyPlan,
     body_processing, envelope,
     inference_attempt_budget::InferenceAttemptBudget,
     middleware::AppState,
@@ -16,9 +15,7 @@ use super::{
     },
     usage::{RequestRejectionUsageContext, UsageRouteSubtype},
 };
-use crate::external_pool::{
-    ExternalPoolRequestBodyMode, ExternalRouteRequest, ExternalRouteRequestPreparationCache,
-};
+use crate::external_pool::{ExternalRouteRequest, ExternalRouteRequestPreparationCache};
 use crate::{model::config::*, token};
 use axum::{
     Json as JsonExtractor,
@@ -194,22 +191,70 @@ impl RequestRuntimeConfig {
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
-            payload_guard_enabled: config.payload_guard_enabled,
-            payload_guard_mode: config.payload_guard_mode,
-            payload_guard_max_bytes: config.payload_guard_max_bytes,
-            payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
-            payload_guard_trim_history: config.payload_guard_trim_history,
-            payload_guard_external_enabled: config.payload_guard_external_enabled,
+            payload_guard_enabled: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.enabled)
+                .unwrap_or(false),
+            payload_guard_mode: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.mode)
+                .unwrap_or(Default::default()),
+            payload_guard_max_bytes: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.max_bytes)
+                .unwrap_or(0),
+            payload_guard_safety_margin_bytes: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.safety_margin_bytes)
+                .unwrap_or(0),
+            payload_guard_trim_history: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.trim_history)
+                .unwrap_or(false),
+            payload_guard_external_enabled: config
+                .route_features
+                .defaults
+                .payload_guard
+                .map(|guard| guard.external_enabled)
+                .unwrap_or(false),
             stream_pre_output_hold_secs: config
                 .stream_pre_output_hold_secs
                 .min(crate::model::config::STREAM_PRE_OUTPUT_HOLD_MAX_SECS),
             inference_upstream_max_attempts: config.inference_upstream_max_attempts.clamp(1, 10),
-            image_processing: config.image_processing.normalized(),
+            image_processing: config
+                .route_features
+                .defaults
+                .image_processing
+                .unwrap_or_default()
+                .normalized(),
             prompt_injection: config.prompt_injection.clone().normalized(),
             route_features: config.route_features.clone().normalized(),
-            missing_max_tokens: config.missing_max_tokens.normalized(),
-            local_request_compat: config.local_request_compat,
-            payload_shaping: config.payload_shaping,
+            missing_max_tokens: config
+                .route_features
+                .defaults
+                .missing_max_tokens
+                .unwrap_or_default()
+                .normalized(),
+            local_request_compat: config
+                .route_features
+                .defaults
+                .reasoning_compat
+                .unwrap_or_default(),
+            payload_shaping: config
+                .route_features
+                .defaults
+                .payload_shaping
+                .unwrap_or_default(),
             external_pools: config.external_pools.clone(),
         }
     }
@@ -389,10 +434,6 @@ fn request_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
     }
     cache.push((key, built.clone()));
     built
-}
-
-fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
-    request_runtime_config(state).image_processing
 }
 
 fn external_request_model_resolution(requested_model: &str) -> ModelResolution {
@@ -716,19 +757,24 @@ async fn count_tokens_for_endpoint(
         &mut payload,
     );
 
-    let image_processing = request_image_processing_config(&state);
-    let _multimodal_report = match body_processing::prepare_multimodal_message_sources(
-        &mut payload.messages,
-        None,
-        image_processing,
-    )
-    .await
+    let _multimodal_report = if let Some(image_processing) =
+        runtime_config.route_features_for(endpoint).image_processing
     {
-        Ok(report) => report,
-        Err(message) => {
-            tracing::warn!("count_tokens 多模态 source 处理失败: {}", message);
-            return multimodal_preprocessing_error_response(message);
+        match body_processing::prepare_multimodal_message_sources(
+            &mut payload.messages,
+            None,
+            image_processing,
+        )
+        .await
+        {
+            Ok(report) => Some(report),
+            Err(message) => {
+                tracing::warn!("count_tokens 多模态 source 处理失败: {}", message);
+                return multimodal_preprocessing_error_response(message);
+            }
         }
+    } else {
+        None
     };
 
     let (total_tokens, calculation) = token::count_all_tokens_with_source(
@@ -1054,6 +1100,7 @@ fn external_route_request_raw(
     let effective_cache_route =
         cache_route_for_request_stream(cache_route.clone(), stream_hint.unwrap_or(false));
     let policy = &effective_cache_route.policy;
+    let projection_payload = serde_json::from_slice::<MessagesRequest>(&raw_body).ok();
     ExternalRouteRequest {
         effective_raw_body: raw_body.clone(),
         effective_raw_probe: Some(raw_probe),
@@ -1061,8 +1108,8 @@ fn external_route_request_raw(
         raw_body,
         headers,
         endpoint: endpoint.to_string(),
-        payload: None,
-        body_mode_filter: Some(ExternalPoolRequestBodyMode::RawPassthrough),
+        payload: projection_payload,
+        history_sanitize_enabled: false,
         model_hint,
         stream_hint,
         request_input_tokens: 0,
@@ -1111,58 +1158,6 @@ fn external_route_request_raw(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn external_route_request_parsed(
-    state: &AppState,
-    runtime: &RequestRuntimeConfig,
-    cache_route: &ResolvedCacheRoutePolicy,
-    headers: HeaderMap,
-    effective_raw_body: Bytes,
-    effective_raw_probe: Arc<RawMessagesBodyProbe>,
-    raw_body: Bytes,
-    payload: MessagesRequest,
-    endpoint: &str,
-    budget: Arc<InferenceAttemptBudget>,
-    request_api_key_id: Option<String>,
-    ingress_id: Option<String>,
-) -> ExternalRouteRequest {
-    let resolution = external_request_model_resolution(&payload.model);
-    let (input_tokens, _) = token::count_all_tokens_with_source(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-        None,
-    );
-    let mut route = external_route_request_raw(
-        state,
-        runtime,
-        cache_route,
-        headers,
-        effective_raw_body,
-        endpoint,
-        envelope::request_id(),
-        budget,
-        request_api_key_id,
-        ingress_id,
-        effective_raw_probe,
-    );
-    route.raw_body = raw_body;
-    route.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
-    route.request_input_tokens = input_tokens.max(0) as i32;
-    route.model_hint = None;
-    route.stream_hint = None;
-    route.upstream_model = resolution.upstream_model;
-    route.model_resolution_source = Some(resolution.source.as_str().to_string());
-    route.model_resolution_note = resolution.note;
-    route.payload = Some(payload);
-    route.payload_guard_external_enabled = runtime.payload_guard_external_enabled;
-    route.payload_guard_retry_config = runtime
-        .too_long_retry_enabled()
-        .then(|| runtime.payload_guard_config());
-    route
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn post_messages_inner(
     state: AppState,
     headers: HeaderMap,
@@ -1173,7 +1168,6 @@ async fn post_messages_inner(
     budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     ingress_id: Option<String>,
-    requires_normalized_body: bool,
     attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
     let runtime = request_runtime_config(&state);
@@ -1182,10 +1176,16 @@ async fn post_messages_inner(
         .as_ref()
         .filter(|_| runtime.external_pools.external_pools_enabled)
     else {
-        let response = envelope::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "api_error",
-            envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
+        let request_id = envelope::request_id();
+        let response = envelope::error_response_with_id_and_headers(
+            StatusCode::from_u16(529).unwrap(),
+            "overloaded_error",
+            envelope::public_message_with_error_id(
+                envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
+                &request_id,
+            ),
+            &request_id,
+            [("x-error-id", request_id.clone())],
         );
         record_pre_usage_rejection_with_metadata_and_context(
             attribution.as_ref(),
@@ -1205,58 +1205,27 @@ async fn post_messages_inner(
         return response;
     };
     let cache_route = runtime.cache_policy_for_path(&endpoint);
-    let route = if !requires_normalized_body {
-        external_route_request_raw(
-            &state,
-            &runtime,
-            &cache_route,
-            headers,
-            effective_raw_body,
-            &endpoint,
-            envelope::request_id(),
-            budget,
-            request_api_key_id,
-            ingress_id,
-            effective_raw_probe,
-        )
-    } else {
-        let request_id = envelope::request_id();
-        let probe = probe_raw_messages_body(&raw_body);
-        let mut payload = match request_entry::parse_messages_payload_with_probe(
-            &raw_body,
-            &probe,
-            &request_id,
-            &runtime.local_request_compat,
-        ) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return error.to_response(&request_id);
-            }
-        };
-        let plan = ParsedAnthropicBodyPlan::shared_compatible(runtime.image_processing);
-        if let Err(response) =
-            parsed_body_pipeline::prepare(&state, &headers, &endpoint, &mut payload, &runtime, plan)
-                .await
-        {
-            return response;
-        }
-        let injections = runtime.injections_for(&endpoint, UpstreamKind::ExternalPool);
-        super::prompt_injection::apply_to_messages_request(&injections, &mut payload);
-        external_route_request_parsed(
-            &state,
-            &runtime,
-            &cache_route,
-            headers,
-            effective_raw_body,
-            effective_raw_probe,
-            raw_body,
-            payload,
-            &endpoint,
-            budget,
-            request_api_key_id,
-            ingress_id,
-        )
-    };
+    let features = runtime.route_features_for(&endpoint);
+    let mut route = external_route_request_raw(
+        &state,
+        &runtime,
+        &cache_route,
+        headers,
+        effective_raw_body,
+        &endpoint,
+        envelope::request_id(),
+        budget,
+        request_api_key_id,
+        ingress_id,
+        effective_raw_probe,
+    );
+    route.raw_body = raw_body;
+    route.history_sanitize_enabled = features.history_sanitize;
+    route.payload_guard_retry_config = features
+        .payload_guard
+        .filter(|config| config.enabled && config.mode == PayloadGuardMode::OnTooLong)
+        .map(|config| request_entry::route_guard_config(config, features.payload_shaping));
+
     manager
         .forward_with_failover(runtime.external_pools.clone(), route)
         .await
@@ -1265,3 +1234,7 @@ async fn post_messages_inner(
 #[cfg(test)]
 #[path = "handlers/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "passthrough_tests.rs"]
+mod passthrough_tests;

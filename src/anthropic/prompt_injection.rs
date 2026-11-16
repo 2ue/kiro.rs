@@ -36,7 +36,7 @@ pub(crate) fn apply_to_count_tokens_request(
     apply_to_system(&mut payload.system, injections)
 }
 
-fn apply_to_system(
+pub(crate) fn apply_to_system(
     system: &mut Option<Vec<SystemMessage>>,
     injections: &ResolvedInjections,
 ) -> AppliedSystemInjections {
@@ -121,7 +121,7 @@ mod tests {
     use crate::anthropic::types::Message;
     use crate::model::config::{CompatProfile, UpstreamKind};
     use crate::model::prompt_injection::catalog::{
-        DEFAULT_IDENTITY_PROMPT, DEFAULT_LANGUAGE_CONSTRAINT_PROMPT, DEFAULT_TASK_QUALITY_PROMPT,
+        DEFAULT_IDENTITY_PROMPT, DEFAULT_LANGUAGE_CONSTRAINT_PROMPT,
     };
     use crate::model::prompt_injection::{ItemOverride, ItemSetting};
 
@@ -159,30 +159,28 @@ mod tests {
     }
 
     #[test]
-    fn fresh_install_injects_task_quality_only_on_cc() {
+    fn fresh_install_keeps_injections_off_on_every_builtin_route() {
         let config = PromptInjectionConfig::default();
-        let mut cc = request();
-        let applied = apply_to_messages_request(&resolve(&config, "/cc/v1/messages"), &mut cc);
-        assert_eq!(applied.items, vec![InjectionId::TaskQuality]);
-        let system = cc.system.expect("cc system");
-        assert_eq!(system.len(), 1);
-        assert_eq!(
-            system[0].text,
-            format!(
-                "{PROMPT_STEERING_MARKER}\n{}\n{PROMPT_STEERING_END_MARKER}",
-                DEFAULT_TASK_QUALITY_PROMPT.trim()
-            )
-        );
-
-        let mut v1 = request();
-        let applied = apply_to_messages_request(&resolve(&config, "/v1/messages"), &mut v1);
-        assert!(applied.items.is_empty());
-        assert!(v1.system.is_none());
+        for endpoint in [
+            "/v1/messages",
+            "/cc/v1/messages",
+            "/na/v1/messages",
+            "/ha/v1/messages",
+        ] {
+            let mut req = request();
+            assert!(
+                apply_to_messages_request(&resolve(&config, endpoint), &mut req)
+                    .items
+                    .is_empty()
+            );
+            assert!(req.system.is_none());
+        }
     }
 
     #[test]
     fn identity_stays_first_and_blocks_are_not_duplicated() {
         let mut config = PromptInjectionConfig::default();
+        set(&mut config, InjectionId::TaskQuality, true);
         set(&mut config, InjectionId::IdentityPrompt, true);
         set(&mut config, InjectionId::LanguageConstraint, true);
         let injections = resolve(&config, "/cc/v1/messages");
@@ -298,6 +296,7 @@ mod tests {
     #[test]
     fn count_tokens_follows_apply_to_count_tokens() {
         let mut config = PromptInjectionConfig::default();
+        set(&mut config, InjectionId::TaskQuality, true);
         let injections = resolve(&config, "/cc/v1/messages/count_tokens");
         let payload = || CountTokensRequest {
             model: "claude-sonnet-4-5".to_string(),

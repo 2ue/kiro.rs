@@ -34,6 +34,7 @@
 //! ```
 
 pub(crate) mod body_capabilities;
+pub(crate) mod body_patch;
 pub(crate) mod body_processing;
 pub(crate) mod bounded_shaping;
 pub(crate) mod cache;
