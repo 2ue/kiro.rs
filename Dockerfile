@@ -59,7 +59,7 @@ RUN cargo build --release --locked --bin kiro-rs \
 
 FROM alpine:3.23
 
-RUN apk add --no-cache busybox-extras ca-certificates
+RUN apk add --no-cache busybox-extras ca-certificates python3
 
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
