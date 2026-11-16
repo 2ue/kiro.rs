@@ -1,0 +1,60 @@
+{
+  "expected": {
+    "message_start_usage": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 1223
+      },
+      "cache_creation_input_tokens": 1223,
+      "cache_read_input_tokens": 6473,
+      "input_tokens": 24,
+      "output_tokens": 0,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "projected": true,
+    "reported": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 1223
+      },
+      "cache_creation_input_tokens": 1223,
+      "cache_read_input_tokens": 8223,
+      "input_tokens": 24,
+      "output_tokens": 350,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "shaped": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 978
+      },
+      "cache_creation_input_tokens": 978,
+      "cache_read_input_tokens": 4477,
+      "input_tokens": 24,
+      "output_tokens": 350,
+      "total_input_tokens": 5479
+    }
+  },
+  "request": {
+    "model": "claude-sonnet-4-5",
+    "system_repeat": 500,
+    "user_text": "hello"
+  },
+  "seed": 4126,
+  "strategy": "bounded_high_cache",
+  "stream": true,
+  "upstream_1h_write": false,
+  "upstream_cache_read_evidence": true,
+  "upstream_usage": {
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 8000,
+    "input_tokens": 1200,
+    "output_tokens": 350
+  }
+}

@@ -16694,5 +16694,7 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
 }
 
 #[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
 #[path = "external_pool/tests.rs"]
 mod tests;

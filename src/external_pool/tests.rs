@@ -12238,7 +12238,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
     ));
 }
 
-fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
+pub(super) fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
     let now = Utc::now();
     ExternalPool {
         id: 1,
@@ -12988,7 +12988,7 @@ fn refresh_test_route_derived_state(route: &mut ExternalRouteRequest) {
     route.reset_preparation_cache();
 }
 
-fn test_route(model: &str) -> ExternalRouteRequest {
+pub(super) fn test_route(model: &str) -> ExternalRouteRequest {
     let payload = test_payload(model);
     let request_input_tokens = count_external_route_input_tokens(&payload);
     ExternalRouteRequest {
@@ -14734,7 +14734,7 @@ fn projection_context_with_cost_floor_margin(
     )
 }
 
-fn projection_context_with_output_uplift(
+pub(super) fn projection_context_with_output_uplift(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     uplift_percent: u32,
