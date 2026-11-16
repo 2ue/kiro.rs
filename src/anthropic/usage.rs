@@ -15,7 +15,6 @@ use tokio::task::JoinHandle;
 
 use crate::anthropic::request_key_limits::{KeyUsageDelta, RequestKeyLimiter};
 use crate::common::upstream_error::RawUpstreamError;
-use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
 use crate::storage::postgres::PostgresUsageStore;
 use crate::storage::redis_cache::RedisStore;
 
@@ -33,7 +32,7 @@ const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_m
 const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
 const USAGE_WRITER_ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_millis(100);
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 120;
-const USAGE_DASHBOARD_ACCOUNTS_TIMEOUT_SECS: u64 = 15;
+
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES: usize = 2;
 const USAGE_DASHBOARD_GATE_WAIT_MS: u64 = 30_000;
@@ -60,68 +59,13 @@ pub enum UsageRecordStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageRouteKind {
-    LocalCredential,
     ExternalPool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageRouteSubtype {
-    LocalSuccess,
-    LocalErrorNoFallback,
-    LocalRescueAfterExternal,
-    ExternalFallbackPreflight,
-    ExternalFallbackAfterLocalAttempts,
-    ExternalDirectPolicy,
-    ExternalRoutePolicy,
-    ExternalError,
-}
-
-/// Why an external-pool request left the local credential pool, grouped by
-/// who has to act on it. The raw `fallbackReason` strings stay on the record
-/// for drill-down; this coarse key is what the overview trend stacks on.
-pub fn usage_external_reason_category(
-    route_subtype: Option<UsageRouteSubtype>,
-    fallback_reason: Option<&str>,
-) -> &'static str {
-    match route_subtype {
-        Some(UsageRouteSubtype::ExternalDirectPolicy | UsageRouteSubtype::ExternalRoutePolicy) => {
-            return "policy_direct";
-        }
-        Some(
-            UsageRouteSubtype::ExternalFallbackPreflight
-            | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
-        ) => {}
-        _ => return "other",
-    }
-    match fallback_reason.map(str::trim).unwrap_or_default() {
-        "local_capacity_full"
-        | "local_capacity_exhausted"
-        | "local_auxiliary_concurrency_saturated"
-        | "local_auxiliary_attempts_exhausted"
-        | "local_attempt_reserved_for_fallback" => "local_capacity",
-        "local_no_credentials"
-        | "local_all_disabled"
-        | "local_proxy_blocked"
-        | "local_all_cooling_down"
-        | "local_transient_exhausted"
-        | "local_request_excluded_all"
-        | "no_available_credentials" => "local_unavailable",
-        "unsupported_model" | "local_no_model_compatible" => "model_unsupported",
-        "local_scheduler_redis_degraded" | "local_pool_risk_circuit_open" => "system_degraded",
-        _ => "other",
-    }
-}
-
-pub fn usage_external_reason_label(key: &str) -> &'static str {
-    match key {
-        "policy_direct" => "策略直连",
-        "local_capacity" => "本地容量不足",
-        "local_unavailable" => "本地账号不可用",
-        "model_unsupported" => "模型不支持",
-        "system_degraded" => "系统降级",
-        _ => "其他",
-    }
+    External,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -268,9 +212,6 @@ pub struct UsageLatencyTrace {
     pub inference_attempts:
         Option<crate::anthropic::inference_attempt_budget::InferenceAttemptSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auxiliary_attempts:
-        Option<crate::anthropic::inference_attempt_budget::AuxiliaryAttemptSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_weight_units: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_input_tokens: Option<i32>,
@@ -403,7 +344,6 @@ pub enum StreamTerminalReason {
 impl UsageLatencyTrace {
     pub fn is_empty(&self) -> bool {
         self.inference_attempts.is_none()
-            && self.auxiliary_attempts.is_none()
             && self.payload_guard_ms.is_none()
             && self.capacity_weight_units.is_none()
             && self.estimated_input_tokens.is_none()
@@ -519,8 +459,6 @@ pub struct UsageRecord {
     #[serde(default)]
     pub original_cost_usd: f64,
     #[serde(default)]
-    pub kiro_metering_usage: f64,
-    #[serde(default)]
     pub pricing_available: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -533,27 +471,15 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_trace: Option<UsageLatencyTrace>,
     pub simulated: bool,
-    pub sticky_bound: bool,
-    pub fallback_from_sticky: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub credential_attempts: Vec<KiroCredentialAttempt>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_kind: Option<UsageRouteKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_subtype: Option<UsageRouteSubtype>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub direct_policy_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_attempted: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_preflight: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_pool_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_pool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_attempts: Vec<ExternalPoolAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_projection_applied: Option<bool>,
@@ -718,7 +644,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
         cache_creation_1h_input_tokens: 0,
         estimated_cost_usd: 0.0,
         original_cost_usd: 0.0,
-        kiro_metering_usage: 0.0,
+
         pricing_available: false,
         pricing_model: None,
         duration_ms: 0,
@@ -726,15 +652,10 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
         response_latency_ms: None,
         latency_trace: None,
         simulated: false,
-        sticky_bound: false,
-        fallback_from_sticky: false,
-        credential_attempts: Vec::new(),
+
         route_kind: None,
         route_subtype: None,
-        fallback_reason: None,
-        direct_policy_reason: None,
-        local_attempted: None,
-        local_preflight: None,
+
         external_pool_id: None,
         external_pool_name: None,
         external_attempts: Vec::new(),
@@ -963,7 +884,6 @@ pub struct UsageSummary {
     #[serde(default)]
     pub total_original_cost_usd: f64,
     #[serde(default)]
-    pub total_kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
     pub local_prompt_cache_requests: usize,
@@ -1302,13 +1222,11 @@ pub struct UsageDashboardSummary {
     #[serde(default)]
     pub total_original_cost_usd: f64,
     #[serde(default)]
-    pub total_kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
     pub average_duration_ms: f64,
     pub p95_duration_ms: u64,
-    pub sticky_bound_requests: usize,
-    pub fallback_from_sticky_requests: usize,
+
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
     pub external_pool_billing: UsageExternalPoolBillingSummary,
@@ -1350,8 +1268,6 @@ pub struct UsageSeriesPoint {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
-    #[serde(default)]
-    pub total_kiro_metering_usage: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1402,7 +1318,7 @@ pub struct UsageOverviewMetrics {
     pub cache_creation_input_tokens: i64,
     pub estimated_cost_usd: f64,
     pub original_cost_usd: f64,
-    pub kiro_metering_usage: f64,
+
     pub priced_requests: usize,
     pub unpriced_requests: usize,
     pub average_duration_ms: f64,
@@ -1422,7 +1338,7 @@ impl Default for UsageOverviewMetrics {
             cache_creation_input_tokens: 0,
             estimated_cost_usd: 0.0,
             original_cost_usd: 0.0,
-            kiro_metering_usage: 0.0,
+
             priced_requests: 0,
             unpriced_requests: 0,
             average_duration_ms: 0.0,
@@ -1443,7 +1359,7 @@ pub struct UsageOverviewSeriesMetrics {
     pub cache_creation_input_tokens: i64,
     pub estimated_cost_usd: f64,
     pub original_cost_usd: f64,
-    pub kiro_metering_usage: f64,
+
     /// External-pool upstream cost. Only external-pool rows contribute, so the
     /// value is zero for local-route breakdowns.
     #[serde(default)]
@@ -1471,14 +1387,9 @@ pub struct UsageOverviewSeriesPoint {
     pub bucket_start: String,
     pub label: String,
     pub all: UsageOverviewSeriesMetrics,
-    pub local: UsageOverviewSeriesMetrics,
     pub external: UsageOverviewSeriesMetrics,
     #[serde(default)]
-    pub local_routes: Vec<UsageOverviewSeriesBreakdown>,
-    #[serde(default)]
     pub external_pools: Vec<UsageOverviewSeriesBreakdown>,
-    #[serde(default)]
-    pub external_reasons: Vec<UsageOverviewSeriesBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1494,11 +1405,7 @@ pub struct UsageOverviewSeriesGroup {
 #[serde(rename_all = "camelCase")]
 pub struct UsageOverviewSeriesGroups {
     #[serde(default)]
-    pub local_routes: Vec<UsageOverviewSeriesGroup>,
-    #[serde(default)]
     pub external_pools: Vec<UsageOverviewSeriesGroup>,
-    #[serde(default)]
-    pub external_reasons: Vec<UsageOverviewSeriesGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1563,7 +1470,6 @@ pub struct UsageOverviewResponse {
     pub range: UsageOverviewRange,
     pub totals: UsageOverviewTotals,
     pub external: UsageOverviewExternal,
-    pub local: UsageOverviewLocal,
     pub series: Vec<UsageOverviewSeriesPoint>,
     #[serde(default)]
     pub series_groups: UsageOverviewSeriesGroups,
@@ -1582,7 +1488,6 @@ pub struct UsageOverviewSummaryResponse {
     pub range: UsageOverviewRange,
     pub totals: UsageOverviewTotals,
     pub external: UsageOverviewExternalSummary,
-    pub local: UsageOverviewLocalSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1593,15 +1498,6 @@ pub struct UsageOverviewSeriesResponse {
     pub range: UsageOverviewRange,
     pub series: Vec<UsageOverviewSeriesPoint>,
     pub series_groups: UsageOverviewSeriesGroups,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageOverviewLocalResponse {
-    pub generated_at: String,
-    pub timezone: String,
-    pub range: UsageOverviewRange,
-    pub local: UsageOverviewLocal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1620,7 +1516,6 @@ pub struct UsageOverviewRankingsResponse {
     pub timezone: String,
     pub range: UsageOverviewRange,
     pub total_requests: usize,
-    pub total_local_requests: usize,
     pub total_errors: usize,
     pub top_models: Vec<UsageOverviewRankRow>,
     pub top_accounts: Vec<UsageOverviewRankRow>,
@@ -1644,16 +1539,8 @@ pub struct UsageOverviewExternalSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageOverviewLocalSummary {
-    pub active_accounts: usize,
-    pub accounts_total: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UsageOverviewTotals {
     pub all: UsageOverviewMetrics,
-    pub local: UsageOverviewMetrics,
     pub external: UsageOverviewMetrics,
 }
 
@@ -1669,16 +1556,6 @@ pub struct UsageOverviewExternal {
     pub cost_floor_delta_usd: f64,
     pub cost_floor_applied_requests: usize,
     pub pools: Vec<UsageOverviewPoolRow>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageOverviewLocal {
-    pub active_accounts: usize,
-    pub accounts_total: usize,
-    pub accounts: Vec<UsageOverviewAccountRow>,
-    #[serde(default)]
-    pub routes: Vec<UsageOverviewRouteRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -1829,34 +1706,6 @@ impl UsageDashboardTop {
     }
 }
 
-/// Window/lifetime usage aggregates for one local credential.
-///
-/// This is intentionally sourced from rollup tables only. It must not trigger
-/// token refreshes, account probes, or scheduler mutations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageDashboardCredentialAggregate {
-    pub credential_id: u64,
-    pub window_requests: usize,
-    pub window_error_requests: usize,
-    pub window_total_input_tokens: i64,
-    pub window_total_output_tokens: i64,
-    pub window_estimated_cost_usd: f64,
-    pub window_original_cost_usd: f64,
-    pub window_kiro_metering_usage: f64,
-    pub window_priced_requests: usize,
-    pub window_unpriced_requests: usize,
-    pub lifetime_requests: usize,
-    pub lifetime_error_requests: usize,
-    pub lifetime_total_input_tokens: i64,
-    pub lifetime_total_output_tokens: i64,
-    pub lifetime_estimated_cost_usd: f64,
-    pub lifetime_original_cost_usd: f64,
-    pub lifetime_kiro_metering_usage: f64,
-    pub lifetime_priced_requests: usize,
-    pub lifetime_unpriced_requests: usize,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTopAggregate {
@@ -1873,8 +1722,6 @@ pub struct UsageTopAggregate {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
-    #[serde(default)]
-    pub total_kiro_metering_usage: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -2381,12 +2228,6 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         .raw_upstream_error
         .take()
         .map(RawUpstreamError::normalize);
-    for attempt in &mut record.credential_attempts {
-        attempt.raw_upstream_error = attempt
-            .raw_upstream_error
-            .take()
-            .map(RawUpstreamError::normalize);
-    }
     for attempt in &mut record.external_attempts {
         attempt.raw_upstream_error = attempt
             .raw_upstream_error
@@ -2578,15 +2419,6 @@ fn ensure_metadata_object_flags(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CredentialCostSummary {
-    pub estimated_cost_usd: f64,
-    pub original_cost_usd: f64,
-    pub kiro_metering_usage: f64,
-    pub priced_requests: usize,
-    pub unpriced_requests: usize,
-}
-
 impl UsageRecorder {
     #[cfg(test)]
     pub fn new(limit: usize) -> Self {
@@ -2772,7 +2604,7 @@ impl UsageRecorder {
             key_id.to_string(),
             KeyUsageDelta {
                 cost_usd: record.estimated_cost_usd,
-                credits: record.kiro_metering_usage,
+                credits: 0.0,
                 tokens: tokens as f64,
             },
         );
@@ -3138,37 +2970,6 @@ impl UsageRecorder {
         self.query_page_without_postgres(query, page, limit)
     }
 
-    /// 查询单个本地凭据参与过的错误记录。
-    ///
-    /// `credential_id` 同时匹配记录最终归属凭据和轮换链中的任一尝试凭据，
-    /// 这样账号在请求中途被替换时仍能在诊断页看到原始错误。
-    pub fn query_credential_error_page(
-        &self,
-        credential_id: u64,
-        page: usize,
-        limit: usize,
-    ) -> UsageRecordsPageResult {
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            return self
-                .dashboard_query("credential diagnostics", 10, async move {
-                    store
-                        .query_credential_error_page(credential_id, page, limit)
-                        .await
-                })
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        credential_id,
-                        "分页查询凭据错误诊断记录失败，回退内存记录: {}",
-                        err
-                    );
-                    self.query_credential_error_page_memory(credential_id, page, limit)
-                });
-        }
-
-        self.query_credential_error_page_memory(credential_id, page, limit)
-    }
-
     fn query_page_without_postgres(
         &self,
         query: UsageRecordQuery,
@@ -3216,43 +3017,6 @@ impl UsageRecorder {
             records.truncate(limit);
         }
 
-        UsageRecordsPageResult {
-            page,
-            limit,
-            has_next,
-            records,
-        }
-    }
-
-    fn query_credential_error_page_memory(
-        &self,
-        credential_id: u64,
-        page: usize,
-        limit: usize,
-    ) -> UsageRecordsPageResult {
-        let page = normalize_page(page);
-        let limit = normalize_page_limit(limit);
-        let start = page.saturating_sub(1).saturating_mul(limit);
-        let mut records: Vec<UsageRecord> = self
-            .records
-            .lock()
-            .iter()
-            .rev()
-            .filter(|record| {
-                (record.status != UsageRecordStatus::Success
-                    && record.credential_id == Some(credential_id))
-                    || record.credential_attempts.iter().any(|attempt| {
-                        attempt.credential_id == credential_id && attempt.action != "success"
-                    })
-            })
-            .skip(start)
-            .take(limit.saturating_add(1))
-            .cloned()
-            .collect();
-        let has_next = records.len() > limit;
-        if has_next {
-            records.truncate(limit);
-        }
         UsageRecordsPageResult {
             page,
             limit,
@@ -3655,42 +3419,6 @@ impl UsageRecorder {
         anyhow::bail!("usage dashboard top 需要 Redis 或 PgSQL 聚合存储")
     }
 
-    /// Read all local-account usage aggregates through the bounded dashboard gate.
-    ///
-    /// This path is deliberately separate from the scheduler and account probes.
-    pub fn dashboard_credential_aggregates(
-        &self,
-        timezone: Option<&str>,
-        window_key: &str,
-        credential_ids: &[u64],
-    ) -> anyhow::Result<(
-        String,
-        String,
-        String,
-        Vec<crate::anthropic::usage::UsageDashboardCredentialAggregate>,
-    )> {
-        let Some(store) = &self.postgres_store else {
-            anyhow::bail!("usage dashboard accounts 需要 PgSQL 聚合存储");
-        };
-        let store = store.clone();
-        let timezone = timezone.map(str::to_string);
-        let window_key = window_key.to_string();
-        let credential_ids = credential_ids.to_vec();
-        self.dashboard_query(
-            "PgSQL usage dashboard accounts",
-            USAGE_DASHBOARD_ACCOUNTS_TIMEOUT_SECS,
-            async move {
-                store
-                    .dashboard_credential_aggregates_for_window(
-                        timezone.as_deref(),
-                        &window_key,
-                        &credential_ids,
-                    )
-                    .await
-            },
-        )
-    }
-
     pub fn dashboard_breakdown(
         &self,
         timezone: Option<&str>,
@@ -3779,7 +3507,7 @@ impl UsageRecorder {
             total_cache_creation_input_tokens: 0,
             total_estimated_cost_usd: 0.0,
             total_original_cost_usd: 0.0,
-            total_kiro_metering_usage: 0.0,
+
             priced_requests: 0,
             unpriced_requests: 0,
             local_prompt_cache_requests: 0,
@@ -3850,7 +3578,6 @@ impl UsageRecorder {
             summary.total_cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
             summary.total_estimated_cost_usd += record.estimated_cost_usd;
             summary.total_original_cost_usd += record.original_cost_usd;
-            summary.total_kiro_metering_usage += record.kiro_metering_usage;
             if record.pricing_available {
                 summary.priced_requests += 1;
             } else {
@@ -3933,85 +3660,6 @@ impl UsageRecorder {
             realtime_billable_input_tokens,
         );
         summary
-    }
-
-    pub fn credential_cost_summary(&self) -> HashMap<u64, CredentialCostSummary> {
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            return block_on_usage_store(async move { store.credential_cost_summary().await })
-                .unwrap_or_else(|err| {
-                    tracing::warn!("汇总 PgSQL 凭据费用失败，回退内存记录: {}", err);
-                    self.credential_cost_summary_memory()
-                });
-        }
-        self.credential_cost_summary_memory()
-    }
-
-    pub fn credential_cost_summary_for_ids(
-        &self,
-        ids: &[u64],
-    ) -> HashMap<u64, CredentialCostSummary> {
-        if ids.is_empty() {
-            return HashMap::new();
-        }
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            let ids = ids.to_vec();
-            let fallback_ids = ids.clone();
-            return block_on_usage_store(async move {
-                store.credential_cost_summary_for_ids(&ids).await
-            })
-            .unwrap_or_else(|err| {
-                tracing::warn!("按 ID 汇总 PgSQL 凭据费用失败，回退内存记录: {}", err);
-                self.credential_cost_summary_memory_for_ids(fallback_ids.as_slice())
-            });
-        }
-        self.credential_cost_summary_memory_for_ids(ids)
-    }
-
-    fn credential_cost_summary_memory(&self) -> HashMap<u64, CredentialCostSummary> {
-        let mut summaries: HashMap<u64, CredentialCostSummary> = HashMap::new();
-        for record in self.records.lock().iter() {
-            let Some(credential_id) = record.credential_id else {
-                continue;
-            };
-            let entry = summaries.entry(credential_id).or_default();
-            entry.estimated_cost_usd += record.estimated_cost_usd;
-            entry.original_cost_usd += record.original_cost_usd;
-            entry.kiro_metering_usage += record.kiro_metering_usage;
-            if record.pricing_available {
-                entry.priced_requests += 1;
-            } else {
-                entry.unpriced_requests += 1;
-            }
-        }
-        summaries
-    }
-
-    fn credential_cost_summary_memory_for_ids(
-        &self,
-        ids: &[u64],
-    ) -> HashMap<u64, CredentialCostSummary> {
-        let wanted: HashSet<u64> = ids.iter().copied().collect();
-        let mut summaries: HashMap<u64, CredentialCostSummary> = HashMap::new();
-        for record in self.records.lock().iter() {
-            let Some(credential_id) = record.credential_id else {
-                continue;
-            };
-            if !wanted.contains(&credential_id) {
-                continue;
-            }
-            let entry = summaries.entry(credential_id).or_default();
-            entry.estimated_cost_usd += record.estimated_cost_usd;
-            entry.original_cost_usd += record.original_cost_usd;
-            entry.kiro_metering_usage += record.kiro_metering_usage;
-            if record.pricing_available {
-                entry.priced_requests += 1;
-            } else {
-                entry.unpriced_requests += 1;
-            }
-        }
-        summaries
     }
 
     pub async fn advance_cleanup_watermark(&self, cutoff: DateTime<Utc>) -> anyhow::Result<usize> {
@@ -4566,24 +4214,6 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
     let original_cost = record.original_cost_usd.to_string();
-    let kiro_metering_usage = record.kiro_metering_usage.to_string();
-    let attempt_chain = summarize_attempts(&record.credential_attempts);
-    // Keep the pre-diagnostic compact form searchable for existing callers.
-    // `summarize_attempts` now includes bounded error details, but old admin
-    // filters may still use chains such as `#6(429)>#9(200)`.
-    let legacy_attempt_chain = record
-        .credential_attempts
-        .iter()
-        .map(|attempt| {
-            let outcome = attempt
-                .status
-                .map(|status| status.to_string())
-                .or_else(|| attempt.error_type.clone())
-                .unwrap_or_else(|| attempt.action.clone());
-            format!("#{}({})", attempt.credential_id, outcome)
-        })
-        .collect::<Vec<_>>()
-        .join(">");
 
     [
         Some(record.id.as_str()),
@@ -4607,9 +4237,6 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.error_detail.as_deref(),
         record.pricing_model.as_deref(),
         Some(estimated_cost.as_str()),
-        Some(kiro_metering_usage.as_str()),
-        Some(attempt_chain.as_str()),
-        Some(legacy_attempt_chain.as_str()),
         credential_id.as_deref(),
     ]
     .into_iter()
@@ -4764,7 +4391,6 @@ mod tests {
             "external": series_metrics_json(),
         }))
         .expect("cached overview without breakdown fields stays readable");
-        assert!(point.local_routes.is_empty());
         assert_eq!(point.external.raw_cost_usd, 0.0);
     }
 
@@ -4817,7 +4443,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
             original_cost_usd: 0.001,
-            kiro_metering_usage: 0.0,
+
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 10,
@@ -4825,15 +4451,10 @@ mod tests {
             response_latency_ms: Some(10),
             latency_trace: None,
             simulated: source.is_simulated(),
-            sticky_bound: false,
-            fallback_from_sticky: false,
-            credential_attempts: Vec::new(),
+
             route_kind: None,
             route_subtype: None,
-            fallback_reason: None,
-            direct_policy_reason: None,
-            local_attempted: None,
-            local_preflight: None,
+
             external_pool_id: None,
             external_pool_name: None,
             external_attempts: Vec::new(),
@@ -4932,7 +4553,6 @@ mod tests {
             assert_eq!(usage.cache_creation_1h_input_tokens, 0, "round {round}");
             assert_eq!(usage.estimated_cost_usd, 0.0, "round {round}");
             assert_eq!(usage.original_cost_usd, 0.0, "round {round}");
-            assert_eq!(usage.kiro_metering_usage, 0.0, "round {round}");
             assert!(!usage.pricing_available, "round {round}");
             assert_eq!(
                 usage.error_type.as_deref(),
@@ -5263,145 +4883,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds()
-    {
-        let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
-        else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
-            return;
-        };
-        let mut config = crate::model::config::Config::default();
-        config.postgres.url = Some(postgres_url);
-        config.postgres.max_connections = 2;
-        config.redis.url = Some(redis_url);
-        config.redis.key_prefix = format!("kiro_rs:test:usage-cleanup:{}", uuid::Uuid::new_v4());
-        let postgres = Arc::new(
-            crate::storage::postgres::PostgresStore::connect_test(&config)
-                .await
-                .unwrap(),
-        );
-        let postgres_usage = Arc::new(PostgresUsageStore::new(postgres.clone()));
-        let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
-        redis.clear_usage_summary().await.unwrap();
-
-        for round in 0..3 {
-            let recorder = Arc::new(UsageRecorder::with_postgres_and_redis(
-                64,
-                postgres_usage.clone(),
-                Some(redis.clone()),
-            ));
-            let mut old = record(
-                &format!("persistent-cleanup-old-round-{round}"),
-                600,
-                UsageSource::UpstreamMetadata,
-            );
-            old.created_at = Utc::now().to_rfc3339();
-            assert_eq!(recorder.record(old.clone()), UsageRecordOutcome::Accepted);
-            tokio::time::sleep(StdDuration::from_millis(2)).await;
-            let cutoff = Utc::now();
-            tokio::time::sleep(StdDuration::from_millis(2)).await;
-            let mut new = record(
-                &format!("persistent-cleanup-new-round-{round}"),
-                600,
-                UsageSource::UpstreamMetadata,
-            );
-            new.created_at = Utc::now().to_rfc3339();
-            assert_eq!(recorder.record(new), UsageRecordOutcome::Accepted);
-            let drained = recorder.drain(StdDuration::from_secs(2)).await;
-            assert!(drained.postgres.drained, "round {round}: postgres writer");
-            assert!(drained.redis.drained, "round {round}: redis writer");
-
-            let effective_cutoff = postgres_usage
-                .advance_soft_delete_cleanup_watermark(cutoff)
-                .await
-                .unwrap();
-            recorder
-                .advance_cleanup_watermark(effective_cutoff)
-                .await
-                .unwrap();
-            redis.invalidate_usage_derived_cache().await.unwrap();
-            loop {
-                let batch = postgres_usage
-                    .soft_delete_cleanup_batch(cutoff, 10)
-                    .await
-                    .unwrap();
-                if batch.has_remaining == Some(false) {
-                    break;
-                }
-            }
-            redis.clear_usage_summary().await.unwrap();
-
-            assert!(
-                redis.usage_summary(500).await.unwrap().is_none(),
-                "round {round}: invalidated Redis summary must force PgSQL fallback"
-            );
-            let summary = recorder.summary(500);
-            assert_eq!(summary.total_requests, 1, "round {round}");
-            assert!((summary.total_estimated_cost_usd - 0.001).abs() < 1e-12);
-            let dashboard = recorder.dashboard(Some("UTC"), 500).unwrap();
-            let last24h = dashboard
-                .windows
-                .iter()
-                .find(|window| window.key == "last24h")
-                .unwrap();
-            assert_eq!(last24h.summary.total_requests, 1, "round {round}");
-            assert!((last24h.summary.total_estimated_cost_usd - 0.001).abs() < 1e-12);
-            let costs = recorder.credential_cost_summary();
-            let credential = costs.get(&1).expect("remaining credential cost");
-            assert!((credential.estimated_cost_usd - 0.001).abs() < 1e-12);
-
-            let mut summary_latencies = Vec::with_capacity(20);
-            for _ in 0..20 {
-                let started = Instant::now();
-                assert_eq!(recorder.summary(500).total_requests, 1);
-                summary_latencies.push(started.elapsed().as_micros() as u64);
-            }
-            summary_latencies.sort_unstable();
-            let summary_p95 = summary_latencies[18];
-            let mut dashboard_latencies = Vec::with_capacity(10);
-            for _ in 0..10 {
-                let started = Instant::now();
-                recorder.dashboard(Some("UTC"), 500).unwrap();
-                dashboard_latencies.push(started.elapsed().as_micros() as u64);
-            }
-            dashboard_latencies.sort_unstable();
-            let dashboard_p95 = dashboard_latencies[8];
-            eprintln!(
-                "usage cleanup fallback round {round}: summary_p95_us={summary_p95}, dashboard_p95_us={dashboard_p95}"
-            );
-            assert!(
-                summary_p95 < 250_000,
-                "round {round}: PgSQL summary fallback p95 was {summary_p95}us"
-            );
-            assert!(
-                dashboard_p95 < 500_000,
-                "round {round}: PgSQL dashboard fallback p95 was {dashboard_p95}us"
-            );
-            assert!(recorder.shutdown(StdDuration::from_secs(2)).await.drained);
-            drop(recorder);
-
-            let restarted = UsageRecorder::with_postgres_and_redis(
-                64,
-                postgres_usage.clone(),
-                Some(redis.clone()),
-            );
-            assert_eq!(
-                restarted.record(old),
-                UsageRecordOutcome::RejectedCleanupWatermark,
-                "round {round}: restart reloads the persistent watermark"
-            );
-            assert_eq!(restarted.summary(500).total_requests, 1, "round {round}");
-            assert!(restarted.shutdown(StdDuration::from_secs(2)).await.drained);
-        }
-
-        postgres.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
     async fn production_postgres_only_usage_never_materializes_redis_for_five_rounds() {
         let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
@@ -5650,28 +5131,6 @@ mod tests {
     }
 
     #[test]
-    fn credential_cost_summary_includes_kiro_metering_usage() {
-        let recorder = UsageRecorder::new(10);
-        let mut first = record("metering-1", 0, UsageSource::ContextEstimate);
-        first.credential_id = Some(7);
-        first.kiro_metering_usage = 0.125;
-        let mut second = record("metering-2", 0, UsageSource::UpstreamMetadata);
-        second.credential_id = Some(7);
-        second.kiro_metering_usage = 0.375;
-
-        recorder.record(first);
-        recorder.record(second);
-
-        let all = recorder.credential_cost_summary();
-        let summary = all.get(&7).expect("credential summary");
-        assert!((summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
-
-        let by_id = recorder.credential_cost_summary_for_ids(&[7]);
-        let summary = by_id.get(&7).expect("credential summary by id");
-        assert!((summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn usage_record_deserializes_historical_json_without_error_diagnostics() {
         let mut value = serde_json::to_value(record("historical", 0, UsageSource::None)).unwrap();
         let object = value.as_object_mut().unwrap();
@@ -5871,54 +5330,6 @@ mod tests {
     }
 
     #[test]
-    fn credential_error_page_includes_rotated_attempts_and_excludes_successes() {
-        let recorder = UsageRecorder::new(10);
-        let mut rotated = record("rotated-error", 0, UsageSource::None);
-        rotated.status = UsageRecordStatus::Error;
-        rotated.credential_id = Some(9);
-        rotated.credential_attempts = vec![KiroCredentialAttempt::new(
-            0,
-            42,
-            Some("rotated@example.com".to_string()),
-            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
-            "transient_retry",
-            Some("rate_limit"),
-            Some("upstream_failure reason=api_rate_limit".to_string()),
-            12,
-        )];
-        recorder.record(rotated);
-
-        let mut success = record("rotated-success", 0, UsageSource::None);
-        success.credential_id = Some(42);
-        recorder.record(success);
-
-        let mut recovered = record("rotated-recovered", 0, UsageSource::None);
-        recovered.credential_id = Some(9);
-        recovered.credential_attempts = vec![KiroCredentialAttempt::new(
-            0,
-            42,
-            Some("rotated@example.com".to_string()),
-            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
-            "transient_retry",
-            Some("rate_limit"),
-            Some("upstream_failure reason=api_rate_limit".to_string()),
-            12,
-        )];
-        recorder.record(recovered);
-
-        let result = recorder.query_credential_error_page(42, 1, 20);
-        assert_eq!(result.records.len(), 2);
-        assert_eq!(result.records[0].id, "rotated-recovered");
-        assert_eq!(result.records[1].id, "rotated-error");
-        assert_eq!(
-            result.records[0].credential_attempts[0]
-                .error_message
-                .as_deref(),
-            Some("upstream_failure reason=api_rate_limit")
-        );
-    }
-
-    #[test]
     fn recorder_query_supports_exact_request_id_and_model_aliases() {
         let recorder = UsageRecorder::new(10);
         let mut first = record("req_01alpha", 10, UsageSource::UpstreamMetadata);
@@ -5998,84 +5409,6 @@ mod tests {
     }
 
     #[test]
-    fn recorder_search_matches_model_account_session_and_error_text() {
-        let recorder = UsageRecorder::new(10);
-        let mut first = record("1", 10, UsageSource::LocalPromptCache);
-        first.model = "claude-sonnet-4-5".to_string();
-        first.credential_label = Some("alpha@example.com".to_string());
-        first.conversation_id = Some("session-alpha".to_string());
-        recorder.record(first);
-
-        let mut second = record("2", 20, UsageSource::UpstreamMetadata);
-        second.model = "claude-opus-4-5".to_string();
-        second.credential_id = Some(42);
-        second.credential_label = Some("beta@example.com".to_string());
-        second.conversation_id = Some("session-beta".to_string());
-        second.error_message = Some("upstream quota exceeded".to_string());
-        recorder.record(second);
-
-        let by_model = recorder.query(UsageRecordQuery {
-            q: Some("opus".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(by_model.total, 1);
-        assert_eq!(by_model.records[0].id, "2");
-
-        let by_account = recorder.query(UsageRecordQuery {
-            q: Some("alpha@example".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(by_account.total, 1);
-        assert_eq!(by_account.records[0].id, "1");
-
-        let by_credential_id = recorder.query(UsageRecordQuery {
-            q: Some("beta@example".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(by_credential_id.total, 1);
-        assert_eq!(by_credential_id.records[0].id, "2");
-
-        let by_error = recorder.query(UsageRecordQuery {
-            q: Some("quota".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(by_error.total, 1);
-        assert_eq!(by_error.records[0].id, "2");
-
-        let mut chained = record("3", 30, UsageSource::LocalPromptCache);
-        chained.credential_attempts = vec![
-            KiroCredentialAttempt::new(
-                0,
-                6,
-                Some("first@example.com".to_string()),
-                Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
-                "transient_retry",
-                Some("transient_error"),
-                Some("429 Too Many Requests".to_string()),
-                10,
-            ),
-            KiroCredentialAttempt::new(
-                1,
-                9,
-                Some("second@example.com".to_string()),
-                Some(reqwest::StatusCode::OK),
-                "success",
-                None::<&str>,
-                None::<String>,
-                20,
-            ),
-        ];
-        recorder.record(chained);
-
-        let by_chain = recorder.query(UsageRecordQuery {
-            q: Some("#6(429)>#9(200)".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(by_chain.total, 1);
-        assert_eq!(by_chain.records[0].id, "3");
-    }
-
-    #[test]
     fn summary_counts_high_cache_and_sources() {
         let recorder = UsageRecorder::new(10);
         recorder.record(record("1", 5, UsageSource::UpstreamMetadata));
@@ -6104,35 +5437,6 @@ mod tests {
         assert_eq!(summary.realtime.billable_tpm, 120.0);
         assert!((summary.total_original_cost_usd - 0.010).abs() < f64::EPSILON);
         assert_eq!(summary.top_credentials[0].key, "1");
-    }
-
-    #[test]
-    fn credential_cost_summary_aggregates_kiro_metering_usage() {
-        let recorder = UsageRecorder::new(10);
-        let mut first = record("1", 5, UsageSource::UpstreamMetadata);
-        first.credential_id = Some(7);
-        first.estimated_cost_usd = 0.25;
-        first.original_cost_usd = 0.50;
-        first.kiro_metering_usage = 1.5;
-        first.pricing_available = true;
-        recorder.record(first);
-
-        let mut second = record("2", 5, UsageSource::UpstreamMetadata);
-        second.credential_id = Some(7);
-        second.estimated_cost_usd = 0.75;
-        second.original_cost_usd = 1.25;
-        second.kiro_metering_usage = 2.25;
-        second.pricing_available = false;
-        recorder.record(second);
-
-        let summary = recorder.credential_cost_summary_for_ids(&[7]);
-        let credential = summary.get(&7).expect("credential summary");
-
-        assert_eq!(credential.estimated_cost_usd, 1.0);
-        assert_eq!(credential.original_cost_usd, 1.75);
-        assert_eq!(credential.kiro_metering_usage, 3.75);
-        assert_eq!(credential.priced_requests, 1);
-        assert_eq!(credential.unpriced_requests, 1);
     }
 
     #[test]

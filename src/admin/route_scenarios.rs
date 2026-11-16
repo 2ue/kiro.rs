@@ -13,7 +13,6 @@ use serde_json::json;
 
 use super::error::AdminServiceError;
 use super::service::{AdminService, block_on_admin_store_public};
-use super::types::SetCredentialRoutePolicyRequest;
 use crate::external_pool::UpdateExternalPoolRequest;
 use crate::model::config::{ExternalPoolRouteMode, normalize_route_rules};
 
@@ -72,11 +71,7 @@ pub struct AccountRoutePolicy {
 #[serde(rename_all = "camelCase")]
 pub struct RouteScenarioContent {
     #[serde(default)]
-    pub local: RoutePolicy,
-    #[serde(default)]
     pub external: RoutePolicy,
-    #[serde(default)]
-    pub local_accounts: Vec<AccountRoutePolicy>,
     #[serde(default)]
     pub external_accounts: Vec<AccountRoutePolicy>,
 }
@@ -94,9 +89,7 @@ impl RouteScenarioContent {
                 .collect()
         };
         Self {
-            local: self.local.normalized(),
             external: self.external.normalized(),
-            local_accounts: dedup(&self.local_accounts),
             external_accounts: dedup(&self.external_accounts),
         }
     }
@@ -139,7 +132,6 @@ pub struct RouteScenarioListResponse {
 #[serde(rename_all = "camelCase")]
 pub struct RouteScenarioOptions {
     pub routes: Vec<String>,
-    pub local_accounts: Vec<RouteScenarioAccountOption>,
     pub external_accounts: Vec<RouteScenarioAccountOption>,
 }
 
@@ -155,9 +147,7 @@ pub struct RouteScenarioAccountOption {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteScenarioItemKind {
-    LocalPool,
     ExternalPool,
-    LocalAccount,
     ExternalAccount,
 }
 
@@ -190,7 +180,6 @@ pub struct RouteScenarioPreview {
     /// Rules that are not one of the selectable routes.
     pub unknown_routes: Vec<String>,
     /// Routes no local / external account would accept under the scenario.
-    pub uncovered_local_routes: Vec<String>,
     pub uncovered_external_routes: Vec<String>,
 }
 
@@ -226,9 +215,7 @@ pub struct RouteScenarioApplyResponse {
 
 /// Current state of every item a scenario covers.
 struct RouteState {
-    local: RoutePolicy,
     external: RoutePolicy,
-    local_accounts: BTreeMap<u64, (String, RoutePolicy)>,
     external_accounts: BTreeMap<u64, (String, RoutePolicy)>,
 }
 
@@ -291,16 +278,12 @@ fn validate_request(
         )));
     }
     let content = req.content.normalized();
-    if content.local_accounts.len() + content.external_accounts.len() > MAX_SCENARIO_ACCOUNTS {
+    if content.external_accounts.len() > MAX_SCENARIO_ACCOUNTS {
         return Err(AdminServiceError::InvalidCredential(format!(
             "单个场景最多包含 {MAX_SCENARIO_ACCOUNTS} 个账号规则"
         )));
     }
-    validate_policy(&content.local, "本地整体")?;
     validate_policy(&content.external, "外部整体")?;
-    for account in &content.local_accounts {
-        validate_policy(&account.policy, &format!("本地账号 #{}", account.id))?;
-    }
     for account in &content.external_accounts {
         validate_policy(&account.policy, &format!("外部账号 #{}", account.id))?;
     }
@@ -331,39 +314,21 @@ fn plan_items(
     content: &RouteScenarioContent,
     state: &RouteState,
 ) -> (Vec<PlannedItem>, Vec<RouteScenarioItemKey>) {
-    let mut items = vec![
-        PlannedItem {
-            key: RouteScenarioItemKey {
-                kind: RouteScenarioItemKind::LocalPool,
-                id: 0,
-            },
-            label: "本地整体".to_string(),
-            before: state.local.clone(),
-            after: content.local.clone(),
+    let mut items = vec![PlannedItem {
+        key: RouteScenarioItemKey {
+            kind: RouteScenarioItemKind::ExternalPool,
+            id: 0,
         },
-        PlannedItem {
-            key: RouteScenarioItemKey {
-                kind: RouteScenarioItemKind::ExternalPool,
-                id: 0,
-            },
-            label: "外部整体".to_string(),
-            before: state.external.clone(),
-            after: content.external.clone(),
-        },
-    ];
+        label: "外部整体".to_string(),
+        before: state.external.clone(),
+        after: content.external.clone(),
+    }];
     let mut missing = Vec::new();
-    for (kind, listed, current) in [
-        (
-            RouteScenarioItemKind::LocalAccount,
-            &content.local_accounts,
-            &state.local_accounts,
-        ),
-        (
-            RouteScenarioItemKind::ExternalAccount,
-            &content.external_accounts,
-            &state.external_accounts,
-        ),
-    ] {
+    for (kind, listed, current) in [(
+        RouteScenarioItemKind::ExternalAccount,
+        &content.external_accounts,
+        &state.external_accounts,
+    )] {
         let listed: BTreeMap<u64, &RoutePolicy> = listed
             .iter()
             .map(|account| (account.id, &account.policy))
@@ -391,11 +356,6 @@ impl AdminService {
     fn route_state(&self) -> Result<RouteState, AdminServiceError> {
         let config = self.route_scenario_runtime_config();
         let pools = self.list_external_pools()?;
-        let local_accounts = self
-            .route_scenario_local_accounts()
-            .into_iter()
-            .map(|(id, label, policy)| (id, (label, policy.normalized())))
-            .collect();
         let external_accounts = pools
             .into_iter()
             .map(|pool| {
@@ -409,17 +369,11 @@ impl AdminService {
             })
             .collect();
         Ok(RouteState {
-            local: RoutePolicy {
-                route_mode: config.local_pool_route_mode,
-                route_rules: config.local_pool_route_rules,
-            }
-            .normalized(),
             external: RoutePolicy {
                 route_mode: config.external_pool_route_mode,
                 route_rules: config.external_pool_route_rules,
             }
             .normalized(),
-            local_accounts,
             external_accounts,
         })
     }
@@ -436,7 +390,6 @@ impl AdminService {
         };
         Ok(RouteScenarioOptions {
             routes: self.route_scenario_routes(),
-            local_accounts: accounts(state.local_accounts),
             external_accounts: accounts(state.external_accounts),
         })
     }
@@ -551,9 +504,7 @@ impl AdminService {
                 .collect()
         };
         Ok(RouteScenarioContent {
-            local: state.local.clone(),
             external: state.external.clone(),
-            local_accounts: restricted(&state.local_accounts),
             external_accounts: restricted(&state.external_accounts),
         })
     }
@@ -590,7 +541,6 @@ impl AdminService {
                 .map(|item| item.after.clone())
                 .unwrap_or_default()
         };
-        let local_pool = pool_after(RouteScenarioItemKind::LocalPool);
         let external_pool = pool_after(RouteScenarioItemKind::ExternalPool);
         let uncovered = |pool: &RoutePolicy, kind: RouteScenarioItemKind| -> Vec<String> {
             routes
@@ -600,7 +550,6 @@ impl AdminService {
                 .cloned()
                 .collect()
         };
-        let uncovered_local_routes = uncovered(&local_pool, RouteScenarioItemKind::LocalAccount);
         let uncovered_external_routes =
             uncovered(&external_pool, RouteScenarioItemKind::ExternalAccount);
 
@@ -623,7 +572,6 @@ impl AdminService {
             unchanged,
             missing_accounts,
             unknown_routes: unknown_routes.into_iter().collect(),
-            uncovered_local_routes,
             uncovered_external_routes,
         })
     }
@@ -650,7 +598,7 @@ impl AdminService {
         let total = selected.len();
         let mut results = Vec::new();
         let mut skipped = 0;
-        let mut pool_update: Option<(RoutePolicy, RoutePolicy)> = None;
+        let mut pool_update: Option<RoutePolicy> = None;
         let mut pool_items = Vec::new();
         for item in selected {
             if item.before == item.after {
@@ -658,25 +606,9 @@ impl AdminService {
                 continue;
             }
             match item.key.kind {
-                RouteScenarioItemKind::LocalPool | RouteScenarioItemKind::ExternalPool => {
-                    let entry = pool_update
-                        .get_or_insert_with(|| (state.local.clone(), state.external.clone()));
-                    if item.key.kind == RouteScenarioItemKind::LocalPool {
-                        entry.0 = item.after.clone();
-                    } else {
-                        entry.1 = item.after.clone();
-                    }
+                RouteScenarioItemKind::ExternalPool => {
+                    pool_update = Some(item.after.clone());
                     pool_items.push(item);
-                }
-                RouteScenarioItemKind::LocalAccount => {
-                    let result = self.set_credential_route_policy(
-                        item.key.id,
-                        SetCredentialRoutePolicyRequest {
-                            route_mode: item.after.route_mode,
-                            route_rules: item.after.route_rules.clone(),
-                        },
-                    );
-                    results.push(apply_item(item, result));
                 }
                 RouteScenarioItemKind::ExternalAccount => {
                     let result = self
@@ -693,9 +625,9 @@ impl AdminService {
                 }
             }
         }
-        if let Some((local, external)) = pool_update {
+        if let Some(external) = pool_update {
             let error = self
-                .set_pool_route_policies(&local, &external)
+                .set_pool_route_policies(&external)
                 .err()
                 .map(|err| err.to_string());
             for item in pool_items {
@@ -823,160 +755,5 @@ pub(super) mod http {
     ) -> Response {
         let request = payload.map(|Json(request)| request).unwrap_or_default();
         respond(state.service.apply_route_scenario(id, request))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn policy(mode: ExternalPoolRouteMode, rules: &[&str]) -> RoutePolicy {
-        RoutePolicy {
-            route_mode: mode,
-            route_rules: rules.iter().map(|rule| rule.to_string()).collect(),
-        }
-    }
-
-    fn state() -> RouteState {
-        RouteState {
-            local: RoutePolicy::unrestricted(),
-            external: RoutePolicy::unrestricted(),
-            local_accounts: BTreeMap::from([
-                (1, ("a".to_string(), RoutePolicy::unrestricted())),
-                (
-                    2,
-                    (
-                        "b".to_string(),
-                        policy(ExternalPoolRouteMode::DenyList, &["/cc"]),
-                    ),
-                ),
-                (3, ("c".to_string(), RoutePolicy::unrestricted())),
-            ]),
-            external_accounts: BTreeMap::from([(
-                10,
-                ("pool".to_string(), RoutePolicy::unrestricted()),
-            )]),
-        }
-    }
-
-    #[test]
-    fn unlisted_accounts_reset_to_unrestricted_and_missing_ones_are_reported() {
-        let content = RouteScenarioContent {
-            local: policy(ExternalPoolRouteMode::DenyList, &["/ha"]),
-            local_accounts: vec![
-                AccountRoutePolicy {
-                    id: 1,
-                    policy: policy(ExternalPoolRouteMode::AllowList, &["/v1"]),
-                },
-                AccountRoutePolicy {
-                    id: 99,
-                    policy: policy(ExternalPoolRouteMode::AllowList, &["/v1"]),
-                },
-            ],
-            ..Default::default()
-        };
-        let (items, missing) = plan_items(&content, &state());
-        let after = |kind, id| {
-            items
-                .iter()
-                .find(|item| item.key == RouteScenarioItemKey { kind, id })
-                .unwrap()
-        };
-        assert_eq!(
-            after(RouteScenarioItemKind::LocalPool, 0).after,
-            policy(ExternalPoolRouteMode::DenyList, &["/ha"])
-        );
-        assert_eq!(
-            after(RouteScenarioItemKind::LocalAccount, 1).after,
-            policy(ExternalPoolRouteMode::AllowList, &["/v1"])
-        );
-        // Account 2 had a rule but is not listed: reset to unrestricted.
-        assert_eq!(
-            after(RouteScenarioItemKind::LocalAccount, 2).after,
-            RoutePolicy::unrestricted()
-        );
-        assert_eq!(
-            after(RouteScenarioItemKind::ExternalAccount, 10).after,
-            RoutePolicy::unrestricted()
-        );
-        assert_eq!(
-            missing,
-            vec![RouteScenarioItemKey {
-                kind: RouteScenarioItemKind::LocalAccount,
-                id: 99
-            }]
-        );
-        // 2 pool items + 3 local + 1 external; the missing account is not written.
-        assert_eq!(items.len(), 6);
-    }
-
-    #[test]
-    fn content_normalization_dedups_accounts_and_drops_rules_of_unrestricted_policies() {
-        let content = RouteScenarioContent {
-            local: policy(ExternalPoolRouteMode::AllowAll, &["/cc"]),
-            local_accounts: vec![
-                AccountRoutePolicy {
-                    id: 1,
-                    policy: policy(ExternalPoolRouteMode::DenyList, &["/CC/"]),
-                },
-                AccountRoutePolicy {
-                    id: 1,
-                    policy: policy(ExternalPoolRouteMode::DenyList, &["/ha"]),
-                },
-            ],
-            ..Default::default()
-        }
-        .normalized();
-        assert!(content.local.route_rules.is_empty());
-        assert_eq!(content.local_accounts.len(), 1);
-        assert_eq!(
-            content.local_accounts[0].policy.route_rules,
-            vec!["/ha".to_string()]
-        );
-    }
-
-    #[test]
-    fn validation_rejects_empty_allow_list_and_blank_names() {
-        let mut req = SaveRouteScenarioRequest {
-            name: "  ".to_string(),
-            description: None,
-            content: RouteScenarioContent::default(),
-        };
-        assert!(validate_request(&req).is_err());
-        req.name = "日常".to_string();
-        assert!(validate_request(&req).is_ok());
-        req.content.local_accounts = vec![AccountRoutePolicy {
-            id: 1,
-            policy: policy(ExternalPoolRouteMode::AllowList, &[]),
-        }];
-        assert!(validate_request(&req).is_err());
-        req.content.local_accounts = vec![AccountRoutePolicy {
-            id: 1,
-            policy: RoutePolicy {
-                route_mode: ExternalPoolRouteMode::DenyList,
-                route_rules: vec![format!("/{}", "x".repeat(300))],
-            },
-        }];
-        assert!(validate_request(&req).is_err());
-    }
-
-    #[test]
-    fn content_round_trips_through_json_with_flat_account_entries() {
-        let content = RouteScenarioContent {
-            local_accounts: vec![AccountRoutePolicy {
-                id: 7,
-                policy: policy(ExternalPoolRouteMode::DenyList, &["/cc"]),
-            }],
-            ..Default::default()
-        };
-        let value = serde_json::to_value(&content).unwrap();
-        assert_eq!(
-            value["localAccounts"][0],
-            json!({"id": 7, "routeMode": "deny_list", "routeRules": ["/cc"]})
-        );
-        assert_eq!(
-            serde_json::from_value::<RouteScenarioContent>(value).unwrap(),
-            content
-        );
     }
 }

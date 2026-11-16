@@ -12,29 +12,15 @@ pub(super) async fn handle_messages_endpoint(
     attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
     let runtime_config = request_runtime_config(&state);
-    let inference_attempt_budget = Arc::new(InferenceAttemptBudget::with_auxiliary_max_attempts(
+    let inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(
         runtime_config.inference_upstream_max_attempts,
-        runtime_config.auxiliary_upstream_max_attempts,
     ));
     inference_attempt_budget.set_dispatch_route(&endpoint);
-    let local_dispatch_max_wait_secs = state
-        .kiro_provider
-        .as_ref()
-        .map(|_| state.runtime.snapshot().credential_dispatch_max_wait_secs)
-        .unwrap_or(5);
-    let shared_dispatch_max_wait_secs = local_dispatch_max_wait_secs
-        .max(
-            runtime_config
-                .external_pools
-                .effective_dispatch_max_wait_secs(),
-        )
-        .max(
-            runtime_config
-                .external_pools
-                .external_pool_local_rescue_max_wait_secs,
-        );
-    inference_attempt_budget.set_dispatch_deadline_after(std::time::Duration::from_secs(
-        shared_dispatch_max_wait_secs.max(1),
+    inference_attempt_budget.set_dispatch_deadline_after(Duration::from_secs(
+        runtime_config
+            .external_pools
+            .effective_dispatch_max_wait_secs()
+            .max(1),
     ));
     let mut defaulted_max_tokens = None;
     let mut raw_probe = probe_raw_messages_body(&raw_body);
@@ -223,7 +209,6 @@ pub(super) async fn handle_messages_endpoint(
         requires_normalized_body = true;
     }
     let effective_raw_probe = Arc::new(raw_probe);
-    let mut parsed_raw_probe = effective_raw_probe.clone();
     if let Some((sanitized_body, report)) = raw_history_sanitization.sanitized_body {
         if runtime_config.compat_profile.is_strict() && report.blocks > 0 {
             let request_id = envelope::request_id();
@@ -247,303 +232,23 @@ pub(super) async fn handle_messages_endpoint(
             );
         }
         raw_body = Bytes::from(sanitized_body);
-        parsed_raw_probe = Arc::new(probe_raw_messages_body(&raw_body));
         requires_normalized_body = true;
     }
 
-    if should_try_raw_external_routes(requires_normalized_body) {
-        if let Some(response) = maybe_raw_external_direct_response(
-            &state,
-            headers.clone(),
-            effective_raw_body.clone(),
-            &endpoint,
-            inference_attempt_budget.clone(),
-            request_api_key_id.clone(),
-            ingress_id.clone(),
-            effective_raw_probe.clone(),
-        )
-        .await
-        {
-            return response;
-        }
-        let mut raw_preflight_failure = None;
-        if let Some(decision) = maybe_raw_external_preflight_response(
-            &state,
-            headers.clone(),
-            effective_raw_body.clone(),
-            &endpoint,
-            inference_attempt_budget.clone(),
-            request_api_key_id.clone(),
-            ingress_id.clone(),
-            effective_raw_probe.clone(),
-        )
-        .await
-        {
-            match decision {
-                RawExternalPreflightDecision::Response(response) => return response,
-                RawExternalPreflightDecision::ContinueWithLocalRescue(failure) => {
-                    raw_preflight_failure = Some(failure);
-                }
-            }
-        }
-        return continue_messages_endpoint_after_raw_external_routes(
-            state,
-            headers,
-            effective_raw_body,
-            effective_raw_probe,
-            raw_body,
-            parsed_raw_probe,
-            endpoint,
-            inference_attempt_budget,
-            request_api_key_id,
-            ingress_id,
-            requires_normalized_body,
-            attribution,
-            raw_preflight_failure,
-        )
-        .await;
-    }
-    continue_messages_endpoint_after_raw_external_routes(
-        state,
-        headers,
-        effective_raw_body,
-        effective_raw_probe,
-        raw_body,
-        parsed_raw_probe,
-        endpoint,
-        inference_attempt_budget,
-        request_api_key_id,
-        ingress_id,
-        requires_normalized_body,
-        attribution,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn continue_messages_endpoint_after_raw_external_routes(
-    state: AppState,
-    headers: HeaderMap,
-    effective_raw_body: Bytes,
-    effective_raw_probe: Arc<RawMessagesBodyProbe>,
-    raw_body: Bytes,
-    parsed_raw_probe: Arc<RawMessagesBodyProbe>,
-    endpoint: String,
-    inference_attempt_budget: Arc<InferenceAttemptBudget>,
-    request_api_key_id: Option<String>,
-    ingress_id: Option<String>,
-    requires_normalized_body: bool,
-    attribution: Option<RequestRejectionAttribution>,
-    raw_preflight_failure: Option<RawExternalPreflightFailure>,
-) -> Response {
-    let runtime_config = request_runtime_config(&state);
-    if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
-        &state,
-        &runtime_config,
-        &endpoint,
-        attribution.as_ref(),
-        &parsed_raw_probe,
-    ) {
-        return response;
-    }
-    let request_id = envelope::request_id();
-    let payload = match parse_messages_payload_with_probe(
-        &raw_body,
-        &parsed_raw_probe,
-        &request_id,
-        &runtime_config.local_request_compat,
-    ) {
-        Ok(payload) => payload,
-        Err(error) => {
-            record_entry_request_error(
-                attribution.as_ref(),
-                &endpoint,
-                &request_id,
-                &error,
-                Some(&parsed_raw_probe),
-            );
-            return error.to_response(&request_id);
-        }
-    };
     post_messages_inner(
         state,
         headers,
         effective_raw_body,
         effective_raw_probe,
         raw_body,
-        payload,
         endpoint,
         inference_attempt_budget,
         request_api_key_id,
         ingress_id,
         requires_normalized_body,
         attribution,
-        raw_preflight_failure,
     )
     .await
-}
-
-static EARLY_REJECTION_LOG_THROTTLE: std::sync::LazyLock<crate::common::log_throttle::LogThrottle> =
-    std::sync::LazyLock::new(|| {
-        crate::common::log_throttle::LogThrottle::new(std::time::Duration::from_secs(1))
-    });
-
-fn should_try_raw_external_routes(requires_normalized_body: bool) -> bool {
-    !requires_normalized_body
-}
-
-fn maybe_local_pool_unavailable_fast_fail_response(
-    state: &AppState,
-    runtime_config: &RequestRuntimeConfig,
-    endpoint: &str,
-    attribution: Option<&RequestRejectionAttribution>,
-    raw_probe: &RawMessagesBodyProbe,
-) -> Option<Response> {
-    let provider = state.kiro_provider.as_ref()?;
-    let model = raw_probe
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())?;
-
-    // The dispatch queue is full and no credential has a free slot: the scheduler would turn
-    // this request away anyway, so answer before parsing the body. During an overload this is
-    // the bulk of incoming requests, and the cheaper the rejection the faster the queued ones
-    // drain.
-    let external_can_take_route = runtime_config.external_pools.external_pools_enabled
-        && state.external_pool_manager.as_ref().is_some_and(|manager| {
-            manager.has_cached_eligible_pool_for_route_and_model(
-                &runtime_config.external_pools,
-                endpoint,
-                model,
-            )
-        });
-    if !external_can_take_route
-        && let Some(retry_after_secs) = provider.dispatch_queue_full_retry_after(Some(model))
-    {
-        if let Some(attribution) = attribution {
-            attribution.apply_local_temporary_backoff(retry_after_secs);
-        }
-        let request_id = envelope::request_id();
-        // Every arriving request takes this path while the queue is full: log one line a second.
-        if let Some(suppressed) = EARLY_REJECTION_LOG_THROTTLE.admit() {
-            tracing::warn!(
-                request_id,
-                endpoint,
-                model,
-                retry_after_secs,
-                suppressed_since_last = suppressed,
-                "local dispatch queue is full and no credential has a free slot; rejecting before body processing"
-            );
-        }
-        let response = envelope::error_response_with_id_and_headers(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            envelope::public_rate_limit_message(Some(retry_after_secs)),
-            &request_id,
-            [("retry-after", retry_after_secs.to_string())],
-        );
-        record_pre_usage_rejection_with_metadata_and_context(
-            attribution,
-            RequestRejectionReason::LocalPoolTemporaryUnavailable,
-            endpoint,
-            &response,
-            Some(serde_json::json!({ "localState": "dispatch_queue_full" })),
-            request_rejection_usage_context_from_probe(raw_probe),
-        );
-        return Some(response);
-    }
-
-    // If external pools are globally enabled and wired, the normalized external fallback path may
-    // still be eligible after typed parsing. Do not preempt it with a local-only response.
-    if runtime_config.external_pools.external_pools_enabled && state.external_pool_manager.is_some()
-    {
-        return None;
-    }
-
-    let local_state = provider.local_pool_route_state_cached_for_route(Some(model), Some(endpoint));
-    let (status, error_type, message, reason, retry_after_secs) =
-        local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)?;
-
-    if let (Some(attribution), Some(retry_after_secs)) = (attribution, retry_after_secs) {
-        attribution.apply_local_temporary_backoff(retry_after_secs);
-    }
-
-    let request_id = envelope::request_id();
-    tracing::warn!(
-        request_id,
-        endpoint,
-        model,
-        local_state = ?local_state.kind,
-        local_total = local_state.total,
-        local_available = local_state.available,
-        local_dispatchable = local_state.dispatchable,
-        local_usable = local_state.usable,
-        retry_after_secs = ?retry_after_secs,
-        "local credential pool is unavailable and no external pool takeover is available; rejecting before full body processing"
-    );
-    let response = match retry_after_secs {
-        Some(retry_after_secs) => envelope::error_response_with_id_and_headers(
-            status,
-            error_type,
-            message,
-            &request_id,
-            [("retry-after", retry_after_secs.to_string())],
-        ),
-        None => envelope::error_response_with_id(status, error_type, message, &request_id),
-    };
-    record_pre_usage_rejection_with_metadata_and_context(
-        attribution,
-        reason,
-        endpoint,
-        &response,
-        None,
-        request_rejection_usage_context_from_probe(raw_probe),
-    );
-    Some(response)
-}
-
-fn local_pool_fast_fail_response_parts(
-    kind: LocalPoolRouteStateKind,
-    retry_after_secs: Option<u64>,
-) -> Option<(
-    StatusCode,
-    &'static str,
-    String,
-    RequestRejectionReason,
-    Option<u64>,
-)> {
-    Some(match kind {
-        LocalPoolRouteStateKind::NoCredentials
-        | LocalPoolRouteStateKind::AllDisabled
-        | LocalPoolRouteStateKind::ProxyBlocked => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "api_error",
-            envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE.to_string(),
-            RequestRejectionReason::LocalPoolUnavailable,
-            None,
-        ),
-        LocalPoolRouteStateKind::RiskCircuitOpen => {
-            let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE.to_string(),
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
-                Some(retry_after_secs),
-            )
-        }
-        // A Redis scheduler breaker that opened on a few slow Redis calls says nothing about the
-        // accounts: the dispatch path still serves them from local state with a bounded wait.
-        // Rejecting here turned every Redis hiccup into seconds of 429s for the whole pool while
-        // every account was idle (mock 2026-10-31: 52,605 rejections at 120-180 of 300 slots).
-        LocalPoolRouteStateKind::Ready
-        | LocalPoolRouteStateKind::NoModelCompatible
-        | LocalPoolRouteStateKind::AllCoolingDown
-        | LocalPoolRouteStateKind::CapacityFull
-        | LocalPoolRouteStateKind::SchedulerRedisDegraded => return None,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -678,7 +383,7 @@ pub(super) fn parse_messages_payload(
     )
 }
 
-fn parse_messages_payload_with_probe(
+pub(super) fn parse_messages_payload_with_probe(
     raw_body: &Bytes,
     probe: &RawMessagesBodyProbe,
     _request_id: &str,
@@ -951,21 +656,21 @@ mod tests {
     use crate::anthropic::prompt_cache::PromptCacheTracker;
     use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
     use crate::anthropic::request_admission::RequestAdmissionController;
-    use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder};
+    use crate::anthropic::usage::{
+        UsageRecordQuery, UsageRecordStatus, UsageRecorder, UsageSource,
+    };
     use crate::common::auth::RequestApiKeyStore;
     use crate::model::config::{DEFAULT_MISSING_MAX_TOKENS_VALUE, RequestAdmissionConfig};
 
     fn test_state(recorder: Arc<UsageRecorder>) -> AppState {
         AppState::new(
             Arc::new(RequestApiKeyStore::new(["test-key"])),
-            true,
             recorder,
             Arc::new(PromptCacheTracker::default()),
             Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::HighCache,
             0.98,
             CompatProfile::ClaudeCode,
-            false,
         )
     }
 
@@ -1018,66 +723,21 @@ mod tests {
             assert_eq!(parsed.max_tokens, DEFAULT_MISSING_MAX_TOKENS_VALUE);
             assert_eq!(parsed.model, "claude-sonnet-4-5");
 
-            let route = raw_external_route_request(
+            let route = external_route_request_raw(
                 &state,
                 &runtime_config,
                 &cache_route,
                 HeaderMap::new(),
-                effective,
+                effective.clone(),
                 "/cc/v1/messages",
                 "req_missing_max_raw_route".to_string(),
-                UsageRouteSubtype::ExternalFallbackPreflight,
-                Some("local_capacity_full".to_string()),
-                None,
-                Some(json!({"preflightStage": "before_parse"})),
                 Arc::new(InferenceAttemptBudget::new(4)),
                 None,
+                None,
+                Arc::new(probe_raw_messages_body(&effective)),
             );
             assert_eq!(route.effective_raw_body, expected);
             assert_eq!(route.raw_body, expected);
-        }
-    }
-
-    #[test]
-    fn contaminated_non_strict_history_skips_raw_direct_and_preflight_for_five_rounds() {
-        let fixtures: [&[u8]; 3] = [
-            br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":"safe\nuser Continue\n\nBash: hidden"}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#,
-            br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":"safe\nuser Tool results provided.\n\nTool results:\n\n[readHash9b9a8d05] hidden"}],"tools":[{"name":"readHash9b9a8d05","input_schema":{"type":"object"}}]}"#,
-            br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":"safe\r\nuser Continue\r\n\r\nbashHashd1e9567d: hidden"}],"tools":[{"name":"bashHashd1e9567d","input_schema":{"type":"object"}}]}"#,
-        ];
-
-        for _round in 0..5 {
-            assert!(should_try_raw_external_routes(false));
-            for fixture in fixtures {
-                let inspection = super::super::super::transcript_sanitizer::sanitize_raw_request_assistant_history(
-                    fixture,
-                )
-                .expect("assistant history inspection succeeds");
-                assert!(inspection.sanitized_body.is_some());
-                assert!(inspection.requires_normalized_body);
-                assert!(!should_try_raw_external_routes(
-                    inspection.requires_normalized_body
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn authenticated_history_without_transcript_leak_still_skips_raw_direct_and_preflight_five_rounds()
-     {
-        let signed_only = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"private thought","signature":"opaque-signature"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#;
-
-        for _round in 0..5 {
-            let inspection =
-                super::super::super::transcript_sanitizer::sanitize_raw_request_assistant_history(
-                    signed_only,
-                )
-                .expect("assistant history inspection succeeds");
-            assert!(inspection.sanitized_body.is_none());
-            assert!(inspection.requires_normalized_body);
-            assert!(!should_try_raw_external_routes(
-                inspection.requires_normalized_body
-            ));
         }
     }
 
@@ -1438,35 +1098,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recoverable_thinking_boundary_is_normalized_before_routing_for_five_rounds() {
-        let client = Bytes::from_static(
-            br#"{"model":"claude-sonnet-4","max_tokens":2048,"messages":[{"role":"user","content":"hello"}],"thinking":{"type":"enabled","budget_tokens":2048}}"#,
-        );
-
-        for round in 0..5 {
-            let probe = probe_raw_messages_body(&client);
-            let normalization = normalize_raw_reasoning_protocol_with_probe(&client, &probe)
-                .unwrap_or_else(|error| panic!("round {round}: {error}"))
-                .unwrap_or_else(|| panic!("round {round}: expected normalization"));
-            assert!(!should_try_raw_external_routes(true), "round {round}");
-            validate_raw_reasoning_protocol(&normalization.body)
-                .unwrap_or_else(|error| panic!("round {round}: {error}"));
-            let parsed = parse_messages_payload(&normalization.body, "req_normalized_thinking")
-                .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
-
-            assert_eq!(parsed.max_tokens, 2048, "round {round}");
-            assert_eq!(
-                parsed
-                    .thinking
-                    .as_ref()
-                    .map(|thinking| thinking.budget_tokens),
-                Some(2047),
-                "round {round}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn messages_entry_normalizes_omitted_or_conflicting_thinking_controls_before_dispatch() {
         let state = test_state(Arc::new(UsageRecorder::new(10)));
@@ -1638,79 +1269,6 @@ mod tests {
                 let error = parse_messages_payload(&Bytes::copy_from_slice(fixture), "req_invalid")
                     .expect_err("invalid reasoning controls must be rejected");
                 assert_eq!(error.status, StatusCode::BAD_REQUEST, "round {round}");
-            }
-        }
-    }
-
-    #[test]
-    fn local_pool_fast_fail_maps_only_terminal_or_temporary_pool_states_for_five_rounds() {
-        for round in 0..5 {
-            for kind in [
-                LocalPoolRouteStateKind::NoCredentials,
-                LocalPoolRouteStateKind::AllDisabled,
-                LocalPoolRouteStateKind::ProxyBlocked,
-            ] {
-                let (status, error_type, message, reason, retry_after) =
-                    local_pool_fast_fail_response_parts(kind, None)
-                        .unwrap_or_else(|| panic!("round {round}: {kind:?} should fast-fail"));
-                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "round {round}");
-                assert_eq!(error_type, "api_error", "round {round}");
-                assert_eq!(
-                    message,
-                    envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
-                    "round {round}"
-                );
-                assert_eq!(
-                    reason,
-                    RequestRejectionReason::LocalPoolUnavailable,
-                    "round {round}"
-                );
-                assert_eq!(retry_after, None, "round {round}");
-            }
-
-            // A degraded Redis scheduler is served from local state by the dispatch path, so the
-            // entry must not turn it into a pool-wide rejection.
-            assert!(
-                local_pool_fast_fail_response_parts(
-                    LocalPoolRouteStateKind::SchedulerRedisDegraded,
-                    Some(4),
-                )
-                .is_none(),
-                "round {round}: a degraded Redis scheduler is not a reason to reject at the entry"
-            );
-
-            let (status, error_type, message, reason, retry_after) =
-                local_pool_fast_fail_response_parts(LocalPoolRouteStateKind::RiskCircuitOpen, None)
-                    .expect("risk circuit should fast-fail");
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "round {round}");
-            assert_eq!(error_type, "api_error", "round {round}");
-            assert_eq!(
-                message,
-                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
-                "round {round}"
-            );
-            assert_eq!(
-                reason,
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
-                "round {round}"
-            );
-            assert_eq!(retry_after, Some(1), "round {round}");
-        }
-    }
-
-    #[test]
-    fn local_pool_fast_fail_does_not_preempt_waitable_or_model_states_for_five_rounds() {
-        for round in 0..5 {
-            for kind in [
-                LocalPoolRouteStateKind::Ready,
-                LocalPoolRouteStateKind::NoModelCompatible,
-                LocalPoolRouteStateKind::AllCoolingDown,
-                LocalPoolRouteStateKind::CapacityFull,
-            ] {
-                assert!(
-                    local_pool_fast_fail_response_parts(kind, Some(2)).is_none(),
-                    "round {round}: {kind:?} must continue through normal parsing/routing"
-                );
             }
         }
     }

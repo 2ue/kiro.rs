@@ -12,25 +12,6 @@ pub use super::prompt_injection::{
     UpstreamKind,
 };
 
-use crate::anthropic::{
-    inference_attempt_budget::DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
-    payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
-};
-
-pub(crate) const DEFAULT_TOKEN_REFRESH_MAX_RPM: u32 = 60;
-pub(crate) const MIN_TOKEN_REFRESH_MAX_RPM: u32 = 1;
-pub(crate) const MAX_TOKEN_REFRESH_MAX_RPM: u32 = 6_000;
-pub(crate) const DEFAULT_TOKEN_REFRESH_BURST: u32 = 8;
-pub(crate) const MIN_TOKEN_REFRESH_BURST: u32 = 1;
-pub(crate) const MAX_TOKEN_REFRESH_BURST: u32 = 256;
-pub(crate) const DEFAULT_TOKEN_REFRESH_BACKGROUND_ENABLED: bool = true;
-pub(crate) const DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS: u64 = 60;
-pub(crate) const MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS: u64 = 10;
-pub(crate) const MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS: u64 = 3_600;
-pub(crate) const DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 600;
-pub(crate) const MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 60;
-pub(crate) const MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 3_600;
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -59,19 +40,6 @@ impl Default for PromptCacheSimulationMode {
     fn default() -> Self {
         Self::HighCache
     }
-}
-
-/// 上游请求压缩配置。
-///
-/// 默认总开关关闭；如果启用，默认只执行低风险的 whitespace 压缩。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CompressionConfig {
-    #[serde(default)]
-    pub enabled: bool,
-
-    #[serde(default = "default_true")]
-    pub whitespace_compression: bool,
 }
 
 /// Kiro payload shaping 配置。
@@ -188,199 +156,6 @@ impl ImageProcessingConfig {
 
 pub const DEFAULT_TOOL_SCHEMA_KEY_VALIDATION_REGEX: &str = "^[a-zA-Z0-9_.-]{1,64}$";
 
-fn default_tool_schema_key_validation_regex() -> String {
-    DEFAULT_TOOL_SCHEMA_KEY_VALIDATION_REGEX.to_string()
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolSchemaKeyMappingMode {
-    /// 清洗不符合目标正则的 schema property key，并在响应 tool_use.input 中映射回原始 key。
-    #[default]
-    Sanitize,
-    /// 检测到不符合目标正则的 schema property key 时直接本地拒绝，不发给上游。
-    Reject,
-    /// 完全保持旧行为，不校验、不清洗、不反向映射。
-    Disabled,
-}
-
-/// 本地 Anthropic -> Kiro body 转换能力开关。
-///
-/// 这些开关只影响本地凭据路径的 Kiro 协议转换器。外部池 raw body 透传不会进入
-/// 这些转换阶段；外部池 normalized body 仍按外部池自己的 body/model/usage 配置处理。
-/// 默认全部开启以保持旧行为。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct BodyConversionConfig {
-    /// 规范化工具 input_schema，移除 Kiro/上游容易拒绝的 OpenAPI/Zod/MCP 扩展字段。
-    #[serde(default = "default_true")]
-    pub tool_schema_normalization: bool,
-
-    /// 将不符合 Kiro 工具名约束的名称清洗/缩短，并维护响应反向映射。
-    #[serde(default = "default_true")]
-    pub tool_name_mapping: bool,
-
-    /// 工具名已满足 Kiro 约束（ASCII 字母开头，只含字母、数字、`_`、`-`，不超过 63 字符）时原样透传，
-    /// 只对非法或超长名称做映射。关闭时回到旧的 camelCase + Hash 全量改写。
-    #[serde(default = "default_true")]
-    pub tool_name_verbatim_when_valid: bool,
-
-    /// 工具 input_schema property key 映射策略。
-    ///
-    /// `sanitize` 仅清洗不匹配 `tool_schema_key_validation_regex` 的 key，合法 key 原样保留且不建映射；
-    /// `reject` 在发现非法 key 时本地 400；`disabled` 保持旧行为。
-    #[serde(default)]
-    pub tool_schema_key_mapping: ToolSchemaKeyMappingMode,
-
-    /// 工具 input_schema property key 合法性正则。默认来自问题分析文档。
-    ///
-    /// 只在 `tool_schema_key_mapping` 为 `sanitize` 或 `reject` 时使用。
-    #[serde(default = "default_tool_schema_key_validation_regex")]
-    pub tool_schema_key_validation_regex: String,
-
-    /// 结构化处理 Anthropic tool_choice：按 none=0、any=N、named=1 过滤当前工具，并在响应侧
-    /// 拦截本轮不允许的调用（含 `disable_parallel_tool_use`）。对应的提示词由注入项
-    /// `toolChoicePrefix` / `toolChoiceTurnReminder` 单独控制。
-    #[serde(default = "default_true")]
-    pub tool_choice_steering: bool,
-
-    /// 旧配置字段，只用于迁移：分块写入策略的第二道开关，现在由注入项单独控制。
-    #[serde(default, skip_serializing)]
-    pub chunked_tool_policy: Option<bool>,
-
-    /// 旧配置字段，只用于迁移：thinking 兼容提示的第二道开关，现在由注入项单独控制。
-    #[serde(default, skip_serializing)]
-    pub thinking_prompt_controls: Option<bool>,
-
-    /// 对支持 Kiro 原生 reasoning/outputConfig 的模型上报 additionalModelRequestFields。
-    #[serde(default = "default_true")]
-    pub native_reasoning_fields: bool,
-
-    /// 为没有 Kiro 原生 reasoning 签名的 Claude Code thinking 块生成确定性的
-    /// 兼容签名标记。该标记只在回传给客户端时出现，历史回放会在发往 Kiro 前剥离。
-    #[serde(default = "default_true")]
-    pub synthetic_thinking_signatures: bool,
-
-    /// 修复或文本化不严格配对的 tool_use/tool_result，减少 Kiro 400。
-    #[serde(default = "default_true")]
-    pub tool_pairing_repair: bool,
-
-    /// 为历史中出现但当前 tools 缺失的工具补占位定义。
-    #[serde(default = "default_true")]
-    pub history_placeholder_tools: bool,
-
-    /// 历史里重复出现的同一张图片只发第一次（默认关闭）。
-    ///
-    /// Claude Code 反复截同一个屏、或工具结果里多次返回同一张图时，历史会带上很多份完全相同的
-    /// base64。打开后从第二份起换成一行文字说明，减少请求体积和输入 token；当前这一轮的图片
-    /// 总是原样发送。只按图片数据完全相同判断，内容稍有不同就不算重复。
-    #[serde(default)]
-    pub history_image_dedup: bool,
-
-    /// Anthropic `code_execution_*` 服务端工具的本地受限执行配置。
-    ///
-    /// 默认关闭。关闭时保持普通 `tool_use` 透传，避免在未配置执行环境时
-    /// 改变既有 Kiro 调度行为。
-    #[serde(default)]
-    pub code_execution: CodeExecutionConfig,
-
-    /// 旧配置字段，只用于迁移：现在由 `routeFeatures` 的 `modelDrivenWebSearch` 控制。
-    #[serde(default, skip_serializing)]
-    pub model_driven_web_search: Option<ModelDrivenWebSearchConfig>,
-}
-
-/// 旧版 WebSearch 模型驱动开关（全局默认 + 按路由覆盖），只用于迁移。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelDrivenWebSearchConfig {
-    /// 全局默认值。
-    #[serde(default)]
-    pub enabled: bool,
-    /// 按路由前缀覆盖（`/v1`、`/cc`、`/dfcache/x` ...），按最长前缀匹配。
-    #[serde(default)]
-    pub path_overrides: BTreeMap<String, bool>,
-}
-
-impl Default for BodyConversionConfig {
-    fn default() -> Self {
-        Self {
-            tool_schema_normalization: true,
-            tool_name_mapping: true,
-            tool_name_verbatim_when_valid: true,
-            tool_schema_key_mapping: ToolSchemaKeyMappingMode::Sanitize,
-            tool_schema_key_validation_regex: default_tool_schema_key_validation_regex(),
-            tool_choice_steering: true,
-            chunked_tool_policy: None,
-            thinking_prompt_controls: None,
-            native_reasoning_fields: true,
-            synthetic_thinking_signatures: true,
-            tool_pairing_repair: true,
-            history_placeholder_tools: true,
-            history_image_dedup: false,
-            code_execution: CodeExecutionConfig::default(),
-            model_driven_web_search: None,
-        }
-    }
-}
-
-/// Claude Code 服务端代码执行的受限本地执行器配置。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CodeExecutionConfig {
-    /// 是否启用代码执行转换。
-    #[serde(default)]
-    pub enabled: bool,
-    /// 按请求路径前缀覆盖全局值，使用最长前缀匹配。
-    #[serde(default)]
-    pub path_overrides: BTreeMap<String, bool>,
-    /// 单次执行超时时间，范围会在执行器内收口。
-    #[serde(default = "default_code_execution_timeout_ms")]
-    pub timeout_ms: u64,
-    /// stdout/stderr 各自最多返回的字节数。
-    #[serde(default = "default_code_execution_max_output_bytes")]
-    pub max_output_bytes: usize,
-    /// 允许提交给解释器的最大代码字节数。
-    #[serde(default = "default_code_execution_max_code_bytes")]
-    pub max_code_bytes: usize,
-}
-
-impl Default for CodeExecutionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            path_overrides: BTreeMap::new(),
-            timeout_ms: default_code_execution_timeout_ms(),
-            max_output_bytes: default_code_execution_max_output_bytes(),
-            max_code_bytes: default_code_execution_max_code_bytes(),
-        }
-    }
-}
-
-impl CodeExecutionConfig {
-    pub fn enabled_for_route(&self, endpoint: &str) -> bool {
-        self.path_overrides
-            .iter()
-            .filter_map(|(prefix, enabled)| {
-                normalize_reported_usage_path_prefix(prefix).map(|prefix| (prefix, *enabled))
-            })
-            .filter(|(prefix, _)| reported_usage_path_matches(prefix, endpoint))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map_or(self.enabled, |(_, enabled)| enabled)
-    }
-}
-
-fn default_code_execution_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_code_execution_max_output_bytes() -> usize {
-    16 * 1024
-}
-
-fn default_code_execution_max_code_bytes() -> usize {
-    64 * 1024
-}
-
 /// 请求参数兼容开关（`localRequestCompat`）。
 ///
 /// 每一项对应一种「客户端发了严格校验不收的写法时怎么处理」的行为：开着就改写后继续，
@@ -408,12 +183,6 @@ pub struct LocalRequestCompatConfig {
     /// 新增：`output_config.effort` 为空串或不认识的值时删除该字段，按未指定处理，
     /// 不再返回 `output_config.effort must be one of` 的 400。
     pub drop_unknown_effort: bool,
-    /// 新增：流式请求超过首输出静默保留期才发出的 `message_start`，usage 填 0。
-    ///
-    /// 保留期一过就要先给客户端发 200 和 `message_start`，此后若上游空回，下游唯一能看到
-    /// 的 usage 就是这里的输入估算，接入方可能据此计费。填 0 后空回不留下任何非零 usage；
-    /// 正常请求的最终 usage 仍以 `message_delta` 为准。
-    pub zero_usage_on_hold_expired_message_start: bool,
 }
 
 impl Default for LocalRequestCompatConfig {
@@ -426,7 +195,6 @@ impl Default for LocalRequestCompatConfig {
             normalize_message_content: true,
             normalize_effort_case: true,
             drop_unknown_effort: true,
-            zero_usage_on_hold_expired_message_start: true,
         }
     }
 }
@@ -494,104 +262,6 @@ impl MissingMaxTokensConfig {
                 "missingMaxTokens.defaultValue 必须在 1 到 {} 之间",
                 MAX_MISSING_MAX_TOKENS_VALUE
             ));
-        }
-        Ok(())
-    }
-}
-
-/// 调度容量加权配置。
-///
-/// 默认关闭；关闭时请求热路径不会为了容量加权额外估算 token，也不会改变并发/RPM
-/// 口径。开启后，调用方在已经完成必要 body 处理时传入一个粗略 token 量级，
-/// 调度器按 tiers 映射成容量单位。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WeightedCapacityConfig {
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// 单请求最多消耗多少容量单位，防止极端上下文导致 Redis 写入和调度计数放大。
-    #[serde(default = "default_weighted_capacity_max_units")]
-    pub max_units_per_request: u32,
-
-    /// token 阈值到容量单位的映射。按 `minTokens` 升序匹配最后一个命中的 tier。
-    #[serde(default = "default_weighted_capacity_tiers")]
-    pub tiers: Vec<WeightedCapacityTier>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WeightedCapacityTier {
-    #[serde(default)]
-    pub min_tokens: u32,
-    #[serde(default = "default_weighted_capacity_unit")]
-    pub units: u32,
-}
-
-impl Default for WeightedCapacityConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_units_per_request: default_weighted_capacity_max_units(),
-            tiers: default_weighted_capacity_tiers(),
-        }
-    }
-}
-
-impl WeightedCapacityConfig {
-    pub fn normalized(&self) -> Self {
-        let max_units_per_request = self.max_units_per_request.clamp(1, 64);
-        let mut tiers: Vec<_> = self
-            .tiers
-            .iter()
-            .copied()
-            .filter(|tier| tier.units > 0)
-            .collect();
-        if tiers.is_empty() {
-            tiers = default_weighted_capacity_tiers();
-        }
-        tiers.sort_by_key(|tier| tier.min_tokens);
-        tiers.dedup_by_key(|tier| tier.min_tokens);
-        for tier in &mut tiers {
-            tier.units = tier.units.clamp(1, max_units_per_request);
-        }
-        Self {
-            enabled: self.enabled,
-            max_units_per_request,
-            tiers,
-        }
-    }
-
-    pub fn units_for_tokens(&self, tokens: u32) -> u32 {
-        if !self.enabled {
-            return 1;
-        }
-        let normalized = self.normalized();
-        normalized
-            .tiers
-            .iter()
-            .filter(|tier| tokens >= tier.min_tokens)
-            .map(|tier| tier.units)
-            .last()
-            .unwrap_or(1)
-            .clamp(1, normalized.max_units_per_request)
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        if self.max_units_per_request == 0 || self.max_units_per_request > 64 {
-            return Err("weightedCapacity.maxUnitsPerRequest 必须在 1 到 64 之间".to_string());
-        }
-        let mut seen = BTreeSet::new();
-        for tier in &self.tiers {
-            if tier.units == 0 || tier.units > self.max_units_per_request {
-                return Err(
-                    "weightedCapacity.tiers[].units 必须大于 0 且不超过 maxUnitsPerRequest"
-                        .to_string(),
-                );
-            }
-            if !seen.insert(tier.min_tokens) {
-                return Err("weightedCapacity.tiers[].minTokens 不能重复".to_string());
-            }
         }
         Ok(())
     }
@@ -665,187 +335,6 @@ pub struct PayloadShapingConfig {
 
     #[serde(default)]
     pub oversized_image_handling: OversizedImageHandling,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolFormatDebugConfig {
-    /// 是否在 Kiro 上游返回 tool-use 格式错误时记录内部诊断。
-    #[serde(default = "default_tool_format_debug_enabled")]
-    pub enabled: bool,
-    /// JSONL 诊断文件目录。仅用于内部排查，不返回给下游。
-    #[serde(default = "default_tool_format_debug_dir")]
-    pub dir: String,
-    /// 非阻塞写盘队列容量。队列满时丢弃诊断，不阻塞主请求。
-    #[serde(default = "default_tool_format_debug_channel_capacity")]
-    pub channel_capacity: usize,
-    /// 单条 JSONL 最大字节数，超过后会丢弃 samples 保留聚合指标。
-    #[serde(default = "default_tool_format_debug_max_record_bytes")]
-    pub max_record_bytes: usize,
-    /// 每类异常最多记录多少个样本。
-    #[serde(default = "default_tool_format_debug_max_samples_per_kind")]
-    pub max_samples_per_kind: usize,
-    /// 同类记录限流窗口秒数。
-    #[serde(default = "default_tool_format_debug_window_secs")]
-    pub window_secs: u64,
-    /// 每个精确 fingerprint 在窗口内最多写几条完整诊断。
-    #[serde(default = "default_tool_format_debug_max_records_per_fingerprint")]
-    pub max_records_per_fingerprint: u32,
-    /// 每个结构 group 在窗口内最多写几条完整诊断。
-    #[serde(default = "default_tool_format_debug_max_records_per_group")]
-    pub max_records_per_group: u32,
-    /// 全局窗口内最多写几条完整诊断。
-    #[serde(default = "default_tool_format_debug_max_records_global")]
-    pub max_records_global: u32,
-    /// 诊断字段中的字符串最大字节数。
-    #[serde(default = "default_tool_format_debug_max_string_bytes")]
-    pub max_string_bytes: usize,
-    /// 是否在采样命中的 tool-use 格式错误诊断中记录实际发送失败的 Kiro 请求体。
-    #[serde(default = "default_tool_format_debug_capture_request_body")]
-    pub capture_request_body: bool,
-    /// 单条诊断中最多保留多少字节的请求体内容。
-    #[serde(default = "default_tool_format_debug_max_request_body_bytes")]
-    pub max_request_body_bytes: usize,
-    /// 同一限流窗口内最多有多少条诊断可以包含请求体内容。
-    #[serde(default = "default_tool_format_debug_max_request_body_records_per_window")]
-    pub max_request_body_records_per_window: u32,
-    /// 诊断文件按时间滚动的间隔秒数。
-    #[serde(default = "default_tool_format_debug_roll_interval_secs")]
-    pub roll_interval_secs: u64,
-    /// 单个诊断文件最大字节数，超过后在同一时间分片内递增序号滚动。
-    #[serde(default = "default_tool_format_debug_max_file_bytes")]
-    pub max_file_bytes: u64,
-}
-
-impl Default for ToolFormatDebugConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_tool_format_debug_enabled(),
-            dir: default_tool_format_debug_dir(),
-            channel_capacity: default_tool_format_debug_channel_capacity(),
-            max_record_bytes: default_tool_format_debug_max_record_bytes(),
-            max_samples_per_kind: default_tool_format_debug_max_samples_per_kind(),
-            window_secs: default_tool_format_debug_window_secs(),
-            max_records_per_fingerprint: default_tool_format_debug_max_records_per_fingerprint(),
-            max_records_per_group: default_tool_format_debug_max_records_per_group(),
-            max_records_global: default_tool_format_debug_max_records_global(),
-            max_string_bytes: default_tool_format_debug_max_string_bytes(),
-            capture_request_body: default_tool_format_debug_capture_request_body(),
-            max_request_body_bytes: default_tool_format_debug_max_request_body_bytes(),
-            max_request_body_records_per_window:
-                default_tool_format_debug_max_request_body_records_per_window(),
-            roll_interval_secs: default_tool_format_debug_roll_interval_secs(),
-            max_file_bytes: default_tool_format_debug_max_file_bytes(),
-        }
-    }
-}
-
-impl ToolFormatDebugConfig {
-    pub fn normalized(&self) -> Self {
-        let max_record_bytes = self.max_record_bytes.clamp(1024, 1024 * 1024);
-        let max_buffered_records_by_bytes = ((64 * 1024 * 1024) / max_record_bytes).max(1);
-        let channel_capacity = self
-            .channel_capacity
-            .clamp(1, 1024)
-            .min(max_buffered_records_by_bytes);
-
-        Self {
-            enabled: self.enabled,
-            dir: if self.dir.trim().is_empty() {
-                default_tool_format_debug_dir()
-            } else {
-                self.dir.trim().to_string()
-            },
-            channel_capacity,
-            max_record_bytes,
-            max_samples_per_kind: self.max_samples_per_kind.min(100),
-            window_secs: self.window_secs.clamp(1, 86_400),
-            max_records_per_fingerprint: self.max_records_per_fingerprint.min(1_000),
-            max_records_per_group: self.max_records_per_group.min(10_000),
-            max_records_global: self.max_records_global.min(10_000),
-            max_string_bytes: self.max_string_bytes.clamp(32, 4096),
-            capture_request_body: self.capture_request_body,
-            max_request_body_bytes: normalize_tool_format_debug_request_body_bytes(
-                self.max_request_body_bytes,
-            ),
-            max_request_body_records_per_window: self.max_request_body_records_per_window.min(100),
-            roll_interval_secs: self.roll_interval_secs.clamp(60, 86_400),
-            max_file_bytes: normalize_tool_format_debug_max_file_bytes(self.max_file_bytes),
-        }
-    }
-}
-
-/// 定向请求抓取（见 `anthropic::request_capture`）。每条记录一个 JSON 文件，含完整请求体，
-/// 只用于内部排查和本地回放，不写入 usage 数据库。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RequestCaptureConfig {
-    /// 总开关，默认关闭。
-    pub enabled: bool,
-    /// 抓取目录；空回和 tool_choice 分别写入 `usage-only/`、`tool-choice/` 子目录。
-    pub dir: String,
-    /// 首输出前重试用完仍空回的本地请求：记录客户端请求体和发给 Kiro 的请求体。
-    pub usage_only: bool,
-    /// 注入了 tool_choice 指令的请求：记录客户端收到的回复，并标出提到策略的回复。
-    pub tool_choice: bool,
-    /// 每个子目录最多保留的文件数，超出后删除最旧的。
-    pub max_files: u32,
-    /// 每个请求体或回复正文最多保留的字节数。
-    pub max_body_bytes: usize,
-}
-
-pub const REQUEST_CAPTURE_MAX_FILES_LIMIT: u32 = 2_000;
-pub const REQUEST_CAPTURE_MAX_BODY_BYTES_LIMIT: usize = 8 * 1024 * 1024;
-
-impl Default for RequestCaptureConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dir: "logs/request-capture".to_string(),
-            usage_only: true,
-            tool_choice: true,
-            max_files: 200,
-            max_body_bytes: 2 * 1024 * 1024,
-        }
-    }
-}
-
-impl RequestCaptureConfig {
-    pub fn normalized(&self) -> Self {
-        let dir = self.dir.trim();
-        Self {
-            enabled: self.enabled,
-            dir: if dir.is_empty() {
-                Self::default().dir
-            } else {
-                dir.to_string()
-            },
-            usage_only: self.usage_only,
-            tool_choice: self.tool_choice,
-            max_files: self.max_files.clamp(1, REQUEST_CAPTURE_MAX_FILES_LIMIT),
-            max_body_bytes: self
-                .max_body_bytes
-                .clamp(1024, REQUEST_CAPTURE_MAX_BODY_BYTES_LIMIT),
-        }
-    }
-
-    /// The directory is editable from the admin page and receives full request bodies, so it
-    /// must stay inside the working directory (Docker: `/app`, next to the other diagnostics).
-    pub fn validate(&self) -> Result<(), String> {
-        let path = std::path::Path::new(self.dir.trim());
-        let escapes = path.components().any(|component| {
-            !matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        });
-        if escapes {
-            return Err(
-                "requestCapture.dir 必须是工作目录内的相对路径（例如 logs/request-capture），不能以 / 开头或包含 ..".to_string(),
-            );
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -1779,57 +1268,6 @@ impl CacheSimulationPolicyPatch {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct CachePointPolicy {
-    #[serde(default = "default_kiro_cache_point_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_kiro_cache_point_tools_only")]
-    pub tools_only: bool,
-    #[serde(default = "default_kiro_cache_point_record_plan")]
-    pub record_plan: bool,
-}
-
-impl Default for CachePointPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: default_kiro_cache_point_enabled(),
-            tools_only: default_kiro_cache_point_tools_only(),
-            record_plan: default_kiro_cache_point_record_plan(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct CachePointPolicyPatch {
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub tools_only: Option<bool>,
-    #[serde(default)]
-    pub record_plan: Option<bool>,
-}
-
-impl CachePointPolicyPatch {
-    fn apply_to(self, mut policy: CachePointPolicy) -> CachePointPolicy {
-        if let Some(value) = self.enabled {
-            policy.enabled = value;
-        }
-        if let Some(value) = self.tools_only {
-            policy.tools_only = value;
-        }
-        if let Some(value) = self.record_plan {
-            policy.record_plan = value;
-        }
-        policy
-    }
-
-    fn is_empty(&self) -> bool {
-        self.enabled.is_none() && self.tools_only.is_none() && self.record_plan.is_none()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct CacheBoundsPolicy {
     /// 每个会话 scope（conversation_id + 路由命名空间）最多保留的条目数；字段名为兼容保留。
     #[serde(default = "default_prompt_cache_max_entries_per_account")]
@@ -2095,33 +1533,19 @@ pub enum CacheTtlMode {
     UpstreamThenRequestDefault5m,
 }
 
-impl CacheTtlMode {
-    /// 本地账号没有渠道标记，渠道优先模式退化为"跟随请求，未指定按 5 分钟"。
-    pub fn for_local(self) -> Self {
-        match self {
-            Self::UpstreamThenRequestDefault5m => Self::FollowRequestDefault5m,
-            other => other,
-        }
-    }
-}
+impl CacheTtlMode {}
 
 /// 路由缓存策略的写入时长设置：本地账号和外部池分开配置。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheTtlPolicy {
     #[serde(default)]
-    pub local: CacheTtlMode,
-    #[serde(default)]
     pub external_pool: CacheTtlMode,
 }
 
 impl CacheTtlPolicy {
     pub fn validate(self, label: &str) -> Result<(), String> {
-        if self.local == CacheTtlMode::UpstreamThenRequestDefault5m {
-            return Err(format!(
-                "{label}.local 不支持 upstream_then_request_default_5m（本地账号没有渠道标记）"
-            ));
-        }
+        let _ = label;
         Ok(())
     }
 }
@@ -2130,16 +1554,11 @@ impl CacheTtlPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct CacheTtlPolicyPatch {
     #[serde(default)]
-    pub local: Option<CacheTtlMode>,
-    #[serde(default)]
     pub external_pool: Option<CacheTtlMode>,
 }
 
 impl CacheTtlPolicyPatch {
     fn apply_to(self, mut policy: CacheTtlPolicy) -> CacheTtlPolicy {
-        if let Some(value) = self.local {
-            policy.local = value;
-        }
         if let Some(value) = self.external_pool {
             policy.external_pool = value;
         }
@@ -2147,15 +1566,11 @@ impl CacheTtlPolicyPatch {
     }
 
     fn is_empty(&self) -> bool {
-        self.local.is_none() && self.external_pool.is_none()
+        self.external_pool.is_none()
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {
-        if self.local == Some(CacheTtlMode::UpstreamThenRequestDefault5m) {
-            return Err(format!(
-                "{label}.local 不支持 upstream_then_request_default_5m（本地账号没有渠道标记）"
-            ));
-        }
+        let _ = label;
         Ok(())
     }
 }
@@ -3253,8 +2668,6 @@ pub struct CacheRoutePolicyPatch {
     #[serde(default)]
     pub reported_usage: Option<ReportedUsagePathPolicy>,
     #[serde(default)]
-    pub cache_point: Option<CachePointPolicyPatch>,
-    #[serde(default)]
     pub bounds: Option<CacheBoundsPolicyPatch>,
     #[serde(default)]
     pub kiro_rs_tool: Option<KiroRsToolCachePolicyPatch>,
@@ -3293,9 +2706,7 @@ impl CacheRoutePolicyPatch {
         if let Some(reported_usage) = &self.reported_usage {
             policy.reported_usage = reported_usage.normalized();
         }
-        if let Some(patch) = self.cache_point {
-            policy.cache_point = patch.apply_to(policy.cache_point);
-        }
+
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
@@ -3381,9 +2792,7 @@ impl CacheRoutePolicyPatch {
         if let Some(reported_usage) = &self.reported_usage {
             policy.reported_usage = reported_usage.normalized();
         }
-        if let Some(patch) = self.cache_point {
-            policy.cache_point = patch.apply_to(policy.cache_point);
-        }
+
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
@@ -3407,9 +2816,7 @@ impl CacheRoutePolicyPatch {
         if let Some(cache_type) = self.cache_type {
             policy.cache_type = cache_type;
         }
-        if let Some(patch) = self.cache_point {
-            policy.cache_point = patch.apply_to(policy.cache_point);
-        }
+
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
@@ -3429,9 +2836,7 @@ impl CacheRoutePolicyPatch {
         if let Some(reported_usage) = &self.reported_usage {
             policy.reported_usage = reported_usage.normalized();
         }
-        if let Some(patch) = self.cache_point {
-            policy.cache_point = patch.apply_to(policy.cache_point);
-        }
+
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
@@ -3456,7 +2861,6 @@ impl CacheRoutePolicyPatch {
             || self.route_namespace.is_some()
             || self.simulation.is_some()
             || self.creation_control.is_some()
-            || self.cache_point.is_some()
             || self.bounds.is_some()
             || self.kiro_rs_tool.is_some()
             || self.kiro_rs_tool_plus.is_some()
@@ -3472,10 +2876,6 @@ impl CacheRoutePolicyPatch {
                 .is_none_or(CacheSimulationPolicyPatch::is_empty)
             && self.creation_control.is_none()
             && self.reported_usage.is_none()
-            && self
-                .cache_point
-                .as_ref()
-                .is_none_or(CachePointPolicyPatch::is_empty)
             && self
                 .bounds
                 .as_ref()
@@ -3580,10 +2980,6 @@ impl CachePolicyConfig {
         self
     }
 
-    pub fn migrate_builtin_no_cache_routes(&mut self) -> bool {
-        false
-    }
-
     pub fn normalized(&self) -> Self {
         let path_overrides = self
             .path_overrides
@@ -3656,7 +3052,7 @@ impl CachePolicyConfig {
             }
             .normalized(),
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
-            cache_point: CachePointPolicy::default(),
+
             bounds: base.bounds,
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
             stable_segment: base.stable_segment,
@@ -3687,7 +3083,7 @@ impl CachePolicyConfig {
             }
             .normalized(),
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
-            cache_point: CachePointPolicy::default(),
+
             bounds: base.bounds,
             kiro_rs_tool: base.kiro_rs_tool,
             stable_segment: StableSegmentCachePolicy::default(),
@@ -3719,7 +3115,7 @@ impl CachePolicyConfig {
             }
             .normalized(),
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
-            cache_point: CachePointPolicy::default(),
+
             bounds: base.bounds,
             kiro_rs_tool: base.kiro_rs_tool,
             stable_segment: base.stable_segment,
@@ -3746,10 +3142,7 @@ impl CachePolicyConfig {
             }
             .normalized(),
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
-            cache_point: CachePointPolicy {
-                enabled: false,
-                ..base.cache_point
-            },
+
             bounds: base.bounds,
             kiro_rs_tool: base.kiro_rs_tool,
             stable_segment: base.stable_segment,
@@ -3799,7 +3192,7 @@ pub struct CacheRoutePolicy {
     pub simulation: CacheSimulationPolicy,
     pub creation_control: PromptCacheCreationControlConfig,
     pub reported_usage: ReportedUsagePathPolicy,
-    pub cache_point: CachePointPolicy,
+
     pub bounds: CacheBoundsPolicy,
     pub kiro_rs_tool: KiroRsToolCachePolicy,
     pub stable_segment: StableSegmentCachePolicy,
@@ -3903,15 +3296,6 @@ pub fn resolve_cache_policy_for_path(
     }
 }
 
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            whitespace_compression: true,
-        }
-    }
-}
-
 impl Default for PayloadShapingConfig {
     fn default() -> Self {
         Self {
@@ -3991,26 +3375,6 @@ pub enum ThinkingTriggerMode {
 impl Default for ThinkingTriggerMode {
     fn default() -> Self {
         Self::RealRequest
-    }
-}
-
-/// Kiro IDE `x-amzn-kiro-agent-mode` header strategy.
-///
-/// `vibe` preserves the current Kiro IDE / Claude Code compatible behavior.
-/// `spec` forces the alternate Kiro planning-oriented mode. `auto` derives the
-/// mode from credential protocol metadata: IdC, Enterprise/external IdP and API
-/// key credentials stay on `vibe`; social/provider credentials use `spec`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum KiroAgentModeStrategy {
-    Vibe,
-    Spec,
-    Auto,
-}
-
-impl Default for KiroAgentModeStrategy {
-    fn default() -> Self {
-        Self::Vibe
     }
 }
 
@@ -4293,18 +3657,12 @@ impl ExternalPoolStreamResponseMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolsConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub external_pools_enabled: bool,
     #[serde(default = "default_external_pool_global_max_concurrent_requests")]
     pub external_pool_global_max_concurrent_requests: u32,
     #[serde(default = "default_external_pool_max_queued_requests")]
     pub external_pool_max_queued_requests: u32,
-    /// 外部池估算输入 token 兼容字段。
-    ///
-    /// 历史版本曾用它在发送前拒绝外部池请求。当前外部池按本地凭证同款语义：
-    /// 先按请求体处理配置发送，是否上下文超限以真实上游响应为准。
-    #[serde(default = "default_external_pool_max_input_tokens")]
-    pub external_pool_max_input_tokens: i32,
     #[serde(default)]
     pub external_pool_capacity_mode: ExternalPoolCapacityMode,
     #[serde(default = "default_external_pool_dispatch_max_wait_secs")]
@@ -4338,12 +3696,6 @@ pub struct ExternalPoolsConfig {
     /// 优先级 10/20 的健康池；填 0 会退回只按配置优先级和负载排序。
     #[serde(default = "default_external_pool_transient_failure_priority_penalty")]
     pub external_pool_transient_failure_priority_penalty: u32,
-    /// 兼容字段：普通瞬态失败只产生短期调度罚分，不再升级为池级冷却。
-    ///
-    /// 保留该字段以兼容已有配置和 API；无论取值如何，池级冷却只由
-    /// 明确的模型不可用、端点配置错误或自动禁用等极端状态触发。
-    #[serde(default = "default_external_pool_transient_failure_cooldown_threshold")]
-    pub external_pool_transient_failure_cooldown_threshold: u32,
 
     // ==================== 质量感知调度（被动采样） ====================
     //
@@ -4409,71 +3761,10 @@ pub struct ExternalPoolsConfig {
     /// 恢复爬坡时长；降级到期后流量线性回升，避免瞬间重新打满。
     #[serde(default = "default_external_pool_recovery_ramp_secs")]
     pub external_pool_recovery_ramp_secs: u64,
-
-    #[serde(default)]
-    pub external_direct_policy_enabled: bool,
-    #[serde(default)]
-    pub direct_external_on_local_maintenance: bool,
-    #[serde(default)]
-    pub direct_external_model_rules: Vec<String>,
-    #[serde(default)]
-    pub direct_external_path_rules: Vec<String>,
     #[serde(default)]
     pub external_pool_route_mode: ExternalPoolRouteMode,
     #[serde(default)]
     pub external_pool_route_rules: Vec<String>,
-    #[serde(default)]
-    pub local_pool_route_mode: ExternalPoolRouteMode,
-    #[serde(default)]
-    pub local_pool_route_rules: Vec<String>,
-    #[serde(default = "default_true")]
-    pub fallback_on_local_capacity_exhausted: bool,
-    /// Redis scheduler coordination is a local routing failure, so historical
-    /// configs that omit this newer field retain the pre-v0.0.108 capacity
-    /// fallback behavior. Operators can still explicitly disable it.
-    #[serde(default = "default_true")]
-    pub fallback_on_scheduler_redis_degraded: bool,
-    #[serde(default = "default_true")]
-    pub fallback_on_no_available_credentials: bool,
-    #[serde(default = "default_true")]
-    pub fallback_on_local_transient_exhausted: bool,
-    #[serde(default)]
-    pub fallback_on_unsupported_model: bool,
-    #[serde(default = "default_true")]
-    pub local_pool_preflight_enabled: bool,
-    #[serde(default = "default_true")]
-    pub external_pool_local_rescue_enabled: bool,
-    #[serde(default = "default_true")]
-    pub external_pool_local_rescue_on_rate_limit: bool,
-    #[serde(default = "default_true")]
-    pub external_pool_local_rescue_on_timeout: bool,
-    #[serde(default = "default_true")]
-    pub external_pool_local_rescue_on_capacity: bool,
-    #[serde(default = "default_external_pool_local_rescue_max_wait_secs")]
-    pub external_pool_local_rescue_max_wait_secs: u64,
-    /// 本地账号池风险保护（全池熔断），默认关闭：被风控的账号只禁用它自己，其余账号照常调度。
-    /// 打开后只统计曾经成功过的账号被上游风控（暂停、封禁、锁定），同一账号在窗口内只计一次；
-    /// 从未成功过的账号（新导入、预热中）被风控只禁用它自己。
-    #[serde(default)]
-    pub local_pool_circuit_enabled: bool,
-    #[serde(default = "default_local_pool_circuit_window_secs")]
-    pub local_pool_circuit_window_secs: u64,
-    /// 兼容字段：旧版本按"失败次数"计数。现在每个账号在窗口内只计一次，所以该值只作为
-    /// `local_pool_circuit_require_distinct_credentials` 的下限参与判断。
-    #[serde(default = "default_local_pool_circuit_open_after_failures")]
-    pub local_pool_circuit_open_after_failures: u32,
-    /// 窗口内至少有多少个不同账号被风控才打开。
-    #[serde(default = "default_local_pool_circuit_require_distinct_credentials")]
-    pub local_pool_circuit_require_distinct_credentials: u32,
-    /// 被风控的账号还需占"被风控账号 + 当前可调度账号"的这个百分比以上才打开，
-    /// 避免大池子里几个账号出问题就挡住全部请求。0 表示只看账号数。
-    #[serde(default = "default_local_pool_circuit_min_ratio_percent")]
-    pub local_pool_circuit_min_ratio_percent: u32,
-    #[serde(default = "default_local_pool_circuit_open_secs")]
-    pub local_pool_circuit_open_secs: u64,
-    /// 打开期满后进入半开状态，最多放行这么多个探测请求；探测成功即关闭，再次被风控就重新打开。
-    #[serde(default = "default_local_pool_circuit_half_open_probes")]
-    pub local_pool_circuit_half_open_probes: u32,
     #[serde(default)]
     pub external_pool_auto_disable_enabled: bool,
     #[serde(default = "default_true")]
@@ -4567,11 +3858,10 @@ pub struct ExternalPoolsConfig {
 impl Default for ExternalPoolsConfig {
     fn default() -> Self {
         Self {
-            external_pools_enabled: false,
+            external_pools_enabled: true,
             external_pool_global_max_concurrent_requests:
                 default_external_pool_global_max_concurrent_requests(),
             external_pool_max_queued_requests: default_external_pool_max_queued_requests(),
-            external_pool_max_input_tokens: default_external_pool_max_input_tokens(),
             external_pool_capacity_mode: ExternalPoolCapacityMode::default(),
             external_pool_dispatch_max_wait_secs: default_external_pool_dispatch_max_wait_secs(),
             external_pool_retry_max_attempts: default_external_pool_retry_max_attempts(),
@@ -4604,37 +3894,8 @@ impl Default for ExternalPoolsConfig {
             external_pool_max_probation_secs: default_external_pool_max_probation_secs(),
             external_pool_probe_share_percent: default_external_pool_probe_share_percent(),
             external_pool_recovery_ramp_secs: default_external_pool_recovery_ramp_secs(),
-            external_pool_transient_failure_cooldown_threshold:
-                default_external_pool_transient_failure_cooldown_threshold(),
-            external_direct_policy_enabled: false,
-            direct_external_on_local_maintenance: false,
-            direct_external_model_rules: Vec::new(),
-            direct_external_path_rules: Vec::new(),
             external_pool_route_mode: ExternalPoolRouteMode::default(),
             external_pool_route_rules: Vec::new(),
-            local_pool_route_mode: ExternalPoolRouteMode::default(),
-            local_pool_route_rules: Vec::new(),
-            fallback_on_local_capacity_exhausted: true,
-            fallback_on_scheduler_redis_degraded: true,
-            fallback_on_no_available_credentials: true,
-            fallback_on_local_transient_exhausted: true,
-            fallback_on_unsupported_model: false,
-            local_pool_preflight_enabled: true,
-            external_pool_local_rescue_enabled: true,
-            external_pool_local_rescue_on_rate_limit: true,
-            external_pool_local_rescue_on_timeout: true,
-            external_pool_local_rescue_on_capacity: true,
-            external_pool_local_rescue_max_wait_secs:
-                default_external_pool_local_rescue_max_wait_secs(),
-            local_pool_circuit_enabled: false,
-            local_pool_circuit_window_secs: default_local_pool_circuit_window_secs(),
-            local_pool_circuit_open_after_failures: default_local_pool_circuit_open_after_failures(
-            ),
-            local_pool_circuit_require_distinct_credentials:
-                default_local_pool_circuit_require_distinct_credentials(),
-            local_pool_circuit_open_secs: default_local_pool_circuit_open_secs(),
-            local_pool_circuit_min_ratio_percent: default_local_pool_circuit_min_ratio_percent(),
-            local_pool_circuit_half_open_probes: default_local_pool_circuit_half_open_probes(),
             external_pool_auto_disable_enabled: false,
             external_pool_auto_disable_on_auth_error: true,
             external_pool_auto_disable_on_security_lock: true,
@@ -4704,14 +3965,6 @@ impl ExternalPoolsConfig {
         route_policy_allows(
             self.external_pool_route_mode,
             &self.external_pool_route_rules,
-            endpoint,
-        )
-    }
-
-    pub fn local_pool_route_allowed(&self, endpoint: &str) -> bool {
-        route_policy_allows(
-            self.local_pool_route_mode,
-            &self.local_pool_route_rules,
             endpoint,
         )
     }
@@ -5020,21 +4273,6 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// How the public read-only pool page shows Free accounts. The page only; nothing else reads it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicPoolFreeAccounts {
-    /// Shown as Kiro Power.
-    #[default]
-    Power,
-    /// Shown as Kiro Pro Max.
-    ProMax,
-    /// Shown as Kiro Pro+.
-    ProPlus,
-    /// Left out of the page and its counts.
-    Hide,
-}
-
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5069,57 +4307,6 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    #[serde(default = "default_region")]
-    pub region: String,
-
-    /// Auth Region（用于 Token 刷新），未配置时回退到 region
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_region: Option<String>,
-
-    /// API Region（用于 API 请求），未配置时回退到 region
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_region: Option<String>,
-
-    #[serde(default = "default_kiro_version")]
-    pub kiro_version: String,
-
-    #[serde(skip)]
-    kiro_version_request_snapshot: Option<String>,
-
-    /// 是否自动检查 Kiro 客户端版本号（默认关闭）。
-    ///
-    /// 打开后，后台每 12 小时从官方发布元数据读取 candidate；candidate 只有在管理员显式
-    /// apply/pin 后才会用于上游请求头。关闭检查不会回退已经应用或固定的 active 版本。
-    #[serde(default)]
-    pub kiro_version_auto_sync_enabled: bool,
-
-    /// Set by the one-time runtime config migration when the legacy auto-sync behavior was
-    /// enabled. Startup transfers it to `kiro_version_state` and clears it.
-    #[serde(default)]
-    kiro_version_legacy_auto_sync_migration: bool,
-
-    /// IDE 端点的对话和联网搜索请求是否改走新版 Kiro 域名 `runtime.{region}.kiro.dev`（默认关闭，
-    /// 走 `q.{region}.amazonaws.com`）。只换地址，请求头仍是 IDE 那一套；模型列表、用量查询、
-    /// token 刷新不受影响。命令行端点本来就走新域名。
-    ///
-    /// 2026-10-30 用 FREE 账号实测：同一批账号走旧域名正常，打开后对话请求每次都被新域名以 429
-    /// 拒绝（命令行端点走新域名正常），所以生产上不要打开，除非先用自己的账号验证过。
-    #[serde(default)]
-    pub kiro_runtime_domain_enabled: bool,
-
-    #[serde(default)]
-    pub machine_id: Option<String>,
-
-    /// 是否允许全局 `machineId` 作为账号身份的兼容 fallback。
-    ///
-    /// 默认关闭。账号存在 refreshToken、API key 或稳定凭据 ID 时，系统始终
-    /// 优先生成账号级 machineId，避免多账号共享同一个全局设备身份。只有需要
-    /// 兼容旧版单账号行为时才应显式打开。
-    #[serde(default)]
-    pub global_machine_id_fallback_enabled: bool,
-
     #[serde(default)]
     pub api_key: Option<String>,
 
@@ -5130,26 +4317,8 @@ pub struct Config {
     #[serde(default)]
     pub api_keys: Vec<String>,
 
-    #[serde(default = "default_system_version")]
-    pub system_version: String,
-
-    #[serde(default = "default_node_version")]
-    pub node_version: String,
-
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
-
-    /// 外部 count_tokens API 地址（可选）
-    #[serde(default)]
-    pub count_tokens_api_url: Option<String>,
-
-    /// count_tokens API 密钥（可选）
-    #[serde(default)]
-    pub count_tokens_api_key: Option<String>,
-
-    /// count_tokens API 认证类型（可选，"x-api-key" 或 "bearer"，默认 "x-api-key"）
-    #[serde(default = "default_count_tokens_auth_type")]
-    pub count_tokens_auth_type: String,
 
     /// HTTP 代理地址（可选）
     /// 支持格式: http://host:port, https://host:port, socks5://host:port, socks5h://host:port
@@ -5181,221 +4350,6 @@ pub struct Config {
     #[serde(default)]
     pub request_api_key_policies: Vec<RequestApiKeyPolicy>,
 
-    /// 单凭据目标请求速率（RPM）。
-    ///
-    /// `None` 或 `0` 表示禁用本地凭据级限速；`>0` 会按每个凭据计算最小请求间隔，
-    /// 并在调度时优先分流到其他可用凭据。
-    #[serde(default = "default_credential_rpm")]
-    pub credential_rpm: Option<u32>,
-
-    /// 单凭据最大并发请求数。
-    ///
-    /// `0` 表示不限制；`>0` 时，同一凭据同时在处理的请求达到上限后，
-    /// 新请求会优先调度到其他可用凭据。
-    #[serde(default = "default_credential_max_concurrent_requests")]
-    pub credential_max_concurrent_requests: u32,
-
-    /// 管理端强制刷新账号信息时，对 Kiro 上游请求的最大并发数。
-    ///
-    /// 该限制独立于推理调度使用的 `credential_max_concurrent_requests`：
-    /// 刷新操作会逐账号调用 Kiro `getUsageLimits`，因此必须使用保守的固定上限。
-    #[serde(default = "default_credential_info_refresh_concurrency")]
-    pub credential_info_refresh_concurrency: u32,
-
-    /// 每个 Kiro 积分的真实成本（美元），由运营按套餐价折算填写。
-    ///
-    /// 只用于管理端总览把本地积分换算成成本、与外部池成本放到同一口径；
-    /// 不参与调度和计费。未配置时总览不展示全局毛利。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kiro_credit_unit_price_usd: Option<f64>,
-
-    /// 上游瞬态错误没有 Retry-After 时，对单个凭据设置的临时冷却秒数。
-    #[serde(default = "default_credential_transient_cooldown_secs")]
-    pub credential_transient_cooldown_secs: u64,
-
-    /// 上游 429 没有 Retry-After 时的基础冷却秒数。
-    #[serde(default = "default_credential_rate_limit_cooldown_secs")]
-    pub credential_rate_limit_cooldown_secs: u64,
-
-    /// 上游 5xx/408 等服务器瞬态错误的基础冷却秒数。
-    #[serde(default = "default_credential_server_error_cooldown_secs")]
-    pub credential_server_error_cooldown_secs: u64,
-
-    /// 网络发送错误的基础冷却秒数。
-    #[serde(default = "default_credential_network_error_cooldown_secs")]
-    pub credential_network_error_cooldown_secs: u64,
-
-    /// 流式读取/idle timeout 错误的基础冷却秒数。
-    #[serde(default = "default_credential_stream_error_cooldown_secs")]
-    pub credential_stream_error_cooldown_secs: u64,
-
-    /// 空回是否让账号进入冷却（默认关闭）。
-    ///
-    /// 空回指上游返回 200 但没有任何正文、思考或工具输出：只有用量统计事件、流里一帧都没有、
-    /// 或非流式响应体为空。关闭时账号不冷却、不记会话失败，只在当次请求内排除并换号；
-    /// 开启时按 `credential_stream_error_cooldown_secs` 冷却，并记会话失败。
-    #[serde(default)]
-    pub credential_empty_turn_cooldown_enabled: bool,
-
-    /// 上游故障是否让账号进入冷却（默认关闭）。
-    ///
-    /// 上游故障指换任何账号都可能遇到、与账号本身无关的错误：上游 5xx、上游在响应里发出的
-    /// 异常/错误事件、EventStream 解码或读取失败、网络发送失败。关闭时账号不冷却、不记会话失败，
-    /// 只在当次请求内排除并换号；开启时按各自的冷却秒数冷却（0.0.225 及之前的行为）。
-    /// 限流、鉴权、额度、风控等账号问题不受这个开关影响，照常冷却。
-    #[serde(default)]
-    pub credential_upstream_failure_cooldown_enabled: bool,
-
-    /// 是否启用按模型的账号劣化分（默认开启）。
-    ///
-    /// 劣化分累积「与账号相关但不值得冷却」的失败（上游 200 但空轮次、流被截断等），
-    /// 达到 `credential_degrade_suspend_score` 后该账号在调度中被暂时摘除，流量自然
-    /// 溢出到同档位或其他档位的健康账号。摘除不改变账号配置、不写 Redis，成功会衰减分数，
-    /// 到期或衰减后自动恢复；被摘除账号仍保留少量探测流量。
-    ///
-    /// 没有一个健康候选时会全部放行，因此摘除本身不会造成排队。
-    #[serde(default = "default_credential_degrade_enabled")]
-    pub credential_degrade_enabled: bool,
-
-    /// 空回（上游 200 但整条响应没有任何内容，换号重试用尽）对外返回的 HTTP 状态码。
-    ///
-    /// 只允许 502 / 503 / 529，其它值按 502 处理。默认 502：下游网关（如 sub2api）收到 529
-    /// 通常会把账号标成过载、暂停调度。流式请求在首个输出前失败同样使用该状态码；
-    /// 已经开始输出后才失败的，流内 error 事件的 type 随之变化（529→overloaded_error）。
-    #[serde(default = "default_empty_turn_error_status_code")]
-    pub empty_turn_error_status_code: u16,
-
-    /// 空回换号重试之间的等待方式：none（不等待）、fixed（固定间隔）、exponential（指数递增）。
-    #[serde(default = "default_empty_turn_retry_backoff_mode")]
-    pub empty_turn_retry_backoff_mode: String,
-
-    /// 空回重试的首次等待毫秒数（0~10000）。
-    #[serde(default = "default_empty_turn_retry_base_delay_ms")]
-    pub empty_turn_retry_base_delay_ms: u64,
-
-    /// 指数模式下空回重试等待的上限毫秒数（0~30000）。
-    #[serde(default = "default_empty_turn_retry_max_delay_ms")]
-    pub empty_turn_retry_max_delay_ms: u64,
-
-    /// 空回重试等待的随机抖动比例（0~100），避免一批请求同时打到上游。
-    #[serde(default = "default_empty_turn_retry_jitter_percent")]
-    pub empty_turn_retry_jitter_percent: u32,
-
-    /// 劣化分摘除阈值；<= 0 时视为关闭摘除。
-    #[serde(default = "default_credential_degrade_suspend_score")]
-    pub credential_degrade_suspend_score: f64,
-
-    /// 劣化分的半衰期秒数：没有新样本时分数按此半衰期惰性衰减。
-    #[serde(default = "default_credential_degrade_half_life_secs")]
-    pub credential_degrade_half_life_secs: u64,
-
-    /// 恢复比例：劣化分必须降到 `阈值 × 该比例` 以下才解除摘除（0~1）。
-    ///
-    /// 摘除和恢复用两条不同的线构成滞回带。若两者相等，一次成功就把分数减半、
-    /// 账号立刻回到最高档吃满流量、再立刻失败被摘除，形成高频抖动。
-    /// 0.4 意味着 6.0 分要降到 2.4 以下才恢复（两次成功或约两个半衰期）。
-    #[serde(default = "default_credential_degrade_resume_ratio")]
-    pub credential_degrade_resume_ratio: f64,
-
-    /// 每次成功把劣化分乘以该系数（0~1），用于「恢复慢于劣化」。
-    #[serde(default = "default_credential_degrade_success_decay")]
-    pub credential_degrade_success_decay: f64,
-
-    /// 被摘除账号的探测流量比例（百分比，0~100）。
-    ///
-    /// 必须大于 0，否则被摘除的账号接不到请求、永远拿不到成功样本，也就永远无法恢复。
-    #[serde(default = "default_credential_degrade_probe_percent")]
-    pub credential_degrade_probe_percent: u32,
-
-    /// 一次空轮次（上游 200 但没有任何正文）累积的劣化分权重。
-    #[serde(default = "default_credential_degrade_empty_turn_weight")]
-    pub credential_degrade_empty_turn_weight: f64,
-
-    /// 一次流截断 / 上游流故障累积的劣化分权重。应低于空轮次：这类错误更偏向上游。
-    #[serde(default = "default_credential_degrade_stream_weight")]
-    pub credential_degrade_stream_weight: f64,
-
-    /// 自愈最小间隔秒数（默认 300，0 表示不限）。
-    ///
-    /// 所有可调度账号都失效时，调度器会自动重新启用因连续失败被禁用的账号。同一个账号两次自愈
-    /// 之间至少隔这么久，避免坏账号在"禁用→自愈→再禁用"之间来回打转、每轮都消耗请求。
-    #[serde(default = "default_credential_auto_heal_min_interval_secs")]
-    pub credential_auto_heal_min_interval_secs: u64,
-
-    /// 同一个账号最多连续自愈几轮（默认 5，0 表示不限）。
-    ///
-    /// 自愈后还没有成功过一次就又被禁用，算连续一轮；有一次调用成功或管理员手动启用/重置后清零。
-    /// 达到上限后不再自动恢复，等管理员处理。
-    #[serde(default = "default_credential_auto_heal_max_consecutive_rounds")]
-    pub credential_auto_heal_max_consecutive_rounds: u32,
-
-    /// 可重试协议异常或无法分类错误的基础冷却秒数。
-    #[serde(default = "default_credential_protocol_error_cooldown_secs")]
-    pub credential_protocol_error_cooldown_secs: u64,
-
-    /// 认证失败进入刷新/判定期间的基础冷却秒数。
-    #[serde(default = "default_credential_auth_error_cooldown_secs")]
-    pub credential_auth_error_cooldown_secs: u64,
-
-    /// 同一凭据连续瞬态失败时的冷却退避倍率。
-    #[serde(default = "default_credential_cooldown_backoff_multiplier")]
-    pub credential_cooldown_backoff_multiplier: f64,
-
-    /// 冷却退避随机抖动百分比，范围 0..=100。
-    #[serde(default = "default_credential_cooldown_jitter_percent")]
-    pub credential_cooldown_jitter_percent: u32,
-
-    /// 冷却结束后的降权观察窗口秒数。
-    #[serde(default = "default_credential_probation_secs")]
-    pub credential_probation_secs: u64,
-
-    /// 单个凭据临时冷却最长秒数，用于限制 Retry-After 头的影响范围。
-    #[serde(default = "default_credential_max_cooldown_secs")]
-    pub credential_max_cooldown_secs: u64,
-
-    /// 单个请求等待凭据可调度的最长秒数。
-    ///
-    /// `0` 表示不限制等待时间；`>0` 时，如果所有可用凭据持续处于冷却、
-    /// 本地限流或并发占满状态，超过该时间后返回明确的本地调度限流错误。
-    #[serde(default = "default_credential_dispatch_max_wait_secs")]
-    pub credential_dispatch_max_wait_secs: u64,
-
-    /// 同一会话在单个凭据上的最大并发请求数。
-    ///
-    /// `0` 表示等于该凭据自身的并发上限（同一会话的并发全部叠在绑定账号上，对上游缓存最友好）；
-    /// `>0` 时，同一会话在绑定账号上的并发达到该值后，后续并发请求临时借用其他账号，不改绑。
-    #[serde(default)]
-    pub credential_session_max_concurrent_requests: u32,
-
-    /// Kiro 上游响应头最长等待秒数。
-    ///
-    /// 只限制请求发出到拿到响应头的阶段；响应头之后的流式 body 读取仍由
-    /// Anthropic SSE 层的上游 idle timeout 控制，避免长输出被整段请求超时误杀。
-    /// `0` 表示关闭该额外保护，仅使用底层 HTTP client 的全局超时。
-    #[serde(default = "default_kiro_upstream_response_timeout_secs")]
-    pub kiro_upstream_response_timeout_secs: u64,
-
-    /// Kiro 上游流式响应正文的静默超时秒数。
-    ///
-    /// 响应头回来后，如果 eventstream 在该时间内没有任何新 chunk，就按上游
-    /// stream idle 处理并释放并发占用。`0` 表示使用默认值，避免错误关闭保护。
-    #[serde(default = "default_kiro_upstream_stream_idle_timeout_secs")]
-    pub kiro_upstream_stream_idle_timeout_secs: u64,
-
-    /// 单次上游响应正文的总时长上限秒数（默认 3600，0 关闭，最大 86400）。
-    ///
-    /// 静默超时只管"多久没有新数据"；上游以低于静默超时的间隔持续滴流时，一个请求会一直
-    /// 占着账号并发。超过该时长后结束本次响应并释放并发，流式以错误事件结束。
-    #[serde(default = "default_kiro_upstream_stream_max_duration_secs")]
-    pub kiro_upstream_stream_max_duration_secs: u64,
-
-    /// 下游流式响应的保活心跳间隔秒数（1–300）。
-    ///
-    /// 上游暂时没有新内容时，按该间隔向客户端发送保活事件，防止客户端或中间代理
-    /// 因空闲断开。
-    #[serde(default = "default_stream_keepalive_interval_secs")]
-    pub stream_keepalive_interval_secs: u64,
-
     /// 首个上游内容到达前，最多静默保留多少秒（0–60，默认 15）。
     ///
     /// 窗口内不向客户端写任何字节，以便上游失败时无感换号重试；超过窗口仍无输出时，
@@ -5403,236 +4357,27 @@ pub struct Config {
     #[serde(default = "default_stream_pre_output_hold_secs")]
     pub stream_pre_output_hold_secs: u64,
 
-    /// 上游响应头之后等待首个内容事件的上限秒数（0 关闭，默认 0，最大 3600）。
-    ///
-    /// 超时后主动断开上游并释放账号并发：尚未向客户端写入时按首输出前重试换号，
-    /// 已写入时以 overloaded_error 结束流。已有输出之后的静默仍由上游流静默超时控制。
-    #[serde(default = "default_stream_first_output_timeout_secs")]
-    pub stream_first_output_timeout_secs: u64,
-
-    /// 是否允许流式响应在尚未向下游发送任何 SSE 字节前，对上游流读取/空闲/错误事件进行重试。
-    ///
-    /// 该开关只覆盖“下游尚未提交”的安全窗口。只要已经发送过 message_start、ping、
-    /// text/thinking/tool_use 或 error 等任意 SSE 字节，就不会自动换号重试，避免重复工具调用
-    /// 或事件乱序。
-    #[serde(default = "default_kiro_upstream_stream_retry_enabled")]
-    pub kiro_upstream_stream_retry_enabled: bool,
-
-    /// 单个请求在“未向下游提交”窗口内，普通首输出前错误最多尝试多少次上游
-    /// （包含首次调用；默认 6）。
-    ///
-    /// 流式和非流式共用，覆盖流读取错误、流静默/首输出超时、2xx 错误事件和 EventStream
-    /// 不完整。只有 usage/metadata 的空轮次使用独立的
-    /// `kiroUpstreamUsageOnlyRetryMaxAttempts`。实际发送次数同时受
-    /// `inferenceUpstreamMaxAttempts` 约束。0/1 都等价于不额外重试。
-    #[serde(default = "default_kiro_upstream_stream_retry_max_attempts")]
-    pub kiro_upstream_stream_retry_max_attempts: u32,
-
-    /// 只有 usage/metadata、没有 assistant/reasoning/tool 输出的空轮次最多尝试多少次上游
-    /// （包含首次调用；默认 2）。流式和非流式共用，1 表示关闭空轮重试；实际发送次数仍受
-    /// `inferenceUpstreamMaxAttempts` 约束。
-    #[serde(default = "default_kiro_upstream_usage_only_retry_max_attempts")]
-    pub kiro_upstream_usage_only_retry_max_attempts: u32,
-
     /// 单个下游 Messages 请求允许发出的推理上游 HTTP 请求硬上限。
     ///
-    /// 本地凭据重试、首输出前流重试、payload/cachePoint 重试、外部池 failover
-    /// 和本地 rescue 共享这一预算。该值与账号、外部池数量无关。
+    /// 首输出前流重试、payload 重试和外部池 failover 共享这一预算。
+    /// 该值与外部池数量无关。
     #[serde(default = "default_inference_upstream_max_attempts")]
     pub inference_upstream_max_attempts: u32,
 
-    /// 单个下游请求允许发出的辅助上游 HTTP 请求硬上限。
-    ///
-    /// Token refresh 与 enterprise profile discovery 共享该 request-scoped 预算；
-    /// 不计入 inferenceUpstreamMaxAttempts，也不受提示词注入开关控制。
-    #[serde(default = "default_auxiliary_upstream_max_attempts")]
-    pub auxiliary_upstream_max_attempts: u32,
-
-    /// 单实例同时执行的辅助上游 HTTP 请求硬上限。
-    ///
-    /// 达到上限时 fail-fast，不进入无界等待队列。该边界独立于普通请求 admission。
-    #[serde(default = "default_auxiliary_upstream_max_concurrent_requests")]
-    pub auxiliary_upstream_max_concurrent_requests: u32,
-
-    /// Token refresh 辅助通道的 RPM 硬上限。
-    ///
-    /// 配置 Redis 时这是跨实例共享上限；未配置 Redis 时是单进程上限。
-    #[serde(default = "default_token_refresh_max_rpm")]
-    pub token_refresh_max_rpm: u32,
-
-    /// Token refresh 通道允许立即消耗的 token bucket 容量。
-    #[serde(default = "default_token_refresh_burst")]
-    pub token_refresh_burst: u32,
-
-    /// 是否启用闲置账号的后台 Token 主动刷新。
-    #[serde(default = "default_token_refresh_background_enabled")]
-    pub token_refresh_background_enabled: bool,
-
-    /// 后台 Token 扫描间隔（秒）。
-    #[serde(default = "default_token_refresh_background_interval_secs")]
-    pub token_refresh_background_interval_secs: u64,
-
-    /// 后台 Token 主动刷新提前量（秒）。
-    #[serde(default = "default_token_refresh_background_lead_secs")]
-    pub token_refresh_background_lead_secs: u64,
-
-    /// 上游 eventstream idle timeout 发生在下游提交前时是否允许重试。
-    #[serde(default = "default_true")]
-    pub kiro_upstream_stream_retry_on_idle_timeout: bool,
-
-    /// 上游 body read error 发生在下游提交前时是否允许重试。
-    #[serde(default = "default_true")]
-    pub kiro_upstream_stream_retry_on_read_error: bool,
-
-    /// 上游 2xx JSON 错误体、流内 error/invalidState 等状态错误发生在下游提交前时是否允许重试。
-    #[serde(default = "default_true")]
-    pub kiro_upstream_stream_retry_on_status_error: bool,
-
-    /// Kiro 上游基础 URL 覆盖。
-    ///
-    /// 默认 `None` 时使用官方 `https://q.{region}.amazonaws.com`。仅用于本地压测、
-    /// staging 或显式内网代理验证；生产不配置时不会改变官方调用协议。
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kiro_upstream_base_url: Option<String>,
-
-    /// 单次上游调用最多尝试多少个凭据/重试轮次。
-    ///
-    /// `0` 表示自动使用 3 次固定预算，不随凭据池规模增长；
-    /// `>0` 表示显式上限，用于限制单次请求在大凭据池下的最长故障转移时间。
-    #[serde(default)]
-    pub credential_retry_max_attempts: u32,
-
-    /// 是否允许部分提示/协议逻辑 400 错误换未尝试账号重试。
-    ///
-    /// 默认关闭，保持 400 请求错误直接失败的原语义。
-    #[serde(default)]
-    pub credential_prompt_logic_retry_enabled: bool,
-
-    /// 提示/协议逻辑 400 错误最多换号重试次数。
-    ///
-    /// 仅在 `credentialPromptLogicRetryEnabled=true` 时生效；0 表示开启时默认 1 次。
-    #[serde(default)]
-    pub credential_prompt_logic_retry_max_attempts: u32,
-
-    /// 上游 region（端点）轮换总开关。
-    ///
-    /// 默认关闭，关闭时一律使用改造之前的端点（凭据自身解析出的 region），
-    /// 便于某个端点不可用导致调度持续失败时一键回退。
-    ///
-    /// 开启后在官方支持的 `us-east-1` / `eu-central-1` 两个端点之间轮换
-    /// （见 `KIRO_ROTATION_REGIONS`，对齐 kiro-rs-main）。具体端点由程序内置，
-    /// 无需用户配置——Kiro/Q 上游只在这两个端点提供服务，填其他值只会打到
-    /// 不存在的域名上。顺序按凭据自身 region 决定：`eu-*` 账号优先 `eu-central-1`。
-    ///
-    /// 该开关与狂暴模式完全独立、互不影响：普通模式下也可以单独开启端点轮换重试。
-    #[serde(default)]
-    pub kiro_upstream_region_rotation_enabled: bool,
-
-    /// 是否允许把带有 Profile ARN 的账号请求发送到与 ARN 区域不同的备用 Region。
-    ///
-    /// 默认关闭。开启 Region rotation 后，仍需显式打开此开关才会尝试异 Region
-    /// Profile；关闭时只允许与 Profile ARN 区域一致的候选。
-    #[serde(default)]
-    pub kiro_region_profile_arn_mismatch_allowed: bool,
-
-    /// 本地账号 429 狂暴轮换模式主开关。
-    ///
-    /// 默认关闭。关闭时所有调度、重试与冷却行为与引入该特性之前逐项一致。
-    /// 开启后遇到可重试的 429/瞬态失败会优先换账号重试，把所有账号轮一遍后
-    /// 再切换到下一个 region，构成 `账号 × region` 的笛卡尔积遍历。
-    ///
-    /// 仅作用于本地账号；外部池有独立的重试管线，不受该开关影响。
-    #[serde(default)]
-    pub local_berserk_mode_enabled: bool,
-
-    /// 狂暴模式下 `账号 × region` 最多完整轮换几轮。
-    ///
-    /// 仅在 `localBerserkModeEnabled=true` 时生效；合法范围 1..=10，
-    /// 0 等价于 1 轮。总尝试上限为 `账号数 × region数 × 轮数`。
-    #[serde(default = "default_local_berserk_max_rounds")]
-    pub local_berserk_max_rounds: u32,
-
-    /// 狂暴模式跨轮次退避毫秒数。
-    ///
-    /// 同一轮内切换账号不等待（不同账号不共享上游限流配额）；
-    /// 一轮全部失败后等待该时长再开始下一轮，避免连环撞墙放大限流。
-    #[serde(default = "default_local_berserk_round_delay_ms")]
-    pub local_berserk_round_delay_ms: u64,
-
-    /// 并发占用 lease 的最大存活秒数。
-    ///
-    /// `0` 表示不自动回收；`>0` 时，调度前会清理超过该时间仍未释放的占用，
-    /// 避免异常路径导致某个凭据永久被视为并发占满。
-    #[serde(default = "default_credential_in_flight_lease_max_secs")]
-    pub credential_in_flight_lease_max_secs: u64,
-
-    /// 全局最大并发调度请求数。默认给新初始化配置一个硬上限；`0` 表示不限制。
-    #[serde(default = "default_dispatch_global_max_concurrent_requests")]
-    pub dispatch_global_max_concurrent_requests: u32,
-
-    /// 全局最多允许等待调度容量的请求数。默认限制等待放大；`0` 表示不限制。
-    #[serde(default = "default_dispatch_max_queued_requests")]
-    pub dispatch_max_queued_requests: u32,
-
-    /// 本地凭据调度容量是否按请求 token 量级加权。
-    ///
-    /// 默认关闭；关闭时不会在调度前做额外 token 估算，也不会改变并发/RPM 口径。
-    /// 开启后只影响本地凭据池，外部池仍按外部池自己的并发配置调度。
-    #[serde(default)]
-    pub weighted_capacity: WeightedCapacityConfig,
-
-    /// 新凭据预热请求次数，每次真实请求成功减 1，不会伪造 success_count。
-    /// 预热期内，只要有就绪凭据可调度，预热凭据就按配额限流（见 `credential_warmup_selection_percent`）。
-    #[serde(default = "default_credential_warmup_requests")]
-    pub credential_warmup_requests: u32,
-
-    /// 预热起始比例：预热凭据起步时的流量为同档位就绪凭据平均流量的这个百分比，
-    /// 随预热进度线性升到 100%。只在有就绪凭据可调度时限流；没有时预热凭据照常接溢出流量。
-    /// `0` 表示有就绪凭据时预热凭据只接溢出流量。所有负载均衡模式都生效。
-    #[serde(default = "default_credential_warmup_selection_percent")]
-    pub credential_warmup_selection_percent: u32,
-
-    /// 已有就绪凭据可用时，所有预热凭据合计最多承接的近期流量百分比。
-    /// 就绪凭据很少时会自动放宽，保证就绪凭据不超过公平份额的 2 倍。
-    #[serde(default = "default_credential_warmup_max_selection_percent")]
-    pub credential_warmup_max_selection_percent: u32,
-
-    /// 输入压缩配置。默认不启用；启用后默认只做 whitespace 压缩。
-    #[serde(default)]
-    pub compression: CompressionConfig,
-
     /// 多模态图片/文件预处理配置。
     ///
-    /// safe 保持现有行为：展开本地 file_id、下载安全远程 URL、识别并修正 base64 图片媒体类型。
-    /// light 不下载、不展开、不 decode 校正图片，只让 inline base64/data URL 进入协议转换。
+    /// safe 下载安全远程 URL、识别并修正 base64 图片媒体类型。
+    /// light 不下载、不 decode 校正图片，保留 inline base64/data URL。
     #[serde(default)]
     pub image_processing: ImageProcessingConfig,
-
-    /// 本地 Anthropic -> Kiro 协议转换能力配置。
-    #[serde(default)]
-    pub body_conversion: BodyConversionConfig,
 
     /// 代理写进上游请求的提示词：每一项的全局默认、可编辑文本和按路由的显式设置。
     #[serde(default)]
     pub prompt_injection: PromptInjectionConfig,
 
-    /// 按路由控制的功能（`-thinking` 模型名、thinking 触发、渠道信息过滤、WebSearch 模型驱动）。
+    /// 按路由控制的功能（`-thinking` 模型名、thinking 触发、历史清洗）。
     #[serde(default)]
     pub route_features: RouteFeaturesConfig,
-
-    /// `/v1/models` 只列出 Claude 模型，避免非 Claude 上游目录暴露渠道。
-    #[serde(default)]
-    pub claude_models_only: bool,
-
-    /// 按订阅等级统一设置的允许模型（key 为 `free`、`pro`、`power` 等订阅等级）。账号自己
-    /// 设置了支持模型时以账号为准；没设置时按所属等级的列表限制；等级没有列表时不限制。
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub subscription_model_lists: SubscriptionModelLists,
-
-    /// 旧配置字段，只用于迁移，加载后转换成上面三个字段。
-    #[serde(default, skip_serializing)]
-    pub prompt_steering: Option<serde_json::Value>,
 
     /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略。
     #[serde(default)]
@@ -5642,14 +4387,11 @@ pub struct Config {
     #[serde(default)]
     pub local_request_compat: LocalRequestCompatConfig,
 
-    /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
+    /// Payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
     #[serde(default)]
     pub payload_shaping: PayloadShapingConfig,
 
-    /// 发送 Kiro 上游前启用最终 payload 防护。
-    ///
-    /// 防护在 Anthropic -> Kiro 转换之后运行，按 Kiro weighted 口径裁剪旧历史，
-    /// 并修复 Kiro 容易返回 `400 Improperly formed request` 的工具配对边界。
+    /// 发送上游前启用按字节计算的 payload 防护。
     #[serde(default = "default_payload_guard_enabled")]
     pub payload_guard_enabled: bool,
 
@@ -5661,31 +4403,21 @@ pub struct Config {
     #[serde(default)]
     pub payload_too_long_handling: PayloadTooLongHandling,
 
-    /// 通用 payload 的本地 byte soft target 和按大小处理总开关。Kiro local path
-    /// 的真实体积判断由 `payload_guard_kiro_max_weight` 提供；`0` 表示不按大小
-    /// 整形或裁剪，但仍执行协议修复。该字段不是入站 hard limit；无法安全裁剪时
+    /// 通用 payload 的 byte soft target 和按大小处理总开关。
+    /// `0` 表示不按大小整形或裁剪。该字段不是入站 hard limit；无法安全裁剪时
     /// 会记录 `still_oversized` 并由上游裁决。
     #[serde(default = "default_payload_guard_max_bytes")]
     pub payload_guard_max_bytes: usize,
 
-    /// Kiro 上游真实 payload 体积的字符集加权裁剪目标。
-    ///
-    /// 与 `payloadGuardMaxBytes` 不同，本字段只用于 Kiro local path：
-    /// ASCII 字符计 1，非 ASCII 字符计 8。`payloadGuardMaxBytes=0`
-    /// 仍表示关闭所有按大小触发的整形/裁剪。
-    #[serde(default = "default_payload_guard_kiro_max_weight")]
-    pub payload_guard_kiro_max_weight: usize,
-
     /// 外部/Anthropic byte guard 的安全余量字节数。
     ///
     /// 当 `payloadGuardMaxBytes > 0` 时，外部/Anthropic byte path 的实际裁剪目标为
-    /// `payloadGuardMaxBytes - payloadGuardSafetyMarginBytes`。Kiro local path 使用
-    /// `payloadGuardKiroMaxWeight`，不把这个 byte margin 当成 weighted 阈值。
+    /// `payloadGuardMaxBytes - payloadGuardSafetyMarginBytes`。
     #[serde(default = "default_payload_guard_safety_margin_bytes")]
     pub payload_guard_safety_margin_bytes: usize,
 
     /// payload 超限时是否允许裁剪最旧历史。关闭后只执行轻量协议修复；
-    /// 仍超预算的请求会标记 `still_oversized` 并继续透传给 Kiro。
+    /// 仍超预算的请求会标记 `still_oversized` 并继续透传给上游。
     #[serde(default = "default_payload_guard_trim_history")]
     pub payload_guard_trim_history: bool,
 
@@ -5697,102 +4429,20 @@ pub struct Config {
     #[serde(default = "default_payload_guard_external_enabled")]
     pub payload_guard_external_enabled: bool,
 
-    /// 是否把 Anthropic tool cache_control 转成 Kiro cachePoint 发送给上游。
-    ///
-    /// 默认关闭；开启后仅对实际发送给 Kiro 的工具定义插入 cachePoint。
-    #[serde(default = "default_kiro_cache_point_enabled")]
-    pub kiro_cache_point_enabled: bool,
-
-    /// cachePoint 第一阶段只根据工具上的 cache_control 插入，不自动改写系统消息或历史消息。
-    #[serde(default = "default_kiro_cache_point_tools_only")]
-    pub kiro_cache_point_tools_only: bool,
-
-    /// 是否把 cachePoint 插入计划写入 payload diagnostics，便于定位上游 body invalid。
-    #[serde(default = "default_kiro_cache_point_record_plan")]
-    pub kiro_cache_point_record_plan: bool,
-
-    /// 负载均衡模式（"priority" 或 "balanced"）。balanced 先按账号优先级分层，
-    /// 再在同优先级账号内按负载与近期选中次数均衡。
-    #[serde(default = "default_load_balancing_mode")]
-    pub load_balancing_mode: String,
-
-    /// 健康调度的错误率 EWMA 新样本权重。
-    #[serde(default = "default_scheduler_error_ewma_alpha")]
-    pub scheduler_error_ewma_alpha: f64,
-
-    /// 健康调度的配置优先级权重。
-    #[serde(default = "default_scheduler_priority_weight")]
-    pub scheduler_priority_weight: f64,
-
-    /// 健康调度的实时并发负载权重。
-    #[serde(default = "default_scheduler_load_weight")]
-    pub scheduler_load_weight: f64,
-
-    /// 健康调度的近期错误率权重。
-    #[serde(default = "default_scheduler_error_weight")]
-    pub scheduler_error_weight: f64,
-
-    /// 健康调度的延迟 EWMA 权重。
-    #[serde(default = "default_scheduler_latency_weight")]
-    pub scheduler_latency_weight: f64,
-
-    /// 健康调度的恢复观察期惩罚权重。
-    #[serde(default = "default_scheduler_probation_weight")]
-    pub scheduler_probation_weight: f64,
-
-    /// 健康调度的近期选中压力权重，用于降低短窗口内被过度选中的凭据。
-    #[serde(default = "default_scheduler_selection_pressure_weight")]
-    pub scheduler_selection_pressure_weight: f64,
-
-    /// 健康调度的总选中次数权重。默认关闭，仅建议作为极弱长期均衡信号。
-    #[serde(default = "default_scheduler_total_selection_weight")]
-    pub scheduler_total_selection_weight: f64,
-
-    /// 健康模式在得分最佳的前 N 个候选中加权抽样，降低并发抢占集中度。
-    #[serde(default = "default_scheduler_top_k")]
-    pub scheduler_top_k: u32,
-
-    /// 调度失败诊断中最多记录多少个账号样本。
-    ///
-    /// 只影响内部 usage/trace 元数据，不影响对下游返回的统一错误。
-    #[serde(default = "default_selection_failure_sample_limit")]
-    pub selection_failure_sample_limit: usize,
-
-    /// 是否记录调度失败的账号样本明细。
-    ///
-    /// 关闭后仍会保留原因计数和主原因，但不写入具体账号样本。
-    #[serde(default = "default_selection_failure_record_enabled")]
-    pub selection_failure_record_enabled: bool,
-
     /// Anthropic 兼容 profile（默认 claude-code）。
     #[serde(default = "default_compat_profile")]
     pub compat_profile: CompatProfile,
 
-    /// Kiro IDE agent-mode header 策略（默认 vibe，保持现有成功链路）。
-    #[serde(default = "default_kiro_agent_mode_strategy")]
-    pub kiro_agent_mode_strategy: KiroAgentModeStrategy,
-
     /// 请求模型解析策略（默认 compatible）。
     ///
     /// 控制 `sonnet`、`opus`、`default` 等短模型名，以及同 family 自动归一化
-    /// 是否允许在发送上游前映射为当前 Kiro 可用模型。
+    /// 是否允许在发送上游前映射为已配置的可用模型。
     #[serde(default = "default_model_resolution_mode")]
     pub model_resolution_mode: ModelResolutionMode,
 
     /// 模型映射和兜底规则配置。
     #[serde(default)]
     pub model_mapping: ModelMappingConfig,
-
-    /// 是否开启非流式响应的 thinking 块提取（默认 true）
-    ///
-    /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
-    /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
-    #[serde(default = "default_extract_thinking")]
-    pub extract_thinking: bool,
-
-    /// 旧配置字段，只用于迁移：现在是 `routeFeatures` 的 `thinkingTrigger`。
-    #[serde(default, skip_serializing)]
-    pub thinking_trigger_mode: Option<ThinkingTriggerMode>,
 
     /// 本地 prompt-cache 模拟的目标 cache read 中心比例。
     ///
@@ -5804,7 +4454,7 @@ pub struct Config {
 
     /// high-cache 模拟专用的 total input 放大倍数。
     ///
-    /// 只影响本地 high-cache usage 模拟，不影响真实 Kiro metadata cache。
+    /// 只影响本地 high-cache usage 模拟，不影响真实上游缓存。
     #[serde(default = "default_prompt_cache_token_scale")]
     pub prompt_cache_token_scale: f64,
 
@@ -5880,42 +4530,9 @@ pub struct Config {
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
 
-    /// tool-use 格式错误的内部 JSONL 诊断记录。详细内容不写入 usage 数据库。
-    #[serde(default)]
-    pub tool_format_debug: ToolFormatDebugConfig,
-
-    /// 定向请求抓取：空回失败的请求体、tool_choice 请求的回复，用于本地回放。默认关闭。
-    #[serde(default)]
-    pub request_capture: RequestCaptureConfig,
-
     /// Admin 高缓存请求阈值。
     #[serde(default = "default_high_cache_threshold")]
     pub high_cache_threshold: i32,
-
-    /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
-    #[serde(default = "default_endpoint")]
-    pub default_endpoint: String,
-
-    /// 是否允许一次请求在同认证类型的协议端点之间故障转移。
-    ///
-    /// 默认关闭；关闭时只使用凭据 endpoint 或 defaultEndpoint，保持现有行为。
-    #[serde(default)]
-    pub kiro_endpoint_fallback_enabled: bool,
-
-    /// 协议端点候选顺序。候选必须已注册且声明支持当前凭据认证类型。
-    ///
-    /// 该字段只描述运行时顺序，不改变凭据的 primary endpoint，也不参与认证 Region
-    /// 或 API Region 的解析。空列表等价于没有备用端点。
-    #[serde(default = "default_kiro_endpoint_fallback_order")]
-    pub kiro_endpoint_fallback_order: Vec<String>,
-
-    /// 是否在响应头中暴露代理改写动作（默认 false）。
-    ///
-    /// 启用后，凡涉及消息合并 / 孤立 tool_use|tool_result 清理 / thinking 覆写等
-    /// 代理侧的隐式改写都会通过 `x-kiro-rs-warnings` 响应头汇总反馈，便于排查。
-    /// 仅写头，不会修改响应体，对客户端无副作用。
-    #[serde(default = "default_expose_proxy_warnings")]
-    pub expose_proxy_warnings: bool,
 
     /// 是否自动清理过期审计日志（含账号异动）。默认关闭：升级后不删除任何已有记录，
     /// 由管理员在审计页确认后手动开启。
@@ -5925,15 +4542,6 @@ pub struct Config {
     /// 审计日志保留天数；开启自动清理后，后台按批删除更早的记录。
     #[serde(default = "default_audit_log_retention_days")]
     pub audit_log_retention_days: u32,
-
-    /// 是否开放免登录的只读号池页面（`/ui/pool`，接口 `/api/public/pool`）。默认关闭：
-    /// 关闭时接口返回 404，升级后不会对外暴露任何账号信息。
-    #[serde(default)]
-    pub public_pool_view_enabled: bool,
-
-    /// 只读号池页面怎么展示 Free 账号：显示为某个付费档位，或者不展示。只影响该页面。
-    #[serde(default)]
-    pub public_pool_free_accounts: PublicPoolFreeAccounts,
 
     /// 外部备用号池和直连/预检 fallback 策略。
     #[serde(default)]
@@ -5952,412 +4560,29 @@ fn default_port() -> u16 {
     8080
 }
 
-fn default_region() -> String {
-    "us-east-1".to_string()
-}
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 1;
 
-fn default_kiro_endpoint_fallback_order() -> Vec<String> {
-    vec![
-        "codewhisperer".to_string(),
-        "amazonq".to_string(),
-        "runtime".to_string(),
-    ]
-}
-
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 15;
-
-impl Config {
-    /// 上游请求头里实际使用的 Kiro 客户端版本：显式 active override 优先，
-    /// 否则使用配置的 `kiro_version`。自动检查发现的 candidate 不会自动应用。
-    pub fn effective_kiro_version(&self) -> String {
-        self.kiro_version_request_snapshot
-            .clone()
-            .unwrap_or_else(|| crate::kiro::kiro_version::effective_version(&self.kiro_version))
-    }
-
-    pub(crate) fn pin_kiro_version_for_request(&mut self, version: String) {
-        self.kiro_version_request_snapshot = Some(version);
-    }
-
-    pub(crate) fn snapshot_kiro_version_for_request(&mut self) {
-        let version = self.effective_kiro_version();
-        self.pin_kiro_version_for_request(version);
-    }
-
-    pub(crate) fn legacy_auto_sync_migration_pending(&self) -> bool {
-        self.kiro_version_legacy_auto_sync_migration
-    }
-
-    pub(crate) fn clear_legacy_auto_sync_migration_marker(&mut self) {
-        self.kiro_version_legacy_auto_sync_migration = false;
-    }
-}
-
-fn default_kiro_version() -> String {
-    crate::kiro::kiro_version::VERIFIED_IDE_CLIENT_VERSION.to_string()
-}
-
-fn default_system_version() -> String {
-    match std::env::consts::OS {
-        "macos" => "darwin#24.6.0".to_string(),
-        "windows" => "win32#10.0.22631".to_string(),
-        other => format!("{other}#unknown"),
-    }
-}
-
-fn default_node_version() -> String {
-    "22.22.0".to_string()
-}
-
-fn default_count_tokens_auth_type() -> String {
-    "x-api-key".to_string()
-}
+impl Config {}
 
 fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
-fn default_load_balancing_mode() -> String {
-    "priority".to_string()
-}
-
-fn default_credential_transient_cooldown_secs() -> u64 {
-    10
-}
-
-fn default_credential_rate_limit_cooldown_secs() -> u64 {
-    30
-}
-
-fn default_credential_server_error_cooldown_secs() -> u64 {
-    5
-}
-
-fn default_credential_network_error_cooldown_secs() -> u64 {
-    5
-}
-
-fn default_credential_stream_error_cooldown_secs() -> u64 {
-    5
-}
-
-fn default_credential_degrade_enabled() -> bool {
-    true
-}
-
-fn default_empty_turn_error_status_code() -> u16 {
-    502
-}
-
-fn default_empty_turn_retry_backoff_mode() -> String {
-    "none".to_string()
-}
-
-fn default_empty_turn_retry_base_delay_ms() -> u64 {
-    100
-}
-
-fn default_empty_turn_retry_max_delay_ms() -> u64 {
-    2000
-}
-
-fn default_empty_turn_retry_jitter_percent() -> u32 {
-    20
-}
-
-/// 5.0：两次空轮次（2.0 × 2 = 4.0）不够，三到四次之间就会触发。
-///
-/// 阈值必须和「N × 权重」留出余量，不能正好相等：累加基数按半衰期做时间衰减，
-/// 三次失败之间只要隔几毫秒，2.0 × 3 就会算出 5.9999 而不是 6.0，
-/// 阈值正好设成 6.0 时判定会时好时坏。这里取 5.0，留出 1.0 的余量。
-fn default_credential_degrade_suspend_score() -> f64 {
-    5.0
-}
-
-fn default_credential_degrade_half_life_secs() -> u64 {
-    120
-}
-
-fn default_credential_degrade_success_decay() -> f64 {
-    0.5
-}
-
-fn default_credential_degrade_resume_ratio() -> f64 {
-    0.4
-}
-
-fn default_credential_degrade_probe_percent() -> u32 {
-    2
-}
-
-fn default_credential_degrade_empty_turn_weight() -> f64 {
-    2.0
-}
-
-fn default_credential_degrade_stream_weight() -> f64 {
-    1.0
-}
-
-fn default_credential_protocol_error_cooldown_secs() -> u64 {
-    10
-}
-
-fn default_credential_auth_error_cooldown_secs() -> u64 {
-    10
-}
-
-fn default_credential_cooldown_backoff_multiplier() -> f64 {
-    2.0
-}
-
-fn default_credential_cooldown_jitter_percent() -> u32 {
-    20
-}
-
-fn default_credential_probation_secs() -> u64 {
-    30
-}
-
-fn default_credential_max_cooldown_secs() -> u64 {
-    300
-}
-
-fn default_credential_rpm() -> Option<u32> {
-    Some(100)
-}
-
-fn default_credential_max_concurrent_requests() -> u32 {
-    30
-}
-
-fn default_credential_info_refresh_concurrency() -> u32 {
-    3
-}
-
-fn default_credential_dispatch_max_wait_secs() -> u64 {
-    5
-}
-
-fn default_kiro_upstream_response_timeout_secs() -> u64 {
-    180
-}
-
-fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
-    180
-}
-
-pub const DEFAULT_KIRO_UPSTREAM_STREAM_MAX_DURATION_SECS: u64 = 3600;
-pub const KIRO_UPSTREAM_STREAM_MAX_DURATION_MAX_SECS: u64 = 86_400;
-
-fn default_kiro_upstream_stream_max_duration_secs() -> u64 {
-    DEFAULT_KIRO_UPSTREAM_STREAM_MAX_DURATION_SECS
-}
-
 pub const STREAM_PRE_OUTPUT_HOLD_MAX_SECS: u64 = 60;
-pub const STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS: u64 = 3600;
-
-fn default_credential_auto_heal_min_interval_secs() -> u64 {
-    300
-}
-
-fn default_credential_auto_heal_max_consecutive_rounds() -> u32 {
-    5
-}
 
 fn default_stream_pre_output_hold_secs() -> u64 {
     15
-}
-
-fn default_stream_first_output_timeout_secs() -> u64 {
-    // Off by default: slow first outputs (opus-5.5 p99 ~140s) are legitimate, and the hold
-    // window plus keepalive already keep the client connection alive.
-    0
-}
-
-pub const STREAM_KEEPALIVE_INTERVAL_MIN_SECS: u64 = 1;
-pub const STREAM_KEEPALIVE_INTERVAL_MAX_SECS: u64 = 300;
-
-/// 默认 5 秒；`KIRO_STREAM_KEEPALIVE_INTERVAL_SECS` 仍可作为未配置时的默认值。
-fn default_stream_keepalive_interval_secs() -> u64 {
-    std::env::var("KIRO_STREAM_KEEPALIVE_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| {
-            (STREAM_KEEPALIVE_INTERVAL_MIN_SECS..=STREAM_KEEPALIVE_INTERVAL_MAX_SECS)
-                .contains(value)
-        })
-        .unwrap_or(5)
-}
-
-fn default_kiro_upstream_stream_retry_enabled() -> bool {
-    true
-}
-
-/// Default cap on ordinary pre-output upstream attempts, first call included.
-/// Usage-only turns use a separate cap.
-pub(crate) const DEFAULT_KIRO_UPSTREAM_STREAM_RETRY_MAX_ATTEMPTS: u32 = 6;
-
-fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
-    DEFAULT_KIRO_UPSTREAM_STREAM_RETRY_MAX_ATTEMPTS
-}
-
-/// Default cap for usage-only pre-output attempts, first call included.
-pub(crate) const DEFAULT_KIRO_UPSTREAM_USAGE_ONLY_RETRY_MAX_ATTEMPTS: u32 = 2;
-
-fn default_kiro_upstream_usage_only_retry_max_attempts() -> u32 {
-    DEFAULT_KIRO_UPSTREAM_USAGE_ONLY_RETRY_MAX_ATTEMPTS
 }
 
 /// 狂暴模式轮数上限。
 ///
 /// 总尝试量是 `账号数 × region数 × 轮数`，放开轮数会让单个下游请求打出成百上千次
 /// 上游调用。管理端校验与运行时 clamp 共用此常量，避免两处阈值漂移。
-pub const MAX_LOCAL_BERSERK_ROUNDS: u32 = 10;
 
 /// 狂暴模式跨轮间隔上限 60s：sleep 期间并发 lease 仍被占用，不能无限拉长。
-pub const MAX_LOCAL_BERSERK_ROUND_DELAY_MS: u64 = 60_000;
-
-/// 狂暴模式默认轮换 1 轮：开启后至少完整遍历一遍 `账号 × region`。
-pub(crate) fn default_local_berserk_max_rounds() -> u32 {
-    1
-}
-
-/// 狂暴模式跨轮退避默认 1s。
-///
-/// 对齐 kiro-rs-main `retry_delay_throttle` 的 1s 基线：429 是账号级速率配额
-/// 耗尽，一轮全部失败后需要给配额留出恢复窗口，否则只会反复撞墙持续触顶。
-/// 同一轮内切换账号不使用该退避（不同账号不共享配额）。
-pub(crate) fn default_local_berserk_round_delay_ms() -> u64 {
-    1_000
-}
 
 pub(crate) fn default_inference_upstream_max_attempts() -> u32 {
     4
-}
-
-pub(crate) fn default_auxiliary_upstream_max_attempts() -> u32 {
-    2
-}
-
-pub(crate) fn default_auxiliary_upstream_max_concurrent_requests() -> u32 {
-    DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
-}
-
-pub(crate) fn default_token_refresh_max_rpm() -> u32 {
-    DEFAULT_TOKEN_REFRESH_MAX_RPM
-}
-
-pub(crate) fn default_token_refresh_burst() -> u32 {
-    DEFAULT_TOKEN_REFRESH_BURST
-}
-
-pub(crate) fn default_token_refresh_background_enabled() -> bool {
-    DEFAULT_TOKEN_REFRESH_BACKGROUND_ENABLED
-}
-
-pub(crate) fn default_token_refresh_background_interval_secs() -> u64 {
-    DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
-}
-
-pub(crate) fn default_token_refresh_background_lead_secs() -> u64 {
-    DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
-}
-
-fn default_credential_in_flight_lease_max_secs() -> u64 {
-    900
-}
-
-fn default_dispatch_global_max_concurrent_requests() -> u32 {
-    512
-}
-
-fn default_dispatch_max_queued_requests() -> u32 {
-    30
-}
-
-fn default_weighted_capacity_unit() -> u32 {
-    1
-}
-
-fn default_weighted_capacity_max_units() -> u32 {
-    8
-}
-
-fn default_weighted_capacity_tiers() -> Vec<WeightedCapacityTier> {
-    vec![
-        WeightedCapacityTier {
-            min_tokens: 0,
-            units: 1,
-        },
-        WeightedCapacityTier {
-            min_tokens: 100_000,
-            units: 2,
-        },
-        WeightedCapacityTier {
-            min_tokens: 300_000,
-            units: 4,
-        },
-        WeightedCapacityTier {
-            min_tokens: 700_000,
-            units: 8,
-        },
-    ]
-}
-
-fn default_credential_warmup_requests() -> u32 {
-    3
-}
-
-fn default_credential_warmup_selection_percent() -> u32 {
-    5
-}
-
-fn default_credential_warmup_max_selection_percent() -> u32 {
-    50
-}
-
-fn default_scheduler_error_ewma_alpha() -> f64 {
-    0.2
-}
-
-fn default_scheduler_priority_weight() -> f64 {
-    1.0
-}
-
-fn default_scheduler_load_weight() -> f64 {
-    100.0
-}
-
-fn default_scheduler_error_weight() -> f64 {
-    100.0
-}
-
-fn default_scheduler_latency_weight() -> f64 {
-    0.01
-}
-
-fn default_scheduler_probation_weight() -> f64 {
-    50.0
-}
-
-fn default_scheduler_selection_pressure_weight() -> f64 {
-    25.0
-}
-
-fn default_scheduler_total_selection_weight() -> f64 {
-    0.0
-}
-
-fn default_scheduler_top_k() -> u32 {
-    3
-}
-
-fn default_selection_failure_sample_limit() -> usize {
-    20
-}
-
-fn default_selection_failure_record_enabled() -> bool {
-    true
 }
 
 fn default_payload_shaping_enabled() -> bool {
@@ -6424,10 +4649,6 @@ fn default_payload_guard_max_bytes() -> usize {
     450 * 1024
 }
 
-fn default_payload_guard_kiro_max_weight() -> usize {
-    KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT
-}
-
 fn default_payload_guard_safety_margin_bytes() -> usize {
     32 * 1024
 }
@@ -6440,32 +4661,12 @@ fn default_payload_guard_external_enabled() -> bool {
     true
 }
 
-fn default_kiro_cache_point_enabled() -> bool {
-    false
-}
-
-fn default_kiro_cache_point_tools_only() -> bool {
-    true
-}
-
-fn default_kiro_cache_point_record_plan() -> bool {
-    true
-}
-
 fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
 
-fn default_kiro_agent_mode_strategy() -> KiroAgentModeStrategy {
-    KiroAgentModeStrategy::Vibe
-}
-
 fn default_model_resolution_mode() -> ModelResolutionMode {
     ModelResolutionMode::Compatible
-}
-
-fn default_extract_thinking() -> bool {
-    true
 }
 
 fn default_true() -> bool {
@@ -6616,92 +4817,8 @@ fn default_usage_record_limit() -> usize {
     5000
 }
 
-fn default_tool_format_debug_enabled() -> bool {
-    true
-}
-
-fn default_tool_format_debug_dir() -> String {
-    "logs/tool-format-debug".to_string()
-}
-
-fn default_tool_format_debug_channel_capacity() -> usize {
-    128
-}
-
-fn default_tool_format_debug_max_record_bytes() -> usize {
-    512 * 1024
-}
-
-fn default_tool_format_debug_max_samples_per_kind() -> usize {
-    5
-}
-
-fn default_tool_format_debug_window_secs() -> u64 {
-    600
-}
-
-fn default_tool_format_debug_max_records_per_fingerprint() -> u32 {
-    3
-}
-
-fn default_tool_format_debug_max_records_per_group() -> u32 {
-    20
-}
-
-fn default_tool_format_debug_max_records_global() -> u32 {
-    200
-}
-
-fn default_tool_format_debug_max_string_bytes() -> usize {
-    256
-}
-
-fn default_tool_format_debug_capture_request_body() -> bool {
-    true
-}
-
-fn default_tool_format_debug_max_request_body_bytes() -> usize {
-    384 * 1024
-}
-
-fn default_tool_format_debug_max_request_body_records_per_window() -> u32 {
-    20
-}
-
-fn default_tool_format_debug_roll_interval_secs() -> u64 {
-    30 * 60
-}
-
-fn default_tool_format_debug_max_file_bytes() -> u64 {
-    100 * 1024 * 1024
-}
-
-fn normalize_tool_format_debug_request_body_bytes(value: usize) -> usize {
-    if value == 0 {
-        0
-    } else {
-        value.clamp(1024, 2 * 1024 * 1024)
-    }
-}
-
-fn normalize_tool_format_debug_max_file_bytes(value: u64) -> u64 {
-    if value == 0 {
-        default_tool_format_debug_max_file_bytes()
-    } else {
-        value.clamp(1024 * 1024, 1024 * 1024 * 1024)
-    }
-}
-
 fn default_high_cache_threshold() -> i32 {
     10_000
-}
-
-fn default_endpoint() -> String {
-    crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
-}
-
-fn default_expose_proxy_warnings() -> bool {
-    false
 }
 
 pub const MIN_AUDIT_LOG_RETENTION_DAYS: u32 = 1;
@@ -6709,30 +4826,6 @@ pub const MAX_AUDIT_LOG_RETENTION_DAYS: u32 = 3650;
 
 fn default_audit_log_retention_days() -> u32 {
     15
-}
-
-fn default_local_pool_circuit_window_secs() -> u64 {
-    300
-}
-
-fn default_local_pool_circuit_open_after_failures() -> u32 {
-    5
-}
-
-fn default_local_pool_circuit_require_distinct_credentials() -> u32 {
-    5
-}
-
-fn default_local_pool_circuit_min_ratio_percent() -> u32 {
-    30
-}
-
-fn default_local_pool_circuit_half_open_probes() -> u32 {
-    3
-}
-
-fn default_local_pool_circuit_open_secs() -> u64 {
-    30
 }
 
 fn default_external_pool_auto_disable_failure_threshold() -> u32 {
@@ -6748,11 +4841,11 @@ fn default_external_pool_global_max_concurrent_requests() -> u32 {
 }
 
 fn default_external_pool_max_queued_requests() -> u32 {
-    10
+    64
 }
 
 fn default_external_pool_dispatch_max_wait_secs() -> u64 {
-    5
+    60
 }
 
 fn default_external_pool_retry_max_attempts() -> u32 {
@@ -6852,18 +4945,6 @@ fn default_external_pool_recovery_ramp_secs() -> u64 {
 
 fn default_external_pool_transient_failure_priority_penalty() -> u32 {
     20
-}
-
-fn default_external_pool_transient_failure_cooldown_threshold() -> u32 {
-    0
-}
-
-fn default_external_pool_max_input_tokens() -> i32 {
-    1_000_000
-}
-
-fn default_external_pool_local_rescue_max_wait_secs() -> u64 {
-    15
 }
 
 fn default_external_pool_rate_limit_cooldown_secs() -> u64 {
@@ -7118,24 +5199,6 @@ fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -
     normalized
 }
 
-/// 订阅等级 → 允许模型列表。
-pub type SubscriptionModelLists = BTreeMap<String, SubscriptionModelList>;
-
-/// 一个订阅等级允许的模型列表。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SubscriptionModelList {
-    pub models: Vec<String>,
-    /// `auto`：从该等级的账号自动获取；`manual`：在管理页手动设置或手动同步。
-    #[serde(default)]
-    pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
-    /// 自动获取时用的账号。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_credential_id: Option<u64>,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -7145,121 +5208,20 @@ impl Default for Config {
             observability_redis: default_observability_redis_config(),
             host: default_host(),
             port: default_port(),
-            region: default_region(),
-            auth_region: None,
-            api_region: None,
-            kiro_version: default_kiro_version(),
-            kiro_version_request_snapshot: None,
-            kiro_version_auto_sync_enabled: false,
-            kiro_version_legacy_auto_sync_migration: false,
-            kiro_runtime_domain_enabled: false,
-            machine_id: None,
-            global_machine_id_fallback_enabled: false,
             api_key: None,
             api_keys: Vec::new(),
-            system_version: default_system_version(),
-            node_version: default_node_version(),
             tls_backend: default_tls_backend(),
-            count_tokens_api_url: None,
-            count_tokens_api_key: None,
-            count_tokens_auth_type: default_count_tokens_auth_type(),
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
             request_admission: RequestAdmissionConfig::default(),
             request_api_key_policies: Vec::new(),
-            credential_rpm: default_credential_rpm(),
-            credential_max_concurrent_requests: default_credential_max_concurrent_requests(),
-            credential_info_refresh_concurrency: default_credential_info_refresh_concurrency(),
-            kiro_credit_unit_price_usd: None,
-            credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
-            credential_rate_limit_cooldown_secs: default_credential_rate_limit_cooldown_secs(),
-            credential_server_error_cooldown_secs: default_credential_server_error_cooldown_secs(),
-            credential_network_error_cooldown_secs: default_credential_network_error_cooldown_secs(
-            ),
-            credential_stream_error_cooldown_secs: default_credential_stream_error_cooldown_secs(),
-            credential_empty_turn_cooldown_enabled: false,
-            credential_upstream_failure_cooldown_enabled: false,
-            credential_degrade_enabled: default_credential_degrade_enabled(),
-            empty_turn_error_status_code: default_empty_turn_error_status_code(),
-            empty_turn_retry_backoff_mode: default_empty_turn_retry_backoff_mode(),
-            empty_turn_retry_base_delay_ms: default_empty_turn_retry_base_delay_ms(),
-            empty_turn_retry_max_delay_ms: default_empty_turn_retry_max_delay_ms(),
-            empty_turn_retry_jitter_percent: default_empty_turn_retry_jitter_percent(),
-            credential_degrade_suspend_score: default_credential_degrade_suspend_score(),
-            credential_degrade_half_life_secs: default_credential_degrade_half_life_secs(),
-            credential_degrade_success_decay: default_credential_degrade_success_decay(),
-            credential_degrade_resume_ratio: default_credential_degrade_resume_ratio(),
-            credential_degrade_probe_percent: default_credential_degrade_probe_percent(),
-            credential_degrade_empty_turn_weight: default_credential_degrade_empty_turn_weight(),
-            credential_degrade_stream_weight: default_credential_degrade_stream_weight(),
-            credential_auto_heal_min_interval_secs: default_credential_auto_heal_min_interval_secs(
-            ),
-            credential_auto_heal_max_consecutive_rounds:
-                default_credential_auto_heal_max_consecutive_rounds(),
-            credential_protocol_error_cooldown_secs:
-                default_credential_protocol_error_cooldown_secs(),
-            credential_auth_error_cooldown_secs: default_credential_auth_error_cooldown_secs(),
-            credential_cooldown_backoff_multiplier: default_credential_cooldown_backoff_multiplier(
-            ),
-            credential_cooldown_jitter_percent: default_credential_cooldown_jitter_percent(),
-            credential_probation_secs: default_credential_probation_secs(),
-            credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
-            credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
-            credential_session_max_concurrent_requests: 0,
-            kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
-            kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
-            ),
-            kiro_upstream_stream_max_duration_secs: default_kiro_upstream_stream_max_duration_secs(
-            ),
-            stream_keepalive_interval_secs: default_stream_keepalive_interval_secs(),
             stream_pre_output_hold_secs: default_stream_pre_output_hold_secs(),
-            stream_first_output_timeout_secs: default_stream_first_output_timeout_secs(),
-            kiro_upstream_stream_retry_enabled: default_kiro_upstream_stream_retry_enabled(),
-            kiro_upstream_stream_retry_max_attempts:
-                default_kiro_upstream_stream_retry_max_attempts(),
-            kiro_upstream_usage_only_retry_max_attempts:
-                default_kiro_upstream_usage_only_retry_max_attempts(),
             inference_upstream_max_attempts: default_inference_upstream_max_attempts(),
-            auxiliary_upstream_max_attempts: default_auxiliary_upstream_max_attempts(),
-            auxiliary_upstream_max_concurrent_requests:
-                default_auxiliary_upstream_max_concurrent_requests(),
-            token_refresh_max_rpm: default_token_refresh_max_rpm(),
-            token_refresh_burst: default_token_refresh_burst(),
-            token_refresh_background_enabled: default_token_refresh_background_enabled(),
-            token_refresh_background_interval_secs: default_token_refresh_background_interval_secs(
-            ),
-            token_refresh_background_lead_secs: default_token_refresh_background_lead_secs(),
-            kiro_upstream_stream_retry_on_idle_timeout: true,
-            kiro_upstream_stream_retry_on_read_error: true,
-            kiro_upstream_stream_retry_on_status_error: true,
-            kiro_upstream_base_url: None,
-            credential_retry_max_attempts: 0,
-            credential_prompt_logic_retry_enabled: false,
-            credential_prompt_logic_retry_max_attempts: 0,
-            kiro_upstream_region_rotation_enabled: false,
-            kiro_region_profile_arn_mismatch_allowed: false,
-            local_berserk_mode_enabled: false,
-            local_berserk_max_rounds: default_local_berserk_max_rounds(),
-            local_berserk_round_delay_ms: default_local_berserk_round_delay_ms(),
-            credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
-            dispatch_global_max_concurrent_requests:
-                default_dispatch_global_max_concurrent_requests(),
-            dispatch_max_queued_requests: default_dispatch_max_queued_requests(),
-            weighted_capacity: WeightedCapacityConfig::default(),
-            credential_warmup_requests: default_credential_warmup_requests(),
-            credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
-            credential_warmup_max_selection_percent:
-                default_credential_warmup_max_selection_percent(),
-            compression: CompressionConfig::default(),
             image_processing: ImageProcessingConfig::default(),
-            body_conversion: BodyConversionConfig::default(),
             prompt_injection: PromptInjectionConfig::default(),
             route_features: RouteFeaturesConfig::default(),
-            claude_models_only: false,
-            subscription_model_lists: BTreeMap::new(),
-            prompt_steering: None,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             local_request_compat: LocalRequestCompatConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
@@ -7267,31 +5229,12 @@ impl Default for Config {
             payload_guard_mode: default_payload_guard_mode(),
             payload_too_long_handling: PayloadTooLongHandling::default(),
             payload_guard_max_bytes: default_payload_guard_max_bytes(),
-            payload_guard_kiro_max_weight: default_payload_guard_kiro_max_weight(),
             payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
             payload_guard_external_enabled: default_payload_guard_external_enabled(),
-            kiro_cache_point_enabled: default_kiro_cache_point_enabled(),
-            kiro_cache_point_tools_only: default_kiro_cache_point_tools_only(),
-            kiro_cache_point_record_plan: default_kiro_cache_point_record_plan(),
-            load_balancing_mode: default_load_balancing_mode(),
-            scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
-            scheduler_priority_weight: default_scheduler_priority_weight(),
-            scheduler_load_weight: default_scheduler_load_weight(),
-            scheduler_error_weight: default_scheduler_error_weight(),
-            scheduler_latency_weight: default_scheduler_latency_weight(),
-            scheduler_probation_weight: default_scheduler_probation_weight(),
-            scheduler_selection_pressure_weight: default_scheduler_selection_pressure_weight(),
-            scheduler_total_selection_weight: default_scheduler_total_selection_weight(),
-            scheduler_top_k: default_scheduler_top_k(),
-            selection_failure_sample_limit: default_selection_failure_sample_limit(),
-            selection_failure_record_enabled: default_selection_failure_record_enabled(),
             compat_profile: default_compat_profile(),
-            kiro_agent_mode_strategy: default_kiro_agent_mode_strategy(),
             model_resolution_mode: default_model_resolution_mode(),
             model_mapping: ModelMappingConfig::default(),
-            extract_thinking: default_extract_thinking(),
-            thinking_trigger_mode: None,
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
             prompt_cache_token_scale: default_prompt_cache_token_scale(),
             prompt_cache_max_simulated_input_tokens:
@@ -7309,17 +5252,9 @@ impl Default for Config {
             defined_cache_routes: Vec::new(),
             active_route_scenario_id: None,
             usage_record_limit: default_usage_record_limit(),
-            tool_format_debug: ToolFormatDebugConfig::default(),
-            request_capture: RequestCaptureConfig::default(),
             high_cache_threshold: default_high_cache_threshold(),
-            default_endpoint: default_endpoint(),
-            kiro_endpoint_fallback_enabled: false,
-            kiro_endpoint_fallback_order: default_kiro_endpoint_fallback_order(),
-            expose_proxy_warnings: default_expose_proxy_warnings(),
             audit_log_retention_enabled: false,
             audit_log_retention_days: default_audit_log_retention_days(),
-            public_pool_view_enabled: false,
-            public_pool_free_accounts: PublicPoolFreeAccounts::default(),
             external_pools: ExternalPoolsConfig::default(),
             config_path: None,
         }
@@ -7330,18 +5265,6 @@ impl Config {
     /// 获取默认配置文件路径
     pub fn default_config_path() -> &'static str {
         "config.json"
-    }
-
-    /// 获取有效的 Auth Region（用于 Token 刷新）
-    /// 优先使用 auth_region，未配置时回退到 region
-    pub fn effective_auth_region(&self) -> &str {
-        self.auth_region.as_deref().unwrap_or(&self.region)
-    }
-
-    /// 获取有效的 API Region（用于 API 请求）
-    /// 优先使用 api_region，未配置时回退到 region
-    pub fn effective_api_region(&self) -> &str {
-        self.api_region.as_deref().unwrap_or(&self.region)
     }
 
     pub fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
@@ -7359,11 +5282,7 @@ impl Config {
             .normalized(),
             creation_control: self.prompt_cache_creation_control.normalized(),
             reported_usage: self.reported_usage.default.normalized(),
-            cache_point: CachePointPolicy {
-                enabled: self.kiro_cache_point_enabled,
-                tools_only: self.kiro_cache_point_tools_only,
-                record_plan: self.kiro_cache_point_record_plan,
-            },
+
             bounds: CacheBoundsPolicy {
                 max_entries_per_account: self.prompt_cache_max_entries_per_account,
                 max_entries_global: self.prompt_cache_max_entries_global,
@@ -7517,172 +5436,10 @@ impl Config {
     /// Apply one-way runtime config migrations that keep old PgSQL configs aligned
     /// with current built-in route semantics.
     pub fn apply_runtime_config_migrations(&mut self) -> bool {
-        // 旧的提示词字段要按迁移前的版本号先做 v2–v12 的文本替换，所以在版本号推进前转换。
-        let mut changed = self.migrate_legacy_prompt_fields();
-        changed |= self.cache_policy.migrate_builtin_no_cache_routes();
-        if self.runtime_config_migration_version < 1 {
-            if self.payload_guard_mode == PayloadGuardMode::Preemptive {
-                self.payload_guard_mode = PayloadGuardMode::OnTooLong;
-            }
-            self.runtime_config_migration_version = 1;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 2 {
-            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
-            self.runtime_config_migration_version = 2;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 3 {
-            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
-            self.runtime_config_migration_version = 3;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 4 {
-            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
-            self.runtime_config_migration_version = 4;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 5 {
-            // v0.0.108 split Redis coordinator failures out of the existing
-            // capacity fallback switch and materialized the new flag as false.
-            // Preserve the broad fallback intent of old external-pool configs
-            // once; an operator can explicitly disable it again after v5.
-            if self.external_pools.external_pools_enabled
-                && self.external_pools.fallback_on_local_capacity_exhausted
-                && self.external_pools.fallback_on_no_available_credentials
-                && self.external_pools.fallback_on_local_transient_exhausted
-                && !self.external_pools.fallback_on_scheduler_redis_degraded
-            {
-                self.external_pools.fallback_on_scheduler_redis_degraded = true;
-            }
-            // An unbounded external capacity wait can amplify a local Redis
-            // outage into permanently queued requests. Zero now migrates to
-            // the documented safe default; runtime also applies this bound.
-            if self.external_pools.external_pool_capacity_mode == ExternalPoolCapacityMode::Wait
-                && self.external_pools.external_pool_dispatch_max_wait_secs == 0
-            {
-                self.external_pools.external_pool_dispatch_max_wait_secs =
-                    default_external_pool_dispatch_max_wait_secs();
-            }
-            self.runtime_config_migration_version = 5;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 6 {
-            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
-            self.runtime_config_migration_version = 6;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 7 {
-            // Historical rollup compression is an offline maintenance operation. A live
-            // instance can block usage writers long enough for their bounded retries to drop
-            // records, so an old persisted startup toggle must not reactivate that path.
-            self.postgres.compress_usage_rollups_on_start = false;
-            self.runtime_config_migration_version = 7;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 8 {
-            // v8 used to switch the local pool circuit on. It is off by default now: a
-            // risk-controlled account disables only itself and the rest of the pool keeps
-            // serving. The persisted value is left as it is.
-            self.runtime_config_migration_version = 8;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 9 {
-            // 提示词相关的改动已并入 migrate_legacy_prompt_fields。
-            self.runtime_config_migration_version = 9;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 10 {
-            // Model-mismatch 404s are routed through the same cross-pool retry path as the
-            // existing model-unavailable errors. Historical runtime configs may still be missing
-            // the exact 404 code even though the code path now classifies it as retryable.
-            if !self
-                .external_pools
-                .external_pool_retry_status_codes
-                .contains(&404)
-            {
-                self.external_pools
-                    .external_pool_retry_status_codes
-                    .insert(0, 404);
-            }
-            self.runtime_config_migration_version = 10;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 11 {
-            // 提示词相关的改动已并入 migrate_legacy_prompt_fields。
-            self.runtime_config_migration_version = 11;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 12 {
-            // 提示词相关的改动已并入 migrate_legacy_prompt_fields。
-            self.runtime_config_migration_version = 12;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 13 {
-            // v13：提示词配置改为 promptInjection / routeFeatures（见 migrate_legacy_prompt_fields）。
-            self.runtime_config_migration_version = 13;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 14 {
-            // v14：任务质量和分块写入策略换了内置文本。保存下来的文本若等于旧内置文本，
-            // 说明运营者没改过，删掉后使用新内置文本；改过的文本保持不变。
-            self.prompt_injection.drop_previous_default_texts();
-            self.runtime_config_migration_version = 14;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 15 {
-            self.kiro_version_legacy_auto_sync_migration = self.kiro_version_auto_sync_enabled;
-            self.runtime_config_migration_version = 15;
-            changed = true;
-        }
+        let changed =
+            self.runtime_config_migration_version != CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
+        self.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
         changed
-    }
-
-    /// 旧字段（`promptSteering`、`thinkingTriggerMode`、`bodyConversion` 里的两个提示词开关和
-    /// `modelDrivenWebSearch`）存在时，转换成等价的 `promptInjection` / `routeFeatures` /
-    /// `claudeModelsOnly`，然后清掉旧字段。返回是否有改动。
-    ///
-    /// 只看旧字段是否存在、不看版本号：配置文件加载时版本号会直接设成最新，旧实例写回 PgSQL
-    /// 的配置也可能带着最新版本号，两种情况都要转换。旧字段无法解析时保留新字段的现值并记录错误。
-    pub fn migrate_legacy_prompt_fields(&mut self) -> bool {
-        use super::prompt_injection::{legacy, migrate};
-        let raw_steering = self.prompt_steering.take();
-        let thinking_trigger_mode = self.thinking_trigger_mode.take();
-        let chunked_tool_policy = self.body_conversion.chunked_tool_policy.take();
-        let thinking_prompt_controls = self.body_conversion.thinking_prompt_controls.take();
-        let model_driven_web_search = self.body_conversion.model_driven_web_search.take();
-        let prompt_steering = match raw_steering {
-            Some(value) => match serde_json::from_value::<legacy::PromptSteeringConfig>(value) {
-                Ok(mut steering) => {
-                    legacy::apply_legacy_versioned_migrations(
-                        &mut steering,
-                        self.runtime_config_migration_version,
-                    );
-                    Some(steering)
-                }
-                Err(error) => {
-                    tracing::error!(%error, "旧 promptSteering 配置无法解析，提示词注入保持当前配置");
-                    return true;
-                }
-            },
-            None => None,
-        };
-        let legacy_fields = migrate::LegacyPromptFields {
-            prompt_steering,
-            thinking_trigger_mode,
-            chunked_tool_policy,
-            thinking_prompt_controls,
-            model_driven_web_search,
-        };
-        if legacy_fields.is_empty() {
-            return false;
-        }
-        let migrated = migrate::migrate(legacy_fields, self.compat_profile);
-        self.prompt_injection = migrated.prompt_injection;
-        self.route_features = migrated.route_features;
-        self.claude_models_only = migrated.claude_models_only;
-        tracing::info!("旧提示词配置已转换为 promptInjection / routeFeatures");
-        true
     }
 
     /// 从文件加载配置
@@ -7702,7 +5459,6 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
-        config.migrate_legacy_prompt_fields();
         config.apply_env_overrides();
         config
             .validate_redis_fault_domains()
@@ -7782,33 +5538,6 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn request_version_snapshot_is_not_serialized_into_runtime_config() {
-        let mut config = Config::default();
-        config.kiro_version = "0.11.107".to_string();
-        config.pin_kiro_version_for_request("1.4.121".to_string());
-
-        assert_eq!(config.effective_kiro_version(), "1.4.121");
-        let serialized = serde_json::to_value(&config).expect("serialize config");
-        assert!(serialized.get("kiroVersionRequestSnapshot").is_none());
-    }
-
-    #[test]
-    fn code_execution_defaults_to_disabled_and_supports_longest_route_override() {
-        let parsed: super::BodyConversionConfig =
-            serde_json::from_value(serde_json::json!({})).expect("body conversion");
-        assert!(!parsed.code_execution.enabled);
-        assert_eq!(parsed.code_execution.timeout_ms, 5_000);
-        let mut config = super::CodeExecutionConfig::default();
-        config.path_overrides.insert("/dfcache".to_string(), true);
-        config
-            .path_overrides
-            .insert("/dfcache/mine-hak".to_string(), false);
-        assert!(config.enabled_for_route("/dfcache/other/v1/messages"));
-        assert!(!config.enabled_for_route("/dfcache/mine-hak/v1/messages"));
-        assert!(!config.enabled_for_route("/dfcachex/v1/messages"));
-    }
 
     #[test]
     fn observability_redis_is_optional_and_uses_its_own_prefix() {
@@ -7893,14 +5622,6 @@ mod tests {
     #[test]
     fn default_compat_profile_is_claude_code() {
         assert_eq!(Config::default().compat_profile, CompatProfile::ClaudeCode);
-    }
-
-    #[test]
-    fn default_kiro_agent_mode_strategy_preserves_vibe() {
-        assert_eq!(
-            Config::default().kiro_agent_mode_strategy,
-            KiroAgentModeStrategy::Vibe
-        );
     }
 
     #[test]
@@ -8052,298 +5773,6 @@ mod tests {
     }
 
     #[test]
-    fn weighted_capacity_defaults_disabled_and_costs_one_unit() {
-        let config = Config::default();
-
-        assert!(!config.weighted_capacity.enabled);
-        assert_eq!(config.weighted_capacity.max_units_per_request, 8);
-        assert_eq!(config.weighted_capacity.units_for_tokens(0), 1);
-        assert_eq!(config.weighted_capacity.units_for_tokens(1_000_000), 1);
-    }
-
-    #[test]
-    fn weighted_capacity_deserializes_missing_field_as_disabled() {
-        let config: Config = serde_json::from_str("{}").unwrap();
-
-        assert!(!config.weighted_capacity.enabled);
-        assert_eq!(config.weighted_capacity.units_for_tokens(700_000), 1);
-    }
-
-    #[test]
-    fn weighted_capacity_enabled_maps_token_tiers() {
-        let config = WeightedCapacityConfig {
-            enabled: true,
-            max_units_per_request: 8,
-            tiers: vec![
-                WeightedCapacityTier {
-                    min_tokens: 0,
-                    units: 1,
-                },
-                WeightedCapacityTier {
-                    min_tokens: 100_000,
-                    units: 2,
-                },
-                WeightedCapacityTier {
-                    min_tokens: 300_000,
-                    units: 4,
-                },
-                WeightedCapacityTier {
-                    min_tokens: 700_000,
-                    units: 8,
-                },
-            ],
-        };
-
-        assert_eq!(config.units_for_tokens(99_999), 1);
-        assert_eq!(config.units_for_tokens(100_000), 2);
-        assert_eq!(config.units_for_tokens(450_000), 4);
-        assert_eq!(config.units_for_tokens(1_000_000), 8);
-    }
-
-    #[test]
-    fn default_runtime_controls_are_conservative() {
-        let config = Config::default();
-
-        assert_eq!(
-            config.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert_eq!(config.postgres.max_connections, 10);
-        assert_eq!(config.postgres.usage_max_connections, 4);
-        assert!(config.postgres.migrate_on_start);
-        assert!(!config.postgres.compress_usage_rollups_on_start);
-        assert_eq!(config.redis.key_prefix, "kiro_rs:local");
-        assert_eq!(config.credential_rpm, Some(100));
-        assert_eq!(config.credential_max_concurrent_requests, 30);
-        assert_eq!(config.credential_info_refresh_concurrency, 3);
-        assert_eq!(config.credential_transient_cooldown_secs, 10);
-        assert_eq!(config.credential_rate_limit_cooldown_secs, 30);
-        assert_eq!(config.credential_server_error_cooldown_secs, 5);
-        assert_eq!(config.credential_auth_error_cooldown_secs, 10);
-        assert_eq!(config.credential_cooldown_backoff_multiplier, 2.0);
-        assert_eq!(config.credential_probation_secs, 30);
-        assert!(
-            !config.credential_empty_turn_cooldown_enabled,
-            "空回默认不让账号冷却"
-        );
-        assert!(
-            !config.credential_upstream_failure_cooldown_enabled,
-            "上游故障默认不让账号冷却"
-        );
-        assert_eq!(config.credential_auto_heal_min_interval_secs, 300);
-        assert_eq!(config.credential_auto_heal_max_consecutive_rounds, 5);
-        assert!(
-            !config.kiro_version_auto_sync_enabled,
-            "版本号自动同步默认关闭"
-        );
-        assert!(
-            !config.kiro_runtime_domain_enabled,
-            "新版 Kiro 域名默认关闭"
-        );
-        assert_eq!(config.credential_max_cooldown_secs, 300);
-        assert_eq!(config.credential_dispatch_max_wait_secs, 5);
-        assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
-        assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
-        assert_eq!(config.kiro_upstream_stream_max_duration_secs, 3600);
-        assert_eq!(config.stream_keepalive_interval_secs, 5);
-        assert_eq!(config.stream_pre_output_hold_secs, 15);
-        assert_eq!(config.stream_first_output_timeout_secs, 0);
-        assert!(config.kiro_upstream_stream_retry_enabled);
-        assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 6);
-        assert_eq!(config.kiro_upstream_usage_only_retry_max_attempts, 2);
-        assert!(config.kiro_upstream_stream_retry_on_idle_timeout);
-        assert!(config.kiro_upstream_stream_retry_on_read_error);
-        assert!(config.kiro_upstream_stream_retry_on_status_error);
-        assert_eq!(config.kiro_upstream_base_url, None);
-        assert_eq!(config.credential_retry_max_attempts, 0);
-        // 狂暴模式必须默认关闭：开启会显著放大上游请求量，必须由用户显式打开。
-        assert!(
-            !config.local_berserk_mode_enabled,
-            "狂暴模式必须默认关闭，否则会在未经用户确认的情况下放大上游限流"
-        );
-        assert!(
-            !config.kiro_upstream_region_rotation_enabled,
-            "端点轮换总开关必须默认关闭，保证默认使用改造之前的端点"
-        );
-        assert!(!config.kiro_region_profile_arn_mismatch_allowed);
-        assert_eq!(config.local_berserk_max_rounds, 1);
-        assert_eq!(config.local_berserk_round_delay_ms, 1_000);
-        assert_eq!(config.credential_in_flight_lease_max_secs, 900);
-        assert_eq!(config.dispatch_global_max_concurrent_requests, 512);
-        assert_eq!(config.dispatch_max_queued_requests, 30);
-        assert!(!config.weighted_capacity.enabled);
-        assert_eq!(config.credential_warmup_requests, 3);
-        // Audit cleanup stays off until an operator turns it on, so upgrades delete nothing.
-        assert!(!config.audit_log_retention_enabled);
-        assert_eq!(config.audit_log_retention_days, 15);
-        // The public pool page stays closed until an operator opens it.
-        assert!(!config.public_pool_view_enabled);
-        assert_eq!(
-            config.public_pool_free_accounts,
-            PublicPoolFreeAccounts::Power
-        );
-        assert_eq!(config.credential_warmup_selection_percent, 5);
-        assert_eq!(config.credential_warmup_max_selection_percent, 50);
-        assert!(config.payload_guard_enabled);
-        assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
-        assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
-        assert_eq!(
-            config.payload_guard_kiro_max_weight,
-            KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT
-        );
-        assert_eq!(config.payload_guard_safety_margin_bytes, 32 * 1024);
-        assert!(config.payload_guard_trim_history);
-        assert!(config.payload_guard_external_enabled);
-        assert!(!config.kiro_cache_point_enabled);
-        assert!(config.kiro_cache_point_tools_only);
-        assert!(config.kiro_cache_point_record_plan);
-        assert!(config.payload_shaping.enabled);
-        assert!(config.payload_shaping.truncate_historical_tool_results);
-        assert_eq!(
-            config.payload_shaping.historical_tool_result_max_chars,
-            8_000
-        );
-        assert_eq!(config.payload_shaping.tool_definitions_budget_bytes, 20_000);
-        assert_eq!(config.payload_shaping.web_fetch_body_max_chars, 12_000);
-        assert!(!config.payload_shaping.fit_current_payload_to_budget);
-        assert!(!config.payload_shaping.truncate_current_user_content);
-        assert!(!config.payload_shaping.truncate_current_tool_results);
-        assert_eq!(config.scheduler_selection_pressure_weight, 25.0);
-        assert_eq!(config.scheduler_total_selection_weight, 0.0);
-        assert_eq!(config.scheduler_top_k, 3);
-        assert_eq!(config.selection_failure_sample_limit, 20);
-        assert!(config.selection_failure_record_enabled);
-        assert_eq!(config.prompt_cache_max_entries_per_account, 200);
-        assert_eq!(config.prompt_cache_max_entries_global, 20_000);
-        assert_eq!(config.prompt_cache_entry_ttl_secs, 86_400);
-        assert_eq!(config.prompt_cache_estimated_bytes_limit, 256 * 1024 * 1024);
-        assert!(!config.external_pools.external_pools_enabled);
-        assert_eq!(
-            config.external_pools.external_pool_capacity_mode,
-            ExternalPoolCapacityMode::FailFast
-        );
-        assert_eq!(
-            config.external_pools.external_pool_dispatch_max_wait_secs,
-            5
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_global_max_concurrent_requests,
-            512
-        );
-        assert_eq!(config.external_pools.external_pool_max_queued_requests, 10);
-        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 3);
-        assert_eq!(
-            config.external_pools.external_pool_retry_status_codes,
-            vec![404, 408, 425, 429, 500, 502, 503, 504, 529]
-        );
-        assert!(config.external_pools.external_pool_retry_on_network_error);
-        assert!(config.external_pools.external_pool_retry_on_protocol_error);
-        assert_eq!(config.external_pools.external_pool_same_pool_retry_count, 1);
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_same_pool_retry_status_codes,
-            vec![408, 425, 429, 500, 502, 503, 504, 529]
-        );
-        assert_eq!(
-            config.external_pools.external_pool_same_pool_retry_delay_ms,
-            500
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_transient_failure_priority_penalty,
-            20
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_transient_failure_cooldown_threshold,
-            0
-        );
-        assert_eq!(
-            config.external_pools.external_pool_max_input_tokens,
-            1_000_000
-        );
-        assert_eq!(
-            config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthrough
-        );
-        assert!(!config.compression.enabled);
-        assert!(config.compression.whitespace_compression);
-        assert_eq!(
-            config
-                .reported_usage
-                .policy_for_path("/cc/v1/messages")
-                .input
-                .max_tokens,
-            96
-        );
-        let cc_policy = config.reported_usage.policy_for_path("/cc/v1/messages");
-        assert_eq!(
-            cc_policy.cache_creation.mode,
-            ReportedUsageFieldMode::SampleTarget
-        );
-        assert_eq!(cc_policy.cache_creation.target_tokens, 3_000);
-        assert_eq!(cc_policy.cache_creation.normal_max_multiplier, 1.2);
-        let ha_policy = config.reported_usage.policy_for_path("/ha/v1/messages");
-        assert_eq!(ha_policy.input.mode, ReportedUsageFieldMode::SampleMax);
-        assert_eq!(ha_policy.input.max_tokens, 96);
-        assert!(ha_policy.input.move_delta_to_cache_read);
-        assert_eq!(
-            ha_policy.cache_creation.mode,
-            ReportedUsageFieldMode::Preserve
-        );
-        assert!(!config.reported_usage.path_overrides.contains_key("/na"));
-        assert!(
-            config
-                .reported_usage
-                .policy_for_path("/na/v1/messages")
-                .enabled
-        );
-    }
-
-    #[test]
-    fn initial_config_deserialization_uses_scheduler_safe_defaults() {
-        let config: Config = serde_json::from_str("{}").unwrap();
-
-        assert_eq!(config.request_admission, RequestAdmissionConfig::default());
-        assert_eq!(config.credential_rpm, Some(100));
-        assert_eq!(config.credential_max_concurrent_requests, 30);
-        assert_eq!(config.credential_info_refresh_concurrency, 3);
-        assert_eq!(config.credential_dispatch_max_wait_secs, 5);
-        assert_eq!(config.dispatch_global_max_concurrent_requests, 512);
-        assert_eq!(config.dispatch_max_queued_requests, 30);
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_global_max_concurrent_requests,
-            512
-        );
-        assert_eq!(config.external_pools.external_pool_max_queued_requests, 10);
-        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 3);
-        assert_eq!(config.external_pools.external_pool_same_pool_retry_count, 1);
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_transient_failure_priority_penalty,
-            20
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_transient_failure_cooldown_threshold,
-            0
-        );
-        assert_eq!(
-            config.external_pools.external_pool_dispatch_max_wait_secs,
-            5
-        );
-    }
-
-    #[test]
     fn parse_env_bool_accepts_common_values() {
         assert_eq!(parse_env_bool("true"), Some(true));
         assert_eq!(parse_env_bool("1"), Some(true));
@@ -8362,62 +5791,6 @@ mod tests {
         assert_eq!(config.prompt_cache_cap_jitter_min_tokens, 12_000);
         assert_eq!(config.prompt_cache_cap_jitter_max_tokens, 24_000);
         assert_eq!(config.prompt_cache_scale_min_input_tokens, 20_000);
-    }
-
-    #[test]
-    fn compat_profile_deserializes_from_camel_case_config() {
-        let config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test",
-                "compatProfile": "anthropic-strict",
-                "kiroAgentModeStrategy": "auto"
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
-        assert_eq!(config.kiro_agent_mode_strategy, KiroAgentModeStrategy::Auto);
-    }
-
-    #[test]
-    fn berserk_switches_round_trip_through_camel_case() {
-        let config = Config {
-            kiro_upstream_region_rotation_enabled: true,
-            kiro_region_profile_arn_mismatch_allowed: true,
-            local_berserk_mode_enabled: true,
-            local_berserk_max_rounds: 7,
-            local_berserk_round_delay_ms: 2_500,
-            ..Default::default()
-        };
-
-        let serialized = serde_json::to_value(&config).unwrap();
-        assert_eq!(serialized["kiroUpstreamRegionRotationEnabled"], true);
-        assert_eq!(serialized["kiroRegionProfileArnMismatchAllowed"], true);
-        assert_eq!(serialized["localBerserkModeEnabled"], true);
-        assert_eq!(serialized["localBerserkMaxRounds"], 7);
-        assert_eq!(serialized["localBerserkRoundDelayMs"], 2_500);
-        // 端点列表已内置，不得再出现在序列化结果里——否则旧前端会把它当成可配项。
-        assert!(serialized.get("kiroUpstreamRegionRotation").is_none());
-
-        let restored: Config = serde_json::from_value(serialized).unwrap();
-        assert!(restored.kiro_upstream_region_rotation_enabled);
-        assert!(restored.kiro_region_profile_arn_mismatch_allowed);
-        assert!(restored.local_berserk_mode_enabled);
-        assert_eq!(restored.local_berserk_max_rounds, 7);
-        assert_eq!(restored.local_berserk_round_delay_ms, 2_500);
-    }
-
-    #[test]
-    fn berserk_fields_absent_from_stored_config_fall_back_to_disabled_defaults() {
-        // 升级场景：老配置文件里没有这几个键，反序列化后必须是「全关」，
-        // 否则升级会在用户毫不知情的情况下启用狂暴轮换。
-        let config: Config = serde_json::from_str(r#"{"apiKey":"sk-legacy"}"#).unwrap();
-
-        assert!(!config.kiro_upstream_region_rotation_enabled);
-        assert!(!config.kiro_region_profile_arn_mismatch_allowed);
-        assert!(!config.local_berserk_mode_enabled);
-        assert_eq!(config.local_berserk_max_rounds, 1);
-        assert_eq!(config.local_berserk_round_delay_ms, 1_000);
     }
 
     #[test]
@@ -8709,208 +6082,15 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_capacity_mode_deserializes_with_compatible_defaults() {
-        let config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test",
-                "externalPools": {
-                    "externalPoolsEnabled": true,
-                    "externalPoolMaxQueuedRequests": 25
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert!(config.external_pools.external_pools_enabled);
-        assert!(
-            config.external_pools.fallback_on_scheduler_redis_degraded,
-            "a config that predates the dedicated flag must retain legacy capacity fallback"
-        );
-        assert_eq!(
-            config.external_pools.external_pool_capacity_mode,
-            ExternalPoolCapacityMode::FailFast
-        );
-        assert_eq!(
-            config.external_pools.external_pool_dispatch_max_wait_secs,
-            5
-        );
-        assert_eq!(
-            config.external_pools.external_pool_request_timeout_secs,
-            180
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_stream_request_timeout_secs,
-            0
-        );
-        assert_eq!(
-            config.external_pools.external_pool_stream_idle_timeout_secs,
-            180
-        );
-        assert!(config.external_pools.external_pool_local_rescue_enabled);
-        assert!(
-            config
-                .external_pools
-                .external_pool_local_rescue_on_rate_limit
-        );
-        assert!(config.external_pools.external_pool_local_rescue_on_timeout);
-        assert!(config.external_pools.external_pool_local_rescue_on_capacity);
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_local_rescue_max_wait_secs,
-            15
-        );
-        assert!(
-            config
-                .external_pools
-                .external_pool_auto_disable_on_channel_disabled
-        );
-        assert_eq!(config.external_pools.external_pool_max_queued_requests, 25);
-        assert_eq!(
-            config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthrough
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_usage_projection_cost_floor_margin_percent,
-            10
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_model_unavailable_cooldown_mode,
-            ExternalPoolModelUnavailableCooldownMode::Model
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .external_pool_model_unavailable_cooldown_secs,
-            10
-        );
-
-        let wait_config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test",
-                "externalPools": {
-                    "externalPoolCapacityMode": "wait",
-                    "externalPoolDispatchMaxWaitSecs": 3,
-                    "externalPoolModelUnavailableCooldownMode": "pool",
-                    "externalPoolModelUnavailableCooldownSecs": 7
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            wait_config.external_pools.external_pool_capacity_mode,
-            ExternalPoolCapacityMode::Wait
-        );
-        assert_eq!(
-            wait_config
-                .external_pools
-                .external_pool_dispatch_max_wait_secs,
-            3
-        );
-        assert_eq!(
-            wait_config
-                .external_pools
-                .external_pool_model_unavailable_cooldown_mode,
-            ExternalPoolModelUnavailableCooldownMode::Pool
-        );
-        assert_eq!(
-            wait_config
-                .external_pools
-                .external_pool_model_unavailable_cooldown_secs,
-            7
-        );
-    }
-
-    #[test]
-    fn external_pool_scheduler_redis_fallback_preserves_explicit_boolean_values() {
-        let missing: Config = serde_json::from_value(serde_json::json!({
-            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
-            "externalPools": {
-                "externalPoolsEnabled": true
-            }
-        }))
-        .unwrap();
-        assert!(missing.external_pools.fallback_on_scheduler_redis_degraded);
-
-        let explicit_false: Config = serde_json::from_value(serde_json::json!({
-            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
-            "externalPools": {
-                "externalPoolsEnabled": true,
-                "fallbackOnSchedulerRedisDegraded": false
-            }
-        }))
-        .unwrap();
-        assert!(
-            !explicit_false
-                .external_pools
-                .fallback_on_scheduler_redis_degraded
-        );
-
-        let explicit_true: Config = serde_json::from_value(serde_json::json!({
-            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
-            "externalPools": {
-                "externalPoolsEnabled": true,
-                "fallbackOnSchedulerRedisDegraded": true
-            }
-        }))
-        .unwrap();
-        assert!(
-            explicit_true
-                .external_pools
-                .fallback_on_scheduler_redis_degraded
-        );
-    }
-
-    #[test]
     fn external_pool_capacity_wait_is_always_bounded() {
         let mut config = ExternalPoolsConfig::default();
-        assert_eq!(config.effective_dispatch_max_wait_secs(), 5);
+        assert_eq!(config.effective_dispatch_max_wait_secs(), 60);
 
         config.external_pool_dispatch_max_wait_secs = 0;
-        assert_eq!(config.effective_dispatch_max_wait_secs(), 5);
+        assert_eq!(config.effective_dispatch_max_wait_secs(), 60);
 
         config.external_pool_dispatch_max_wait_secs = 7;
         assert_eq!(config.effective_dispatch_max_wait_secs(), 7);
-    }
-
-    #[test]
-    fn external_pool_route_policy_defaults_to_allow_all() {
-        let config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test",
-                "externalPools": {
-                    "externalPoolsEnabled": true
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.external_pools.external_pool_route_mode,
-            ExternalPoolRouteMode::AllowAll
-        );
-        assert!(
-            config
-                .external_pools
-                .external_pool_route_allowed("/cc/v1/messages")
-        );
-        assert!(
-            config
-                .external_pools
-                .external_pool_route_allowed("/dfcache/team-a/v1/messages")
-        );
-        assert!(
-            config
-                .external_pools
-                .local_pool_route_allowed("/cc/v1/messages")
-        );
     }
 
     #[test]
@@ -8931,23 +6111,6 @@ mod tests {
     }
 
     #[test]
-    fn local_pool_route_policy_denies_matching_routes_only() {
-        let mut config = ExternalPoolsConfig {
-            local_pool_route_mode: ExternalPoolRouteMode::DenyList,
-            local_pool_route_rules: vec!["/cc".to_string(), "/dfcache/team-a".to_string()],
-            ..ExternalPoolsConfig::default()
-        };
-
-        assert!(!config.local_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.local_pool_route_allowed("/dfcache/team-a/v1/messages"));
-        assert!(config.local_pool_route_allowed("/v1/messages"));
-
-        config.local_pool_route_rules = vec!["*".to_string()];
-        assert!(!config.local_pool_route_allowed("/v1/messages"));
-        assert!(!config.local_pool_route_allowed("/ha/v1/messages"));
-    }
-
-    #[test]
     fn external_pool_route_policy_allow_list_requires_a_match() {
         let config = ExternalPoolsConfig {
             external_pool_route_mode: ExternalPoolRouteMode::AllowList,
@@ -8959,20 +6122,6 @@ mod tests {
         assert!(config.external_pool_route_allowed("/dfcache/team-b/v1/messages"));
         assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
         assert!(!config.external_pool_route_allowed("/v1/messages"));
-    }
-
-    #[test]
-    fn local_pool_route_policy_allow_list_requires_a_match() {
-        let config = ExternalPoolsConfig {
-            local_pool_route_mode: ExternalPoolRouteMode::AllowList,
-            local_pool_route_rules: vec!["/ha".to_string(), "/dfcache/team-b".to_string()],
-            ..ExternalPoolsConfig::default()
-        };
-
-        assert!(config.local_pool_route_allowed("/ha/v1/messages"));
-        assert!(config.local_pool_route_allowed("/dfcache/team-b/v1/messages"));
-        assert!(!config.local_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.local_pool_route_allowed("/v1/messages"));
     }
 
     #[test]
@@ -8988,18 +6137,6 @@ mod tests {
     }
 
     #[test]
-    fn local_pool_route_policy_matches_case_insensitively() {
-        let config = ExternalPoolsConfig {
-            local_pool_route_mode: ExternalPoolRouteMode::AllowList,
-            local_pool_route_rules: vec!["/CC/V1".to_string()],
-            ..ExternalPoolsConfig::default()
-        };
-
-        assert!(config.local_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.local_pool_route_allowed("/ha/v1/messages"));
-    }
-
-    #[test]
     fn external_pool_route_policy_does_not_match_mid_path_segments() {
         let config = ExternalPoolsConfig {
             external_pool_route_mode: ExternalPoolRouteMode::AllowList,
@@ -9010,19 +6147,6 @@ mod tests {
         assert!(config.external_pool_route_allowed("/v1/messages"));
         assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
         assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
-    }
-
-    #[test]
-    fn local_pool_route_policy_does_not_match_mid_path_segments() {
-        let config = ExternalPoolsConfig {
-            local_pool_route_mode: ExternalPoolRouteMode::AllowList,
-            local_pool_route_rules: vec!["/v1".to_string()],
-            ..ExternalPoolsConfig::default()
-        };
-
-        assert!(config.local_pool_route_allowed("/v1/messages"));
-        assert!(!config.local_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.local_pool_route_allowed("/ha/v1/messages"));
     }
 
     #[test]
@@ -9151,43 +6275,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_bounds_and_selection_diagnostics_deserialize_from_camel_case_config() {
-        let config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test",
-                "selectionFailureSampleLimit": 12,
-                "selectionFailureRecordEnabled": false,
-                "kiroUpstreamStreamIdleTimeoutSecs": 45,
-                "streamKeepaliveIntervalSecs": 12,
-                "streamPreOutputHoldSecs": 20,
-                "streamFirstOutputTimeoutSecs": 0,
-                "kiroCachePointEnabled": true,
-                "kiroCachePointToolsOnly": false,
-                "kiroCachePointRecordPlan": false,
-                "promptCacheMaxEntriesPerAccount": 50,
-                "promptCacheMaxEntriesGlobal": 500,
-                "promptCacheEntryTtlSecs": 600,
-                "promptCacheEstimatedBytesLimit": 1048576
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.selection_failure_sample_limit, 12);
-        assert!(!config.selection_failure_record_enabled);
-        assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 45);
-        assert_eq!(config.stream_keepalive_interval_secs, 12);
-        assert_eq!(config.stream_pre_output_hold_secs, 20);
-        assert_eq!(config.stream_first_output_timeout_secs, 0);
-        assert!(config.kiro_cache_point_enabled);
-        assert!(!config.kiro_cache_point_tools_only);
-        assert!(!config.kiro_cache_point_record_plan);
-        assert_eq!(config.prompt_cache_max_entries_per_account, 50);
-        assert_eq!(config.prompt_cache_max_entries_global, 500);
-        assert_eq!(config.prompt_cache_entry_ttl_secs, 600);
-        assert_eq!(config.prompt_cache_estimated_bytes_limit, 1_048_576);
-    }
-
-    #[test]
     fn payload_shaping_patch_preserves_unspecified_fields() {
         let base = PayloadShapingConfig {
             enabled: true,
@@ -9232,27 +6319,6 @@ mod tests {
             merged.oversized_image_handling,
             OversizedImageHandling::DropWithPlaceholder
         );
-    }
-
-    #[test]
-    fn tool_format_debug_normalization_caps_buffer_memory() {
-        let config = ToolFormatDebugConfig {
-            channel_capacity: 65_536,
-            max_record_bytes: 4 * 1024 * 1024,
-            max_records_per_fingerprint: u32::MAX,
-            max_records_per_group: u32::MAX,
-            max_records_global: u32::MAX,
-            max_request_body_records_per_window: u32::MAX,
-            ..ToolFormatDebugConfig::default()
-        }
-        .normalized();
-
-        assert_eq!(config.max_record_bytes, 1024 * 1024);
-        assert_eq!(config.channel_capacity, 64);
-        assert_eq!(config.max_records_per_fingerprint, 1_000);
-        assert_eq!(config.max_records_per_group, 10_000);
-        assert_eq!(config.max_records_global, 10_000);
-        assert_eq!(config.max_request_body_records_per_window, 100);
     }
 
     #[test]
@@ -9310,390 +6376,6 @@ mod tests {
         assert_eq!(normalize_defined_cache_route(&legacy_route), None);
         assert_eq!(normalize_defined_cache_route("/dfcache/a/b"), None);
         assert_eq!(normalize_defined_cache_route("/dfcache/a?b"), None);
-    }
-
-    #[test]
-    fn cache_policy_resolves_legacy_and_path_overrides_in_order() {
-        let mut config = Config::default();
-        config.cache_policy.default.simulation = Some(CacheSimulationPolicyPatch {
-            target_read_ratio: Some(0.91),
-            ..CacheSimulationPolicyPatch::default()
-        });
-        config.cache_policy.path_overrides.insert(
-            "/cc".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
-                simulation: Some(CacheSimulationPolicyPatch {
-                    enabled: Some(false),
-                    token_scale: Some(1.2),
-                    ..CacheSimulationPolicyPatch::default()
-                }),
-                reported_usage: Some(ReportedUsagePathPolicy {
-                    input: ReportedUsageFieldPolicy::sample_input_max(48),
-                    ..ReportedUsagePathPolicy::default()
-                }),
-                cache_point: Some(CachePointPolicyPatch {
-                    enabled: Some(true),
-                    ..CachePointPolicyPatch::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-
-        let cc = config.cache_policy_for_path("/cc/v1/messages");
-
-        assert_eq!(cc.namespace.as_deref(), Some("/cc"));
-        assert_eq!(cc.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
-        assert!(!cc.policy.simulation.enabled);
-        assert_eq!(cc.policy.simulation.token_scale, 1.0);
-        assert_eq!(cc.policy.simulation.target_read_ratio, 0.98);
-        assert!(cc.policy.reported_usage.enabled);
-        assert_eq!(cc.policy.reported_usage.input.max_tokens, 48);
-        assert!(cc.policy.cache_point.enabled);
-
-        let ha = config.cache_policy_for_path("/ha/v1/messages");
-        assert_eq!(ha.namespace, None);
-        assert_eq!(
-            ha.policy.cache_type,
-            PromptCacheStrategyType::CurrentHighCache
-        );
-        assert!(ha.policy.simulation.enabled);
-        assert_eq!(ha.policy.simulation.target_read_ratio, 0.91);
-        assert_eq!(ha.policy.reported_usage.input.max_tokens, 96);
-
-        let na = config.cache_policy_for_path("/na/v1/messages");
-        assert_eq!(na.namespace, None);
-        assert_eq!(na.policy.cache_type, PromptCacheStrategyType::NoCache);
-        assert!(!na.policy.simulation.enabled);
-        assert!(!na.policy.creation_control.enabled);
-        assert!(!na.policy.cache_point.enabled);
-
-        let unknown = config.cache_policy_for_path("/reports/v1/messages");
-        assert_eq!(unknown.namespace, None);
-        assert_eq!(unknown.policy.cache_type, PromptCacheStrategyType::NoCache);
-        assert!(!unknown.policy.simulation.enabled);
-    }
-
-    #[test]
-    fn cache_policy_parameter_matrix_applies_each_strategy_semantics() {
-        let mut config = Config::default();
-        config.cache_policy.default = CacheRoutePolicyPatch {
-            simulation: Some(CacheSimulationPolicyPatch {
-                target_read_ratio: Some(0.61),
-                token_scale: Some(1.1),
-                max_simulated_input_tokens: Some(161_000),
-                cap_jitter_min_tokens: Some(1_000),
-                cap_jitter_max_tokens: Some(9_000),
-                scale_min_input_tokens: Some(6_000),
-                ..CacheSimulationPolicyPatch::default()
-            }),
-            creation_control: Some(PromptCacheCreationControlConfig {
-                enabled: true,
-                scope_mode: PromptCacheCreationControlScopeMode::ConversationModel,
-                min_successful_requests_between_creation: 5,
-                min_creation_interval_secs: 55,
-                min_creation_delta_tokens: 15_000,
-                max_creation_tokens_per_event: 25_000,
-                creation_budget_window_secs: 155,
-                max_creation_tokens_per_window: 75_000,
-                expire_after_idle_secs: 1_555,
-            }),
-            reported_usage: Some(ReportedUsagePathPolicy {
-                output: ReportedUsageFieldPolicy::sample_max(222),
-                ..ReportedUsagePathPolicy::default()
-            }),
-            cache_point: Some(CachePointPolicyPatch {
-                enabled: Some(true),
-                tools_only: Some(true),
-                record_plan: Some(true),
-            }),
-            bounds: Some(CacheBoundsPolicyPatch {
-                max_entries_per_account: Some(11),
-                max_entries_global: Some(111),
-                entry_ttl_secs: Some(1_111),
-                estimated_bytes_limit: Some(11_111),
-            }),
-            ..CacheRoutePolicyPatch::default()
-        };
-        config.cache_policy.current_high_cache = CacheRoutePolicyPatch {
-            simulation: Some(CacheSimulationPolicyPatch {
-                token_scale: Some(1.7),
-                cap_jitter_min_tokens: Some(2_000),
-                ..CacheSimulationPolicyPatch::default()
-            }),
-            cache_point: Some(CachePointPolicyPatch {
-                tools_only: Some(false),
-                ..CachePointPolicyPatch::default()
-            }),
-            ..CacheRoutePolicyPatch::default()
-        };
-        config.cache_policy.path_overrides.insert(
-            "/matrix".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                route_namespace: None,
-                simulation: Some(CacheSimulationPolicyPatch {
-                    enabled: Some(true),
-                    target_read_ratio: Some(0.77),
-                    max_simulated_input_tokens: Some(177_000),
-                    scale_min_input_tokens: Some(17_000),
-                    ..CacheSimulationPolicyPatch::default()
-                }),
-                creation_control: Some(PromptCacheCreationControlConfig {
-                    enabled: true,
-                    scope_mode: PromptCacheCreationControlScopeMode::CredentialConversationModel,
-                    min_successful_requests_between_creation: 3,
-                    min_creation_interval_secs: 33,
-                    min_creation_delta_tokens: 13_000,
-                    max_creation_tokens_per_event: 23_000,
-                    creation_budget_window_secs: 133,
-                    max_creation_tokens_per_window: 73_000,
-                    expire_after_idle_secs: 1_333,
-                }),
-                reported_usage: Some(ReportedUsagePathPolicy {
-                    final_cache_read_max_tokens: 333_000,
-                    input: ReportedUsageFieldPolicy::sample_input_max(333),
-                    output: ReportedUsageFieldPolicy::sample_target(444),
-                    cache_read: ReportedUsageFieldPolicy::sample_max(55_000),
-                    cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(
-                        6_000, 1.4,
-                    ),
-                    ..ReportedUsagePathPolicy::default()
-                }),
-                cache_point: Some(CachePointPolicyPatch {
-                    enabled: Some(true),
-                    tools_only: Some(false),
-                    record_plan: Some(false),
-                }),
-                bounds: Some(CacheBoundsPolicyPatch {
-                    max_entries_per_account: Some(7),
-                    max_entries_global: Some(70),
-                    entry_ttl_secs: Some(700),
-                    estimated_bytes_limit: Some(7_000),
-                }),
-                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
-                    coverage_ratio: Some(0.7),
-                    max_coverage_tokens: Some(70_000),
-                    incremental_create_enabled: Some(false),
-                    max_new_creation_tokens_per_request: Some(7_000),
-                    cache_current_user_stable_prefix: Some(true),
-                    current_user_stable_prefix_max_tokens: Some(700),
-                    ..Default::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-        config.cache_policy.path_overrides.insert(
-            "/plain".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::NoCache),
-                route_namespace: None,
-                simulation: Some(CacheSimulationPolicyPatch {
-                    enabled: Some(true),
-                    target_read_ratio: Some(0.88),
-                    token_scale: Some(2.0),
-                    ..CacheSimulationPolicyPatch::default()
-                }),
-                creation_control: Some(PromptCacheCreationControlConfig::default()),
-                reported_usage: Some(ReportedUsagePathPolicy {
-                    input: ReportedUsageFieldPolicy::sample_input_max(111),
-                    output: ReportedUsageFieldPolicy::sample_max(22),
-                    ..ReportedUsagePathPolicy::default()
-                }),
-                cache_point: Some(CachePointPolicyPatch {
-                    enabled: Some(true),
-                    tools_only: Some(false),
-                    record_plan: Some(true),
-                }),
-                bounds: Some(CacheBoundsPolicyPatch {
-                    max_entries_per_account: Some(2),
-                    max_entries_global: Some(20),
-                    entry_ttl_secs: Some(200),
-                    estimated_bytes_limit: Some(2_000),
-                }),
-                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
-                    coverage_ratio: Some(0.2),
-                    ..KiroRsToolCachePolicyPatch::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-        config.cache_policy.path_overrides.insert(
-            "/tool-matrix".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
-                route_namespace: None,
-                simulation: Some(CacheSimulationPolicyPatch {
-                    enabled: Some(true),
-                    token_scale: Some(2.5),
-                    ..CacheSimulationPolicyPatch::default()
-                }),
-                creation_control: Some(PromptCacheCreationControlConfig::default()),
-                reported_usage: Some(ReportedUsagePathPolicy {
-                    input: ReportedUsageFieldPolicy::sample_input_max(123),
-                    ..ReportedUsagePathPolicy::default()
-                }),
-                cache_point: Some(CachePointPolicyPatch {
-                    enabled: Some(true),
-                    tools_only: Some(false),
-                    record_plan: Some(true),
-                }),
-                bounds: Some(CacheBoundsPolicyPatch {
-                    max_entries_per_account: Some(5),
-                    max_entries_global: Some(50),
-                    entry_ttl_secs: Some(500),
-                    estimated_bytes_limit: Some(5_000),
-                }),
-                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
-                    coverage_ratio: Some(0.5),
-                    max_coverage_tokens: Some(50_000),
-                    incremental_create_enabled: Some(false),
-                    max_new_creation_tokens_per_request: Some(5_000),
-                    cache_current_user_stable_prefix: Some(true),
-                    current_user_stable_prefix_max_tokens: Some(500),
-                    ..Default::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-
-        let high = config.cache_policy_for_path("/matrix/v1/messages");
-        assert_eq!(high.namespace.as_deref(), Some("/matrix"));
-        assert_eq!(
-            high.policy.cache_type,
-            PromptCacheStrategyType::CurrentHighCache
-        );
-        assert!(high.policy.simulation.enabled);
-        assert_eq!(high.policy.simulation.target_read_ratio, 0.77);
-        assert_eq!(high.policy.simulation.token_scale, 1.7);
-        assert_eq!(high.policy.simulation.max_simulated_input_tokens, 177_000);
-        assert_eq!(high.policy.simulation.cap_jitter_min_tokens, 2_000);
-        assert_eq!(high.policy.simulation.cap_jitter_max_tokens, 9_000);
-        assert_eq!(high.policy.simulation.scale_min_input_tokens, 17_000);
-        assert_eq!(
-            high.policy.creation_control.scope_mode,
-            PromptCacheCreationControlScopeMode::CredentialConversationModel
-        );
-        assert_eq!(
-            high.policy
-                .creation_control
-                .min_successful_requests_between_creation,
-            3
-        );
-        assert_eq!(high.policy.creation_control.min_creation_interval_secs, 33);
-        assert_eq!(
-            high.policy.creation_control.min_creation_delta_tokens,
-            13_000
-        );
-        assert_eq!(
-            high.policy.creation_control.max_creation_tokens_per_event,
-            23_000
-        );
-        assert_eq!(
-            high.policy.creation_control.creation_budget_window_secs,
-            133
-        );
-        assert_eq!(
-            high.policy.creation_control.max_creation_tokens_per_window,
-            73_000
-        );
-        assert_eq!(high.policy.creation_control.expire_after_idle_secs, 1_333);
-        assert_eq!(
-            high.policy.reported_usage.input.mode,
-            ReportedUsageFieldMode::SampleMax
-        );
-        assert_eq!(high.policy.reported_usage.input.max_tokens, 333);
-        assert_eq!(
-            high.policy.reported_usage.output.mode,
-            ReportedUsageFieldMode::SampleTarget
-        );
-        assert_eq!(high.policy.reported_usage.output.target_tokens, 444);
-        assert_eq!(high.policy.reported_usage.cache_read.max_tokens, 55_000);
-        assert_eq!(
-            high.policy.reported_usage.cache_creation.target_tokens,
-            6_000
-        );
-        assert_eq!(
-            high.policy
-                .reported_usage
-                .cache_creation
-                .normal_max_multiplier,
-            1.4
-        );
-        assert_eq!(
-            high.policy.reported_usage.final_cache_read_max_tokens,
-            333_000
-        );
-        assert!(high.policy.cache_point.enabled);
-        assert!(!high.policy.cache_point.tools_only);
-        assert!(!high.policy.cache_point.record_plan);
-        assert_eq!(high.policy.bounds.max_entries_per_account, 7);
-        assert_eq!(high.policy.bounds.max_entries_global, 70);
-        assert_eq!(high.policy.bounds.entry_ttl_secs, 700);
-        assert_eq!(high.policy.bounds.estimated_bytes_limit, 7_000);
-        assert_eq!(high.policy.kiro_rs_tool.coverage_ratio, 0.7);
-        assert_eq!(high.policy.kiro_rs_tool.max_coverage_tokens, 70_000);
-        assert!(!high.policy.kiro_rs_tool.incremental_create_enabled);
-        assert_eq!(
-            high.policy.kiro_rs_tool.max_new_creation_tokens_per_request,
-            7_000
-        );
-        assert!(high.policy.kiro_rs_tool.cache_current_user_stable_prefix);
-        assert_eq!(
-            high.policy
-                .kiro_rs_tool
-                .current_user_stable_prefix_max_tokens,
-            700
-        );
-
-        let plain = config.cache_policy_for_path("/plain/v1/messages");
-        assert_eq!(plain.namespace, None);
-        assert_eq!(plain.policy.cache_type, PromptCacheStrategyType::NoCache);
-        assert!(!plain.policy.simulation.enabled);
-        assert_ne!(plain.policy.simulation.token_scale, 2.0);
-        assert!(!plain.policy.creation_control.enabled);
-        assert!(!plain.policy.cache_point.enabled);
-        assert!(!plain.policy.reported_usage.enabled);
-        assert_eq!(
-            plain.policy.reported_usage.input.mode,
-            ReportedUsageFieldMode::Raw
-        );
-        assert_eq!(
-            plain.policy.reported_usage.output.mode,
-            ReportedUsageFieldMode::Raw
-        );
-        assert_ne!(plain.policy.bounds.max_entries_per_account, 2);
-        assert_ne!(plain.policy.kiro_rs_tool.coverage_ratio, 0.2);
-
-        let tool = config.cache_policy_for_path("/tool-matrix/v1/messages");
-        assert_eq!(tool.namespace.as_deref(), Some("/tool-matrix"));
-        assert_eq!(tool.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
-        assert!(!tool.policy.simulation.enabled);
-        assert_eq!(tool.policy.simulation.token_scale, 1.0);
-        assert!(!tool.policy.creation_control.enabled);
-        assert!(tool.policy.reported_usage.enabled);
-        assert_eq!(tool.policy.reported_usage.input.max_tokens, 123);
-        assert!(tool.policy.cache_point.enabled);
-        assert!(!tool.policy.cache_point.tools_only);
-        assert!(tool.policy.cache_point.record_plan);
-        assert_eq!(tool.policy.bounds.max_entries_per_account, 5);
-        assert_eq!(tool.policy.bounds.max_entries_global, 50);
-        assert_eq!(tool.policy.bounds.entry_ttl_secs, 500);
-        assert_eq!(tool.policy.bounds.estimated_bytes_limit, 5_000);
-        assert_eq!(tool.policy.kiro_rs_tool.coverage_ratio, 0.5);
-        assert_eq!(tool.policy.kiro_rs_tool.max_coverage_tokens, 50_000);
-        assert!(!tool.policy.kiro_rs_tool.incremental_create_enabled);
-        assert_eq!(
-            tool.policy.kiro_rs_tool.max_new_creation_tokens_per_request,
-            5_000
-        );
-        assert!(tool.policy.kiro_rs_tool.cache_current_user_stable_prefix);
-        assert_eq!(
-            tool.policy
-                .kiro_rs_tool
-                .current_user_stable_prefix_max_tokens,
-            500
-        );
     }
 
     #[test]
@@ -10391,29 +7073,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_policy_no_cache_route_skips_cache_state_and_is_preserved() {
-        let mut config = Config::default();
-        config.cache_policy.path_overrides.insert(
-            "/plain".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::NoCache),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-
-        let normalized = config.cache_policy.normalized();
-        assert!(normalized.path_overrides.contains_key("/plain"));
-
-        let resolved = config.cache_policy_for_path("/plain/v1/messages");
-        assert_eq!(resolved.namespace, None);
-        assert_eq!(resolved.policy.cache_type, PromptCacheStrategyType::NoCache);
-        assert!(!resolved.policy.simulation.enabled);
-        assert!(!resolved.policy.creation_control.enabled);
-        assert!(!resolved.policy.cache_point.enabled);
-        assert!(!resolved.policy.reported_usage.enabled);
-    }
-
-    #[test]
     fn builtin_route_cache_strategy_is_config_driven() {
         let mut config = Config::default();
         config.cache_policy.path_overrides.insert(
@@ -10520,315 +7179,6 @@ mod tests {
                 .and_then(|policy| policy.simulation)
                 .is_some()
         );
-    }
-
-    #[test]
-    fn runtime_config_migration_preserves_explicit_na_policy() {
-        let mut config = Config {
-            runtime_config_migration_version: CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
-            ..Config::default()
-        };
-        config.cache_policy.path_overrides.insert(
-            "/na".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                reported_usage: Some(ReportedUsagePathPolicy::disabled()),
-                cache_point: Some(CachePointPolicyPatch {
-                    enabled: Some(true),
-                    ..CachePointPolicyPatch::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-
-        assert!(!config.apply_runtime_config_migrations());
-        let na = config
-            .cache_policy
-            .path_overrides
-            .get("/na")
-            .expect("/na should be retained as an explicit route");
-        assert_eq!(
-            na.cache_type,
-            Some(PromptCacheStrategyType::CurrentHighCache)
-        );
-        assert!(na.reported_usage.is_some());
-        assert!(na.cache_point.is_some());
-    }
-
-    #[test]
-    fn runtime_config_migration_rewrites_legacy_payload_guard_default_once() {
-        let mut config = Config {
-            runtime_config_migration_version: 0,
-            payload_guard_mode: PayloadGuardMode::Preemptive,
-            ..Default::default()
-        };
-
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
-        assert_eq!(
-            config.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-
-        config.payload_guard_mode = PayloadGuardMode::Preemptive;
-        assert!(!config.apply_runtime_config_migrations());
-        assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
-    }
-
-    #[test]
-    fn runtime_config_v15_migrates_legacy_auto_sync_without_rewriting_explicit_version() {
-        let mut config = Config {
-            runtime_config_migration_version: 14,
-            kiro_version: "0.11.107".to_string(),
-            kiro_version_auto_sync_enabled: true,
-            ..Config::default()
-        };
-
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(config.runtime_config_migration_version, 15);
-        assert_eq!(config.kiro_version, "0.11.107");
-        assert!(config.legacy_auto_sync_migration_pending());
-
-        config.clear_legacy_auto_sync_migration_marker();
-        assert!(!config.legacy_auto_sync_migration_pending());
-        assert_eq!(config.kiro_version, "0.11.107");
-    }
-
-    #[test]
-    fn runtime_config_migration_v14_replaces_unedited_task_quality_and_chunked_texts() {
-        use crate::model::prompt_injection::{TextKey, catalog};
-
-        let previous_task_quality = catalog::previous_default_texts(TextKey::TaskQuality)[0];
-        let previous_chunked = catalog::previous_default_texts(TextKey::ChunkedWritePolicy)[0];
-        let mut config = Config {
-            runtime_config_migration_version: 13,
-            ..Default::default()
-        };
-        config
-            .prompt_injection
-            .texts
-            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
-        config
-            .prompt_injection
-            .texts
-            .insert(TextKey::ChunkedWritePolicy, previous_chunked.to_string());
-        config
-            .prompt_injection
-            .texts
-            .insert(TextKey::Custom, "operator text".to_string());
-
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(
-            config.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        let injection = &config.prompt_injection;
-        assert!(!injection.texts.contains_key(&TextKey::TaskQuality));
-        assert!(!injection.texts.contains_key(&TextKey::ChunkedWritePolicy));
-        assert_eq!(
-            injection.text(TextKey::TaskQuality),
-            catalog::DEFAULT_TASK_QUALITY_PROMPT
-        );
-        assert_eq!(injection.text(TextKey::Custom), "operator text");
-        // Route switches are untouched.
-        assert_eq!(
-            injection.path_overrides,
-            PromptInjectionConfig::default().path_overrides
-        );
-
-        // Runs once: a later operator choice of the old text is kept.
-        config
-            .prompt_injection
-            .texts
-            .insert(TextKey::TaskQuality, previous_task_quality.to_string());
-        assert!(!config.apply_runtime_config_migrations());
-        assert_eq!(
-            config
-                .prompt_injection
-                .texts
-                .get(&TextKey::TaskQuality)
-                .map(String::as_str),
-            Some(previous_task_quality)
-        );
-    }
-
-    #[test]
-    fn runtime_config_migration_disables_online_usage_rollup_compression_once() {
-        let mut config = Config {
-            runtime_config_migration_version: 6,
-            ..Default::default()
-        };
-        config.postgres.compress_usage_rollups_on_start = true;
-
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(
-            config.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert!(!config.postgres.compress_usage_rollups_on_start);
-
-        config.postgres.compress_usage_rollups_on_start = true;
-        assert!(!config.apply_runtime_config_migrations());
-        assert!(config.postgres.compress_usage_rollups_on_start);
-    }
-
-    #[test]
-    fn runtime_config_migrations_never_change_the_pool_circuit() {
-        for enabled in [false, true] {
-            let mut config = Config {
-                runtime_config_migration_version: 0,
-                external_pools: ExternalPoolsConfig {
-                    local_pool_circuit_enabled: enabled,
-                    local_pool_circuit_window_secs: 60,
-                    local_pool_circuit_open_after_failures: 3,
-                    local_pool_circuit_require_distinct_credentials: 2,
-                    ..ExternalPoolsConfig::default()
-                },
-                ..Config::default()
-            };
-            config.apply_runtime_config_migrations();
-            let pools = &config.external_pools;
-            assert_eq!(
-                pools.local_pool_circuit_enabled, enabled,
-                "the switch is left as it is"
-            );
-            assert_eq!(pools.local_pool_circuit_window_secs, 60);
-            assert_eq!(pools.local_pool_circuit_open_after_failures, 3);
-            assert_eq!(pools.local_pool_circuit_require_distinct_credentials, 2);
-        }
-    }
-
-    #[test]
-    fn pool_circuit_is_off_by_default() {
-        let pools: ExternalPoolsConfig = serde_json::from_str("{}").unwrap();
-        assert!(!pools.local_pool_circuit_enabled);
-        assert!(!ExternalPoolsConfig::default().local_pool_circuit_enabled);
-        assert!(!Config::default().external_pools.local_pool_circuit_enabled);
-    }
-
-    #[test]
-    fn runtime_config_migration_adds_404_to_external_pool_retry_status_codes_once() {
-        let mut config = Config {
-            runtime_config_migration_version: 9,
-            external_pools: ExternalPoolsConfig {
-                external_pool_retry_status_codes: vec![408, 425, 429, 500, 502, 503, 504, 529],
-                ..ExternalPoolsConfig::default()
-            },
-            ..Config::default()
-        };
-
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(
-            config.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert_eq!(
-            config.external_pools.external_pool_retry_status_codes,
-            vec![404, 408, 425, 429, 500, 502, 503, 504, 529]
-        );
-
-        config.external_pools.external_pool_retry_status_codes =
-            vec![404, 408, 425, 429, 500, 502, 503, 504, 529];
-        assert!(!config.apply_runtime_config_migrations());
-    }
-
-    #[test]
-    fn runtime_config_migration_restores_legacy_scheduler_fallback_intent_once() {
-        for legacy_version in [0, 1, 2, 3, 4] {
-            let mut config = Config {
-                runtime_config_migration_version: legacy_version,
-                ..Default::default()
-            };
-            config.external_pools.external_pools_enabled = true;
-            config.external_pools.fallback_on_scheduler_redis_degraded = false;
-
-            assert!(config.apply_runtime_config_migrations());
-            assert_eq!(
-                config.runtime_config_migration_version,
-                CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-            );
-            assert!(
-                config.external_pools.fallback_on_scheduler_redis_degraded,
-                "legacy migration version {legacy_version} must retain broad local fallback intent"
-            );
-
-            config.external_pools.fallback_on_scheduler_redis_degraded = false;
-            assert!(!config.apply_runtime_config_migrations());
-            assert!(
-                !config.external_pools.fallback_on_scheduler_redis_degraded,
-                "an explicit post-migration opt-out must be stable"
-            );
-        }
-    }
-
-    #[test]
-    fn runtime_config_migration_does_not_enable_scheduler_fallback_without_legacy_intent() {
-        let mut external_disabled = Config {
-            runtime_config_migration_version: 4,
-            ..Default::default()
-        };
-        external_disabled.external_pools.external_pools_enabled = false;
-        external_disabled
-            .external_pools
-            .fallback_on_scheduler_redis_degraded = false;
-        assert!(external_disabled.apply_runtime_config_migrations());
-        assert!(
-            !external_disabled
-                .external_pools
-                .fallback_on_scheduler_redis_degraded
-        );
-
-        for disable_legacy_fallback in ["capacity", "no_credentials", "transient"] {
-            let mut config = Config {
-                runtime_config_migration_version: 4,
-                ..Default::default()
-            };
-            config.external_pools.external_pools_enabled = true;
-            config.external_pools.fallback_on_scheduler_redis_degraded = false;
-            match disable_legacy_fallback {
-                "capacity" => config.external_pools.fallback_on_local_capacity_exhausted = false,
-                "no_credentials" => {
-                    config.external_pools.fallback_on_no_available_credentials = false
-                }
-                "transient" => config.external_pools.fallback_on_local_transient_exhausted = false,
-                _ => unreachable!(),
-            }
-
-            assert!(config.apply_runtime_config_migrations());
-            assert!(
-                !config.external_pools.fallback_on_scheduler_redis_degraded,
-                "partial legacy fallback policy {disable_legacy_fallback} must not be broadened"
-            );
-        }
-
-        let mut explicit_true = Config {
-            runtime_config_migration_version: 4,
-            ..Default::default()
-        };
-        explicit_true.external_pools.external_pools_enabled = true;
-        assert!(explicit_true.apply_runtime_config_migrations());
-        assert!(
-            explicit_true
-                .external_pools
-                .fallback_on_scheduler_redis_degraded
-        );
-    }
-
-    #[test]
-    fn runtime_config_migration_bounds_legacy_unlimited_external_wait() {
-        let mut config = Config {
-            runtime_config_migration_version: 4,
-            ..Default::default()
-        };
-        config.external_pools.external_pool_capacity_mode = ExternalPoolCapacityMode::Wait;
-        config.external_pools.external_pool_dispatch_max_wait_secs = 0;
-
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(
-            config.external_pools.external_pool_dispatch_max_wait_secs,
-            default_external_pool_dispatch_max_wait_secs()
-        );
-        assert_eq!(config.external_pools.effective_dispatch_max_wait_secs(), 5);
     }
 
     #[test]
@@ -10957,140 +7307,6 @@ mod tests {
     }
 
     #[test]
-    fn config_example_load_keeps_prompt_injection_and_route_features() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let example_path = std::path::Path::new(manifest_dir).join("config.example.json");
-        let raw: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&example_path).unwrap()).unwrap();
-        let expected_injection: super::super::prompt_injection::PromptInjectionConfig =
-            serde_json::from_value(raw["promptInjection"].clone()).unwrap();
-        let expected_route_features: super::super::prompt_injection::RouteFeaturesConfig =
-            serde_json::from_value(raw["routeFeatures"].clone()).unwrap();
-
-        // Real load path, including legacy prompt field migration.
-        let config = Config::load(&example_path).unwrap();
-        assert_eq!(config.prompt_injection, expected_injection);
-        assert_eq!(config.route_features, expected_route_features);
-        assert_eq!(
-            config.claude_models_only,
-            raw["claudeModelsOnly"].as_bool().unwrap()
-        );
-
-        // Migration-only fields would make the loader rebuild both sections from legacy
-        // defaults and silently discard what the example file says.
-        let mut parsed: Config = serde_json::from_value(raw).unwrap();
-        assert!(
-            !parsed.migrate_legacy_prompt_fields(),
-            "config.example.json must not carry migration-only legacy fields"
-        );
-    }
-
-    #[test]
-    fn config_example_bootstraps_desired_reported_usage_defaults() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let example_path = std::path::Path::new(manifest_dir).join("config.example.json");
-        let json = std::fs::read_to_string(example_path).unwrap();
-        let config: Config = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
-        assert_eq!(config.inference_upstream_max_attempts, 4);
-        assert_eq!(config.auxiliary_upstream_max_attempts, 2);
-        assert_eq!(
-            config.auxiliary_upstream_max_concurrent_requests,
-            DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
-        );
-        assert_eq!(config.token_refresh_max_rpm, DEFAULT_TOKEN_REFRESH_MAX_RPM);
-        assert_eq!(config.token_refresh_burst, DEFAULT_TOKEN_REFRESH_BURST);
-        assert_eq!(
-            config.token_refresh_background_enabled,
-            DEFAULT_TOKEN_REFRESH_BACKGROUND_ENABLED
-        );
-        assert_eq!(
-            config.token_refresh_background_interval_secs,
-            DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
-        );
-        assert_eq!(
-            config.token_refresh_background_lead_secs,
-            DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
-        );
-        assert!(!config.weighted_capacity.enabled);
-        assert_eq!(config.weighted_capacity.max_units_per_request, 8);
-        assert_eq!(config.weighted_capacity.units_for_tokens(1_000_000), 1);
-
-        let default_policy = config.reported_usage.policy_for_path("/v1/messages");
-        assert_eq!(default_policy.input.mode, ReportedUsageFieldMode::Raw);
-        assert_eq!(default_policy.output.mode, ReportedUsageFieldMode::Raw);
-        assert_eq!(default_policy.final_cache_read_max_tokens, 700_000);
-        assert_eq!(default_policy.final_cache_read_jitter_min_tokens, 0);
-        assert_eq!(default_policy.final_cache_read_jitter_max_tokens, 0);
-        assert_eq!(default_policy.final_cache_creation_max_tokens, 400_000);
-        assert_eq!(
-            default_policy.final_cache_creation_jitter_min_tokens,
-            20_000
-        );
-        assert_eq!(
-            default_policy.final_cache_creation_jitter_max_tokens,
-            45_000
-        );
-        assert!(default_policy.final_output_guard_enabled);
-        assert_eq!(default_policy.output_uplift_min_tokens, 1_000);
-        assert_eq!(default_policy.output_uplift_percent, 50);
-        assert_eq!(default_policy.final_output_max_tokens, 200_000);
-        assert_eq!(default_policy.final_output_jitter_min_tokens, 5_000);
-        assert_eq!(default_policy.final_output_jitter_max_tokens, 12_000);
-        assert_eq!(
-            default_policy.cache_read.mode,
-            ReportedUsageFieldMode::Preserve
-        );
-        assert_eq!(
-            default_policy.cache_creation.mode,
-            ReportedUsageFieldMode::Preserve
-        );
-
-        let cc_policy = config.reported_usage.policy_for_path("/cc/v1/messages");
-        assert_eq!(cc_policy.final_cache_read_max_tokens, 700_000);
-        assert_eq!(cc_policy.final_cache_creation_max_tokens, 400_000);
-        assert_eq!(cc_policy.final_cache_creation_jitter_min_tokens, 20_000);
-        assert_eq!(cc_policy.final_cache_creation_jitter_max_tokens, 45_000);
-        assert!(cc_policy.final_output_guard_enabled);
-        assert_eq!(cc_policy.output_uplift_min_tokens, 1_000);
-        assert_eq!(cc_policy.output_uplift_percent, 50);
-        assert_eq!(cc_policy.final_output_max_tokens, 200_000);
-        assert_eq!(cc_policy.final_output_jitter_min_tokens, 5_000);
-        assert_eq!(cc_policy.final_output_jitter_max_tokens, 12_000);
-        assert_eq!(cc_policy.input.mode, ReportedUsageFieldMode::SampleMax);
-        assert_eq!(cc_policy.input.max_tokens, 96);
-        assert!(cc_policy.input.move_delta_to_cache_read);
-        assert_eq!(
-            cc_policy.cache_creation.mode,
-            ReportedUsageFieldMode::SampleTarget
-        );
-        assert_eq!(cc_policy.cache_creation.target_tokens, 3_000);
-        assert_eq!(cc_policy.cache_creation.normal_max_multiplier, 1.2);
-
-        let ha_policy = config.reported_usage.policy_for_path("/ha/v1/messages");
-        assert!(ha_policy.final_output_guard_enabled);
-        assert_eq!(ha_policy.output_uplift_min_tokens, 1_000);
-        assert_eq!(ha_policy.output_uplift_percent, 50);
-        assert_eq!(ha_policy.final_output_max_tokens, 200_000);
-        assert_eq!(ha_policy.final_output_jitter_min_tokens, 5_000);
-        assert_eq!(ha_policy.final_output_jitter_max_tokens, 12_000);
-        assert_eq!(ha_policy.input.mode, ReportedUsageFieldMode::SampleMax);
-        assert_eq!(
-            ha_policy.cache_creation.mode,
-            ReportedUsageFieldMode::Preserve
-        );
-
-        assert!(!config.reported_usage.path_overrides.contains_key("/na"));
-        assert!(
-            config
-                .reported_usage
-                .policy_for_path("/na/v1/messages")
-                .enabled
-        );
-    }
-
-    #[test]
     fn inference_attempt_budget_uses_compatible_default_and_preserves_explicit_value() {
         let historical: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(historical.inference_upstream_max_attempts, 4);
@@ -11098,64 +7314,5 @@ mod tests {
         let explicit: Config =
             serde_json::from_str(r#"{"inferenceUpstreamMaxAttempts":7}"#).unwrap();
         assert_eq!(explicit.inference_upstream_max_attempts, 7);
-    }
-
-    #[test]
-    fn auxiliary_focus_limits_default_round_trip_and_ignore_prompt_steering_for_five_rounds() {
-        for _ in 0..5 {
-            let historical: Config = serde_json::from_str("{}").unwrap();
-            assert_eq!(historical.auxiliary_upstream_max_attempts, 2);
-            assert_eq!(
-                historical.auxiliary_upstream_max_concurrent_requests,
-                DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
-            );
-            assert_eq!(
-                historical.token_refresh_max_rpm,
-                DEFAULT_TOKEN_REFRESH_MAX_RPM
-            );
-            assert_eq!(historical.token_refresh_burst, DEFAULT_TOKEN_REFRESH_BURST);
-            assert!(historical.token_refresh_background_enabled);
-            assert_eq!(
-                historical.token_refresh_background_interval_secs,
-                DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
-            );
-            assert_eq!(
-                historical.token_refresh_background_lead_secs,
-                DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
-            );
-
-            let explicit: Config = serde_json::from_str(
-                r#"{
-                    "auxiliaryUpstreamMaxAttempts": 7,
-                    "auxiliaryUpstreamMaxConcurrentRequests": 31,
-                    "tokenRefreshMaxRpm": 120,
-                    "tokenRefreshBurst": 16,
-                    "tokenRefreshBackgroundEnabled": false,
-                    "tokenRefreshBackgroundIntervalSecs": 120,
-                    "tokenRefreshBackgroundLeadSecs": 900,
-                    "claudeModelsOnly": true
-                }"#,
-            )
-            .unwrap();
-            assert_eq!(explicit.auxiliary_upstream_max_attempts, 7);
-            assert_eq!(explicit.auxiliary_upstream_max_concurrent_requests, 31);
-            assert_eq!(explicit.token_refresh_max_rpm, 120);
-            assert_eq!(explicit.token_refresh_burst, 16);
-            assert!(!explicit.token_refresh_background_enabled);
-            assert_eq!(explicit.token_refresh_background_interval_secs, 120);
-            assert_eq!(explicit.token_refresh_background_lead_secs, 900);
-            assert!(explicit.claude_models_only);
-
-            let round_trip: Config =
-                serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
-            assert_eq!(round_trip.auxiliary_upstream_max_attempts, 7);
-            assert_eq!(round_trip.auxiliary_upstream_max_concurrent_requests, 31);
-            assert_eq!(round_trip.token_refresh_max_rpm, 120);
-            assert_eq!(round_trip.token_refresh_burst, 16);
-            assert!(!round_trip.token_refresh_background_enabled);
-            assert_eq!(round_trip.token_refresh_background_interval_secs, 120);
-            assert_eq!(round_trip.token_refresh_background_lead_secs, 900);
-            assert!(round_trip.claude_models_only);
-        }
     }
 }

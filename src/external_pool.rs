@@ -65,12 +65,12 @@ use crate::{
             UsageSource,
         },
     },
+    common::storage_task::spawn_critical_storage_task,
     common::{
         capacity_signal::{CapacitySignal, CapacityWaiter},
         upstream_error::RawUpstreamError,
     },
     http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout},
-    kiro::token_manager::storage_task::spawn_critical_storage_task,
     model::config::{
         ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode, ExternalPoolRouteMode,
         ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
@@ -1054,7 +1054,7 @@ pub struct ExternalRouteRequest {
     /// Probe bound to `effective_raw_body`; shared across every failover candidate.
     pub(crate) effective_raw_probe: Option<Arc<RawMessagesBodyProbe>>,
     pub(crate) preparation_cache: Arc<ExternalRouteRequestPreparationCache>,
-    /// Mutable working serialization used by normalized/local processing.
+    /// Mutable working serialization used by normalized processing.
     pub raw_body: Bytes,
     pub headers: HeaderMap,
     pub endpoint: String,
@@ -1067,11 +1067,6 @@ pub struct ExternalRouteRequest {
     pub model_resolution_source: Option<String>,
     pub model_resolution_note: Option<String>,
     pub route_subtype: UsageRouteSubtype,
-    pub fallback_reason: Option<String>,
-    pub direct_policy_reason: Option<String>,
-    pub local_attempted: bool,
-    pub local_preflight: Option<serde_json::Value>,
-    pub local_attempts: Vec<crate::kiro::call_trace::KiroCredentialAttempt>,
     pub reported_usage: ReportedUsageConfig,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -1114,14 +1109,6 @@ pub struct ExternalRouteRequest {
     pub payload_guard_retry_config: Option<PayloadGuardConfig>,
     pub inference_attempt_budget: Arc<InferenceAttemptBudget>,
     pub request_api_key_id: Option<String>,
-}
-
-fn route_allows_degraded_fallback_local_lease(route: &ExternalRouteRequest) -> bool {
-    matches!(
-        route.route_subtype,
-        UsageRouteSubtype::ExternalFallbackPreflight
-            | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
-    ) && route.fallback_reason.as_deref() == Some("local_scheduler_redis_degraded")
 }
 
 impl ExternalRouteRequest {
@@ -1199,7 +1186,7 @@ impl ExternalRouteRequest {
     fn stable_conversation_id(&self) -> Option<String> {
         self.payload
             .as_ref()
-            .and_then(crate::anthropic::converter::extract_stable_conversation_id)
+            .and_then(crate::anthropic::conversation_id::extract_stable_conversation_id)
     }
 
     fn reset_preparation_cache(&mut self) {
@@ -1293,7 +1280,6 @@ impl ExternalLatencyTraceState {
         let first_output_delta_ms = load_nonzero(&self.first_output_delta_ms);
         let trace = UsageLatencyTrace {
             inference_attempts: None,
-            auxiliary_attempts: None,
             capacity_weight_units: None,
             estimated_input_tokens: None,
             payload_guard_ms: None,
@@ -2173,9 +2159,9 @@ fn external_pool_usage_debug_route_context(
         "conversationId": route.stable_conversation_id(),
         "requestApiKeyId": route.request_api_key_id.as_deref(),
         "routeSubtype": route.route_subtype,
-        "fallbackReason": route.fallback_reason.as_deref(),
-        "directPolicyReason": route.direct_policy_reason.as_deref(),
-        "localAttempted": route.local_attempted,
+
+
+
         "requestInputTokens": route.request_input_tokens,
         "pool": {
             "id": pool.id,
@@ -2273,9 +2259,9 @@ fn external_pool_wire_debug_route_context(
         "conversationId": route.stable_conversation_id(),
         "requestApiKeyId": route.request_api_key_id.as_deref(),
         "routeSubtype": route.route_subtype,
-        "fallbackReason": route.fallback_reason.as_deref(),
-        "directPolicyReason": route.direct_policy_reason.as_deref(),
-        "localAttempted": route.local_attempted,
+
+
+
         "requestInputTokens": route.request_input_tokens,
         "pool": {
             "id": pool.id,
@@ -2554,61 +2540,6 @@ fn external_pool_wire_debug_text_summary(text: &str) -> serde_json::Value {
         "preview": preview,
         "previewTruncated": chars > EXTERNAL_POOL_WIRE_DEBUG_TEXT_PREVIEW_CHARS,
     })
-}
-
-pub(crate) fn record_external_pool_wire_debug_handler_ingress(
-    config: &ExternalPoolsConfig,
-    endpoint: &str,
-    effective_raw_body: &Bytes,
-    raw_body: &Bytes,
-    payload: &MessagesRequest,
-    request_api_key_id: Option<&str>,
-) {
-    if !external_pool_wire_debug_enabled(config) {
-        return;
-    }
-    let max_bytes = external_pool_wire_debug_max_body_bytes(config);
-    let ingress_request_id = crate::anthropic::envelope::request_id();
-    let typed_payload_body = serde_json::to_vec(payload).ok().map(Bytes::from);
-    let payload_summary = typed_payload_body
-        .as_ref()
-        .map(|body| external_pool_wire_debug_request_summary(body))
-        .unwrap_or_else(|| {
-            json!({
-                "parseOk": false,
-                "serializeError": true,
-            })
-        });
-    let payload = json!({
-        "kind": "external_pool_wire_debug",
-        "stage": "handler_ingress",
-        "ingress": {
-            "ingressRequestId": ingress_request_id.as_str(),
-            "createdAt": Utc::now().to_rfc3339(),
-            "endpoint": endpoint,
-            "requestApiKeyId": request_api_key_id,
-            "externalPoolsEnabled": config.external_pools_enabled,
-            "routeAllowed": config.external_pool_route_allowed(endpoint),
-        },
-        "request": {
-            "effectiveRawBody": {
-                "body": external_pool_wire_debug_bytes(effective_raw_body, max_bytes),
-                "summary": external_pool_wire_debug_request_summary(effective_raw_body),
-            },
-            "workingRawBody": {
-                "body": external_pool_wire_debug_bytes(raw_body, max_bytes),
-                "summary": external_pool_wire_debug_request_summary(raw_body),
-                "differsFromEffectiveRawBody": raw_body.as_ref() != effective_raw_body.as_ref(),
-            },
-            "typedPayloadSummary": payload_summary,
-        },
-    });
-    spawn_external_pool_wire_debug_write_with_id(
-        config,
-        &ingress_request_id,
-        "handler-ingress",
-        payload,
-    );
 }
 
 struct ExternalUsageDebugNonStreamRecordContext<'a> {
@@ -3520,6 +3451,7 @@ pub struct ExternalPoolManager {
     coordinator_recovery_grace: Duration,
     release_dispatcher: Arc<ExternalPoolReleaseDispatcher>,
     degraded_fallback_local_leases: Arc<SyncMutex<HashMap<(u64, u32), Arc<Semaphore>>>>,
+    degraded_global_leases: Arc<SyncMutex<HashMap<u32, Arc<Semaphore>>>>,
     local_mutation_dispatch_trust: Arc<SyncMutex<HashMap<(u64, u64), Instant>>>,
 }
 
@@ -3532,6 +3464,7 @@ struct ExternalPoolLease {
     max_age: Duration,
     heartbeat: Option<ExternalPoolLeaseHeartbeat>,
     release_permit: Option<OwnedSemaphorePermit>,
+    global_permit: Option<OwnedSemaphorePermit>,
 }
 
 struct ExternalPoolLeaseHeartbeat {
@@ -3939,6 +3872,7 @@ impl ExternalPoolLease {
             max_age,
             heartbeat: None,
             release_permit: Some(release_permit),
+            global_permit: None,
         }
     }
 
@@ -3947,6 +3881,7 @@ impl ExternalPoolLease {
         pool_id: u64,
         lease_id: String,
         release_permit: OwnedSemaphorePermit,
+        global_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             manager,
@@ -3957,6 +3892,7 @@ impl ExternalPoolLease {
             max_age: Duration::from_secs(EXTERNAL_POOL_LEASE_MAX_AGE_SECS),
             heartbeat: None,
             release_permit: Some(release_permit),
+            global_permit,
         }
     }
 
@@ -3996,6 +3932,7 @@ impl Drop for ExternalPoolLease {
             ExternalPoolLeaseState::Confirmed => ExternalPoolLeaseReleaseKind::Confirmed,
             ExternalPoolLeaseState::DegradedFallbackLocal => {
                 let _ = self.release_permit.take();
+                let _ = self.global_permit.take();
                 return;
             }
             ExternalPoolLeaseState::Disarmed => return,
@@ -4743,36 +4680,6 @@ pub fn mask_external_pool_key(value: &str) -> String {
     )
 }
 
-const EXPLICIT_DIRECT_POLICY_REASON: &str = "explicit_direct";
-
-fn direct_external_policy_static_reason(
-    config: &ExternalPoolsConfig,
-    endpoint: &str,
-    model: &str,
-) -> Option<String> {
-    if !config.external_pools_enabled || !config.external_direct_policy_enabled {
-        return None;
-    }
-    if !config.external_pool_route_allowed(endpoint) {
-        return None;
-    }
-    if config
-        .direct_external_model_rules
-        .iter()
-        .any(|rule| rule_matches(rule, model))
-    {
-        return Some(format!("model_rule:{}", model));
-    }
-    if config
-        .direct_external_path_rules
-        .iter()
-        .any(|rule| rule_matches(rule, endpoint))
-    {
-        return Some(format!("path_rule:{}", endpoint));
-    }
-    Some(EXPLICIT_DIRECT_POLICY_REASON.to_string())
-}
-
 impl ExternalPoolManager {
     pub fn new(postgres: Arc<PostgresStore>, redis: Arc<RedisStore>) -> Self {
         let capacity_signal = Arc::new(CapacitySignal::default());
@@ -4860,6 +4767,7 @@ impl ExternalPoolManager {
             ),
             release_dispatcher,
             degraded_fallback_local_leases: Arc::new(SyncMutex::new(HashMap::new())),
+            degraded_global_leases: Arc::new(SyncMutex::new(HashMap::new())),
             local_mutation_dispatch_trust: Arc::new(SyncMutex::new(HashMap::new())),
         }
     }
@@ -6216,15 +6124,6 @@ impl ExternalPoolManager {
         }
     }
 
-    pub async fn direct_policy_reason(
-        &self,
-        config: &ExternalPoolsConfig,
-        endpoint: &str,
-        model: &str,
-    ) -> Option<String> {
-        direct_external_policy_static_reason(config, endpoint, model)
-    }
-
     pub async fn forward_with_failover(
         &self,
         config: ExternalPoolsConfig,
@@ -6544,22 +6443,21 @@ impl ExternalPoolManager {
                 }
             };
             let degraded_selection = (selection.selected_pool.is_none()
-                && selection.availability.coordinator_unavailable
-                && route_allows_degraded_fallback_local_lease(&route))
-            .then(|| {
-                self.select_degraded_fallback_local_pool_from_snapshot(
-                    &authoritative_pools,
-                    &excluded,
-                    &route,
-                    &config,
-                )
-            })
-            .flatten();
+                && selection.availability.coordinator_unavailable)
+                .then(|| {
+                    self.select_degraded_fallback_local_pool_from_snapshot(
+                        &authoritative_pools,
+                        &excluded,
+                        &route,
+                        &config,
+                    )
+                })
+                .flatten();
             if let Some(degraded_selection) = degraded_selection {
                 tracing::warn!(
                     request_id = %route.request_id,
-                    fallback_reason = ?route.fallback_reason,
-                    "外部池 Redis coordinator 与本地 scheduler 同时不可用，使用进程内有界 emergency external lease"
+
+                    "外部池 Redis coordinator 不可用，使用进程内有界 lease"
                 );
                 selection = degraded_selection;
             }
@@ -6644,21 +6542,20 @@ impl ExternalPoolManager {
             };
             let pool_id = pool.id;
             let acquire_result = if selection.degraded_fallback_local_lease {
-                self.acquire_degraded_fallback_local_pool(&pool)
+                self.acquire_degraded_fallback_local_pool(&pool, &config)
             } else {
                 match self.acquire_pool_for_route(&pool, &config, &route).await {
                     PoolAcquireResult::Acquired(lease) => PoolAcquireResult::Acquired(lease),
                     PoolAcquireResult::Unavailable(unavailable)
-                        if unavailable.reason == PoolCapacityWaitReason::CoordinatorUnavailable
-                            && route_allows_degraded_fallback_local_lease(&route) =>
+                        if unavailable.reason == PoolCapacityWaitReason::CoordinatorUnavailable =>
                     {
                         tracing::warn!(
                             request_id = %route.request_id,
                             pool_id,
                             detail = unavailable.detail,
-                            "外部池 Redis lease 准入在 scheduler degraded fallback 中不可用，尝试进程内有界 emergency external lease"
+                            "外部池 Redis lease 准入不可用，尝试进程内有界 lease"
                         );
-                        self.acquire_degraded_fallback_local_pool(&pool)
+                        self.acquire_degraded_fallback_local_pool(&pool, &config)
                     }
                     PoolAcquireResult::Unavailable(unavailable) => {
                         PoolAcquireResult::Unavailable(unavailable)
@@ -6761,16 +6658,14 @@ impl ExternalPoolManager {
                             continue;
                         }
                         PoolDispatchFenceResult::CoordinatorUnavailable(unavailable) => {
-                            if route_allows_degraded_fallback_local_lease(&route)
-                                && self.local_mutation_dispatch_trusted(&pool)
-                            {
+                            if self.local_mutation_dispatch_trusted(&pool) {
                                 tracing::warn!(
                                     request_id = %route.request_id,
                                     pool_id = pool.id,
                                     pool_revision = pool.revision,
-                                    fallback_reason = ?route.fallback_reason,
+
                                     unavailable_kind = unavailable.kind.as_str(),
-                                    "本地 scheduler degraded 且外部池 dispatch fence 暂不可用，使用本进程刚提交的外部池 revision 有界兜底"
+                                    "外部池 coordinator 与 dispatch fence 暂不可用，使用本进程刚提交的外部池 revision 有界兜底"
                                 );
                             } else {
                                 drop(lease);
@@ -8684,7 +8579,33 @@ impl ExternalPoolManager {
             .await
     }
 
-    fn acquire_degraded_fallback_local_pool(&self, pool: &ExternalPool) -> PoolAcquireResult {
+    fn acquire_degraded_fallback_local_pool(
+        &self,
+        pool: &ExternalPool,
+        config: &ExternalPoolsConfig,
+    ) -> PoolAcquireResult {
+        let global_max = config.external_pool_global_max_concurrent_requests;
+        let global_permit = if global_max > 0 {
+            let limiter = self
+                .degraded_global_leases
+                .lock()
+                .entry(global_max)
+                .or_insert_with(|| Arc::new(Semaphore::new(global_max as usize)))
+                .clone();
+            match limiter.try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                        reason: PoolCapacityWaitReason::Full,
+                        wait_for: None,
+                        exclude_pool_for_reselect: false,
+                        detail: "degraded_global_capacity_full",
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let max_concurrent = pool.max_concurrent_requests.max(1);
         let limiter = {
             let mut limiters = self.degraded_fallback_local_leases.lock();
@@ -8699,6 +8620,7 @@ impl ExternalPoolManager {
                 pool.id,
                 uuid::Uuid::new_v4().to_string(),
                 permit,
+                global_permit,
             )),
             Err(_) => PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
                 reason: PoolCapacityWaitReason::Full,
@@ -10133,7 +10055,7 @@ impl ExternalPoolManager {
             } else {
                 0.0
             },
-            kiro_metering_usage: 0.0,
+
             pricing_available,
             pricing_model,
             duration_ms,
@@ -10144,15 +10066,10 @@ impl ExternalPoolManager {
             response_latency_ms: Some(duration_ms),
             latency_trace: Some(latency_trace),
             simulated: usage_source.is_simulated(),
-            sticky_bound: false,
-            fallback_from_sticky: false,
-            credential_attempts: route.local_attempts.clone(),
+
             route_kind: Some(UsageRouteKind::ExternalPool),
             route_subtype: Some(route.route_subtype),
-            fallback_reason: route.fallback_reason.clone(),
-            direct_policy_reason: route.direct_policy_reason.clone(),
-            local_attempted: Some(route.local_attempted),
-            local_preflight: route.local_preflight.clone(),
+
             external_pool_id: pool.map(|pool| pool.id),
             external_pool_name: pool.map(|pool| pool.name.clone()),
             external_attempts: attempts,
@@ -10237,7 +10154,6 @@ fn external_record_usage_source(
 fn external_usage_latency_trace(route: &ExternalRouteRequest) -> UsageLatencyTrace {
     let mut latency_trace = route.latency_trace.snapshot().unwrap_or_default();
     latency_trace.inference_attempts = Some(route.inference_attempt_budget.snapshot());
-    latency_trace.auxiliary_attempts = Some(route.inference_attempt_budget.auxiliary_snapshot());
     latency_trace.credential_dispatch_elapsed_ms = route
         .inference_attempt_budget
         .credential_dispatch_elapsed_ms();
@@ -10801,20 +10717,6 @@ fn pool_auto_disable_policy_enabled(
         ExternalPoolAutoDisablePolicy::Enabled => true,
         ExternalPoolAutoDisablePolicy::Inherit => config.external_pool_auto_disable_enabled,
     }
-}
-
-fn rule_matches(rule: &str, value: &str) -> bool {
-    let rule = rule.trim();
-    if rule.is_empty() {
-        return false;
-    }
-    if rule == "*" {
-        return true;
-    }
-    value.eq_ignore_ascii_case(rule)
-        || value
-            .to_ascii_lowercase()
-            .contains(&rule.to_ascii_lowercase())
 }
 
 fn load_score(in_flight: u32, max: u32) -> u64 {
@@ -11607,6 +11509,12 @@ fn record_external_upstream_chunk(
         return;
     };
     let index = index.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diagnostics::capture::record_upstream_frame(
+        Some(request_id),
+        Some(pool_id),
+        index,
+        chunk,
+    );
     crate::diagnostics::capture::record("external_upstream_chunk", Some(request_id), || {
         match std::str::from_utf8(chunk) {
             Ok(text) => json!({
@@ -15530,17 +15438,6 @@ fn drain_sse_events_with_transcript(
  * The wrappers above keep the existing unit-test surface for usage-only processing while the live
  * external route passes a request-scoped transcript state through the extended functions.
  */
-#[allow(dead_code)]
-fn capture_sse_usage_without_rewrite(
-    event: &[u8],
-    projection: Option<&ExternalUsageProjectionContext>,
-    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
-    plan: ExternalStreamProcessingPlan,
-) {
-    if plan.capture_usage {
-        capture_sse_event_usage(event, projection, capture);
-    }
-}
 
 fn maybe_mask_external_stream_error_event(
     event: &[u8],

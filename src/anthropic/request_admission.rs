@@ -48,8 +48,6 @@ const REJECTION_LOG_BURST_CAPACITY: u32 = 64;
 const REJECTION_LOG_REFILL_PER_SECOND: f64 = 8.0;
 const REJECTION_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_REJECTION_REASON_COUNT: usize = RequestRejectionReason::COUNT;
-const LOCAL_TEMPORARY_BACKOFF_MIN: Duration = Duration::from_secs(1);
-const LOCAL_TEMPORARY_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Default)]
 struct ConcurrencyGate {
@@ -74,7 +72,6 @@ struct KeyState {
     rpm: Mutex<RpmBucket>,
     rejection_counts: [AtomicU64; REQUEST_REJECTION_REASON_COUNT],
     last_seen_ms: AtomicU64,
-    local_temporary_backoff_until_ms: AtomicU64,
 }
 
 impl KeyState {
@@ -89,7 +86,6 @@ impl KeyState {
             }),
             rejection_counts: std::array::from_fn(|_| AtomicU64::new(0)),
             last_seen_ms: AtomicU64::new(last_seen_ms),
-            local_temporary_backoff_until_ms: AtomicU64::new(0),
         }
     }
 
@@ -106,7 +102,6 @@ enum AdmissionRejectionKind {
     QueueFull,
     QueueTimeout,
     StateCapacity,
-    LocalTemporaryBackoff,
 }
 
 impl AdmissionRejectionKind {
@@ -117,9 +112,6 @@ impl AdmissionRejectionKind {
             Self::QueueFull => Some(RequestRejectionReason::AdmissionQueueFull),
             Self::QueueTimeout => Some(RequestRejectionReason::AdmissionQueueTimeout),
             Self::StateCapacity => None,
-            Self::LocalTemporaryBackoff => {
-                Some(RequestRejectionReason::AdmissionLocalTemporaryBackoff)
-            }
         }
     }
 }
@@ -138,13 +130,6 @@ pub(crate) enum RequestRejectionReason {
     DfcacheRouteInvalid,
     ProviderNotReady,
     MultimodalInvalid,
-    ModelUnsupported,
-    WebSearchUnsupported,
-    LocalRouteBlocked,
-    LocalBodyPrepare,
-    LocalPoolUnavailable,
-    LocalPoolTemporaryUnavailable,
-    AdmissionLocalTemporaryBackoff,
     /// A per-key usage limit (billed amount, credits or tokens) is reached.
     KeyUsageLimitExceeded,
     /// Usage-limit counters could not be read, so a limited key is rejected.
@@ -172,13 +157,6 @@ impl RequestRejectionReason {
             Self::DfcacheRouteInvalid => "dfcache_route_invalid",
             Self::ProviderNotReady => "provider_not_ready",
             Self::MultimodalInvalid => "multimodal_invalid",
-            Self::ModelUnsupported => "model_unsupported",
-            Self::WebSearchUnsupported => "websearch_unsupported",
-            Self::LocalRouteBlocked => "local_route_blocked",
-            Self::LocalBodyPrepare => "local_body_prepare",
-            Self::LocalPoolUnavailable => "local_pool_unavailable",
-            Self::LocalPoolTemporaryUnavailable => "local_pool_temporary_unavailable",
-            Self::AdmissionLocalTemporaryBackoff => "admission_local_temporary_backoff",
             Self::KeyUsageLimitExceeded => "key_usage_limit_exceeded",
             Self::KeyUsageLimitUnavailable => "key_usage_limit_unavailable",
         }
@@ -354,14 +332,6 @@ impl RequestRejectionAttribution {
 
     pub(crate) fn request_api_key_id(&self) -> String {
         self.identity.stable_id()
-    }
-
-    pub(crate) fn apply_local_temporary_backoff(&self, retry_after_secs: u64) -> bool {
-        self.controller.apply_local_temporary_backoff(
-            self.identity,
-            self.key_state.clone(),
-            Duration::from_secs(retry_after_secs.max(1)),
-        )
     }
 
     pub(crate) fn record(
@@ -596,9 +566,6 @@ impl RequestAdmissionController {
         }
 
         let state = self.state_for(identity)?;
-        if let Some(rejection) = self.local_temporary_backoff_rejection(&state) {
-            return Err(rejection);
-        }
         if initial_config.rpm > 0 {
             self.reserve_rpm(&state, initial_config.rpm)?;
         }
@@ -690,63 +657,6 @@ impl RequestAdmissionController {
         now.duration_since(self.started_at)
             .as_millis()
             .min(u64::MAX as u128) as u64
-    }
-
-    fn local_temporary_backoff_rejection(
-        &self,
-        state: &Arc<KeyState>,
-    ) -> Option<AdmissionRejection> {
-        let now_ms = self.monotonic_millis(Instant::now());
-        let until_ms = state
-            .local_temporary_backoff_until_ms
-            .load(Ordering::Acquire);
-        if until_ms <= now_ms {
-            return None;
-        }
-        Some(AdmissionRejection::for_key(
-            AdmissionRejectionKind::LocalTemporaryBackoff,
-            duration_ceil_secs(Duration::from_millis(until_ms.saturating_sub(now_ms))),
-            state.clone(),
-        ))
-    }
-
-    fn apply_local_temporary_backoff(
-        &self,
-        identity: RequestApiKeyIdentity,
-        key_state: Option<Arc<KeyState>>,
-        retry_after: Duration,
-    ) -> bool {
-        if !self.policy_for(identity).enabled() {
-            return false;
-        }
-        let state = match key_state {
-            Some(state) => state,
-            None => match self.state_for(identity) {
-                Ok(state) => state,
-                Err(_) => return false,
-            },
-        };
-        let bounded = retry_after.clamp(LOCAL_TEMPORARY_BACKOFF_MIN, LOCAL_TEMPORARY_BACKOFF_MAX);
-        let now_ms = self.monotonic_millis(Instant::now());
-        let until_ms = now_ms.saturating_add(duration_millis_u64(bounded));
-        let mut current = state
-            .local_temporary_backoff_until_ms
-            .load(Ordering::Acquire);
-        while until_ms > current {
-            match state.local_temporary_backoff_until_ms.compare_exchange(
-                current,
-                until_ms,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    state.notify.notify_waiters();
-                    return true;
-                }
-                Err(actual) => current = actual,
-            }
-        }
-        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -893,9 +803,6 @@ impl RequestAdmissionController {
                 let mut gate = state.gate.lock();
                 registration.complete_locked(&mut gate);
                 return Ok(false);
-            }
-            if let Some(rejection) = self.local_temporary_backoff_rejection(&state) {
-                return Err(rejection);
             }
             {
                 let mut gate = state.gate.lock();
@@ -1394,91 +1301,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-    }
-
-    #[tokio::test]
-    async fn local_temporary_backoff_rejects_before_rpm_for_five_rounds() {
-        for round in 0..5 {
-            let controller = test_controller(config(2, 0, 0, 0));
-            let key = identity(&format!("local-temporary-backoff-{round}"));
-            let permit = controller.acquire(key).await.unwrap();
-            drop(permit);
-            let state = controller.state_for(key).unwrap();
-            let tokens_before = rpm_tokens(&controller, key);
-
-            assert!(controller.apply_local_temporary_backoff(
-                key,
-                Some(state),
-                Duration::from_secs(2),
-            ));
-            let rejection = controller.acquire(key).await.unwrap_err();
-
-            assert_eq!(
-                rejection.kind,
-                AdmissionRejectionKind::LocalTemporaryBackoff
-            );
-            assert!(rejection.retry_after_secs >= 1);
-            assert_eq!(rpm_tokens(&controller, key), tokens_before);
-        }
-    }
-
-    #[tokio::test]
-    async fn local_temporary_backoff_retry_after_is_bounded() {
-        let controller = test_controller(config(100, 0, 0, 0));
-        let key = identity("local-temporary-backoff-bounded");
-        let state = controller.state_for(key).unwrap();
-
-        assert!(controller.apply_local_temporary_backoff(
-            key,
-            Some(state),
-            Duration::from_secs(60),
-        ));
-        let rejection = controller.acquire(key).await.unwrap_err();
-
-        assert_eq!(
-            rejection.kind,
-            AdmissionRejectionKind::LocalTemporaryBackoff
-        );
-        assert!(
-            rejection.retry_after_secs <= LOCAL_TEMPORARY_BACKOFF_MAX.as_secs(),
-            "retry-after must be capped so one local scheduler failure cannot suppress a key for too long"
-        );
-    }
-
-    #[tokio::test]
-    async fn local_temporary_backoff_wakes_and_rejects_queued_waiters() {
-        let controller = test_controller(config(0, 1, 2, 5_000));
-        let key = identity("local-temporary-backoff-queue");
-        let permit = controller.acquire(key).await.unwrap();
-        let waiter_controller = controller.clone();
-        let waiter = tokio::spawn(async move { waiter_controller.acquire(key).await });
-
-        wait_for_queue_count(&controller, key, 1).await;
-        let state = controller.state_for(key).unwrap();
-        assert!(
-            controller.apply_local_temporary_backoff(key, Some(state), Duration::from_secs(2),)
-        );
-        let rejection = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("queued waiter must be woken by local temporary backoff")
-            .expect("queued waiter task joins")
-            .expect_err("queued waiter must be rejected by local temporary backoff");
-
-        assert_eq!(
-            rejection.kind,
-            AdmissionRejectionKind::LocalTemporaryBackoff
-        );
-        assert_eq!(controller.queued_for(key), 0);
-        drop(permit);
-    }
-
-    #[tokio::test]
-    async fn local_temporary_backoff_is_disabled_when_admission_is_disabled() {
-        let controller = test_controller(RequestAdmissionConfig::disabled());
-        let key = identity("local-temporary-backoff-disabled");
-
-        assert!(!controller.apply_local_temporary_backoff(key, None, Duration::from_secs(2)));
-        assert!(controller.acquire(key).await.is_ok());
     }
 
     #[tokio::test]
@@ -2370,13 +2192,6 @@ mod tests {
             RequestRejectionReason::DfcacheRouteInvalid,
             RequestRejectionReason::ProviderNotReady,
             RequestRejectionReason::MultimodalInvalid,
-            RequestRejectionReason::ModelUnsupported,
-            RequestRejectionReason::WebSearchUnsupported,
-            RequestRejectionReason::LocalRouteBlocked,
-            RequestRejectionReason::LocalBodyPrepare,
-            RequestRejectionReason::LocalPoolUnavailable,
-            RequestRejectionReason::LocalPoolTemporaryUnavailable,
-            RequestRejectionReason::AdmissionLocalTemporaryBackoff,
             RequestRejectionReason::KeyUsageLimitExceeded,
             RequestRejectionReason::KeyUsageLimitUnavailable,
         ];

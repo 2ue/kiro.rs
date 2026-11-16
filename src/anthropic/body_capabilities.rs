@@ -1,11 +1,10 @@
-use crate::model::config::{BodyConversionConfig, ImageProcessingConfig, ToolSchemaKeyMappingMode};
+use crate::model::config::ImageProcessingConfig;
 
 use super::payload_guard::PayloadGuardConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyProcessingProfile {
     SharedParsedAnthropic,
-    LocalCredential,
     ExternalNormalized,
     ExternalRaw,
 }
@@ -14,7 +13,6 @@ impl BodyProcessingProfile {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SharedParsedAnthropic => "shared_parsed_anthropic",
-            Self::LocalCredential => "local_credential",
             Self::ExternalNormalized => "external_normalized",
             Self::ExternalRaw => "external_raw",
         }
@@ -113,78 +111,6 @@ impl PayloadGuardStagePlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KiroConverterPlan {
-    pub(crate) tool_schema_normalization: BodyStageState,
-    pub(crate) tool_name_mapping: BodyStageState,
-    pub(crate) tool_name_verbatim_when_valid: BodyStageState,
-    pub(crate) tool_schema_key_mapping: ToolSchemaKeyMappingMode,
-    pub(crate) tool_schema_key_validation_regex: String,
-    pub(crate) tool_choice_steering: BodyStageState,
-    pub(crate) native_reasoning_fields: BodyStageState,
-    pub(crate) tool_pairing_repair: BodyStageState,
-    pub(crate) history_placeholder_tools: BodyStageState,
-    pub(crate) history_image_dedup: BodyStageState,
-}
-
-impl KiroConverterPlan {
-    pub(crate) fn from_config(config: BodyConversionConfig) -> Self {
-        Self {
-            tool_schema_normalization: BodyStageState::from(config.tool_schema_normalization),
-            tool_name_mapping: BodyStageState::from(config.tool_name_mapping),
-            tool_name_verbatim_when_valid: BodyStageState::from(
-                config.tool_name_verbatim_when_valid,
-            ),
-            tool_schema_key_mapping: config.tool_schema_key_mapping,
-            tool_schema_key_validation_regex: config.tool_schema_key_validation_regex,
-            tool_choice_steering: BodyStageState::from(config.tool_choice_steering),
-            native_reasoning_fields: BodyStageState::from(config.native_reasoning_fields),
-            tool_pairing_repair: BodyStageState::from(config.tool_pairing_repair),
-            history_placeholder_tools: BodyStageState::from(config.history_placeholder_tools),
-            history_image_dedup: BodyStageState::from(config.history_image_dedup),
-        }
-    }
-}
-
-impl Default for KiroConverterPlan {
-    fn default() -> Self {
-        Self::from_config(BodyConversionConfig::default())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LocalKiroBodyPlan {
-    pub(crate) profile: BodyProcessingProfile,
-    pub(crate) conversion: BodyStageState,
-    pub(crate) converter: KiroConverterPlan,
-    pub(crate) payload_guard: PayloadGuardStagePlan,
-    pub(crate) token_counting: BodyStageState,
-    pub(crate) diagnostics: BodyStageState,
-    pub(crate) retry_payloads: BodyStageState,
-}
-
-impl LocalKiroBodyPlan {
-    #[cfg(test)]
-    pub(crate) fn compatible_default(payload_guard_config: PayloadGuardConfig) -> Self {
-        Self::compatible_with_config(payload_guard_config, BodyConversionConfig::default())
-    }
-
-    pub(crate) fn compatible_with_config(
-        payload_guard_config: PayloadGuardConfig,
-        body_conversion: BodyConversionConfig,
-    ) -> Self {
-        Self {
-            profile: BodyProcessingProfile::LocalCredential,
-            conversion: BodyStageState::Enabled,
-            converter: KiroConverterPlan::from_config(body_conversion),
-            payload_guard: PayloadGuardStagePlan::from_config(payload_guard_config),
-            token_counting: BodyStageState::Enabled,
-            diagnostics: BodyStageState::Enabled,
-            retry_payloads: BodyStageState::Enabled,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawModelStagePlan {
     None,
@@ -243,7 +169,7 @@ mod tests {
         PayloadGuardConfig {
             enabled,
             max_bytes: 1234,
-            max_kiro_weight: 1234,
+
             trim_history: true,
             shaping: PayloadShapingConfig::default(),
         }
@@ -269,18 +195,6 @@ mod tests {
         assert!(!plan.thinking.trigger_mode.is_enabled());
         assert!(!plan.thinking.trace.is_enabled());
         assert!(!plan.multimodal.is_enabled());
-    }
-
-    #[test]
-    fn local_default_mounts_current_local_capabilities() {
-        let plan = LocalKiroBodyPlan::compatible_default(payload_guard_config(true));
-
-        assert_eq!(plan.profile, BodyProcessingProfile::LocalCredential);
-        assert!(plan.conversion.is_enabled());
-        assert!(plan.payload_guard.state.is_enabled());
-        assert!(plan.token_counting.is_enabled());
-        assert!(plan.diagnostics.is_enabled());
-        assert!(plan.retry_payloads.is_enabled());
     }
 
     #[test]

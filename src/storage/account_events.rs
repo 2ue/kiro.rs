@@ -1,5 +1,5 @@
 //! Account change log: quota exhausted, auto-disabled, risk control, recovered and manual
-//! enable/disable for local credentials and external pools.
+//! enable/disable for external pools.
 //!
 //! Events are rows in `admin_audit_logs` whose `detail` carries an `accountEvent` kind, so the
 //! audit page can show them as their own view. Recording never blocks or fails the caller: the
@@ -12,25 +12,19 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use crate::kiro::token_manager::storage_task::spawn_best_effort_storage_task;
+use crate::common::storage_task::spawn_best_effort_storage_task;
 use crate::model::config::{MAX_AUDIT_LOG_RETENTION_DAYS, MIN_AUDIT_LOG_RETENTION_DAYS};
-use crate::storage::postgres::{AccountQuotaFigures, PostgresStore};
+use crate::storage::postgres::PostgresStore;
 
 /// Kind of account change, stored as `detail.accountEvent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountEventKind {
     /// Base quota used up; the account stops taking requests.
     QuotaExhausted,
-    /// Quota available again after a refresh of the account info.
-    QuotaRecovered,
-    /// Usage went past the plan limit and overage started.
-    OverageStarted,
     /// Disabled automatically for failures, an invalid token or configuration.
     AutoDisabled,
     /// Disabled because upstream reported risk control, suspension or a lock.
     RiskControlled,
-    /// Re-enabled automatically.
-    AutoEnabled,
     /// Disabled by an operator.
     ManualDisabled,
     /// Enabled or reset by an operator.
@@ -43,11 +37,8 @@ impl AccountEventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::QuotaExhausted => "quota_exhausted",
-            Self::QuotaRecovered => "quota_recovered",
-            Self::OverageStarted => "overage_started",
             Self::AutoDisabled => "auto_disabled",
             Self::RiskControlled => "risk_controlled",
-            Self::AutoEnabled => "auto_enabled",
             Self::ManualDisabled => "manual_disabled",
             Self::ManualEnabled => "manual_enabled",
             Self::Deleted => "deleted",
@@ -58,21 +49,18 @@ impl AccountEventKind {
 /// Which pool the account belongs to, stored as `detail.accountSource`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountSource {
-    Local,
     External,
 }
 
 impl AccountSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Local => "local",
             Self::External => "external",
         }
     }
 
     fn object_type(self) -> &'static str {
         match self {
-            Self::Local => "credential",
             Self::External => "external_pool",
         }
     }
@@ -95,7 +83,6 @@ impl AccountEvent {
     /// with the fixed account-event keys.
     pub fn into_audit_parts(self) -> (&'static str, &'static str, String, Value) {
         let action = match self.source {
-            AccountSource::Local => "credential_account_event",
             AccountSource::External => "external_pool_account_event",
         };
         let mut detail = match self.detail {
@@ -146,29 +133,6 @@ pub fn record_account_event(
             )
             .await
     })
-}
-
-/// Quota change between two account-info snapshots, if any. The first snapshot of an account
-/// is not a change and yields nothing, so syncing a pool for the first time does not flood the
-/// log. Overage takes precedence: going past the limit also means the plan quota is used up.
-pub fn quota_transition(
-    previous: Option<AccountQuotaFigures>,
-    next: AccountQuotaFigures,
-) -> Option<AccountEventKind> {
-    let previous = previous?;
-    let used_up = |f: &AccountQuotaFigures| f.usage_limit > 0.0 && f.current_usage >= f.usage_limit;
-    let in_overage = |f: &AccountQuotaFigures| {
-        f.usage_limit > 0.0 && (f.current_usage > f.usage_limit || f.current_overages > 0.0)
-    };
-    if !in_overage(&previous) && in_overage(&next) {
-        Some(AccountEventKind::OverageStarted)
-    } else if !used_up(&previous) && used_up(&next) {
-        Some(AccountEventKind::QuotaExhausted)
-    } else if used_up(&previous) && !used_up(&next) {
-        Some(AccountEventKind::QuotaRecovered)
-    } else {
-        None
-    }
 }
 
 /// Event kind and label for an external pool auto-disable reason.
@@ -294,29 +258,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn audit_parts_carry_fixed_keys_and_keep_extra_detail() {
-        let event = AccountEvent {
-            kind: AccountEventKind::QuotaExhausted,
-            source: AccountSource::Local,
-            account_id: 7,
-            account_label: "a@example.com".to_string(),
-            reason: "upstream_quota_exhausted".to_string(),
-            reason_label: "额度耗尽".to_string(),
-            detail: json!({ "currentUsage": 1000.0, "reason": "overwritten" }),
-        };
-        let (action, object_type, object_id, detail) = event.into_audit_parts();
-        assert_eq!(action, "credential_account_event");
-        assert_eq!(object_type, "credential");
-        assert_eq!(object_id, "7");
-        assert_eq!(detail["accountEvent"], "quota_exhausted");
-        assert_eq!(detail["accountSource"], "local");
-        assert_eq!(detail["accountLabel"], "a@example.com");
-        assert_eq!(detail["reason"], "upstream_quota_exhausted");
-        assert_eq!(detail["reasonLabel"], "额度耗尽");
-        assert_eq!(detail["currentUsage"], 1000.0);
-    }
-
-    #[test]
     fn external_events_use_their_own_action_and_object_type() {
         let event = AccountEvent {
             kind: AccountEventKind::AutoDisabled,
@@ -331,77 +272,6 @@ mod tests {
         assert_eq!(action, "external_pool_account_event");
         assert_eq!(object_type, "external_pool");
         assert_eq!(detail["accountSource"], "external");
-    }
-
-    fn figures(current_usage: f64, usage_limit: f64, current_overages: f64) -> AccountQuotaFigures {
-        AccountQuotaFigures {
-            current_usage,
-            usage_limit,
-            current_overages,
-        }
-    }
-
-    #[test]
-    fn quota_transitions_follow_the_snapshots() {
-        use AccountEventKind::*;
-        // The first snapshot is not a change.
-        assert_eq!(quota_transition(None, figures(1000.0, 1000.0, 0.0)), None);
-        assert_eq!(
-            quota_transition(
-                Some(figures(900.0, 1000.0, 0.0)),
-                figures(1000.0, 1000.0, 0.0)
-            ),
-            Some(QuotaExhausted)
-        );
-        assert_eq!(
-            quota_transition(
-                Some(figures(900.0, 1000.0, 0.0)),
-                figures(1200.0, 1000.0, 0.0)
-            ),
-            Some(OverageStarted)
-        );
-        assert_eq!(
-            quota_transition(
-                Some(figures(1000.0, 1000.0, 0.0)),
-                figures(1000.0, 1000.0, 5.0)
-            ),
-            Some(OverageStarted)
-        );
-        assert_eq!(
-            quota_transition(
-                Some(figures(1000.0, 1000.0, 0.0)),
-                figures(0.0, 1000.0, 0.0)
-            ),
-            Some(QuotaRecovered)
-        );
-        // Monthly reset out of overage is a recovery too.
-        assert_eq!(
-            quota_transition(
-                Some(figures(1300.0, 1000.0, 300.0)),
-                figures(10.0, 1000.0, 0.0)
-            ),
-            Some(QuotaRecovered)
-        );
-        // No change of state, no event.
-        assert_eq!(
-            quota_transition(
-                Some(figures(100.0, 1000.0, 0.0)),
-                figures(500.0, 1000.0, 0.0)
-            ),
-            None
-        );
-        assert_eq!(
-            quota_transition(
-                Some(figures(1200.0, 1000.0, 0.0)),
-                figures(1500.0, 1000.0, 0.0)
-            ),
-            None
-        );
-        // An account without a limit never transitions.
-        assert_eq!(
-            quota_transition(Some(figures(0.0, 0.0, 0.0)), figures(5.0, 0.0, 0.0)),
-            None
-        );
     }
 
     #[test]

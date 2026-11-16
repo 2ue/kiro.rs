@@ -526,7 +526,7 @@ const EVENT_TYPE_DOCS: &[(&str, &str)] = &[
         "protocol_response_body",
         "账号协议响应体；Token refresh 响应正文不会采集",
     ),
-    ("upstream_frame", "上游 AWS EventStream 帧：帧头与 payload"),
+    ("upstream_frame", "上游原始字节块"),
     (
         "upstream_body",
         "非流式上游响应体中无法按 EventStream 解码的原始内容",
@@ -774,21 +774,19 @@ pub fn ingress_id_from_extensions(extensions: &http::Extensions) -> Option<Strin
     extensions.get::<IngressId>().map(|value| value.0.clone())
 }
 
-/// 记录一个 AWS EventStream 帧。
+/// 记录上游原始字节块，不解释协议帧。
 pub fn record_upstream_frame(
     request_id: Option<&str>,
     credential_id: Option<u64>,
-    attempt: u32,
-    frame: &crate::kiro::parser::frame::Frame,
+    index: u64,
+    frame: &[u8],
 ) {
     record("upstream_frame", request_id, || {
         json!({
             "credentialId": credential_id,
-            "attempt": attempt,
-            "messageType": frame.message_type(),
-            "eventType": frame.event_type(),
-            "headers": frame.headers.to_json(),
-            "payload": body_json(&frame.payload),
+            "index": index,
+            "bytes": frame.len(),
+            "base64": base64_encode(frame),
         })
     });
 }

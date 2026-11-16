@@ -146,11 +146,6 @@ fn build_normalized_request_base(
     }
     let mut value = normalized_request_value(route, &prepared_payload.payload)
         .map_err(|error| PayloadGuardError::Serialize(error.to_string()))?;
-    if let Some(constraint) =
-        crate::anthropic::integer_output::from_request_body(&route.effective_raw_body)
-    {
-        crate::anthropic::integer_output::append_constraint(&mut value, constraint);
-    }
     if normalize_thinking {
         super::normalize_external_pool_thinking_value(&mut value);
     }
@@ -501,11 +496,9 @@ fn prepare_raw_request(
     pool: &ExternalPool,
     model_stage: RawModelStagePlan,
 ) -> Result<PreparedExternalRequest, ExternalPoolError> {
-    let rewrite_integer_constraint =
-        |body: Bytes| crate::anthropic::integer_output::rewrite_body(&body);
     match model_stage {
         RawModelStagePlan::None => Ok(PreparedExternalRequest {
-            body: rewrite_integer_constraint(route.effective_raw_body.clone()),
+            body: route.effective_raw_body.clone(),
             outbound_model: None,
         }),
         RawModelStagePlan::ProbeOnly => {
@@ -513,7 +506,7 @@ fn prepare_raw_request(
             let outbound_model =
                 model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
             Ok(PreparedExternalRequest {
-                body: rewrite_integer_constraint(route.effective_raw_body.clone()),
+                body: route.effective_raw_body.clone(),
                 outbound_model,
             })
         }
@@ -523,7 +516,7 @@ fn prepare_raw_request(
                 model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
             let Some(outbound_model_value) = outbound_model.as_deref() else {
                 return Ok(PreparedExternalRequest {
-                    body: rewrite_integer_constraint(route.effective_raw_body.clone()),
+                    body: route.effective_raw_body.clone(),
                     outbound_model,
                 });
             };
@@ -545,7 +538,7 @@ fn prepare_raw_request(
                 raw_upstream_error: None,
             })?;
             Ok(PreparedExternalRequest {
-                body: rewrite_integer_constraint(body),
+                body: body,
                 outbound_model,
             })
         }
@@ -600,11 +593,7 @@ fn prepare_normalized_payload(
     ) {
         Ok(prepared) => Ok((prepared, None)),
         Err(err) => {
-            if matches!(
-                err,
-                PayloadGuardError::OversizedImage { .. }
-                    | PayloadGuardError::ToolPairingInvariant { .. }
-            ) {
+            if matches!(err, PayloadGuardError::OversizedImage { .. }) {
                 return Err(err);
             }
             let mut payload = payload.clone();
@@ -636,10 +625,6 @@ fn payload_guard_error(pool: &ExternalPool, err: PayloadGuardError) -> ExternalP
             StatusCode::BAD_REQUEST,
             "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry."
                 .to_string(),
-        ),
-        PayloadGuardError::ToolPairingInvariant { .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request body could not be prepared".to_string(),
         ),
     };
     ExternalPoolError {

@@ -12,11 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::model::config::{ImageProcessingConfig, ImageProcessingMode};
 
-use super::{
-    converter::{infer_document_media_type_from_url, infer_image_format_from_url},
-    files::{self, AnthropicFileStore},
-    types::{Message, MessagesRequest},
-};
+use super::types::{Message, MessagesRequest};
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 const MAX_REMOTE_MULTIMODAL_SOURCES: usize = 20;
@@ -236,17 +232,14 @@ pub(crate) fn is_remote_multimodal_capacity_error(message: &str) -> bool {
 }
 
 pub(crate) async fn prepare_multimodal_sources(
-    store: &AnthropicFileStore,
     payload: &mut MessagesRequest,
     caller_user_agent: Option<&str>,
     config: ImageProcessingConfig,
 ) -> Result<BodyProcessingReport, String> {
-    prepare_multimodal_message_sources(store, &mut payload.messages, caller_user_agent, config)
-        .await
+    prepare_multimodal_message_sources(&mut payload.messages, caller_user_agent, config).await
 }
 
 pub(crate) async fn prepare_multimodal_message_sources(
-    store: &AnthropicFileStore,
     messages: &mut Vec<Message>,
     caller_user_agent: Option<&str>,
     config: ImageProcessingConfig,
@@ -259,10 +252,6 @@ pub(crate) async fn prepare_multimodal_message_sources(
 
     match config.mode {
         ImageProcessingMode::Safe => {
-            if config.safe_materialize_file_sources {
-                report.materialized_file_sources =
-                    files::materialize_file_sources(store, messages)?;
-            }
             if config.safe_download_remote_sources {
                 if let Some(outcome) =
                     materialize_remote_multimodal_sources(messages, caller_user_agent).await?
@@ -1364,7 +1353,6 @@ mod tests {
 
     #[tokio::test]
     async fn clean_text_multimodal_path_is_value_identical_and_skips_remote_admission() {
-        let store = AnthropicFileStore::default();
         for size in [1024usize, 100 * 1024, 1024 * 1024, 5 * 1024 * 1024] {
             let mut payload = MessagesRequest {
                 model: "claude-sonnet-4".to_string(),
@@ -1389,7 +1377,6 @@ mod tests {
             for _ in 0..100 {
                 let started = std::time::Instant::now();
                 let report = prepare_multimodal_sources(
-                    &store,
                     &mut payload,
                     None,
                     ImageProcessingConfig::default(),
@@ -1795,5 +1782,34 @@ mod tests {
                 panic!("rejected public URL {url}: {error}");
             });
         }
+    }
+}
+
+pub(crate) fn infer_document_media_type_from_url(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".pdf") {
+        "application/pdf".to_string()
+    } else if path.ends_with(".md") {
+        "text/markdown".to_string()
+    } else if path.ends_with(".html") || path.ends_with(".htm") {
+        "text/html".to_string()
+    } else if path.ends_with(".txt") {
+        "text/plain".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+pub(crate) fn infer_image_format_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        Some("jpeg".to_string())
+    } else if path.ends_with(".png") {
+        Some("png".to_string())
+    } else if path.ends_with(".gif") {
+        Some("gif".to_string())
+    } else if path.ends_with(".webp") {
+        Some("webp".to_string())
+    } else {
+        None
     }
 }

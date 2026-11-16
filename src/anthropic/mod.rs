@@ -8,8 +8,6 @@
 //! - `GET /v1/models` - 获取可用模型列表
 //! - `POST /v1/messages` - 创建消息（对话）
 //! - `POST /v1/messages/count_tokens` - 计算 token 数量
-//! - `POST /v1/chat/completions` - OpenAI Chat Completions 兼容接口（各前缀下同名路径同样可用）
-//! - `POST /v1/responses` - OpenAI Responses 兼容接口（各前缀下同名路径同样可用）
 //!
 //! ## 内置端点 (/na/v1)
 //! - `GET /na/v1/models` - 获取可用模型列表
@@ -39,23 +37,14 @@ pub(crate) mod body_capabilities;
 pub(crate) mod body_processing;
 pub(crate) mod bounded_shaping;
 pub(crate) mod cache;
-pub(crate) mod code_execution;
-mod control_block_cleaner;
-pub(crate) mod converter;
-mod empty_turn_nudge;
-pub(crate) mod empty_turn_policy;
+pub(crate) mod conversation_id;
 pub(crate) mod envelope;
-pub(crate) mod files;
 mod handlers;
-mod identity_guard;
 mod image_resize;
 pub(crate) mod inference_attempt_budget;
-pub(crate) mod integer_output;
 pub(crate) mod kiro_plus_shaping;
-pub(crate) mod language_preference;
 mod middleware;
 pub(crate) mod model_capabilities;
-mod openai;
 pub(crate) mod payload_guard;
 pub(crate) mod payload_guard_runtime;
 pub(crate) mod pricing;
@@ -64,25 +53,14 @@ pub(crate) mod prompt_cache_creation_control;
 pub(crate) mod prompt_injection;
 pub(crate) mod request_admission;
 pub(crate) mod request_body;
-pub(crate) mod request_capture;
 pub(crate) mod request_facts;
 pub mod request_key_limits;
 mod router;
-pub(crate) mod signature;
-mod stop_sequence;
-mod stream;
-mod structured_output;
-mod thinking_display;
-pub(crate) mod tool_format_debug;
-mod tool_name_restore;
-pub(crate) mod tool_schema_keys;
-pub(crate) mod tool_use_policy;
 pub(crate) mod transcript_sanitizer;
 pub mod types;
 pub(crate) mod usage;
-mod websearch;
 
 pub(crate) use handlers::{
     PromptInjectionPreviewRequest, PromptInjectionPreviewResponse, preview_prompt_injection,
 };
-pub use router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider};
+pub use router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router};

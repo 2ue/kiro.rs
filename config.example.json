@@ -20,26 +20,7 @@
     "maxQueuedRequests": 64,
     "queueTimeoutMs": 1000
   },
-  "kiroUpstreamResponseTimeoutSecs": 180,
-  "credentialRetryMaxAttempts": 0,
   "inferenceUpstreamMaxAttempts": 4,
-  "auxiliaryUpstreamMaxAttempts": 2,
-  "auxiliaryUpstreamMaxConcurrentRequests": 16,
-  "tokenRefreshMaxRpm": 60,
-  "tokenRefreshBurst": 8,
-  "tokenRefreshBackgroundEnabled": true,
-  "tokenRefreshBackgroundIntervalSecs": 60,
-  "tokenRefreshBackgroundLeadSecs": 600,
-  "weightedCapacity": {
-    "enabled": false,
-    "maxUnitsPerRequest": 8,
-    "tiers": [
-      { "minTokens": 0, "units": 1 },
-      { "minTokens": 100000, "units": 2 },
-      { "minTokens": 300000, "units": 4 },
-      { "minTokens": 700000, "units": 8 }
-    ]
-  },
   "payloadGuardEnabled": true,
   "payloadGuardMode": "on_too_long",
   "payloadGuardMaxBytes": 460800,
@@ -55,60 +36,32 @@
     "resizeMaxBytes": 400000,
     "resizeJpegQuality": 85
   },
-  "bodyConversion": {
-    "toolSchemaNormalization": true,
-    "toolNameMapping": true,
-    "toolSchemaKeyMapping": "sanitize",
-    "toolSchemaKeyValidationRegex": "^[a-zA-Z0-9_.-]{1,64}$",
-    "toolChoiceSteering": true,
-    "nativeReasoningFields": true,
-    "syntheticThinkingSignatures": true,
-    "toolPairingRepair": true,
-    "historyPlaceholderTools": true,
-    "codeExecution": {
-      "enabled": false,
-      "pathOverrides": {},
-      "timeoutMs": 5000,
-      "maxOutputBytes": 16384,
-      "maxCodeBytes": 65536
-    }
-  },
   "promptInjection": {
     "applyToCountTokens": true,
     "defaults": {
-      "taskQuality": { "enabled": false, "externalPool": false },
-      "languageConstraint": { "enabled": false, "externalPool": false },
-      "languageTurnReminder": { "enabled": false },
-      "custom": { "enabled": false, "externalPool": false },
-      "identityPrompt": { "enabled": false, "externalPool": false },
-      "identityTurnReminder": { "enabled": false },
-      "chunkedWritePolicy": { "enabled": true },
-      "chunkedWriteToolSuffix": { "enabled": true },
-      "thinkingControls": { "enabled": true },
-      "thinkingOutputPolicy": { "enabled": true },
-      "toolChoicePrefix": { "enabled": true },
-      "toolChoiceTurnReminder": { "enabled": true },
-      "webSearchGuidance": { "enabled": true },
-      "emptyTurnNudge": { "enabled": true }
+      "custom": {
+        "enabled": false
+      },
+      "identityPrompt": {
+        "enabled": false
+      },
+      "languageConstraint": {
+        "enabled": false
+      },
+      "taskQuality": {
+        "enabled": false
+      }
     },
     "texts": {},
-    "pathOverrides": {
-      "/cc": {
-        "taskQuality": { "enabled": true }
-      }
-    }
+    "pathOverrides": {}
   },
   "routeFeatures": {
     "defaults": {
       "thinkingModelName": true,
-      "thinkingTrigger": "real_request",
-      "channelLeakGuard": false,
-      "channelLeakGuardStream": true,
-      "modelDrivenWebSearch": false
+      "thinkingTrigger": "real_request"
     },
     "pathOverrides": {}
   },
-  "claudeModelsOnly": false,
   "payloadShaping": {
     "enabled": true,
     "truncateHistoricalToolResults": true,
@@ -133,5 +86,11 @@
     "currentImagesMaxBytes": 180000,
     "oversizedImageHandling": "drop-with-placeholder"
   },
-  "kiroAgentModeStrategy": "vibe"
+  "runtimeConfigMigrationVersion": 1,
+  "externalPools": {
+    "externalPoolsEnabled": true,
+    "externalPoolDispatchMaxWaitSecs": 60,
+    "externalPoolCapacityMode": "wait",
+    "externalPoolMaxQueuedRequests": 64
+  }
 }

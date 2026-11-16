@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+
 use serde_json::Value;
 
 use super::types::ErrorResponse;
@@ -24,11 +25,9 @@ pub(crate) const PUBLIC_TEMPORARY_FAILURE_MESSAGE: &str =
 pub(crate) const PUBLIC_PROCESSING_FAILED_MESSAGE: &str =
     "The request could not be completed. Please try again.";
 /// 空回：模型这次没有返回任何内容，已自动重试仍失败。
-pub(crate) const PUBLIC_EMPTY_RESPONSE_MESSAGE: &str =
-    "The model returned an empty response. Please try again.";
+
 /// 输出过程中连接中断（已有部分内容）。
-pub(crate) const PUBLIC_STREAM_INTERRUPTED_MESSAGE: &str =
-    "The response was interrupted before it finished. Please try again.";
+
 /// 当前没有空闲的处理容量。
 pub(crate) const PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE: &str =
     "The service is busy right now. Please try again shortly.";
@@ -44,14 +43,11 @@ pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "The request could not b
 pub(crate) const PUBLIC_IMAGE_TOO_LARGE_MESSAGE: &str =
     "One or more images exceed the 5 MB size limit. Please resize or remove them and try again.";
 /// 图片数量过多。
-pub(crate) const PUBLIC_IMAGE_COUNT_EXCEEDED_MESSAGE: &str =
-    "The request contains more than 100 images. Please send fewer images and try again.";
+
 /// 图片格式不支持。
-pub(crate) const PUBLIC_IMAGE_FORMAT_UNSUPPORTED_MESSAGE: &str =
-    "An image format is not supported. Please convert it to PNG, JPEG, GIF, or WebP and try again.";
+
 /// 联网搜索工具失败。
-pub(crate) const PUBLIC_WEB_SEARCH_FAILED_MESSAGE: &str =
-    "Web search failed. Please try again later, or disable web search.";
+
 /// 请求频率过高。
 pub(crate) const PUBLIC_RATE_LIMIT_MESSAGE: &str =
     "Too many requests right now. Please try again shortly.";
@@ -69,172 +65,6 @@ pub(crate) fn public_rate_limit_message(retry_after_secs: Option<u64>) -> String
         ),
         _ => PUBLIC_RATE_LIMIT_MESSAGE.to_string(),
     }
-}
-
-/// Public text for an upstream error body.
-///
-/// Only the human-readable `message` is relayed, with known provider prefixes removed. Upstream
-/// `reason` / `code` values are channel-specific identifiers (for example
-/// `CONTENT_LENGTH_EXCEEDS_THRESHOLD`), so they stay in the logs and are never appended.
-pub(crate) fn kiro_official_upstream_message(raw: &str) -> Option<String> {
-    let value = extract_json_value(raw)?;
-    let message = json_string_at(
-        &value,
-        &[
-            "/message",
-            "/Message",
-            "/error/message",
-            "/error/Message",
-            "/error",
-        ],
-    )?;
-    let message = normalize_public_upstream_text(strip_provider_message_prefix(message))?;
-    Some(truncate_public_upstream_message(&message))
-}
-
-/// Provider wrappers that prefix the real message, e.g. `Bedrock error message: ...`.
-fn strip_provider_message_prefix(message: &str) -> &str {
-    const PREFIXES: &[&str] = &["bedrock error message:", "bedrock error:"];
-    let trimmed = message.trim_start();
-    PREFIXES
-        .iter()
-        .find_map(|prefix| {
-            trimmed
-                .get(..prefix.len())
-                .filter(|head| head.eq_ignore_ascii_case(prefix))
-                .map(|_| trimmed[prefix.len()..].trim_start())
-        })
-        .unwrap_or(trimmed)
-}
-
-fn extract_json_value(raw: &str) -> Option<Value> {
-    if let Ok(value) = serde_json::from_str::<Value>(raw.trim()) {
-        return Some(value);
-    }
-    for (idx, ch) in raw.char_indices() {
-        if ch != '{' {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(&raw[idx..]) {
-            return Some(value);
-        }
-    }
-    None
-}
-
-fn json_string_at<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
-    pointers
-        .iter()
-        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-}
-
-fn normalize_public_upstream_text(raw: &str) -> Option<String> {
-    let text = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect::<String>();
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.is_empty() || public_upstream_message_has_forbidden_content(&text) {
-        return None;
-    }
-    Some(text)
-}
-
-/// Whether proxy-generated text can be shown to clients verbatim; it must not name the serving
-/// channel or internal machinery. Callers fall back to a generic public message otherwise.
-pub(crate) fn public_text_is_safe(message: &str) -> bool {
-    !public_upstream_message_has_forbidden_content(message)
-}
-
-/// 对外文案只用英文：含中日韩文字的文本（多为内部诊断信息）一律不透传，回退到英文模板。
-fn contains_cjk(message: &str) -> bool {
-    message.chars().any(|ch| {
-        matches!(ch as u32,
-            0x3000..=0x303F | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
-            | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
-    })
-}
-
-fn public_upstream_message_has_forbidden_content(message: &str) -> bool {
-    if contains_cjk(message) {
-        return true;
-    }
-    let lower = message.to_ascii_lowercase();
-    let substring_hit = [
-        "kiro",
-        "credential",
-        "external pool",
-        "external_pool",
-        "fallback",
-        "scheduler",
-        "bearer token",
-        "api key",
-        "client secret",
-        "refresh token",
-        "access token",
-        // Channel identity: the serving platform must not be inferable from relayed text.
-        "amazon",
-        "amazonaws",
-        "bedrock",
-        "codewhisperer",
-        "q developer",
-        "arn:",
-        "profilearn",
-        "profile_arn",
-        "账号 #",
-        "凭据",
-        "凭证",
-        "外部池",
-        "调度",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    // Short or ambiguous terms are matched as whole words so ordinary text ("laws", "draws",
-    // "q") is not rejected.
-    substring_hit
-        || lower
-            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-            .any(|word| matches!(word, "aws" | "sigv4" | "q_developer"))
-        || message_contains_upstream_reason_code(message)
-}
-
-/// Upstream reason codes are SCREAMING_SNAKE_CASE identifiers such as
-/// `MONTHLY_REQUEST_COUNT`; a message that embeds one is channel-identifying.
-fn message_contains_upstream_reason_code(message: &str) -> bool {
-    message
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .any(|word| {
-            word.len() >= 8
-                && word.contains('_')
-                && word
-                    .chars()
-                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
-                && word.chars().any(|ch| ch.is_ascii_uppercase())
-        })
-}
-
-fn truncate_public_upstream_message(message: &str) -> String {
-    const MAX_BYTES: usize = 1024;
-    if message.len() <= MAX_BYTES {
-        return message.to_string();
-    }
-    let mut out = String::with_capacity(MAX_BYTES + 3);
-    for ch in message.chars() {
-        if out.len() + ch.len_utf8() > MAX_BYTES {
-            out.push_str("...");
-            return out;
-        }
-        out.push(ch);
-    }
-    out
 }
 
 fn random_anthropic_id(prefix: &str) -> String {
@@ -257,26 +87,6 @@ pub(crate) fn tool_use_id() -> String {
 
 pub(crate) fn server_tool_use_id() -> String {
     random_anthropic_id("srvtoolu")
-}
-
-/// Client-facing id for an upstream tool call. Kiro ids (`tooluse_...`) are mapped to the
-/// Anthropic shape (`toolu_01...`); the mapping is a hash so every chunk of one upstream call,
-/// and a replayed or duplicated event, resolves to the same id. Ids already in the Anthropic
-/// shape pass through. The client echoes the id back in `tool_result`, and Kiro accepts any
-/// matching id pair in history, so no reverse mapping is kept.
-pub(crate) fn public_tool_use_id(upstream_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    if upstream_id.starts_with("toolu_") {
-        return upstream_id.to_string();
-    }
-    let digest = Sha256::digest(upstream_id.as_bytes());
-    let mut id = String::with_capacity("toolu_01".len() + ID_RANDOM_LEN);
-    id.push_str("toolu_01");
-    for byte in digest.iter().take(ID_RANDOM_LEN) {
-        id.push(ID_ALPHABET[usize::from(*byte) % ID_ALPHABET.len()] as char);
-    }
-    id
 }
 
 pub(crate) fn request_id() -> String {
@@ -320,15 +130,6 @@ pub(crate) fn status_is_non_retryable_client_error(status: StatusCode) -> bool {
 pub(crate) fn insert_should_retry_header(headers: &mut HeaderMap, status: StatusCode) {
     if status_is_non_retryable_client_error(status) && !headers.contains_key(SHOULD_RETRY_HEADER) {
         headers.insert(SHOULD_RETRY_HEADER, HeaderValue::from_static("false"));
-    }
-}
-
-pub(crate) fn insert_optional_warnings_header(headers: &mut HeaderMap, warnings: Option<String>) {
-    let Some(warnings) = warnings else {
-        return;
-    };
-    if let Ok(value) = HeaderValue::from_str(&warnings) {
-        headers.insert("x-kiro-rs-warnings", value);
     }
 }
 
@@ -377,26 +178,6 @@ pub(crate) fn error_response(
     error_response_with_id(status, error_type, message, &request_id)
 }
 
-pub(crate) fn json_response_with_id(
-    status: StatusCode,
-    body: Value,
-    request_id: &str,
-    warnings: Option<String>,
-) -> Response {
-    crate::diagnostics::capture::record("client_response", Some(request_id), || {
-        serde_json::json!({
-            "kind": "json",
-            "status": status.as_u16(),
-            "warnings": warnings,
-            "body": body,
-        })
-    });
-    let mut response = (status, Json(body)).into_response();
-    insert_request_id_headers(response.headers_mut(), request_id);
-    insert_optional_warnings_header(response.headers_mut(), warnings);
-    response
-}
-
 pub(crate) fn sse_builder_with_id(request_id: &str) -> axum::http::response::Builder {
     axum::http::Response::builder()
         .status(StatusCode::OK)
@@ -437,16 +218,6 @@ mod tests {
             tool.chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         );
-    }
-
-    #[test]
-    fn upstream_tool_ids_map_to_stable_anthropic_ids() {
-        let mapped = public_tool_use_id("tooluse_h1bbC3KF2KuOFbdG5EAQLC");
-        assert!(mapped.starts_with("toolu_01"));
-        assert_eq!(mapped.len(), "toolu_01".len() + ID_RANDOM_LEN);
-        assert_eq!(mapped, public_tool_use_id("tooluse_h1bbC3KF2KuOFbdG5EAQLC"));
-        assert_ne!(mapped, public_tool_use_id("tooluse_OpVN1F4YbO74BG70uFmV5r"));
-        assert_eq!(public_tool_use_id("toolu_01abc"), "toolu_01abc");
     }
 
     #[test]
@@ -571,93 +342,5 @@ mod tests {
             PUBLIC_RATE_LIMIT_MESSAGE
         );
         assert_eq!(public_rate_limit_message(None), PUBLIC_RATE_LIMIT_MESSAGE);
-    }
-
-    #[test]
-    fn kiro_official_upstream_message_extracts_json_body_without_internal_prefix() {
-        let message = kiro_official_upstream_message(
-            r#"流式 API 请求失败（账号 #170 test）: 400 Bad Request {"message":"Bedrock error message: Could not process image","reason":"IMAGE_FORMAT_UNSUPPORTED"}"#,
-        )
-        .expect("official message");
-
-        assert_eq!(message, "Could not process image");
-        assert!(!message.contains("账号"));
-        assert!(!message.contains("test"));
-        assert!(!message.to_ascii_lowercase().contains("bedrock"));
-        assert!(!message.contains("IMAGE_FORMAT_UNSUPPORTED"));
-    }
-
-    #[test]
-    fn kiro_official_upstream_message_hides_channel_identifying_text() {
-        for raw in [
-            r#"{"message":"Amazon Q could not complete the request"}"#,
-            r#"{"message":"Request failed for arn:aws:codewhisperer:us-east-1:123:profile/X"}"#,
-            r#"{"message":"Error calling https://q.us-east-1.amazonaws.com"}"#,
-            r#"{"message":"CodeWhisperer streaming failed"}"#,
-            r#"{"message":"Bedrock rejected this request"}"#,
-            r#"{"message":"AWS service error"}"#,
-            r#"{"message":"Input exceeds CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
-            r#"{"message":"Monthly limit reached: MONTHLY_REQUEST_COUNT"}"#,
-        ] {
-            assert!(
-                kiro_official_upstream_message(raw).is_none(),
-                "channel-identifying upstream text must not be relayed: {raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn kiro_official_upstream_message_keeps_ordinary_wording() {
-        for (raw, expected) in [
-            (
-                r#"{"message":"Improperly formed request.","reason":"INVALID_INPUT_FORMAT"}"#,
-                "Improperly formed request.",
-            ),
-            (
-                r#"{"message":"The draws and laws in this image could not be read"}"#,
-                "The draws and laws in this image could not be read",
-            ),
-            (
-                r#"{"message":"Bedrock error: Input is too long for requested model."}"#,
-                "Input is too long for requested model.",
-            ),
-        ] {
-            assert_eq!(
-                kiro_official_upstream_message(raw).as_deref(),
-                Some(expected),
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn kiro_official_upstream_message_rejects_sensitive_json_message() {
-        assert!(
-            kiro_official_upstream_message(
-                r#"{"message":"The bearer token included in the request is invalid"}"#
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn kiro_official_upstream_message_rejects_kiro_branded_json_message() {
-        assert!(
-            kiro_official_upstream_message(
-                r#"{"message":"Kiro service rejected this model request"}"#
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn kiro_official_upstream_message_drops_forbidden_reason_without_leaking_it() {
-        let message = kiro_official_upstream_message(
-            r#"{"message":"The requested model is temporarily unavailable.","reason":"KIRO_MODEL_GATEWAY"}"#,
-        )
-        .expect("safe message remains available");
-
-        assert_eq!(message, "The requested model is temporarily unavailable.");
-        assert!(!message.to_ascii_lowercase().contains("kiro"));
     }
 }

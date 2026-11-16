@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::kiro::model::requests::conversation::Message as KiroMessage;
 use crate::model::config::{InjectionId, ResolvedInjections, UpstreamKind};
 use crate::model::prompt_injection::BlockReason;
 
@@ -45,13 +44,8 @@ fn default_model() -> String {
 pub(crate) struct PromptInjectionPreviewRequest {
     /// 路由前缀，例如 `/cc`、`/v1`、`/dfcache/team`。
     pub route: String,
-    #[serde(default = "default_upstream")]
-    pub upstream: PreviewUpstream,
     #[serde(default = "default_model")]
     pub model: String,
-    /// 上游模型是否有原生 reasoning 字段；没有时 thinking 走兼容标签。
-    #[serde(default)]
-    pub native_reasoning: bool,
     #[serde(default = "default_true")]
     pub with_system: bool,
     #[serde(default = "default_true")]
@@ -64,26 +58,14 @@ pub(crate) struct PromptInjectionPreviewRequest {
     pub thinking: PreviewThinking,
     #[serde(default = "default_language")]
     pub language: PreviewLanguage,
-    /// 同时展示空轮重试时的续写提示。
-    #[serde(default)]
-    pub empty_turn_retry: bool,
     #[serde(default)]
     pub stream: bool,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PreviewUpstream {
-    Local,
-    ExternalPool,
 }
 
 fn default_true() -> bool {
     true
 }
-fn default_upstream() -> PreviewUpstream {
-    PreviewUpstream::Local
-}
+
 fn default_tool_choice() -> PreviewToolChoice {
     PreviewToolChoice::Auto
 }
@@ -112,8 +94,6 @@ pub(crate) struct PreviewItem {
 pub(crate) struct PreviewFeatures {
     pub thinking_model_name: bool,
     pub thinking_trigger: crate::model::config::ThinkingTriggerMode,
-    pub channel_leak_guard: bool,
-    pub model_driven_web_search: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,20 +105,6 @@ pub(crate) struct PromptInjectionPreviewResponse {
     /// 外部池：发往外部上游的 system（Anthropic 格式）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_system: Option<Vec<String>>,
-    /// 本地 Kiro：history 里由 system 合成的第一条 user 消息。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_turn: Option<String>,
-    /// 本地 Kiro：当前轮 user 消息。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_turn: Option<String>,
-    /// 本地 Kiro：发给上游的工具描述（名称 → 描述）。
-    pub tools: Vec<(String, String)>,
-    /// 本地 Kiro：空轮重试时的当前轮 user 消息。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub empty_turn_retry_turn: Option<String>,
-    /// 转换失败时的错误，例如 thinking 标签关闭且模型没有原生字段。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// 合成请求的固定内容。用户文字用英文，避免语言识别把它当成语言信号。
@@ -250,142 +216,18 @@ pub(crate) fn preview_prompt_injection(
     let preview_features = PreviewFeatures {
         thinking_model_name: features.thinking_model_name,
         thinking_trigger: features.thinking_trigger,
-        channel_leak_guard: features.channel_leak_guard_applies(req.stream),
-        model_driven_web_search: features.model_driven_web_search,
     };
     let mut payload = preview_payload(&req);
 
-    if req.upstream == PreviewUpstream::ExternalPool {
-        let injections = runtime_config.injections_for(&endpoint, UpstreamKind::ExternalPool);
-        let applied =
-            super::super::prompt_injection::apply_to_messages_request(&injections, &mut payload);
-        return Ok(PromptInjectionPreviewResponse {
-            endpoint,
-            items: item_statuses(&injections, &applied.items),
-            features: preview_features,
-            external_system: payload
-                .system
-                .map(|blocks| blocks.into_iter().map(|block| block.text).collect()),
-            system_turn: None,
-            current_turn: None,
-            tools: Vec::new(),
-            empty_turn_retry_turn: None,
-            error: None,
-        });
-    }
-
-    // 与真实请求相同的顺序：先做路由功能对请求参数的改写，再注入 system，最后转换。
-    if features.thinking_model_name {
-        override_thinking_from_model_name(&mut payload)?;
-    }
-    apply_thinking_trigger_mode(&mut payload, features.thinking_trigger);
-    let injections = runtime_config.injections_for(&endpoint, UpstreamKind::Local);
-    super::super::prompt_injection::apply_to_messages_request(&injections, &mut payload);
-    if features.model_driven_web_search {
-        // 预览请求没有原生 web_search 工具，这里只展示 WebSearch 引导会加在哪里。
-        let guidance = injections.allows(InjectionId::WebSearchGuidance).then(|| {
-            injections
-                .text(crate::model::prompt_injection::TextKey::WebSearchGuidance)
-                .to_string()
-        });
-        payload = super::model_driven_websearch::internal_request(&payload, guidance.as_deref());
-    }
-
-    let model_resolution = ModelResolution::exact(payload.model.clone());
-    let capability = if req.native_reasoning {
-        KiroReasoningCapabilityState::Supported(
-            crate::anthropic::model_capabilities::KiroReasoningFieldCapability {
-                path: crate::anthropic::model_capabilities::KiroReasoningFieldPath::OutputConfig,
-                efforts: vec!["low".into(), "medium".into(), "high".into()],
-                default_effort: Some("high".into()),
-            },
-        )
-    } else {
-        KiroReasoningCapabilityState::AuthoritativeAbsent
-    };
-    let cache_route = runtime_config.cache_policy_for_path(&endpoint);
-    let prepared = match super::local_body_pipeline::prepare(
-        &endpoint,
-        &payload,
-        &runtime_config,
-        &cache_route,
-        &model_resolution,
-        capability,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return Ok(PromptInjectionPreviewResponse {
-                endpoint,
-                items: item_statuses(&injections, &[]),
-                features: preview_features,
-                external_system: None,
-                system_turn: None,
-                current_turn: None,
-                tools: Vec::new(),
-                empty_turn_retry_turn: None,
-                error: Some(
-                    error
-                        .error_metadata
-                        .get("localBodyPrepareDiagnostic")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| error.error_metadata.to_string()),
-                ),
-            });
-        }
-    };
-
-    let state = &prepared.kiro_request.conversation_state;
-    let system_turn = match state.history.as_slice() {
-        [KiroMessage::User(user), KiroMessage::Assistant(_), ..] => {
-            Some(user.user_input_message.content.clone())
-        }
-        _ => None,
-    };
-    let current = &state.current_message.user_input_message;
-    let tools = current
-        .user_input_message_context
-        .tools
-        .iter()
-        .map(|tool| {
-            (
-                tool.tool_specification.name.clone(),
-                tool.tool_specification.description.clone(),
-            )
-        })
-        .collect();
-    let empty_turn_retry_turn = req.empty_turn_retry.then(|| {
-        let retry = LocalStreamRetryConfig::from_runtime_config(&runtime_config, &injections);
-        usage_only_retry_request(
-            &prepared.request_body,
-            Some(&prepared.kiro_request),
-            retry.empty_turn_nudge.as_deref(),
-        )
-        .map(|(_, request)| {
-            request
-                .conversation_state
-                .current_message
-                .user_input_message
-                .content
-        })
-        .unwrap_or_default()
-    });
-    let mut applied = prepared.applied_injections.clone();
-    if empty_turn_retry_turn
-        .as_deref()
-        .is_some_and(|text| text != current.content)
-    {
-        applied.push(InjectionId::EmptyTurnNudge);
-    }
+    let injections = runtime_config.injections_for(&endpoint, UpstreamKind::ExternalPool);
+    let applied =
+        super::super::prompt_injection::apply_to_messages_request(&injections, &mut payload);
     Ok(PromptInjectionPreviewResponse {
         endpoint,
-        items: item_statuses(&injections, &applied),
+        items: item_statuses(&injections, &applied.items),
         features: preview_features,
-        external_system: None,
-        system_turn,
-        current_turn: Some(current.content.clone()),
-        tools,
-        empty_turn_retry_turn,
-        error: None,
+        external_system: payload
+            .system
+            .map(|blocks| blocks.into_iter().map(|block| block.text).collect()),
     })
 }

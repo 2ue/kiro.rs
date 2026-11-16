@@ -8,14 +8,100 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use serde::Deserialize;
 
-use super::converter::{deterministic_mapped_tool_name, legacy_overlong_mapped_tool_name};
 use super::request_facts::RawMessagesBodyProbe;
 #[cfg(test)]
 use super::request_facts::probe_raw_messages_body;
 use super::types::{Message as AnthropicMessage, MessagesRequest};
+use sha2::{Digest, Sha256};
 
 pub(crate) const RESPONSE_PROTOCOL_CONTAMINATION_DETAIL: &str =
     "upstream assistant response contained suppressed internal protocol transcript";
+
+const TOOL_NAME_MAX_LEN: usize = 63;
+const TOOL_HASH_MARKER: &str = "Hash";
+
+fn capitalize_ascii_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut result = first.to_ascii_uppercase().to_string();
+    result.push_str(chars.as_str());
+    result
+}
+
+fn sanitize_tool_name(name: &str) -> String {
+    let parts: Vec<String> = name
+        .split(|c: char| c == '_' || c == '-' || !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let mut iter = parts.into_iter();
+    let Some(first) = iter.next() else {
+        return "tool".to_string();
+    };
+
+    let mut sanitized = first;
+    let mut chars = sanitized.chars();
+    if let Some(first_char) = chars.next() {
+        sanitized = format!("{}{}", first_char.to_ascii_lowercase(), chars.as_str());
+    }
+    for part in iter {
+        sanitized.push_str(&capitalize_ascii_first(&part));
+    }
+
+    if sanitized.is_empty() {
+        "tool".to_string()
+    } else if !sanitized
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic())
+    {
+        format!("tool{}", capitalize_ascii_first(&sanitized))
+    } else {
+        sanitized
+    }
+}
+
+fn deterministic_mapped_tool_name(name: &str) -> String {
+    let sanitized = sanitize_tool_name(name);
+    if sanitized != name || sanitized.len() > TOOL_NAME_MAX_LEN {
+        shorten_tool_name(&sanitized, name)
+    } else {
+        sanitized
+    }
+}
+
+fn legacy_overlong_mapped_tool_name(name: &str) -> Option<String> {
+    if name.len() <= TOOL_NAME_MAX_LEN {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    let hash_hex = format!("{:x}", hasher.finalize());
+    let hash_suffix = &hash_hex[..8];
+    let prefix_max = TOOL_NAME_MAX_LEN - 1 - 8;
+    let prefix = match name.char_indices().nth(prefix_max) {
+        Some((index, _)) => &name[..index],
+        None => name,
+    };
+    Some(format!("{prefix}_{hash_suffix}"))
+}
+
+fn shorten_tool_name(name: &str, hash_input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(hash_input.as_bytes());
+    let hash_hex = format!("{:x}", hasher.finalize());
+    let hash_suffix = &hash_hex[..8];
+    // 51 prefix + "Hash" + 8 hash = 63
+    let prefix_max = TOOL_NAME_MAX_LEN - TOOL_HASH_MARKER.len() - 8;
+    let prefix = match name.char_indices().nth(prefix_max) {
+        Some((idx, _)) => &name[..idx],
+        None => name,
+    };
+    format!("{}{}{}", prefix, TOOL_HASH_MARKER, hash_suffix)
+}
 
 const MAX_CANDIDATE_BYTES: usize = 4096;
 const NEW_ROLE_LINES: &[&str] = &["user Continue"];
@@ -733,13 +819,6 @@ impl ToolTranscriptSanitizer {
     /// Flushes safe pending text at response EOF.
     pub(crate) fn finish(&mut self) -> String {
         self.finish_segment()
-    }
-
-    /// Whether text is still held back (a line-start probe, an unconfirmed candidate, or a
-    /// confirmed transcript being dropped). Callers must not splice separators in that state,
-    /// because a scaffold split across chunks has to stay contiguous to be recognized.
-    pub(crate) fn has_pending_text(&self) -> bool {
-        !matches!(self.state, State::Scan) || !self.line_probe.is_empty()
     }
 
     pub(crate) fn suppressed_blocks(&self) -> u32 {

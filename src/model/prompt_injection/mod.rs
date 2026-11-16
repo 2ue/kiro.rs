@@ -8,8 +8,6 @@
 //! 和提示词无关、但以前和提示词开关绑在一起的功能放在 [`RouteFeaturesConfig`]。
 
 pub mod catalog;
-pub mod legacy;
-pub(crate) mod migrate;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -32,217 +30,81 @@ fn default_true() -> bool {
     true
 }
 
-/// 注入项。顺序就是页面上的展示顺序。
+/// 可写入 Anthropic system 的注入项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InjectionId {
     TaskQuality,
     LanguageConstraint,
-    LanguageTurnReminder,
     Custom,
     IdentityPrompt,
-    IdentityTurnReminder,
-    ChunkedWritePolicy,
-    ChunkedWriteToolSuffix,
-    ThinkingControls,
-    ThinkingOutputPolicy,
-    ToolChoicePrefix,
-    ToolChoiceTurnReminder,
-    WebSearchGuidance,
-    EmptyTurnNudge,
 }
 impl InjectionId {
-    pub const ALL: [InjectionId; 14] = [
+    pub const ALL: [Self; 4] = [
         Self::TaskQuality,
         Self::LanguageConstraint,
-        Self::LanguageTurnReminder,
         Self::Custom,
         Self::IdentityPrompt,
-        Self::IdentityTurnReminder,
-        Self::ChunkedWritePolicy,
-        Self::ChunkedWriteToolSuffix,
-        Self::ThinkingControls,
-        Self::ThinkingOutputPolicy,
-        Self::ToolChoicePrefix,
-        Self::ToolChoiceTurnReminder,
-        Self::WebSearchGuidance,
-        Self::EmptyTurnNudge,
     ];
-
     fn index(self) -> usize {
         self as usize
     }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TaskQuality => "taskQuality",
             Self::LanguageConstraint => "languageConstraint",
-            Self::LanguageTurnReminder => "languageTurnReminder",
             Self::Custom => "custom",
             Self::IdentityPrompt => "identityPrompt",
-            Self::IdentityTurnReminder => "identityTurnReminder",
-            Self::ChunkedWritePolicy => "chunkedWritePolicy",
-            Self::ChunkedWriteToolSuffix => "chunkedWriteToolSuffix",
-            Self::ThinkingControls => "thinkingControls",
-            Self::ThinkingOutputPolicy => "thinkingOutputPolicy",
-            Self::ToolChoicePrefix => "toolChoicePrefix",
-            Self::ToolChoiceTurnReminder => "toolChoiceTurnReminder",
-            Self::WebSearchGuidance => "webSearchGuidance",
-            Self::EmptyTurnNudge => "emptyTurnNudge",
         }
     }
-
-    /// 新装默认值。`taskQuality` 另在 `/cc` 上显式开启（见 [`PromptInjectionConfig::default`]）。
     pub fn default_enabled(self) -> bool {
-        !matches!(
-            self,
-            Self::TaskQuality
-                | Self::LanguageConstraint
-                | Self::LanguageTurnReminder
-                | Self::Custom
-                | Self::IdentityPrompt
-                | Self::IdentityTurnReminder
-        )
+        false
     }
-
-    /// 能注入到外部池请求里的项。外部池不经过 Kiro 转换，只有写进 system 的这几项能生效。
-    pub fn supports_external_pool(self) -> bool {
-        matches!(
-            self,
-            Self::TaskQuality | Self::LanguageConstraint | Self::Custom | Self::IdentityPrompt
-        )
-    }
-
-    /// `anthropic-strict` 下不注入的项（保持现有覆盖范围）。thinking 控制标签在强制可见
-    /// thinking 时例外，由注入点处理。
     pub fn blocked_by_strict(self) -> bool {
-        !matches!(
-            self,
-            Self::IdentityPrompt
-                | Self::IdentityTurnReminder
-                | Self::WebSearchGuidance
-                | Self::EmptyTurnNudge
-        )
+        self != Self::IdentityPrompt
     }
-
-    /// 这一项可编辑的文本槽位。只读项（协议控制标签）返回空。
     pub fn text_keys(self) -> &'static [TextKey] {
         match self {
             Self::TaskQuality => &[TextKey::TaskQuality],
             Self::LanguageConstraint => &[TextKey::LanguageConstraint],
-            Self::LanguageTurnReminder => &[
-                TextKey::LanguageTurnReminderExplicit,
-                TextKey::LanguageTurnReminderFollowUser,
-            ],
             Self::Custom => &[TextKey::Custom],
             Self::IdentityPrompt => &[TextKey::IdentityPrompt],
-            Self::IdentityTurnReminder => &[TextKey::IdentityTurnReminder],
-            Self::ChunkedWritePolicy => &[TextKey::ChunkedWritePolicy],
-            Self::ChunkedWriteToolSuffix => &[
-                TextKey::ChunkedWriteToolSuffixWrite,
-                TextKey::ChunkedWriteToolSuffixEdit,
-            ],
-            Self::WebSearchGuidance => &[TextKey::WebSearchGuidance],
-            Self::EmptyTurnNudge => &[TextKey::EmptyTurnNudge],
-            Self::ThinkingControls
-            | Self::ThinkingOutputPolicy
-            | Self::ToolChoicePrefix
-            | Self::ToolChoiceTurnReminder => &[],
         }
     }
 }
-
-/// 可编辑文本槽位。key 形如 `taskQuality`、`languageTurnReminder.explicit`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TextKey {
-    #[serde(rename = "taskQuality")]
     TaskQuality,
-    #[serde(rename = "languageConstraint")]
     LanguageConstraint,
-    #[serde(rename = "languageTurnReminder.explicit")]
-    LanguageTurnReminderExplicit,
-    #[serde(rename = "languageTurnReminder.followUser")]
-    LanguageTurnReminderFollowUser,
-    #[serde(rename = "custom")]
     Custom,
-    #[serde(rename = "identityPrompt")]
     IdentityPrompt,
-    #[serde(rename = "identityTurnReminder")]
-    IdentityTurnReminder,
-    #[serde(rename = "chunkedWritePolicy")]
-    ChunkedWritePolicy,
-    #[serde(rename = "chunkedWriteToolSuffix.write")]
-    ChunkedWriteToolSuffixWrite,
-    #[serde(rename = "chunkedWriteToolSuffix.edit")]
-    ChunkedWriteToolSuffixEdit,
-    #[serde(rename = "webSearchGuidance")]
-    WebSearchGuidance,
-    #[serde(rename = "emptyTurnNudge")]
-    EmptyTurnNudge,
 }
-
 impl TextKey {
-    pub const ALL: [TextKey; 12] = [
+    pub const ALL: [Self; 4] = [
         Self::TaskQuality,
         Self::LanguageConstraint,
-        Self::LanguageTurnReminderExplicit,
-        Self::LanguageTurnReminderFollowUser,
         Self::Custom,
         Self::IdentityPrompt,
-        Self::IdentityTurnReminder,
-        Self::ChunkedWritePolicy,
-        Self::ChunkedWriteToolSuffixWrite,
-        Self::ChunkedWriteToolSuffixEdit,
-        Self::WebSearchGuidance,
-        Self::EmptyTurnNudge,
     ];
-
     pub fn label(self) -> &'static str {
-        match self {
-            Self::LanguageTurnReminderExplicit => "客户端声明了语言（{language} 会替换成语言名）",
-            Self::LanguageTurnReminderFollowUser => "跟随用户自己的消息",
-            Self::ChunkedWriteToolSuffixWrite => "Write 工具",
-            Self::ChunkedWriteToolSuffixEdit => "Edit 工具",
-            _ => "文本",
-        }
+        self.as_str()
     }
-
-    /// 注入时必须保留的片段：控制块清洗靠这些标签识别模型复述的提醒。
     fn required_fragments(self) -> &'static [&'static str] {
-        match self {
-            Self::LanguageTurnReminderExplicit => {
-                &["<language_reminder>", "</language_reminder>", "{language}"]
-            }
-            Self::LanguageTurnReminderFollowUser => {
-                &["<language_reminder>", "</language_reminder>"]
-            }
-            Self::IdentityTurnReminder => &["<identity_reminder>", "</identity_reminder>"],
-            _ => &[],
-        }
+        &[]
     }
-
     fn is_turn_reminder(self) -> bool {
-        matches!(
-            self,
-            Self::LanguageTurnReminderExplicit
-                | Self::LanguageTurnReminderFollowUser
-                | Self::IdentityTurnReminder
-        )
+        false
     }
-
-    /// 清空时是否回到内置文本。自定义项清空就是不注入。
     fn empty_means_default(self) -> bool {
         self != Self::Custom
     }
 }
-
 /// 一项的全局默认。`externalPool` 只对支持外部池的项有意义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ItemSetting {
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_pool: Option<bool>,
 }
 
 /// 一项在某个路由上的设置；没写的字段跟随更短的前缀或全局默认。
@@ -251,13 +113,11 @@ pub struct ItemSetting {
 pub struct ItemOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_pool: Option<bool>,
 }
 
 impl ItemOverride {
     pub fn is_empty(&self) -> bool {
-        self.enabled.is_none() && self.external_pool.is_none()
+        self.enabled.is_none()
     }
 }
 
@@ -285,7 +145,6 @@ fn default_item_settings() -> BTreeMap<InjectionId, ItemSetting> {
                 *id,
                 ItemSetting {
                     enabled: id.default_enabled(),
-                    external_pool: id.supports_external_pool().then_some(false),
                 },
             )
         })
@@ -300,7 +159,6 @@ fn default_injection_path_overrides() -> BTreeMap<String, BTreeMap<InjectionId, 
             InjectionId::TaskQuality,
             ItemOverride {
                 enabled: Some(true),
-                external_pool: None,
             },
         )]),
     )])
@@ -322,13 +180,9 @@ impl PromptInjectionConfig {
     /// 与内置文本相同的文本。
     pub fn normalized(mut self) -> Self {
         for id in InjectionId::ALL {
-            let setting = self.defaults.entry(id).or_insert(ItemSetting {
+            self.defaults.entry(id).or_insert(ItemSetting {
                 enabled: id.default_enabled(),
-                external_pool: None,
             });
-            setting.external_pool = id
-                .supports_external_pool()
-                .then(|| setting.external_pool.unwrap_or(false));
         }
         self.path_overrides = std::mem::take(&mut self.path_overrides)
             .into_iter()
@@ -336,12 +190,6 @@ impl PromptInjectionConfig {
                 let prefix = normalize_reported_usage_path_prefix(&prefix)?;
                 let items: BTreeMap<_, _> = items
                     .into_iter()
-                    .map(|(id, mut item)| {
-                        if !id.supports_external_pool() {
-                            item.external_pool = None;
-                        }
-                        (id, item)
-                    })
                     .filter(|(_, item)| !item.is_empty())
                     .collect();
                 (!items.is_empty()).then_some((prefix, items))
@@ -356,15 +204,6 @@ impl PromptInjectionConfig {
             })
             .collect();
         self
-    }
-
-    /// 删掉等于旧版本内置文本的文本，让这些槽位使用当前内置文本。只在升级迁移里调用：
-    /// 升级之后运营者再把文本改回旧内容，是有意的选择，要保留。
-    pub fn drop_previous_default_texts(&mut self) -> bool {
-        let before = self.texts.len();
-        self.texts
-            .retain(|key, text| !catalog::is_previous_default_text(*key, text));
-        self.texts.len() != before
     }
 
     /// 保存前的校验：长度、每轮提醒必须保留的标签和占位符。
@@ -419,9 +258,7 @@ impl PromptInjectionConfig {
     /// 这一项在 `endpoint` 上的开关和外部池开关，以及决定开关的来源。
     pub fn item_setting_for_route(&self, endpoint: &str, id: InjectionId) -> RouteItemSetting {
         let mut enabled = None;
-        let mut external_pool = None;
         let mut enabled_len = 0;
-        let mut external_len = 0;
         for (prefix, items) in &self.path_overrides {
             let Some(item) = items.get(&id) else {
                 continue;
@@ -435,26 +272,15 @@ impl PromptInjectionConfig {
                 enabled = Some((value, prefix.clone()));
                 enabled_len = prefix.len();
             }
-            if let Some(value) = item.external_pool
-                && (external_pool.is_none() || prefix.len() > external_len)
-            {
-                external_pool = Some(value);
-                external_len = prefix.len();
-            }
         }
         let default = self.defaults.get(&id).copied().unwrap_or(ItemSetting {
             enabled: id.default_enabled(),
-            external_pool: None,
         });
         let (enabled, source) = match enabled {
             Some((value, prefix)) => (value, Some(prefix)),
             None => (default.enabled, None),
         };
-        RouteItemSetting {
-            enabled,
-            external_pool: external_pool.or(default.external_pool).unwrap_or(false),
-            source,
-        }
+        RouteItemSetting { enabled, source }
     }
 }
 
@@ -463,16 +289,8 @@ impl TextKey {
         match self {
             Self::TaskQuality => "taskQuality",
             Self::LanguageConstraint => "languageConstraint",
-            Self::LanguageTurnReminderExplicit => "languageTurnReminder.explicit",
-            Self::LanguageTurnReminderFollowUser => "languageTurnReminder.followUser",
             Self::Custom => "custom",
             Self::IdentityPrompt => "identityPrompt",
-            Self::IdentityTurnReminder => "identityTurnReminder",
-            Self::ChunkedWritePolicy => "chunkedWritePolicy",
-            Self::ChunkedWriteToolSuffixWrite => "chunkedWriteToolSuffix.write",
-            Self::ChunkedWriteToolSuffixEdit => "chunkedWriteToolSuffix.edit",
-            Self::WebSearchGuidance => "webSearchGuidance",
-            Self::EmptyTurnNudge => "emptyTurnNudge",
         }
     }
 }
@@ -480,7 +298,6 @@ impl TextKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteItemSetting {
     pub enabled: bool,
-    pub external_pool: bool,
     /// 决定 `enabled` 的路由前缀；`None` 表示来自全局默认。
     pub source: Option<String>,
 }
@@ -488,7 +305,6 @@ pub struct RouteItemSetting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum UpstreamKind {
-    Local,
     ExternalPool,
 }
 
@@ -497,10 +313,6 @@ pub enum UpstreamKind {
 pub enum BlockReason {
     /// 开关关闭（全局默认或路由设置）。
     Off,
-    /// 外部池请求不经过 Kiro 转换，这一项没法注入。
-    ExternalPoolUnsupported,
-    /// 这一项的外部池开关关闭。
-    ExternalPoolOff,
     /// `anthropic-strict` 不做兼容改写。
     Strict,
 }
@@ -528,7 +340,7 @@ pub struct ResolvedInjections {
 impl ResolvedInjections {
     pub fn resolve(
         endpoint: &str,
-        upstream: UpstreamKind,
+        _upstream: UpstreamKind,
         profile: CompatProfile,
         config: &PromptInjectionConfig,
     ) -> Self {
@@ -538,10 +350,6 @@ impl ResolvedInjections {
                 let setting = config.item_setting_for_route(endpoint, *id);
                 let blocked = if !setting.enabled {
                     Some(BlockReason::Off)
-                } else if upstream == UpstreamKind::ExternalPool && !id.supports_external_pool() {
-                    Some(BlockReason::ExternalPoolUnsupported)
-                } else if upstream == UpstreamKind::ExternalPool && !setting.external_pool {
-                    Some(BlockReason::ExternalPoolOff)
                 } else if profile.is_strict() && id.blocked_by_strict() {
                     Some(BlockReason::Strict)
                 } else {
@@ -602,15 +410,11 @@ impl ResolvedInjections {
         let mut config = PromptInjectionConfig::default();
         config.path_overrides.clear();
         for (id, enabled) in changes {
-            config.defaults.insert(
-                *id,
-                ItemSetting {
-                    enabled: *enabled,
-                    external_pool: id.supports_external_pool().then_some(false),
-                },
-            );
+            config
+                .defaults
+                .insert(*id, ItemSetting { enabled: *enabled });
         }
-        Self::resolve("/v1/messages", UpstreamKind::Local, profile, &config)
+        Self::resolve("/v1/messages", UpstreamKind::ExternalPool, profile, &config)
     }
 
     /// 测试用：在 `with_items` 的基础上改一段文本。
@@ -639,7 +443,7 @@ impl Default for ResolvedInjections {
     fn default() -> Self {
         Self::resolve(
             "/v1/messages",
-            UpstreamKind::Local,
+            UpstreamKind::ExternalPool,
             CompatProfile::default(),
             &PromptInjectionConfig::default(),
         )
@@ -655,15 +459,6 @@ pub struct RouteFeatureSet {
     pub thinking_model_name: bool,
     #[serde(default)]
     pub thinking_trigger: ThinkingTriggerMode,
-    /// 删除回复里暴露上游渠道的句子（"I'm Kiro"、"conflicting instructions" 等）。
-    #[serde(default)]
-    pub channel_leak_guard: bool,
-    /// 流式回复也过滤：每句话检查完才下发，首字会稍晚。
-    #[serde(default = "default_true")]
-    pub channel_leak_guard_stream: bool,
-    /// 原生 web_search 由模型生成搜索词，代理执行搜索，模型根据结果写带引用的回答。
-    #[serde(default)]
-    pub model_driven_web_search: bool,
 }
 
 impl Default for RouteFeatureSet {
@@ -671,16 +466,7 @@ impl Default for RouteFeatureSet {
         Self {
             thinking_model_name: true,
             thinking_trigger: ThinkingTriggerMode::default(),
-            channel_leak_guard: false,
-            channel_leak_guard_stream: true,
-            model_driven_web_search: false,
         }
-    }
-}
-
-impl RouteFeatureSet {
-    pub fn channel_leak_guard_applies(&self, stream: bool) -> bool {
-        self.channel_leak_guard && (!stream || self.channel_leak_guard_stream)
     }
 }
 
@@ -691,18 +477,6 @@ pub struct RouteFeatureOverride {
     pub thinking_model_name: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_trigger: Option<ThinkingTriggerMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel_leak_guard: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel_leak_guard_stream: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_driven_web_search: Option<bool>,
-}
-
-impl RouteFeatureOverride {
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,6 +486,12 @@ pub struct RouteFeaturesConfig {
     pub defaults: RouteFeatureSet,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, RouteFeatureOverride>,
+}
+
+impl RouteFeatureOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl RouteFeaturesConfig {
@@ -743,15 +523,6 @@ impl RouteFeaturesConfig {
             if let Some(value) = route.thinking_trigger {
                 resolved.thinking_trigger = value;
             }
-            if let Some(value) = route.channel_leak_guard {
-                resolved.channel_leak_guard = value;
-            }
-            if let Some(value) = route.channel_leak_guard_stream {
-                resolved.channel_leak_guard_stream = value;
-            }
-            if let Some(value) = route.model_driven_web_search {
-                resolved.model_driven_web_search = value;
-            }
         }
         resolved
     }
@@ -760,34 +531,6 @@ impl RouteFeaturesConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn partial_config_fills_missing_items_with_built_in_defaults() {
-        let config: PromptInjectionConfig = serde_json::from_value(serde_json::json!({
-            "pathOverrides": {"/cc/": {"taskQuality": {"enabled": true}}}
-        }))
-        .unwrap();
-        let config = config.normalized();
-        assert_eq!(config.defaults.len(), InjectionId::ALL.len());
-        for id in InjectionId::ALL {
-            assert_eq!(config.defaults[&id].enabled, id.default_enabled(), "{id:?}");
-            assert_eq!(
-                config.defaults[&id].external_pool.is_some(),
-                id.supports_external_pool()
-            );
-        }
-        assert!(
-            config.path_overrides.contains_key("/cc"),
-            "prefix is normalized"
-        );
-        assert_eq!(
-            config
-                .item_setting_for_route("/cc/v1/messages", InjectionId::TaskQuality)
-                .source
-                .as_deref(),
-            Some("/cc")
-        );
-    }
 
     #[test]
     fn unknown_items_and_fields_are_rejected() {
@@ -803,124 +546,6 @@ mod tests {
             }))
             .is_err()
         );
-    }
-
-    #[test]
-    fn route_features_dfcache_websearch_override_covers_the_six_cctest_routes() {
-        let mut config = RouteFeaturesConfig::default();
-        assert!(!config.resolve("/v1/messages").model_driven_web_search);
-
-        config.path_overrides.insert(
-            "/dfcache".to_string(),
-            RouteFeatureOverride {
-                model_driven_web_search: Some(true),
-                ..RouteFeatureOverride::default()
-            },
-        );
-        config.path_overrides.insert(
-            "/dfcache/mine-hak".to_string(),
-            RouteFeatureOverride {
-                model_driven_web_search: Some(false),
-                ..RouteFeatureOverride::default()
-            },
-        );
-
-        for route in ["mine-haa", "naaa", "minea", "mineb", "mcc"] {
-            assert!(
-                config
-                    .resolve(&format!("/dfcache/{route}/v1/messages"))
-                    .model_driven_web_search,
-                "{route} should inherit the /dfcache model-driven WebSearch override"
-            );
-        }
-        assert!(
-            !config
-                .resolve("/dfcache/mine-hak/v1/messages")
-                .model_driven_web_search,
-            "the longest route override must be able to disable the feature"
-        );
-        assert!(
-            !config
-                .resolve("/dfcachex/v1/messages")
-                .model_driven_web_search,
-            "a non-boundary prefix must not match /dfcache"
-        );
-    }
-
-    #[test]
-    fn validation_requires_reminder_tags_and_language_placeholder() {
-        let mut config = PromptInjectionConfig::default();
-        assert!(config.validate().is_ok());
-        config.texts.insert(
-            TextKey::LanguageTurnReminderExplicit,
-            "<language_reminder>Reply in Chinese.</language_reminder>".into(),
-        );
-        assert!(config.validate().unwrap_err().contains("{language}"));
-        config.texts.insert(
-            TextKey::LanguageTurnReminderExplicit,
-            "<language_reminder>{language}</language_reminder>".into(),
-        );
-        config
-            .texts
-            .insert(TextKey::IdentityTurnReminder, "Be Claude.".into());
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .contains("<identity_reminder>")
-        );
-        config.texts.remove(&TextKey::IdentityTurnReminder);
-        config
-            .texts
-            .insert(TextKey::Custom, "x".repeat(MAX_TEXT_CHARS + 1));
-        assert!(config.validate().unwrap_err().contains("超过"));
-        // Clearing a text restores the built-in one, so an empty edit is not a validation error.
-        config.texts.insert(TextKey::Custom, String::new());
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn stored_previous_default_texts_give_way_to_the_current_ones() {
-        let previous_task_quality = "<task_quality_policy>\n优先处理最新一条用户消息。";
-        assert!(!catalog::is_previous_default_text(
-            TextKey::TaskQuality,
-            previous_task_quality
-        ));
-
-        let mut config = PromptInjectionConfig::default();
-        for key in [TextKey::TaskQuality, TextKey::ChunkedWritePolicy] {
-            let previous = catalog::previous_default_texts(key)
-                .first()
-                .copied()
-                .expect("a previous built-in text");
-            assert!(catalog::is_previous_default_text(key, previous));
-            config.texts.insert(key, format!("\n{previous}\n"));
-        }
-        config
-            .texts
-            .insert(TextKey::Custom, "operator text".to_string());
-        // Saving keeps them: only the upgrade migration treats them as old defaults.
-        assert_eq!(config.clone().normalized().texts.len(), 3);
-        assert!(config.drop_previous_default_texts());
-        assert!(!config.drop_previous_default_texts());
-        assert_eq!(
-            config.text(TextKey::TaskQuality),
-            catalog::DEFAULT_TASK_QUALITY_PROMPT
-        );
-        assert_eq!(
-            config.text(TextKey::ChunkedWritePolicy),
-            catalog::DEFAULT_CHUNKED_WRITE_POLICY
-        );
-        // Operator edits are kept, including an edit of an old default.
-        assert_eq!(config.text(TextKey::Custom), "operator text");
-        let mut edited = PromptInjectionConfig::default();
-        let previous = catalog::previous_default_texts(TextKey::TaskQuality)[0];
-        let edited_text = format!("{previous}\n额外规则");
-        edited
-            .texts
-            .insert(TextKey::TaskQuality, edited_text.clone());
-        assert!(!edited.drop_previous_default_texts());
-        assert_eq!(edited.text(TextKey::TaskQuality), edited_text.trim());
     }
 
     #[test]
@@ -951,16 +576,6 @@ mod tests {
         for phrase in ["system", "提醒", "reminder", "Tool result received"] {
             assert!(!text.contains(phrase), "{phrase}");
         }
-    }
-
-    #[test]
-    fn chunked_write_policy_is_scoped_to_writing_files() {
-        let text = catalog::DEFAULT_CHUNKED_WRITE_POLICY;
-        for phrase in ["silently", "without commentary", "Never ask"] {
-            assert!(!text.contains(phrase), "{phrase}");
-        }
-        assert!(text.contains("Write or Edit"));
-        assert!(text.contains("unless the user asked for a different approach"));
     }
 
     #[test]

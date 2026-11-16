@@ -13,21 +13,15 @@ use axum::{
 
 use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
-use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig,
-    ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
-    ToolFormatDebugConfig,
+    CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
+    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
 };
 
 use super::{
     envelope,
-    files::{
-        MAX_FILE_UPLOAD_BODY_SIZE, delete_file, delete_file_dfcache, get_file, get_file_content,
-        get_file_content_dfcache, get_file_dfcache, list_files, upload_file,
-    },
     handlers::{
         count_tokens, count_tokens_cc, count_tokens_dfcache, count_tokens_ha, count_tokens_na,
         get_model, get_model_dfcache, get_models, get_models_dfcache, post_messages,
@@ -35,11 +29,6 @@ use super::{
     },
     middleware::{AppState, auth_middleware, capture_http_ingress, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
-    openai::{
-        post_chat_completions, post_chat_completions_cc, post_chat_completions_dfcache,
-        post_chat_completions_ha, post_chat_completions_na, post_responses, post_responses_cc,
-        post_responses_dfcache, post_responses_ha, post_responses_na,
-    },
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
@@ -47,14 +36,12 @@ use super::{
         RequestAdmissionController, RequestAdmissionMiddlewareState, request_admission_middleware,
     },
     request_body::MAX_MESSAGES_BODY_SIZE,
-    tool_format_debug::ToolFormatDebugRecorder,
     usage::UsageRecorder,
 };
 
 pub struct AnthropicRouterDependencies {
     pub request_api_keys: Arc<RequestApiKeyStore>,
     pub request_admission: Arc<RequestAdmissionController>,
-    pub kiro_provider: Option<Arc<KiroProvider>>,
     pub usage_recorder: Arc<UsageRecorder>,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -64,7 +51,6 @@ pub struct AnthropicRouterDependencies {
 }
 
 pub struct AnthropicRouterConfig {
-    extract_thinking: bool,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -79,33 +65,23 @@ pub struct AnthropicRouterConfig {
     compat_profile: CompatProfile,
     prompt_injection: PromptInjectionConfig,
     route_features: RouteFeaturesConfig,
-    claude_models_only: bool,
     model_resolution_mode: ModelResolutionMode,
     model_mapping: ModelMappingConfig,
-    expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
     payload_guard_max_bytes: usize,
-    payload_guard_kiro_max_weight: usize,
     payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
     payload_guard_external_enabled: bool,
-    kiro_cache_point_enabled: bool,
-    kiro_cache_point_tools_only: bool,
-    kiro_cache_point_record_plan: bool,
-    kiro_upstream_stream_idle_timeout_secs: u64,
     image_processing: ImageProcessingConfig,
-    body_conversion: BodyConversionConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
-    tool_format_debug: ToolFormatDebugConfig,
 }
 
 impl AnthropicRouterConfig {
     pub fn from_runtime_config(config: &Config) -> Self {
         Self {
-            extract_thinking: config.extract_thinking,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: config.prompt_cache_token_scale,
             prompt_cache_max_simulated_input_tokens: config.prompt_cache_max_simulated_input_tokens,
@@ -125,27 +101,18 @@ impl AnthropicRouterConfig {
             compat_profile: config.compat_profile,
             prompt_injection: config.prompt_injection.clone().normalized(),
             route_features: config.route_features.clone().normalized(),
-            claude_models_only: config.claude_models_only,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
-            expose_proxy_warnings: config.expose_proxy_warnings,
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes,
-            payload_guard_kiro_max_weight: config.payload_guard_kiro_max_weight,
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_guard_external_enabled: config.payload_guard_external_enabled,
-            kiro_cache_point_enabled: config.kiro_cache_point_enabled,
-            kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
-            kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
-            kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             image_processing: config.image_processing.normalized(),
-            body_conversion: config.body_conversion.clone(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
-            tool_format_debug: config.tool_format_debug.clone(),
         }
     }
 }
@@ -156,8 +123,6 @@ impl AnthropicRouterConfig {
 /// - `GET /v1/models` - 获取可用模型列表
 /// - `POST /v1/messages` - 创建消息（对话）
 /// - `POST /v1/messages/count_tokens` - 计算 token 数量
-/// - `POST /v1/chat/completions` - OpenAI Chat Completions 兼容接口（各前缀下同名路径同样可用）
-/// - `POST /v1/responses` - OpenAI Responses 兼容接口（各前缀下同名路径同样可用）
 /// - `GET /na/v1/models` - 获取可用模型列表
 /// - `POST /na/v1/messages` - 创建消息
 /// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
@@ -170,15 +135,13 @@ impl AnthropicRouterConfig {
 /// - `x-api-key` header
 /// - `Authorization: Bearer <token>` header
 ///
-/// 创建带有 KiroProvider 的 Anthropic API 路由
-pub fn create_router_with_provider(
+pub fn create_router(
     dependencies: AnthropicRouterDependencies,
     config: AnthropicRouterConfig,
 ) -> Router {
     let AnthropicRouterDependencies {
         request_api_keys,
         request_admission,
-        kiro_provider,
         usage_recorder,
         prompt_cache,
         prompt_cache_creation_controller,
@@ -187,7 +150,6 @@ pub fn create_router_with_provider(
         external_pool_manager,
     } = dependencies;
     let AnthropicRouterConfig {
-        extract_thinking,
         prompt_cache_target_read_ratio,
         prompt_cache_token_scale,
         prompt_cache_max_simulated_input_tokens,
@@ -202,41 +164,29 @@ pub fn create_router_with_provider(
         compat_profile,
         prompt_injection,
         route_features,
-        claude_models_only,
         model_resolution_mode,
         model_mapping,
-        expose_proxy_warnings,
         payload_guard_enabled,
         payload_guard_mode,
         payload_guard_max_bytes,
-        payload_guard_kiro_max_weight,
         payload_guard_safety_margin_bytes,
         payload_guard_trim_history,
         payload_guard_external_enabled,
-        kiro_cache_point_enabled,
-        kiro_cache_point_tools_only,
-        kiro_cache_point_record_plan,
-        kiro_upstream_stream_idle_timeout_secs,
         image_processing,
-        body_conversion,
         missing_max_tokens,
         payload_shaping,
         external_pools,
-        tool_format_debug,
     } = config;
-    let tool_format_debug_recorder = ToolFormatDebugRecorder::new(tool_format_debug);
     let request_admission_state =
         RequestAdmissionMiddlewareState::new(request_admission, usage_recorder.clone());
     let mut base_state = AppState::new(
         request_api_keys,
-        extract_thinking,
         usage_recorder,
         prompt_cache,
         prompt_cache_creation_controller,
         PromptCacheSimulationMode::HighCache,
         prompt_cache_target_read_ratio,
         compat_profile,
-        expose_proxy_warnings,
     )
     .with_prompt_cache_amplification(
         prompt_cache_token_scale,
@@ -250,33 +200,24 @@ pub fn create_router_with_provider(
     .with_reported_usage(reported_usage)
     .with_cache_policy(cache_policy)
     .with_defined_cache_routes(defined_cache_routes)
-    .with_prompt_injection(prompt_injection, route_features, claude_models_only)
+    .with_prompt_injection(prompt_injection, route_features)
     .with_model_resolution_mode(model_resolution_mode)
     .with_model_mapping(model_mapping)
     .with_payload_guard(
         payload_guard_enabled,
         payload_guard_mode,
         payload_guard_max_bytes,
-        payload_guard_kiro_max_weight,
         payload_guard_safety_margin_bytes,
         payload_guard_trim_history,
         payload_guard_external_enabled,
-        kiro_cache_point_enabled,
-        kiro_cache_point_tools_only,
-        kiro_cache_point_record_plan,
-        kiro_upstream_stream_idle_timeout_secs,
         image_processing,
-        body_conversion,
         payload_shaping,
     )
     .with_missing_max_tokens(missing_max_tokens)
     .with_external_pools(external_pools)
-    .with_tool_format_debug_recorder(tool_format_debug_recorder)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
-    if let Some(provider) = kiro_provider {
-        base_state = base_state.with_kiro_provider(provider);
-    }
+
     if let Some(manager) = external_pool_manager {
         base_state = base_state.with_external_pool_manager(manager);
     }
@@ -289,14 +230,6 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/models/{model_id}", get(get_model))
         .route(
-            "/files",
-            get(list_files)
-                .post(upload_file)
-                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
-        )
-        .route("/files/{file_id}", get(get_file).delete(delete_file))
-        .route("/files/{file_id}/content", get(get_file_content))
-        .route(
             "/messages",
             post(post_messages).layer(middleware::from_fn_with_state(
                 request_admission_state.clone(),
@@ -304,20 +237,6 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens))
-        .route(
-            "/chat/completions",
-            post(post_chat_completions).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
-        .route(
-            "/responses",
-            post(post_responses).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -331,14 +250,6 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/models/{model_id}", get(get_model))
         .route(
-            "/files",
-            get(list_files)
-                .post(upload_file)
-                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
-        )
-        .route("/files/{file_id}", get(get_file).delete(delete_file))
-        .route("/files/{file_id}/content", get(get_file_content))
-        .route(
             "/messages",
             post(post_messages_na).layer(middleware::from_fn_with_state(
                 request_admission_state.clone(),
@@ -346,20 +257,6 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens_na))
-        .route(
-            "/chat/completions",
-            post(post_chat_completions_na).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
-        .route(
-            "/responses",
-            post(post_responses_na).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -373,14 +270,6 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/models/{model_id}", get(get_model))
         .route(
-            "/files",
-            get(list_files)
-                .post(upload_file)
-                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
-        )
-        .route("/files/{file_id}", get(get_file).delete(delete_file))
-        .route("/files/{file_id}/content", get(get_file_content))
-        .route(
             "/messages",
             post(post_messages_cc).layer(middleware::from_fn_with_state(
                 request_admission_state.clone(),
@@ -388,20 +277,6 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens_cc))
-        .route(
-            "/chat/completions",
-            post(post_chat_completions_cc).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
-        .route(
-            "/responses",
-            post(post_responses_cc).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -415,14 +290,6 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/models/{model_id}", get(get_model))
         .route(
-            "/files",
-            get(list_files)
-                .post(upload_file)
-                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
-        )
-        .route("/files/{file_id}", get(get_file).delete(delete_file))
-        .route("/files/{file_id}/content", get(get_file_content))
-        .route(
             "/messages",
             post(post_messages_ha).layer(middleware::from_fn_with_state(
                 request_admission_state.clone(),
@@ -430,20 +297,6 @@ pub fn create_router_with_provider(
             )),
         )
         .route("/messages/count_tokens", post(count_tokens_ha))
-        .route(
-            "/chat/completions",
-            post(post_chat_completions_ha).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
-        .route(
-            "/responses",
-            post(post_responses_ha).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
@@ -458,37 +311,9 @@ pub fn create_router_with_provider(
         .route("/{route}/v1/models", get(get_models_dfcache))
         .route("/{route}/v1/models/{model_id}", get(get_model_dfcache))
         .route(
-            "/{route}/v1/files",
-            get(list_files)
-                .post(upload_file)
-                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
-        )
-        .route(
-            "/{route}/v1/files/{file_id}",
-            get(get_file_dfcache).delete(delete_file_dfcache),
-        )
-        .route(
-            "/{route}/v1/files/{file_id}/content",
-            get(get_file_content_dfcache),
-        )
-        .route(
             "/{route}/v1/messages",
             post(post_messages_dfcache).layer(middleware::from_fn_with_state(
                 request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
-        .route(
-            "/{route}/v1/chat/completions",
-            post(post_chat_completions_dfcache).layer(middleware::from_fn_with_state(
-                request_admission_state.clone(),
-                request_admission_middleware,
-            )),
-        )
-        .route(
-            "/{route}/v1/responses",
-            post(post_responses_dfcache).layer(middleware::from_fn_with_state(
-                request_admission_state,
                 request_admission_middleware,
             )),
         )
@@ -582,14 +407,12 @@ mod tests {
     fn base_state(mode: PromptCacheSimulationMode) -> AppState {
         AppState::new(
             Arc::new(RequestApiKeyStore::new(["test-key"])),
-            true,
             Arc::new(UsageRecorder::new(10)),
             Arc::new(PromptCacheTracker::default()),
             Arc::new(PromptCacheCreationController::default()),
             mode,
             0.98,
             CompatProfile::ClaudeCode,
-            false,
         )
     }
 
@@ -698,7 +521,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut config = Config::default();
             config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
-            let app = create_router_with_provider(
+            let app = create_router(
                 AnthropicRouterDependencies {
                     request_api_keys: Arc::new(RequestApiKeyStore::new(&keys)),
                     request_admission: Arc::new(RequestAdmissionController::new(
@@ -709,7 +532,7 @@ mod tests {
                             queue_timeout_ms: 0,
                         },
                     )),
-                    kiro_provider: None,
+
                     usage_recorder: Arc::new(UsageRecorder::new(10)),
                     prompt_cache: Arc::new(PromptCacheTracker::default()),
                     prompt_cache_creation_controller: Arc::new(
@@ -759,13 +582,13 @@ mod tests {
         ];
         let mut config = Config::default();
         config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
-        let app = create_router_with_provider(
+        let app = create_router(
             AnthropicRouterDependencies {
                 request_api_keys: Arc::new(RequestApiKeyStore::new(["body-limit-key"])),
                 request_admission: Arc::new(RequestAdmissionController::new(
                     RequestAdmissionConfig::disabled(),
                 )),
-                kiro_provider: None,
+
                 usage_recorder: Arc::new(UsageRecorder::new(10)),
                 prompt_cache: Arc::new(PromptCacheTracker::default()),
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
@@ -822,13 +645,13 @@ mod tests {
     fn test_router(keys: &[&str]) -> Router {
         let mut config = Config::default();
         config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
-        create_router_with_provider(
+        create_router(
             AnthropicRouterDependencies {
                 request_api_keys: Arc::new(RequestApiKeyStore::new(keys)),
                 request_admission: Arc::new(RequestAdmissionController::new(
                     RequestAdmissionConfig::disabled(),
                 )),
-                kiro_provider: None,
+
                 usage_recorder: Arc::new(UsageRecorder::new(10)),
                 prompt_cache: Arc::new(PromptCacheTracker::default()),
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
@@ -1019,111 +842,5 @@ mod tests {
         body.resize(body.len() + file_bytes, b'x');
         body.extend_from_slice(suffix.as_bytes());
         Bytes::from(body)
-    }
-
-    #[tokio::test]
-    async fn file_upload_route_accepts_exact_file_limit_and_rejects_one_byte_over_for_five_rounds()
-    {
-        const BOUNDARY: &str = "kiro-rs-file-limit-boundary";
-        let config = Config::default();
-        let app = create_router_with_provider(
-            AnthropicRouterDependencies {
-                request_api_keys: Arc::new(RequestApiKeyStore::new(["file-limit-key"])),
-                request_admission: Arc::new(RequestAdmissionController::new(
-                    RequestAdmissionConfig::disabled(),
-                )),
-                kiro_provider: None,
-                usage_recorder: Arc::new(UsageRecorder::new(10)),
-                prompt_cache: Arc::new(PromptCacheTracker::default()),
-                prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
-                pricing_catalog: Arc::new(PricingCatalog::new()),
-                model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                external_pool_manager: None,
-            },
-            AnthropicRouterConfig::from_runtime_config(&config),
-        );
-        let exact = multipart_file_body(BOUNDARY, crate::anthropic::files::MAX_FILE_BYTES);
-        let over = multipart_file_body(BOUNDARY, crate::anthropic::files::MAX_FILE_BYTES + 1);
-        assert!(exact.len() > MAX_MESSAGES_BODY_SIZE);
-        assert!(over.len() < MAX_FILE_UPLOAD_BODY_SIZE);
-
-        for round in 0..5 {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/v1/files")
-                        .header("x-api-key", "file-limit-key")
-                        .header(
-                            "content-type",
-                            format!("multipart/form-data; boundary={BOUNDARY}"),
-                        )
-                        .body(Body::from(exact.clone()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                axum::http::StatusCode::OK,
-                "round {round}"
-            );
-            let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let metadata: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
-            let file_id = metadata["id"].as_str().expect("uploaded file id");
-
-            let deleted = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("DELETE")
-                        .uri(format!("/v1/files/{file_id}"))
-                        .header("x-api-key", "file-limit-key")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                deleted.status(),
-                axum::http::StatusCode::OK,
-                "round {round}"
-            );
-
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/v1/files")
-                        .header("x-api-key", "file-limit-key")
-                        .header(
-                            "content-type",
-                            format!("multipart/form-data; boundary={BOUNDARY}"),
-                        )
-                        .body(Body::from(over.clone()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                "round {round}"
-            );
-            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            assert!(
-                String::from_utf8_lossy(&body).contains(&format!(
-                    "uploaded file exceeds {} bytes",
-                    crate::anthropic::files::MAX_FILE_BYTES
-                )),
-                "round {round}: over-limit file must reach the file-content guard"
-            );
-        }
     }
 }

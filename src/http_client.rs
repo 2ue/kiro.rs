@@ -4,7 +4,7 @@
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use reqwest::{Client, Proxy, Request, RequestBuilder, Response};
+use reqwest::{Client, Proxy, RequestBuilder, Response};
 use serde::Deserialize;
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -262,26 +262,6 @@ impl HttpSendError {
     }
 }
 
-/// The lowest-level cause of a send failure (for example "Connection reset by peer" or "Can't
-/// assign requested address"), without the request URL, for logs. The top-level reqwest message
-/// only says "error sending request", which cannot tell a local socket shortage from an
-/// upstream reset.
-pub fn send_error_cause(error: &HttpSendError) -> String {
-    let HttpSendError::Request(error) = error else {
-        return error.to_string();
-    };
-    let mut cause: &dyn std::error::Error = error;
-    while let Some(source) = cause.source() {
-        cause = source;
-    }
-    let text = cause.to_string();
-    if std::ptr::addr_eq(cause, error as &dyn std::error::Error) {
-        // No deeper cause: drop the URL reqwest appends to its own message.
-        return text.split(" for url (").next().unwrap_or(&text).to_string();
-    }
-    text
-}
-
 impl fmt::Display for HttpSendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -344,28 +324,6 @@ pub async fn send_with_response_header_timeout(
     }
 
     match deadline_first_timeout(Duration::from_secs(timeout_secs), request.send()).await {
-        Ok(result) => result.map_err(HttpSendError::Request),
-        Err(_) => Err(HttpSendError::ResponseHeaderTimeout { timeout_secs }),
-    }
-}
-
-/// Execute an already-built request with a response-header deadline.
-///
-/// Callers that account real HTTP sends can build first, then reserve their send budget, and
-/// finally execute here. A request-builder failure therefore cannot consume a send attempt.
-pub async fn execute_with_response_header_timeout(
-    client: &Client,
-    request: Request,
-    timeout_secs: u64,
-) -> Result<Response, HttpSendError> {
-    if timeout_secs == 0 {
-        return client
-            .execute(request)
-            .await
-            .map_err(HttpSendError::Request);
-    }
-
-    match deadline_first_timeout(Duration::from_secs(timeout_secs), client.execute(request)).await {
         Ok(result) => result.map_err(HttpSendError::Request),
         Err(_) => Err(HttpSendError::ResponseHeaderTimeout { timeout_secs }),
     }

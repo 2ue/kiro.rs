@@ -4,19 +4,17 @@ use anyhow::Context;
 use chrono::{Datelike, Duration, FixedOffset, Timelike, Utc};
 use fastrand::Rng;
 use serde_json::json;
-use sqlx::Row;
 
 use crate::anthropic::usage::{
     ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRecord, UsageRecordStatus, UsageRouteKind,
     UsageRouteSubtype, UsageSource,
 };
 use crate::external_pool::CreateExternalPoolRequest;
-use crate::kiro::model::credentials::KiroCredentials;
 
-use super::postgres::{CredentialAccountInfoRow, PostgresStore, PostgresUsageStore};
+use super::postgres::{PostgresStore, PostgresUsageStore};
 
 const DEMO_DATABASE_PREFIX: &str = "kiro_overview_demo_";
-const DEMO_ACCOUNT_PREFIX: &str = "demo-acc-";
+
 const DEMO_POOL_NAMES: [&str; 3] = ["demo-pool-alpha", "demo-pool-beta", "demo-pool-gamma"];
 const DEMO_MODELS: [&str; 3] = ["claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5"];
 const DEMO_ENDPOINTS: [&str; 4] = [
@@ -41,76 +39,14 @@ pub struct UsageDemoSeedReport {
     pub database: String,
     pub days: u32,
     pub records: usize,
-    pub local_records: usize,
     pub external_records: usize,
     pub accounts: usize,
     pub pools: usize,
 }
 
-/// Spreads demo external traffic over the real fallback reasons so the overview
-/// "why external" trend has every category; a capacity crunch skews to capacity.
-fn demo_external_route(
-    rng: &mut fastrand::Rng,
-    capacity_crunch: bool,
-) -> (Option<UsageRouteSubtype>, Option<String>, Option<String>) {
-    let roll = rng.usize(0..100);
-    let fallback = |subtype, reason: &str| (Some(subtype), Some(reason.to_string()), None);
-    if capacity_crunch {
-        return if roll < 80 {
-            fallback(
-                UsageRouteSubtype::ExternalFallbackPreflight,
-                "local_capacity_full",
-            )
-        } else {
-            fallback(
-                UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
-                "local_capacity_exhausted",
-            )
-        };
-    }
-    match roll {
-        0..=44 => (
-            Some(UsageRouteSubtype::ExternalDirectPolicy),
-            None,
-            Some("demo_seed".to_string()),
-        ),
-        45..=69 => fallback(
-            UsageRouteSubtype::ExternalFallbackPreflight,
-            "local_capacity_full",
-        ),
-        70..=84 => fallback(
-            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
-            "local_transient_exhausted",
-        ),
-        85..=93 => fallback(
-            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
-            "unsupported_model",
-        ),
-        _ => fallback(
-            UsageRouteSubtype::ExternalFallbackPreflight,
-            "local_scheduler_redis_degraded",
-        ),
-    }
-}
-
-/// Cache behaviour that makes the hit-rate views tell a story: sticky local
-/// traffic and direct-policy pools reuse the prompt cache well, while requests
-/// that overflowed from the local pool lose stickiness and mostly miss. A
-/// nightly redeploy window (03:00-04:59) resets local caches.
-fn demo_cache_split(
-    rng: &mut fastrand::Rng,
-    input_tokens: i32,
-    is_external: bool,
-    fallback_reason: Option<&str>,
-    hour: u32,
-) -> (i32, i32) {
-    let (hit_probability, read_share) = match (is_external, fallback_reason) {
-        (false, _) if (3..=4).contains(&hour) => (35, 0.70),
-        (false, _) => (92, 0.90),
-        (true, None) => (88, 0.86),
-        (true, Some("local_capacity_full" | "local_capacity_exhausted")) => (45, 0.75),
-        (true, Some(_)) => (30, 0.70),
-    };
+/// Simulates warm and cold upstream prompt caches.
+fn demo_cache_split(rng: &mut fastrand::Rng, input_tokens: i32) -> (i32, i32) {
+    let (hit_probability, read_share) = (88, 0.86);
     if rng.usize(0..100) < hit_probability {
         let jitter = 0.9 + rng.f64() * 0.1;
         let read = (f64::from(input_tokens) * read_share * jitter) as i32;
@@ -153,8 +89,6 @@ pub async fn seed_usage_demo(
         clear_usage_tables(store).await?;
     }
 
-    let accounts = ensure_demo_accounts(store).await?;
-    seed_demo_account_info(store, &accounts).await?;
     let pools = ensure_demo_pools(store).await?;
     let usage = PostgresUsageStore::new(Arc::new(store.clone()));
     let now = Utc::now();
@@ -163,7 +97,6 @@ pub async fn seed_usage_demo(
     let mut rng = Rng::with_seed(seed);
     let mut batch = Vec::with_capacity(DEMO_BATCH_SIZE);
     let mut total = 0usize;
-    let mut local_records = 0usize;
     let mut external_records = 0usize;
 
     for day in 0..days {
@@ -182,28 +115,10 @@ pub async fn seed_usage_demo(
                 chrono::Weekday::Sat | chrono::Weekday::Sun
             );
             let weekend_factor = if is_weekend { 0.7 } else { 1.0 };
-            let external_ratio = if day == 2 && (11..=15).contains(&hour) {
-                0.60
-            } else {
-                0.28
-            };
-            let is_external = rng.f64() < external_ratio;
             let model = choose_model(&mut rng);
-            let capacity_crunch = day == 2 && (11..=15).contains(&hour);
-            let (route_subtype, fallback_reason, direct_policy_reason) = if is_external {
-                demo_external_route(&mut rng, capacity_crunch)
-            } else {
-                (None, None, None)
-            };
             let input_tokens = 24_000 + rng.i32(0..96_000);
             let output_tokens = 600 + rng.i32(0..3_000);
-            let (cache_read, cache_creation) = demo_cache_split(
-                &mut rng,
-                input_tokens,
-                is_external,
-                fallback_reason.as_deref(),
-                hour,
-            );
+            let (cache_read, cache_creation) = demo_cache_split(&mut rng, input_tokens);
             let total_input_tokens = input_tokens;
             let billable_input_tokens = (input_tokens - cache_read - cache_creation).max(0);
             let base_cost = estimate_cost(
@@ -213,7 +128,7 @@ pub async fn seed_usage_demo(
                 cache_read,
                 cache_creation,
             ) * weekend_factor;
-            let error_spike = day == 4 && (14..=15).contains(&hour) && !is_external;
+            let error_spike = day == 4 && (14..=15).contains(&hour);
             let status = choose_status(&mut rng, error_spike);
             let pricing_available = rng.usize(0..100) >= 3;
             let (
@@ -223,7 +138,7 @@ pub async fn seed_usage_demo(
                 estimated_cost_usd,
                 original_cost_usd,
                 billing,
-            ) = if is_external {
+            ) = {
                 let pool = choose_pool(&mut rng, &pools);
                 let floor = rng.usize(0..100) < pool.floor_probability;
                 let raw_cost_usd = base_cost * (0.73 + rng.f64() * 0.08);
@@ -247,8 +162,8 @@ pub async fn seed_usage_demo(
                     cache_creation_1h_input_tokens: 0,
                 };
                 (
-                    None,
-                    None,
+                    None::<u64>,
+                    None::<String>,
                     Some((pool, floor)),
                     billable_cost_usd,
                     raw_cost_usd,
@@ -275,20 +190,6 @@ pub async fn seed_usage_demo(
                         usage_candidate_path: None,
                         body_usage_projection_applied: true,
                     }),
-                )
-            } else {
-                // Keep two disabled accounts in the historical usage set so the
-                // UI can demonstrate "consumed history" versus "spendable balance".
-                let credential_index = rng.usize(0..22);
-                let credential = &accounts[credential_index];
-                let original_cost_usd = base_cost * (1.10 + rng.f64() * 0.20);
-                (
-                    credential.id,
-                    credential.email.clone(),
-                    None,
-                    base_cost,
-                    original_cost_usd,
-                    None,
                 )
             };
             let (external_pool_id, external_pool_name) = pool
@@ -338,21 +239,8 @@ pub async fn seed_usage_demo(
                 cache_creation_input_tokens: cache_creation,
                 cache_creation_5m_input_tokens: cache_creation,
                 cache_creation_1h_input_tokens: 0,
-                estimated_cost_usd: if is_external || pricing_available {
-                    estimated_cost_usd
-                } else {
-                    0.0
-                },
-                original_cost_usd: if is_external || pricing_available {
-                    original_cost_usd
-                } else {
-                    0.0
-                },
-                kiro_metering_usage: if is_external {
-                    0.0
-                } else {
-                    0.1 + rng.f64() * 1.9
-                },
+                estimated_cost_usd,
+                original_cost_usd,
                 pricing_available,
                 pricing_model: Some(model.to_string()),
                 duration_ms,
@@ -360,27 +248,9 @@ pub async fn seed_usage_demo(
                 response_latency_ms: Some(duration_ms),
                 latency_trace: None,
                 simulated: false,
-                sticky_bound: rng.usize(0..100) < 8,
-                fallback_from_sticky: false,
-                credential_attempts: Vec::new(),
-                route_kind: Some(if is_external {
-                    UsageRouteKind::ExternalPool
-                } else {
-                    UsageRouteKind::LocalCredential
-                }),
-                route_subtype: Some(route_subtype.unwrap_or_else(|| {
-                    if status != UsageRecordStatus::Success {
-                        UsageRouteSubtype::LocalErrorNoFallback
-                    } else if rng.usize(0..100) < 3 {
-                        UsageRouteSubtype::LocalRescueAfterExternal
-                    } else {
-                        UsageRouteSubtype::LocalSuccess
-                    }
-                })),
-                fallback_reason,
-                direct_policy_reason,
-                local_attempted: Some(!is_external),
-                local_preflight: None,
+                route_kind: Some(UsageRouteKind::ExternalPool),
+                route_subtype: Some(UsageRouteSubtype::External),
+
                 external_pool_id,
                 external_pool_name,
                 external_attempts: Vec::new(),
@@ -404,11 +274,7 @@ pub async fn seed_usage_demo(
                 payload_breakdown: None,
                 payload_guard_report: None,
             };
-            if is_external {
-                external_records += 1;
-            } else {
-                local_records += 1;
-            }
+            external_records += 1;
             batch.push(record);
             total += 1;
             if batch.len() >= DEMO_BATCH_SIZE {
@@ -424,9 +290,8 @@ pub async fn seed_usage_demo(
         database,
         days,
         records: total,
-        local_records,
         external_records,
-        accounts: accounts.len(),
+        accounts: pools.len(),
         pools: pools.len(),
     })
 }
@@ -435,130 +300,11 @@ async fn clear_usage_tables(store: &PostgresStore) -> anyhow::Result<()> {
     sqlx::query(
         "TRUNCATE TABLE usage_records, usage_cleanup_watermarks, usage_cleanup_jobs, \
          usage_rollup_totals, usage_rollup_time_buckets, usage_cache_read_totals, \
-         usage_cache_read_rollup_time_buckets, usage_duration_rollup_time_buckets, \
-         usage_credential_cost_summary",
+         usage_cache_read_rollup_time_buckets, usage_duration_rollup_time_buckets",
     )
     .execute(store.pool())
     .await
     .context("清空 demo usage 表失败")?;
-    Ok(())
-}
-
-async fn ensure_demo_accounts(store: &PostgresStore) -> anyhow::Result<Vec<KiroCredentials>> {
-    let rows = sqlx::query(
-        "SELECT id, data, revision FROM credentials WHERE deleted_at IS NULL ORDER BY id ASC",
-    )
-    .fetch_all(store.pool())
-    .await?;
-    let mut accounts = Vec::new();
-    for row in rows {
-        let id: i64 = row.try_get("id")?;
-        let revision: i64 = row.try_get("revision")?;
-        let value: serde_json::Value = row.try_get("data")?;
-        let mut credential: KiroCredentials = serde_json::from_value(value)?;
-        credential.id = Some(id.max(0) as u64);
-        credential.storage_revision = revision.max(0) as u64;
-        if credential
-            .email
-            .as_deref()
-            .is_some_and(|email| email.starts_with(DEMO_ACCOUNT_PREFIX))
-        {
-            accounts.push(credential);
-        }
-    }
-    accounts.sort_by_key(|credential| credential.id);
-    for index in accounts.len()..24 {
-        let credential = KiroCredentials {
-            email: Some(format!(
-                "demo-acc-{index_plus_one:02}@example.com",
-                index_plus_one = index + 1
-            )),
-            refresh_token: Some(format!("demo-refresh-token-{index:02}")),
-            auth_method: Some("social".to_string()),
-            provider: Some("Demo".to_string()),
-            subscription_title: Some(if index < 2 {
-                "KIRO STUDENT".to_string()
-            } else if index < 20 {
-                "KIRO PRO+".to_string()
-            } else {
-                "KIRO FREE".to_string()
-            }),
-            disabled: index >= 20,
-            endpoint: Some("ide".to_string()),
-            ..Default::default()
-        };
-        accounts.push(store.insert_credential(&credential).await?);
-    }
-    for (index, account) in accounts.iter_mut().enumerate() {
-        let expected_title = if index < 2 {
-            "KIRO STUDENT"
-        } else if index < 20 {
-            "KIRO PRO+"
-        } else {
-            "KIRO FREE"
-        };
-        if account.subscription_title.as_deref() == Some(expected_title) {
-            continue;
-        }
-        let mut updated = account.clone();
-        updated.subscription_title = Some(expected_title.to_string());
-        if let Some(saved) = store
-            .save_credentials(std::slice::from_ref(&updated))
-            .await?
-            .into_iter()
-            .next()
-        {
-            *account = saved;
-        }
-    }
-    Ok(accounts)
-}
-
-async fn seed_demo_account_info(
-    store: &PostgresStore,
-    accounts: &[KiroCredentials],
-) -> anyhow::Result<()> {
-    let checked_at = Utc::now().to_rfc3339();
-    for (index, account) in accounts.iter().enumerate() {
-        let Some(account_id) = account.id else {
-            continue;
-        };
-        let credit_base = 1_000.0 + (index as f64 * 75.0);
-        let credit_bonus = 120.0 + ((index % 4) as f64 * 25.0);
-        let credit_limit = credit_base + credit_bonus;
-        let credit_remaining = if account.disabled {
-            260.0 + ((index % 3) as f64 * 35.0)
-        } else {
-            520.0 + (((index * 37) % 320) as f64)
-        };
-        // Keep the monthly usage quota empty so the admin credit snapshot
-        // preserves the deterministic demo credit fields below.
-        let usage_limit = 0.0;
-        let current_usage = 0.0;
-        store
-            .save_credential_account_info(
-                account_id,
-                &CredentialAccountInfoRow {
-                    subscription_title: account.subscription_title.clone(),
-                    current_usage,
-                    usage_limit,
-                    remaining: (usage_limit - current_usage).max(0.0),
-                    usage_percentage: 0.0,
-                    credit_limit,
-                    credit_remaining,
-                    credit_base,
-                    credit_bonus,
-                    overage_status: Some("enabled".to_string()),
-                    overage_capability: Some("demo".to_string()),
-                    overage_cap: 0.0,
-                    overage_rate: 0.0,
-                    current_overages: 0.0,
-                    next_reset_at: None,
-                    checked_at: checked_at.clone(),
-                },
-            )
-            .await?;
-    }
     Ok(())
 }
 

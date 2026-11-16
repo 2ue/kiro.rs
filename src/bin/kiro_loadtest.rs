@@ -22,7 +22,6 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
-use crc::{CRC_32_ISO_HDLC, Crc};
 use futures::{Stream, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -35,7 +34,7 @@ const LOADTEST_SSE_EVENT_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "kiro_loadtest")]
-#[command(about = "Kiro proxy load/chaos test helper")]
+#[command(about = "Anthropic proxy load/chaos test helper")]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:9022")]
     base_url: String,
@@ -93,10 +92,6 @@ struct Args {
     fake_listen: Option<SocketAddr>,
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     fake_only: bool,
-    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
-    fake_kiro_eventstream: bool,
-    #[arg(long, value_enum, default_value_t = FakeKiroUsageMode::Reported)]
-    fake_kiro_usage: FakeKiroUsageMode,
     #[arg(long, default_value_t = 1500)]
     fake_delay_ms: u64,
     #[arg(long, default_value_t = 10)]
@@ -126,21 +121,12 @@ enum Scenario {
     RateLimit429,
     ServerError500,
     InvalidToolFormat,
-    CachePointReject,
     ToolUseStream,
     LongStream,
     MalformedSse,
     ClientDrop,
     RecoveryAfterBurst,
     MixedChaos,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum FakeKiroUsageMode {
-    Reported,
-    AllZero,
-    MetadataThenZero,
-    Split,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -275,8 +261,7 @@ struct FakeServerState {
     stream_chunks: usize,
     stream_chunk_delay: Duration,
     fake_tool_input_chars: usize,
-    kiro_eventstream: bool,
-    kiro_usage: FakeKiroUsageMode,
+
     capture_dir: Option<PathBuf>,
     counter: Arc<AtomicU64>,
 }
@@ -300,13 +285,12 @@ async fn main() -> anyhow::Result<()> {
             stream_chunks: args.fake_stream_chunks.max(1),
             stream_chunk_delay: Duration::from_millis(args.fake_stream_chunk_delay_ms),
             fake_tool_input_chars: args.fake_tool_input_chars,
-            kiro_eventstream: args.fake_kiro_eventstream,
-            kiro_usage: args.fake_kiro_usage,
+
             capture_dir: args.fake_capture_dir,
             counter: Arc::new(AtomicU64::new(0)),
         };
         let server = tokio::spawn(run_fake_server(addr, state));
-        tracing::info!("fake Kiro server listening on http://{}", addr);
+        tracing::info!("fake Anthropic server listening on http://{}", addr);
         if args.fake_only {
             return server.await.context("fake server task failed")?;
         }
@@ -1493,16 +1477,10 @@ async fn fake_handler(
     let sequence = state.counter.fetch_add(1, Ordering::Relaxed) + 1;
     let request_id = format!("fake_req_{}", sequence);
     let request = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| json!({}));
-    if is_kiro_model_discovery_request(&uri, &headers) {
-        capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
-        return fake_kiro_model_discovery_message(&request_id);
-    }
     let stream = request
         .get("stream")
         .and_then(Value::as_bool)
-        .unwrap_or_else(|| {
-            wants_stream(&headers) || wants_kiro_eventstream(&state, &uri, &headers)
-        });
+        .unwrap_or_else(|| wants_stream(&headers));
     let scenario = effective_fake_scenario(&state, sequence);
     capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
     let thinking = body_requests_thinking(&request);
@@ -1526,27 +1504,7 @@ async fn fake_handler(
             "invalid_request_error",
             "Invalid tool use format.",
         ),
-        Scenario::CachePointReject => {
-            if body_contains_cache_point(&request) {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    &request_id,
-                    "invalid_request_error",
-                    "Invalid tool use format.",
-                )
-            } else if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
-                }
-            } else {
-                fake_json_message(&request_id)
-            }
-        }
+
         Scenario::JsonException200 => (
             StatusCode::OK,
             [
@@ -1568,26 +1526,13 @@ async fn fake_handler(
         ),
         Scenario::StreamIdleTimeout => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        vec![(
-                            state.delay,
-                            kiro_event_frame(
-                                "assistantResponseEvent",
-                                json!({"content":"partial response"}),
-                            ),
-                        )],
-                    )
-                } else {
-                    sse_response(
-                        request_id,
-                        vec![(
-                            state.delay,
-                            "data: {\"type\":\"message_start\"}\n\n".to_string(),
-                        )],
-                    )
-                }
+                sse_response(
+                    request_id,
+                    vec![(
+                        state.delay,
+                        "data: {\"type\":\"message_start\"}\n\n".to_string(),
+                    )],
+                )
             } else {
                 sleep(state.delay).await;
                 fake_json_message(&request_id)
@@ -1595,14 +1540,7 @@ async fn fake_handler(
         }
         Scenario::SlowFirstByte => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        normal_kiro_events(state.delay, false, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, normal_sse_events(state.delay, false))
-                }
+                sse_response(request_id, normal_sse_events(state.delay, false))
             } else {
                 sleep(state.delay).await;
                 fake_json_message(&request_id)
@@ -1611,14 +1549,7 @@ async fn fake_handler(
         Scenario::RandomSlowFirstByte => {
             let delay = random_slow_first_byte_delay(state.delay, sequence);
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        normal_kiro_events(delay, thinking, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, normal_sse_events(delay, thinking))
-                }
+                sse_response(request_id, normal_sse_events(delay, thinking))
             } else {
                 sleep(delay).await;
                 fake_json_message(&request_id)
@@ -1627,14 +1558,7 @@ async fn fake_handler(
         Scenario::DenseSlowFirstByte => {
             let delay = dense_slow_first_byte_delay(state.delay, sequence);
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        normal_kiro_events(delay, thinking, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, normal_sse_events(delay, thinking))
-                }
+                sse_response(request_id, normal_sse_events(delay, thinking))
             } else {
                 sleep(delay).await;
                 fake_json_message(&request_id)
@@ -1643,14 +1567,7 @@ async fn fake_handler(
         Scenario::TieredSlowFirstByte => {
             let delay = tiered_slow_first_byte_delay(sequence);
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        normal_kiro_events(delay, thinking, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, normal_sse_events(delay, thinking))
-                }
+                sse_response(request_id, normal_sse_events(delay, thinking))
             } else {
                 sleep(delay).await;
                 fake_json_message(&request_id)
@@ -1658,14 +1575,7 @@ async fn fake_handler(
         }
         Scenario::SlowThinkingThenText => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        thinking_kiro_events(state.delay, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, thinking_sse_events(state.delay))
-                }
+                sse_response(request_id, thinking_sse_events(state.delay))
             } else {
                 sleep(state.delay).await;
                 fake_json_message(&request_id)
@@ -1673,24 +1583,7 @@ async fn fake_handler(
         }
         Scenario::ToolUseStream => {
             if stream {
-                if state.kiro_eventstream {
-                    if body_contains_tool_result(&request) || !body_contains_tools(&request) {
-                        kiro_eventstream_response(
-                            request_id,
-                            normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
-                        )
-                    } else {
-                        kiro_eventstream_response(
-                            request_id,
-                            tool_use_kiro_events(
-                                select_fake_tool_name(&request),
-                                &request,
-                                state.kiro_usage,
-                                state.fake_tool_input_chars,
-                            ),
-                        )
-                    }
-                } else if body_contains_tool_result(&request) || !body_contains_tools(&request) {
+                if body_contains_tool_result(&request) || !body_contains_tools(&request) {
                     sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
                 } else {
                     sse_response(
@@ -1708,26 +1601,14 @@ async fn fake_handler(
         }
         Scenario::LongStream => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        long_stream_kiro_events(
-                            state.delay,
-                            state.stream_chunks,
-                            state.stream_chunk_delay,
-                            state.kiro_usage,
-                        ),
-                    )
-                } else {
-                    sse_response(
-                        request_id,
-                        long_stream_sse_events(
-                            state.delay,
-                            state.stream_chunks,
-                            state.stream_chunk_delay,
-                        ),
-                    )
-                }
+                sse_response(
+                    request_id,
+                    long_stream_sse_events(
+                        state.delay,
+                        state.stream_chunks,
+                        state.stream_chunk_delay,
+                    ),
+                )
             } else {
                 sleep(
                     state
@@ -1740,28 +1621,14 @@ async fn fake_handler(
         }
         Scenario::NormalNonStream => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
-                }
+                sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
             } else {
                 fake_json_message(&request_id)
             }
         }
         Scenario::NormalStream | Scenario::ClientDrop | Scenario::RecoveryAfterBurst => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
-                        request_id,
-                        normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
-                    )
-                } else {
-                    sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
-                }
+                sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
             } else {
                 fake_json_message(&request_id)
             }
@@ -1828,43 +1695,7 @@ fn wants_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.contains("text/event-stream")
-                || value.contains("application/vnd.amazon.eventstream")
-        })
-}
-
-fn wants_kiro_eventstream(state: &FakeServerState, uri: &Uri, headers: &HeaderMap) -> bool {
-    if !state.kiro_eventstream {
-        return false;
-    }
-    if uri.path().contains("generateAssistantResponse") {
-        return true;
-    }
-    headers
-        .get("x-amz-target")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|target| target.ends_with(".GenerateAssistantResponse"))
-}
-
-fn is_kiro_model_discovery_request(uri: &Uri, headers: &HeaderMap) -> bool {
-    if uri.path().ends_with("/ListAvailableModels") {
-        return true;
-    }
-    headers
-        .get("x-amz-target")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|target| target.ends_with(".ListAvailableModels"))
-}
-
-fn body_contains_cache_point(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => map
-            .iter()
-            .any(|(key, value)| key == "cachePoint" || body_contains_cache_point(value)),
-        Value::Array(items) => items.iter().any(body_contains_cache_point),
-        _ => false,
-    }
+        .is_some_and(|value| value.contains("text/event-stream"))
 }
 
 fn body_contains_tool_result(value: &Value) -> bool {
@@ -1875,11 +1706,6 @@ fn body_contains_tool_result(value: &Value) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|kind| kind == "tool_result")
             {
-                return true;
-            }
-            if map.iter().any(|(key, value)| {
-                key == "toolResults" && value.as_array().is_some_and(|items| !items.is_empty())
-            }) {
                 return true;
             }
             map.values().any(body_contains_tool_result)
@@ -1925,25 +1751,12 @@ fn body_contains_tools(value: &Value) -> bool {
 }
 
 fn collect_tool_names(value: &Value, names: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(name) = map
-                .get("toolSpecification")
-                .and_then(|spec| spec.get("name"))
-                .and_then(Value::as_str)
-            {
-                names.push(name.to_string());
-            }
-            for value in map.values() {
-                collect_tool_names(value, names);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_tool_names(item, names);
-            }
-        }
-        _ => {}
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        names.extend(
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string)),
+        );
     }
 }
 
@@ -2006,22 +1819,12 @@ fn body_requests_thinking(value: &Value) -> bool {
             {
                 return true;
             }
-            if map
-                .get("additionalModelRequestFields")
-                .is_some_and(native_reasoning_fields_request_thinking)
-            {
-                return true;
-            }
             if native_reasoning_fields_request_thinking(value) {
                 return true;
             }
             map.values().any(body_requests_thinking)
         }
         Value::Array(items) => items.iter().any(body_requests_thinking),
-        Value::String(text) => {
-            text.contains("<thinking_mode>enabled</thinking_mode>")
-                || text.contains("<thinking_mode>adaptive</thinking_mode>")
-        }
         _ => false,
     }
 }
@@ -2086,49 +1889,6 @@ fn fake_json_message(request_id: &str) -> Response {
         .into_response()
 }
 
-fn fake_kiro_model_discovery_message(request_id: &str) -> Response {
-    (
-        StatusCode::OK,
-        [("request-id", request_id), ("x-amzn-requestid", request_id)],
-        Json(json!({
-            "models": [
-                fake_kiro_model("claude-sonnet-4"),
-                fake_kiro_model("claude-sonnet-4-20250514"),
-                fake_kiro_model("claude-sonnet-4.6")
-            ],
-            "nextToken": null
-        })),
-    )
-        .into_response()
-}
-
-fn fake_kiro_model(model_id: &str) -> Value {
-    json!({
-        "modelId": model_id,
-        "modelName": format!("Kiro loadtest fixture {model_id}"),
-        "supportedInputTypes": ["TEXT", "IMAGE"],
-        "tokenLimits": {
-            "maxInputTokens": 1000000,
-            "maxOutputTokens": 64000
-        },
-        "additionalModelRequestFieldsSchema": {
-            "type": "object",
-            "properties": {
-                "output_config": {
-                    "type": "object",
-                    "properties": {
-                        "effort": {
-                            "type": "string",
-                            "enum": ["low", "medium", "high", "max"],
-                            "default": "high"
-                        }
-                    }
-                }
-            }
-        }
-    })
-}
-
 fn sse_response(request_id: String, events: Vec<(Duration, String)>) -> Response {
     let body_stream = delayed_event_stream(events);
     Response::builder()
@@ -2141,32 +1901,8 @@ fn sse_response(request_id: String, events: Vec<(Duration, String)>) -> Response
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn kiro_eventstream_response(request_id: String, events: Vec<(Duration, Vec<u8>)>) -> Response {
-    let body_stream = delayed_byte_stream(events);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header("request-id", &request_id)
-        .header("x-amzn-requestid", &request_id)
-        .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
 fn delayed_event_stream(
     events: Vec<(Duration, String)>,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    stream::unfold(events.into_iter(), |mut iter| async move {
-        let (delay, event) = iter.next()?;
-        if !delay.is_zero() {
-            sleep(delay).await;
-        }
-        Some((Ok(Bytes::from(event)), iter))
-    })
-}
-
-fn delayed_byte_stream(
-    events: Vec<(Duration, Vec<u8>)>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     stream::unfold(events.into_iter(), |mut iter| async move {
         let (delay, event) = iter.next()?;
@@ -2215,149 +1951,6 @@ fn normal_sse_events(first_delay: Duration, thinking: bool) -> Vec<(Duration, St
     events
 }
 
-fn fake_kiro_token_usage(
-    mode: FakeKiroUsageMode,
-    uncached_input_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_write_input_tokens: u64,
-    output_tokens: u64,
-) -> Value {
-    let (uncached_input_tokens, cache_read_input_tokens, cache_write_input_tokens, output_tokens) =
-        match mode {
-            FakeKiroUsageMode::Reported
-            | FakeKiroUsageMode::MetadataThenZero
-            | FakeKiroUsageMode::Split => (
-                uncached_input_tokens,
-                cache_read_input_tokens,
-                cache_write_input_tokens,
-                output_tokens,
-            ),
-            FakeKiroUsageMode::AllZero => (0, 0, 0, 0),
-        };
-    let total_tokens = uncached_input_tokens
-        .saturating_add(cache_read_input_tokens)
-        .saturating_add(cache_write_input_tokens)
-        .saturating_add(output_tokens);
-
-    json!({
-        "uncachedInputTokens": uncached_input_tokens,
-        "cacheReadInputTokens": cache_read_input_tokens,
-        "cacheWriteInputTokens": cache_write_input_tokens,
-        "outputTokens": output_tokens,
-        "totalTokens": total_tokens
-    })
-}
-
-fn fake_kiro_token_usage_pair(
-    mode: FakeKiroUsageMode,
-    uncached_input_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_write_input_tokens: u64,
-    output_tokens: u64,
-) -> (Value, Value) {
-    let reported = || {
-        fake_kiro_token_usage(
-            FakeKiroUsageMode::Reported,
-            uncached_input_tokens,
-            cache_read_input_tokens,
-            cache_write_input_tokens,
-            output_tokens,
-        )
-    };
-    let zero = || fake_kiro_token_usage(FakeKiroUsageMode::AllZero, 0, 0, 0, 0);
-
-    match mode {
-        FakeKiroUsageMode::Reported => {
-            let usage = reported();
-            (usage.clone(), usage)
-        }
-        FakeKiroUsageMode::AllZero => {
-            let usage = zero();
-            (usage.clone(), usage)
-        }
-        FakeKiroUsageMode::MetadataThenZero => {
-            let usage = fake_kiro_token_usage(
-                FakeKiroUsageMode::Reported,
-                uncached_input_tokens,
-                cache_read_input_tokens.max(2),
-                cache_write_input_tokens.max(3),
-                output_tokens,
-            );
-            (usage, zero())
-        }
-        FakeKiroUsageMode::Split => {
-            let cache_read_input_tokens = cache_read_input_tokens.max(2);
-            let cache_write_input_tokens = cache_write_input_tokens.max(3);
-            let total_tokens = uncached_input_tokens
-                .saturating_add(cache_read_input_tokens)
-                .saturating_add(cache_write_input_tokens)
-                .saturating_add(output_tokens);
-            (
-                json!({
-                    "uncachedInputTokens": uncached_input_tokens,
-                    "cacheReadInputTokens": cache_read_input_tokens,
-                    "cacheWriteInputTokens": cache_write_input_tokens,
-                    "outputTokens": 0,
-                    "totalTokens": 0
-                }),
-                json!({
-                    "uncachedInputTokens": 0,
-                    "cacheReadInputTokens": 0,
-                    "cacheWriteInputTokens": 0,
-                    "outputTokens": output_tokens,
-                    "totalTokens": total_tokens
-                }),
-            )
-        }
-    }
-}
-
-fn normal_kiro_events(
-    first_delay: Duration,
-    thinking: bool,
-    usage_mode: FakeKiroUsageMode,
-) -> Vec<(Duration, Vec<u8>)> {
-    let mut events = Vec::new();
-    let (metadata_usage, message_metadata_usage) =
-        fake_kiro_token_usage_pair(usage_mode, 10, 0, 0, if thinking { 9 } else { 3 });
-    if thinking {
-        events.push((
-            Duration::ZERO,
-            kiro_event_frame(
-                "reasoningContentEvent",
-                json!({"text":"thinking through the loadtest path","signature":"fake-signature"}),
-            ),
-        ));
-    }
-    events.extend([
-        (
-            first_delay,
-            kiro_event_frame("assistantResponseEvent", json!({"content":"fake response"})),
-        ),
-        (
-            Duration::ZERO,
-            kiro_event_frame(
-                "metadataEvent",
-                json!({
-                    "tokenUsage": metadata_usage
-                }),
-            ),
-        ),
-        (
-            Duration::ZERO,
-            kiro_event_frame(
-                "messageMetadataEvent",
-                json!({
-                    "conversationId": "fake-conversation",
-                    "utteranceId": "fake-utterance",
-                    "tokenUsage": message_metadata_usage
-                }),
-            ),
-        ),
-    ]);
-    events
-}
-
 fn long_stream_sse_events(
     first_delay: Duration,
     chunks: usize,
@@ -2400,48 +1993,6 @@ fn long_stream_sse_events(
     events
 }
 
-fn long_stream_kiro_events(
-    first_delay: Duration,
-    chunks: usize,
-    chunk_delay: Duration,
-    usage_mode: FakeKiroUsageMode,
-) -> Vec<(Duration, Vec<u8>)> {
-    let chunks = chunks.max(1);
-    let mut events = Vec::with_capacity(chunks.saturating_add(2));
-    let (metadata_usage, message_metadata_usage) =
-        fake_kiro_token_usage_pair(usage_mode, 10, 0, 0, 64);
-    for index in 0..chunks {
-        events.push((
-            if index == 0 { first_delay } else { chunk_delay },
-            kiro_event_frame(
-                "assistantResponseEvent",
-                json!({"content": format!("stream chunk {index}; ")}),
-            ),
-        ));
-    }
-    events.push((
-        Duration::ZERO,
-        kiro_event_frame(
-            "metadataEvent",
-            json!({
-                "tokenUsage": metadata_usage
-            }),
-        ),
-    ));
-    events.push((
-        Duration::ZERO,
-        kiro_event_frame(
-            "messageMetadataEvent",
-            json!({
-                "conversationId": "fake-conversation",
-                "utteranceId": "fake-utterance",
-                "tokenUsage": message_metadata_usage
-            }),
-        ),
-    ));
-    events
-}
-
 fn thinking_sse_events(text_delay: Duration) -> Vec<(Duration, String)> {
     vec![
         (
@@ -2459,34 +2010,6 @@ fn thinking_sse_events(text_delay: Duration) -> Vec<(Duration, String)> {
         (
             Duration::ZERO,
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
-        ),
-    ]
-}
-
-fn thinking_kiro_events(
-    text_delay: Duration,
-    usage_mode: FakeKiroUsageMode,
-) -> Vec<(Duration, Vec<u8>)> {
-    vec![
-        (
-            Duration::ZERO,
-            kiro_event_frame(
-                "reasoningContentEvent",
-                json!({"text":"real thinking chunk","signature":"fake-signature"}),
-            ),
-        ),
-        (
-            text_delay,
-            kiro_event_frame("assistantResponseEvent", json!({"content":"visible text"})),
-        ),
-        (
-            Duration::ZERO,
-            kiro_event_frame(
-                "metadataEvent",
-                json!({
-                    "tokenUsage": fake_kiro_token_usage(usage_mode, 10, 0, 0, 8)
-                }),
-            ),
         ),
     ]
 }
@@ -2539,7 +2062,7 @@ fn is_schema_probe_tool_name(name: &str) -> bool {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(|ch| ch.to_lowercase())
         .collect();
-    normalized == "schemaprobe" || normalized.starts_with("schemaprobehash")
+    normalized == "schemaprobe"
 }
 
 fn schema_properties_from_schema(schema: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -2559,23 +2082,18 @@ fn sanitized_schema_probe_key_from_spec(spec: &Value) -> Option<String> {
         return None;
     }
     let properties = map
-        .get("inputSchema")
-        .or_else(|| map.get("input_schema"))
+        .get("input_schema")
         .and_then(schema_properties_from_schema)?;
     properties
         .keys()
-        .find(|key| key.starts_with("key") && key.len() == 19)
+        .find(|key| key.as_str() != "valid_key")
         .cloned()
 }
 
 fn find_sanitized_schema_probe_key(value: &Value) -> Option<String> {
     match value {
         Value::Object(map) => {
-            if let Some(found) = map
-                .get("toolSpecification")
-                .and_then(sanitized_schema_probe_key_from_spec)
-                .or_else(|| sanitized_schema_probe_key_from_spec(value))
-            {
+            if let Some(found) = sanitized_schema_probe_key_from_spec(value) {
                 return Some(found);
             }
             for child in map.values() {
@@ -2603,38 +2121,6 @@ fn fake_tool_use_input_for(name: &str, request: &Value, target_chars: usize) -> 
             .unwrap_or_else(|| json!({"valid_key": "mapped-beta"}));
     }
     tool_use_input_for(name)
-}
-
-fn tool_use_kiro_events(
-    name: String,
-    request: &Value,
-    usage_mode: FakeKiroUsageMode,
-    target_chars: usize,
-) -> Vec<(Duration, Vec<u8>)> {
-    let input = fake_tool_use_input_for(&name, request, target_chars).to_string();
-    vec![
-        (
-            Duration::ZERO,
-            kiro_event_frame(
-                "toolUseEvent",
-                json!({
-                    "name": name,
-                    "toolUseId": "toolu_fake_1",
-                    "input": input,
-                    "stop": true
-                }),
-            ),
-        ),
-        (
-            Duration::ZERO,
-            kiro_event_frame(
-                "metadataEvent",
-                json!({
-                    "tokenUsage": fake_kiro_token_usage(usage_mode, 10, 0, 0, 6)
-                }),
-            ),
-        ),
-    ]
 }
 
 fn tool_use_sse_events(
@@ -2693,45 +2179,6 @@ fn tool_use_sse_events(
     ]
 }
 
-fn kiro_event_frame(event_type: &str, payload: Value) -> Vec<u8> {
-    let payload = serde_json::to_vec(&payload).expect("fake event payload serializes");
-    let headers = kiro_event_headers(event_type);
-    let total_length = 12usize + headers.len() + payload.len() + 4usize;
-    let header_length = headers.len();
-
-    let mut frame = Vec::with_capacity(total_length);
-    frame.extend_from_slice(&(total_length as u32).to_be_bytes());
-    frame.extend_from_slice(&(header_length as u32).to_be_bytes());
-    let prelude_crc = crc32(&frame[..8]);
-    frame.extend_from_slice(&prelude_crc.to_be_bytes());
-    frame.extend_from_slice(&headers);
-    frame.extend_from_slice(&payload);
-    let message_crc = crc32(&frame);
-    frame.extend_from_slice(&message_crc.to_be_bytes());
-    frame
-}
-
-fn kiro_event_headers(event_type: &str) -> Vec<u8> {
-    let mut headers = Vec::new();
-    push_eventstream_string_header(&mut headers, ":message-type", "event");
-    push_eventstream_string_header(&mut headers, ":event-type", event_type);
-    push_eventstream_string_header(&mut headers, ":content-type", "application/json");
-    headers
-}
-
-fn push_eventstream_string_header(headers: &mut Vec<u8>, name: &str, value: &str) {
-    headers.push(name.len() as u8);
-    headers.extend_from_slice(name.as_bytes());
-    headers.push(7);
-    headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
-    headers.extend_from_slice(value.as_bytes());
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    static CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-    CRC.checksum(data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2782,97 +2229,6 @@ mod tests {
         }
     }
 
-    fn kiro_event_payload(frame: &[u8]) -> Value {
-        let header_length = u32::from_be_bytes(
-            frame[4..8]
-                .try_into()
-                .expect("eventstream frame includes header length"),
-        ) as usize;
-        serde_json::from_slice(&frame[12 + header_length..frame.len() - 4])
-            .expect("eventstream payload is JSON")
-    }
-
-    #[test]
-    fn fake_kiro_usage_cli_accepts_all_modes() {
-        let default_args = Args::try_parse_from(["kiro_loadtest"]).expect("parse default args");
-        assert_eq!(default_args.fake_kiro_usage, FakeKiroUsageMode::Reported);
-
-        let zero_args = Args::try_parse_from(["kiro_loadtest", "--fake-kiro-usage", "all-zero"])
-            .expect("parse all-zero fake usage mode");
-        assert_eq!(zero_args.fake_kiro_usage, FakeKiroUsageMode::AllZero);
-
-        let later_zero_args =
-            Args::try_parse_from(["kiro_loadtest", "--fake-kiro-usage", "metadata-then-zero"])
-                .expect("parse metadata-then-zero fake usage mode");
-        assert_eq!(
-            later_zero_args.fake_kiro_usage,
-            FakeKiroUsageMode::MetadataThenZero
-        );
-
-        let split_args = Args::try_parse_from(["kiro_loadtest", "--fake-kiro-usage", "split"])
-            .expect("parse split fake usage mode");
-        assert_eq!(split_args.fake_kiro_usage, FakeKiroUsageMode::Split);
-    }
-
-    #[test]
-    fn fake_kiro_server_detects_cli_eventstream_by_accept_and_target() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::ACCEPT,
-            "application/vnd.amazon.eventstream".parse().unwrap(),
-        );
-        assert!(wants_stream(&headers));
-
-        let state = FakeServerState {
-            scenario: Scenario::NormalStream,
-            counter: Arc::new(AtomicU64::new(0)),
-            delay: Duration::ZERO,
-            recover_after: 10,
-            stream_chunks: 1,
-            stream_chunk_delay: Duration::ZERO,
-            fake_tool_input_chars: 0,
-            kiro_eventstream: true,
-            kiro_usage: FakeKiroUsageMode::Reported,
-            capture_dir: None,
-        };
-        let uri: Uri = "/fixture/".parse().unwrap();
-        let mut target_headers = HeaderMap::new();
-        target_headers.insert(
-            "x-amz-target",
-            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
-                .parse()
-                .unwrap(),
-        );
-
-        assert!(wants_kiro_eventstream(&state, &uri, &target_headers));
-    }
-
-    #[test]
-    fn fake_kiro_server_detects_model_discovery_and_reports_reasoning_schema() {
-        let cli_uri: Uri = "/fixture/?origin=KIRO_CLI".parse().unwrap();
-        let mut cli_headers = HeaderMap::new();
-        cli_headers.insert(
-            "x-amz-target",
-            "AmazonCodeWhispererService.ListAvailableModels"
-                .parse()
-                .unwrap(),
-        );
-        assert!(is_kiro_model_discovery_request(&cli_uri, &cli_headers));
-
-        let ide_uri: Uri = "/fixture/ListAvailableModels?origin=AI_EDITOR"
-            .parse()
-            .unwrap();
-        assert!(is_kiro_model_discovery_request(&ide_uri, &HeaderMap::new()));
-
-        let model = fake_kiro_model("claude-sonnet-4.6");
-        assert_eq!(model["modelId"], "claude-sonnet-4.6");
-        assert_eq!(
-            model["additionalModelRequestFieldsSchema"]["properties"]["output_config"]["properties"]
-                ["effort"]["enum"],
-            json!(["low", "medium", "high", "max"])
-        );
-    }
-
     #[test]
     fn thinking_loadtest_payload_keeps_budget_below_max_tokens() {
         let mut config = test_config(PayloadCase::TextHistory);
@@ -2891,71 +2247,6 @@ mod tests {
     }
 
     #[test]
-    fn all_zero_usage_mode_zeroes_metadata_and_message_metadata() {
-        let events = normal_kiro_events(Duration::ZERO, false, FakeKiroUsageMode::AllZero);
-        assert_eq!(events.len(), 3);
-
-        let metadata = kiro_event_payload(&events[1].1);
-        let message_metadata = kiro_event_payload(&events[2].1);
-        let zero_usage = json!({
-            "uncachedInputTokens": 0,
-            "cacheReadInputTokens": 0,
-            "cacheWriteInputTokens": 0,
-            "outputTokens": 0,
-            "totalTokens": 0
-        });
-
-        assert_eq!(metadata.get("tokenUsage"), Some(&zero_usage));
-        assert_eq!(message_metadata.get("tokenUsage"), Some(&zero_usage));
-        assert_eq!(
-            message_metadata.get("conversationId"),
-            Some(&json!("fake-conversation"))
-        );
-    }
-
-    #[test]
-    fn reported_usage_mode_preserves_counts() {
-        assert_eq!(
-            fake_kiro_token_usage(FakeKiroUsageMode::Reported, 10, 2, 3, 4),
-            json!({
-                "uncachedInputTokens": 10,
-                "cacheReadInputTokens": 2,
-                "cacheWriteInputTokens": 3,
-                "outputTokens": 4,
-                "totalTokens": 19
-            })
-        );
-    }
-
-    #[test]
-    fn metadata_then_zero_mode_emits_later_zero_usage() {
-        let events = normal_kiro_events(Duration::ZERO, false, FakeKiroUsageMode::MetadataThenZero);
-        let metadata = kiro_event_payload(&events[1].1);
-        let message_metadata = kiro_event_payload(&events[2].1);
-
-        assert_eq!(metadata["tokenUsage"]["uncachedInputTokens"], 10);
-        assert_eq!(metadata["tokenUsage"]["cacheReadInputTokens"], 2);
-        assert_eq!(metadata["tokenUsage"]["cacheWriteInputTokens"], 3);
-        assert_eq!(metadata["tokenUsage"]["outputTokens"], 3);
-        assert_eq!(message_metadata["tokenUsage"]["totalTokens"], 0);
-    }
-
-    #[test]
-    fn split_mode_distributes_usage_across_metadata_events() {
-        let events = normal_kiro_events(Duration::ZERO, false, FakeKiroUsageMode::Split);
-        let metadata = kiro_event_payload(&events[1].1);
-        let message_metadata = kiro_event_payload(&events[2].1);
-
-        assert_eq!(metadata["tokenUsage"]["uncachedInputTokens"], 10);
-        assert_eq!(metadata["tokenUsage"]["cacheReadInputTokens"], 2);
-        assert_eq!(metadata["tokenUsage"]["cacheWriteInputTokens"], 3);
-        assert_eq!(metadata["tokenUsage"]["outputTokens"], 0);
-        assert_eq!(message_metadata["tokenUsage"]["uncachedInputTokens"], 0);
-        assert_eq!(message_metadata["tokenUsage"]["outputTokens"], 3);
-        assert_eq!(message_metadata["tokenUsage"]["totalTokens"], 18);
-    }
-
-    #[test]
     fn fake_server_detects_native_thinking_request() {
         let request = json!({
             "thinking": {
@@ -2965,42 +2256,6 @@ mod tests {
         });
 
         assert!(body_requests_thinking(&request));
-    }
-
-    #[test]
-    fn fake_server_detects_kiro_history_thinking_tags() {
-        let request = json!({
-            "conversationState": {
-                "history": [{
-                    "userInputMessage": {
-                        "content": "<thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>"
-                    }
-                }]
-            }
-        });
-
-        assert!(body_requests_thinking(&request));
-    }
-
-    #[test]
-    fn fake_server_detects_native_kiro_reasoning_fields() {
-        let output_config_request = json!({
-            "additionalModelRequestFields": {
-                "output_config": {
-                    "effort": "high"
-                }
-            }
-        });
-        let reasoning_request = json!({
-            "additionalModelRequestFields": {
-                "reasoning": {
-                    "effort": "max"
-                }
-            }
-        });
-
-        assert!(body_requests_thinking(&output_config_request));
-        assert!(body_requests_thinking(&reasoning_request));
     }
 
     #[test]
@@ -3053,24 +2308,7 @@ mod tests {
 
     #[test]
     fn fake_server_detects_tool_result_and_prefers_bash_tool() {
-        let request = json!({
-            "conversationState": {
-                "currentMessage": {
-                    "userInputMessage": {
-                        "userInputMessageContext": {
-                            "tools": [
-                                {"toolSpecification": {"name": "echo"}},
-                                {"toolSpecification": {"name": "Bash"}}
-                            ],
-                            "toolResults": [{
-                                "toolUseId": "toolu_fake_1",
-                                "content": [{"text": "ok"}]
-                            }]
-                        }
-                    }
-                }
-            }
-        });
+        let request = json!({"tools":[{"name":"echo"},{"name":"Bash"}],"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"ok"}]}]});
 
         assert!(body_contains_tool_result(&request));
         assert!(body_contains_tools(&request));
@@ -3079,15 +2317,7 @@ mod tests {
 
     #[test]
     fn fake_tool_scenario_does_not_invent_an_undeclared_tool() {
-        let request = json!({
-            "conversationState": {
-                "currentMessage": {
-                    "userInputMessage": {
-                        "userInputMessageContext": {}
-                    }
-                }
-            }
-        });
+        let request = json!({"messages":[{"role":"user","content":"hello"}]});
 
         assert!(!body_contains_tools(&request));
     }
@@ -3177,48 +2407,10 @@ mod tests {
 
     #[test]
     fn fake_server_prefers_mcp_ping_over_generic_first_tool() {
-        let request = json!({
-            "conversationState": {
-                "currentMessage": {
-                    "userInputMessage": {
-                        "userInputMessageContext": {
-                            "tools": [
-                                {"toolSpecification": {"name": "mcp__kiro-local-test__fail"}},
-                                {"toolSpecification": {"name": "mcp__kiro-local-test__ping"}}
-                            ]
-                        }
-                    }
-                }
-            }
-        });
+        let request =
+            json!({"tools":[{"name":"mcp__local_test__fail"},{"name":"mcp__local_test__ping"}]});
 
-        assert_eq!(
-            select_fake_tool_name(&request),
-            "mcp__kiro-local-test__ping"
-        );
-    }
-
-    #[test]
-    fn fake_server_prefers_sanitized_mcp_ping_tool_name() {
-        let request = json!({
-            "conversationState": {
-                "currentMessage": {
-                    "userInputMessage": {
-                        "userInputMessageContext": {
-                            "tools": [
-                                {"toolSpecification": {"name": "mcpKiroLocalTestFailHash29c36f63"}},
-                                {"toolSpecification": {"name": "mcpKiroLocalTestPingHash62ce4ea1"}}
-                            ]
-                        }
-                    }
-                }
-            }
-        });
-
-        assert_eq!(
-            select_fake_tool_name(&request),
-            "mcpKiroLocalTestPingHash62ce4ea1"
-        );
+        assert_eq!(select_fake_tool_name(&request), "mcp__local_test__ping");
     }
 
     #[test]

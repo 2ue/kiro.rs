@@ -1,8 +1,14 @@
+fn normalize_admin_request_admission(
+    config: crate::model::config::RequestAdmissionConfig,
+) -> Result<crate::model::config::RequestAdmissionConfig, AdminServiceError> {
+    config
+        .validate()
+        .map_err(AdminServiceError::InvalidCredential)?;
+    Ok(config.normalized())
+}
 use super::*;
 use crate::model::config::{ExternalPoolsConfig, RequestAdmissionConfig, RequestApiKeyPolicy};
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn cleanup_request() -> UsageCleanupRequest {
     UsageCleanupRequest {
@@ -18,46 +24,60 @@ fn cleanup_request() -> UsageCleanupRequest {
 }
 
 #[test]
-fn runtime_config_audit_detail_records_only_changed_fields() {
-    let before = crate::model::config::Config::default();
-    let mut after = before.clone();
-    after.credential_rpm = Some(42);
-    after.request_admission.rpm = 900;
+fn access_key_response_keeps_legacy_primary_field_and_lists_managed_policies() {
+    let keys = vec![
+        "sk-legacy-primary".to_string(),
+        "sk-managed-client".to_string(),
+    ];
+    let policies = vec![RequestApiKeyPolicy {
+        usage_limits: Vec::new(),
+        api_key: "sk-managed-client".to_string(),
+        name: "client-a".to_string(),
+        enabled: true,
+        request_admission: Some(RequestAdmissionConfig {
+            max_concurrent_requests: 5,
+            ..RequestAdmissionConfig::default()
+        }),
+    }];
+    let response = access_keys_response(
+        &keys,
+        &policies,
+        RequestAdmissionConfig::default(),
+        "sk-admin",
+    );
 
-    let detail = AdminService::runtime_config_audit_detail(&before, &after);
-    assert_eq!(detail["kind"], "runtime_config_change");
-    assert_eq!(detail["changedCount"], 2);
-    let changes = detail["changes"].as_array().unwrap();
-    assert!(changes.iter().any(|change| {
-        change["path"] == "credentialRpm" && change["before"] == 100 && change["after"] == 42
-    }));
-    assert!(changes.iter().any(|change| {
-        change["path"] == "requestAdmission.rpm"
-            && change["before"] == 300
-            && change["after"] == 900
-    }));
-    let normalized = AdminService::normalize_audit_detail(detail);
-    assert!(normalized["changes"].is_array());
+    assert_eq!(response.request_api_key, "sk-legacy-primary");
+    assert_eq!(response.request_api_keys.len(), 2);
+    assert!(response.request_api_keys[0].primary);
+    assert_eq!(response.request_api_keys[0].api_key, "sk-legacy-primary");
+    assert!(!response.request_api_keys[1].primary);
+    assert_eq!(response.request_api_keys[1].name, "client-a");
+    assert_eq!(
+        response.request_api_keys[1]
+            .request_admission
+            .unwrap()
+            .max_concurrent_requests,
+        5
+    );
+
+    let wire = serde_json::to_value(response).expect("access-key response json");
+    assert_eq!(wire["requestApiKey"], "sk-legacy-primary");
+    assert_eq!(wire["requestApiKeys"][1]["apiKey"], "sk-managed-client");
 }
 
 #[test]
-fn runtime_config_audit_detail_redacts_secret_values_and_bounds_arrays() {
-    let mut before = crate::model::config::Config::default();
-    before.api_keys = vec!["old-secret".to_string()];
-    let mut after = before.clone();
-    after.api_keys = (0..25).map(|index| format!("key-{index}")).collect();
+fn admin_request_key_id_matches_runtime_authenticated_identity() {
+    let items = request_api_key_items(&[" sk-one ".to_string()], &[]);
+    let store = RequestApiKeyStore::new(["sk-one"]);
+    let runtime_id = store.authenticate("sk-one").unwrap().stable_id();
 
-    let detail = AdminService::runtime_config_audit_detail(&before, &after);
-    let changes = detail["changes"].as_array().unwrap();
-    let keys = changes
-        .iter()
-        .find(|change| change["path"] == "apiKeys")
-        .unwrap();
-    assert_eq!(keys["before"], "[已隐藏]");
-    assert_eq!(keys["after"], "[已隐藏]");
-    assert_eq!(keys["redacted"], true);
-    assert!(!detail.to_string().contains("old-secret"));
-    assert!(!detail.to_string().contains("key-24"));
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, runtime_id);
+    assert_eq!(items[0].id.len(), 64);
+    assert_eq!(
+        items[0].id,
+        crate::common::auth::request_api_key_id("sk-one")
+    );
 }
 
 #[test]
@@ -72,608 +92,155 @@ fn audit_detail_normalization_is_bounded_without_returning_an_error() {
 }
 
 #[test]
-fn runtime_config_audit_array_summary_survives_normalization() {
-    let detail = AdminService::normalize_audit_detail(serde_json::json!({
-        "kind": "runtime_config_change",
-        "changes": [{
-            "path": "kiroEndpointFallbackOrder",
-            "before": {"count": 0, "items": []},
-            "after": {"count": 2, "items": ["first", "second"]},
-        }],
-    }));
-    assert_eq!(
-        detail["changes"][0]["before"]["items"],
-        serde_json::json!([])
-    );
-    assert_eq!(
-        detail["changes"][0]["after"]["items"],
-        serde_json::json!(["first", "second"])
+fn external_pool_cost_floor_margin_validation_is_bounded() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_usage_projection_cost_floor_margin_percent: 200,
+        ..ExternalPoolsConfig::default()
+    };
+    validate_external_pools_config(&config).expect("upper bound should be accepted");
+
+    config.external_pool_usage_projection_cost_floor_margin_percent = 201;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(
+        err.contains("externalPoolUsageProjectionCostFloorMarginPercent"),
+        "unexpected validation error: {err}"
     );
 }
 
 #[test]
-fn kiro_credit_unit_price_accepts_positive_values_and_treats_zero_as_unset() {
-    assert_eq!(normalize_kiro_credit_unit_price_usd(None).unwrap(), None);
-    assert_eq!(
-        normalize_kiro_credit_unit_price_usd(Some(0.0)).unwrap(),
-        None
-    );
-    assert_eq!(
-        normalize_kiro_credit_unit_price_usd(Some(0.04)).unwrap(),
-        Some(0.04)
-    );
-    for invalid in [-0.01, f64::NAN, f64::INFINITY, 100.5] {
-        assert!(normalize_kiro_credit_unit_price_usd(Some(invalid)).is_err());
+fn external_pool_degrade_error_rate_threshold_is_a_ratio() {
+    let mut config = ExternalPoolsConfig::default();
+    for valid in [0.0, 0.5, 1.0] {
+        config.external_pool_degrade_error_rate_threshold = valid;
+        validate_external_pools_config(&config).expect("合法比率必须被接受");
+    }
+    for invalid in [-0.1, 1.1] {
+        config.external_pool_degrade_error_rate_threshold = invalid;
+        let err = validate_external_pools_config(&config).unwrap_err();
+        assert!(
+            err.contains("externalPoolDegradeErrorRateThreshold"),
+            "unexpected validation error: {err}"
+        );
     }
 }
 
 #[test]
-fn update_runtime_config_request_distinguishes_missing_and_null_credit_price() {
-    let base = serde_json::json!({
-        "credentialRpm": 0,
-        "credentialTransientCooldownSecs": 10,
-        "credentialMaxCooldownSecs": 300,
-        "credentialWarmupRequests": 0,
-        "compressionEnabled": false,
-    });
-    let missing: UpdateRuntimeConfigRequest = serde_json::from_value(base.clone()).unwrap();
-    assert_eq!(missing.kiro_credit_unit_price_usd, None);
+fn external_pool_probation_ceiling_cannot_be_below_single_probation() {
+    // 避让上限小于单次避让时长会让指数退避的上限语义自相矛盾。
+    let mut config = ExternalPoolsConfig {
+        external_pool_degrade_probation_secs: 600,
+        external_pool_max_probation_secs: 300,
+        ..Default::default()
+    };
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(
+        err.contains("externalPoolMaxProbationSecs"),
+        "unexpected validation error: {err}"
+    );
 
-    let mut cleared = base.clone();
-    cleared["kiroCreditUnitPriceUsd"] = serde_json::Value::Null;
-    let cleared: UpdateRuntimeConfigRequest = serde_json::from_value(cleared).unwrap();
-    assert_eq!(cleared.kiro_credit_unit_price_usd, Some(None));
-
-    let mut set = base;
-    set["kiroCreditUnitPriceUsd"] = serde_json::json!(0.035);
-    let set: UpdateRuntimeConfigRequest = serde_json::from_value(set).unwrap();
-    assert_eq!(set.kiro_credit_unit_price_usd, Some(Some(0.035)));
+    config.external_pool_max_probation_secs = 600;
+    validate_external_pools_config(&config).expect("相等必须被接受");
 }
 
 #[test]
-fn credential_info_refresh_concurrency_defaults_and_clamps() {
-    let mut config = crate::model::config::Config::default();
-    assert_eq!(effective_credential_info_refresh_concurrency(&config), 3);
-
-    config.credential_info_refresh_concurrency = 0;
-    assert_eq!(effective_credential_info_refresh_concurrency(&config), 1);
-
-    config.credential_info_refresh_concurrency = 99;
-    assert_eq!(effective_credential_info_refresh_concurrency(&config), 16);
+fn external_pool_quality_defaults_pass_validation() {
+    // Quality-aware scheduling changes runtime decisions and must be opt-in on
+    // upgrades. The remaining defaults still need to validate as a whole.
+    let config = ExternalPoolsConfig::default();
+    assert!(
+        !config.external_pool_quality_aware_scheduling_enabled,
+        "质量感知调度主开关必须默认关闭"
+    );
+    validate_external_pools_config(&config).expect("默认配置必须通过校验");
 }
 
-#[tokio::test]
-async fn credential_info_refresh_stream_limits_concurrency_and_completes_all_items() {
-    use futures::{StreamExt, stream};
+#[test]
+fn external_pool_quality_ewma_alpha_validation_is_bounded() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_quality_ewma_alpha: 0.01,
+        ..Default::default()
+    };
+    validate_external_pools_config(&config).expect("下界必须被接受");
+    config.external_pool_quality_ewma_alpha = 1.0;
+    validate_external_pools_config(&config).expect("上界必须被接受");
 
-    let mut config = crate::model::config::Config::default();
-    config.credential_info_refresh_concurrency = 3;
-    let active = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-
-    let mut results = stream::iter((0..183usize).map(|id| {
-        let active = Arc::clone(&active);
-        let peak = Arc::clone(&peak);
-        async move {
-            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-            let mut observed = peak.load(Ordering::SeqCst);
-            while current > observed {
-                match peak.compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst) {
-                    Ok(_) => break,
-                    Err(actual) => observed = actual,
-                }
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
-            active.fetch_sub(1, Ordering::SeqCst);
-            (id, id % 19 != 0)
-        }
-    }))
-    .buffer_unordered(effective_credential_info_refresh_concurrency(&config))
-    .collect::<Vec<_>>()
-    .await;
-
-    results.sort_unstable_by_key(|(id, _)| *id);
-    assert_eq!(results.len(), 183);
-    assert_eq!(results.iter().filter(|(_, ok)| !ok).count(), 10);
-    assert_eq!(
-        results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        (0..183usize).collect::<Vec<_>>(),
-    );
-    assert!(
-        results.iter().any(|(id, ok)| *id == 182 && *ok),
-        "a failure in an earlier task must not prevent later tasks from running"
-    );
-    assert!(
-        peak.load(Ordering::SeqCst) <= 3,
-        "peak upstream refresh concurrency exceeded configured cap"
-    );
-    assert_eq!(active.load(Ordering::SeqCst), 0);
-}
-
-fn local_rate_limited_error(retry_after: std::time::Duration) -> AdminServiceError {
-    AdminServiceError::LocalRateLimited {
-        source: Box::new(AdminServiceError::InternalError(
-            "token refresh failed: stage=coordination kind=rate_limited".to_string(),
-        )),
-        retry_after,
+    for invalid in [0.0, 1.0001, -0.5, f64::NAN] {
+        config.external_pool_quality_ewma_alpha = invalid;
+        let err = validate_external_pools_config(&config).unwrap_err();
+        assert!(
+            err.contains("externalPoolQualityEwmaAlpha"),
+            "alpha={invalid} 应被拒绝，实际错误: {err}"
+        );
     }
 }
 
-#[tokio::test]
-async fn credential_info_refresh_retries_local_rate_limit_and_clamps_wait() {
-    let mut attempts = 0;
-    let started = tokio::time::Instant::now();
-    let deadline = started + CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET;
-    let (result, retries) = retry_local_rate_limited(deadline, || {
-        attempts += 1;
-        let attempt = attempts;
-        async move {
-            match attempt {
-                1 => Err(local_rate_limited_error(std::time::Duration::from_millis(
-                    1,
-                ))),
-                2 => Err(local_rate_limited_error(std::time::Duration::from_secs(6))),
-                _ => Ok("refreshed"),
-            }
+#[test]
+fn external_pool_quality_probe_share_and_top_k_are_bounded() {
+    let config = ExternalPoolsConfig {
+        external_pool_probe_share_percent: 101,
+        ..Default::default()
+    };
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(err.contains("externalPoolProbeSharePercent"), "{err}");
+
+    let config = ExternalPoolsConfig {
+        external_pool_quality_top_k: 101,
+        ..Default::default()
+    };
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(err.contains("externalPoolQualityTopK"), "{err}");
+}
+
+#[test]
+fn external_pool_quality_weights_reject_negative_and_non_finite() {
+    // 负权重会把"差"变成"好"，是最危险的误配置方向。
+    for mutate in [
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_error_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_latency_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_probation_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_priority_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_load_weight = value
+        },
+    ] {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, 1_000_001.0] {
+            let mut config = ExternalPoolsConfig::default();
+            mutate(&mut config, invalid);
+            let err = validate_external_pools_config(&config)
+                .expect_err(&format!("权重 {invalid} 必须被拒绝"));
+            assert!(
+                err.contains("externalPoolQuality"),
+                "unexpected validation error: {err}"
+            );
         }
-    })
-    .await;
-
-    assert_eq!(result.unwrap(), "refreshed");
-    assert_eq!(attempts, 3);
-    assert_eq!(retries, 2);
-    assert!(tokio::time::Instant::now() - started >= std::time::Duration::from_millis(5_050));
-    assert_eq!(
-        local_rate_limit_retry_delay(std::time::Duration::from_millis(1)),
-        std::time::Duration::from_millis(50)
-    );
-    assert_eq!(
-        local_rate_limit_retry_delay(std::time::Duration::from_secs(6)),
-        std::time::Duration::from_secs(5)
-    );
-}
-
-#[tokio::test]
-async fn credential_info_refresh_stops_after_local_rate_limit_retry_limit() {
-    let mut attempts = 0;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let (result, retries) = retry_local_rate_limited(deadline, || {
-        attempts += 1;
-        async { Err::<(), _>(local_rate_limited_error(std::time::Duration::ZERO)) }
-    })
-    .await;
-
-    let error = result.unwrap_err();
-    assert_eq!(attempts, MAX_LOCAL_RATE_LIMIT_RETRIES as usize + 1);
-    assert_eq!(retries, MAX_LOCAL_RATE_LIMIT_RETRIES);
-    assert_eq!(
-        error.to_string(),
-        "内部错误: token refresh failed: stage=coordination kind=rate_limited"
-    );
-}
-
-#[tokio::test]
-async fn credential_info_refresh_does_not_retry_non_rate_limit_errors() {
-    let mut attempts = 0;
-    let deadline = tokio::time::Instant::now() + CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET;
-    let (result, retries) = retry_local_rate_limited(deadline, || {
-        attempts += 1;
-        async {
-            Err::<(), _>(AdminServiceError::UpstreamError(
-                "credential_auth: upstream rejected refresh".to_string(),
-            ))
-        }
-    })
-    .await;
-
-    assert_eq!(attempts, 1);
-    assert_eq!(retries, 0);
-    assert_eq!(
-        result.unwrap_err().to_string(),
-        "上游服务错误: credential_auth: upstream rejected refresh"
-    );
-}
-
-#[tokio::test]
-async fn credential_info_refresh_stops_retrying_at_total_budget() {
-    let mut attempts = 0;
-    let started = tokio::time::Instant::now();
-    let deadline = started + std::time::Duration::from_millis(75);
-    let (result, retries) = retry_local_rate_limited(deadline, || {
-        attempts += 1;
-        async { Err::<(), _>(local_rate_limited_error(std::time::Duration::from_secs(1))) }
-    })
-    .await;
-
-    assert_eq!(attempts, 1);
-    assert_eq!(retries, 0);
-    assert!(tokio::time::Instant::now() - started >= std::time::Duration::from_millis(75));
-    assert_eq!(
-        result.unwrap_err().to_string(),
-        "内部错误: token refresh failed: stage=coordination kind=rate_limited"
-    );
+    }
 }
 
 #[test]
-fn credential_info_refresh_only_recognizes_local_coordination_rate_limits() {
-    let rate_limited = anyhow::Error::new(RefreshFailure::new(
-        RefreshFailureStage::Coordination,
-        RefreshFailureKind::RateLimited,
-        None,
-        Some(std::time::Duration::from_millis(123)),
-        false,
-    ));
+fn external_pool_supported_models_canonicalize_legacy_claude_35_commands() {
     assert_eq!(
-        local_rate_limit_retry_after(&rate_limited),
-        Some(std::time::Duration::from_millis(123))
-    );
-
-    let credential_auth = anyhow::Error::new(RefreshFailure::new(
-        RefreshFailureStage::ResponseStatus,
-        RefreshFailureKind::CredentialAuth,
-        Some(403),
-        Some(std::time::Duration::from_secs(1)),
-        true,
-    ));
-    assert_eq!(local_rate_limit_retry_after(&credential_auth), None);
-}
-
-#[test]
-fn credential_import_claim_rejects_the_same_account_until_released() {
-    let in_flight = Arc::new(Mutex::new(HashSet::new()));
-    let first = CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
-        .expect("first import claims the account");
-    let err = CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
-        .err()
-        .expect("second import of the same account is rejected");
-    assert!(matches!(err, AdminServiceError::Conflict(_)));
-    assert!(err.to_string().contains("凭据已存在"));
-
-    // 不同账号互不影响；空 token 不登记，交给后续校验报错。
-    let _other = CredentialImportClaim::acquire(&in_flight, Some("rt-other"), "refreshToken")
-        .expect("another account imports concurrently");
-    let _empty = CredentialImportClaim::acquire(&in_flight, Some(""), "refreshToken")
-        .expect("empty token is not claimed");
-    assert_eq!(in_flight.lock().len(), 2);
-
-    drop(first);
-    CredentialImportClaim::acquire(&in_flight, Some("rt-same"), "refreshToken")
-        .expect("released account can be imported again");
-}
-
-#[test]
-fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
-    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "refreshToken": "fake-refresh-token",
-        "accessToken": "fake-access-token",
-        "clientId": "fake-client-id",
-        "clientSecret": "fake-client-secret",
-        "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE"
-    }))
-    .unwrap();
-
-    assert_eq!(resolve_add_credential_auth_method(&req), "idc");
-}
-
-#[test]
-fn enterprise_provider_with_client_secret_import_is_inferred_as_idc() {
-    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "refreshToken": "fake-refresh-token",
-        "provider": "Enterprise",
-        "clientId": "fake-client-id",
-        "clientSecret": "fake-client-secret"
-    }))
-    .unwrap();
-
-    assert_eq!(resolve_add_credential_auth_method(&req), "idc");
-}
-
-#[test]
-fn enterprise_provider_with_external_idp_endpoint_stays_external_idp() {
-    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "refreshToken": "fake-refresh-token",
-        "provider": "Enterprise",
-        "clientId": "fake-client-id",
-        "clientSecret": "fake-client-secret",
-        "tokenEndpoint": "https://login.example.invalid/token"
-    }))
-    .unwrap();
-
-    assert_eq!(resolve_add_credential_auth_method(&req), "external_idp");
-}
-
-#[test]
-fn export_credentials_filter_keeps_selected_ids_and_rejects_missing_ids() {
-    let mut credentials = vec![
-        KiroCredentials {
-            id: Some(1),
-            ..Default::default()
-        },
-        KiroCredentials {
-            id: Some(2),
-            ..Default::default()
-        },
-        KiroCredentials {
-            id: Some(3),
-            ..Default::default()
-        },
-        KiroCredentials {
-            id: None,
-            ..Default::default()
-        },
-    ];
-    filter_export_credentials_by_ids(&mut credentials, &HashSet::from([3, 1])).unwrap();
-    assert_eq!(
-        credentials
-            .iter()
-            .filter_map(|credential| credential.id)
-            .collect::<Vec<_>>(),
-        vec![1, 3]
-    );
-
-    let mut credentials = vec![KiroCredentials {
-        id: Some(1),
-        ..Default::default()
-    }];
-    let err = filter_export_credentials_by_ids(&mut credentials, &HashSet::from([1, 2]))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains('2'));
-}
-
-#[test]
-fn explicit_social_auth_method_is_preserved() {
-    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "refreshToken": "fake-refresh-token",
-        "authMethod": "social",
-        "clientId": "ignored-client-id",
-        "clientSecret": "ignored-client-secret"
-    }))
-    .unwrap();
-
-    assert_eq!(resolve_add_credential_auth_method(&req), "social");
-}
-
-#[test]
-fn conflicting_social_builder_id_import_is_inferred_as_idc() {
-    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "refreshToken": "fake-refresh-token",
-        "provider": "BuilderId",
-        "authMethod": "social",
-        "clientId": "fake-client-id",
-        "clientSecret": "fake-client-secret"
-    }))
-    .unwrap();
-
-    assert_eq!(resolve_add_credential_auth_method(&req), "idc");
-}
-
-#[test]
-fn missing_auth_method_with_external_idp_fields_is_inferred_as_external_idp() {
-    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "refreshToken": "fake-refresh-token",
-        "clientId": "fake-client-id",
-        "issuerUrl": "https://login.microsoftonline.com/common/v2.0",
-        "scopes": "offline_access"
-    }))
-    .unwrap();
-
-    assert_eq!(resolve_add_credential_auth_method(&req), "external_idp");
-}
-
-#[test]
-fn missing_auth_method_with_kiro_api_key_is_inferred_as_api_key() {
-    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "kiroApiKey": "ksk_test_key|eu-central-1"
-    }))
-    .unwrap();
-
-    assert_eq!(resolve_add_credential_auth_method(&req), "api_key");
-}
-
-#[test]
-fn batch_import_fast_applies_only_when_credential_has_no_fast() {
-    let defaults = BatchCredentialImportDefaults {
-        fast: Some(5),
-        ..Default::default()
-    };
-    let without_fast: AddCredentialRequest =
-        serde_json::from_value(serde_json::json!({ "kiroApiKey": "ksk_without_fast" })).unwrap();
-    assert_eq!(
-        apply_batch_import_defaults(without_fast, &defaults, None).fast,
-        5
-    );
-    let with_fast: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "kiroApiKey": "ksk_with_fast",
-        "fast": 10
-    }))
-    .unwrap();
-    assert_eq!(
-        apply_batch_import_defaults(with_fast, &defaults, None).fast,
-        10
-    );
-}
-
-#[test]
-fn batch_import_tags_apply_only_when_credential_has_no_tags() {
-    let defaults = BatchCredentialImportDefaults {
-        tags: vec!["默认".to_string(), "team-a".to_string()],
-        ..Default::default()
-    };
-
-    let without_tags: AddCredentialRequest =
-        serde_json::from_value(serde_json::json!({ "kiroApiKey": "ksk_without_tags" })).unwrap();
-    assert_eq!(
-        apply_batch_import_defaults(without_tags, &defaults, None).tags,
-        vec!["默认", "team-a"]
-    );
-
-    let with_tags: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "kiroApiKey": "ksk_with_tags",
-        "tags": ["账号自身"]
-    }))
-    .unwrap();
-    assert_eq!(
-        apply_batch_import_defaults(with_tags, &defaults, None).tags,
-        vec!["账号自身"]
-    );
-}
-
-#[test]
-fn batch_import_proxy_ids_are_deduplicated_preserving_order() {
-    assert_eq!(
-        normalized_batch_proxy_resource_ids(&[3, 1, 3, 2, 1]),
-        vec![3, 1, 2]
-    );
-}
-
-#[test]
-fn batch_import_round_robin_proxy_assignment_is_stable() {
-    let defaults = BatchCredentialImportDefaults {
-        proxy_resource_ids: vec![1, 2, 3],
-        ..Default::default()
-    };
-    let assigned = (0..5)
-        .map(|index| {
-            let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-                "kiroApiKey": format!("ksk_test_{index}")
-            }))
-            .unwrap();
-            apply_batch_import_defaults(request, &defaults, Some([1, 2, 3][index % 3]))
-                .proxy_resource_id
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(assigned, vec![Some(1), Some(2), Some(3), Some(1), Some(2)]);
-}
-
-#[test]
-fn batch_import_round_robin_does_not_override_explicit_direct_proxy() {
-    let defaults = BatchCredentialImportDefaults {
-        proxy_resource_ids: vec![1, 2],
-        ..Default::default()
-    };
-    let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "kiroApiKey": "ksk_direct",
-        "proxyUrl": "socks5h://127.0.0.1:8080"
-    }))
-    .unwrap();
-
-    let merged = apply_batch_import_defaults(request, &defaults, Some(1));
-    assert_eq!(merged.proxy_resource_id, None);
-    assert_eq!(
-        merged.proxy_url.as_deref(),
-        Some("socks5h://127.0.0.1:8080")
-    );
-}
-
-#[test]
-fn batch_import_without_round_robin_keeps_single_proxy_default() {
-    let defaults = BatchCredentialImportDefaults {
-        proxy_resource_id: Some(Some(9)),
-        ..Default::default()
-    };
-    let request: AddCredentialRequest =
-        serde_json::from_value(serde_json::json!({ "kiroApiKey": "ksk_single" })).unwrap();
-
-    let merged = apply_batch_import_defaults(request, &defaults, None);
-    assert_eq!(merged.proxy_resource_id, Some(9));
-}
-
-#[test]
-fn proxy_import_parser_supports_common_formats_and_default_http() {
-    let parsed = parse_proxy_resource_import_content(
-        "1.2.3.4:8080:user:pass\nuser2:pass2@proxy.example:3128\nproxy.example:8081|user3|pass3",
-    )
-    .unwrap();
-    assert_eq!(parsed.len(), 3);
-    let first = parsed[0].as_ref().unwrap();
-    assert_eq!(first.proxy_url.as_deref(), Some("1.2.3.4:8080"));
-    assert_eq!(first.proxy_username.as_deref(), Some("user"));
-    assert_eq!(first.proxy_password.as_deref(), Some("pass"));
-    let second = parsed[1].as_ref().unwrap();
-    assert_eq!(second.proxy_url.as_deref(), Some("proxy.example:3128"));
-    assert_eq!(second.proxy_username.as_deref(), Some("user2"));
-    assert_eq!(second.proxy_password.as_deref(), Some("pass2"));
-    let third = parsed[2].as_ref().unwrap();
-    assert_eq!(third.proxy_url.as_deref(), Some("proxy.example:8081"));
-    assert_eq!(third.proxy_username.as_deref(), Some("user3"));
-    assert_eq!(third.proxy_password.as_deref(), Some("pass3"));
-    let ipv6 = parse_proxy_resource_import_content("[::1]:8080:user:pass:with:colon").unwrap();
-    assert_eq!(
-        ipv6[0].as_ref().unwrap().proxy_url.as_deref(),
-        Some("[::1]:8080")
-    );
-    assert_eq!(
-        ipv6[0].as_ref().unwrap().proxy_password.as_deref(),
-        Some("pass:with:colon")
-    );
-    assert_eq!(
-        validate_proxy_url("1.2.3.4:8080").unwrap(),
-        "http://1.2.3.4:8080"
-    );
-}
-
-#[test]
-fn proxy_import_default_protocol_can_be_selected() {
-    assert_eq!(
-        validate_proxy_url_with_default_protocol("1.2.3.4:1080", "socks5").unwrap(),
-        "socks5://1.2.3.4:1080"
-    );
-    assert_eq!(
-        validate_proxy_import_default_protocol(Some("socks5h://".to_string())).unwrap(),
-        "socks5h"
-    );
-    assert!(validate_proxy_import_default_protocol(Some("ftp".to_string())).is_err());
-}
-
-#[test]
-fn proxy_resource_dedupe_key_ignores_url_case_and_trailing_slash() {
-    assert_eq!(
-        proxy_resource_dedupe_key("HTTP://Proxy.EXAMPLE:8080/", Some("user"), Some("pass")),
-        proxy_resource_dedupe_key("http://proxy.example:8080", Some("user"), Some("pass"))
-    );
-    assert_ne!(
-        proxy_resource_dedupe_key("http://proxy.example:8080", Some("user"), Some("pass")),
-        proxy_resource_dedupe_key("http://proxy.example:8080", Some("user2"), Some("pass"))
-    );
-}
-
-#[test]
-fn proxy_import_parser_supports_json_and_jsonl() {
-    let parsed = parse_proxy_resource_import_content(
-        r#"[{"name":"a","proxyUrl":"10.0.0.1:80","proxyUsername":"u","proxyPassword":"p"},{"proxyUrl":"socks5://127.0.0.1:1080"}]"#,
-    )
-    .unwrap();
-    assert_eq!(parsed.len(), 2);
-    assert_eq!(parsed[0].as_ref().unwrap().name.as_deref(), Some("a"));
-    assert_eq!(
-        parsed[1].as_ref().unwrap().proxy_url.as_deref(),
-        Some("socks5://127.0.0.1:1080")
-    );
-    let jsonl = parse_proxy_resource_import_content(
-        "{\"proxyUrl\":\"proxy-a:8000\"}\n{\"proxyUrl\":\"https://proxy-b:8443\"}",
-    )
-    .unwrap();
-    assert_eq!(jsonl.len(), 2);
-}
-
-#[test]
-fn discovered_supported_models_preserve_non_claude_model_ids() {
-    let models = AdminService::normalize_discovered_supported_models(vec![
-        " QWEN3-CODER-NEXT ".to_string(),
-        "minimax-m2.5".to_string(),
-        "qwen3-coder-next".to_string(),
-        "claude-sonnet-4-5-20250929".to_string(),
-    ]);
-
-    assert_eq!(
-        models,
+        AdminService::normalize_external_pool_supported_models(vec![
+            "claude-3-5-sonnet-20241022".to_string(),
+            "claude-3.5-sonnet".to_string(),
+            "claude-3-5-haiku-20241022-thinking[1m]".to_string(),
+            "claude-3.5-haiku".to_string(),
+            "claude-3-5-opus-20241022".to_string(),
+            "tenant-claude-3-5-sonnet".to_string(),
+        ]),
         vec![
-            "qwen3-coder-next".to_string(),
-            "minimax-m2.5".to_string(),
-            "claude-sonnet-4-5-20250929".to_string(),
+            "sonnet-3.5".to_string(),
+            "haiku-3.5-thinking[1m]".to_string(),
+            "haiku-3.5".to_string(),
+            "claude-3-5-opus-20241022".to_string(),
+            "tenant-claude-3-5-sonnet".to_string(),
         ]
     );
 }
@@ -699,104 +266,6 @@ fn external_pool_supported_models_use_claude_code_family_commands() {
 }
 
 #[test]
-fn external_pool_supported_models_canonicalize_legacy_claude_35_commands() {
-    assert_eq!(
-        AdminService::normalize_external_pool_supported_models(vec![
-            "claude-3-5-sonnet-20241022".to_string(),
-            "claude-3.5-sonnet".to_string(),
-            "claude-3-5-haiku-20241022-thinking[1m]".to_string(),
-            "claude-3.5-haiku".to_string(),
-            "claude-3-5-opus-20241022".to_string(),
-            "tenant-claude-3-5-sonnet".to_string(),
-        ]),
-        vec![
-            "sonnet-3.5".to_string(),
-            "haiku-3.5-thinking[1m]".to_string(),
-            "haiku-3.5".to_string(),
-            "claude-3-5-opus-20241022".to_string(),
-            "tenant-claude-3-5-sonnet".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn runtime_cooldown_validation_allows_base_values_above_max_cap() {
-    validate_runtime_cooldown_settings(10, 2, &[30, 5, 10, 60])
-        .expect("max cooldown is an upper cap applied at runtime");
-}
-
-#[test]
-fn runtime_cooldown_validation_rejects_zero_values() {
-    assert!(matches!(
-        validate_runtime_cooldown_settings(0, 2, &[1]),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-    assert!(matches!(
-        validate_runtime_cooldown_settings(1, 0, &[1]),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-    assert!(matches!(
-        validate_runtime_cooldown_settings(1, 2, &[1, 0]),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-}
-
-#[test]
-fn berserk_settings_accept_the_full_supported_range() {
-    let config = crate::model::config::Config::default();
-    // 默认配置必须能通过校验，否则未改过任何设置的用户一保存就报错。
-    validate_berserk_settings(
-        config.local_berserk_max_rounds,
-        config.local_berserk_round_delay_ms,
-    )
-    .expect("默认配置应当通过校验");
-
-    for rounds in 1..=MAX_LOCAL_BERSERK_ROUNDS {
-        validate_berserk_settings(rounds, 0).expect("1..=上限的轮数都应接受");
-    }
-    validate_berserk_settings(1, MAX_LOCAL_BERSERK_ROUND_DELAY_MS).expect("间隔取到上限应当接受");
-}
-
-#[test]
-fn berserk_rounds_validation_rejects_zero_and_overflow() {
-    // 0 轮语义含糊（关闭？还是不重试？），一律要求显式用开关表达关闭。
-    assert!(matches!(
-        validate_berserk_settings(0, 1_000),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-    assert!(matches!(
-        validate_berserk_settings(MAX_LOCAL_BERSERK_ROUNDS + 1, 1_000),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-    assert!(matches!(
-        validate_berserk_settings(u32::MAX, 1_000),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-}
-
-#[test]
-fn berserk_round_delay_validation_rejects_values_above_one_minute() {
-    assert!(matches!(
-        validate_berserk_settings(1, MAX_LOCAL_BERSERK_ROUND_DELAY_MS + 1),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-    assert!(matches!(
-        validate_berserk_settings(1, u64::MAX),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-}
-
-#[test]
-fn berserk_admin_bound_matches_the_runtime_clamp() {
-    // 校验阈值与 retry_pipeline 的 clamp 必须同源，否则管理端放行的轮数
-    // 会被运行时静默改写，用户看到的配置与实际行为不一致。
-    assert_eq!(
-        MAX_LOCAL_BERSERK_ROUNDS,
-        crate::kiro::retry_pipeline::MAX_BERSERK_ROUNDS
-    );
-}
-
-#[test]
 fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
     let mut config = ExternalPoolsConfig {
         external_pool_transient_failure_priority_penalty: 10_000,
@@ -808,38 +277,6 @@ fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
     let err = validate_external_pools_config(&config).unwrap_err();
     assert!(
         err.contains("externalPoolTransientFailurePriorityPenalty"),
-        "unexpected validation error: {err}"
-    );
-}
-
-#[test]
-fn external_pool_transient_failure_cooldown_threshold_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_transient_failure_cooldown_threshold: 1_000,
-        ..ExternalPoolsConfig::default()
-    };
-    validate_external_pools_config(&config).expect("upper bound should be accepted");
-
-    config.external_pool_transient_failure_cooldown_threshold = 1_001;
-    let err = validate_external_pools_config(&config).unwrap_err();
-    assert!(
-        err.contains("externalPoolTransientFailureCooldownThreshold"),
-        "unexpected validation error: {err}"
-    );
-}
-
-#[test]
-fn external_pool_cost_floor_margin_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_usage_projection_cost_floor_margin_percent: 200,
-        ..ExternalPoolsConfig::default()
-    };
-    validate_external_pools_config(&config).expect("upper bound should be accepted");
-
-    config.external_pool_usage_projection_cost_floor_margin_percent = 201;
-    let err = validate_external_pools_config(&config).unwrap_err();
-    assert!(
-        err.contains("externalPoolUsageProjectionCostFloorMarginPercent"),
         "unexpected validation error: {err}"
     );
 }
@@ -870,6 +307,85 @@ fn external_pool_wire_debug_validation_is_bounded() {
 }
 
 #[test]
+fn extracts_model_ids_from_anthropic_and_openai_models_response() {
+    let body = r#"{
+            "data": [
+                {"id": "claude-sonnet-5"},
+                {"id": "claude-opus-4-8"}
+            ]
+        }"#;
+
+    assert_eq!(
+        extract_model_ids_from_models_response(body),
+        vec!["claude-sonnet-5", "claude-opus-4-8"]
+    );
+}
+
+#[test]
+fn extracts_model_ids_from_kiro_compatible_models_response() {
+    let body = r#"{
+            "defaultModel": {"modelId": "auto"},
+            "models": [
+                {"modelId": "claude-sonnet-4.5"},
+                {"model": "claude-opus-4.8"},
+                "claude-haiku-4.5"
+            ]
+        }"#;
+
+    assert_eq!(
+        extract_model_ids_from_models_response(body),
+        vec![
+            "claude-sonnet-4.5",
+            "claude-opus-4.8",
+            "claude-haiku-4.5",
+            "auto",
+        ]
+    );
+}
+
+#[test]
+fn remove_request_api_key_by_id_rejects_missing_key() {
+    let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
+
+    let err = remove_request_api_key_by_id(
+        &mut keys,
+        &crate::common::auth::request_api_key_id("sk-missing"),
+    )
+    .expect_err("missing key should fail");
+
+    assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
+    assert_eq!(keys, vec!["sk-one".to_string(), "sk-two".to_string()]);
+}
+
+#[test]
+fn remove_request_api_key_by_id_rejects_removing_last_key() {
+    let mut keys = vec!["sk-one".to_string()];
+
+    let err = remove_request_api_key_by_id(
+        &mut keys,
+        &crate::common::auth::request_api_key_id("sk-one"),
+    )
+    .expect_err("last key should not be removable");
+
+    assert!(matches!(err, AdminServiceError::Conflict(_)));
+    assert_eq!(keys, vec!["sk-one".to_string()]);
+}
+
+#[test]
+fn remove_request_api_key_by_id_removes_requested_key() {
+    let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
+
+    let removed = remove_request_api_key_by_id(
+        &mut keys,
+        &crate::common::auth::request_api_key_id("sk-one"),
+    )
+    .expect("key should be removed");
+
+    assert_eq!(removed, "sk-one");
+    assert_eq!(keys, vec!["sk-two".to_string()]);
+}
+
+#[test]
 fn request_admission_admin_save_refresh_returns_canonical_queue_fields() {
     let queue_only = RequestAdmissionConfig {
         rpm: 0,
@@ -897,744 +413,71 @@ fn request_admission_admin_save_refresh_returns_canonical_queue_fields() {
 }
 
 #[test]
-fn credential_admin_list_options_include_account_info_snapshot() {
-    let options = CredentialStatusBuildOptions::WITH_ACCOUNT_INFO_AND_COST_SUMMARY;
+fn request_key_policy_validation_preserves_legacy_keys_and_fails_closed() {
+    let keys = vec!["sk-legacy".to_string(), "sk-managed".to_string()];
+    assert!(validate_request_api_key_policies(&keys, &[]).is_ok());
 
-    assert!(options.include_account_info);
-    assert!(options.include_cost_summary);
-}
-
-#[test]
-fn credit_snapshot_takes_the_upstream_limit_for_every_tier() {
-    // 59138 2026-11-08：同为 KIRO PRO，上游上限 808 和 1247 都出现过，不能当成 1000。
-    let used_up_low_limit = credit_snapshot_for_subscription(Some("KIRO PRO"), 808.0, 808.0, 0.0);
-    assert_eq!(used_up_low_limit.limit, 808.0);
-    assert_eq!(used_up_low_limit.remaining, 0.0);
-    assert_eq!(used_up_low_limit.base, 808.0);
-    assert_eq!(used_up_low_limit.bonus, 0.0);
-
-    let high_limit = credit_snapshot_for_subscription(Some("KIRO PRO"), 69.28, 1_247.0, 0.0);
-    assert_eq!(high_limit.limit, 1_247.0);
-    assert!((high_limit.remaining - 1_177.72).abs() < 1e-9);
-
-    let pro_plus = credit_snapshot_for_subscription(Some("Kiro Pro+"), 125.25, 1_524.0, 0.0);
-    assert_eq!(pro_plus.limit, 1_524.0);
-    assert_eq!(pro_plus.remaining, 1_398.75);
-
-    // 奖励额度来自上游，已经算在 usage_limit 里；只拆分展示，不再额外加 10000。
-    let with_bonus = credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 1_500.0, 500.0);
-    assert_eq!(with_bonus.limit, 1_500.0);
-    assert_eq!(with_bonus.remaining, 1_374.75);
-    assert_eq!(with_bonus.base, 1_000.0);
-    assert_eq!(with_bonus.bonus, 500.0);
-
-    let free = credit_snapshot_for_subscription(Some("KIRO FREE"), 34.52, 50.0, 0.0);
-    assert_eq!(free.limit, 50.0);
-    assert!((free.remaining - 15.48).abs() < 1e-9);
-
-    // 超额：已用量超过上限时剩余为 0，不会出现负数。
-    let overage = credit_snapshot_for_subscription(Some("Kiro Pro"), 1_345.0, 1_000.0, 0.0);
-    assert_eq!(overage.limit, 1_000.0);
-    assert_eq!(overage.remaining, 0.0);
-}
-
-#[test]
-fn credit_snapshot_estimates_by_tier_only_without_an_upstream_limit() {
-    let students = credit_snapshot_for_subscription(Some("KIRO STUDENT"), 125.25, 0.0, 0.0);
-    assert_eq!(students.limit, 1_000.0);
-    assert_eq!(students.remaining, 874.75);
-    let power = credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 0.0, 0.0);
-    assert_eq!(power.limit, 10_000.0);
-    let unknown = credit_snapshot_for_subscription(None, 10.0, 0.0, 0.0);
-    assert_eq!(unknown.limit, 0.0);
-    assert_eq!(unknown.remaining, 0.0);
-}
-
-#[test]
-fn subscription_key_distinguishes_pro_max_from_pro() {
-    for title in ["Kiro Pro Max", "KIRO PRO_MAX", "pro-max", "promax"] {
-        assert_eq!(subscription_key(Some(title)), "pro_max", "title={title}");
-    }
-    assert_eq!(subscription_key(Some("Kiro Pro")), "pro");
-    assert_eq!(subscription_key(Some("Kiro Pro+")), "pro_plus");
-    assert_eq!(subscription_key(Some("Kiro Power")), "power");
-    assert_eq!(subscription_key(Some("KIRO STUDENT")), "students");
-    assert_eq!(subscription_key(Some("Kiro Students")), "students");
-    assert_eq!(subscription_key(Some("legacy trial")), "free");
-}
-
-#[test]
-fn subscription_filter_uses_canonical_official_tiers() {
-    let mut credential = credential_item(10, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None);
-    credential.subscription_title = Some("KIRO PRO+".to_string());
-
-    for expected in ["pro_plus", "Kiro Pro+", "pro-plus"] {
-        let query = CredentialListQuery {
-            subscription: Some(expected.to_string()),
-            ..Default::default()
-        };
-        assert!(credential_matches_query(&credential, &query), "{expected}");
-    }
-
-    let pro_query = CredentialListQuery {
-        subscription: Some("pro".to_string()),
-        ..Default::default()
-    };
-    assert!(
-        !credential_matches_query(&credential, &pro_query),
-        "Kiro Pro+ must not match the narrower Kiro Pro filter"
-    );
-
-    credential.subscription_title = Some("KIRO STUDENT".to_string());
-    let students_query = CredentialListQuery {
-        subscription: Some("students".to_string()),
-        ..Default::default()
-    };
-    assert!(credential_matches_query(&credential, &students_query));
-
-    let student_alias_query = CredentialListQuery {
-        subscription: Some("student".to_string()),
-        ..Default::default()
-    };
-    assert!(credential_matches_query(&credential, &student_alias_query));
-}
-
-#[test]
-fn persisted_credit_snapshot_recomputes_from_the_upstream_limit() {
-    // 旧版本按档位写死存下的积分字段：上游 808/808 用尽，却存成 1000 上限、剩余 192。
-    let old_wrong_pro = credit_snapshot_from_persisted_fields(
-        Some("KIRO PRO"),
-        808.0,
-        808.0,
-        1_000.0,
-        192.0,
-        1_000.0,
-        0.0,
-    );
-    assert_eq!(old_wrong_pro.limit, 808.0);
-    assert_eq!(old_wrong_pro.remaining, 0.0);
-    assert_eq!(old_wrong_pro.bonus, 0.0);
-
-    // 旧版本会给 usage_limit ≥ 档位 + 10000 的账号凭空加 10000 奖励额度。
-    let old_inferred_bonus = credit_snapshot_from_persisted_fields(
-        Some("Kiro Power"),
-        250.0,
-        20_000.0,
-        20_000.0,
-        19_750.0,
-        10_000.0,
-        10_000.0,
-    );
-    assert_eq!(old_inferred_bonus.limit, 20_000.0);
-    assert_eq!(old_inferred_bonus.remaining, 19_750.0);
-    // 存下的拆分与上限一致，就沿用它展示。
-    assert_eq!(old_inferred_bonus.base, 10_000.0);
-    assert_eq!(old_inferred_bonus.bonus, 10_000.0);
-
-    // 拆分与上限对不上（旧版按档位写死），奖励额度不再沿用。
-    let mismatched_split = credit_snapshot_from_persisted_fields(
-        Some("Kiro Pro"),
-        125.0,
-        1_500.0,
-        11_000.0,
-        10_875.0,
-        1_000.0,
-        10_000.0,
-    );
-    assert_eq!(mismatched_split.limit, 1_500.0);
-    assert_eq!(mismatched_split.remaining, 1_375.0);
-    assert_eq!(mismatched_split.bonus, 0.0);
-}
-
-#[test]
-fn account_info_estimate_subtracts_local_metering_since_the_snapshot() {
-    let row = crate::storage::postgres::CredentialAccountInfoRow {
-        subscription_title: Some("KIRO PRO".to_string()),
-        current_usage: 69.28,
-        usage_limit: 1_247.0,
-        remaining: 1_177.72,
-        overage_status: Some("DISABLED".to_string()),
-        checked_at: "2026-11-09T02:32:50Z".to_string(),
-        ..Default::default()
-    };
-    let info = account_info_from_row_with_metering(&row, Some(200.0));
-    assert!((info.credit_remaining - 1_177.72).abs() < 1e-9);
-    assert_eq!(info.metered_since_check, Some(200.0));
-    assert!((info.estimated_remaining.unwrap() - 977.72).abs() < 1e-9);
-
-    let overspent = account_info_from_row_with_metering(&row, Some(5_000.0));
-    assert_eq!(overspent.estimated_remaining, Some(0.0));
-
-    let plain = account_info_from_row(&row);
-    assert_eq!(plain.metered_since_check, None);
-    assert_eq!(plain.estimated_remaining, None);
-}
-
-pub(in crate::admin) fn credential_item(
-    id: u64,
-    disabled: bool,
-    created_at: Option<&str>,
-    success_count: u64,
-    estimated_cost_usd: f64,
-    usage_percentage: Option<f64>,
-) -> CredentialStatusItem {
-    CredentialStatusItem {
-        id,
-        created_at: created_at.map(str::to_string),
-        updated_at: None,
-        priority: id as u32,
-        fast: 0,
-        route_mode: crate::model::config::ExternalPoolRouteMode::AllowAll,
-        route_rules: Vec::new(),
-        disabled,
-        failure_count: 0,
-        is_current: false,
-        expires_at: None,
-        auth_method: None,
-        provider: None,
-        region: None,
-        auth_region: None,
-        api_region: None,
-        effective_auth_region: "us-east-1".to_string(),
-        effective_api_region: "us-east-1".to_string(),
-        has_profile_arn: false,
-        identity: crate::kiro::token_manager::CredentialIdentitySnapshot {
-            machine_id_hash: "identity-hash".to_string(),
-            machine_id_source: "deterministic_fallback".to_string(),
-            fingerprint_version: "account-v2".to_string(),
-            ua_profile: "kiro-ide-js-1.0.34-codewhispererstreaming".to_string(),
-            tls_profile: "rustls".to_string(),
-        },
-        refresh_token_hash: None,
-        api_key_hash: None,
-        masked_api_key: None,
-        email: Some(format!("user{}@example.com", id)),
-        subscription_title: None,
-        account_info: usage_percentage.map(|usage_percentage| CredentialAccountInfo {
-            subscription_title: Some("Kiro Pro".to_string()),
-            current_usage: usage_percentage,
-            usage_limit: 100.0,
-            remaining: 100.0 - usage_percentage,
-            usage_percentage,
-            credit_limit: 11_000.0,
-            credit_remaining: (11_000.0 - usage_percentage).max(0.0),
-            credit_base: 1_000.0,
-            credit_bonus: 10_000.0,
-            overage_status: Some("ENABLED".to_string()),
-            overage_capability: Some("OVERAGE_CAPABLE".to_string()),
-            overage_cap: 10.0,
-            overage_rate: 0.04,
-            current_overages: 0.0,
-            next_reset_at: None,
-            checked_at: "2026-01-01T00:00:00Z".to_string(),
-            metered_since_check: None,
-            estimated_remaining: None,
+    let policy = RequestApiKeyPolicy {
+        usage_limits: Vec::new(),
+        api_key: "sk-managed".to_string(),
+        name: "client-a".to_string(),
+        enabled: true,
+        request_admission: Some(RequestAdmissionConfig {
+            max_concurrent_requests: 5,
+            ..RequestAdmissionConfig::default()
         }),
-        success_count,
-        last_used_at: None,
-        supported_models: Vec::new(),
-        tags: Vec::new(),
-        has_proxy: false,
-        proxy_url: None,
-        proxy_username: None,
-        proxy_password: None,
-        proxy_resource_id: None,
-        proxy_resource_name: None,
-        effective_proxy_url: None,
-        effective_proxy_source: "none".to_string(),
-        refresh_failure_count: 0,
-        disabled_reason: None,
-        endpoint: "ide".to_string(),
-        cooled_down: false,
-        cooldown_remaining_secs: 0,
-        cooldown_reason: None,
-        rate_limited: false,
-        rate_limit_remaining_secs: 0,
-        in_flight_requests: 0,
-        oldest_in_flight_age_secs: 0,
-        newest_in_flight_idle_secs: 0,
-        max_concurrent_requests: 0,
-        max_concurrent_requests_override: None,
-        rpm: 0,
-        rpm_override: None,
-        rate_limit_auto_disable_enabled: true,
-        in_flight_lease_max_secs: 0,
-        warmup_remaining: 0,
-        transient_failure_streak: 0,
-        recent_error_rate: 0.0,
-        latency_ewma_ms: None,
-        last_error_kind: None,
-        last_error_reason: None,
-        last_error_at_ms: None,
-        in_probation: false,
-        probation_remaining_secs: 0,
-        scheduler_selection_count: 0,
-        recent_scheduler_selection_count_10s: 0,
-        recent_scheduler_selection_count_60s: 0,
-        recent_scheduler_selection_count_5m: 0,
-        scheduler_selection_pressure: 0.0,
-        scheduler_score: 0.0,
-        estimated_cost_usd,
-        kiro_metering_usage: 0.0,
-        priced_requests: 0,
-        unpriced_requests: 0,
-    }
-}
-
-#[test]
-fn credential_default_sort_keeps_enabled_then_newest_created() {
-    let mut credentials = vec![
-        credential_item(1, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None),
-        credential_item(2, true, Some("2026-01-03T00:00:00Z"), 0, 0.0, None),
-        credential_item(3, false, Some("2026-01-02T00:00:00Z"), 0, 0.0, None),
-        credential_item(4, false, None, 0, 0.0, None),
-    ];
-
-    sort_credentials_for_admin_display(&mut credentials);
-
-    let ids: Vec<u64> = credentials
-        .into_iter()
-        .map(|credential| credential.id)
-        .collect();
-    assert_eq!(ids, vec![3, 1, 4, 2]);
-}
-
-#[test]
-fn credential_default_sort_puts_fast_accounts_first() {
-    let mut credentials = vec![
-        credential_item(1, false, Some("2026-01-03T00:00:00Z"), 0, 0.0, None),
-        credential_item(2, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None),
-        credential_item(3, true, Some("2026-01-02T00:00:00Z"), 0, 0.0, None),
-        credential_item(4, false, Some("2026-01-02T00:00:00Z"), 0, 0.0, None),
-        credential_item(5, false, Some("2026-01-04T00:00:00Z"), 0, 0.0, None),
-    ];
-    credentials[1].fast = 2; // #2
-    credentials[2].fast = 5; // #3, disabled: Fast is ignored
-    credentials[3].fast = 2; // #4
-
-    sort_credentials_for_admin_display(&mut credentials);
-
-    let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
-    // Normal Fast accounts first (equal Fast keeps newest first); everything else, including
-    // the disabled Fast account, keeps the usual enabled-then-newest order.
-    assert_eq!(ids, vec![4, 2, 5, 1, 3]);
-
-    // An explicit sort is untouched by Fast.
-    let query = CredentialListQuery {
-        sort_by: Some("id".to_string()),
-        sort_order: Some("asc".to_string()),
-        ..Default::default()
     };
-    sort_credentials_for_admin_display_with_query(&mut credentials, &query);
-    let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
-    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    assert!(validate_request_api_key_policies(&keys, std::slice::from_ref(&policy)).is_ok());
+
+    let mut unknown = policy.clone();
+    unknown.api_key = "sk-not-configured".to_string();
+    assert!(validate_request_api_key_policies(&keys, &[unknown]).is_err());
+
+    let mut disabled = policy.clone();
+    disabled.enabled = false;
+    assert!(validate_request_api_key_policies(&["sk-managed".to_string()], &[disabled]).is_err());
+
+    assert!(validate_request_api_key_policies(&keys, &[policy.clone(), policy]).is_err());
 }
 
 #[test]
-fn credential_default_sort_keeps_fast_first_through_temporary_states() {
-    let mut credentials = vec![
-        credential_item(1, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None),
-        credential_item(2, false, Some("2026-01-02T00:00:00Z"), 0, 0.0, Some(100.0)),
-        credential_item(3, false, Some("2026-01-03T00:00:00Z"), 0, 0.0, None),
-        credential_item(4, false, Some("2026-01-04T00:00:00Z"), 0, 0.0, None),
-        credential_item(5, false, Some("2026-01-05T00:00:00Z"), 0, 0.0, None),
-        credential_item(6, false, Some("2026-01-06T00:00:00Z"), 0, 0.0, None),
-        credential_item(7, true, Some("2026-01-07T00:00:00Z"), 0, 0.0, None),
-        credential_item(8, false, Some("2026-01-08T00:00:00Z"), 0, 0.0, None),
-    ];
-    credentials[0].fast = 1; // #1 normal
-    credentials[1].fast = 2; // #2 quota used up, still enabled
-    credentials[2].fast = 2; // #3 recent auth failures
-    credentials[2].last_error_kind = Some("auth".to_string());
-    credentials[2].transient_failure_streak = 1;
-    credentials[3].fast = 3; // #4 cooling
-    credentials[3].cooled_down = true;
-    credentials[4].fast = 1; // #5 rate limited
-    credentials[4].rate_limited = true;
-    credentials[6].fast = 9; // #7 disabled (403): the only state that drops Fast
-    credentials[6].disabled_reason = Some("AccountSuspended".to_string());
-
-    sort_credentials_for_admin_display(&mut credentials);
-
-    let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
-    // Fast high to low, equal Fast newest first. The disabled Fast account is not pinned; it
-    // sorts with the rest by the usual rule (enabled before disabled, then newest first).
-    assert_eq!(ids, vec![4, 3, 2, 5, 1, 8, 6, 7]);
+fn runtime_config_audit_array_summary_survives_normalization() {
+    let detail = AdminService::normalize_audit_detail(serde_json::json!({
+        "kind": "runtime_config_change",
+        "changes": [{
+            "path": "kiroEndpointFallbackOrder",
+            "before": {"count": 0, "items": []},
+            "after": {"count": 2, "items": ["first", "second"]},
+        }],
+    }));
+    assert_eq!(
+        detail["changes"][0]["before"]["items"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        detail["changes"][0]["after"]["items"],
+        serde_json::json!(["first", "second"])
+    );
 }
 
 #[test]
-fn credential_list_default_sort_matches_the_full_sort_without_runtime_state() {
-    let mut full: Vec<_> = (1..=6)
-        .map(|id| {
-            credential_item(
-                id,
-                id == 5,
-                Some(&format!("2026-01-0{id}T00:00:00Z")),
-                0,
-                0.0,
-                None,
-            )
-        })
-        .collect();
-    full[0].fast = 2;
-    full[2].fast = 1;
-    full[2].cooled_down = true;
-    full[4].fast = 3; // disabled
-    let mut list: Vec<CredentialListItem> = full
+fn runtime_config_audit_detail_redacts_secret_values_and_bounds_arrays() {
+    let mut before = crate::model::config::Config::default();
+    before.api_keys = vec!["old-secret".to_string()];
+    let mut after = before.clone();
+    after.api_keys = (0..25).map(|index| format!("key-{index}")).collect();
+
+    let detail = AdminService::runtime_config_audit_detail(&before, &after);
+    let changes = detail["changes"].as_array().unwrap();
+    let keys = changes
         .iter()
-        .map(|credential| CredentialListItem {
-            id: credential.id,
-            created_at: credential.created_at.clone(),
-            updated_at: credential.updated_at.clone(),
-            priority: credential.priority,
-            fast: credential.fast,
-            route_mode: credential.route_mode,
-            route_rules: credential.route_rules.clone(),
-            disabled: credential.disabled,
-            disabled_reason: credential.disabled_reason.clone(),
-            auth_method: credential.auth_method.clone(),
-            provider: credential.provider.clone(),
-            region: credential.region.clone(),
-            auth_region: credential.auth_region.clone(),
-            api_region: credential.api_region.clone(),
-            effective_auth_region: credential.effective_auth_region.clone(),
-            effective_api_region: credential.effective_api_region.clone(),
-            has_profile_arn: credential.has_profile_arn,
-            identity: credential.identity.clone(),
-            refresh_token_hash: credential.refresh_token_hash.clone(),
-            api_key_hash: credential.api_key_hash.clone(),
-            masked_api_key: credential.masked_api_key.clone(),
-            email: credential.email.clone(),
-            subscription_title: credential.subscription_title.clone(),
-            tags: credential.tags.clone(),
-            supported_models: credential.supported_models.clone(),
-            has_proxy: credential.has_proxy,
-            proxy_url: credential.proxy_url.clone(),
-            proxy_username: credential.proxy_username.clone(),
-            proxy_password: credential.proxy_password.clone(),
-            proxy_resource_id: credential.proxy_resource_id,
-            proxy_resource_name: credential.proxy_resource_name.clone(),
-            effective_proxy_url: credential.effective_proxy_url.clone(),
-            effective_proxy_source: credential.effective_proxy_source.clone(),
-            endpoint: credential.endpoint.clone(),
-            max_concurrent_requests: credential.max_concurrent_requests,
-            max_concurrent_requests_override: credential.max_concurrent_requests_override,
-            rpm: credential.rpm,
-            rpm_override: credential.rpm_override,
-            rate_limit_auto_disable_enabled: credential.rate_limit_auto_disable_enabled,
-            warmup_remaining: credential.warmup_remaining,
-        })
-        .collect();
-
-    sort_credentials_for_admin_display(&mut full);
-    sort_credential_list_items_for_admin_display_with_query(
-        &mut list,
-        &CredentialListQuery::default(),
-    );
-
-    let full_ids: Vec<u64> = full.iter().map(|credential| credential.id).collect();
-    let list_ids: Vec<u64> = list.iter().map(|credential| credential.id).collect();
-    assert_eq!(full_ids, vec![1, 3, 6, 4, 2, 5]);
-    assert_eq!(list_ids, full_ids);
-}
-
-#[test]
-fn usage_cleanup_row_limit_is_a_per_run_budget() {
-    // A paused job that already used its row budget gets a fresh one when resumed.
-    assert_eq!(usage_cleanup_run_rows_remaining(10_000, 0, 10_000), 0);
-    assert_eq!(
-        usage_cleanup_run_rows_remaining(10_000, 10_000, 10_000),
-        10_000
-    );
-    assert_eq!(
-        usage_cleanup_run_rows_remaining(14_000, 10_000, 10_000),
-        6_000
-    );
-    assert_eq!(usage_cleanup_run_rows_remaining(25_000, 10_000, 10_000), 0);
-}
-
-#[test]
-fn credential_status_filters_keep_quota_and_account_errors_separate() {
-    let quota = credential_item(1, true, None, 0, 0.0, Some(100.0));
-    assert!(is_quota_exhausted(&quota));
-    assert!(!is_account_error(&quota));
-
-    let mut account_error = credential_item(2, true, None, 0, 0.0, None);
-    account_error.disabled_reason = Some("InvalidRefreshToken".to_string());
-    assert!(is_account_error(&account_error));
-    assert!(!is_quota_exhausted(&account_error));
-
-    let mut cooling = credential_item(3, false, None, 0, 0.0, None);
-    cooling.cooled_down = true;
-    assert!(is_cooling_account(&cooling));
-    assert!(!is_normal_account(&cooling));
-
-    let normal = credential_item(4, false, None, 0, 0.0, None);
-    assert!(is_normal_account(&normal));
-
-    // 限流、普通失败的原因文本里出现 token/auth 等字样也不能算账号异常
-    let mut rate_limited = credential_item(5, false, None, 0, 0.0, None);
-    rate_limited.last_error_kind = Some("rate_limit".to_string());
-    rate_limited.last_error_reason = Some("token_refresh_rate_limited".to_string());
-    rate_limited.transient_failure_streak = 2;
-    assert!(!is_account_error(&rate_limited));
-
-    let mut auth_failing = credential_item(6, false, None, 0, 0.0, None);
-    auth_failing.last_error_kind = Some("auth".to_string());
-    auth_failing.transient_failure_streak = 1;
-    assert!(is_account_error(&auth_failing));
-    assert!(!is_normal_account(&auth_failing));
-
-    // 认证失败已经被后续成功调用抵消，不再算账号异常
-    auth_failing.transient_failure_streak = 0;
-    assert!(!is_account_error(&auth_failing));
-
-    let mut manual = credential_item(7, true, None, 0, 0.0, None);
-    manual.disabled_reason = Some("Manual".to_string());
-    assert!(!is_account_error(&manual));
-    assert!(!is_quota_exhausted(&manual));
-}
-
-#[test]
-fn unavailable_status_covers_disabled_quota_and_account_errors_but_not_cooling() {
-    let unavailable = |credential: &CredentialStatusItem| {
-        credential_matches_query(
-            credential,
-            &CredentialListQuery {
-                status: Some("unavailable".to_string()),
-                ..Default::default()
-            },
-        )
-    };
-
-    let mut manual = credential_item(1, true, None, 0, 0.0, None);
-    manual.disabled_reason = Some("Manual".to_string());
-    assert!(unavailable(&manual));
-
-    let quota = credential_item(2, false, None, 0, 0.0, Some(100.0));
-    assert!(unavailable(&quota));
-
-    let mut auth_failing = credential_item(3, false, None, 0, 0.0, None);
-    auth_failing.last_error_kind = Some("auth".to_string());
-    auth_failing.transient_failure_streak = 1;
-    assert!(unavailable(&auth_failing));
-
-    // Cooling and rate limiting recover on their own.
-    let mut cooling = credential_item(4, false, None, 0, 0.0, None);
-    cooling.cooled_down = true;
-    assert!(!unavailable(&cooling));
-    let mut rate_limited = credential_item(5, false, None, 0, 0.0, None);
-    rate_limited.rate_limited = true;
-    assert!(!unavailable(&rate_limited));
-
-    let normal = credential_item(6, false, None, 0, 0.0, None);
-    assert!(!unavailable(&normal));
-    assert!(status_requires_runtime_filter("unavailable"));
-}
-
-#[test]
-fn suspended_account_with_an_exhausted_quota_snapshot_is_an_account_error() {
-    // Seen on 2026-10-24: free accounts used past their limit, then got suspended upstream.
-    // Their quota snapshot still says exhausted; they belong to "账号异常", once.
-    for reason in [
-        "TemporarilySuspended",
-        "AccountSuspended",
-        "AccountLocked",
-        "InvalidRefreshToken",
-        "InvalidConfig",
-    ] {
-        let mut suspended = credential_item(1, true, None, 0, 0.0, Some(100.0));
-        suspended.disabled_reason = Some(reason.to_string());
-        assert!(is_account_error(&suspended), "{reason}");
-        assert!(!is_quota_exhausted(&suspended), "{reason}");
-    }
-
-    // A quota disable stays quota exhausted even when a snapshot is missing.
-    let mut quota = credential_item(2, true, None, 0, 0.0, None);
-    quota.disabled_reason = Some("QuotaExceeded".to_string());
-    assert!(is_quota_exhausted(&quota));
-    assert!(!is_account_error(&quota));
-}
-
-#[test]
-fn credential_custom_sort_runs_before_pagination_order() {
-    let mut credentials = vec![
-        credential_item(1, false, Some("2026-01-01T00:00:00Z"), 10, 0.2, Some(20.0)),
-        credential_item(2, false, Some("2026-01-02T00:00:00Z"), 30, 0.1, Some(90.0)),
-        credential_item(3, true, Some("2026-01-03T00:00:00Z"), 20, 0.3, None),
-    ];
-    let query = CredentialListQuery {
-        sort_by: Some("success_count".to_string()),
-        sort_order: Some("desc".to_string()),
-        ..Default::default()
-    };
-
-    sort_credentials_for_admin_display_with_query(&mut credentials, &query);
-
-    let ids: Vec<u64> = credentials
-        .into_iter()
-        .map(|credential| credential.id)
-        .collect();
-    assert_eq!(ids, vec![2, 3, 1]);
-}
-
-#[test]
-fn credential_filters_and_search_match_scheduling_overrides() {
-    let mut credential = credential_item(9, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None);
-    credential.priority = 4;
-    credential.max_concurrent_requests = 7;
-    credential.max_concurrent_requests_override = Some(7);
-    credential.rpm = 60;
-    credential.rpm_override = Some(60);
-    credential.api_region = Some("us-west-2".to_string());
-    credential.effective_api_region = "us-west-2".to_string();
-    credential.supported_models = vec!["claude-opus-4.8".to_string()];
-
-    for status in [
-        "custom_priority",
-        "custom_concurrency",
-        "custom_rpm",
-        "custom_scheduling",
-    ] {
-        let query = CredentialListQuery {
-            status: Some(status.to_string()),
-            ..Default::default()
-        };
-        assert!(
-            credential_matches_query(&credential, &query),
-            "{status} should match"
-        );
-    }
-
-    for q in ["#9", "id:9", "priority:4", "concurrency:7", "rpm:60"] {
-        let query = CredentialListQuery {
-            q: Some(q.to_string()),
-            ..Default::default()
-        };
-        assert!(
-            credential_matches_query(&credential, &query),
-            "{q} should match"
-        );
-    }
-
-    for query in [
-        CredentialListQuery {
-            credential_id: Some(9),
-            ..Default::default()
-        },
-        CredentialListQuery {
-            account: Some("user9@example.com".to_string()),
-            ..Default::default()
-        },
-        CredentialListQuery {
-            region: Some("us-west-2".to_string()),
-            ..Default::default()
-        },
-        CredentialListQuery {
-            model: Some("opus-4.8".to_string()),
-            ..Default::default()
-        },
-        CredentialListQuery {
-            endpoint: Some("ide".to_string()),
-            ..Default::default()
-        },
-        CredentialListQuery {
-            priority: Some(4),
-            rpm: Some(60),
-            concurrency: Some(7),
-            ..Default::default()
-        },
-    ] {
-        assert!(credential_matches_query(&credential, &query));
-    }
-}
-
-#[test]
-fn usage_cleanup_request_uses_safe_manual_defaults() {
-    let before = Utc::now();
-    let plan = normalize_usage_cleanup_request(cleanup_request()).expect("valid request");
-    let after = Utc::now();
-
-    assert_eq!(plan.mode, UsageCleanupMode::SoftDelete);
-    assert!(!plan.include_summary);
-    assert_eq!(plan.batch_size, USAGE_CLEANUP_DEFAULT_BATCH_SIZE);
-    assert_eq!(plan.max_batches, USAGE_CLEANUP_DEFAULT_MAX_BATCHES);
-    assert_eq!(plan.max_rows, None);
-    assert_eq!(plan.pause_ms_between_batches, 10);
-    assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
-    assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
-}
-
-#[test]
-fn usage_cleanup_request_cutoff_before_overrides_days() {
-    let cutoff = Utc::now() - ChronoDuration::days(30);
-    let mut request = cleanup_request();
-    request.mode = UsageCleanupMode::HardDelete;
-    request.older_than_days = Some(1);
-    request.cutoff_before = Some(cutoff.to_rfc3339());
-    request.batch_size = Some(USAGE_CLEANUP_MAX_BATCH_SIZE);
-    request.max_batches = Some(10_000);
-    request.max_rows = Some(123);
-    request.pause_ms_between_batches = Some(0);
-
-    let plan = normalize_usage_cleanup_request(request).expect("valid request");
-
-    assert_eq!(plan.mode, UsageCleanupMode::HardDelete);
-    assert_eq!(plan.cutoff, cutoff);
-    assert_eq!(plan.batch_size, USAGE_CLEANUP_MAX_BATCH_SIZE);
-    assert_eq!(plan.max_batches, 10_000);
-    assert_eq!(plan.max_rows, Some(123));
-    assert_eq!(plan.pause_ms_between_batches, 0);
-
-    let mut above_legacy_limit = cleanup_request();
-    above_legacy_limit.batch_size = Some(501);
-    let plan =
-        normalize_usage_cleanup_request(above_legacy_limit).expect("501 is within current limit");
-    assert_eq!(plan.batch_size, 501);
-}
-
-#[test]
-fn usage_cleanup_request_zero_days_uses_execution_cutoff() {
-    let before = Utc::now();
-    let mut zero_days = cleanup_request();
-    zero_days.older_than_days = Some(0);
-
-    let plan = normalize_usage_cleanup_request(zero_days).expect("zero days is valid");
-    let after = Utc::now();
-
-    assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
-    assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
-}
-
-#[test]
-fn usage_cleanup_request_rejects_unsafe_bounds() {
-    let mut large_batch = cleanup_request();
-    large_batch.batch_size = Some(USAGE_CLEANUP_MAX_BATCH_SIZE + 1);
-    assert!(matches!(
-        normalize_usage_cleanup_request(large_batch),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-
-    let mut too_many_batches = cleanup_request();
-    too_many_batches.max_batches = Some(USAGE_CLEANUP_MAX_BATCHES + 1);
-    assert!(matches!(
-        normalize_usage_cleanup_request(too_many_batches),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-
-    let mut future_cutoff = cleanup_request();
-    future_cutoff.cutoff_before = Some((Utc::now() + ChronoDuration::minutes(1)).to_rfc3339());
-    assert!(matches!(
-        normalize_usage_cleanup_request(future_cutoff),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
-
-    let mut too_many_rows = cleanup_request();
-    too_many_rows.max_rows = Some(USAGE_CLEANUP_MAX_ROWS + 1);
-    assert!(matches!(
-        normalize_usage_cleanup_request(too_many_rows),
-        Err(AdminServiceError::InvalidCredential(_))
-    ));
+        .find(|change| change["path"] == "apiKeys")
+        .unwrap();
+    assert_eq!(keys["before"], "[已隐藏]");
+    assert_eq!(keys["after"], "[已隐藏]");
+    assert_eq!(keys["redacted"], true);
+    assert!(!detail.to_string().contains("old-secret"));
+    assert!(!detail.to_string().contains("key-24"));
 }
 
 #[test]
@@ -1654,34 +497,6 @@ fn usage_cleanup_include_summary_is_simple_full_history_mode() {
     assert_eq!(plan.max_rows, None);
     assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
     assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
-}
-
-#[test]
-fn usage_cleanup_resume_gets_a_fresh_per_run_batch_budget() {
-    assert!(usage_cleanup_run_batch_limit_reached(10, 0, 10));
-    assert!(!usage_cleanup_run_batch_limit_reached(10, 10, 10));
-    assert!(!usage_cleanup_run_batch_limit_reached(19, 10, 10));
-    assert!(usage_cleanup_run_batch_limit_reached(20, 10, 10));
-}
-
-#[test]
-fn usage_cleanup_lock_contention_backoff_is_bounded() {
-    assert_eq!(
-        usage_cleanup_lock_contention_backoff(1),
-        StdDuration::from_millis(25)
-    );
-    assert_eq!(
-        usage_cleanup_lock_contention_backoff(2),
-        StdDuration::from_millis(50)
-    );
-    assert_eq!(
-        usage_cleanup_lock_contention_backoff(5),
-        StdDuration::from_millis(400)
-    );
-    assert_eq!(
-        usage_cleanup_lock_contention_backoff(100),
-        StdDuration::from_millis(400)
-    );
 }
 
 #[tokio::test]
@@ -1780,435 +595,172 @@ async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_
 }
 
 #[test]
-fn remove_request_api_key_by_id_removes_requested_key() {
-    let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
-
-    let removed = remove_request_api_key_by_id(
-        &mut keys,
-        &crate::common::auth::request_api_key_id("sk-one"),
-    )
-    .expect("key should be removed");
-
-    assert_eq!(removed, "sk-one");
-    assert_eq!(keys, vec!["sk-two".to_string()]);
-}
-
-#[test]
-fn admin_request_key_id_matches_runtime_authenticated_identity() {
-    let items = request_api_key_items(&[" sk-one ".to_string()], &[]);
-    let store = RequestApiKeyStore::new(["sk-one"]);
-    let runtime_id = store.authenticate("sk-one").unwrap().stable_id();
-
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].id, runtime_id);
-    assert_eq!(items[0].id.len(), 64);
+fn usage_cleanup_lock_contention_backoff_is_bounded() {
     assert_eq!(
-        items[0].id,
-        crate::common::auth::request_api_key_id("sk-one")
+        usage_cleanup_lock_contention_backoff(1),
+        StdDuration::from_millis(25)
+    );
+    assert_eq!(
+        usage_cleanup_lock_contention_backoff(2),
+        StdDuration::from_millis(50)
+    );
+    assert_eq!(
+        usage_cleanup_lock_contention_backoff(5),
+        StdDuration::from_millis(400)
+    );
+    assert_eq!(
+        usage_cleanup_lock_contention_backoff(100),
+        StdDuration::from_millis(400)
     );
 }
 
 #[test]
-fn access_key_response_keeps_legacy_primary_field_and_lists_managed_policies() {
-    let keys = vec![
-        "sk-legacy-primary".to_string(),
-        "sk-managed-client".to_string(),
+fn usage_cleanup_request_cutoff_before_overrides_days() {
+    let cutoff = Utc::now() - ChronoDuration::days(30);
+    let mut request = cleanup_request();
+    request.mode = UsageCleanupMode::HardDelete;
+    request.older_than_days = Some(1);
+    request.cutoff_before = Some(cutoff.to_rfc3339());
+    request.batch_size = Some(USAGE_CLEANUP_MAX_BATCH_SIZE);
+    request.max_batches = Some(10_000);
+    request.max_rows = Some(123);
+    request.pause_ms_between_batches = Some(0);
+
+    let plan = normalize_usage_cleanup_request(request).expect("valid request");
+
+    assert_eq!(plan.mode, UsageCleanupMode::HardDelete);
+    assert_eq!(plan.cutoff, cutoff);
+    assert_eq!(plan.batch_size, USAGE_CLEANUP_MAX_BATCH_SIZE);
+    assert_eq!(plan.max_batches, 10_000);
+    assert_eq!(plan.max_rows, Some(123));
+    assert_eq!(plan.pause_ms_between_batches, 0);
+
+    let mut above_legacy_limit = cleanup_request();
+    above_legacy_limit.batch_size = Some(501);
+    let plan =
+        normalize_usage_cleanup_request(above_legacy_limit).expect("501 is within current limit");
+    assert_eq!(plan.batch_size, 501);
+}
+
+#[test]
+fn usage_cleanup_request_rejects_unsafe_bounds() {
+    let mut large_batch = cleanup_request();
+    large_batch.batch_size = Some(USAGE_CLEANUP_MAX_BATCH_SIZE + 1);
+    assert!(matches!(
+        normalize_usage_cleanup_request(large_batch),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+
+    let mut too_many_batches = cleanup_request();
+    too_many_batches.max_batches = Some(USAGE_CLEANUP_MAX_BATCHES + 1);
+    assert!(matches!(
+        normalize_usage_cleanup_request(too_many_batches),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+
+    let mut future_cutoff = cleanup_request();
+    future_cutoff.cutoff_before = Some((Utc::now() + ChronoDuration::minutes(1)).to_rfc3339());
+    assert!(matches!(
+        normalize_usage_cleanup_request(future_cutoff),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+
+    let mut too_many_rows = cleanup_request();
+    too_many_rows.max_rows = Some(USAGE_CLEANUP_MAX_ROWS + 1);
+    assert!(matches!(
+        normalize_usage_cleanup_request(too_many_rows),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+}
+
+#[test]
+fn usage_cleanup_request_uses_safe_manual_defaults() {
+    let before = Utc::now();
+    let plan = normalize_usage_cleanup_request(cleanup_request()).expect("valid request");
+    let after = Utc::now();
+
+    assert_eq!(plan.mode, UsageCleanupMode::SoftDelete);
+    assert!(!plan.include_summary);
+    assert_eq!(plan.batch_size, USAGE_CLEANUP_DEFAULT_BATCH_SIZE);
+    assert_eq!(plan.max_batches, USAGE_CLEANUP_DEFAULT_MAX_BATCHES);
+    assert_eq!(plan.max_rows, None);
+    assert_eq!(plan.pause_ms_between_batches, 10);
+    assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
+    assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
+}
+
+#[test]
+fn usage_cleanup_request_zero_days_uses_execution_cutoff() {
+    let before = Utc::now();
+    let mut zero_days = cleanup_request();
+    zero_days.older_than_days = Some(0);
+
+    let plan = normalize_usage_cleanup_request(zero_days).expect("zero days is valid");
+    let after = Utc::now();
+
+    assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
+    assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
+}
+
+#[test]
+fn usage_cleanup_resume_gets_a_fresh_per_run_batch_budget() {
+    assert!(usage_cleanup_run_batch_limit_reached(10, 0, 10));
+    assert!(!usage_cleanup_run_batch_limit_reached(10, 10, 10));
+    assert!(!usage_cleanup_run_batch_limit_reached(19, 10, 10));
+    assert!(usage_cleanup_run_batch_limit_reached(20, 10, 10));
+}
+
+#[test]
+fn usage_cleanup_row_limit_is_a_per_run_budget() {
+    // A paused job that already used its row budget gets a fresh one when resumed.
+    assert_eq!(usage_cleanup_run_rows_remaining(10_000, 0, 10_000), 0);
+    assert_eq!(
+        usage_cleanup_run_rows_remaining(10_000, 10_000, 10_000),
+        10_000
+    );
+    assert_eq!(
+        usage_cleanup_run_rows_remaining(14_000, 10_000, 10_000),
+        6_000
+    );
+    assert_eq!(usage_cleanup_run_rows_remaining(25_000, 10_000, 10_000), 0);
+}
+
+#[test]
+fn runtime_config_rejects_invalid_common_settings_before_install() {
+    let invalid_cases: Vec<Box<dyn Fn(&mut Config)>> = vec![
+        Box::new(|config| config.prompt_cache_target_read_ratio = 1.0),
+        Box::new(|config| config.prompt_cache_token_scale = 0.5),
+        Box::new(|config| {
+            config.prompt_cache_cap_jitter_min_tokens =
+                config.prompt_cache_cap_jitter_max_tokens + 1
+        }),
+        Box::new(|config| config.prompt_cache_entry_ttl_secs = 0),
+        Box::new(|config| config.inference_upstream_max_attempts = 0),
+        Box::new(|config| config.audit_log_retention_days = 0),
+        Box::new(|config| config.high_cache_threshold = -1),
+        Box::new(|config| config.defined_cache_routes = vec!["/invalid".to_string()]),
+        Box::new(|config| config.request_admission.rpm = u32::MAX),
     ];
-    let policies = vec![RequestApiKeyPolicy {
-        usage_limits: Vec::new(),
-        api_key: "sk-managed-client".to_string(),
-        name: "client-a".to_string(),
-        enabled: true,
-        request_admission: Some(RequestAdmissionConfig {
-            max_concurrent_requests: 5,
-            ..RequestAdmissionConfig::default()
-        }),
-    }];
-    let response = access_keys_response(
-        &keys,
-        &policies,
-        RequestAdmissionConfig::default(),
-        "sk-admin",
-    );
-
-    assert_eq!(response.request_api_key, "sk-legacy-primary");
-    assert_eq!(response.request_api_keys.len(), 2);
-    assert!(response.request_api_keys[0].primary);
-    assert_eq!(response.request_api_keys[0].api_key, "sk-legacy-primary");
-    assert!(!response.request_api_keys[1].primary);
-    assert_eq!(response.request_api_keys[1].name, "client-a");
-    assert_eq!(
-        response.request_api_keys[1]
-            .request_admission
-            .unwrap()
-            .max_concurrent_requests,
-        5
-    );
-
-    let wire = serde_json::to_value(response).expect("access-key response json");
-    assert_eq!(wire["requestApiKey"], "sk-legacy-primary");
-    assert_eq!(wire["requestApiKeys"][1]["apiKey"], "sk-managed-client");
-}
-
-#[test]
-fn request_key_policy_validation_preserves_legacy_keys_and_fails_closed() {
-    let keys = vec!["sk-legacy".to_string(), "sk-managed".to_string()];
-    assert!(validate_request_api_key_policies(&keys, &[]).is_ok());
-
-    let policy = RequestApiKeyPolicy {
-        usage_limits: Vec::new(),
-        api_key: "sk-managed".to_string(),
-        name: "client-a".to_string(),
-        enabled: true,
-        request_admission: Some(RequestAdmissionConfig {
-            max_concurrent_requests: 5,
-            ..RequestAdmissionConfig::default()
-        }),
-    };
-    assert!(validate_request_api_key_policies(&keys, std::slice::from_ref(&policy)).is_ok());
-
-    let mut unknown = policy.clone();
-    unknown.api_key = "sk-not-configured".to_string();
-    assert!(validate_request_api_key_policies(&keys, &[unknown]).is_err());
-
-    let mut disabled = policy.clone();
-    disabled.enabled = false;
-    assert!(validate_request_api_key_policies(&["sk-managed".to_string()], &[disabled]).is_err());
-
-    assert!(validate_request_api_key_policies(&keys, &[policy.clone(), policy]).is_err());
-}
-
-#[test]
-fn remove_request_api_key_by_id_rejects_missing_key() {
-    let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
-
-    let err = remove_request_api_key_by_id(
-        &mut keys,
-        &crate::common::auth::request_api_key_id("sk-missing"),
-    )
-    .expect_err("missing key should fail");
-
-    assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
-    assert_eq!(keys, vec!["sk-one".to_string(), "sk-two".to_string()]);
-}
-
-#[test]
-fn remove_request_api_key_by_id_rejects_removing_last_key() {
-    let mut keys = vec!["sk-one".to_string()];
-
-    let err = remove_request_api_key_by_id(
-        &mut keys,
-        &crate::common::auth::request_api_key_id("sk-one"),
-    )
-    .expect_err("last key should not be removable");
-
-    assert!(matches!(err, AdminServiceError::Conflict(_)));
-    assert_eq!(keys, vec!["sk-one".to_string()]);
-}
-
-#[test]
-fn extracts_model_ids_from_anthropic_and_openai_models_response() {
-    let body = r#"{
-            "data": [
-                {"id": "claude-sonnet-5"},
-                {"id": "claude-opus-4-8"}
-            ]
-        }"#;
-
-    assert_eq!(
-        extract_model_ids_from_models_response(body),
-        vec!["claude-sonnet-5", "claude-opus-4-8"]
-    );
-}
-
-#[test]
-fn extracts_model_ids_from_kiro_compatible_models_response() {
-    let body = r#"{
-            "defaultModel": {"modelId": "auto"},
-            "models": [
-                {"modelId": "claude-sonnet-4.5"},
-                {"model": "claude-opus-4.8"},
-                "claude-haiku-4.5"
-            ]
-        }"#;
-
-    assert_eq!(
-        extract_model_ids_from_models_response(body),
-        vec![
-            "claude-sonnet-4.5",
-            "claude-opus-4.8",
-            "claude-haiku-4.5",
-            "auto",
-        ]
-    );
-}
-
-#[test]
-fn external_pool_quality_defaults_pass_validation() {
-    // Quality-aware scheduling changes runtime decisions and must be opt-in on
-    // upgrades. The remaining defaults still need to validate as a whole.
-    let config = ExternalPoolsConfig::default();
-    assert!(
-        !config.external_pool_quality_aware_scheduling_enabled,
-        "质量感知调度主开关必须默认关闭"
-    );
-    validate_external_pools_config(&config).expect("默认配置必须通过校验");
-}
-
-#[test]
-fn external_pool_quality_ewma_alpha_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_quality_ewma_alpha: 0.01,
-        ..Default::default()
-    };
-    validate_external_pools_config(&config).expect("下界必须被接受");
-    config.external_pool_quality_ewma_alpha = 1.0;
-    validate_external_pools_config(&config).expect("上界必须被接受");
-
-    for invalid in [0.0, 1.0001, -0.5, f64::NAN] {
-        config.external_pool_quality_ewma_alpha = invalid;
-        let err = validate_external_pools_config(&config).unwrap_err();
-        assert!(
-            err.contains("externalPoolQualityEwmaAlpha"),
-            "alpha={invalid} 应被拒绝，实际错误: {err}"
-        );
+    for invalidate in invalid_cases {
+        let mut config = Config::default();
+        invalidate(&mut config);
+        assert!(normalize_and_validate_runtime_config(&mut config).is_err());
     }
 }
 
 #[test]
-fn external_pool_quality_weights_reject_negative_and_non_finite() {
-    // 负权重会把"差"变成"好"，是最危险的误配置方向。
-    for mutate in [
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_error_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_latency_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_probation_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_priority_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_load_weight = value
-        },
-    ] {
-        for invalid in [-1.0, f64::NAN, f64::INFINITY, 1_000_001.0] {
-            let mut config = ExternalPoolsConfig::default();
-            mutate(&mut config, invalid);
-            let err = validate_external_pools_config(&config)
-                .expect_err(&format!("权重 {invalid} 必须被拒绝"));
-            assert!(
-                err.contains("externalPoolQuality"),
-                "unexpected validation error: {err}"
-            );
-        }
-    }
-}
-
-#[test]
-fn external_pool_probation_ceiling_cannot_be_below_single_probation() {
-    // 避让上限小于单次避让时长会让指数退避的上限语义自相矛盾。
-    let mut config = ExternalPoolsConfig {
-        external_pool_degrade_probation_secs: 600,
-        external_pool_max_probation_secs: 300,
-        ..Default::default()
-    };
-    let err = validate_external_pools_config(&config).unwrap_err();
+fn runtime_config_normalizes_custom_routes_and_installs_defaults() {
+    let mut config = Config::default();
+    config.defined_cache_routes = vec![
+        " dfcache/example/ ".to_string(),
+        "/dfcache/example".to_string(),
+    ];
+    normalize_and_validate_runtime_config(&mut config).unwrap();
+    assert_eq!(config.defined_cache_routes, vec!["/dfcache/example"]);
     assert!(
-        err.contains("externalPoolMaxProbationSecs"),
-        "unexpected validation error: {err}"
+        config
+            .cache_policy
+            .path_overrides
+            .contains_key("/dfcache/example")
     );
-
-    config.external_pool_max_probation_secs = 600;
-    validate_external_pools_config(&config).expect("相等必须被接受");
-}
-
-#[test]
-fn external_pool_degrade_error_rate_threshold_is_a_ratio() {
-    let mut config = ExternalPoolsConfig::default();
-    for valid in [0.0, 0.5, 1.0] {
-        config.external_pool_degrade_error_rate_threshold = valid;
-        validate_external_pools_config(&config).expect("合法比率必须被接受");
-    }
-    for invalid in [-0.1, 1.1] {
-        config.external_pool_degrade_error_rate_threshold = invalid;
-        let err = validate_external_pools_config(&config).unwrap_err();
-        assert!(
-            err.contains("externalPoolDegradeErrorRateThreshold"),
-            "unexpected validation error: {err}"
-        );
-    }
-}
-
-#[test]
-fn external_pool_quality_probe_share_and_top_k_are_bounded() {
-    let config = ExternalPoolsConfig {
-        external_pool_probe_share_percent: 101,
-        ..Default::default()
-    };
-    let err = validate_external_pools_config(&config).unwrap_err();
-    assert!(err.contains("externalPoolProbeSharePercent"), "{err}");
-
-    let config = ExternalPoolsConfig {
-        external_pool_quality_top_k: 101,
-        ..Default::default()
-    };
-    let err = validate_external_pools_config(&config).unwrap_err();
-    assert!(err.contains("externalPoolQualityTopK"), "{err}");
-}
-
-#[test]
-fn credential_route_policy_validation_normalizes_and_rejects_empty_allow_list() {
-    use crate::model::config::ExternalPoolRouteMode;
-    let (mode, rules) = validated_credential_route_policy(SetCredentialRoutePolicyRequest {
-        route_mode: ExternalPoolRouteMode::DenyList,
-        route_rules: vec![" ha/ ".to_string(), "/HA".to_string()],
-    })
-    .unwrap();
-    assert_eq!(mode, ExternalPoolRouteMode::DenyList);
-    assert_eq!(rules, vec!["/ha".to_string()]);
-
-    assert!(
-        validated_credential_route_policy(SetCredentialRoutePolicyRequest {
-            route_mode: ExternalPoolRouteMode::AllowList,
-            route_rules: vec!["  ".to_string()],
-        })
-        .is_err()
-    );
-    assert!(
-        validated_credential_route_policy(SetCredentialRoutePolicyRequest {
-            route_mode: ExternalPoolRouteMode::AllowAll,
-            route_rules: vec!["/x".to_string(); 201],
-        })
-        .is_err()
-    );
-}
-
-#[test]
-fn batch_proxy_assignments_rotate_in_account_order() {
-    let assignments = batch_proxy_assignments(&[10, 11, 12, 13, 14], &[7, 3]);
-    assert_eq!(assignments.get(&10), Some(&7));
-    assert_eq!(assignments.get(&11), Some(&3));
-    assert_eq!(assignments.get(&12), Some(&7));
-    assert_eq!(assignments.get(&13), Some(&3));
-    assert_eq!(assignments.get(&14), Some(&7));
-    // More proxies than accounts: each account still gets exactly one, the rest stay unused.
-    let fewer = batch_proxy_assignments(&[1, 2], &[5, 6, 7]);
-    assert_eq!(fewer.len(), 2);
-    assert_eq!((fewer[&1], fewer[&2]), (5, 6));
-    assert!(batch_proxy_assignments(&[1, 2], &[]).is_empty());
-}
-
-#[test]
-fn batch_update_accepts_route_policy_alone() {
-    let req: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
-        "ids": [1, 2],
-        "routePolicy": {"routeMode": "allow_list", "routeRules": ["/cc"]}
-    }))
-    .unwrap();
-    let policy = req.route_policy.expect("route policy");
-    assert_eq!(
-        policy.route_mode,
-        crate::model::config::ExternalPoolRouteMode::AllowList
-    );
-    assert_eq!(policy.route_rules, vec!["/cc".to_string()]);
-}
-
-#[test]
-fn degrade_settings_keep_current_values_and_clamp_bad_input() {
-    let current = crate::model::config::Config::default();
-
-    let required = serde_json::json!({
-        "credentialRpm": 0,
-        "credentialTransientCooldownSecs": 10,
-        "credentialMaxCooldownSecs": 300,
-        "credentialWarmupRequests": 0,
-        "compressionEnabled": false,
-    });
-    let empty: UpdateRuntimeConfigRequest = serde_json::from_value(required.clone()).unwrap();
-    let kept = resolve_degrade_settings(&empty, &current);
-    assert!(kept.enabled);
-    assert_eq!(kept.suspend_score, current.credential_degrade_suspend_score);
-    assert_eq!(kept.probe_percent, current.credential_degrade_probe_percent);
-
-    let mut bad = required;
-    bad.as_object_mut().unwrap().extend(
-        serde_json::json!({
-        "credentialDegradeEnabled": false,
-        "credentialDegradeSuspendScore": -3.0,
-        "credentialDegradeResumeRatio": 4.0,
-        "credentialDegradeHalfLifeSecs": 0,
-        "credentialDegradeSuccessDecay": 2.0,
-        "credentialDegradeProbePercent": 500,
-        "credentialDegradeEmptyTurnWeight": 1e9,
-        "credentialDegradeStreamWeight": -1.0
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
-    );
-    let bad: UpdateRuntimeConfigRequest = serde_json::from_value(bad).unwrap();
-    let clamped = resolve_degrade_settings(&bad, &current);
-    assert!(!clamped.enabled);
-    assert_eq!(clamped.suspend_score, 0.0);
-    assert_eq!(clamped.resume_ratio, 1.0);
-    assert_eq!(clamped.half_life_secs, 1);
-    assert_eq!(clamped.success_decay, 1.0);
-    assert_eq!(clamped.probe_percent, 100);
-    assert_eq!(clamped.empty_turn_weight, 100.0);
-    assert_eq!(clamped.stream_weight, 0.0);
-}
-
-#[tokio::test]
-async fn official_kiro_key_batch_skips_key_accounts_and_continues_after_failure() {
-    let accounts = HashMap::from([
-        (1, (None, true)),
-        (2, (Some("failed@example.invalid".to_string()), false)),
-        (3, (None, false)),
-    ]);
-    let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let recorded = calls.clone();
-    let response =
-        run_kiro_api_key_batch(vec![1, 2, 99, 3], "batch", &accounts, move |id, label| {
-            recorded.lock().push(id);
-            async move {
-                if id == 2 {
-                    return Err(AdminServiceError::UpstreamError("HTTP 429".to_string()));
-                }
-                Ok(CreateKiroApiKeyItem {
-                    key: crate::storage::kiro_api_keys::StoredKiroApiKey {
-                        credential_id: id,
-                        key_id: "key-id".to_string(),
-                        label,
-                        api_key: "ksk_full_test_value".to_string(),
-                        key_prefix: "ksk_full".to_string(),
-                        region: "us-east-1".to_string(),
-                        profile_arn: "profile".to_string(),
-                        created_at: 1786856404260,
-                    },
-                    email: None,
-                    persisted: true,
-                    warning: None,
-                })
-            }
-        })
-        .await;
-    assert_eq!(*calls.lock(), vec![2, 3]);
-    assert_eq!(
-        (
-            response.total,
-            response.success,
-            response.skipped,
-            response.failed
-        ),
-        (4, 1, 1, 2)
-    );
-    assert!(response.items[0].skipped);
-    assert!(!response.items[1].ok);
-    assert!(!response.items[2].ok);
-    assert_eq!(response.keys[0].key.credential_id, 3);
-    assert_eq!(response.keys[0].key.label, "batch-3");
 }

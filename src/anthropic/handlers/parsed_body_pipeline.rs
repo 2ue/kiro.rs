@@ -11,7 +11,7 @@ pub(super) struct ParsedAnthropicBodyReport {
 }
 
 pub(super) async fn prepare(
-    state: &AppState,
+    _state: &AppState,
     headers: &HeaderMap,
     endpoint: &str,
     payload: &mut MessagesRequest,
@@ -46,7 +46,7 @@ pub(super) async fn prepare(
         report.thinking_trigger_mode = true;
     }
     if plan.thinking.trace.is_enabled() {
-        log_thinking_request_trace(endpoint, payload, runtime_config);
+        tracing::trace!(endpoint, model = %payload.model, thinking = ?payload.thinking, "parsed thinking controls");
         report.thinking_trace = true;
     }
 
@@ -56,14 +56,10 @@ pub(super) async fn prepare(
             let caller_ua = headers
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok());
-            let multimodal = body_processing::prepare_multimodal_sources(
-                &state.file_store,
-                payload,
-                caller_ua,
-                config,
-            )
-            .await
-            .map_err(multimodal_preprocessing_error_response)?;
+            let multimodal =
+                body_processing::prepare_multimodal_sources(payload, caller_ua, config)
+                    .await
+                    .map_err(multimodal_preprocessing_error_response)?;
             report.multimodal = Some(multimodal);
         }
     }

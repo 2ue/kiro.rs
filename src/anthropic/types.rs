@@ -700,16 +700,8 @@ pub struct OutputConfig {
 ///
 /// It is not an Anthropic request default and must never be serialized as a client-selected
 /// `output_config.effort` or used in place of an authoritative Kiro schema default.
-pub const LEGACY_PROMPT_COMPAT_THINKING_EFFORT: &str = "high";
 
-impl OutputConfig {
-    /// Whether this output config asks for reasoning. `format` alone is a structured output
-    /// request, not a reasoning request; an empty object keeps meaning "reasoning at the model's
-    /// default effort", as before `format` existed.
-    pub fn requests_reasoning(&self) -> bool {
-        self.effort.is_some() || self.format.is_none()
-    }
-}
+impl OutputConfig {}
 
 pub fn parse_thinking_effort(effort: &str) -> Option<&'static str> {
     THINKING_EFFORT_VALUES
@@ -869,50 +861,6 @@ pub struct Tool {
     /// Prompt cache control for cacheable tool definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<serde_json::Value>,
-}
-
-/// 内容块
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ContentBlock {
-    #[serde(rename = "type")]
-    pub block_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_use_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_error: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<ImageSource>,
-}
-
-/// 图片数据源
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ImageSource {
-    #[serde(rename = "type")]
-    pub source_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_id: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

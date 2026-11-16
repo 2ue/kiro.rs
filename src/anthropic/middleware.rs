@@ -21,27 +21,23 @@ use uuid::Uuid;
 use crate::common::auth;
 use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
-use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
-    ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
+    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ImageProcessingConfig,
+    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
     normalize_defined_cache_routes,
 };
 
+use super::request_body::MAX_MESSAGES_BODY_SIZE;
 use super::{
     envelope,
-    files::AnthropicFileStore,
     model_capabilities::ModelCapabilitiesCatalog,
-    payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
-    tool_format_debug::ToolFormatDebugRecorder,
     usage::UsageRecorder,
 };
-use super::{files::MAX_FILE_UPLOAD_BODY_SIZE, request_body::MAX_MESSAGES_BODY_SIZE};
 
 /// 入口层明文采集。仅在采集会话运行时旁路复制请求体，并把入口关联 id 传给下游。
 pub async fn capture_http_ingress(mut request: Request<Body>, next: Next) -> Response {
@@ -104,12 +100,8 @@ pub async fn capture_http_ingress(mut request: Request<Body>, next: Next) -> Res
     record_http_egress(response, &ingress_id)
 }
 
-fn ingress_body_limit(path: &str) -> usize {
-    if path.ends_with("/v1/files") {
-        MAX_FILE_UPLOAD_BODY_SIZE
-    } else {
-        MAX_MESSAGES_BODY_SIZE
-    }
+fn ingress_body_limit(_path: &str) -> usize {
+    MAX_MESSAGES_BODY_SIZE
 }
 
 struct IngressCaptureBody {
@@ -267,20 +259,15 @@ pub struct AppState {
     /// 客户端请求 API Key 内存索引。
     pub request_api_keys: Arc<RequestApiKeyStore>,
     /// Kiro Provider（可选，用于实际 API 调用）
-    /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
-    pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
-    pub extract_thinking: bool,
     /// 请求级 usage 记录器
     pub usage_recorder: Arc<UsageRecorder>,
     /// tool-use 格式错误内部诊断写盘器。关闭时为 no-op。
-    pub tool_format_debug_recorder: Arc<ToolFormatDebugRecorder>,
     /// 模型价格目录。仅用于统计计价，失败不影响请求。
     pub pricing_catalog: Arc<PricingCatalog>,
     /// 模型能力目录。仅用于 /models 和后台观测，失败不影响请求调度。
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     /// Anthropic Files 兼容上传暂存区，用于 Claude Code 图片/文件 source.file_id。
-    pub file_store: Arc<AnthropicFileStore>,
     /// 本地 prompt-cache tracker
     pub prompt_cache: Arc<PromptCacheTracker>,
     /// 本地 prompt-cache creation 上报频次控制器
@@ -316,7 +303,6 @@ pub struct AppState {
     /// 模型映射和兜底规则
     pub model_mapping: Arc<ModelMappingConfig>,
     /// 是否在响应头中暴露代理改写动作
-    pub expose_proxy_warnings: bool,
     /// 是否启用发送 Kiro 上游前的最终 payload 防护
     pub payload_guard_enabled: bool,
     /// payload guard 大小裁剪触发模式
@@ -324,7 +310,6 @@ pub struct AppState {
     /// 通用 payload 的本地 byte soft target 和按大小处理总开关
     pub payload_guard_max_bytes: usize,
     /// Kiro 上游请求体字符集加权体积目标
-    pub payload_guard_kiro_max_weight: usize,
     /// payload guard 安全余量字节数
     pub payload_guard_safety_margin_bytes: usize,
     /// payload 超限时是否裁剪旧历史
@@ -332,23 +317,17 @@ pub struct AppState {
     /// 外部备用池是否复用同一套 payload guard / shaping 配置
     pub payload_guard_external_enabled: bool,
     /// 是否把工具 cache_control 转成 Kiro cachePoint
-    pub kiro_cache_point_enabled: bool,
     /// cachePoint 是否仅按工具 cache_control 插入
-    pub kiro_cache_point_tools_only: bool,
     /// 是否记录 cachePoint 插入计划
-    pub kiro_cache_point_record_plan: bool,
     /// Kiro 上游流式响应正文静默超时秒数
-    pub kiro_upstream_stream_idle_timeout_secs: u64,
     /// 多模态图片/文件预处理配置
     pub image_processing: ImageProcessingConfig,
     /// 本地 Anthropic -> Kiro 转换能力配置
-    pub body_conversion: Arc<BodyConversionConfig>,
     /// 提示词注入配置
     pub prompt_injection: Arc<PromptInjectionConfig>,
     /// 按路由控制的功能
     pub route_features: Arc<RouteFeaturesConfig>,
     /// `/v1/models` 只列出 Claude 模型
-    pub claude_models_only: bool,
     /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略
     pub missing_max_tokens: MissingMaxTokensConfig,
     /// payload shaping 配置
@@ -363,30 +342,22 @@ impl AppState {
     /// 创建新的应用状态
     pub fn new(
         request_api_keys: Arc<RequestApiKeyStore>,
-        extract_thinking: bool,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
         prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
         prompt_cache_simulation_mode: PromptCacheSimulationMode,
         prompt_cache_target_read_ratio: f64,
         compat_profile: CompatProfile,
-        expose_proxy_warnings: bool,
     ) -> Self {
         let mut initial = crate::model::config::Config::default();
-        initial.extract_thinking = extract_thinking;
         initial.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio.clamp(0.0, 0.99);
         initial.compat_profile = compat_profile;
-        initial.expose_proxy_warnings = expose_proxy_warnings || compat_profile.is_debug();
         Self {
             runtime: crate::model::runtime::RuntimeConfigStore::new(initial, None),
             request_api_keys,
-            kiro_provider: None,
-            extract_thinking,
             usage_recorder,
-            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            file_store: Arc::new(AnthropicFileStore::default()),
             prompt_cache,
             prompt_cache_creation_controller,
             prompt_cache_simulation_mode,
@@ -404,23 +375,15 @@ impl AppState {
             compat_profile,
             model_resolution_mode: ModelResolutionMode::Compatible,
             model_mapping: Arc::new(ModelMappingConfig::default()),
-            expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
             payload_guard_enabled: true,
             payload_guard_mode: PayloadGuardMode::OnTooLong,
             payload_guard_max_bytes: 450 * 1024,
-            payload_guard_kiro_max_weight: KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
             payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,
             payload_guard_external_enabled: true,
-            kiro_cache_point_enabled: false,
-            kiro_cache_point_tools_only: true,
-            kiro_cache_point_record_plan: true,
-            kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
-            body_conversion: Arc::new(BodyConversionConfig::default()),
             prompt_injection: Arc::new(PromptInjectionConfig::default()),
             route_features: Arc::new(RouteFeaturesConfig::default()),
-            claude_models_only: false,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: Arc::new(ExternalPoolsConfig::default()),
@@ -443,7 +406,6 @@ impl AppState {
         mut self,
         prompt_injection: PromptInjectionConfig,
         route_features: RouteFeaturesConfig,
-        claude_models_only: bool,
     ) -> Self {
         self.prompt_injection = Arc::new(prompt_injection.normalized());
         self.runtime.install_local(|config| {
@@ -452,9 +414,7 @@ impl AppState {
         self.route_features = Arc::new(route_features.normalized());
         self.runtime
             .install_local(|config| config.route_features = self.route_features.as_ref().clone());
-        self.claude_models_only = claude_models_only;
-        self.runtime
-            .install_local(|config| config.claude_models_only = self.claude_models_only);
+
         self
     }
 
@@ -503,14 +463,6 @@ impl AppState {
 
     pub fn with_pricing_catalog(mut self, pricing_catalog: Arc<PricingCatalog>) -> Self {
         self.pricing_catalog = pricing_catalog;
-        self
-    }
-
-    pub fn with_tool_format_debug_recorder(
-        mut self,
-        recorder: Arc<ToolFormatDebugRecorder>,
-    ) -> Self {
-        self.tool_format_debug_recorder = recorder;
         self
     }
 
@@ -563,16 +515,10 @@ impl AppState {
         enabled: bool,
         mode: PayloadGuardMode,
         max_bytes: usize,
-        max_kiro_weight: usize,
         safety_margin_bytes: usize,
         trim_history: bool,
         external_enabled: bool,
-        kiro_cache_point_enabled: bool,
-        kiro_cache_point_tools_only: bool,
-        kiro_cache_point_record_plan: bool,
-        kiro_upstream_stream_idle_timeout_secs: u64,
         image_processing: ImageProcessingConfig,
-        body_conversion: BodyConversionConfig,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
@@ -584,10 +530,7 @@ impl AppState {
         self.payload_guard_max_bytes = max_bytes;
         self.runtime
             .install_local(|config| config.payload_guard_max_bytes = self.payload_guard_max_bytes);
-        self.payload_guard_kiro_max_weight = max_kiro_weight;
-        self.runtime.install_local(|config| {
-            config.payload_guard_kiro_max_weight = self.payload_guard_kiro_max_weight
-        });
+
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
         self.runtime.install_local(|config| {
             config.payload_guard_safety_margin_bytes = self.payload_guard_safety_margin_bytes
@@ -600,29 +543,11 @@ impl AppState {
         self.runtime.install_local(|config| {
             config.payload_guard_external_enabled = self.payload_guard_external_enabled
         });
-        self.kiro_cache_point_enabled = kiro_cache_point_enabled;
-        self.runtime.install_local(|config| {
-            config.kiro_cache_point_enabled = self.kiro_cache_point_enabled
-        });
-        self.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
-        self.runtime.install_local(|config| {
-            config.kiro_cache_point_tools_only = self.kiro_cache_point_tools_only
-        });
-        self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
-        self.runtime.install_local(|config| {
-            config.kiro_cache_point_record_plan = self.kiro_cache_point_record_plan
-        });
-        self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
-        self.runtime.install_local(|config| {
-            config.kiro_upstream_stream_idle_timeout_secs =
-                self.kiro_upstream_stream_idle_timeout_secs
-        });
+
         self.image_processing = image_processing.normalized();
         self.runtime
             .install_local(|config| config.image_processing = self.image_processing);
-        self.body_conversion = Arc::new(body_conversion);
-        self.runtime
-            .install_local(|config| config.body_conversion = self.body_conversion.as_ref().clone());
+
         self.payload_shaping = payload_shaping;
         self.runtime
             .install_local(|config| config.payload_shaping = self.payload_shaping);
@@ -633,13 +558,6 @@ impl AppState {
         self.missing_max_tokens = config.normalized();
         self.runtime
             .install_local(|config| config.missing_max_tokens = self.missing_max_tokens);
-        self
-    }
-
-    /// 设置 KiroProvider
-    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
-        self.runtime = provider.runtime_store();
-        self.kiro_provider = Some(provider);
         self
     }
 
@@ -730,14 +648,12 @@ mod tests {
     fn test_state() -> AppState {
         AppState::new(
             Arc::new(RequestApiKeyStore::new(["middleware-413-key"])),
-            true,
             Arc::new(UsageRecorder::new(10)),
             Arc::new(PromptCacheTracker::default()),
             Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::HighCache,
             0.98,
             CompatProfile::ClaudeCode,
-            false,
         )
     }
 

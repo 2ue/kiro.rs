@@ -301,7 +301,7 @@ fn build_template(
         && prompt_cache_supported;
     let stable_conversation_id = route
         .stable_conversation_id()
-        .or_else(|| crate::anthropic::converter::extract_stable_conversation_id(payload));
+        .or_else(|| crate::anthropic::conversation_id::extract_stable_conversation_id(payload));
     let scope = cache_state_enabled
         .then(|| {
             prompt_cache_scope(

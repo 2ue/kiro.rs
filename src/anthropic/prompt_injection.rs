@@ -146,19 +146,13 @@ mod tests {
     }
 
     fn set(config: &mut PromptInjectionConfig, id: InjectionId, enabled: bool) {
-        config.defaults.insert(
-            id,
-            ItemSetting {
-                enabled,
-                external_pool: id.supports_external_pool().then_some(false),
-            },
-        );
+        config.defaults.insert(id, ItemSetting { enabled });
     }
 
     fn resolve(config: &PromptInjectionConfig, endpoint: &str) -> ResolvedInjections {
         ResolvedInjections::resolve(
             endpoint,
-            UpstreamKind::Local,
+            UpstreamKind::ExternalPool,
             CompatProfile::ClaudeCode,
             config,
         )
@@ -273,7 +267,6 @@ mod tests {
                 InjectionId::TaskQuality,
                 ItemOverride {
                     enabled: Some(false),
-                    external_pool: None,
                 },
             )]
             .into(),
@@ -284,7 +277,6 @@ mod tests {
                 InjectionId::TaskQuality,
                 ItemOverride {
                     enabled: Some(true),
-                    external_pool: None,
                 },
             )]
             .into(),
@@ -335,41 +327,13 @@ mod tests {
         set(&mut config, InjectionId::IdentityPrompt, true);
         let injections = ResolvedInjections::resolve(
             "/cc/v1/messages",
-            UpstreamKind::Local,
+            UpstreamKind::ExternalPool,
             CompatProfile::AnthropicStrict,
             &config,
         );
         let mut req = request();
         let applied = apply_to_messages_request(&injections, &mut req);
         assert_eq!(applied.items, vec![InjectionId::IdentityPrompt]);
-    }
-
-    #[test]
-    fn external_pool_needs_its_own_switch() {
-        let mut config = PromptInjectionConfig::default();
-        set(&mut config, InjectionId::IdentityPrompt, true);
-        let external = |config: &PromptInjectionConfig| {
-            ResolvedInjections::resolve(
-                "/cc/v1/messages",
-                UpstreamKind::ExternalPool,
-                CompatProfile::ClaudeCode,
-                config,
-            )
-        };
-        let injections = external(&config);
-        assert!(!injections.allows(InjectionId::IdentityPrompt));
-        assert!(!injections.allows(InjectionId::TaskQuality));
-        assert!(!injections.allows(InjectionId::ChunkedWritePolicy));
-        config.defaults.insert(
-            InjectionId::IdentityPrompt,
-            ItemSetting {
-                enabled: true,
-                external_pool: Some(true),
-            },
-        );
-        let injections = external(&config);
-        assert!(injections.allows(InjectionId::IdentityPrompt));
-        assert!(!injections.allows(InjectionId::TaskQuality));
     }
 
     #[test]

@@ -1,41 +1,36 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Timelike, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{
     Connection, PgPool, Postgres, QueryBuilder, Row, Transaction,
     postgres::{PgConnection, PgPoolOptions, PgRow},
 };
-use uuid::Uuid;
 
-#[cfg(test)]
-use crate::anthropic::model_capabilities::KiroReasoningFieldPath;
 use crate::anthropic::model_capabilities::{
-    KiroReasoningFieldCapability, MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
+    MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
 };
 use crate::anthropic::pricing::{
     MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
 };
 use crate::anthropic::usage::{
-    CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem,
-    UsageDashboardCredentialAggregate, UsageDashboardResponse, UsageDashboardSeries,
-    UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec,
-    UsageExternalPoolBillingByPool, UsageExternalPoolBillingSummary, UsageExternalPoolRiskBucket,
-    UsageExternalPoolRiskCacheStats, UsageExternalPoolRiskCostConfig,
+    REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem, UsageDashboardResponse,
+    UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow,
+    UsageDashboardWindowSpec, UsageExternalPoolBillingByPool, UsageExternalPoolBillingSummary,
+    UsageExternalPoolRiskBucket, UsageExternalPoolRiskCacheStats, UsageExternalPoolRiskCostConfig,
     UsageExternalPoolRiskCostStats, UsageExternalPoolRiskFilters, UsageExternalPoolRiskGroup,
     UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageExternalPoolRiskSample,
     UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals, UsageExternalPoolRiskWindow,
-    UsageOverviewAccountRow, UsageOverviewExternal, UsageOverviewLocal, UsageOverviewMetrics,
-    UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewRouteRow,
-    UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup, UsageOverviewSeriesGroups,
-    UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals,
-    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
-    UsageRecordsResult, UsageRouteKind, UsageRouteSubtype, UsageSeriesPoint, UsageSource,
-    UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
-    usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
-    usage_external_reason_category, usage_external_reason_label,
+    UsageOverviewAccountRow, UsageOverviewExternal, UsageOverviewMetrics, UsageOverviewPoolRow,
+    UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewSeriesBreakdown,
+    UsageOverviewSeriesGroup, UsageOverviewSeriesGroups, UsageOverviewSeriesMetrics,
+    UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals, UsageRealtimeStats,
+    UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
+    UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
+    usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
+    usage_dashboard_window_spec_for_key, usage_dashboard_windows,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -45,26 +40,11 @@ use crate::external_pool::{
     UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_header_overrides,
     normalize_external_pool_model_mapping_rules,
 };
-use crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
-use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::{
     Config, ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ModelMappingRule,
     normalize_route_rules,
 };
 use crate::model::model_support::normalize_supported_models;
-
-const ACTIVE_CREDENTIALS_SELECT_SQL: &str = r#"
-SELECT id, priority, disabled, data, created_at, updated_at, revision
-FROM credentials
-WHERE deleted_at IS NULL
-ORDER BY priority ASC, id ASC
-"#;
-
-const CREDENTIAL_RUNTIME_STATE_SELECT_SQL: &str = r#"
-SELECT credential_id, failure_count, refresh_failure_count,
-       disabled_reason, warmup_remaining, generation, revision
-FROM credential_runtime_state
-"#;
 
 const EXTERNAL_POOL_SELECT_SQL: &str = r#"
 SELECT id, name, base_url, api_key, auth_type, enabled, priority,
@@ -83,7 +63,6 @@ WHERE deleted_at IS NULL
 ORDER BY priority ASC, id ASC
 "#;
 
-const CREDENTIAL_ID_SEQUENCE_LOCK_ID: i64 = 4_950_531_234_002;
 const POSTGRES_MIGRATION_LOCK_ID: i64 = 4_950_531_234_001;
 const USAGE_CLEANUP_COMMIT_LOCK_ID: i64 = 4_950_531_234_003;
 const USAGE_OFFLINE_MAINTENANCE_LOCK_ID: i64 = 4_950_531_234_004;
@@ -106,36 +85,12 @@ struct RequiredPostgresColumn {
 
 const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
-        table_name: "credential_inventory",
-        column_name: "pushed_credential_id",
-    },
-    RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
         column_name: "total_compat_input_tokens",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
         column_name: "total_compat_input_tokens",
-    },
-    RequiredPostgresColumn {
-        table_name: "credentials",
-        column_name: "revision",
-    },
-    RequiredPostgresColumn {
-        table_name: "credential_runtime_state",
-        column_name: "revision",
-    },
-    RequiredPostgresColumn {
-        table_name: "credential_runtime_state",
-        column_name: "generation",
-    },
-    RequiredPostgresColumn {
-        table_name: "credential_runtime_mutations",
-        column_name: "operation_id",
-    },
-    RequiredPostgresColumn {
-        table_name: "credential_stats_delta_batches",
-        column_name: "operation_id",
     },
     RequiredPostgresColumn {
         table_name: "external_upstream_pools",
@@ -199,10 +154,6 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_records",
-        column_name: "kiro_metering_usage",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_records",
         column_name: "pricing_available",
     },
     RequiredPostgresColumn {
@@ -219,19 +170,7 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "total_kiro_metering_usage",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_rollup_totals",
         column_name: "upstream_metadata_requests",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_rollup_totals",
-        column_name: "sticky_bound_requests",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_rollup_totals",
-        column_name: "fallback_from_sticky_requests",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
@@ -275,19 +214,7 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "total_kiro_metering_usage",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_rollup_time_buckets",
         column_name: "upstream_metadata_requests",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_rollup_time_buckets",
-        column_name: "sticky_bound_requests",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_rollup_time_buckets",
-        column_name: "fallback_from_sticky_requests",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
@@ -328,42 +255,6 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "usage_duration_rollup_time_buckets",
         column_name: "duration_ms",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_credential_cost_summary",
-        column_name: "original_cost_usd",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_credential_cost_summary",
-        column_name: "kiro_metering_usage",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_credential_cost_summary",
-        column_name: "priced_requests",
-    },
-    RequiredPostgresColumn {
-        table_name: "usage_credential_cost_summary",
-        column_name: "unpriced_requests",
-    },
-    RequiredPostgresColumn {
-        table_name: "model_capabilities_sync_status",
-        column_name: "reasoning_fields",
-    },
-    RequiredPostgresColumn {
-        table_name: "model_capabilities_sync_status",
-        column_name: "reasoning_cohort_keys",
-    },
-    RequiredPostgresColumn {
-        table_name: "model_capabilities_sync_status",
-        column_name: "reasoning_cohort_complete",
-    },
-    RequiredPostgresColumn {
-        table_name: "model_capabilities_sync_status",
-        column_name: "reasoning_contract_version",
-    },
-    RequiredPostgresColumn {
-        table_name: "model_capabilities_sync_status",
-        column_name: "reasoning_invalid_models",
     },
 ];
 
@@ -477,11 +368,6 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
         name: "idx_usage_duration_rollup_positive_max",
         sql: "CREATE INDEX IF NOT EXISTS idx_usage_duration_rollup_positive_max ON usage_duration_rollup_time_buckets (duration_ms DESC) WHERE requests > 0",
     },
-    UsageIndexDefinition {
-        table: "usage_credential_cost_summary",
-        name: "idx_usage_credential_cost_summary_cost",
-        sql: "CREATE INDEX IF NOT EXISTS idx_usage_credential_cost_summary_cost ON usage_credential_cost_summary (estimated_cost_usd DESC, requests DESC)",
-    },
     // Account change view on the audit page: filter by account and by event kind. Built like the
     // usage indexes so a large audit table never stalls startup.
     UsageIndexDefinition {
@@ -496,170 +382,10 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
     },
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProxyResourceRow {
-    pub id: u64,
-    pub name: String,
-    pub proxy_url: String,
-    pub proxy_username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy_password: Option<String>,
-    pub enabled: bool,
-    pub notes: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    pub credential_count: u64,
-    pub last_test_at: Option<String>,
-    pub last_test_success: Option<bool>,
-    pub last_test_status: Option<u16>,
-    pub last_test_duration_ms: Option<u64>,
-    pub last_test_message: Option<String>,
-    pub last_test_url: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CreateProxyResourceRow {
-    pub name: String,
-    pub proxy_url: String,
-    pub proxy_username: Option<String>,
-    pub proxy_password: Option<String>,
-    pub enabled: bool,
-    pub notes: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct UpdateProxyResourceRow {
-    pub name: Option<String>,
-    pub proxy_url: Option<String>,
-    pub proxy_username: Option<Option<String>>,
-    pub proxy_password: Option<Option<String>>,
-    pub enabled: Option<bool>,
-    pub notes: Option<Option<String>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DeleteProxyResourceOutcome {
-    pub cleared_disabled_credentials: u64,
-    pub enabled_credential_count: u64,
-}
-
-fn proxy_resource_from_row(row: PgRow) -> anyhow::Result<ProxyResourceRow> {
-    let id: i64 = row.try_get("id")?;
-    let created_at: DateTime<Utc> = row.try_get("created_at")?;
-    let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
-    let credential_count: i64 = row.try_get("credential_count").unwrap_or(0);
-    let last_test_at: Option<DateTime<Utc>> = row.try_get("last_test_at")?;
-    let last_test_status: Option<i32> = row.try_get("last_test_status")?;
-    let last_test_duration_ms: Option<i64> = row.try_get("last_test_duration_ms")?;
-    Ok(ProxyResourceRow {
-        id: id as u64,
-        name: row.try_get("name")?,
-        proxy_url: row.try_get("proxy_url")?,
-        proxy_username: row.try_get("proxy_username")?,
-        proxy_password: row.try_get("proxy_password")?,
-        enabled: row.try_get("enabled")?,
-        notes: row.try_get("notes")?,
-        created_at: created_at.to_rfc3339(),
-        updated_at: updated_at.to_rfc3339(),
-        credential_count: credential_count.max(0) as u64,
-        last_test_at: last_test_at.map(|value| value.to_rfc3339()),
-        last_test_success: row.try_get("last_test_success")?,
-        last_test_status: last_test_status.map(|value| value.max(0) as u16),
-        last_test_duration_ms: last_test_duration_ms.map(|value| value.max(0) as u64),
-        last_test_message: row.try_get("last_test_message")?,
-        last_test_url: row.try_get("last_test_url")?,
-    })
-}
-
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-fn credential_hash_columns(
-    credential: &KiroCredentials,
-) -> (String, Option<String>, Option<String>) {
-    let is_api_key = credential.is_api_key_credential();
-    let auth_kind = if is_api_key {
-        "api_key".to_string()
-    } else {
-        credential
-            .auth_method
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("oauth")
-            .to_ascii_lowercase()
-    };
-    let api_key_hash = is_api_key
-        .then(|| credential.kiro_api_key.as_deref())
-        .flatten()
-        .filter(|value| !value.is_empty())
-        .map(sha256_hex);
-    let refresh_token_hash = (!is_api_key)
-        .then(|| credential.refresh_token.as_deref())
-        .flatten()
-        .filter(|value| !value.is_empty())
-        .map(sha256_hex);
-    (auth_kind, api_key_hash, refresh_token_hash)
-}
-
-fn duplicate_credential_message(err: sqlx::Error) -> anyhow::Error {
-    match &err {
-        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-            let constraint = db_err.constraint().unwrap_or_default();
-            if constraint.contains("api_key") {
-                return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
-            }
-            if constraint.contains("refresh_token") {
-                return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
-            }
-            return anyhow::anyhow!("凭据已存在（唯一约束冲突）");
-        }
-        _ => {}
-    }
-    anyhow::Error::new(err)
-}
-
-fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
-    let id: i64 = row.try_get("id")?;
-    let priority: i32 = row.try_get("priority")?;
-    let disabled: bool = row.try_get("disabled")?;
-    let created_at: DateTime<Utc> = row.try_get("created_at")?;
-    let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
-    let revision: i64 = row.try_get("revision")?;
-    let value: serde_json::Value = row.try_get("data")?;
-    let mut credential: KiroCredentials = serde_json::from_value(value)?;
-    credential.id = Some(id as u64);
-    credential.created_at = Some(created_at.to_rfc3339());
-    credential.updated_at = Some(updated_at.to_rfc3339());
-    credential.storage_revision = revision.max(0) as u64;
-    credential.priority = priority.max(0) as u32;
-    credential.disabled = disabled;
-    credential.canonicalize_auth_method();
-    credential.normalize_supported_models();
-    credential.normalize_api_key_defaults();
-    credential.normalize_external_idp_defaults();
-    credential
-        .normalize_tags()
-        .map_err(|reason| anyhow::anyhow!("账号标签无效: {reason}"))?;
-    Ok(credential)
-}
-
-fn credentials_from_rows(rows: Vec<PgRow>) -> anyhow::Result<Vec<KiroCredentials>> {
-    rows.into_iter().map(credential_from_row).collect()
-}
-
-fn credential_runtime_states_from_rows(
-    rows: Vec<PgRow>,
-) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateRow>> {
-    let mut states = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let credential_id: i64 = row.try_get("credential_id")?;
-        states.insert(credential_id.max(0) as u64, runtime_state_from_row(&row)?);
-    }
-    Ok(states)
 }
 
 #[derive(Debug, Clone)]
@@ -1084,39 +810,7 @@ impl PostgresStore {
                 // maintenance commands, otherwise a normal docker compose upgrade can block on
                 // multi-GB production usage history before the service becomes available.
                 execute_sql_statements_in_tx(&mut tx, SCHEMA_SQL).await?;
-                execute_sql_statements_in_tx(&mut tx, super::kiro_api_keys::SCHEMA).await?;
                 ensure_usage_indexes_if_startup_safe(&mut tx).await?;
-                repair_active_credential_hashes_in_tx(&mut tx).await?;
-                run_versioned_migration_in_tx(
-                    &mut tx,
-                    "credential-storage-revision-v1",
-                    CREDENTIAL_STORAGE_REVISION_SQL,
-                )
-                .await?;
-                run_versioned_migration_in_tx(
-                    &mut tx,
-                    "credential-runtime-revision-v1",
-                    CREDENTIAL_RUNTIME_REVISION_SQL,
-                )
-                .await?;
-                run_versioned_migration_in_tx(
-                    &mut tx,
-                    "credential-runtime-generation-v1",
-                    CREDENTIAL_RUNTIME_GENERATION_SQL,
-                )
-                .await?;
-                run_versioned_migration_in_tx(
-                    &mut tx,
-                    "credential-runtime-mutation-cleanup-v1",
-                    CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL,
-                )
-                .await?;
-                run_versioned_migration_in_tx(
-                    &mut tx,
-                    "credential-stats-delta-batches-v1",
-                    CREDENTIAL_STATS_DELTA_BATCH_SQL,
-                )
-                .await?;
                 run_versioned_migration_in_tx(
                     &mut tx,
                     "usage-cleanup-batch-size-limit-v1",
@@ -1281,7 +975,6 @@ impl PostgresStore {
         let mut config: Config = serde_json::from_value(value)?;
         config.set_config_path_for_runtime(None);
         // 升级过程中旧版本实例可能写回旧的提示词字段；每次加载都转换，热加载也能拿到新结构。
-        config.migrate_legacy_prompt_fields();
         Ok(Some(config))
     }
 
@@ -1321,30 +1014,13 @@ impl PostgresStore {
                 let mut config = file_config.clone();
                 config.set_request_api_keys(file_config.request_api_keys());
                 config.apply_runtime_config_migrations();
-                if config.legacy_auto_sync_migration_pending() {
-                    let legacy_version_state = crate::kiro::kiro_version::VersionState {
-                        legacy_auto_sync_pending: true,
-                        ..Default::default()
-                    };
-                    self.initialize_kiro_version_state_if_absent(&legacy_version_state)
-                        .await?;
-                    config.clear_legacy_auto_sync_migration_marker();
-                }
+
                 self.save_runtime_config(&config).await?;
             }
             Some(mut config) => {
                 let mut changed = config.fill_missing_access_keys_from(file_config);
                 changed |= config.apply_runtime_config_migrations();
-                if config.legacy_auto_sync_migration_pending() {
-                    let legacy_version_state = crate::kiro::kiro_version::VersionState {
-                        legacy_auto_sync_pending: true,
-                        ..Default::default()
-                    };
-                    self.initialize_kiro_version_state_if_absent(&legacy_version_state)
-                        .await?;
-                    config.clear_legacy_auto_sync_migration_marker();
-                    changed = true;
-                }
+
                 if changed {
                     self.save_runtime_config(&config).await?;
                 }
@@ -2028,844 +1704,6 @@ impl PostgresStore {
         Ok(result.rows_affected() == 1)
     }
 
-    #[cfg(test)]
-    pub async fn load_credentials(&self) -> anyhow::Result<Vec<KiroCredentials>> {
-        let rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
-            .fetch_all(&self.pool)
-            .await?;
-
-        credentials_from_rows(rows)
-    }
-
-    pub async fn load_credential(
-        &self,
-        credential_id: u64,
-    ) -> anyhow::Result<Option<KiroCredentials>> {
-        let credential_id_i64 = i64::try_from(credential_id)
-            .map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
-        let row = sqlx::query(
-            r#"
-            SELECT id, priority, disabled, data, created_at, updated_at, revision
-            FROM credentials
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(credential_id_i64)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(credential_from_row).transpose()
-    }
-
-    #[cfg(test)]
-    pub async fn load_credentials_with_runtime_state(
-        &self,
-    ) -> anyhow::Result<(
-        Vec<KiroCredentials>,
-        HashMap<u64, CredentialRuntimeStateRow>,
-    )> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *tx)
-            .await?;
-        let credential_rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
-            .fetch_all(&mut *tx)
-            .await?;
-        let runtime_state_rows = sqlx::query(CREDENTIAL_RUNTIME_STATE_SELECT_SQL)
-            .fetch_all(&mut *tx)
-            .await?;
-        let credentials = credentials_from_rows(credential_rows)?;
-        let runtime_states = credential_runtime_states_from_rows(runtime_state_rows)?;
-        tx.commit().await?;
-
-        Ok((credentials, runtime_states))
-    }
-
-    /// Load the credential configuration, authoritative runtime state, and the latest
-    /// account-balance snapshot from one repeatable-read transaction.
-    ///
-    /// The account snapshot is intentionally returned separately from runtime state: it is
-    /// display/probe data and must never overwrite an explicit Admin disable or runtime
-    /// generation. Scheduler admission may derive a short-lived quota guard from it.
-    pub async fn load_credentials_with_runtime_state_and_account_info(
-        &self,
-    ) -> anyhow::Result<(
-        Vec<KiroCredentials>,
-        HashMap<u64, CredentialRuntimeStateRow>,
-        HashMap<u64, CredentialAccountInfoRow>,
-    )> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *tx)
-            .await?;
-        let credential_rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
-            .fetch_all(&mut *tx)
-            .await?;
-        let runtime_state_rows = sqlx::query(CREDENTIAL_RUNTIME_STATE_SELECT_SQL)
-            .fetch_all(&mut *tx)
-            .await?;
-        let account_info_rows = sqlx::query(
-            r#"
-            SELECT credential_id, subscription_title, current_usage, usage_limit,
-                   remaining, usage_percentage, credit_limit, credit_remaining,
-                   credit_base, credit_bonus, overage_status, overage_capability,
-                   overage_cap, overage_rate, current_overages, next_reset_at, checked_at
-            FROM credential_account_info
-            "#,
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        let credentials = credentials_from_rows(credential_rows)?;
-        let runtime_states = credential_runtime_states_from_rows(runtime_state_rows)?;
-        let mut account_info = HashMap::with_capacity(account_info_rows.len());
-        for row in account_info_rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            let checked_at: DateTime<Utc> = row.try_get("checked_at")?;
-            account_info.insert(
-                credential_id as u64,
-                CredentialAccountInfoRow {
-                    subscription_title: row.try_get("subscription_title")?,
-                    current_usage: row.try_get("current_usage")?,
-                    usage_limit: row.try_get("usage_limit")?,
-                    remaining: row.try_get("remaining")?,
-                    usage_percentage: row.try_get("usage_percentage")?,
-                    credit_limit: row.try_get("credit_limit")?,
-                    credit_remaining: row.try_get("credit_remaining")?,
-                    credit_base: row.try_get("credit_base")?,
-                    credit_bonus: row.try_get("credit_bonus")?,
-                    overage_status: row.try_get("overage_status")?,
-                    overage_capability: row.try_get("overage_capability")?,
-                    overage_cap: row.try_get("overage_cap")?,
-                    overage_rate: row.try_get("overage_rate")?,
-                    current_overages: row.try_get("current_overages")?,
-                    next_reset_at: row.try_get("next_reset_at")?,
-                    checked_at: checked_at.to_rfc3339(),
-                },
-            );
-        }
-        tx.commit().await?;
-
-        Ok((credentials, runtime_states, account_info))
-    }
-
-    pub async fn load_credential_with_runtime_state(
-        &self,
-        credential_id: u64,
-    ) -> anyhow::Result<Option<(KiroCredentials, Option<CredentialRuntimeStateRow>)>> {
-        let credential_id_i64 = i64::try_from(credential_id)
-            .map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *tx)
-            .await?;
-        let credential = sqlx::query(
-            r#"
-            SELECT id, priority, disabled, data, created_at, updated_at, revision
-            FROM credentials
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(credential_id_i64)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(credential_from_row)
-        .transpose()?;
-        let Some(credential) = credential else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let runtime_state = sqlx::query(
-            r#"
-            SELECT credential_id, failure_count, refresh_failure_count,
-                   disabled_reason, warmup_remaining, generation, revision
-            FROM credential_runtime_state
-            WHERE credential_id = $1
-            "#,
-        )
-        .bind(credential_id_i64)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(|row| runtime_state_from_row(&row))
-        .transpose()?;
-        tx.commit().await?;
-
-        Ok(Some((credential, runtime_state)))
-    }
-
-    /// 查询未软删除的 API Key 凭据。
-    ///
-    /// 这里的“存在”只对应 `deleted_at IS NULL`，不等于已启用或可调度。
-    /// 已禁用凭据仍然应该被识别为已有凭据，避免重启或导入时重复写入。
-    pub async fn find_existing_api_key_credential(
-        &self,
-        api_key: &str,
-    ) -> anyhow::Result<Option<KiroCredentials>> {
-        let api_key = api_key.trim();
-        if api_key.is_empty() {
-            return Ok(None);
-        }
-        let row = sqlx::query(
-            r#"
-            SELECT id, priority, disabled, data, created_at, updated_at, revision
-            FROM credentials
-            WHERE deleted_at IS NULL
-              AND api_key_hash = $1
-            ORDER BY priority ASC, id ASC
-            LIMIT 1
-            "#,
-        )
-        .bind(sha256_hex(api_key))
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(credential_from_row).transpose()
-    }
-
-    pub async fn ensure_api_key_credential(
-        &self,
-        api_key: &str,
-    ) -> anyhow::Result<KiroCredentials> {
-        let (api_key, region) =
-            crate::kiro::model::credentials::split_kiro_api_key_and_region(api_key)
-                .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 为空"))?;
-        if api_key.trim().is_empty() {
-            anyhow::bail!("KIRO_API_KEY 为空");
-        }
-        if let Some(existing) = self.find_existing_api_key_credential(&api_key).await? {
-            return Ok(existing);
-        }
-
-        let mut credential = KiroCredentials {
-            kiro_api_key: Some(api_key.to_string()),
-            auth_method: Some("api_key".to_string()),
-            priority: 0,
-            region: region.clone(),
-            auth_region: region.clone(),
-            api_region: region,
-            ..Default::default()
-        };
-        credential.normalize_api_key_defaults();
-        match self.insert_credential(&credential).await {
-            Ok(inserted) => Ok(inserted),
-            Err(err) if err.to_string().contains("kiroApiKey 重复") => self
-                .find_existing_api_key_credential(&api_key)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 已存在但重新查询失败")),
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn lock_credential_id_sequence_in_tx(
-        tx: &mut Transaction<'_, Postgres>,
-    ) -> anyhow::Result<()> {
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(CREDENTIAL_ID_SEQUENCE_LOCK_ID)
-            .execute(&mut **tx)
-            .await?;
-        Ok(())
-    }
-
-    async fn advance_credential_id_sequence_in_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        credential_id: i64,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            SELECT setval(
-                'credentials_id_seq',
-                GREATEST(last_value, $1),
-                is_called OR $1 >= last_value
-            )
-            FROM credentials_id_seq
-            "#,
-        )
-        .bind(credential_id)
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
-    }
-
-    async fn next_credential_id_in_tx(tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<i64> {
-        let max_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM credentials")
-            .fetch_one(&mut **tx)
-            .await?;
-        Self::advance_credential_id_sequence_in_tx(tx, max_id).await?;
-        let id: i64 = sqlx::query_scalar("SELECT nextval('credentials_id_seq')")
-            .fetch_one(&mut **tx)
-            .await?;
-        Ok(id)
-    }
-
-    /// 非破坏性保存凭据列表。
-    ///
-    /// 只 upsert 传入行，不删除 PgSQL 中其他未软删除凭据，避免旧进程内存快照
-    /// 覆盖其他实例新增的凭据。
-    pub async fn save_credentials(
-        &self,
-        credentials: &[KiroCredentials],
-    ) -> anyhow::Result<Vec<KiroCredentials>> {
-        let mut saved = Vec::with_capacity(credentials.len());
-        for credential in credentials {
-            let authoritative = if credential.id.is_some() {
-                match self.upsert_credential(credential).await? {
-                    CredentialUpsertCasOutcome::Applied(saved) => saved,
-                    CredentialUpsertCasOutcome::Conflict { current } => current,
-                }
-            } else {
-                self.insert_credential(credential).await?
-            };
-            saved.push(authoritative);
-        }
-        Ok(saved)
-    }
-
-    pub async fn insert_credential(
-        &self,
-        credential: &KiroCredentials,
-    ) -> anyhow::Result<KiroCredentials> {
-        let mut canonical = credential.clone();
-        canonical.storage_revision = 0;
-        match self
-            .upsert_credential_with_optional_id(&canonical, true)
-            .await?
-        {
-            CredentialUpsertCasOutcome::Applied(credential) => Ok(credential),
-            CredentialUpsertCasOutcome::Conflict { current } => {
-                let id = current.id.unwrap_or_default();
-                anyhow::bail!(
-                    "凭据 #{} 已存在（当前 revision {}）",
-                    id,
-                    current.storage_revision
-                )
-            }
-        }
-    }
-
-    pub async fn upsert_credential(
-        &self,
-        credential: &KiroCredentials,
-    ) -> anyhow::Result<CredentialUpsertCasOutcome> {
-        if credential.id.is_none() {
-            anyhow::bail!("保存到 PgSQL 的凭据必须先分配 id");
-        }
-        self.upsert_credential_with_optional_id(credential, false)
-            .await
-    }
-
-    async fn upsert_credential_with_optional_id(
-        &self,
-        credential: &KiroCredentials,
-        allocate_missing_id: bool,
-    ) -> anyhow::Result<CredentialUpsertCasOutcome> {
-        if credential.id.is_none() && !allocate_missing_id {
-            anyhow::bail!("保存到 PgSQL 的凭据必须先分配 id");
-        }
-        let expected_revision = i64::try_from(credential.storage_revision)
-            .map_err(|_| anyhow::anyhow!("凭据 storage revision 超出 PgSQL BIGINT 范围"))?;
-        let next_revision = credential
-            .storage_revision
-            .checked_add(1)
-            .filter(|revision| i64::try_from(*revision).is_ok())
-            .ok_or_else(|| anyhow::anyhow!("凭据 storage revision 已达到 PgSQL BIGINT 上限"))?;
-        let mut tx = self.pool.begin().await?;
-        if credential.storage_revision == 0 {
-            Self::lock_credential_id_sequence_in_tx(&mut tx).await?;
-        }
-        let id_i64 = match credential.id {
-            Some(id) => {
-                i64::try_from(id).map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?
-            }
-            None if credential.storage_revision == 0 => {
-                Self::next_credential_id_in_tx(&mut tx).await?
-            }
-            None => anyhow::bail!("保存到 PgSQL 的凭据必须先分配 id"),
-        };
-        let id = id_i64 as u64;
-        let mut canonical = credential.clone();
-        canonical.id = Some(id);
-        canonical.canonicalize_auth_method();
-        canonical.normalize_supported_models();
-        canonical.normalize_api_key_defaults();
-        canonical.normalize_external_idp_defaults();
-        canonical
-            .normalize_tags()
-            .map_err(|reason| anyhow::anyhow!("账号标签无效: {reason}"))?;
-        let priority = i32::try_from(canonical.priority)
-            .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
-        let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
-        let value = serde_json::to_value(&canonical)?;
-        let applied = if canonical.storage_revision == 0 {
-            sqlx::query(
-                r#"
-                INSERT INTO credentials (
-                    id, priority, disabled, auth_kind, api_key_hash, refresh_token_hash,
-                    data, updated_at, deleted_at, revision
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, now(), NULL, 1)
-                ON CONFLICT (id) DO NOTHING
-                RETURNING id, priority, disabled, data, created_at, updated_at, revision
-                "#,
-            )
-            .bind(id_i64)
-            .bind(priority)
-            .bind(canonical.disabled)
-            .bind(&auth_kind)
-            .bind(&api_key_hash)
-            .bind(&refresh_token_hash)
-            .bind(&value)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(duplicate_credential_message)?
-        } else {
-            sqlx::query(
-                r#"
-                UPDATE credentials
-                SET priority = $2,
-                    disabled = $3,
-                    auth_kind = $4,
-                    api_key_hash = $5,
-                    refresh_token_hash = $6,
-                    data = $7,
-                    updated_at = now(),
-                    revision = credentials.revision + 1
-                WHERE id = $1
-                  AND deleted_at IS NULL
-                  AND revision = $8
-                RETURNING id, priority, disabled, data, created_at, updated_at, revision
-                "#,
-            )
-            .bind(id_i64)
-            .bind(priority)
-            .bind(canonical.disabled)
-            .bind(&auth_kind)
-            .bind(&api_key_hash)
-            .bind(&refresh_token_hash)
-            .bind(&value)
-            .bind(expected_revision)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(duplicate_credential_message)?
-        };
-        if let Some(row) = applied {
-            let credential = credential_from_row(row)?;
-            if credential.storage_revision != next_revision {
-                anyhow::bail!(
-                    "凭据 #{} storage revision 不一致：期望 {}，实际 {}",
-                    id,
-                    next_revision,
-                    credential.storage_revision
-                );
-            }
-            if canonical.storage_revision == 0 {
-                Self::advance_credential_id_sequence_in_tx(&mut tx, id_i64).await?;
-            }
-            tx.commit().await?;
-            return Ok(CredentialUpsertCasOutcome::Applied(credential));
-        }
-
-        let current = sqlx::query(
-            r#"
-            SELECT id, priority, disabled, data, created_at, updated_at, revision
-            FROM credentials
-            WHERE id = $1 AND deleted_at IS NULL
-            FOR SHARE
-            "#,
-        )
-        .bind(id_i64)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(credential_from_row)
-        .transpose()?;
-        if let Some(current) = current {
-            tx.commit().await?;
-            return Ok(CredentialUpsertCasOutcome::Conflict { current });
-        }
-
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credentials WHERE id = $1)")
-                .bind(id_i64)
-                .fetch_one(&mut *tx)
-                .await?;
-        tx.rollback().await?;
-        if exists {
-            anyhow::bail!("凭据 #{} 已被删除，禁止通过 upsert 恢复", id);
-        }
-        anyhow::bail!("凭据 #{} 不存在，无法按 revision 更新", id)
-    }
-
-    pub async fn insert_credential_with_runtime_patch(
-        &self,
-        credential: &KiroCredentials,
-        operation_id: Uuid,
-        patch: &CredentialRuntimeStatePatch,
-    ) -> anyhow::Result<(KiroCredentials, CredentialRuntimeStateMutationResult)> {
-        validate_credential_runtime_state_patch(patch)?;
-        let mut tx = self.pool.begin().await?;
-        Self::lock_credential_id_sequence_in_tx(&mut tx).await?;
-        let id = match credential.id {
-            Some(id) => id,
-            None => {
-                let id = Self::next_credential_id_in_tx(&mut tx).await?;
-                id.max(0) as u64
-            }
-        };
-        let id_i64 =
-            i64::try_from(id).map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
-        let mut canonical = credential.clone();
-        canonical.id = Some(id);
-        canonical.storage_revision = 0;
-        if let Some(disabled) = patch.credential_disabled {
-            canonical.disabled = disabled;
-        }
-        canonical.canonicalize_auth_method();
-        canonical.normalize_supported_models();
-        canonical.normalize_api_key_defaults();
-        canonical.normalize_external_idp_defaults();
-        canonical
-            .normalize_tags()
-            .map_err(|reason| anyhow::anyhow!("账号标签无效: {reason}"))?;
-        let priority = i32::try_from(canonical.priority)
-            .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
-        let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
-        let value = serde_json::to_value(&canonical)?;
-        let row = sqlx::query(
-            r#"
-            INSERT INTO credentials (
-                id, priority, disabled, auth_kind, api_key_hash, refresh_token_hash,
-                data, updated_at, deleted_at, revision
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), NULL, 1)
-            RETURNING id, priority, disabled, data, created_at, updated_at, revision
-            "#,
-        )
-        .bind(id_i64)
-        .bind(priority)
-        .bind(canonical.disabled)
-        .bind(auth_kind)
-        .bind(api_key_hash)
-        .bind(refresh_token_hash)
-        .bind(value)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(duplicate_credential_message)?;
-        let inserted = credential_from_row(row)?;
-        if inserted.storage_revision != 1 {
-            anyhow::bail!("新凭据 #{} 的 storage revision 必须为 1", id);
-        }
-        Self::advance_credential_id_sequence_in_tx(&mut tx, id_i64).await?;
-
-        let mut runtime_patch = patch.clone();
-        runtime_patch.credential_disabled = None;
-        let runtime = Self::patch_credential_runtime_state_in_tx(
-            &mut tx,
-            id,
-            operation_id,
-            "initial_patch",
-            &runtime_patch,
-        )
-        .await?;
-        if !runtime.applied {
-            tx.rollback().await?;
-            anyhow::bail!(
-                "新凭据 #{} 的初始运行态 generation 已过期：当前 {}",
-                id,
-                runtime.state.generation
-            );
-        }
-        tx.commit().await?;
-        Ok((inserted, runtime))
-    }
-
-    pub async fn update_credential_with_runtime_patch_cas(
-        &self,
-        credential: &KiroCredentials,
-        operation_id: Uuid,
-        patch: &CredentialRuntimeStatePatch,
-    ) -> anyhow::Result<CredentialWithRuntimePatchCasOutcome> {
-        validate_credential_runtime_state_patch(patch)?;
-        let id = credential
-            .id
-            .ok_or_else(|| anyhow::anyhow!("更新 PgSQL 凭据必须提供 id"))?;
-        if credential.storage_revision == 0 {
-            anyhow::bail!(
-                "凭据 #{} runtime patch 更新必须提供非零 storage revision",
-                id
-            );
-        }
-        let id_i64 =
-            i64::try_from(id).map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
-        let expected_revision = i64::try_from(credential.storage_revision)
-            .map_err(|_| anyhow::anyhow!("凭据 storage revision 超出 PgSQL BIGINT 范围"))?;
-        let next_revision = credential
-            .storage_revision
-            .checked_add(1)
-            .filter(|revision| i64::try_from(*revision).is_ok())
-            .ok_or_else(|| anyhow::anyhow!("凭据 storage revision 已达到 PgSQL BIGINT 上限"))?;
-        let mut canonical = credential.clone();
-        if let Some(disabled) = patch.credential_disabled {
-            canonical.disabled = disabled;
-        }
-        canonical.canonicalize_auth_method();
-        canonical.normalize_supported_models();
-        canonical.normalize_api_key_defaults();
-        canonical.normalize_external_idp_defaults();
-        let priority = i32::try_from(canonical.priority)
-            .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
-        let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
-        let value = serde_json::to_value(&canonical)?;
-
-        let mut tx = self.pool.begin().await?;
-        let applied = sqlx::query(
-            r#"
-            UPDATE credentials
-            SET priority = $2,
-                disabled = $3,
-                auth_kind = $4,
-                api_key_hash = $5,
-                refresh_token_hash = $6,
-                data = $7,
-                updated_at = now(),
-                revision = credentials.revision + 1
-            WHERE id = $1
-              AND deleted_at IS NULL
-              AND revision = $8
-            RETURNING id, priority, disabled, data, created_at, updated_at, revision
-            "#,
-        )
-        .bind(id_i64)
-        .bind(priority)
-        .bind(canonical.disabled)
-        .bind(auth_kind)
-        .bind(api_key_hash)
-        .bind(refresh_token_hash)
-        .bind(value)
-        .bind(expected_revision)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(duplicate_credential_message)?;
-        let Some(row) = applied else {
-            let current = sqlx::query(
-                r#"
-                SELECT id, priority, disabled, data, created_at, updated_at, revision
-                FROM credentials
-                WHERE id = $1 AND deleted_at IS NULL
-                FOR SHARE
-                "#,
-            )
-            .bind(id_i64)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(credential_from_row)
-            .transpose()?;
-            if let Some(current) = current {
-                tx.commit().await?;
-                return Ok(CredentialWithRuntimePatchCasOutcome::Conflict { current });
-            }
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credentials WHERE id = $1)")
-                    .bind(id_i64)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            tx.rollback().await?;
-            if exists {
-                anyhow::bail!("凭据 #{} 已被删除，禁止更新", id);
-            }
-            anyhow::bail!("凭据 #{} 不存在，无法更新", id);
-        };
-        let updated = credential_from_row(row)?;
-        if updated.storage_revision != next_revision {
-            anyhow::bail!(
-                "凭据 #{} storage revision 不一致：期望 {}，实际 {}",
-                id,
-                next_revision,
-                updated.storage_revision
-            );
-        }
-
-        let mut runtime_patch = patch.clone();
-        runtime_patch.credential_disabled = None;
-        let runtime = Self::patch_credential_runtime_state_in_tx(
-            &mut tx,
-            id,
-            operation_id,
-            "credential_update_patch",
-            &runtime_patch,
-        )
-        .await?;
-        if !runtime.applied {
-            tx.rollback().await?;
-            anyhow::bail!(
-                "凭据 #{} 的原子运行态 generation 已过期：当前 {}",
-                id,
-                runtime.state.generation
-            );
-        }
-        tx.commit().await?;
-        Ok(CredentialWithRuntimePatchCasOutcome::Applied {
-            credential: updated,
-            runtime,
-        })
-    }
-
-    pub async fn update_credential_refresh_fields_cas(
-        &self,
-        credential_id: u64,
-        expected: &CredentialRefreshExpectedContext,
-        patch: &CredentialRefreshFieldsPatch,
-    ) -> anyhow::Result<CredentialRefreshFieldsCasOutcome> {
-        if patch
-            .refresh_token
-            .as_deref()
-            .is_some_and(|token| token.trim().is_empty())
-        {
-            anyhow::bail!("刷新后的 refreshToken 不能为空");
-        }
-        if patch.access_token.is_none()
-            && patch.refresh_token.is_none()
-            && patch.profile_arn.is_none()
-            && patch.expires_at.is_none()
-            && patch.scopes.is_none()
-        {
-            anyhow::bail!("凭据 refresh 字段更新不能为空");
-        }
-
-        let new_refresh_token_hash = patch.refresh_token.as_deref().map(sha256_hex);
-        let mut tx = self.pool.begin().await?;
-        let applied = sqlx::query(
-            r#"
-            UPDATE credentials
-            SET refresh_token_hash = CASE
-                    WHEN $11::text IS NULL THEN credentials.refresh_token_hash
-                    ELSE $12::text
-                END,
-                data = credentials.data
-                    || CASE WHEN $10::text IS NULL
-                        THEN '{}'::jsonb
-                        ELSE jsonb_build_object('accessToken', $10::text)
-                    END
-                    || CASE WHEN $11::text IS NULL
-                        THEN '{}'::jsonb
-                        ELSE jsonb_build_object('refreshToken', $11::text)
-                    END
-                    || CASE WHEN $13::text IS NULL
-                        THEN '{}'::jsonb
-                        ELSE jsonb_build_object('profileArn', $13::text)
-                    END
-                    || CASE WHEN $14::text IS NULL
-                        THEN '{}'::jsonb
-                        ELSE jsonb_build_object('expiresAt', $14::text)
-                    END
-                    || CASE WHEN $15::text IS NULL
-                        THEN '{}'::jsonb
-                        ELSE jsonb_build_object('scopes', $15::text)
-                    END,
-                updated_at = now(),
-                revision = credentials.revision + 1
-            WHERE id = $1
-              AND deleted_at IS NULL
-              AND refresh_token_hash = $2
-              AND (
-                  COALESCE(data->>'accessToken', data->>'access_token')
-                  IS NOT DISTINCT FROM $9::text
-              )
-              AND (
-                  CASE regexp_replace(
-                      lower(COALESCE(data->>'authMethod', data->>'auth_method')),
-                      '[^a-z0-9]',
-                      '',
-                      'g'
-                  )
-                      WHEN 'builderid' THEN 'idc'
-                      WHEN 'iam' THEN 'idc'
-                      WHEN 'idc' THEN 'idc'
-                      WHEN 'apikey' THEN 'api_key'
-                      WHEN 'externalidp' THEN 'external_idp'
-                      WHEN 'enterprise' THEN 'external_idp'
-                      WHEN 'iamsso' THEN 'external_idp'
-                      WHEN 'awsidc' THEN 'external_idp'
-                      WHEN 'internal' THEN 'external_idp'
-                      WHEN 'social' THEN 'social'
-                      ELSE COALESCE(data->>'authMethod', data->>'auth_method')
-                  END
-                  IS NOT DISTINCT FROM $3::text
-              )
-              AND (data->>'provider' IS NOT DISTINCT FROM $4::text)
-              AND (
-                  COALESCE(data->>'clientId', data->>'client_id')
-                  IS NOT DISTINCT FROM $5::text
-              )
-              AND (
-                  COALESCE(data->>'clientSecret', data->>'client_secret')
-                  IS NOT DISTINCT FROM $6::text
-              )
-              AND (
-                  COALESCE(data->>'tokenEndpoint', data->>'token_endpoint')
-                  IS NOT DISTINCT FROM $7::text
-              )
-              AND (
-                  COALESCE(data->>'scopes', data->>'scope')
-                  IS NOT DISTINCT FROM $8::text
-              )
-            RETURNING id, priority, disabled, data, created_at, updated_at, revision
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(&expected.refresh_token_hash)
-        .bind(&expected.auth_method)
-        .bind(&expected.provider)
-        .bind(&expected.client_id)
-        .bind(&expected.client_secret)
-        .bind(&expected.token_endpoint)
-        .bind(&expected.scopes)
-        .bind(&expected.access_token)
-        .bind(&patch.access_token)
-        .bind(&patch.refresh_token)
-        .bind(&new_refresh_token_hash)
-        .bind(&patch.profile_arn)
-        .bind(&patch.expires_at)
-        .bind(&patch.scopes)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(duplicate_credential_message)?;
-        if let Some(row) = applied {
-            let credential = credential_from_row(row)?;
-            tx.commit().await?;
-            return Ok(CredentialRefreshFieldsCasOutcome::Applied(credential));
-        }
-
-        let current = sqlx::query(
-            r#"
-            SELECT id, priority, disabled, data, created_at, updated_at, revision
-            FROM credentials
-            WHERE id = $1 AND deleted_at IS NULL
-            FOR SHARE
-            "#,
-        )
-        .bind(credential_id as i64)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(credential_from_row)
-        .transpose()?;
-        tx.commit().await?;
-        Ok(CredentialRefreshFieldsCasOutcome::Conflict { current })
-    }
-
-    pub async fn soft_delete_credential(&self, credential_id: u64) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE credentials
-            SET deleted_at = now(),
-                updated_at = now(),
-                revision = credentials.revision + 1
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(credential_id as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn list_route_scenarios(&self) -> anyhow::Result<Vec<RouteScenarioRow>> {
         let rows = sqlx::query(
             "SELECT id, name, description, content, revision, created_at, updated_at \
@@ -2932,1712 +1770,6 @@ impl PostgresStore {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    pub async fn load_proxy_resources(&self) -> anyhow::Result<Vec<ProxyResourceRow>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT pr.id, pr.name, pr.proxy_url, pr.proxy_username, pr.proxy_password,
-                   pr.enabled, pr.notes, pr.created_at, pr.updated_at,
-                   pr.last_test_at, pr.last_test_success, pr.last_test_status,
-                   pr.last_test_duration_ms, pr.last_test_message, pr.last_test_url,
-                   COUNT(c.id) FILTER (WHERE c.deleted_at IS NULL) AS credential_count
-            FROM proxy_resources pr
-            LEFT JOIN credentials c
-              ON c.deleted_at IS NULL
-             AND (c.data->>'proxyResourceId') ~ '^[0-9]+$'
-             AND (c.data->>'proxyResourceId')::BIGINT = pr.id
-            WHERE pr.deleted_at IS NULL
-            GROUP BY pr.id
-            ORDER BY pr.id ASC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(proxy_resource_from_row).collect()
-    }
-
-    pub async fn get_proxy_resource(&self, id: u64) -> anyhow::Result<Option<ProxyResourceRow>> {
-        let row = sqlx::query(
-            r#"
-            SELECT pr.id, pr.name, pr.proxy_url, pr.proxy_username, pr.proxy_password,
-                   pr.enabled, pr.notes, pr.created_at, pr.updated_at,
-                   pr.last_test_at, pr.last_test_success, pr.last_test_status,
-                   pr.last_test_duration_ms, pr.last_test_message, pr.last_test_url,
-                   COUNT(c.id) FILTER (WHERE c.deleted_at IS NULL) AS credential_count
-            FROM proxy_resources pr
-            LEFT JOIN credentials c
-              ON c.deleted_at IS NULL
-             AND (c.data->>'proxyResourceId') ~ '^[0-9]+$'
-             AND (c.data->>'proxyResourceId')::BIGINT = pr.id
-            WHERE pr.id = $1 AND pr.deleted_at IS NULL
-            GROUP BY pr.id
-            "#,
-        )
-        .bind(id as i64)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(proxy_resource_from_row).transpose()
-    }
-
-    pub async fn soft_delete_proxy_resource_clearing_disabled_bindings(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<Option<DeleteProxyResourceOutcome>> {
-        let mut tx = self.pool.begin().await?;
-        let exists = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT id
-            FROM proxy_resources
-            WHERE id = $1 AND deleted_at IS NULL
-            FOR UPDATE
-            "#,
-        )
-        .bind(id as i64)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if exists.is_none() {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-
-        let enabled_credential_count = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*)
-            FROM credentials
-            WHERE deleted_at IS NULL
-              AND disabled = false
-              AND (data->>'proxyResourceId') ~ '^[0-9]+$'
-              AND (data->>'proxyResourceId')::BIGINT = $1
-            "#,
-        )
-        .bind(id as i64)
-        .fetch_one(&mut *tx)
-        .await?;
-        let enabled_credential_count = enabled_credential_count.max(0) as u64;
-
-        let cleared_disabled_credentials = sqlx::query(
-            r#"
-            UPDATE credentials
-            SET data = data - 'proxyResourceId',
-                updated_at = now(),
-                revision = revision + 1
-            WHERE deleted_at IS NULL
-              AND disabled = true
-              AND (data->>'proxyResourceId') ~ '^[0-9]+$'
-              AND (data->>'proxyResourceId')::BIGINT = $1
-            "#,
-        )
-        .bind(id as i64)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        if enabled_credential_count == 0 {
-            sqlx::query(
-                r#"
-                UPDATE proxy_resources
-                SET deleted_at = now(),
-                    enabled = false,
-                    updated_at = now()
-                WHERE id = $1 AND deleted_at IS NULL
-                "#,
-            )
-            .bind(id as i64)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(Some(DeleteProxyResourceOutcome {
-            cleared_disabled_credentials,
-            enabled_credential_count,
-        }))
-    }
-
-    pub async fn insert_proxy_resource(
-        &self,
-        resource: &CreateProxyResourceRow,
-    ) -> anyhow::Result<ProxyResourceRow> {
-        let row = sqlx::query(
-            r#"
-            INSERT INTO proxy_resources (
-                name, proxy_url, proxy_username, proxy_password,
-                enabled, notes, updated_at, deleted_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, now(), NULL)
-            RETURNING id, name, proxy_url, proxy_username, proxy_password,
-                      enabled, notes, created_at, updated_at,
-                      last_test_at, last_test_success, last_test_status,
-                      last_test_duration_ms, last_test_message, last_test_url,
-                      0::BIGINT AS credential_count
-            "#,
-        )
-        .bind(&resource.name)
-        .bind(&resource.proxy_url)
-        .bind(&resource.proxy_username)
-        .bind(&resource.proxy_password)
-        .bind(resource.enabled)
-        .bind(&resource.notes)
-        .fetch_one(&self.pool)
-        .await?;
-        proxy_resource_from_row(row)
-    }
-
-    pub async fn update_proxy_resource_test(
-        &self,
-        id: u64,
-        success: bool,
-        status: Option<u16>,
-        duration_ms: u64,
-        message: &str,
-        test_url: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE proxy_resources
-            SET last_test_at = now(),
-                last_test_success = $2,
-                last_test_status = $3,
-                last_test_duration_ms = $4,
-                last_test_message = $5,
-                last_test_url = $6,
-                updated_at = now()
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(id as i64)
-        .bind(success)
-        .bind(status.map(i32::from))
-        .bind(duration_ms as i64)
-        .bind(message)
-        .bind(test_url)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn update_proxy_resource(
-        &self,
-        id: u64,
-        update: &UpdateProxyResourceRow,
-    ) -> anyhow::Result<Option<ProxyResourceRow>> {
-        sqlx::query(
-            r#"
-            UPDATE proxy_resources
-            SET name = COALESCE($2, name),
-                proxy_url = COALESCE($3, proxy_url),
-                proxy_username = CASE WHEN $4 THEN $5 ELSE proxy_username END,
-                proxy_password = CASE WHEN $6 THEN $7 ELSE proxy_password END,
-                enabled = COALESCE($8, enabled),
-                notes = CASE WHEN $9 THEN $10 ELSE notes END,
-                updated_at = now()
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(id as i64)
-        .bind(&update.name)
-        .bind(&update.proxy_url)
-        .bind(update.proxy_username.is_some())
-        .bind(update.proxy_username.clone().flatten())
-        .bind(update.proxy_password.is_some())
-        .bind(update.proxy_password.clone().flatten())
-        .bind(update.enabled)
-        .bind(update.notes.is_some())
-        .bind(update.notes.clone().flatten())
-        .execute(&self.pool)
-        .await?;
-
-        self.get_proxy_resource(id).await
-    }
-
-    pub async fn delete_credential_stats_and_runtime(
-        &self,
-        credential_id: u64,
-    ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM credential_runtime_state WHERE credential_id = $1")
-            .bind(credential_id as i64)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM credential_stats WHERE credential_id = $1")
-            .bind(credential_id as i64)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn load_credential_stats(&self) -> anyhow::Result<HashMap<u64, CredentialStatsRow>> {
-        let rows = sqlx::query(
-            "SELECT credential_id, success_count, selection_count, last_used_at FROM credential_stats",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut stats = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            let success_count: i64 = row.try_get("success_count")?;
-            let selection_count: i64 = row.try_get("selection_count")?;
-            let last_used_at: Option<String> = row.try_get("last_used_at")?;
-            stats.insert(
-                credential_id as u64,
-                CredentialStatsRow {
-                    success_count: success_count.max(0) as u64,
-                    selection_count: selection_count.max(0) as u64,
-                    last_used_at,
-                },
-            );
-        }
-        Ok(stats)
-    }
-
-    pub async fn load_credential_runtime_state(
-        &self,
-    ) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateRow>> {
-        let rows = sqlx::query(CREDENTIAL_RUNTIME_STATE_SELECT_SQL)
-            .fetch_all(&self.pool)
-            .await?;
-        credential_runtime_states_from_rows(rows)
-    }
-
-    pub async fn cleanup_credential_runtime_mutations(
-        &self,
-        retention: std::time::Duration,
-        limit: usize,
-    ) -> anyhow::Result<u64> {
-        const MAX_CLEANUP_BATCH: usize = 10_000;
-        let limit = limit.min(MAX_CLEANUP_BATCH);
-        if limit == 0 {
-            return Ok(0);
-        }
-        let retention_micros = i64::try_from(retention.as_micros())
-            .map_err(|_| anyhow::anyhow!("credential mutation retention 超出 PgSQL 范围"))?;
-        let removed: i64 = sqlx::query_scalar(
-            r#"
-            WITH runtime_candidates AS (
-                SELECT operation_id, created_at
-                FROM credential_runtime_mutations
-                WHERE created_at < now() - ($1::bigint * interval '1 microsecond')
-                ORDER BY created_at ASC, operation_id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            ),
-            stats_candidates AS (
-                SELECT operation_id, created_at
-                FROM credential_stats_delta_batches
-                WHERE created_at < now() - ($1::bigint * interval '1 microsecond')
-                ORDER BY created_at ASC, operation_id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            ),
-            expired AS (
-                SELECT ledger_kind, operation_id
-                FROM (
-                    SELECT 'runtime'::text AS ledger_kind,
-                           operation_id, created_at
-                    FROM runtime_candidates
-                    UNION ALL
-                    SELECT 'stats'::text AS ledger_kind,
-                           operation_id, created_at
-                    FROM stats_candidates
-                ) AS candidates
-                ORDER BY created_at ASC, ledger_kind ASC, operation_id ASC
-                LIMIT $2
-            ),
-            deleted_runtime AS (
-                DELETE FROM credential_runtime_mutations AS mutation
-                USING expired
-                WHERE expired.ledger_kind = 'runtime'
-                  AND mutation.operation_id = expired.operation_id
-                RETURNING 1
-            ),
-            deleted_stats AS (
-                DELETE FROM credential_stats_delta_batches AS batch
-                USING expired
-                WHERE expired.ledger_kind = 'stats'
-                  AND batch.operation_id = expired.operation_id
-                RETURNING 1
-            )
-            SELECT (SELECT COUNT(*) FROM deleted_runtime)
-                 + (SELECT COUNT(*) FROM deleted_stats)
-            "#,
-        )
-        .bind(retention_micros)
-        .bind(limit as i64)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(removed.max(0) as u64)
-    }
-
-    pub async fn load_credential_account_info(
-        &self,
-    ) -> anyhow::Result<HashMap<u64, CredentialAccountInfoRow>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT credential_id, subscription_title, current_usage, usage_limit,
-                   remaining, usage_percentage, credit_limit, credit_remaining,
-                   credit_base, credit_bonus, overage_status, overage_capability,
-                   overage_cap, overage_rate, current_overages, next_reset_at, checked_at
-            FROM credential_account_info
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut info = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            let checked_at: DateTime<Utc> = row.try_get("checked_at")?;
-            info.insert(
-                credential_id as u64,
-                CredentialAccountInfoRow {
-                    subscription_title: row.try_get("subscription_title")?,
-                    current_usage: row.try_get("current_usage")?,
-                    usage_limit: row.try_get("usage_limit")?,
-                    remaining: row.try_get("remaining")?,
-                    usage_percentage: row.try_get("usage_percentage")?,
-                    credit_limit: row.try_get("credit_limit")?,
-                    credit_remaining: row.try_get("credit_remaining")?,
-                    credit_base: row.try_get("credit_base")?,
-                    credit_bonus: row.try_get("credit_bonus")?,
-                    overage_status: row.try_get("overage_status")?,
-                    overage_capability: row.try_get("overage_capability")?,
-                    overage_cap: row.try_get("overage_cap")?,
-                    overage_rate: row.try_get("overage_rate")?,
-                    current_overages: row.try_get("current_overages")?,
-                    next_reset_at: row.try_get("next_reset_at")?,
-                    checked_at: checked_at.to_rfc3339(),
-                },
-            );
-        }
-        Ok(info)
-    }
-
-    /// 每个账号在额度快照 `checked_at` 之后本地记录的 Kiro 计量积分。
-    ///
-    /// 用来在两次上游查询之间估算当前剩余额度，不触发任何上游请求。
-    /// `ids` 为 `None` 时返回所有有快照的账号。走 `(credential_id, created_at)` 索引，
-    /// 每个账号只扫快照之后的少量记录。
-    pub async fn credential_metering_since_account_info(
-        &self,
-        ids: Option<&[u64]>,
-    ) -> anyhow::Result<HashMap<u64, f64>> {
-        let credential_ids: Option<Vec<i64>> =
-            ids.map(|ids| ids.iter().map(|id| *id as i64).collect());
-        if credential_ids.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(HashMap::new());
-        }
-        let rows = sqlx::query(
-            r#"
-            SELECT a.credential_id, s.used
-            FROM credential_account_info a
-            JOIN credentials c ON c.id = a.credential_id AND c.deleted_at IS NULL
-            CROSS JOIN LATERAL (
-                SELECT COALESCE(SUM(r.kiro_metering_usage), 0)::double precision AS used
-                FROM usage_records r
-                WHERE r.credential_id = a.credential_id
-                  AND r.created_at > a.checked_at
-                  AND r.deleted_at IS NULL
-            ) s
-            WHERE ($1::bigint[] IS NULL OR a.credential_id = ANY($1))
-              AND s.used > 0
-            "#,
-        )
-        .bind(&credential_ids)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut used = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            used.insert(credential_id as u64, row.try_get::<f64, _>("used")?);
-        }
-        Ok(used)
-    }
-
-    pub async fn load_credential_account_info_for_ids(
-        &self,
-        ids: &[u64],
-    ) -> anyhow::Result<HashMap<u64, CredentialAccountInfoRow>> {
-        if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let credential_ids: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
-        let rows = sqlx::query(
-            r#"
-            SELECT credential_id, subscription_title, current_usage, usage_limit,
-                   remaining, usage_percentage, credit_limit, credit_remaining,
-                   credit_base, credit_bonus, overage_status, overage_capability,
-                   overage_cap, overage_rate, current_overages, next_reset_at, checked_at
-            FROM credential_account_info
-            WHERE credential_id = ANY($1)
-            "#,
-        )
-        .bind(&credential_ids)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut info = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            let checked_at: DateTime<Utc> = row.try_get("checked_at")?;
-            info.insert(
-                credential_id as u64,
-                CredentialAccountInfoRow {
-                    subscription_title: row.try_get("subscription_title")?,
-                    current_usage: row.try_get("current_usage")?,
-                    usage_limit: row.try_get("usage_limit")?,
-                    remaining: row.try_get("remaining")?,
-                    usage_percentage: row.try_get("usage_percentage")?,
-                    credit_limit: row.try_get("credit_limit")?,
-                    credit_remaining: row.try_get("credit_remaining")?,
-                    credit_base: row.try_get("credit_base")?,
-                    credit_bonus: row.try_get("credit_bonus")?,
-                    overage_status: row.try_get("overage_status")?,
-                    overage_capability: row.try_get("overage_capability")?,
-                    overage_cap: row.try_get("overage_cap")?,
-                    overage_rate: row.try_get("overage_rate")?,
-                    current_overages: row.try_get("current_overages")?,
-                    next_reset_at: row.try_get("next_reset_at")?,
-                    checked_at: checked_at.to_rfc3339(),
-                },
-            );
-        }
-        Ok(info)
-    }
-
-    pub async fn save_credential_account_info(
-        &self,
-        credential_id: u64,
-        info: &CredentialAccountInfoRow,
-    ) -> anyhow::Result<()> {
-        self.save_credential_account_info_returning_previous(credential_id, info)
-            .await
-            .map(drop)
-    }
-
-    /// Saves the snapshot and returns the usage figures it replaced (read in the same statement).
-    /// `None` when this is the first snapshot for the account.
-    pub async fn save_credential_account_info_returning_previous(
-        &self,
-        credential_id: u64,
-        info: &CredentialAccountInfoRow,
-    ) -> anyhow::Result<Option<AccountQuotaFigures>> {
-        let checked_at = DateTime::parse_from_rfc3339(&info.checked_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        let previous = sqlx::query(
-            r#"
-            WITH previous AS (
-                SELECT current_usage, usage_limit, current_overages
-                FROM credential_account_info
-                WHERE credential_id = $1
-            ),
-            saved AS (
-            INSERT INTO credential_account_info (
-                credential_id, subscription_title, current_usage, usage_limit,
-                remaining, usage_percentage, credit_limit, credit_remaining,
-                credit_base, credit_bonus, overage_status, overage_capability,
-                overage_cap, overage_rate, current_overages, next_reset_at, checked_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now())
-            ON CONFLICT (credential_id) DO UPDATE
-            SET subscription_title = EXCLUDED.subscription_title,
-                current_usage = EXCLUDED.current_usage,
-                usage_limit = EXCLUDED.usage_limit,
-                remaining = EXCLUDED.remaining,
-                usage_percentage = EXCLUDED.usage_percentage,
-                credit_limit = EXCLUDED.credit_limit,
-                credit_remaining = EXCLUDED.credit_remaining,
-                credit_base = EXCLUDED.credit_base,
-                credit_bonus = EXCLUDED.credit_bonus,
-                overage_status = EXCLUDED.overage_status,
-                overage_capability = EXCLUDED.overage_capability,
-                overage_cap = EXCLUDED.overage_cap,
-                overage_rate = EXCLUDED.overage_rate,
-                current_overages = EXCLUDED.current_overages,
-                next_reset_at = EXCLUDED.next_reset_at,
-                checked_at = EXCLUDED.checked_at,
-                updated_at = now()
-            RETURNING credential_id
-            )
-            SELECT previous.current_usage, previous.usage_limit, previous.current_overages
-            FROM saved
-            LEFT JOIN previous ON TRUE
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(&info.subscription_title)
-        .bind(info.current_usage)
-        .bind(info.usage_limit)
-        .bind(info.remaining)
-        .bind(info.usage_percentage)
-        .bind(info.credit_limit)
-        .bind(info.credit_remaining)
-        .bind(info.credit_base)
-        .bind(info.credit_bonus)
-        .bind(&info.overage_status)
-        .bind(&info.overage_capability)
-        .bind(info.overage_cap)
-        .bind(info.overage_rate)
-        .bind(info.current_overages)
-        .bind(info.next_reset_at)
-        .bind(checked_at)
-        .fetch_one(&self.pool)
-        .await?;
-        let usage: Option<f64> = previous.try_get("current_usage")?;
-        Ok(match usage {
-            Some(current_usage) => Some(AccountQuotaFigures {
-                current_usage,
-                usage_limit: previous.try_get("usage_limit")?,
-                current_overages: previous.try_get("current_overages")?,
-            }),
-            None => None,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub async fn save_credential_runtime_state(
-        &self,
-        states: &HashMap<u64, CredentialRuntimeStateRow>,
-    ) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateCasOutcome>> {
-        let snapshots = states
-            .iter()
-            .map(|(credential_id, state)| {
-                (
-                    *credential_id,
-                    CredentialRuntimeStateSnapshot {
-                        state: state.clone(),
-                        expected_revision: state.revision,
-                    },
-                )
-            })
-            .collect();
-        self.apply_credential_runtime_state_snapshots(&snapshots)
-            .await
-    }
-
-    #[allow(dead_code)]
-    pub async fn save_credential_runtime_state_for(
-        &self,
-        credential_id: u64,
-        state: &CredentialRuntimeStateRow,
-    ) -> anyhow::Result<CredentialRuntimeStateCasOutcome> {
-        let snapshot = CredentialRuntimeStateSnapshot {
-            state: state.clone(),
-            expected_revision: state.revision,
-        };
-        self.save_credential_runtime_state_snapshot(credential_id, &snapshot)
-            .await
-    }
-
-    pub async fn save_credential_runtime_state_snapshot(
-        &self,
-        credential_id: u64,
-        snapshot: &CredentialRuntimeStateSnapshot,
-    ) -> anyhow::Result<CredentialRuntimeStateCasOutcome> {
-        if snapshot.state.revision != snapshot.expected_revision {
-            anyhow::bail!(
-                "凭据 #{} snapshot revision {} 与 expected revision {} 不一致",
-                credential_id,
-                snapshot.state.revision,
-                snapshot.expected_revision
-            );
-        }
-        let expected_revision = i64::try_from(snapshot.expected_revision)
-            .map_err(|_| anyhow::anyhow!("凭据运行态 expected revision 超出 PgSQL BIGINT 范围"))?;
-        let expected_generation = i64::try_from(snapshot.state.generation)
-            .map_err(|_| anyhow::anyhow!("凭据运行态 generation 超出 PgSQL BIGINT 范围"))?;
-        let next_revision = snapshot
-            .expected_revision
-            .checked_add(1)
-            .filter(|revision| i64::try_from(*revision).is_ok())
-            .ok_or_else(|| anyhow::anyhow!("凭据运行态 revision 已达到 PgSQL BIGINT 上限"))?;
-        let mut tx = self.pool.begin().await?;
-        lock_active_credential_in_tx(&mut tx, credential_id).await?;
-        let applied = if snapshot.expected_revision == 0 {
-            sqlx::query(
-                r#"
-                INSERT INTO credential_runtime_state (
-                    credential_id, failure_count, refresh_failure_count,
-                    disabled_reason, warmup_remaining, generation, revision, updated_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, 1, now())
-                ON CONFLICT (credential_id) DO NOTHING
-                RETURNING failure_count, refresh_failure_count, disabled_reason,
-                          warmup_remaining, generation, revision
-                "#,
-            )
-            .bind(credential_id as i64)
-            .bind(snapshot.state.failure_count as i32)
-            .bind(snapshot.state.refresh_failure_count as i32)
-            .bind(&snapshot.state.disabled_reason)
-            .bind(snapshot.state.warmup_remaining as i32)
-            .bind(expected_generation)
-            .fetch_optional(&mut *tx)
-            .await?
-        } else {
-            sqlx::query(
-                r#"
-                UPDATE credential_runtime_state
-                SET failure_count = $2,
-                    refresh_failure_count = $3,
-                    disabled_reason = $4,
-                    warmup_remaining = $5,
-                    revision = credential_runtime_state.revision + 1,
-                    updated_at = now()
-                WHERE credential_id = $1
-                  AND credential_runtime_state.generation = $6
-                  AND credential_runtime_state.revision = $7
-                RETURNING failure_count, refresh_failure_count, disabled_reason,
-                          warmup_remaining, generation, revision
-                "#,
-            )
-            .bind(credential_id as i64)
-            .bind(snapshot.state.failure_count as i32)
-            .bind(snapshot.state.refresh_failure_count as i32)
-            .bind(&snapshot.state.disabled_reason)
-            .bind(snapshot.state.warmup_remaining as i32)
-            .bind(expected_generation)
-            .bind(expected_revision)
-            .fetch_optional(&mut *tx)
-            .await?
-        };
-        if let Some(row) = applied {
-            let state = runtime_state_from_row(&row)?;
-            verify_runtime_mutation_revision(&state, next_revision)?;
-            verify_runtime_mutation_generation(&state, snapshot.state.generation)?;
-            tx.commit().await?;
-            return Ok(CredentialRuntimeStateCasOutcome::Applied(state));
-        }
-
-        let current = sqlx::query(
-            r#"
-            SELECT failure_count, refresh_failure_count, disabled_reason,
-                   warmup_remaining, generation, revision
-            FROM credential_runtime_state
-            WHERE credential_id = $1
-            FOR SHARE
-            "#,
-        )
-        .bind(credential_id as i64)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(|row| runtime_state_from_row(&row))
-        .transpose()?;
-        tx.commit().await?;
-        Ok(CredentialRuntimeStateCasOutcome::Conflict { current })
-    }
-
-    #[cfg(test)]
-    pub async fn save_credential_stats(
-        &self,
-        stats: &HashMap<u64, CredentialStatsRow>,
-    ) -> anyhow::Result<()> {
-        for (credential_id, stat) in stats {
-            self.save_credential_stats_for(*credential_id, stat).await?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub async fn save_credential_stats_for(
-        &self,
-        credential_id: u64,
-        stat: &CredentialStatsRow,
-    ) -> anyhow::Result<()> {
-        if let Some(last_used_at) = stat.last_used_at.as_deref() {
-            validate_rfc3339_timestamp("last_used_at", last_used_at)?;
-        }
-        sqlx::query(
-            r#"
-            INSERT INTO credential_stats (
-                credential_id, success_count, selection_count, last_used_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, now())
-            ON CONFLICT (credential_id) DO UPDATE
-            SET success_count = GREATEST(credential_stats.success_count, EXCLUDED.success_count),
-                selection_count = GREATEST(credential_stats.selection_count, EXCLUDED.selection_count),
-                last_used_at = CASE
-                    WHEN EXCLUDED.last_used_at IS NULL THEN credential_stats.last_used_at
-                    WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
-                    WHEN EXCLUDED.last_used_at::timestamptz
-                         >= credential_stats.last_used_at::timestamptz
-                        THEN EXCLUDED.last_used_at
-                    ELSE credential_stats.last_used_at
-                END,
-                updated_at = now()
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(stat.success_count as i64)
-        .bind(stat.selection_count as i64)
-        .bind(&stat.last_used_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn apply_credential_stats_deltas(
-        &self,
-        operation_id: Uuid,
-        deltas: &HashMap<u64, CredentialStatsDeltaRow>,
-    ) -> anyhow::Result<()> {
-        let mut rows = Vec::with_capacity(deltas.len());
-        for (credential_id, delta) in deltas {
-            if delta.success_delta == 0
-                && delta.selection_delta == 0
-                && delta.last_used_at.is_none()
-            {
-                continue;
-            }
-            if let Some(last_used_at) = delta.last_used_at.as_deref() {
-                validate_rfc3339_timestamp("last_used_at", last_used_at)?;
-            }
-            rows.push((
-                i64::try_from(*credential_id).map_err(|_| {
-                    anyhow::anyhow!("凭据统计增量 credential_id 超出 PgSQL BIGINT 范围")
-                })?,
-                i64::try_from(delta.success_delta).map_err(|_| {
-                    anyhow::anyhow!("凭据统计 success_delta 超出 PgSQL BIGINT 范围")
-                })?,
-                i64::try_from(delta.selection_delta).map_err(|_| {
-                    anyhow::anyhow!("凭据统计 selection_delta 超出 PgSQL BIGINT 范围")
-                })?,
-                delta.last_used_at.clone(),
-            ));
-        }
-        rows.sort_unstable_by_key(|row| row.0);
-        let payload_hash = sha256_hex(&serde_json::to_string(&rows)?);
-        let input_credential_count = i32::try_from(rows.len())
-            .map_err(|_| anyhow::anyhow!("凭据统计增量批次行数超出 PgSQL INTEGER 范围"))?;
-
-        let mut tx = self.pool.begin().await?;
-        let credential_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
-        let active_credential_ids: Vec<i64> = if credential_ids.is_empty() {
-            Vec::new()
-        } else {
-            sqlx::query_scalar(
-                r#"
-                SELECT id
-                FROM credentials
-                WHERE deleted_at IS NULL
-                  AND id = ANY($1)
-                ORDER BY id ASC
-                FOR SHARE
-                "#,
-            )
-            .bind(&credential_ids)
-            .fetch_all(&mut *tx)
-            .await?
-        };
-        rows.retain(|row| active_credential_ids.binary_search(&row.0).is_ok());
-        let applied_credential_count = i32::try_from(rows.len())
-            .map_err(|_| anyhow::anyhow!("凭据统计有效增量行数超出 PgSQL INTEGER 范围"))?;
-
-        let operation_id = operation_id.to_string();
-        let inserted: Option<String> = sqlx::query_scalar(
-            r#"
-            INSERT INTO credential_stats_delta_batches (
-                operation_id, payload_hash, input_credential_count,
-                applied_credential_count, created_at
-            )
-            VALUES ($1, $2, $3, $4, now())
-            ON CONFLICT (operation_id) DO NOTHING
-            RETURNING operation_id
-            "#,
-        )
-        .bind(&operation_id)
-        .bind(&payload_hash)
-        .bind(input_credential_count)
-        .bind(applied_credential_count)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if inserted.is_none() {
-            let existing_payload_hash: String = sqlx::query_scalar(
-                r#"
-                SELECT payload_hash
-                FROM credential_stats_delta_batches
-                WHERE operation_id = $1
-                FOR UPDATE
-                "#,
-            )
-            .bind(&operation_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if existing_payload_hash != payload_hash {
-                anyhow::bail!("凭据统计 operation_id {} 已用于不同 payload", operation_id);
-            }
-            sqlx::query(
-                "UPDATE credential_stats_delta_batches SET created_at = now() WHERE operation_id = $1",
-            )
-            .bind(&operation_id)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(());
-        }
-
-        for chunk in rows.chunks(1_000) {
-            let now = Utc::now();
-            let mut builder = QueryBuilder::<Postgres>::new(
-                r#"
-                INSERT INTO credential_stats (
-                    credential_id, success_count, selection_count, last_used_at, updated_at
-                )
-                "#,
-            );
-            builder.push_values(
-                chunk.iter(),
-                |mut row, &(credential_id, success_delta, selection_delta, ref last_used_at)| {
-                    row.push_bind(credential_id)
-                        .push_bind(success_delta)
-                        .push_bind(selection_delta)
-                        .push_bind(last_used_at.clone())
-                        .push_bind(now.clone());
-                },
-            );
-            builder.push(
-                r#"
-                ON CONFLICT (credential_id) DO UPDATE
-                SET success_count = credential_stats.success_count + EXCLUDED.success_count,
-                    selection_count = credential_stats.selection_count + EXCLUDED.selection_count,
-                    last_used_at = CASE
-                        WHEN EXCLUDED.last_used_at IS NULL THEN credential_stats.last_used_at
-                        WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
-                        WHEN EXCLUDED.last_used_at::timestamptz
-                             >= credential_stats.last_used_at::timestamptz
-                            THEN EXCLUDED.last_used_at
-                        ELSE credential_stats.last_used_at
-                    END,
-                    updated_at = now()
-                "#,
-            );
-            builder.build().execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn apply_credential_runtime_state_snapshots(
-        &self,
-        snapshots: &HashMap<u64, CredentialRuntimeStateSnapshot>,
-    ) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateCasOutcome>> {
-        let mut outcomes = HashMap::with_capacity(snapshots.len());
-        for (credential_id, snapshot) in snapshots {
-            let outcome = self
-                .save_credential_runtime_state_snapshot(*credential_id, snapshot)
-                .await?;
-            outcomes.insert(*credential_id, outcome);
-        }
-        Ok(outcomes)
-    }
-
-    #[cfg(test)]
-    pub async fn record_credential_selection(&self, credential_id: u64) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO credential_stats (credential_id, selection_count, updated_at)
-            VALUES ($1, 1, now())
-            ON CONFLICT (credential_id) DO UPDATE
-            SET selection_count = credential_stats.selection_count + 1,
-                updated_at = now()
-            "#,
-        )
-        .bind(credential_id as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn record_credential_success(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-    ) -> anyhow::Result<CredentialRuntimeStateRow> {
-        Ok(self
-            .record_credential_success_with_expected_generation(
-                credential_id,
-                operation_id,
-                None,
-                1,
-            )
-            .await?
-            .state)
-    }
-
-    pub async fn record_credential_success_at_generation_with_count(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: u64,
-        success_count: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        self.record_credential_success_with_expected_generation(
-            credential_id,
-            operation_id,
-            Some(expected_generation),
-            success_count,
-        )
-        .await
-    }
-
-    pub async fn record_credential_success_if_runtime_dirty_at_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: u64,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        let mut tx = self.pool.begin().await?;
-        let credential_disabled = lock_active_credential_in_tx(&mut tx, credential_id).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO credential_runtime_state (
-                credential_id, failure_count, refresh_failure_count,
-                disabled_reason, warmup_remaining, generation, revision, updated_at
-            )
-            VALUES ($1, 0, 0, NULL, 0, 0, 0, now())
-            ON CONFLICT (credential_id) DO NOTHING
-            "#,
-        )
-        .bind(credential_id as i64)
-        .execute(&mut *tx)
-        .await?;
-
-        let row = sqlx::query(
-            r#"
-            SELECT failure_count, refresh_failure_count, disabled_reason,
-                   warmup_remaining, generation, revision
-            FROM credential_runtime_state
-            WHERE credential_id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(credential_id as i64)
-        .fetch_one(&mut *tx)
-        .await?;
-        let state = runtime_state_from_row(&row)?;
-        if expected_generation < state.generation {
-            tx.commit().await?;
-            return Ok(CredentialRuntimeStateMutationResult {
-                state,
-                credential_disabled,
-                applied: false,
-            });
-        }
-        if expected_generation > state.generation {
-            anyhow::bail!(
-                "凭据 #{} 运行态 generation 超前：期望 {}，当前 {}",
-                credential_id,
-                expected_generation,
-                state.generation
-            );
-        }
-
-        let runtime_dirty = state.failure_count > 0
-            || state.refresh_failure_count > 0
-            || state.disabled_reason.is_some()
-            || state.warmup_remaining > 0;
-        if !runtime_dirty {
-            tx.commit().await?;
-            return Ok(CredentialRuntimeStateMutationResult {
-                state,
-                credential_disabled,
-                applied: false,
-            });
-        }
-
-        let (next_revision, credential_disabled) = match prepare_credential_runtime_mutation(
-            &mut tx,
-            credential_id,
-            operation_id,
-            "success",
-            Some(expected_generation),
-        )
-        .await?
-        {
-            CredentialRuntimeMutationPreparation::Apply {
-                next_revision,
-                credential_disabled,
-                ..
-            } => (next_revision, credential_disabled),
-            CredentialRuntimeMutationPreparation::Duplicate {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: true,
-                });
-            }
-            CredentialRuntimeMutationPreparation::Stale {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: false,
-                });
-            }
-        };
-        let row = sqlx::query(
-            r#"
-            UPDATE credential_runtime_state
-            SET failure_count = 0,
-                refresh_failure_count = 0,
-                warmup_remaining = GREATEST(credential_runtime_state.warmup_remaining - 1, 0),
-                revision = credential_runtime_state.revision + 1,
-                updated_at = now()
-            WHERE credential_id = $1
-            RETURNING failure_count, refresh_failure_count, disabled_reason,
-                      warmup_remaining, generation, revision
-            "#,
-        )
-        .bind(credential_id as i64)
-        .fetch_one(&mut *tx)
-        .await?;
-        let state = runtime_state_from_row(&row)?;
-        verify_runtime_mutation_revision(&state, next_revision)?;
-        tx.commit().await?;
-        Ok(CredentialRuntimeStateMutationResult {
-            state,
-            credential_disabled,
-            applied: true,
-        })
-    }
-
-    async fn record_credential_success_with_expected_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: Option<u64>,
-        success_count: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        let warmup_decrement = i32::try_from(success_count.max(1)).unwrap_or(i32::MAX);
-        let mut tx = self.pool.begin().await?;
-        let (next_revision, credential_disabled) = match prepare_credential_runtime_mutation(
-            &mut tx,
-            credential_id,
-            operation_id,
-            "success",
-            expected_generation,
-        )
-        .await?
-        {
-            CredentialRuntimeMutationPreparation::Apply {
-                next_revision,
-                credential_disabled,
-                ..
-            } => (next_revision, credential_disabled),
-            CredentialRuntimeMutationPreparation::Duplicate {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: true,
-                });
-            }
-            CredentialRuntimeMutationPreparation::Stale {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: false,
-                });
-            }
-        };
-        let row = sqlx::query(
-            r#"
-            UPDATE credential_runtime_state
-            SET failure_count = 0,
-                refresh_failure_count = 0,
-                warmup_remaining = GREATEST(
-                    credential_runtime_state.warmup_remaining - $2,
-                    0
-                ),
-                revision = credential_runtime_state.revision + 1,
-                updated_at = now()
-            WHERE credential_id = $1
-            RETURNING failure_count, refresh_failure_count, disabled_reason,
-                      warmup_remaining, generation, revision
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(warmup_decrement)
-        .fetch_one(&mut *tx)
-        .await?;
-        let state = runtime_state_from_row(&row)?;
-        verify_runtime_mutation_revision(&state, next_revision)?;
-        tx.commit().await?;
-        Ok(CredentialRuntimeStateMutationResult {
-            state,
-            credential_disabled,
-            applied: true,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub async fn record_credential_api_failure(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        last_used_at: &str,
-        max_failures: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateRow> {
-        Ok(self
-            .record_credential_api_failure_with_expected_generation(
-                credential_id,
-                operation_id,
-                None,
-                last_used_at,
-                max_failures,
-            )
-            .await?
-            .state)
-    }
-
-    pub async fn record_credential_api_failure_at_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: u64,
-        last_used_at: &str,
-        max_failures: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        self.record_credential_api_failure_with_expected_generation(
-            credential_id,
-            operation_id,
-            Some(expected_generation),
-            last_used_at,
-            max_failures,
-        )
-        .await
-    }
-
-    async fn record_credential_api_failure_with_expected_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: Option<u64>,
-        last_used_at: &str,
-        max_failures: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        let mut tx = self.pool.begin().await?;
-        let (next_revision, mut credential_disabled) = match prepare_credential_runtime_mutation(
-            &mut tx,
-            credential_id,
-            operation_id,
-            "api_failure",
-            expected_generation,
-        )
-        .await?
-        {
-            CredentialRuntimeMutationPreparation::Apply {
-                next_revision,
-                credential_disabled,
-                state,
-                ..
-            } => {
-                if credential_disabled || state.disabled_reason.is_some() {
-                    tx.commit().await?;
-                    return Ok(CredentialRuntimeStateMutationResult {
-                        state,
-                        credential_disabled,
-                        applied: false,
-                    });
-                }
-                (next_revision, credential_disabled)
-            }
-            CredentialRuntimeMutationPreparation::Duplicate {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: true,
-                });
-            }
-            CredentialRuntimeMutationPreparation::Stale {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: false,
-                });
-            }
-        };
-        upsert_last_used_at(&mut tx, credential_id, last_used_at).await?;
-        let row = sqlx::query(
-            r#"
-            UPDATE credential_runtime_state
-            SET failure_count = credential_runtime_state.failure_count + 1,
-                disabled_reason = CASE
-                    WHEN credential_runtime_state.failure_count + 1 >= $2
-                        THEN 'TooManyFailures'
-                    ELSE credential_runtime_state.disabled_reason
-                END,
-                revision = credential_runtime_state.revision + 1,
-                updated_at = now()
-            WHERE credential_id = $1
-            RETURNING failure_count, refresh_failure_count, disabled_reason,
-                      warmup_remaining, generation, revision
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(max_failures as i32)
-        .fetch_one(&mut *tx)
-        .await?;
-        let state = runtime_state_from_row(&row)?;
-        verify_runtime_mutation_revision(&state, next_revision)?;
-        if state.disabled_reason.as_deref() == Some("TooManyFailures") {
-            persist_credential_disabled_flag_in_tx(&mut tx, credential_id, true).await?;
-            credential_disabled = true;
-        }
-        tx.commit().await?;
-        Ok(CredentialRuntimeStateMutationResult {
-            state,
-            credential_disabled,
-            applied: true,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub async fn record_credential_refresh_failure(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        last_used_at: &str,
-        max_failures: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateRow> {
-        Ok(self
-            .record_credential_refresh_failure_with_expected_generation(
-                credential_id,
-                operation_id,
-                None,
-                last_used_at,
-                max_failures,
-            )
-            .await?
-            .state)
-    }
-
-    #[cfg(test)]
-    pub async fn record_credential_refresh_failure_at_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: u64,
-        last_used_at: &str,
-        max_failures: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        self.record_credential_refresh_failure_with_expected_generation(
-            credential_id,
-            operation_id,
-            Some(expected_generation),
-            last_used_at,
-            max_failures,
-        )
-        .await
-    }
-
-    async fn record_credential_refresh_failure_with_expected_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: Option<u64>,
-        last_used_at: &str,
-        max_failures: u32,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        let mut tx = self.pool.begin().await?;
-        let (next_revision, mut credential_disabled) = match prepare_credential_runtime_mutation(
-            &mut tx,
-            credential_id,
-            operation_id,
-            "refresh_failure",
-            expected_generation,
-        )
-        .await?
-        {
-            CredentialRuntimeMutationPreparation::Apply {
-                next_revision,
-                credential_disabled,
-                state,
-                ..
-            } => {
-                if credential_disabled || state.disabled_reason.is_some() {
-                    tx.commit().await?;
-                    return Ok(CredentialRuntimeStateMutationResult {
-                        state,
-                        credential_disabled,
-                        applied: false,
-                    });
-                }
-                (next_revision, credential_disabled)
-            }
-            CredentialRuntimeMutationPreparation::Duplicate {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: true,
-                });
-            }
-            CredentialRuntimeMutationPreparation::Stale {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
-                    state,
-                    credential_disabled,
-                    applied: false,
-                });
-            }
-        };
-        upsert_last_used_at(&mut tx, credential_id, last_used_at).await?;
-        let row = sqlx::query(
-            r#"
-            UPDATE credential_runtime_state
-            SET refresh_failure_count = credential_runtime_state.refresh_failure_count + 1,
-                disabled_reason = CASE
-                    WHEN credential_runtime_state.refresh_failure_count + 1 >= $2
-                        THEN 'TooManyRefreshFailures'
-                    ELSE credential_runtime_state.disabled_reason
-                END,
-                revision = credential_runtime_state.revision + 1,
-                updated_at = now()
-            WHERE credential_id = $1
-            RETURNING failure_count, refresh_failure_count, disabled_reason,
-                      warmup_remaining, generation, revision
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(max_failures as i32)
-        .fetch_one(&mut *tx)
-        .await?;
-        let state = runtime_state_from_row(&row)?;
-        verify_runtime_mutation_revision(&state, next_revision)?;
-        if state.disabled_reason.as_deref() == Some("TooManyRefreshFailures") {
-            persist_credential_disabled_flag_in_tx(&mut tx, credential_id, true).await?;
-            credential_disabled = true;
-        }
-        tx.commit().await?;
-        Ok(CredentialRuntimeStateMutationResult {
-            state,
-            credential_disabled,
-            applied: true,
-        })
-    }
-
-    pub async fn heal_credential_api_failures(
-        &self,
-        credential_id: u64,
-    ) -> anyhow::Result<Option<CredentialRuntimeStateRow>> {
-        let mut tx = self.pool.begin().await?;
-        lock_active_credential_in_tx(&mut tx, credential_id).await?;
-        let current_reason: Option<String> = sqlx::query_scalar(
-            r#"
-            SELECT disabled_reason
-            FROM credential_runtime_state
-            WHERE credential_id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(credential_id as i64)
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten();
-        if current_reason.as_deref() != Some("TooManyFailures") {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-
-        let row = sqlx::query(
-            r#"
-            UPDATE credential_runtime_state
-            SET failure_count = 0,
-                disabled_reason = NULL,
-                generation = credential_runtime_state.generation + 1,
-                revision = credential_runtime_state.revision + 1,
-                updated_at = now()
-            WHERE credential_id = $1 AND disabled_reason = 'TooManyFailures'
-            RETURNING failure_count, refresh_failure_count, disabled_reason,
-                      warmup_remaining, generation, revision
-            "#,
-        )
-        .bind(credential_id as i64)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(row) = row else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-        persist_credential_disabled_flag_in_tx(&mut tx, credential_id, false).await?;
-        let state = runtime_state_from_row(&row)?;
-        tx.commit().await?;
-        Ok(Some(state))
-    }
-
-    pub async fn patch_credential_runtime_state(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        patch: &CredentialRuntimeStatePatch,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        self.patch_credential_runtime_state_with_kind(credential_id, operation_id, "patch", patch)
-            .await
-    }
-
-    async fn patch_credential_runtime_state_with_kind(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        mutation_kind: &str,
-        patch: &CredentialRuntimeStatePatch,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        validate_credential_runtime_state_patch(patch)?;
-        let mut tx = self.pool.begin().await?;
-        let result = Self::patch_credential_runtime_state_in_tx(
-            &mut tx,
-            credential_id,
-            operation_id,
-            mutation_kind,
-            patch,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(result)
-    }
-
-    async fn patch_credential_runtime_state_in_tx(
-        tx: &mut Transaction<'_, Postgres>,
-        credential_id: u64,
-        operation_id: Uuid,
-        mutation_kind: &str,
-        patch: &CredentialRuntimeStatePatch,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        let failure_count = runtime_state_count_to_i32("failure_count", patch.failure_count)?;
-        let refresh_failure_count =
-            runtime_state_count_to_i32("refresh_failure_count", patch.refresh_failure_count)?;
-        let warmup_remaining =
-            runtime_state_count_to_i32("warmup_remaining", patch.warmup_remaining)?;
-        let (update_disabled_reason, disabled_reason) = match &patch.disabled_reason {
-            CredentialRuntimeDisabledReasonPatch::Preserve => (false, None),
-            CredentialRuntimeDisabledReasonPatch::Set(reason) => (true, Some(reason.as_str())),
-            CredentialRuntimeDisabledReasonPatch::Clear => (true, None),
-        };
-
-        let (next_revision, current_generation, current_credential_disabled) =
-            match prepare_credential_runtime_mutation(
-                tx,
-                credential_id,
-                operation_id,
-                mutation_kind,
-                patch.expected_generation,
-            )
-            .await?
-            {
-                CredentialRuntimeMutationPreparation::Apply {
-                    next_revision,
-                    current_generation,
-                    credential_disabled,
-                    ..
-                } => (next_revision, current_generation, credential_disabled),
-                CredentialRuntimeMutationPreparation::Duplicate {
-                    state,
-                    credential_disabled,
-                } => {
-                    return Ok(CredentialRuntimeStateMutationResult {
-                        state,
-                        credential_disabled,
-                        applied: true,
-                    });
-                }
-                CredentialRuntimeMutationPreparation::Stale {
-                    state,
-                    credential_disabled,
-                } => {
-                    return Ok(CredentialRuntimeStateMutationResult {
-                        state,
-                        credential_disabled,
-                        applied: false,
-                    });
-                }
-            };
-        let next_generation = if patch.advance_generation {
-            current_generation
-                .checked_add(1)
-                .filter(|generation| i64::try_from(*generation).is_ok())
-                .ok_or_else(|| anyhow::anyhow!("凭据运行态 generation 已达到 PgSQL BIGINT 上限"))?
-        } else {
-            current_generation
-        };
-        if let Some(last_used_at) = patch.last_used_at.as_deref() {
-            upsert_last_used_at(tx, credential_id, last_used_at).await?;
-        }
-        let row = sqlx::query(
-            r#"
-            UPDATE credential_runtime_state
-            SET failure_count = COALESCE($2, credential_runtime_state.failure_count),
-                refresh_failure_count = COALESCE($3, credential_runtime_state.refresh_failure_count),
-                disabled_reason = CASE
-                    WHEN $4 THEN $5
-                    ELSE credential_runtime_state.disabled_reason
-                END,
-                warmup_remaining = COALESCE($6, credential_runtime_state.warmup_remaining),
-                generation = credential_runtime_state.generation
-                    + CASE WHEN $7 THEN 1 ELSE 0 END,
-                revision = credential_runtime_state.revision + 1,
-                updated_at = now()
-            WHERE credential_id = $1
-            RETURNING failure_count, refresh_failure_count, disabled_reason,
-                      warmup_remaining, generation, revision
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(failure_count)
-        .bind(refresh_failure_count)
-        .bind(update_disabled_reason)
-        .bind(disabled_reason)
-        .bind(warmup_remaining)
-        .bind(patch.advance_generation)
-        .fetch_one(&mut **tx)
-        .await?;
-        let state = runtime_state_from_row(&row)?;
-        verify_runtime_mutation_revision(&state, next_revision)?;
-        verify_runtime_mutation_generation(&state, next_generation)?;
-        let credential_disabled = if let Some(disabled) = patch.credential_disabled {
-            persist_credential_disabled_flag_in_tx(tx, credential_id, disabled).await?;
-            disabled
-        } else {
-            current_credential_disabled
-        };
-        Ok(CredentialRuntimeStateMutationResult {
-            state,
-            credential_disabled,
-            applied: true,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub async fn mark_credential_disabled(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        reason: &str,
-        failure_count: Option<u32>,
-        refresh_failure_count: Option<u32>,
-        last_used_at: &str,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        self.mark_credential_disabled_with_expected_generation(
-            credential_id,
-            operation_id,
-            None,
-            reason,
-            CredentialRuntimeFailureCounts {
-                failure_count,
-                refresh_failure_count,
-            },
-            last_used_at,
-        )
-        .await
-    }
-
-    pub async fn mark_credential_disabled_at_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: u64,
-        reason: &str,
-        failure_counts: CredentialRuntimeFailureCounts,
-        last_used_at: &str,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        self.mark_credential_disabled_with_expected_generation(
-            credential_id,
-            operation_id,
-            Some(expected_generation),
-            reason,
-            failure_counts,
-            last_used_at,
-        )
-        .await
-    }
-
-    async fn mark_credential_disabled_with_expected_generation(
-        &self,
-        credential_id: u64,
-        operation_id: Uuid,
-        expected_generation: Option<u64>,
-        reason: &str,
-        failure_counts: CredentialRuntimeFailureCounts,
-        last_used_at: &str,
-    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        self.patch_credential_runtime_state_with_kind(
-            credential_id,
-            operation_id,
-            "disable",
-            &CredentialRuntimeStatePatch {
-                failure_count: failure_counts.failure_count,
-                refresh_failure_count: failure_counts.refresh_failure_count,
-                disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(reason.to_string()),
-                credential_disabled: Some(true),
-                last_used_at: Some(last_used_at.to_string()),
-                expected_generation,
-                ..Default::default()
-            },
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    pub async fn update_credential_last_used_at(
-        &self,
-        credential_id: u64,
-        last_used_at: &str,
-    ) -> anyhow::Result<()> {
-        validate_rfc3339_timestamp("last_used_at", last_used_at)?;
-        sqlx::query(
-            r#"
-            INSERT INTO credential_stats (credential_id, success_count, last_used_at, updated_at)
-            VALUES ($1, 0, $2, now())
-            ON CONFLICT (credential_id) DO UPDATE
-            SET last_used_at = CASE
-                    WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
-                    WHEN EXCLUDED.last_used_at::timestamptz
-                         >= credential_stats.last_used_at::timestamptz
-                        THEN EXCLUDED.last_used_at
-                    ELSE credential_stats.last_used_at
-                END,
-                updated_at = now()
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(last_used_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn save_pricing_status(&self, status: &PricingStatus) -> anyhow::Result<()> {
@@ -4898,20 +2030,14 @@ impl PostgresStore {
             r#"
             INSERT INTO model_capabilities_sync_status (
                 id, source, last_synced_at, last_error, model_count,
-                reasoning_fields, reasoning_cohort_keys, reasoning_cohort_complete,
-                reasoning_contract_version, reasoning_invalid_models, updated_at
+                updated_at
             )
-            VALUES ('default', $1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+            VALUES ('default', $1, $2, $3, $4, now())
             ON CONFLICT (id) DO UPDATE
             SET source = EXCLUDED.source,
                 last_synced_at = EXCLUDED.last_synced_at,
                 last_error = EXCLUDED.last_error,
                 model_count = EXCLUDED.model_count,
-                reasoning_fields = EXCLUDED.reasoning_fields,
-                reasoning_cohort_keys = EXCLUDED.reasoning_cohort_keys,
-                reasoning_cohort_complete = EXCLUDED.reasoning_cohort_complete,
-                reasoning_contract_version = EXCLUDED.reasoning_contract_version,
-                reasoning_invalid_models = EXCLUDED.reasoning_invalid_models,
                 updated_at = now()
             "#,
         )
@@ -4919,13 +2045,6 @@ impl PostgresStore {
         .bind(&status.last_synced_at)
         .bind(&status.last_error)
         .bind(status.model_count as i32)
-        .bind(serde_json::to_value(&status.reasoning_fields)?)
-        .bind(serde_json::to_value(
-            &status.reasoning_capability_cohort_keys,
-        )?)
-        .bind(status.reasoning_capability_cohort_complete)
-        .bind(status.reasoning_capability_contract_version as i32)
-        .bind(serde_json::to_value(&status.reasoning_invalid_models)?)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -4952,55 +2071,24 @@ impl PostgresStore {
 
         let status_row = sqlx::query(
             r#"
-            SELECT source, last_synced_at, last_error, reasoning_fields,
-                   reasoning_cohort_keys, reasoning_cohort_complete,
-                   reasoning_contract_version, reasoning_invalid_models
+            SELECT source, last_synced_at, last_error
             FROM model_capabilities_sync_status
             WHERE id = 'default'
             "#,
         )
         .fetch_optional(&self.pool)
         .await?;
-        let (
-            source,
-            last_synced_at,
-            last_error,
-            reasoning_fields,
-            reasoning_capability_cohort_keys,
-            reasoning_capability_cohort_complete,
-            reasoning_capability_contract_version,
-            reasoning_invalid_models,
-        ): (
-            String,
-            Option<String>,
-            Option<String>,
-            BTreeMap<String, KiroReasoningFieldCapability>,
-            Vec<KiroModelCapabilityCohortKey>,
-            bool,
-            u32,
-            Vec<String>,
-        ) = if let Some(row) = status_row {
+        let (source, last_synced_at, last_error) = if let Some(row) = status_row {
             (
                 row.try_get("source")?,
                 row.try_get("last_synced_at")?,
                 row.try_get("last_error")?,
-                serde_json::from_value(row.try_get("reasoning_fields")?).unwrap_or_default(),
-                serde_json::from_value(row.try_get("reasoning_cohort_keys")?).unwrap_or_default(),
-                row.try_get("reasoning_cohort_complete")?,
-                row.try_get::<i32, _>("reasoning_contract_version")?.max(0) as u32,
-                serde_json::from_value(row.try_get("reasoning_invalid_models")?)
-                    .unwrap_or_default(),
             )
         } else {
             (
                 rows[0].try_get("source")?,
                 rows[0].try_get("last_synced_at")?,
                 rows[0].try_get("last_error")?,
-                std::collections::BTreeMap::new(),
-                Vec::new(),
-                false,
-                0,
-                Vec::new(),
             )
         };
         let mut models = Vec::with_capacity(rows.len());
@@ -5024,98 +2112,7 @@ impl PostgresStore {
             last_synced_at,
             last_error,
             models,
-            reasoning_fields,
-            reasoning_capability_cohort_keys,
-            reasoning_capability_cohort_complete,
-            reasoning_capability_contract_version,
-            reasoning_invalid_models,
         }))
-    }
-
-    pub async fn load_kiro_version_state(
-        &self,
-    ) -> anyhow::Result<Option<crate::kiro::kiro_version::VersionState>> {
-        let row = sqlx::query("SELECT state FROM kiro_version_state WHERE id = 'default'")
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|row| {
-            let value: serde_json::Value = row.try_get("state")?;
-            serde_json::from_value(value).map_err(Into::into)
-        })
-        .transpose()
-    }
-
-    /// Insert the one-time lifecycle row without replacing state written by another instance.
-    pub async fn initialize_kiro_version_state_if_absent(
-        &self,
-        state: &crate::kiro::kiro_version::VersionState,
-    ) -> anyhow::Result<()> {
-        let value = serde_json::to_value(state)?;
-        sqlx::query(
-            r#"
-            INSERT INTO kiro_version_state (id, state, updated_at)
-            VALUES ('default', $1, now())
-            ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// 原子保存 Kiro 版本状态；只有数据库中的 generation 等于 expected 时才覆盖。
-    ///
-    /// candidate/错误状态同样推进 generation，并经过同一把 CAS 锁，避免后台检查把
-    /// 另一个实例刚刚应用的 active 版本覆盖掉。
-    pub async fn save_kiro_version_state_if_generation(
-        &self,
-        state: &crate::kiro::kiro_version::VersionState,
-        expected_generation: u64,
-    ) -> anyhow::Result<bool> {
-        let expected_generation = i64::try_from(expected_generation)
-            .map_err(|_| anyhow::anyhow!("Kiro 版本状态 generation 超出 PostgreSQL bigint"))?;
-        let value = serde_json::to_value(state)?;
-        // INSERT ... SELECT 只在 expected=0 时产生候选行；已有行的情况必须走独立的条件 UPDATE，
-        // 否则 SELECT 没有行可插入，ON CONFLICT 分支永远不会触发，第二次及以后的写入全部失败。
-        let sql = if expected_generation == 0 {
-            r#"
-INSERT INTO kiro_version_state (id, state, updated_at)
-VALUES ('default', $1, now())
-ON CONFLICT (id) DO UPDATE
-SET state = EXCLUDED.state,
-updated_at = now()
-WHERE COALESCE(
-CASE
-WHEN kiro_version_state.state->>'generation' ~ '^[0-9]+$'
-THEN (kiro_version_state.state->>'generation')::bigint
-END,
-0
-) = $2
-RETURNING id
-"#
-        } else {
-            r#"
-UPDATE kiro_version_state
-SET state = $1,
-updated_at = now()
-WHERE id = 'default'
-AND COALESCE(
-CASE
-WHEN state->>'generation' ~ '^[0-9]+$'
-THEN (state->>'generation')::bigint
-END,
-0
-) = $2
-RETURNING id
-"#
-        };
-        let result = sqlx::query(sql)
-            .bind(value)
-            .bind(expected_generation)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(result.is_some())
     }
 
     pub async fn save_manual_model(
@@ -5153,13 +2150,6 @@ RETURNING id
         .bind(item.supports_prompt_caching)
         .bind(&item.supported_input_types)
         .bind(item.source.as_deref().unwrap_or(MANUAL_SOURCE))
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "UPDATE model_capabilities_sync_status SET reasoning_fields = reasoning_fields - $1, updated_at = now() WHERE id = 'default'",
-        )
-        .bind(&item.model)
         .execute(&mut *tx)
         .await?;
 
@@ -5393,7 +2383,7 @@ RETURNING id
             Some(since) => sqlx::query(
                 r#"
                 SELECT COALESCE(SUM(total_estimated_cost_usd), 0)::float8 AS cost_usd,
-                       COALESCE(SUM(total_kiro_metering_usage), 0)::float8 AS credits,
+
                        COALESCE(SUM(billable_input_tokens + total_cache_read_input_tokens + total_output_tokens), 0)::float8 AS tokens
                 FROM usage_rollup_time_buckets
                 WHERE dimension = 'request_api_key' AND dimension_key = $1 AND bucket_start >= $2
@@ -5406,7 +2396,7 @@ RETURNING id
             None => sqlx::query(
                 r#"
                 SELECT COALESCE(SUM(total_estimated_cost_usd), 0)::float8 AS cost_usd,
-                       COALESCE(SUM(total_kiro_metering_usage), 0)::float8 AS credits,
+
                        COALESCE(SUM(billable_input_tokens + total_cache_read_input_tokens + total_output_tokens), 0)::float8 AS tokens
                 FROM usage_rollup_totals
                 WHERE dimension = 'request_api_key' AND dimension_key = $1
@@ -5421,28 +2411,6 @@ RETURNING id
             credits: row.try_get("credits")?,
             tokens: row.try_get("tokens")?,
         })
-    }
-
-    pub async fn record_credential_event(
-        &self,
-        credential_id: Option<u64>,
-        event_type: &str,
-        reason: Option<&str>,
-        detail: serde_json::Value,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO credential_events (credential_id, event_type, reason, detail, created_at)
-            VALUES ($1, $2, $3, $4, now())
-            "#,
-        )
-        .bind(credential_id.map(|id| id as i64))
-        .bind(event_type)
-        .bind(reason)
-        .bind(detail)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 }
 
@@ -5599,285 +2567,6 @@ async fn execute_sql_statements_in_tx(
         }
     }
     Ok(())
-}
-
-async fn repair_active_credential_hashes_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-) -> anyhow::Result<()> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, api_key_hash, refresh_token_hash, data
-        FROM credentials
-        WHERE deleted_at IS NULL
-          AND (
-              (
-                  api_key_hash IS NULL
-                  AND COALESCE(data->>'kiroApiKey', data->>'kiro_api_key') IS NOT NULL
-              )
-              OR (
-                  refresh_token_hash IS NULL
-                  AND COALESCE(data->>'refreshToken', data->>'refresh_token') IS NOT NULL
-              )
-          )
-        ORDER BY id ASC
-        FOR UPDATE
-        "#,
-    )
-    .fetch_all(&mut **tx)
-    .await?;
-
-    for row in rows {
-        let credential_id: i64 = row.try_get("id")?;
-        let existing_api_key_hash: Option<String> = row.try_get("api_key_hash")?;
-        let existing_refresh_token_hash: Option<String> = row.try_get("refresh_token_hash")?;
-        let data: serde_json::Value = row.try_get("data")?;
-        let mut credential: KiroCredentials = serde_json::from_value(data)?;
-        credential.id = Some(credential_id.max(0) as u64);
-        credential.canonicalize_auth_method();
-        credential.normalize_api_key_defaults();
-        credential.normalize_external_idp_defaults();
-        let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&credential);
-
-        if let Some(api_key_hash) = api_key_hash
-            .as_deref()
-            .filter(|_| existing_api_key_hash.is_none())
-        {
-            let conflicting_id: Option<i64> = sqlx::query_scalar(
-                r#"
-                    SELECT id
-                    FROM credentials
-                    WHERE deleted_at IS NULL
-                      AND id <> $1
-                      AND api_key_hash = $2
-                    LIMIT 1
-                    "#,
-            )
-            .bind(credential_id)
-            .bind(api_key_hash)
-            .fetch_optional(&mut **tx)
-            .await?;
-            if let Some(conflicting_id) = conflicting_id {
-                anyhow::bail!(
-                    "凭据 #{} 与 #{} 的 kiroApiKey 重复，无法回填 hash",
-                    credential_id,
-                    conflicting_id
-                );
-            }
-        }
-        if let Some(refresh_token_hash) = refresh_token_hash
-            .as_deref()
-            .filter(|_| existing_refresh_token_hash.is_none())
-        {
-            let conflicting_id: Option<i64> = sqlx::query_scalar(
-                r#"
-                    SELECT id
-                    FROM credentials
-                    WHERE deleted_at IS NULL
-                      AND id <> $1
-                      AND refresh_token_hash = $2
-                    LIMIT 1
-                    "#,
-            )
-            .bind(credential_id)
-            .bind(refresh_token_hash)
-            .fetch_optional(&mut **tx)
-            .await?;
-            if let Some(conflicting_id) = conflicting_id {
-                anyhow::bail!(
-                    "凭据 #{} 与 #{} 的 refreshToken 重复，无法回填 hash",
-                    credential_id,
-                    conflicting_id
-                );
-            }
-        }
-
-        sqlx::query(
-            r#"
-            UPDATE credentials
-            SET auth_kind = $2,
-                api_key_hash = COALESCE(credentials.api_key_hash, $3),
-                refresh_token_hash = COALESCE(credentials.refresh_token_hash, $4)
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(credential_id)
-        .bind(auth_kind)
-        .bind(api_key_hash)
-        .bind(refresh_token_hash)
-        .execute(&mut **tx)
-        .await
-        .map_err(duplicate_credential_message)?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CredentialStatsRow {
-    pub success_count: u64,
-    pub selection_count: u64,
-    pub last_used_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CredentialStatsDeltaRow {
-    pub success_delta: u64,
-    pub selection_delta: u64,
-    pub last_used_at: Option<String>,
-}
-
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct CredentialRefreshFieldsPatch {
-    pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
-    pub profile_arn: Option<String>,
-    pub expires_at: Option<String>,
-    pub scopes: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-#[must_use = "credential upsert CAS conflicts must be handled explicitly"]
-pub enum CredentialUpsertCasOutcome {
-    Applied(KiroCredentials),
-    Conflict { current: KiroCredentials },
-}
-
-#[derive(Debug, Clone)]
-#[must_use = "credential/runtime CAS conflicts must be handled explicitly"]
-pub enum CredentialWithRuntimePatchCasOutcome {
-    Applied {
-        credential: KiroCredentials,
-        runtime: CredentialRuntimeStateMutationResult,
-    },
-    Conflict {
-        current: KiroCredentials,
-    },
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct CredentialRefreshExpectedContext {
-    refresh_token_hash: String,
-    access_token: Option<String>,
-    auth_method: Option<String>,
-    provider: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    token_endpoint: Option<String>,
-    scopes: Option<String>,
-}
-
-impl CredentialRefreshExpectedContext {
-    pub fn from_credentials(credentials: &KiroCredentials) -> anyhow::Result<Self> {
-        let mut credentials = credentials.clone();
-        credentials.canonicalize_auth_method();
-        let refresh_token = credentials
-            .refresh_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("凭据 refreshToken CAS 缺少原 refreshToken"))?;
-        Ok(Self {
-            refresh_token_hash: sha256_hex(refresh_token),
-            access_token: credentials.access_token,
-            auth_method: credentials.auth_method,
-            provider: credentials.provider,
-            client_id: credentials.client_id,
-            client_secret: credentials.client_secret,
-            token_endpoint: credentials.token_endpoint,
-            scopes: credentials.scopes,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-#[must_use = "credential refresh field CAS conflicts must be handled explicitly"]
-pub enum CredentialRefreshFieldsCasOutcome {
-    Applied(KiroCredentials),
-    Conflict { current: Option<KiroCredentials> },
-}
-
-#[derive(Debug, Clone)]
-pub struct CredentialRuntimeStateSnapshot {
-    pub state: CredentialRuntimeStateRow,
-    pub expected_revision: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CredentialRuntimeStateRow {
-    pub failure_count: u32,
-    pub refresh_failure_count: u32,
-    pub disabled_reason: Option<String>,
-    pub warmup_remaining: u32,
-    pub generation: u64,
-    pub revision: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum CredentialRuntimeDisabledReasonPatch {
-    #[default]
-    Preserve,
-    Set(String),
-    Clear,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CredentialRuntimeStatePatch {
-    pub failure_count: Option<u32>,
-    pub refresh_failure_count: Option<u32>,
-    pub disabled_reason: CredentialRuntimeDisabledReasonPatch,
-    pub warmup_remaining: Option<u32>,
-    pub credential_disabled: Option<bool>,
-    pub last_used_at: Option<String>,
-    pub expected_generation: Option<u64>,
-    pub advance_generation: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CredentialRuntimeFailureCounts {
-    pub failure_count: Option<u32>,
-    pub refresh_failure_count: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialRuntimeStateMutationResult {
-    pub state: CredentialRuntimeStateRow,
-    pub credential_disabled: bool,
-    pub applied: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "credential runtime CAS conflicts must be handled explicitly"]
-pub enum CredentialRuntimeStateCasOutcome {
-    Applied(CredentialRuntimeStateRow),
-    Conflict {
-        current: Option<CredentialRuntimeStateRow>,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CredentialAccountInfoRow {
-    pub subscription_title: Option<String>,
-    pub current_usage: f64,
-    pub usage_limit: f64,
-    pub remaining: f64,
-    pub usage_percentage: f64,
-    pub credit_limit: f64,
-    pub credit_remaining: f64,
-    pub credit_base: f64,
-    pub credit_bonus: f64,
-    pub overage_status: Option<String>,
-    pub overage_capability: Option<String>,
-    pub overage_cap: f64,
-    pub overage_rate: f64,
-    pub current_overages: f64,
-    pub next_reset_at: Option<f64>,
-    pub checked_at: String,
-}
-
-/// Usage figures of an account-info snapshot, used to detect quota transitions.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AccountQuotaFigures {
-    pub current_usage: f64,
-    pub usage_limit: f64,
-    pub current_overages: f64,
 }
 
 /// A request API key's usage in limit units, read from the usage rollups.
@@ -6484,8 +3173,6 @@ impl PostgresUsageStore {
         let dimensions = vec![
             "global".to_string(),
             "external_pool".to_string(),
-            "external_reason".to_string(),
-            "local_route".to_string(),
             "credential".to_string(),
             "model".to_string(),
             "endpoint".to_string(),
@@ -6515,7 +3202,7 @@ impl PostgresUsageStore {
                     THEN total_original_cost_usd
                     ELSE COALESCE(total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
-                total_kiro_metering_usage,
+
                 priced_requests,
                 unpriced_requests,
                 duration_ms_sum,
@@ -6541,54 +3228,6 @@ impl PostgresUsageStore {
         .fetch_all(&mut *tx)
         .await?;
 
-        let local_endpoint_rows = sqlx::query(
-            r#"
-            SELECT
-                COALESCE(NULLIF(BTRIM(endpoint), ''), 'unknown') AS dimension_key,
-                COUNT(*)::bigint AS requests,
-                COUNT(*) FILTER (WHERE status = 'success')::bigint AS success_requests,
-                COUNT(*) FILTER (WHERE status <> 'success')::bigint AS error_requests,
-                COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(compat_input_tokens), 0)::bigint AS total_compat_input_tokens,
-                COALESCE(SUM(output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(cache_read_input_tokens), 0)::bigint
-                    AS total_cache_read_input_tokens,
-                COALESCE(SUM(cache_creation_input_tokens), 0)::bigint
-                    AS total_cache_creation_input_tokens,
-                COALESCE(SUM(estimated_cost_usd), 0)::double precision
-                    AS total_estimated_cost_usd,
-                COALESCE(SUM(
-                    CASE
-                        WHEN COALESCE(original_cost_usd, 0) <> 0
-                        THEN original_cost_usd
-                        ELSE COALESCE(estimated_cost_usd, 0)
-                    END
-                ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage,
-                COUNT(*) FILTER (WHERE pricing_available)::bigint AS priced_requests,
-                COUNT(*) FILTER (WHERE NOT pricing_available)::bigint AS unpriced_requests,
-                COALESCE(SUM(duration_ms), 0)::bigint AS duration_ms_sum,
-                COUNT(*)::bigint AS duration_ms_count,
-                0::bigint AS external_pool_cost_floor_applied_requests
-            FROM usage_records
-            WHERE deleted_at IS NULL
-              AND rollup_active
-              AND created_at >= $1
-              AND created_at < $2
-              AND credential_id IS NOT NULL
-              AND COALESCE(NULLIF(data->>'routeKind', ''), 'local_credential') = 'local_credential'
-            GROUP BY COALESCE(NULLIF(BTRIM(endpoint), ''), 'unknown')
-            ORDER BY total_kiro_metering_usage DESC,
-                     total_estimated_cost_usd DESC,
-                     requests DESC,
-                     dimension_key ASC
-            "#,
-        )
-        .bind(spec.from)
-        .bind(spec.to)
-        .fetch_all(&mut *tx)
-        .await?;
         tx.commit().await?;
 
         let mut all = OverviewAccumulator::default();
@@ -6659,37 +3298,7 @@ impl PostgresUsageStore {
                         pool.label = Some(label.to_string());
                     }
                 }
-                "local_route" => {
-                    series
-                        .entry(series_key)
-                        .or_default()
-                        .local_routes
-                        .entry(dimension_key.clone())
-                        .or_default()
-                        .add(metrics, OverviewExternalCosts::default());
-                    series_groups.local_routes.add(
-                        &dimension_key,
-                        dimension_label.as_deref(),
-                        metrics.kiro_metering_usage,
-                        metrics.requests,
-                    );
-                }
-                "external_reason" => {
-                    let costs = OverviewExternalCosts::from_row(&row)?;
-                    series
-                        .entry(series_key)
-                        .or_default()
-                        .external_reasons
-                        .entry(dimension_key.clone())
-                        .or_default()
-                        .add(metrics, costs);
-                    series_groups.external_reasons.add(
-                        &dimension_key,
-                        Some(usage_external_reason_label(&dimension_key)),
-                        metrics.requests as f64,
-                        metrics.requests,
-                    );
-                }
+
                 "credential" => {
                     let account = accounts.entry(dimension_key.clone()).or_default();
                     account.add(metrics);
@@ -6732,7 +3341,6 @@ impl PostgresUsageStore {
         let series_groups = series_groups.finish();
         let series_points = overview_series_points(spec, series, &series_groups);
         let external_metrics = external.to_metrics();
-        let local_metrics = all.subtract(&external);
 
         let cost_floor_applied_requests = pools
             .values()
@@ -6792,41 +3400,6 @@ impl PostgresUsageStore {
                 .then_with(|| right.metrics.requests.cmp(&left.metrics.requests))
                 .then_with(|| left.credential_id.cmp(&right.credential_id))
         });
-        let accounts_total = account_rows.len();
-        let active_accounts = accounts_total;
-        let mut route_rows = local_endpoint_rows
-            .into_iter()
-            .map(|row| {
-                let key: String = row.try_get("dimension_key")?;
-                let label = if key == "unknown" {
-                    "未记录路径".to_string()
-                } else {
-                    key.clone()
-                };
-                Ok(UsageOverviewRouteRow {
-                    label,
-                    key,
-                    metrics: OverviewAccumulator::from_row(&row)?.to_metrics(),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|row| row.metrics.requests > 0)
-            .collect::<Vec<_>>();
-        route_rows.sort_by(|left, right| {
-            right
-                .metrics
-                .kiro_metering_usage
-                .total_cmp(&left.metrics.kiro_metering_usage)
-                .then_with(|| {
-                    right
-                        .metrics
-                        .estimated_cost_usd
-                        .total_cmp(&left.metrics.estimated_cost_usd)
-                })
-                .then_with(|| right.metrics.requests.cmp(&left.metrics.requests))
-                .then_with(|| left.key.cmp(&right.key))
-        });
         let mut top_accounts = account_rows
             .iter()
             .map(|row| UsageOverviewRankRow {
@@ -6876,7 +3449,6 @@ impl PostgresUsageStore {
             },
             totals: UsageOverviewTotals {
                 all: all.to_metrics(),
-                local: local_metrics.to_metrics(),
                 external: external_metrics,
             },
             external: UsageOverviewExternal {
@@ -6889,12 +3461,6 @@ impl PostgresUsageStore {
                 cost_floor_delta_usd: pool_rows.iter().map(|pool| pool.cost_floor_delta_usd).sum(),
                 cost_floor_applied_requests,
                 pools: pool_rows,
-            },
-            local: UsageOverviewLocal {
-                active_accounts,
-                accounts_total,
-                accounts: account_rows,
-                routes: route_rows,
             },
             series: series_points,
             series_groups,
@@ -6929,49 +3495,6 @@ impl PostgresUsageStore {
         let mut records = self
             .load_matching(query, offset, limit.saturating_add(1))
             .await?;
-        let has_next = records.len() > limit;
-        if has_next {
-            records.truncate(limit);
-        }
-        Ok(UsageRecordsPageResult {
-            page,
-            limit,
-            has_next,
-            records,
-        })
-    }
-
-    pub async fn query_credential_error_page(
-        &self,
-        credential_id: u64,
-        page: usize,
-        limit: usize,
-    ) -> anyhow::Result<UsageRecordsPageResult> {
-        let page = page.max(1);
-        let limit = normalize_page_limit(limit);
-        let offset = page.saturating_sub(1).saturating_mul(limit);
-        let credential_id = credential_id as i64;
-        let mut builder = QueryBuilder::<Postgres>::new(
-            "SELECT data FROM usage_records WHERE deleted_at IS NULL AND ((status <> 'success' AND credential_id = ",
-        );
-        builder.push_bind(credential_id);
-        builder.push(
-            ") OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(data->'credentialAttempts', '[]'::jsonb)) AS attempt WHERE CASE WHEN (attempt->>'credentialId') ~ '^[0-9]+$' THEN (attempt->>'credentialId')::bigint END = ",
-        );
-        builder.push_bind(credential_id);
-        builder.push(" AND COALESCE(attempt->>'action', '') <> 'success')) ORDER BY created_at DESC, id DESC OFFSET ");
-        builder.push_bind(usize_to_i64(offset));
-        builder.push(" LIMIT ");
-        builder.push_bind(usize_to_i64(limit.saturating_add(1)));
-
-        let rows = builder.build().fetch_all(self.store.pool()).await?;
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            let value: serde_json::Value = row.try_get("data")?;
-            let mut record: UsageRecord = serde_json::from_value(value)?;
-            apply_usage_record_legacy_cost_compatibility(&mut record);
-            records.push(record);
-        }
         let has_next = records.len() > limit;
         if has_next {
             records.truncate(limit);
@@ -7434,7 +3957,6 @@ impl PostgresUsageStore {
         configure_usage_cleanup_transaction(&mut tx).await?;
         acquire_usage_writer_commit_guard(&mut tx).await?;
         for statement in [
-            "TRUNCATE TABLE usage_credential_cost_summary",
             "TRUNCATE TABLE usage_duration_rollup_time_buckets",
             "TRUNCATE TABLE usage_cache_read_rollup_time_buckets",
             "TRUNCATE TABLE usage_cache_read_totals",
@@ -7499,8 +4021,8 @@ impl PostgresUsageStore {
                     THEN t.total_original_cost_usd
                     ELSE COALESCE(t.total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
-                COALESCE(t.total_kiro_metering_usage, 0)::double precision
-                    AS total_kiro_metering_usage,
+
+
                 COALESCE(t.priced_requests, 0)::bigint AS priced_requests,
                 COALESCE(t.unpriced_requests, 0)::bigint AS unpriced_requests,
                 COALESCE(t.local_prompt_cache_requests, 0)::bigint AS local_prompt_cache_requests,
@@ -7552,7 +4074,7 @@ impl PostgresUsageStore {
                      t.total_input_tokens, t.total_output_tokens,
                      t.total_cache_read_input_tokens, t.total_cache_creation_input_tokens,
                      t.total_estimated_cost_usd, t.total_original_cost_usd,
-                     t.total_kiro_metering_usage, t.priced_requests, t.unpriced_requests,
+                     t.priced_requests, t.unpriced_requests,
                      t.local_prompt_cache_requests, t.local_prompt_cache_input_tokens,
                      t.local_prompt_cache_read_input_tokens,
                      t.local_prompt_cache_creation_input_tokens,
@@ -7581,7 +4103,7 @@ impl PostgresUsageStore {
             total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-            total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             local_prompt_cache_requests: row_i64_to_usize(&row, "local_prompt_cache_requests")?,
@@ -7617,7 +4139,7 @@ impl PostgresUsageStore {
                 row.try_get("realtime_output_tokens")?,
                 row.try_get("realtime_billable_input_tokens")?,
             ),
-            top_credentials: self.top_credential_aggregates().await?,
+            top_credentials: Vec::new(),
             top_conversations: self.top_conversation_aggregates().await?,
         })
     }
@@ -7771,215 +4293,6 @@ impl PostgresUsageStore {
                 errors_order_by: "error_requests".to_string(),
             },
         ))
-    }
-
-    /// Read all credential usage aggregates for one dashboard window.
-    ///
-    /// The query is rollup-first and only scans the two partial boundary hours
-    /// from `usage_records`, matching the existing dashboard aggregation rules.
-    /// It is read-only and never touches credential runtime state.
-    pub async fn dashboard_credential_aggregates_for_window(
-        &self,
-        timezone: Option<&str>,
-        window_key: &str,
-        credential_ids: &[u64],
-    ) -> anyhow::Result<(
-        String,
-        String,
-        String,
-        Vec<UsageDashboardCredentialAggregate>,
-    )> {
-        let now = Utc::now();
-        let (timezone, offset) = usage_dashboard_timezone(timezone);
-        let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
-        let specs = [window_spec.clone()];
-        if credential_ids.is_empty() {
-            return Ok((now.to_rfc3339(), timezone, window_spec.key, Vec::new()));
-        }
-        let credential_keys: Vec<String> = credential_ids.iter().map(|id| id.to_string()).collect();
-        let credential_ids_i64: Vec<i64> = credential_ids
-            .iter()
-            .filter_map(|id| i64::try_from(*id).ok())
-            .collect();
-
-        let mut builder = QueryBuilder::<Postgres>::new("");
-        push_dashboard_windows_cte(&mut builder, &specs);
-        builder.push(
-            r#", window_credential_segments AS (
-            SELECT
-                b.dimension_key AS credential_key,
-                b.requests,
-                b.error_requests,
-                b.total_input_tokens,
-                b.total_output_tokens,
-                b.total_estimated_cost_usd,
-                CASE
-                    WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
-                    THEN b.total_original_cost_usd
-                    ELSE COALESCE(b.total_estimated_cost_usd, 0)
-                END::double precision AS total_original_cost_usd,
-                b.total_kiro_metering_usage,
-                b.priced_requests,
-                b.unpriced_requests
-            FROM window_bounds w
-            JOIN usage_rollup_time_buckets b
-              ON b.dimension = 'credential'
-             AND b.dimension_key = ANY(
-            "#,
-        );
-        builder.push_bind(&credential_keys);
-        builder.push(
-            r#"::text[])
-             AND b.bucket_start >= w.full_from_at
-             AND b.bucket_start < w.full_to_at
-            UNION ALL
-            SELECT
-                r.credential_id::text AS credential_key,
-                COUNT(*)::bigint AS requests,
-                COUNT(*) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
-                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision
-                    AS total_estimated_cost_usd,
-                COALESCE(SUM(
-                    CASE
-                        WHEN COALESCE(r.original_cost_usd, 0) <> 0
-                        THEN r.original_cost_usd
-                        ELSE COALESCE(r.estimated_cost_usd, 0)
-                    END
-                ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(r.kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage,
-                COUNT(*) FILTER (WHERE r.pricing_available)::bigint AS priced_requests,
-                COUNT(*) FILTER (WHERE NOT r.pricing_available)::bigint AS unpriced_requests
-            FROM window_boundary_records r
-            WHERE r.credential_id IS NOT NULL
-              AND r.credential_id = ANY(
-            "#,
-        );
-        builder.push_bind(&credential_ids_i64);
-        builder.push(
-            r#"::bigint[])
-            GROUP BY r.credential_id
-            ), window_credential_totals AS (
-            SELECT
-                credential_key,
-                SUM(requests)::bigint AS requests,
-                SUM(error_requests)::bigint AS error_requests,
-                SUM(total_input_tokens)::bigint AS total_input_tokens,
-                SUM(total_output_tokens)::bigint AS total_output_tokens,
-                SUM(total_estimated_cost_usd)::double precision AS total_estimated_cost_usd,
-                SUM(total_original_cost_usd)::double precision AS total_original_cost_usd,
-                SUM(total_kiro_metering_usage)::double precision AS total_kiro_metering_usage,
-                SUM(priced_requests)::bigint AS priced_requests,
-                SUM(unpriced_requests)::bigint AS unpriced_requests
-            FROM window_credential_segments
-            GROUP BY credential_key
-            ), lifetime_credentials AS (
-            SELECT
-                dimension_key,
-                requests,
-                error_requests,
-                total_input_tokens,
-                total_output_tokens,
-                total_estimated_cost_usd,
-                total_original_cost_usd,
-                total_kiro_metering_usage,
-                priced_requests,
-                unpriced_requests
-            FROM usage_rollup_totals
-            WHERE dimension = 'credential'
-              AND dimension_key = ANY(
-            "#,
-        );
-        builder.push_bind(&credential_keys);
-        builder.push(
-            r#"::text[])
-            )
-            SELECT
-                COALESCE(window_credential_totals.credential_key, lifetime.dimension_key)
-                    AS credential_id,
-                COALESCE(window_credential_totals.requests, 0)::bigint AS window_requests,
-                COALESCE(window_credential_totals.error_requests, 0)::bigint
-                    AS window_error_requests,
-                COALESCE(window_credential_totals.total_input_tokens, 0)::bigint
-                    AS window_total_input_tokens,
-                COALESCE(window_credential_totals.total_output_tokens, 0)::bigint
-                    AS window_total_output_tokens,
-                COALESCE(window_credential_totals.total_estimated_cost_usd, 0)::double precision
-                    AS window_estimated_cost_usd,
-                COALESCE(window_credential_totals.total_original_cost_usd, 0)::double precision
-                    AS window_original_cost_usd,
-                COALESCE(window_credential_totals.total_kiro_metering_usage, 0)::double precision
-                    AS window_kiro_metering_usage,
-                COALESCE(window_credential_totals.priced_requests, 0)::bigint
-                    AS window_priced_requests,
-                COALESCE(window_credential_totals.unpriced_requests, 0)::bigint
-                    AS window_unpriced_requests,
-                COALESCE(lifetime.requests, 0)::bigint AS lifetime_requests,
-                COALESCE(lifetime.error_requests, 0)::bigint AS lifetime_error_requests,
-                COALESCE(lifetime.total_input_tokens, 0)::bigint
-                    AS lifetime_total_input_tokens,
-                COALESCE(lifetime.total_output_tokens, 0)::bigint
-                    AS lifetime_total_output_tokens,
-                COALESCE(lifetime.total_estimated_cost_usd, 0)::double precision
-                    AS lifetime_estimated_cost_usd,
-                COALESCE(
-                    CASE
-                        WHEN COALESCE(lifetime.total_original_cost_usd, 0) <> 0
-                        THEN lifetime.total_original_cost_usd
-                        ELSE lifetime.total_estimated_cost_usd
-                    END,
-                    0
-                )::double precision AS lifetime_original_cost_usd,
-                COALESCE(lifetime.total_kiro_metering_usage, 0)::double precision
-                    AS lifetime_kiro_metering_usage,
-                COALESCE(lifetime.priced_requests, 0)::bigint AS lifetime_priced_requests,
-                COALESCE(lifetime.unpriced_requests, 0)::bigint AS lifetime_unpriced_requests
-            FROM lifetime_credentials lifetime
-            FULL OUTER JOIN window_credential_totals
-              ON window_credential_totals.credential_key = lifetime.dimension_key
-            WHERE window_credential_totals.credential_key IS NOT NULL
-               OR lifetime.dimension_key IS NOT NULL
-            ORDER BY credential_id
-            "#,
-        );
-
-        let mut tx = self.store.pool().begin().await?;
-        configure_usage_dashboard_read_transaction(&mut tx).await?;
-        let rows = builder.build().fetch_all(&mut *tx).await?;
-        tx.commit().await?;
-
-        let mut aggregates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: String = row.try_get("credential_id")?;
-            let Ok(credential_id) = credential_id.parse::<u64>() else {
-                continue;
-            };
-            aggregates.push(UsageDashboardCredentialAggregate {
-                credential_id,
-                window_requests: row_i64_to_usize(&row, "window_requests")?,
-                window_error_requests: row_i64_to_usize(&row, "window_error_requests")?,
-                window_total_input_tokens: row.try_get("window_total_input_tokens")?,
-                window_total_output_tokens: row.try_get("window_total_output_tokens")?,
-                window_estimated_cost_usd: row.try_get("window_estimated_cost_usd")?,
-                window_original_cost_usd: row.try_get("window_original_cost_usd")?,
-                window_kiro_metering_usage: row.try_get("window_kiro_metering_usage")?,
-                window_priced_requests: row_i64_to_usize(&row, "window_priced_requests")?,
-                window_unpriced_requests: row_i64_to_usize(&row, "window_unpriced_requests")?,
-                lifetime_requests: row_i64_to_usize(&row, "lifetime_requests")?,
-                lifetime_error_requests: row_i64_to_usize(&row, "lifetime_error_requests")?,
-                lifetime_total_input_tokens: row.try_get("lifetime_total_input_tokens")?,
-                lifetime_total_output_tokens: row.try_get("lifetime_total_output_tokens")?,
-                lifetime_estimated_cost_usd: row.try_get("lifetime_estimated_cost_usd")?,
-                lifetime_original_cost_usd: row.try_get("lifetime_original_cost_usd")?,
-                lifetime_kiro_metering_usage: row.try_get("lifetime_kiro_metering_usage")?,
-                lifetime_priced_requests: row_i64_to_usize(&row, "lifetime_priced_requests")?,
-                lifetime_unpriced_requests: row_i64_to_usize(&row, "lifetime_unpriced_requests")?,
-            });
-        }
-
-        Ok((now.to_rfc3339(), timezone, window_spec.key, aggregates))
     }
 
     pub async fn dashboard_breakdown_only(
@@ -8173,8 +4486,6 @@ impl PostgresUsageStore {
                         ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(s.total_kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage,
                 COALESCE(SUM(s.priced_requests), 0)::bigint AS priced_requests,
                 COALESCE(SUM(s.unpriced_requests), 0)::bigint AS unpriced_requests,
                 CASE
@@ -8183,8 +4494,8 @@ impl PostgresUsageStore {
                          / SUM(s.duration_ms_count)::double precision
                     ELSE 0
                 END AS average_duration_ms,
-                COALESCE(SUM(s.sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
-                COALESCE(SUM(s.fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
+
+
                 COALESCE(SUM(s.simulated_requests), 0)::bigint AS simulated_requests,
                 COALESCE(SUM(s.upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
                 COALESCE(SUM(s.external_pool_requests), 0)::bigint AS external_pool_requests,
@@ -8316,13 +4627,13 @@ impl PostgresUsageStore {
                 r.total_cache_creation_input_tokens,
                 r.total_estimated_cost_usd,
                 r.total_original_cost_usd,
-                r.total_kiro_metering_usage,
+
                 r.priced_requests,
                 r.unpriced_requests,
                 r.average_duration_ms,
                 COALESCE(p.p95_duration_ms, 0)::bigint AS p95_duration_ms,
-                r.sticky_bound_requests,
-                r.fallback_from_sticky_requests,
+
+
                 r.simulated_requests,
                 r.upstream_metadata_requests,
                 r.external_pool_requests,
@@ -8534,9 +4845,7 @@ impl PostgresUsageStore {
                         THEN s.total_original_cost_usd
                         ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
-                ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(s.total_kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage
+                ), 0)::double precision AS total_original_cost_usd
             FROM window_bounds w
             LEFT JOIN dashboard_global_segments s ON s.window_key = w.key
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
@@ -8668,8 +4977,8 @@ impl PostgresUsageStore {
                     THEN total_original_cost_usd
                     ELSE COALESCE(total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
-                COALESCE(total_kiro_metering_usage, 0)::double precision
-                    AS total_kiro_metering_usage,
+
+
                 COUNT(*) OVER()::bigint AS total_dimension_count
             FROM usage_rollup_totals
             WHERE dimension = "#,
@@ -8733,9 +5042,7 @@ impl PostgresUsageStore {
                     WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
                     THEN b.total_original_cost_usd
                     ELSE COALESCE(b.total_estimated_cost_usd, 0)
-                END::double precision AS total_original_cost_usd,
-                COALESCE(b.total_kiro_metering_usage, 0)::double precision
-                    AS total_kiro_metering_usage
+                END::double precision AS total_original_cost_usd
             FROM window_bounds w
             JOIN usage_rollup_time_buckets b
               ON b.dimension = "#,
@@ -8773,8 +5080,6 @@ impl PostgresUsageStore {
                         ELSE COALESCE(r.estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(r.kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage
             FROM window_boundary_records r
             "#,
         );
@@ -8801,8 +5106,6 @@ impl PostgresUsageStore {
                 SUM(total_cache_creation_input_tokens)::bigint AS total_cache_creation_input_tokens,
                 SUM(total_estimated_cost_usd)::double precision AS total_estimated_cost_usd,
                 SUM(total_original_cost_usd)::double precision AS total_original_cost_usd,
-                SUM(total_kiro_metering_usage)::double precision
-                    AS total_kiro_metering_usage
             FROM top_metric_segments
             GROUP BY item_key
             )
@@ -8818,7 +5121,7 @@ impl PostgresUsageStore {
                 total_cache_creation_input_tokens,
                 total_estimated_cost_usd,
                 total_original_cost_usd,
-                total_kiro_metering_usage,
+
                 COUNT(*) OVER()::bigint AS total_dimension_count
             FROM top_metric_totals
             WHERE requests > 0
@@ -8853,118 +5156,6 @@ impl PostgresUsageStore {
             .map(usage_top_aggregate_from_row)
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(DashboardTopAggregateResult { items, total })
-    }
-
-    pub async fn credential_cost_summary(
-        &self,
-    ) -> anyhow::Result<HashMap<u64, CredentialCostSummary>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                credential_id,
-                estimated_cost_usd,
-                CASE
-                    WHEN COALESCE(original_cost_usd, 0) <> 0
-                    THEN original_cost_usd
-                    ELSE COALESCE(estimated_cost_usd, 0)
-                END::double precision AS original_cost_usd,
-                kiro_metering_usage,
-                priced_requests,
-                unpriced_requests
-            FROM usage_credential_cost_summary
-            WHERE requests > 0
-            "#,
-        )
-        .fetch_all(self.store.pool())
-        .await?;
-
-        let mut summaries = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            summaries.insert(
-                credential_id as u64,
-                CredentialCostSummary {
-                    estimated_cost_usd: row.try_get("estimated_cost_usd")?,
-                    original_cost_usd: row.try_get("original_cost_usd")?,
-                    kiro_metering_usage: row.try_get("kiro_metering_usage")?,
-                    priced_requests: row_i64_to_usize(&row, "priced_requests")?,
-                    unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
-                },
-            );
-        }
-        Ok(summaries)
-    }
-
-    pub async fn credential_cost_summary_for_ids(
-        &self,
-        ids: &[u64],
-    ) -> anyhow::Result<HashMap<u64, CredentialCostSummary>> {
-        if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let credential_ids: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                credential_id,
-                estimated_cost_usd,
-                CASE
-                    WHEN COALESCE(original_cost_usd, 0) <> 0
-                    THEN original_cost_usd
-                    ELSE COALESCE(estimated_cost_usd, 0)
-                END::double precision AS original_cost_usd,
-                kiro_metering_usage,
-                priced_requests,
-                unpriced_requests
-            FROM usage_credential_cost_summary
-            WHERE requests > 0 AND credential_id = ANY($1)
-            "#,
-        )
-        .bind(&credential_ids)
-        .fetch_all(self.store.pool())
-        .await?;
-
-        let mut summaries = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            summaries.insert(
-                credential_id as u64,
-                CredentialCostSummary {
-                    estimated_cost_usd: row.try_get("estimated_cost_usd")?,
-                    original_cost_usd: row.try_get("original_cost_usd")?,
-                    kiro_metering_usage: row.try_get("kiro_metering_usage")?,
-                    priced_requests: row_i64_to_usize(&row, "priced_requests")?,
-                    unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
-                },
-            );
-        }
-        Ok(summaries)
-    }
-
-    async fn top_credential_aggregates(&self) -> anyhow::Result<Vec<UsageAggregate>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                dimension_key AS key,
-                NULLIF(dimension_label, '') AS label,
-                requests,
-                total_cache_read_input_tokens AS cache_read_input_tokens,
-                total_cache_creation_input_tokens AS cache_creation_input_tokens,
-                total_estimated_cost_usd AS estimated_cost_usd,
-                CASE
-                    WHEN COALESCE(total_original_cost_usd, 0) <> 0
-                    THEN total_original_cost_usd
-                    ELSE COALESCE(total_estimated_cost_usd, 0)
-                END AS original_cost_usd
-            FROM usage_rollup_totals
-            WHERE dimension = 'credential' AND requests > 0
-            ORDER BY estimated_cost_usd DESC, requests DESC, cache_read_input_tokens DESC
-            LIMIT 10
-            "#,
-        )
-        .fetch_all(self.store.pool())
-        .await?;
-        rows.into_iter().map(usage_aggregate_from_row).collect()
     }
 
     async fn top_conversation_aggregates(&self) -> anyhow::Result<Vec<UsageAggregate>> {
@@ -9836,8 +6027,8 @@ async fn upsert_usage_record_in_tx(
             credential_label, status, usage_source, total_input_tokens, compat_input_tokens,
             billable_input_tokens, output_tokens, cache_read_input_tokens,
             cache_creation_input_tokens, cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens, estimated_cost_usd, original_cost_usd, kiro_metering_usage,
-            pricing_available, pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
+            cache_creation_1h_input_tokens, estimated_cost_usd, original_cost_usd,
+            pricing_available, pricing_model, duration_ms, simulated,
             error_type, error_message, error_detail, data
         )
         SELECT
@@ -9872,13 +6063,13 @@ async fn upsert_usage_record_in_tx(
             cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
             estimated_cost_usd = EXCLUDED.estimated_cost_usd,
             original_cost_usd = EXCLUDED.original_cost_usd,
-            kiro_metering_usage = EXCLUDED.kiro_metering_usage,
+
             pricing_available = EXCLUDED.pricing_available,
             pricing_model = EXCLUDED.pricing_model,
             duration_ms = EXCLUDED.duration_ms,
             simulated = EXCLUDED.simulated,
-            sticky_bound = EXCLUDED.sticky_bound,
-            fallback_from_sticky = EXCLUDED.fallback_from_sticky,
+
+
             error_type = EXCLUDED.error_type,
             error_message = EXCLUDED.error_message,
             error_detail = EXCLUDED.error_detail,
@@ -9909,13 +6100,10 @@ async fn upsert_usage_record_in_tx(
     .bind(record.cache_creation_1h_input_tokens)
     .bind(record.estimated_cost_usd)
     .bind(record.original_cost_usd)
-    .bind(record.kiro_metering_usage)
     .bind(record.pricing_available)
     .bind(&record.pricing_model)
     .bind(u64_to_i64(record.duration_ms))
     .bind(record.simulated)
-    .bind(record.sticky_bound)
-    .bind(record.fallback_from_sticky)
     .bind(&record.error_type)
     .bind(&record.error_message)
     .bind(&record.error_detail)
@@ -10193,8 +6381,7 @@ struct UsageRollupMetrics {
     local_prompt_cache_requests: i64,
     simulated_requests: i64,
     upstream_metadata_requests: i64,
-    sticky_bound_requests: i64,
-    fallback_from_sticky_requests: i64,
+
     total_input_tokens: i64,
     billable_input_tokens: i64,
     /// Uncached input as reported downstream (Anthropic `input_tokens`); the
@@ -10208,7 +6395,7 @@ struct UsageRollupMetrics {
     local_prompt_cache_creation_input_tokens: i64,
     total_estimated_cost_usd: f64,
     total_original_cost_usd: f64,
-    total_kiro_metering_usage: f64,
+
     external_pool_requests: i64,
     external_pool_priced_requests: i64,
     external_pool_unpriced_requests: i64,
@@ -10246,8 +6433,7 @@ impl UsageRollupMetrics {
             local_prompt_cache_requests: signed_bool(local_prompt_cache, sign),
             simulated_requests: signed_bool(record.simulated, sign),
             upstream_metadata_requests: signed_bool(upstream_metadata, sign),
-            sticky_bound_requests: signed_bool(record.sticky_bound, sign),
-            fallback_from_sticky_requests: signed_bool(record.fallback_from_sticky, sign),
+
             total_input_tokens: signed_i32(record.total_input_tokens, sign),
             billable_input_tokens: signed_i32(record.billable_input_tokens, sign),
             total_compat_input_tokens: signed_i32(record.compat_input_tokens, sign),
@@ -10271,7 +6457,7 @@ impl UsageRollupMetrics {
             },
             total_estimated_cost_usd: record.estimated_cost_usd * sign as f64,
             total_original_cost_usd: record.original_cost_usd * sign as f64,
-            total_kiro_metering_usage: record.kiro_metering_usage * sign as f64,
+
             external_pool_requests: signed_bool(external_pool, sign),
             external_pool_priced_requests: signed_bool(external_priced, sign),
             external_pool_unpriced_requests: signed_bool(external_pool && !external_priced, sign),
@@ -10321,8 +6507,6 @@ impl UsageRollupMetrics {
         self.local_prompt_cache_requests += other.local_prompt_cache_requests;
         self.simulated_requests += other.simulated_requests;
         self.upstream_metadata_requests += other.upstream_metadata_requests;
-        self.sticky_bound_requests += other.sticky_bound_requests;
-        self.fallback_from_sticky_requests += other.fallback_from_sticky_requests;
         self.total_input_tokens += other.total_input_tokens;
         self.billable_input_tokens += other.billable_input_tokens;
         self.total_compat_input_tokens += other.total_compat_input_tokens;
@@ -10335,7 +6519,6 @@ impl UsageRollupMetrics {
             other.local_prompt_cache_creation_input_tokens;
         self.total_estimated_cost_usd += other.total_estimated_cost_usd;
         self.total_original_cost_usd += other.total_original_cost_usd;
-        self.total_kiro_metering_usage += other.total_kiro_metering_usage;
         self.external_pool_requests += other.external_pool_requests;
         self.external_pool_priced_requests += other.external_pool_priced_requests;
         self.external_pool_unpriced_requests += other.external_pool_unpriced_requests;
@@ -10377,23 +6560,12 @@ impl UsageRollupAggregate {
 }
 
 #[derive(Default)]
-struct CredentialUsageSummaryDelta {
-    requests: i64,
-    estimated_cost_usd: f64,
-    original_cost_usd: f64,
-    kiro_metering_usage: f64,
-    priced_requests: i64,
-    unpriced_requests: i64,
-}
-
-#[derive(Default)]
 struct UsageRollupBatchDelta {
     totals: HashMap<(&'static str, String), UsageRollupAggregate>,
     time_buckets: HashMap<(DateTime<Utc>, &'static str, String), UsageRollupAggregate>,
     cache_read_totals: HashMap<i32, i64>,
     cache_read_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
     duration_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
-    credential_summaries: HashMap<u64, CredentialUsageSummaryDelta>,
     has_negative: bool,
 }
 
@@ -10490,7 +6662,7 @@ impl UsageCompatInputBackfill {
 
 /// Rollup dimensions describing how a request was routed. They were added
 /// after launch, so history needs an explicit rebuild to fill them.
-const USAGE_ROUTE_ROLLUP_DIMENSIONS: [&str; 2] = ["local_route", "external_reason"];
+const USAGE_ROUTE_ROLLUP_DIMENSIONS: [&str; 0] = [];
 
 impl UsageRollupBatchDelta {
     /// Adds only the named dimensions (totals and hour buckets). Used by the
@@ -10544,16 +6716,6 @@ impl UsageRollupBatchDelta {
             .duration_time_buckets
             .entry((bucket_start, record.duration_ms.min(i32::MAX as u64) as i32))
             .or_default() += direction;
-
-        if let Some(credential_id) = record.credential_id {
-            let summary = self.credential_summaries.entry(credential_id).or_default();
-            summary.requests += direction;
-            summary.estimated_cost_usd += record.estimated_cost_usd * direction as f64;
-            summary.original_cost_usd += record.original_cost_usd * direction as f64;
-            summary.kiro_metering_usage += record.kiro_metering_usage * direction as f64;
-            summary.priced_requests += signed_bool(record.pricing_available, direction);
-            summary.unpriced_requests += signed_bool(!record.pricing_available, direction);
-        }
     }
 
     async fn apply(self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
@@ -10563,7 +6725,6 @@ impl UsageRollupBatchDelta {
             cache_read_totals,
             cache_read_time_buckets,
             duration_time_buckets,
-            credential_summaries,
             has_negative,
         } = self;
 
@@ -10580,8 +6741,6 @@ impl UsageRollupBatchDelta {
         cache_read_time_buckets.sort_unstable_by_key(|(key, _)| *key);
         let mut duration_time_buckets = duration_time_buckets.into_iter().collect::<Vec<_>>();
         duration_time_buckets.sort_unstable_by_key(|(key, _)| *key);
-        let mut credential_summaries = credential_summaries.into_iter().collect::<Vec<_>>();
-        credential_summaries.sort_unstable_by_key(|(credential_id, _)| *credential_id);
 
         let (affected_total_dimensions, affected_total_keys): (Vec<_>, Vec<_>) = totals
             .iter()
@@ -10595,10 +6754,6 @@ impl UsageRollupBatchDelta {
                 out.2.push((entry.0).2.clone());
                 out
             });
-        let affected_credentials = credential_summaries
-            .iter()
-            .map(|(credential_id, _)| *credential_id as i64)
-            .collect::<Vec<_>>();
         let affected_cache_reads = cache_read_totals
             .iter()
             .map(|(cache_read, _)| *cache_read)
@@ -10643,9 +6798,6 @@ impl UsageRollupBatchDelta {
         for ((bucket_start, duration_ms), requests) in duration_time_buckets {
             upsert_usage_duration_time_bucket(tx, bucket_start, duration_ms, requests).await?;
         }
-        for (credential_id, delta) in credential_summaries {
-            upsert_credential_usage_summary_delta(tx, credential_id, delta).await?;
-        }
         if has_negative {
             reconcile_usage_rollups_after_negative_delta(
                 tx,
@@ -10654,7 +6806,6 @@ impl UsageRollupBatchDelta {
                 &affected_time_buckets,
                 &affected_time_dimensions,
                 &affected_time_keys,
-                &affected_credentials,
                 &affected_cache_reads,
                 &affected_cache_buckets,
                 &affected_duration_buckets,
@@ -10725,31 +6876,6 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
         });
     }
 
-    if record.route_kind == Some(UsageRouteKind::LocalCredential) {
-        let route_key = record
-            .route_subtype
-            .map(usage_route_subtype_value)
-            .unwrap_or("local_unknown")
-            .to_string();
-        dimensions.push(UsageRollupDimension {
-            dimension: "local_route",
-            label: Some(usage_local_route_label(&route_key)),
-            key: route_key,
-            include_time_bucket: true,
-        });
-    }
-
-    if record.route_kind == Some(UsageRouteKind::ExternalPool) {
-        let reason_key =
-            usage_external_reason_category(record.route_subtype, record.fallback_reason.as_deref());
-        dimensions.push(UsageRollupDimension {
-            dimension: "external_reason",
-            key: reason_key.to_string(),
-            label: Some(usage_external_reason_label(reason_key).to_string()),
-            include_time_bucket: true,
-        });
-    }
-
     if let Some(external_pool_id) = record.external_pool_id {
         dimensions.push(UsageRollupDimension {
             dimension: "external_pool",
@@ -10812,12 +6938,12 @@ async fn upsert_usage_rollup_total(
             dimension, dimension_key, dimension_label, requests, success_requests,
             error_requests, stream_requests, non_stream_requests, priced_requests,
             unpriced_requests, local_prompt_cache_requests, simulated_requests,
-            upstream_metadata_requests, sticky_bound_requests, fallback_from_sticky_requests,
+            upstream_metadata_requests,
             total_input_tokens, billable_input_tokens, total_output_tokens,
             total_cache_read_input_tokens, total_cache_creation_input_tokens,
             local_prompt_cache_input_tokens, local_prompt_cache_read_input_tokens,
             local_prompt_cache_creation_input_tokens, total_estimated_cost_usd,
-            total_original_cost_usd, total_kiro_metering_usage,
+            total_original_cost_usd,
             external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
             external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
             external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -10828,10 +6954,10 @@ async fn upsert_usage_rollup_total(
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20, $21, $22, $23, $24, $25, $26,
-            $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, $39, $40, $41, now()
+            $11, $12, $13, $14, $15, $16,
+            $17, $18, $19, $20, $21, $22, $23,
+            $24, $25, $26, $27, $28, $29, $30, $31,
+            $32, $33, $34, $35, $36, $37, $38, now()
         )
         ON CONFLICT (dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_totals.dimension_label),
@@ -10845,8 +6971,8 @@ async fn upsert_usage_rollup_total(
             local_prompt_cache_requests = usage_rollup_totals.local_prompt_cache_requests + EXCLUDED.local_prompt_cache_requests,
             simulated_requests = usage_rollup_totals.simulated_requests + EXCLUDED.simulated_requests,
             upstream_metadata_requests = usage_rollup_totals.upstream_metadata_requests + EXCLUDED.upstream_metadata_requests,
-            sticky_bound_requests = usage_rollup_totals.sticky_bound_requests + EXCLUDED.sticky_bound_requests,
-            fallback_from_sticky_requests = usage_rollup_totals.fallback_from_sticky_requests + EXCLUDED.fallback_from_sticky_requests,
+
+
             total_input_tokens = usage_rollup_totals.total_input_tokens + EXCLUDED.total_input_tokens,
             billable_input_tokens = usage_rollup_totals.billable_input_tokens + EXCLUDED.billable_input_tokens,
             total_compat_input_tokens = usage_rollup_totals.total_compat_input_tokens + EXCLUDED.total_compat_input_tokens,
@@ -10858,7 +6984,7 @@ async fn upsert_usage_rollup_total(
             local_prompt_cache_creation_input_tokens = usage_rollup_totals.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_totals.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_totals.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
-            total_kiro_metering_usage = usage_rollup_totals.total_kiro_metering_usage + EXCLUDED.total_kiro_metering_usage,
+
             external_pool_requests = usage_rollup_totals.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_totals.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_totals.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -10892,8 +7018,8 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.local_prompt_cache_requests)
     .bind(metrics.simulated_requests)
     .bind(metrics.upstream_metadata_requests)
-    .bind(metrics.sticky_bound_requests)
-    .bind(metrics.fallback_from_sticky_requests)
+
+
     .bind(metrics.total_input_tokens)
     .bind(metrics.billable_input_tokens)
     .bind(metrics.total_output_tokens)
@@ -10904,7 +7030,7 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
-    .bind(metrics.total_kiro_metering_usage)
+
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -10937,12 +7063,11 @@ async fn upsert_usage_rollup_time_bucket(
             bucket_start, dimension, dimension_key, dimension_label, requests,
             success_requests, error_requests, stream_requests, non_stream_requests,
             priced_requests, unpriced_requests, local_prompt_cache_requests,
-            simulated_requests, upstream_metadata_requests, sticky_bound_requests,
-            fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+            simulated_requests, upstream_metadata_requests, total_input_tokens, billable_input_tokens,
             total_output_tokens, total_cache_read_input_tokens,
             total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
             local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-            total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+            total_estimated_cost_usd, total_original_cost_usd,
             external_pool_requests, external_pool_priced_requests,
             external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
             external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
@@ -10953,10 +7078,9 @@ async fn upsert_usage_rollup_time_bucket(
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20, $21, $22, $23, $24, $25, $26,
-            $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, $39, $40, $41, $42, now()
+            $11, $12, $13, $14, $15, $16,
+            $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
+            $32, $33, $34, $35, $36, $37, $38, $39, now()
         )
         ON CONFLICT (bucket_start, dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_time_buckets.dimension_label),
@@ -10970,8 +7094,8 @@ async fn upsert_usage_rollup_time_bucket(
             local_prompt_cache_requests = usage_rollup_time_buckets.local_prompt_cache_requests + EXCLUDED.local_prompt_cache_requests,
             simulated_requests = usage_rollup_time_buckets.simulated_requests + EXCLUDED.simulated_requests,
             upstream_metadata_requests = usage_rollup_time_buckets.upstream_metadata_requests + EXCLUDED.upstream_metadata_requests,
-            sticky_bound_requests = usage_rollup_time_buckets.sticky_bound_requests + EXCLUDED.sticky_bound_requests,
-            fallback_from_sticky_requests = usage_rollup_time_buckets.fallback_from_sticky_requests + EXCLUDED.fallback_from_sticky_requests,
+
+
             total_input_tokens = usage_rollup_time_buckets.total_input_tokens + EXCLUDED.total_input_tokens,
             billable_input_tokens = usage_rollup_time_buckets.billable_input_tokens + EXCLUDED.billable_input_tokens,
             total_compat_input_tokens = usage_rollup_time_buckets.total_compat_input_tokens + EXCLUDED.total_compat_input_tokens,
@@ -10983,7 +7107,7 @@ async fn upsert_usage_rollup_time_bucket(
             local_prompt_cache_creation_input_tokens = usage_rollup_time_buckets.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_time_buckets.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_time_buckets.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
-            total_kiro_metering_usage = usage_rollup_time_buckets.total_kiro_metering_usage + EXCLUDED.total_kiro_metering_usage,
+
             external_pool_requests = usage_rollup_time_buckets.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_time_buckets.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_time_buckets.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -11018,8 +7142,8 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.local_prompt_cache_requests)
     .bind(metrics.simulated_requests)
     .bind(metrics.upstream_metadata_requests)
-    .bind(metrics.sticky_bound_requests)
-    .bind(metrics.fallback_from_sticky_requests)
+
+
     .bind(metrics.total_input_tokens)
     .bind(metrics.billable_input_tokens)
     .bind(metrics.total_output_tokens)
@@ -11030,7 +7154,7 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
-    .bind(metrics.total_kiro_metering_usage)
+
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -11129,7 +7253,6 @@ async fn reconcile_usage_rollups_after_negative_delta(
     affected_time_buckets: &[DateTime<Utc>],
     affected_time_dimensions: &[String],
     affected_time_keys: &[String],
-    affected_credentials: &[i64],
     affected_cache_reads: &[i32],
     affected_cache_buckets: &[DateTime<Utc>],
     affected_duration_buckets: &[DateTime<Utc>],
@@ -11167,18 +7290,7 @@ async fn reconcile_usage_rollups_after_negative_delta(
         .execute(&mut **tx)
         .await?;
     }
-    if !affected_credentials.is_empty() {
-        sqlx::query(
-            r#"
-            DELETE FROM usage_credential_cost_summary
-            WHERE credential_id = ANY($1)
-              AND requests <= 0
-            "#,
-        )
-        .bind(affected_credentials)
-        .execute(&mut **tx)
-        .await?;
-    }
+
     if !affected_cache_reads.is_empty() {
         sqlx::query(
             r#"
@@ -11258,40 +7370,6 @@ async fn reconcile_usage_rollups_after_negative_delta(
           AND dimension_key = 'all'
         "#,
     )
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn upsert_credential_usage_summary_delta(
-    tx: &mut Transaction<'_, Postgres>,
-    credential_id: u64,
-    delta: CredentialUsageSummaryDelta,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO usage_credential_cost_summary (
-            credential_id, requests, estimated_cost_usd, original_cost_usd, kiro_metering_usage,
-            priced_requests, unpriced_requests, updated_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-        ON CONFLICT (credential_id) DO UPDATE
-        SET requests = usage_credential_cost_summary.requests + EXCLUDED.requests,
-            estimated_cost_usd = usage_credential_cost_summary.estimated_cost_usd + EXCLUDED.estimated_cost_usd,
-            original_cost_usd = usage_credential_cost_summary.original_cost_usd + EXCLUDED.original_cost_usd,
-            kiro_metering_usage = usage_credential_cost_summary.kiro_metering_usage + EXCLUDED.kiro_metering_usage,
-            priced_requests = usage_credential_cost_summary.priced_requests + EXCLUDED.priced_requests,
-            unpriced_requests = usage_credential_cost_summary.unpriced_requests + EXCLUDED.unpriced_requests,
-            updated_at = now()
-        "#,
-    )
-    .bind(credential_id as i64)
-    .bind(delta.requests)
-    .bind(delta.estimated_cost_usd)
-    .bind(delta.original_cost_usd)
-    .bind(delta.kiro_metering_usage)
-    .bind(delta.priced_requests)
-    .bind(delta.unpriced_requests)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -11461,7 +7539,6 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "data->>'routeSubtype'",
             "data->>'modelResolutionSource'",
             "estimated_cost_usd::text",
-            "kiro_metering_usage::text",
         ];
         for (index, field) in fields.iter().enumerate() {
             if index > 0 {
@@ -11632,11 +7709,11 @@ fn push_dashboard_windows_cte(
             records.cache_creation_input_tokens,
             records.estimated_cost_usd,
             records.original_cost_usd,
-            records.kiro_metering_usage,
+
             records.pricing_available,
             records.simulated,
-            records.sticky_bound,
-            records.fallback_from_sticky,
+
+
             records.data->>'externalPoolId' AS dashboard_external_pool_id,
             NULLIF(BTRIM(records.data->>'externalPoolName'), '')
                 AS dashboard_external_pool_name,
@@ -11737,11 +7814,11 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
             buckets.total_cache_creation_input_tokens,
             buckets.total_estimated_cost_usd,
             buckets.total_original_cost_usd,
-            buckets.total_kiro_metering_usage,
+
             buckets.priced_requests,
             buckets.unpriced_requests,
-            buckets.sticky_bound_requests,
-            buckets.fallback_from_sticky_requests,
+
+
             buckets.simulated_requests,
             buckets.upstream_metadata_requests,
             buckets.external_pool_requests,
@@ -11781,12 +7858,10 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
             COALESCE(SUM(records.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
             COALESCE(SUM(records.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
             COALESCE(SUM(records.original_cost_usd), 0)::double precision AS total_original_cost_usd,
-            COALESCE(SUM(records.kiro_metering_usage), 0)::double precision
-                AS total_kiro_metering_usage,
             COUNT(*) FILTER (WHERE records.pricing_available)::bigint AS priced_requests,
             COUNT(*) FILTER (WHERE NOT records.pricing_available)::bigint AS unpriced_requests,
-            COUNT(*) FILTER (WHERE records.sticky_bound)::bigint AS sticky_bound_requests,
-            COUNT(*) FILTER (WHERE records.fallback_from_sticky)::bigint AS fallback_from_sticky_requests,
+
+
             COUNT(*) FILTER (WHERE records.simulated)::bigint AS simulated_requests,
             COUNT(*) FILTER (WHERE records.usage_source = 'upstream_metadata')::bigint
                 AS upstream_metadata_requests,
@@ -11847,13 +7922,9 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
                 AS total_estimated_cost_usd,
             SUM(segment_rows.total_original_cost_usd)::double precision
                 AS total_original_cost_usd,
-            SUM(segment_rows.total_kiro_metering_usage)::double precision
-                AS total_kiro_metering_usage,
             SUM(segment_rows.priced_requests)::bigint AS priced_requests,
             SUM(segment_rows.unpriced_requests)::bigint AS unpriced_requests,
-            SUM(segment_rows.sticky_bound_requests)::bigint AS sticky_bound_requests,
-            SUM(segment_rows.fallback_from_sticky_requests)::bigint
-                AS fallback_from_sticky_requests,
+
             SUM(segment_rows.simulated_requests)::bigint AS simulated_requests,
             SUM(segment_rows.upstream_metadata_requests)::bigint AS upstream_metadata_requests,
             SUM(segment_rows.external_pool_requests)::bigint AS external_pool_requests,
@@ -12008,7 +8079,7 @@ struct OverviewAccumulator {
     cache_creation_input_tokens: i64,
     estimated_cost_usd: f64,
     original_cost_usd: f64,
-    kiro_metering_usage: f64,
+
     priced_requests: i64,
     unpriced_requests: i64,
     duration_ms_sum: i64,
@@ -12029,7 +8100,7 @@ impl OverviewAccumulator {
             cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
             estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             original_cost_usd: row.try_get("total_original_cost_usd")?,
-            kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+
             priced_requests: row.try_get("priced_requests")?,
             unpriced_requests: row.try_get("unpriced_requests")?,
             duration_ms_sum: row.try_get("duration_ms_sum")?,
@@ -12050,90 +8121,12 @@ impl OverviewAccumulator {
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.estimated_cost_usd += other.estimated_cost_usd;
         self.original_cost_usd += other.original_cost_usd;
-        self.kiro_metering_usage += other.kiro_metering_usage;
         self.priced_requests += other.priced_requests;
         self.unpriced_requests += other.unpriced_requests;
         self.duration_ms_sum += other.duration_ms_sum;
         self.duration_ms_count += other.duration_ms_count;
         self.external_pool_cost_floor_applied_requests +=
             other.external_pool_cost_floor_applied_requests;
-    }
-
-    fn subtract(&self, other: &Self) -> Self {
-        Self {
-            requests: overview_subtract_i64(self.requests, other.requests, "requests"),
-            success_requests: overview_subtract_i64(
-                self.success_requests,
-                other.success_requests,
-                "success_requests",
-            ),
-            error_requests: overview_subtract_i64(
-                self.error_requests,
-                other.error_requests,
-                "error_requests",
-            ),
-            input_tokens: overview_subtract_i64(
-                self.input_tokens,
-                other.input_tokens,
-                "input_tokens",
-            ),
-            uncached_input_tokens: overview_subtract_i64(
-                self.uncached_input_tokens,
-                other.uncached_input_tokens,
-                "uncached_input_tokens",
-            ),
-            output_tokens: overview_subtract_i64(
-                self.output_tokens,
-                other.output_tokens,
-                "output_tokens",
-            ),
-            cache_read_input_tokens: overview_subtract_i64(
-                self.cache_read_input_tokens,
-                other.cache_read_input_tokens,
-                "cache_read_input_tokens",
-            ),
-            cache_creation_input_tokens: overview_subtract_i64(
-                self.cache_creation_input_tokens,
-                other.cache_creation_input_tokens,
-                "cache_creation_input_tokens",
-            ),
-            estimated_cost_usd: overview_subtract_f64(
-                self.estimated_cost_usd,
-                other.estimated_cost_usd,
-                "estimated_cost_usd",
-            ),
-            original_cost_usd: overview_subtract_f64(
-                self.original_cost_usd,
-                other.original_cost_usd,
-                "original_cost_usd",
-            ),
-            kiro_metering_usage: overview_subtract_f64(
-                self.kiro_metering_usage,
-                other.kiro_metering_usage,
-                "kiro_metering_usage",
-            ),
-            priced_requests: overview_subtract_i64(
-                self.priced_requests,
-                other.priced_requests,
-                "priced_requests",
-            ),
-            unpriced_requests: overview_subtract_i64(
-                self.unpriced_requests,
-                other.unpriced_requests,
-                "unpriced_requests",
-            ),
-            duration_ms_sum: overview_subtract_i64(
-                self.duration_ms_sum,
-                other.duration_ms_sum,
-                "duration_ms_sum",
-            ),
-            duration_ms_count: overview_subtract_i64(
-                self.duration_ms_count,
-                other.duration_ms_count,
-                "duration_ms_count",
-            ),
-            external_pool_cost_floor_applied_requests: 0,
-        }
     }
 
     fn to_metrics(self) -> UsageOverviewMetrics {
@@ -12151,7 +8144,7 @@ impl OverviewAccumulator {
             cache_creation_input_tokens: self.cache_creation_input_tokens.max(0),
             estimated_cost_usd: self.estimated_cost_usd.max(0.0),
             original_cost_usd: self.original_cost_usd.max(0.0),
-            kiro_metering_usage: self.kiro_metering_usage.max(0.0),
+
             priced_requests: self.priced_requests.max(0) as usize,
             unpriced_requests: self.unpriced_requests.max(0) as usize,
             average_duration_ms: if self.duration_ms_count > 0 {
@@ -12174,7 +8167,7 @@ impl OverviewAccumulator {
             cache_creation_input_tokens: metrics.cache_creation_input_tokens,
             estimated_cost_usd: metrics.estimated_cost_usd,
             original_cost_usd: metrics.original_cost_usd,
-            kiro_metering_usage: metrics.kiro_metering_usage,
+
             raw_cost_usd: 0.0,
             billable_cost_usd: 0.0,
             profit_usd: 0.0,
@@ -12233,9 +8226,7 @@ impl OverviewSeriesCell {
 struct OverviewSeriesAccumulator {
     all: OverviewSeriesCell,
     external: OverviewSeriesCell,
-    local_routes: HashMap<String, OverviewSeriesCell>,
     external_pools: HashMap<String, OverviewSeriesCell>,
-    external_reasons: HashMap<String, OverviewSeriesCell>,
 }
 
 #[derive(Debug, Default)]
@@ -12287,19 +8278,13 @@ impl OverviewSeriesGroupAccumulator {
 
 #[derive(Debug, Default)]
 struct OverviewSeriesGroupsAccumulator {
-    local_routes: OverviewSeriesGroupAccumulator,
     external_pools: OverviewSeriesGroupAccumulator,
-    external_reasons: OverviewSeriesGroupAccumulator,
 }
 
 impl OverviewSeriesGroupsAccumulator {
     fn finish(self) -> UsageOverviewSeriesGroups {
         UsageOverviewSeriesGroups {
-            local_routes: self.local_routes.finish(usage_local_route_label),
             external_pools: self.external_pools.finish(|key| format!("#{key}")),
-            external_reasons: self
-                .external_reasons
-                .finish(|key| usage_external_reason_label(key).to_string()),
         }
     }
 }
@@ -12335,34 +8320,6 @@ impl OverviewRankAccumulator {
             .error_requests
             .saturating_add(metrics.error_requests.max(0) as usize);
         self.estimated_cost_usd += metrics.estimated_cost_usd.max(0.0);
-    }
-}
-
-fn overview_subtract_i64(left: i64, right: i64, metric: &str) -> i64 {
-    if left < right {
-        tracing::warn!(
-            metric,
-            left,
-            right,
-            "usage overview 本地拆分出现负数，已截断为 0"
-        );
-        0
-    } else {
-        left - right
-    }
-}
-
-fn overview_subtract_f64(left: f64, right: f64, metric: &str) -> f64 {
-    if left + 1e-9 < right {
-        tracing::warn!(
-            metric,
-            left,
-            right,
-            "usage overview 本地费用拆分出现负数，已截断为 0"
-        );
-        0.0
-    } else {
-        (left - right).max(0.0)
     }
 }
 
@@ -12445,24 +8402,14 @@ fn overview_series_points(
         .into_iter()
         .map(|(key, bucket_start, label)| {
             let values = series.remove(&key).unwrap_or_default();
-            let local = OverviewSeriesCell {
-                metrics: values.all.metrics.subtract(&values.external.metrics),
-                costs: OverviewExternalCosts::default(),
-            };
             UsageOverviewSeriesPoint {
                 bucket_start: bucket_start.to_rfc3339(),
                 label,
                 all: values.all.to_series_metrics(),
-                local: local.to_series_metrics(),
                 external: values.external.to_series_metrics(),
-                local_routes: overview_series_breakdown(&groups.local_routes, &values.local_routes),
                 external_pools: overview_series_breakdown(
                     &groups.external_pools,
                     &values.external_pools,
-                ),
-                external_reasons: overview_series_breakdown(
-                    &groups.external_reasons,
-                    &values.external_reasons,
                 ),
             }
         })
@@ -12531,13 +8478,12 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
             cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-            total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             average_duration_ms: row.try_get("average_duration_ms")?,
             p95_duration_ms: p95_duration_ms.max(0) as u64,
-            sticky_bound_requests: row_i64_to_usize(&row, "sticky_bound_requests")?,
-            fallback_from_sticky_requests: row_i64_to_usize(&row, "fallback_from_sticky_requests")?,
+
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
             external_pool_billing: UsageExternalPoolBillingSummary {
@@ -12587,13 +8533,12 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
             cache_read_ratio: 0.0,
             total_estimated_cost_usd: point.total_estimated_cost_usd,
             total_original_cost_usd: point.total_original_cost_usd,
-            total_kiro_metering_usage: point.total_kiro_metering_usage,
+
             priced_requests: 0,
             unpriced_requests: 0,
             average_duration_ms: 0.0,
             p95_duration_ms: 0,
-            sticky_bound_requests: 0,
-            fallback_from_sticky_requests: 0,
+
             simulated_requests: 0,
             upstream_metadata_requests: 0,
             external_pool_billing: UsageExternalPoolBillingSummary::default(),
@@ -12620,7 +8565,6 @@ fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
         total_output_tokens: row.try_get("total_output_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-        total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
     })
 }
 
@@ -12649,7 +8593,6 @@ fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate>
         total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-        total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
     })
 }
 
@@ -12691,24 +8634,6 @@ fn usage_source_label(value: &str) -> String {
         _ => value,
     }
     .to_string()
-}
-
-#[allow(dead_code)]
-fn runtime_state_from_row(row: &PgRow) -> anyhow::Result<CredentialRuntimeStateRow> {
-    let failure_count: i32 = row.try_get("failure_count")?;
-    let refresh_failure_count: i32 = row.try_get("refresh_failure_count")?;
-    let disabled_reason: Option<String> = row.try_get("disabled_reason")?;
-    let warmup_remaining: i32 = row.try_get("warmup_remaining")?;
-    let generation: i64 = row.try_get("generation")?;
-    let revision: i64 = row.try_get("revision")?;
-    Ok(CredentialRuntimeStateRow {
-        failure_count: failure_count.max(0) as u32,
-        refresh_failure_count: refresh_failure_count.max(0) as u32,
-        disabled_reason,
-        warmup_remaining: warmup_remaining.max(0) as u32,
-        generation: generation.max(0) as u64,
-        revision: revision.max(0) as u64,
-    })
 }
 
 fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoolEligibility> {
@@ -13132,318 +9057,6 @@ fn validate_external_pool_input(
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn upsert_last_used_at(
-    tx: &mut Transaction<'_, Postgres>,
-    credential_id: u64,
-    last_used_at: &str,
-) -> anyhow::Result<()> {
-    validate_rfc3339_timestamp("last_used_at", last_used_at)?;
-    sqlx::query(
-        r#"
-        INSERT INTO credential_stats (credential_id, success_count, last_used_at, updated_at)
-        VALUES ($1, 0, $2, now())
-        ON CONFLICT (credential_id) DO UPDATE
-        SET last_used_at = CASE
-                WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
-                WHEN EXCLUDED.last_used_at::timestamptz
-                     >= credential_stats.last_used_at::timestamptz
-                    THEN EXCLUDED.last_used_at
-                ELSE credential_stats.last_used_at
-            END,
-            updated_at = now()
-        "#,
-    )
-    .bind(credential_id as i64)
-    .bind(last_used_at)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-enum CredentialRuntimeMutationPreparation {
-    Apply {
-        next_revision: u64,
-        current_generation: u64,
-        credential_disabled: bool,
-        state: CredentialRuntimeStateRow,
-    },
-    Duplicate {
-        state: CredentialRuntimeStateRow,
-        credential_disabled: bool,
-    },
-    Stale {
-        state: CredentialRuntimeStateRow,
-        credential_disabled: bool,
-    },
-}
-
-async fn prepare_credential_runtime_mutation(
-    tx: &mut Transaction<'_, Postgres>,
-    credential_id: u64,
-    operation_id: Uuid,
-    mutation_kind: &str,
-    expected_generation: Option<u64>,
-) -> anyhow::Result<CredentialRuntimeMutationPreparation> {
-    let operation_id = operation_id.to_string();
-    let credential_disabled = lock_active_credential_in_tx(tx, credential_id).await?;
-    sqlx::query(
-        r#"
-        INSERT INTO credential_runtime_state (
-            credential_id, failure_count, refresh_failure_count,
-            disabled_reason, warmup_remaining, generation, revision, updated_at
-        )
-        VALUES ($1, 0, 0, NULL, 0, 0, 0, now())
-        ON CONFLICT (credential_id) DO NOTHING
-        "#,
-    )
-    .bind(credential_id as i64)
-    .execute(&mut **tx)
-    .await?;
-
-    let row = sqlx::query(
-        r#"
-        SELECT failure_count, refresh_failure_count, disabled_reason,
-               warmup_remaining, generation, revision
-        FROM credential_runtime_state
-        WHERE credential_id = $1
-        FOR UPDATE
-        "#,
-    )
-    .bind(credential_id as i64)
-    .fetch_one(&mut **tx)
-    .await?;
-    let state = runtime_state_from_row(&row)?;
-
-    let existing = sqlx::query(
-        r#"
-        SELECT credential_id, mutation_kind
-        FROM credential_runtime_mutations
-        WHERE operation_id = $1
-        FOR UPDATE
-        "#,
-    )
-    .bind(&operation_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(existing) = existing {
-        let existing_credential_id: i64 = existing.try_get("credential_id")?;
-        let existing_mutation_kind: String = existing.try_get("mutation_kind")?;
-        if existing_credential_id != credential_id as i64 || existing_mutation_kind != mutation_kind
-        {
-            anyhow::bail!(
-                "运行态 operation_id {} 已用于凭据 #{} 的 {} 操作",
-                operation_id,
-                existing_credential_id,
-                existing_mutation_kind
-            );
-        }
-        sqlx::query(
-            "UPDATE credential_runtime_mutations SET created_at = now() WHERE operation_id = $1",
-        )
-        .bind(&operation_id)
-        .execute(&mut **tx)
-        .await?;
-        return Ok(CredentialRuntimeMutationPreparation::Duplicate {
-            state,
-            credential_disabled,
-        });
-    }
-
-    if let Some(expected_generation) = expected_generation {
-        if expected_generation < state.generation {
-            return Ok(CredentialRuntimeMutationPreparation::Stale {
-                state,
-                credential_disabled,
-            });
-        }
-        if expected_generation > state.generation {
-            anyhow::bail!(
-                "凭据 #{} 运行态 generation 超前：期望 {}，当前 {}",
-                credential_id,
-                expected_generation,
-                state.generation
-            );
-        }
-    }
-
-    let next_revision = state
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("凭据运行态 revision 已溢出"))?;
-    let next_revision_i64 = i64::try_from(next_revision)
-        .map_err(|_| anyhow::anyhow!("凭据运行态 revision 超出 PgSQL BIGINT 范围"))?;
-
-    let inserted_revision: Option<i64> = sqlx::query_scalar(
-        r#"
-        INSERT INTO credential_runtime_mutations (
-            operation_id, credential_id, mutation_kind, applied_revision, created_at
-        )
-        VALUES ($1, $2, $3, $4, now())
-        ON CONFLICT (operation_id) DO NOTHING
-        RETURNING applied_revision
-        "#,
-    )
-    .bind(&operation_id)
-    .bind(credential_id as i64)
-    .bind(mutation_kind)
-    .bind(next_revision_i64)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(inserted_revision) = inserted_revision {
-        if inserted_revision != next_revision_i64 {
-            anyhow::bail!("凭据运行态 mutation revision 写入不一致");
-        }
-        return Ok(CredentialRuntimeMutationPreparation::Apply {
-            next_revision,
-            current_generation: state.generation,
-            credential_disabled,
-            state,
-        });
-    }
-
-    let existing = sqlx::query(
-        r#"
-        SELECT credential_id, mutation_kind
-        FROM credential_runtime_mutations
-        WHERE operation_id = $1
-        FOR UPDATE
-        "#,
-    )
-    .bind(&operation_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let existing_credential_id: i64 = existing.try_get("credential_id")?;
-    let existing_mutation_kind: String = existing.try_get("mutation_kind")?;
-    if existing_credential_id != credential_id as i64 || existing_mutation_kind != mutation_kind {
-        anyhow::bail!(
-            "运行态 operation_id {} 已用于凭据 #{} 的 {} 操作",
-            operation_id,
-            existing_credential_id,
-            existing_mutation_kind
-        );
-    }
-    sqlx::query(
-        "UPDATE credential_runtime_mutations SET created_at = now() WHERE operation_id = $1",
-    )
-    .bind(&operation_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(CredentialRuntimeMutationPreparation::Duplicate {
-        state,
-        credential_disabled,
-    })
-}
-
-fn verify_runtime_mutation_revision(
-    state: &CredentialRuntimeStateRow,
-    expected_revision: u64,
-) -> anyhow::Result<()> {
-    if state.revision != expected_revision {
-        anyhow::bail!(
-            "凭据运行态 revision 不一致：期望 {}，实际 {}",
-            expected_revision,
-            state.revision
-        );
-    }
-    Ok(())
-}
-
-fn verify_runtime_mutation_generation(
-    state: &CredentialRuntimeStateRow,
-    expected_generation: u64,
-) -> anyhow::Result<()> {
-    if state.generation != expected_generation {
-        anyhow::bail!(
-            "凭据运行态 generation 不一致：期望 {}，实际 {}",
-            expected_generation,
-            state.generation
-        );
-    }
-    Ok(())
-}
-
-fn validate_rfc3339_timestamp(field: &str, value: &str) -> anyhow::Result<()> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|_| ())
-        .map_err(|err| anyhow::anyhow!("{} 必须是有效 RFC3339 时间: {}", field, err))
-}
-
-fn validate_credential_runtime_state_patch(
-    patch: &CredentialRuntimeStatePatch,
-) -> anyhow::Result<()> {
-    runtime_state_count_to_i32("failure_count", patch.failure_count)?;
-    runtime_state_count_to_i32("refresh_failure_count", patch.refresh_failure_count)?;
-    runtime_state_count_to_i32("warmup_remaining", patch.warmup_remaining)?;
-    if patch
-        .expected_generation
-        .is_some_and(|generation| i64::try_from(generation).is_err())
-    {
-        anyhow::bail!("凭据运行态 expected generation 超出 PgSQL BIGINT 范围");
-    }
-    if let Some(last_used_at) = patch.last_used_at.as_deref() {
-        validate_rfc3339_timestamp("last_used_at", last_used_at)?;
-    }
-    Ok(())
-}
-
-fn runtime_state_count_to_i32(field: &str, value: Option<u32>) -> anyhow::Result<Option<i32>> {
-    value
-        .map(|value| {
-            i32::try_from(value).map_err(|_| {
-                anyhow::anyhow!(
-                    "凭据运行态字段 {} 的值 {} 超出 PgSQL INTEGER 范围",
-                    field,
-                    value
-                )
-            })
-        })
-        .transpose()
-}
-
-async fn lock_active_credential_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    credential_id: u64,
-) -> anyhow::Result<bool> {
-    sqlx::query_scalar(
-        r#"
-        SELECT disabled
-        FROM credentials
-        WHERE id = $1 AND deleted_at IS NULL
-        FOR UPDATE
-        "#,
-    )
-    .bind(credential_id as i64)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在或已删除，无法更新运行态", credential_id))
-}
-
-async fn persist_credential_disabled_flag_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    credential_id: u64,
-    disabled: bool,
-) -> anyhow::Result<()> {
-    let result = sqlx::query(
-        r#"
-        UPDATE credentials
-        SET disabled = $2,
-            data = jsonb_set(data, '{disabled}', to_jsonb($2::boolean), true),
-            updated_at = now(),
-            revision = credentials.revision + 1
-        WHERE id = $1 AND deleted_at IS NULL
-        "#,
-    )
-    .bind(credential_id as i64)
-    .bind(disabled)
-    .execute(&mut **tx)
-    .await?;
-    if result.rows_affected() != 1 {
-        anyhow::bail!("凭据 #{} 不存在或已删除，无法更新禁用状态", credential_id);
-    }
-    Ok(())
-}
-
 fn usize_to_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
 }
@@ -13474,33 +9087,7 @@ fn usage_source_value(source: crate::anthropic::usage::UsageSource) -> &'static 
 
 fn usage_route_kind_value(route_kind: UsageRouteKind) -> &'static str {
     match route_kind {
-        UsageRouteKind::LocalCredential => "local_credential",
         UsageRouteKind::ExternalPool => "external_pool",
-    }
-}
-
-fn usage_route_subtype_value(route_subtype: UsageRouteSubtype) -> &'static str {
-    match route_subtype {
-        UsageRouteSubtype::LocalSuccess => "local_success",
-        UsageRouteSubtype::LocalErrorNoFallback => "local_error_no_fallback",
-        UsageRouteSubtype::LocalRescueAfterExternal => "local_rescue_after_external",
-        UsageRouteSubtype::ExternalFallbackPreflight => "external_fallback_preflight",
-        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts => {
-            "external_fallback_after_local_attempts"
-        }
-        UsageRouteSubtype::ExternalDirectPolicy => "external_direct_policy",
-        UsageRouteSubtype::ExternalRoutePolicy => "external_route_policy",
-        UsageRouteSubtype::ExternalError => "external_error",
-    }
-}
-
-fn usage_local_route_label(value: &str) -> String {
-    match value {
-        "local_success" => "本地直连成功".to_string(),
-        "local_error_no_fallback" => "本地失败（未回退）".to_string(),
-        "local_rescue_after_external" => "外部失败后本地救援".to_string(),
-        "local_unknown" => "本地未知路由".to_string(),
-        _ => format!("本地 · {value}"),
     }
 }
 
@@ -13539,128 +9126,6 @@ CREATE TABLE IF NOT EXISTS runtime_config (
 ALTER TABLE runtime_config
     ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 
-CREATE TABLE IF NOT EXISTS kiro_version_state (
-    id TEXT PRIMARY KEY,
-    state JSONB NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE SEQUENCE IF NOT EXISTS credentials_id_seq;
-
-CREATE TABLE IF NOT EXISTS credentials (
-    id BIGINT PRIMARY KEY DEFAULT nextval('credentials_id_seq'),
-    priority INTEGER NOT NULL DEFAULT 0,
-    disabled BOOLEAN NOT NULL DEFAULT false,
-    auth_kind TEXT NOT NULL DEFAULT 'oauth',
-    api_key_hash TEXT,
-    refresh_token_hash TEXT,
-    data JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    revision BIGINT NOT NULL DEFAULT 1,
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE credentials
-    ALTER COLUMN id SET DEFAULT nextval('credentials_id_seq');
-
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS auth_kind TEXT NOT NULL DEFAULT 'oauth';
-
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS api_key_hash TEXT;
-
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS refresh_token_hash TEXT;
-
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
-
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
--- 这里的 active 是数据库索引名里的历史术语，含义是“未软删除”
--- (`deleted_at IS NULL`)，不是 `disabled = false`。禁用凭据仍属于后台
--- 管理范围，也继续参与重复导入检测。
-CREATE INDEX IF NOT EXISTS idx_credentials_active_priority
-    ON credentials (priority, id)
-    WHERE deleted_at IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_credentials_api_key_hash
-    ON credentials (api_key_hash)
-    WHERE deleted_at IS NULL AND api_key_hash IS NOT NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_credentials_refresh_token_hash
-    ON credentials (refresh_token_hash)
-    WHERE deleted_at IS NULL AND refresh_token_hash IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS proxy_resources (
-    id BIGSERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    proxy_url TEXT NOT NULL,
-    proxy_username TEXT,
-    proxy_password TEXT,
-    enabled BOOLEAN NOT NULL DEFAULT true,
-    notes TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_test_at TIMESTAMPTZ,
-    last_test_success BOOLEAN,
-    last_test_status INTEGER,
-    last_test_duration_ms BIGINT,
-    last_test_message TEXT,
-    last_test_url TEXT,
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS proxy_username TEXT;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS proxy_password TEXT;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS notes TEXT;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS last_test_at TIMESTAMPTZ;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS last_test_success BOOLEAN;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS last_test_status INTEGER;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS last_test_duration_ms BIGINT;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS last_test_message TEXT;
-
-ALTER TABLE proxy_resources
-    ADD COLUMN IF NOT EXISTS last_test_url TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_proxy_resources_active
-    ON proxy_resources (id)
-    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS external_upstream_pools (
     id BIGSERIAL PRIMARY KEY,
@@ -13813,170 +9278,6 @@ CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_auto_disabled
     ON external_upstream_pools (auto_disabled, auto_disabled_until)
     WHERE deleted_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS credential_stats (
-    credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
-    success_count BIGINT NOT NULL DEFAULT 0,
-    selection_count BIGINT NOT NULL DEFAULT 0,
-    last_used_at TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS credential_stats_delta_batches (
-    operation_id TEXT PRIMARY KEY,
-    payload_hash TEXT NOT NULL,
-    input_credential_count INTEGER NOT NULL,
-    applied_credential_count INTEGER NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_credential_stats_delta_batches_created_at
-    ON credential_stats_delta_batches (created_at ASC);
-
-ALTER TABLE credential_stats
-    ADD COLUMN IF NOT EXISTS selection_count BIGINT NOT NULL DEFAULT 0;
-
-CREATE TABLE IF NOT EXISTS credential_runtime_state (
-    credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
-    failure_count INTEGER NOT NULL DEFAULT 0,
-    refresh_failure_count INTEGER NOT NULL DEFAULT 0,
-    disabled_reason TEXT,
-    warmup_remaining INTEGER NOT NULL DEFAULT 0,
-    generation BIGINT NOT NULL DEFAULT 0,
-    revision BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-ALTER TABLE credential_runtime_state
-    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
-
-ALTER TABLE credential_runtime_state
-    ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
-
-CREATE TABLE IF NOT EXISTS credential_runtime_mutations (
-    operation_id TEXT PRIMARY KEY,
-    credential_id BIGINT NOT NULL REFERENCES credential_runtime_state(credential_id) ON DELETE CASCADE,
-    mutation_kind TEXT NOT NULL,
-    applied_revision BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_credential_created
-    ON credential_runtime_mutations (credential_id, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_created_at
-    ON credential_runtime_mutations (created_at ASC);
-
-CREATE TABLE IF NOT EXISTS credential_account_info (
-    credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
-    subscription_title TEXT,
-    current_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
-    usage_limit DOUBLE PRECISION NOT NULL DEFAULT 0,
-    remaining DOUBLE PRECISION NOT NULL DEFAULT 0,
-    usage_percentage DOUBLE PRECISION NOT NULL DEFAULT 0,
-    credit_limit DOUBLE PRECISION NOT NULL DEFAULT 0,
-    credit_remaining DOUBLE PRECISION NOT NULL DEFAULT 0,
-    credit_base DOUBLE PRECISION NOT NULL DEFAULT 0,
-    credit_bonus DOUBLE PRECISION NOT NULL DEFAULT 0,
-    overage_status TEXT,
-    overage_capability TEXT,
-    overage_cap DOUBLE PRECISION NOT NULL DEFAULT 0,
-    overage_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
-    current_overages DOUBLE PRECISION NOT NULL DEFAULT 0,
-    next_reset_at DOUBLE PRECISION,
-    checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS credit_limit DOUBLE PRECISION NOT NULL DEFAULT 0;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS credit_remaining DOUBLE PRECISION NOT NULL DEFAULT 0;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS credit_base DOUBLE PRECISION NOT NULL DEFAULT 0;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS credit_bonus DOUBLE PRECISION NOT NULL DEFAULT 0;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS overage_status TEXT;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS overage_capability TEXT;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS overage_cap DOUBLE PRECISION NOT NULL DEFAULT 0;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS overage_rate DOUBLE PRECISION NOT NULL DEFAULT 0;
-ALTER TABLE credential_account_info
-    ADD COLUMN IF NOT EXISTS current_overages DOUBLE PRECISION NOT NULL DEFAULT 0;
-
-CREATE TABLE IF NOT EXISTS usage_records (
-    id TEXT PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL,
-    endpoint TEXT NOT NULL,
-    stream BOOLEAN NOT NULL,
-    model TEXT NOT NULL,
-    conversation_id TEXT,
-    credential_id BIGINT,
-    credential_label TEXT,
-    status TEXT NOT NULL,
-    usage_source TEXT NOT NULL,
-    total_input_tokens INTEGER NOT NULL,
-    compat_input_tokens INTEGER NOT NULL,
-    billable_input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL,
-    cache_read_input_tokens INTEGER NOT NULL,
-    cache_creation_input_tokens INTEGER NOT NULL,
-    cache_creation_5m_input_tokens INTEGER NOT NULL,
-    cache_creation_1h_input_tokens INTEGER NOT NULL,
-    estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
-    pricing_available BOOLEAN NOT NULL DEFAULT false,
-    pricing_model TEXT,
-    duration_ms BIGINT NOT NULL DEFAULT 0,
-    simulated BOOLEAN NOT NULL DEFAULT false,
-    sticky_bound BOOLEAN NOT NULL DEFAULT false,
-    fallback_from_sticky BOOLEAN NOT NULL DEFAULT false,
-    error_type TEXT,
-    error_message TEXT,
-    error_detail TEXT,
-    data JSONB NOT NULL,
-    deleted_at TIMESTAMPTZ,
-    rollup_active BOOLEAN NOT NULL DEFAULT true,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-ALTER TABLE usage_records
-    ADD COLUMN IF NOT EXISTS endpoint TEXT NOT NULL DEFAULT '',
-    ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '',
-    ADD COLUMN IF NOT EXISTS conversation_id TEXT,
-    ADD COLUMN IF NOT EXISTS credential_id BIGINT,
-    ADD COLUMN IF NOT EXISTS credential_label TEXT,
-    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unknown',
-    ADD COLUMN IF NOT EXISTS usage_source TEXT NOT NULL DEFAULT 'none',
-    ADD COLUMN IF NOT EXISTS total_input_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS compat_input_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS billable_input_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS output_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS pricing_available BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS pricing_model TEXT,
-    ADD COLUMN IF NOT EXISTS duration_ms BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS simulated BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS sticky_bound BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS fallback_from_sticky BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS error_type TEXT,
-    ADD COLUMN IF NOT EXISTS error_message TEXT,
-    ADD COLUMN IF NOT EXISTS error_detail TEXT,
-    ADD COLUMN IF NOT EXISTS data JSONB NOT NULL DEFAULT '{}'::jsonb,
-    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS rollup_active BOOLEAN NOT NULL DEFAULT true,
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
 CREATE TABLE IF NOT EXISTS usage_cleanup_watermarks (
     scope TEXT PRIMARY KEY,
     cutoff_at TIMESTAMPTZ NOT NULL,
@@ -14044,8 +9345,8 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
     simulated_requests BIGINT NOT NULL DEFAULT 0,
     upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
-    sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
-    fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+
+
     total_input_tokens BIGINT NOT NULL DEFAULT 0,
     billable_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -14057,7 +9358,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -14088,8 +9389,8 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS simulated_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+
+
     ADD COLUMN IF NOT EXISTS total_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS billable_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -14101,7 +9402,7 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -14133,8 +9434,8 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
     simulated_requests BIGINT NOT NULL DEFAULT 0,
     upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
-    sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
-    fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+
+
     total_input_tokens BIGINT NOT NULL DEFAULT 0,
     billable_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -14146,7 +9447,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -14177,8 +9478,8 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS simulated_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+
+
     ADD COLUMN IF NOT EXISTS total_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS billable_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -14190,7 +9491,7 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -14228,26 +9529,6 @@ CREATE TABLE IF NOT EXISTS usage_duration_rollup_time_buckets (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (bucket_start, duration_ms)
 );
-
-CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
-    credential_id BIGINT NOT NULL PRIMARY KEY,
-    requests BIGINT NOT NULL DEFAULT 0,
-    estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
-    priced_requests BIGINT NOT NULL DEFAULT 0,
-    unpriced_requests BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-ALTER TABLE usage_credential_cost_summary
-    ADD COLUMN IF NOT EXISTS requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS priced_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS unpriced_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS model_pricing (
     model TEXT PRIMARY KEY,
@@ -14295,24 +9576,19 @@ CREATE TABLE IF NOT EXISTS model_capabilities_sync_status (
     last_synced_at TEXT,
     last_error TEXT,
     model_count INTEGER NOT NULL DEFAULT 0,
-    reasoning_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
-    reasoning_cohort_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
-    reasoning_cohort_complete BOOLEAN NOT NULL DEFAULT FALSE,
-    reasoning_contract_version INTEGER NOT NULL DEFAULT 0,
-    reasoning_invalid_models JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+
+
+
+
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-ALTER TABLE model_capabilities_sync_status
-    ADD COLUMN IF NOT EXISTS reasoning_fields JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE model_capabilities_sync_status
-    ADD COLUMN IF NOT EXISTS reasoning_cohort_keys JSONB NOT NULL DEFAULT '[]'::jsonb;
-ALTER TABLE model_capabilities_sync_status
-    ADD COLUMN IF NOT EXISTS reasoning_cohort_complete BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE model_capabilities_sync_status
-    ADD COLUMN IF NOT EXISTS reasoning_contract_version INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE model_capabilities_sync_status
-    ADD COLUMN IF NOT EXISTS reasoning_invalid_models JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+
+
+
+
 
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
     id BIGSERIAL PRIMARY KEY,
@@ -14331,20 +9607,6 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at
 CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_action_created
     ON admin_audit_logs (action, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS credential_events (
-    id BIGSERIAL PRIMARY KEY,
-    credential_id BIGINT REFERENCES credentials(id) ON DELETE SET NULL,
-    event_type TEXT NOT NULL,
-    reason TEXT,
-    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_credential_events_credential_created
-    ON credential_events (credential_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_credential_events_type_created
-    ON credential_events (event_type, created_at DESC);
-
 CREATE TABLE IF NOT EXISTS route_scenarios (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL,
@@ -14354,38 +9616,6 @@ CREATE TABLE IF NOT EXISTS route_scenarios (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE TABLE IF NOT EXISTS credential_inventory (
-    id BIGSERIAL PRIMARY KEY,
-    status TEXT NOT NULL DEFAULT 'stored',
-    auth_kind TEXT NOT NULL,
-    refresh_token_hash TEXT,
-    api_key_hash TEXT,
-    identity_key TEXT,
-    email TEXT,
-    data JSONB,
-    source TEXT,
-    note TEXT,
-    account_info JSONB,
-    last_check_at TIMESTAMPTZ,
-    last_check_error TEXT,
-    last_refresh_at TIMESTAMPTZ,
-    last_refresh_error TEXT,
-    refresh_failure_count INTEGER NOT NULL DEFAULT 0,
-    pushed_credential_id BIGINT,
-    pushed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_inventory_refresh_hash
-    ON credential_inventory (refresh_token_hash) WHERE refresh_token_hash IS NOT NULL AND deleted_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_inventory_api_key_hash
-    ON credential_inventory (api_key_hash) WHERE api_key_hash IS NOT NULL AND deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_credential_inventory_identity
-    ON credential_inventory (identity_key) WHERE identity_key IS NOT NULL AND deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_credential_inventory_status
-    ON credential_inventory (status, id DESC) WHERE deleted_at IS NULL;
 "#;
 
 // Explicit maintenance-only backfill. Do not call this from the default startup
@@ -14442,11 +9672,6 @@ WHERE external_pool_requests > 0
   AND external_pool_shaped_cost_usd = 0
   AND external_pool_uplifted_cost_usd = 0
   AND external_pool_profit_usd = 0;
-
-UPDATE usage_credential_cost_summary
-SET original_cost_usd = estimated_cost_usd
-WHERE original_cost_usd = 0
-  AND estimated_cost_usd <> 0;
 "#;
 
 const EXTERNAL_POOL_DEFAULT_MODEL_MAPPING_PASSTHROUGH_SQL: &str = r#"
@@ -14462,58 +9687,6 @@ WHERE deleted_at IS NULL
   AND normalize_model_version_dots = false
   AND model_mapping_require_match = false
   AND model_mapping_rules = '[]'::jsonb;
-"#;
-
-const CREDENTIAL_RUNTIME_REVISION_SQL: &str = r#"
-ALTER TABLE credential_runtime_state
-    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
-
-UPDATE credential_runtime_state
-SET revision = 1
-WHERE revision = 0;
-
-CREATE TABLE IF NOT EXISTS credential_runtime_mutations (
-    operation_id TEXT PRIMARY KEY,
-    credential_id BIGINT NOT NULL REFERENCES credential_runtime_state(credential_id) ON DELETE CASCADE,
-    mutation_kind TEXT NOT NULL,
-    applied_revision BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_credential_created
-    ON credential_runtime_mutations (credential_id, created_at DESC);
-"#;
-
-const CREDENTIAL_RUNTIME_GENERATION_SQL: &str = r#"
-ALTER TABLE credential_runtime_state
-    ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
-"#;
-
-const CREDENTIAL_STORAGE_REVISION_SQL: &str = r#"
-ALTER TABLE credentials
-    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
-
-UPDATE credentials
-SET revision = 1
-WHERE revision < 1;
-"#;
-
-const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL: &str = r#"
-CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_created_at
-    ON credential_runtime_mutations (created_at ASC);
-"#;
-
-const CREDENTIAL_STATS_DELTA_BATCH_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS credential_stats_delta_batches (
-    operation_id TEXT PRIMARY KEY,
-    payload_hash TEXT NOT NULL,
-    input_credential_count INTEGER NOT NULL,
-    applied_credential_count INTEGER NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_credential_stats_delta_batches_created_at
-    ON credential_stats_delta_batches (created_at ASC);
 "#;
 
 const USAGE_CLEANUP_BATCH_SIZE_LIMIT_SQL: &str = r#"
@@ -14567,8 +9740,8 @@ SELECT
     COALESCE(SUM(local_prompt_cache_requests), 0)::bigint AS local_prompt_cache_requests,
     COALESCE(SUM(simulated_requests), 0)::bigint AS simulated_requests,
     COALESCE(SUM(upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
-    COALESCE(SUM(sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
-    COALESCE(SUM(fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
+
+
     COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
     COALESCE(SUM(billable_input_tokens), 0)::bigint AS billable_input_tokens,
     COALESCE(SUM(total_output_tokens), 0)::bigint AS total_output_tokens,
@@ -14579,7 +9752,7 @@ SELECT
     COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
     COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
     COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
-    COALESCE(SUM(total_kiro_metering_usage), 0)::double precision AS total_kiro_metering_usage,
+
     COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
     COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
     COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
@@ -14604,12 +9777,11 @@ INSERT INTO usage_rollup_time_buckets (
     bucket_start, dimension, dimension_key, dimension_label, requests,
     success_requests, error_requests, stream_requests, non_stream_requests,
     priced_requests, unpriced_requests, local_prompt_cache_requests,
-    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
-    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    simulated_requests, upstream_metadata_requests, total_input_tokens, billable_input_tokens,
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    total_estimated_cost_usd, total_original_cost_usd,
     external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -14621,13 +9793,11 @@ SELECT
     bucket_start, dimension, dimension_key, dimension_label, requests,
     success_requests, error_requests, stream_requests, non_stream_requests,
     priced_requests, unpriced_requests, local_prompt_cache_requests,
-    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
-    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    simulated_requests, upstream_metadata_requests, total_input_tokens, billable_input_tokens,
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
-    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
+    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
     external_pool_profit_usd, external_pool_reported_cost_usd,
@@ -14690,8 +9860,8 @@ SELECT
     COALESCE(SUM(local_prompt_cache_requests), 0)::bigint AS local_prompt_cache_requests,
     COALESCE(SUM(simulated_requests), 0)::bigint AS simulated_requests,
     COALESCE(SUM(upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
-    COALESCE(SUM(sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
-    COALESCE(SUM(fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
+
+
     COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
     COALESCE(SUM(billable_input_tokens), 0)::bigint AS billable_input_tokens,
     COALESCE(SUM(total_compat_input_tokens), 0)::bigint AS total_compat_input_tokens,
@@ -14703,7 +9873,7 @@ SELECT
     COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
     COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
     COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
-    COALESCE(SUM(total_kiro_metering_usage), 0)::double precision AS total_kiro_metering_usage,
+
     COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
     COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
     COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
@@ -14728,13 +9898,12 @@ INSERT INTO usage_rollup_time_buckets (
     bucket_start, dimension, dimension_key, dimension_label, requests,
     success_requests, error_requests, stream_requests, non_stream_requests,
     priced_requests, unpriced_requests, local_prompt_cache_requests,
-    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
-    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    simulated_requests, upstream_metadata_requests, total_input_tokens, billable_input_tokens,
     total_compat_input_tokens,
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    total_estimated_cost_usd, total_original_cost_usd,
     external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -14746,14 +9915,12 @@ SELECT
     bucket_start, dimension, dimension_key, dimension_label, requests,
     success_requests, error_requests, stream_requests, non_stream_requests,
     priced_requests, unpriced_requests, local_prompt_cache_requests,
-    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
-    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    simulated_requests, upstream_metadata_requests, total_input_tokens, billable_input_tokens,
     total_compat_input_tokens,
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
-    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
+    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
     external_pool_profit_usd, external_pool_reported_cost_usd,
@@ -14798,16 +9965,54 @@ FROM usage_duration_rollup_time_buckets_hourly;
 
 #[cfg(test)]
 mod tests {
+    async fn assert_postgres_usage_cleanup_authorities_empty(
+        store: &PostgresStore,
+        usage_store: &PostgresUsageStore,
+        context: &str,
+    ) {
+        let active_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM usage_records WHERE deleted_at IS NULL",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(active_rows, 0, "{context}: active detail rows");
+
+        let summary = usage_store.summary(500).await.unwrap();
+        assert_eq!(summary.total_requests, 0, "{context}: summary requests");
+        assert_eq!(
+            summary.total_input_tokens, 0,
+            "{context}: summary input tokens"
+        );
+        assert!(
+            summary.total_estimated_cost_usd.abs() < 1e-12,
+            "{context}: summary cost was {}",
+            summary.total_estimated_cost_usd
+        );
+
+        let dashboard = usage_store.dashboard(Some("UTC"), 500).await.unwrap();
+        for window in dashboard.windows {
+            assert_eq!(
+                window.summary.total_requests, 0,
+                "{context}: dashboard {} requests",
+                window.key
+            );
+            assert!(
+                window.summary.total_estimated_cost_usd.abs() < 1e-12,
+                "{context}: dashboard {} cost was {}",
+                window.key,
+                window.summary.total_estimated_cost_usd
+            );
+        }
+    }
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use super::*;
-    use crate::anthropic::pricing::{ModelPriceItem, ModelPricing};
     use crate::anthropic::usage::{
         ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRecordStatus, UsageRouteKind,
         UsageRouteSubtype, UsageSource,
     };
-    use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
     use serde_json::json;
 
     #[tokio::test]
@@ -14878,12 +10083,6 @@ mod tests {
             ("usage_records", "rollup_active"),
             ("usage_cleanup_jobs", "batch_size"),
             ("usage_records", "original_cost_usd"),
-            ("usage_records", "kiro_metering_usage"),
-            ("model_capabilities_sync_status", "reasoning_fields"),
-            ("credentials", "revision"),
-            ("credential_runtime_state", "generation"),
-            ("credential_runtime_mutations", "operation_id"),
-            ("credential_stats_delta_batches", "operation_id"),
         ] {
             assert!(
                 required.contains(&pair),
@@ -14910,125 +10109,6 @@ mod tests {
 
         let missing = required_postgres_schema_missing_columns(&present);
         assert_eq!(missing, vec!["external_upstream_pools.revision"]);
-    }
-
-    #[tokio::test]
-    async fn postgres_kiro_version_state_cas_allows_one_concurrent_writer() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        let peer = PostgresStore::connect_test_peer(&config, &store)
-            .await
-            .unwrap();
-        let initial = crate::kiro::kiro_version::VersionState::default();
-        assert!(
-            store
-                .save_kiro_version_state_if_generation(&initial, 0)
-                .await
-                .unwrap()
-        );
-
-        let mut candidate = initial.clone();
-        crate::kiro::kiro_version::record_candidate(&mut candidate, "1.4.121").unwrap();
-        let active =
-            crate::kiro::kiro_version::pin_version(&initial, "1.4.200", "0.11.107").unwrap();
-        let (candidate_result, active_result) = tokio::join!(
-            store.save_kiro_version_state_if_generation(&candidate, 0),
-            peer.save_kiro_version_state_if_generation(&active, 0),
-        );
-        let candidate_saved = candidate_result.unwrap();
-        let active_saved = active_result.unwrap();
-        let results = [candidate_saved, active_saved];
-        assert_eq!(results.iter().filter(|saved| **saved).count(), 1);
-        assert_eq!(results.iter().filter(|saved| !**saved).count(), 1);
-
-        let mut stored = store
-            .load_kiro_version_state()
-            .await
-            .unwrap()
-            .expect("CAS winner must remain persisted");
-        if !candidate_saved {
-            let before = stored.clone();
-            crate::kiro::kiro_version::record_candidate(&mut stored, "1.4.121").unwrap();
-            assert!(
-                store
-                    .save_kiro_version_state_if_generation(&stored, before.generation)
-                    .await
-                    .unwrap()
-            );
-        }
-        if !active_saved {
-            let before = stored.clone();
-            stored =
-                crate::kiro::kiro_version::pin_version(&before, "1.4.200", "0.11.107").unwrap();
-            assert!(
-                store
-                    .save_kiro_version_state_if_generation(&stored, before.generation)
-                    .await
-                    .unwrap()
-            );
-        }
-        assert_eq!(stored.generation, 2);
-        assert_eq!(stored.active_version.as_deref(), Some("1.4.200"));
-        assert_eq!(stored.candidate_version.as_deref(), Some("1.4.121"));
-        assert!(crate::kiro::kiro_version::active_changed(&initial, &stored));
-        peer.pool.close().await;
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_kiro_version_state_initialization_is_insert_once_and_restartable() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        let peer = PostgresStore::connect_test_peer(&config, &store)
-            .await
-            .unwrap();
-
-        let legacy = crate::kiro::kiro_version::VersionState {
-            legacy_auto_sync_pending: true,
-            ..Default::default()
-        };
-        store
-            .initialize_kiro_version_state_if_absent(&legacy)
-            .await
-            .unwrap();
-        peer.initialize_kiro_version_state_if_absent(
-            &crate::kiro::kiro_version::VersionState::default(),
-        )
-        .await
-        .unwrap();
-        let loaded = peer
-            .load_kiro_version_state()
-            .await
-            .unwrap()
-            .expect("initialized state survives process restart");
-        assert!(loaded.legacy_auto_sync_pending);
-
-        let mut activated = loaded.clone();
-        crate::kiro::kiro_version::record_candidate(&mut activated, "1.4.154").unwrap();
-        let active =
-            crate::kiro::kiro_version::apply_version(&activated, None, "0.11.107").unwrap();
-        assert!(
-            store
-                .save_kiro_version_state_if_generation(&active, loaded.generation)
-                .await
-                .unwrap()
-        );
-        let restarted = peer
-            .load_kiro_version_state()
-            .await
-            .unwrap()
-            .expect("applied version survives restart");
-        assert_eq!(restarted.active_version.as_deref(), Some("1.4.154"));
-        assert!(!restarted.legacy_auto_sync_pending);
-
-        peer.pool.close().await;
-        store.drop_test_schema().await.unwrap();
     }
 
     #[tokio::test]
@@ -15215,74 +10295,11 @@ mod tests {
         store.drop_test_schema().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn account_info_save_returns_the_snapshot_it_replaced() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        let saved = store
-            .insert_credential(&KiroCredentials {
-                email: Some("quota@example.com".to_string()),
-                kiro_api_key: Some("ksk_quota_transition".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let id = saved.id.unwrap();
-        let info = |current_usage: f64, current_overages: f64| CredentialAccountInfoRow {
-            subscription_title: Some("KIRO PRO".to_string()),
-            current_usage,
-            usage_limit: 1000.0,
-            remaining: (1000.0 - current_usage).max(0.0),
-            usage_percentage: current_usage / 10.0,
-            credit_limit: 1000.0,
-            credit_remaining: (1000.0 - current_usage).max(0.0),
-            credit_base: 1000.0,
-            credit_bonus: 0.0,
-            overage_status: Some("ENABLED".to_string()),
-            overage_capability: Some("OVERAGE_CAPABLE".to_string()),
-            overage_cap: 10000.0,
-            overage_rate: 0.04,
-            current_overages,
-            next_reset_at: None,
-            checked_at: Utc::now().to_rfc3339(),
-        };
-        let first = store
-            .save_credential_account_info_returning_previous(id, &info(900.0, 0.0))
-            .await
-            .unwrap();
-        assert_eq!(first, None);
-        let second = store
-            .save_credential_account_info_returning_previous(id, &info(1000.0, 12.5))
-            .await
-            .unwrap();
-        assert_eq!(
-            second,
-            Some(AccountQuotaFigures {
-                current_usage: 900.0,
-                usage_limit: 1000.0,
-                current_overages: 0.0
-            })
-        );
-        let third = store
-            .save_credential_account_info_returning_previous(id, &info(10.0, 0.0))
-            .await
-            .unwrap();
-        assert_eq!(third.map(|figures| figures.current_overages), Some(12.5));
-
-        store.drop_test_schema().await.unwrap();
-    }
-
     async fn clean(store: &PostgresStore) {
         for statement in [
             "TRUNCATE TABLE admin_audit_logs",
-            "TRUNCATE TABLE credential_events",
             "TRUNCATE TABLE usage_cleanup_jobs",
             "TRUNCATE TABLE usage_cleanup_watermarks",
-            "TRUNCATE TABLE usage_credential_cost_summary",
             "TRUNCATE TABLE usage_duration_rollup_time_buckets",
             "TRUNCATE TABLE usage_cache_read_rollup_time_buckets",
             "TRUNCATE TABLE usage_cache_read_totals",
@@ -15291,12 +10308,6 @@ mod tests {
             "TRUNCATE TABLE usage_records",
             "TRUNCATE TABLE model_pricing_sync_status",
             "TRUNCATE TABLE model_pricing",
-            "TRUNCATE TABLE credential_stats_delta_batches",
-            "TRUNCATE TABLE credential_runtime_mutations",
-            "TRUNCATE TABLE credential_runtime_state CASCADE",
-            "TRUNCATE TABLE credential_stats CASCADE",
-            "TRUNCATE TABLE credentials CASCADE",
-            "TRUNCATE TABLE proxy_resources CASCADE",
             "TRUNCATE TABLE external_upstream_pools CASCADE",
             "TRUNCATE TABLE runtime_config",
         ] {
@@ -15383,13 +10394,10 @@ mod tests {
             "ALTER TABLE usage_records DROP COLUMN pricing_available",
             "ALTER TABLE usage_records DROP COLUMN duration_ms",
             "ALTER TABLE usage_records DROP COLUMN data",
-            "ALTER TABLE usage_rollup_totals DROP COLUMN sticky_bound_requests",
             "ALTER TABLE usage_rollup_totals DROP COLUMN external_pool_reported_cost_usd",
             "ALTER TABLE usage_rollup_totals DROP COLUMN duration_ms_sum",
-            "ALTER TABLE usage_rollup_time_buckets DROP COLUMN sticky_bound_requests",
             "ALTER TABLE usage_rollup_time_buckets DROP COLUMN external_pool_reported_cost_usd",
             "ALTER TABLE usage_rollup_time_buckets DROP COLUMN duration_ms_sum",
-            "ALTER TABLE usage_credential_cost_summary DROP COLUMN priced_requests",
         ] {
             sqlx::query(statement).execute(store.pool()).await.unwrap();
         }
@@ -15540,7 +10548,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
             original_cost_usd: 0.001,
-            kiro_metering_usage: 0.0,
+
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 30,
@@ -15548,20 +10556,16 @@ mod tests {
             response_latency_ms: Some(30),
             latency_trace: None,
             simulated: true,
-            sticky_bound: true,
-            fallback_from_sticky: false,
+
             route_kind: None,
             route_subtype: None,
-            fallback_reason: None,
-            direct_policy_reason: None,
-            local_attempted: None,
-            local_preflight: None,
+
             external_pool_id: None,
             external_pool_name: None,
             external_attempts: Vec::new(),
             usage_projection_applied: None,
             external_pool_billing: None,
-            credential_attempts: Vec::new(),
+
             error_type: None,
             error_message: None,
             error_detail: None,
@@ -15614,122 +10618,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn usage_rollup_dimensions_tag_external_records_with_reason_category() {
-        let mut external = usage_record("external-reason", 0);
-        external.route_kind = Some(UsageRouteKind::ExternalPool);
-        external.route_subtype = Some(UsageRouteSubtype::ExternalFallbackPreflight);
-        external.fallback_reason = Some("local_capacity_full".to_string());
-        let reason = usage_rollup_dimensions(&external)
-            .into_iter()
-            .find(|dimension| dimension.dimension == "external_reason")
-            .expect("external reason rollup dimension");
-        assert_eq!(reason.key, "local_capacity");
-        assert_eq!(reason.label.as_deref(), Some("本地容量不足"));
-        assert!(reason.include_time_bucket);
-
-        external.route_kind = Some(UsageRouteKind::LocalCredential);
-        assert!(
-            usage_rollup_dimensions(&external)
-                .into_iter()
-                .all(|dimension| dimension.dimension != "external_reason"),
-            "local records must not be tagged with an external reason"
-        );
-    }
-
-    #[test]
-    fn usage_external_reason_category_groups_by_owner() {
-        use UsageRouteSubtype::*;
-        let cases = [
-            (
-                Some(ExternalDirectPolicy),
-                Some("model_rule:x"),
-                "policy_direct",
-            ),
-            (
-                Some(ExternalRoutePolicy),
-                Some("local_route_blocked"),
-                "policy_direct",
-            ),
-            (
-                Some(ExternalFallbackPreflight),
-                Some("local_capacity_full"),
-                "local_capacity",
-            ),
-            (
-                Some(ExternalFallbackAfterLocalAttempts),
-                Some("local_attempt_reserved_for_fallback"),
-                "local_capacity",
-            ),
-            (
-                Some(ExternalFallbackPreflight),
-                Some("local_all_cooling_down"),
-                "local_unavailable",
-            ),
-            (
-                Some(ExternalFallbackAfterLocalAttempts),
-                Some("no_available_credentials"),
-                "local_unavailable",
-            ),
-            (
-                Some(ExternalFallbackAfterLocalAttempts),
-                Some("unsupported_model"),
-                "model_unsupported",
-            ),
-            (
-                Some(ExternalFallbackPreflight),
-                Some("local_scheduler_redis_degraded"),
-                "system_degraded",
-            ),
-            (
-                Some(ExternalFallbackPreflight),
-                Some("something_new"),
-                "other",
-            ),
-            (Some(ExternalFallbackPreflight), None, "other"),
-            (Some(ExternalError), Some("local_capacity_full"), "other"),
-            (None, Some("local_capacity_full"), "other"),
-        ];
-        for (subtype, reason, expected) in cases {
-            assert_eq!(
-                usage_external_reason_category(subtype, reason),
-                expected,
-                "{subtype:?} / {reason:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn usage_rollup_dimensions_include_local_route_subtype_only_for_local_routes() {
-        let mut local = usage_record("local-route", 0);
-        local.route_kind = Some(UsageRouteKind::LocalCredential);
-        local.route_subtype = Some(UsageRouteSubtype::LocalRescueAfterExternal);
-        let local_route = usage_rollup_dimensions(&local)
-            .into_iter()
-            .find(|dimension| dimension.dimension == "local_route")
-            .expect("local route rollup dimension");
-        assert_eq!(local_route.key, "local_rescue_after_external");
-        assert_eq!(local_route.label.as_deref(), Some("外部失败后本地救援"));
-        assert!(local_route.include_time_bucket);
-
-        local.route_kind = Some(UsageRouteKind::ExternalPool);
-        assert!(
-            usage_rollup_dimensions(&local)
-                .into_iter()
-                .all(|dimension| dimension.dimension != "local_route")
-        );
-    }
-
-    #[test]
-    fn usage_local_route_labels_keep_unknown_subtypes_visible() {
-        assert_eq!(usage_local_route_label("local_success"), "本地直连成功");
-        assert_eq!(usage_local_route_label("local_unknown"), "本地未知路由");
-        assert_eq!(
-            usage_local_route_label("unexpected_route"),
-            "本地 · unexpected_route"
-        );
-    }
-
     fn fixed_utc(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
             .expect("fixed test timestamp")
@@ -15751,14 +10639,12 @@ mod tests {
             total_output_tokens: 678,
             total_estimated_cost_usd: 1.25,
             total_original_cost_usd: 2.5,
-            total_kiro_metering_usage: 3.75,
         });
 
         assert_eq!(window.key, "today");
         assert_eq!(window.summary.total_requests, 100);
         assert_eq!(window.summary.success_requests, 97);
         assert_eq!(window.summary.error_requests, 3);
-        assert_eq!(window.summary.total_kiro_metering_usage, 3.75);
         assert!((window.summary.error_rate - 0.03).abs() < f64::EPSILON);
         assert_eq!(window.summary.total_input_tokens, 12_345);
         assert_eq!(window.summary.billable_input_tokens, 2_345);
@@ -16301,65 +11187,6 @@ mod tests {
         store_a.drop_test_schema().await.unwrap();
     }
 
-    async fn assert_postgres_usage_cleanup_authorities_empty(
-        store: &PostgresStore,
-        usage_store: &PostgresUsageStore,
-        context: &str,
-    ) {
-        let active_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM usage_records WHERE deleted_at IS NULL",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(active_rows, 0, "{context}: active detail rows");
-
-        let summary = usage_store.summary(500).await.unwrap();
-        assert_eq!(summary.total_requests, 0, "{context}: summary requests");
-        assert_eq!(
-            summary.total_input_tokens, 0,
-            "{context}: summary input tokens"
-        );
-        assert!(
-            summary.total_estimated_cost_usd.abs() < 1e-12,
-            "{context}: summary cost was {}",
-            summary.total_estimated_cost_usd
-        );
-        assert!(
-            usage_store
-                .credential_cost_summary()
-                .await
-                .unwrap()
-                .is_empty(),
-            "{context}: credential cost summary"
-        );
-
-        let dashboard = usage_store.dashboard(Some("UTC"), 500).await.unwrap();
-        for window in dashboard.windows {
-            assert_eq!(
-                window.summary.total_requests, 0,
-                "{context}: dashboard {} requests",
-                window.key
-            );
-            assert!(
-                window.summary.total_estimated_cost_usd.abs() < 1e-12,
-                "{context}: dashboard {} cost was {}",
-                window.key,
-                window.summary.total_estimated_cost_usd
-            );
-        }
-    }
-
-    async fn assert_active_usage_detail_rows(store: &PostgresStore, expected: i64, context: &str) {
-        let active_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM usage_records WHERE deleted_at IS NULL",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(active_rows, expected, "{context}: active detail rows");
-    }
-
     async fn zero_stored_usage_json_original_cost(store: &PostgresStore, id: &str) {
         let updated = sqlx::query(
             r#"
@@ -16421,25 +11248,6 @@ mod tests {
             assert!((local_rollup.1 - 0.2).abs() < 1e-12, "local round {round}");
             assert!((local_rollup.2 - 0.2).abs() < 1e-12, "local round {round}");
             assert_eq!(local_rollup.3, 120, "local round {round}");
-            let local_credential: (i64, f64, f64) = sqlx::query_as(
-                r#"
-                SELECT requests, estimated_cost_usd, original_cost_usd
-                FROM usage_credential_cost_summary
-                WHERE credential_id = 7
-                "#,
-            )
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-            assert_eq!(local_credential.0, 1, "local round {round}");
-            assert!(
-                (local_credential.1 - 0.2).abs() < 1e-12,
-                "local round {round}"
-            );
-            assert!(
-                (local_credential.2 - 0.2).abs() < 1e-12,
-                "local round {round}"
-            );
 
             clean(&store).await;
             let external_id = format!("legacy-external-update-round-{round}");
@@ -16587,124 +11395,6 @@ mod tests {
                 &format!("soft round {round}"),
             )
             .await;
-        }
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_detail_cleanup_preserves_summary_until_explicit_purge_for_three_rounds() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
-        clean(&store).await;
-        let usage_store = PostgresUsageStore::new(store.clone());
-
-        for round in 0..3 {
-            clean(&store).await;
-            let mut record = usage_record(&format!("cleanup-preserve-summary-round-{round}"), 600);
-            record.created_at = Utc::now().to_rfc3339();
-            record.estimated_cost_usd = 0.42;
-            record.original_cost_usd = 0.45;
-            record.kiro_metering_usage = 12.0;
-            usage_store.record(record).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-
-            let before = usage_store.summary(500).await.unwrap();
-            assert_eq!(before.total_requests, 1, "round {round}: summary before");
-            assert!((before.total_estimated_cost_usd - 0.42).abs() < 1e-12);
-
-            let soft = usage_store
-                .soft_delete_cleanup_batch_preserving_summary(Utc::now(), 10)
-                .await
-                .unwrap();
-            assert_eq!(soft.processed_rows, 1, "round {round}: soft detail cleanup");
-            assert_eq!(soft.has_remaining, Some(false), "round {round}");
-            assert_active_usage_detail_rows(
-                &store,
-                0,
-                &format!("round {round}: after soft detail cleanup"),
-            )
-            .await;
-
-            let after_soft = usage_store.summary(500).await.unwrap();
-            assert_eq!(
-                after_soft.total_requests, 1,
-                "round {round}: preserved summary"
-            );
-            assert!((after_soft.total_estimated_cost_usd - 0.42).abs() < 1e-12);
-            let costs = usage_store.credential_cost_summary().await.unwrap();
-            let credential = costs
-                .get(&7)
-                .expect("credential summary remains after detail cleanup");
-            assert_eq!(
-                credential
-                    .priced_requests
-                    .saturating_add(credential.unpriced_requests),
-                1,
-                "round {round}: credential requests"
-            );
-            assert!((credential.estimated_cost_usd - 0.42).abs() < 1e-12);
-
-            let hard = usage_store
-                .hard_delete_cleanup_batch_preserving_summary(
-                    Utc::now() + chrono::Duration::seconds(1),
-                    10,
-                )
-                .await
-                .unwrap();
-            assert_eq!(hard.processed_rows, 1, "round {round}: hard detail cleanup");
-            assert_eq!(hard.has_remaining, Some(false), "round {round}");
-            let physical_rows: i64 =
-                sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_records")
-                    .fetch_one(store.pool())
-                    .await
-                    .unwrap();
-            assert_eq!(physical_rows, 0, "round {round}: physical detail rows");
-            assert_eq!(
-                usage_store.summary(500).await.unwrap().total_requests,
-                1,
-                "round {round}: summary survives hard detail cleanup"
-            );
-
-            let mut live_record =
-                usage_record(&format!("cleanup-preserve-summary-live-round-{round}"), 700);
-            live_record.created_at = Utc::now().to_rfc3339();
-            live_record.estimated_cost_usd = 0.07;
-            live_record.original_cost_usd = 0.09;
-            usage_store.record(live_record).await.unwrap();
-
-            let before_reset = usage_store.summary(500).await.unwrap();
-            assert_eq!(
-                before_reset.total_requests, 2,
-                "round {round}: preserved stale summary plus live row before reset"
-            );
-
-            usage_store
-                .reset_usage_rollups_from_active_records()
-                .await
-                .unwrap();
-            let after_reset = usage_store.summary(500).await.unwrap();
-            assert_eq!(
-                after_reset.total_requests, 1,
-                "round {round}: summary reset keeps live detail rows"
-            );
-            assert!((after_reset.total_estimated_cost_usd - 0.07).abs() < 1e-12);
-
-            let costs = usage_store.credential_cost_summary().await.unwrap();
-            let credential = costs
-                .get(&7)
-                .expect("live credential summary remains after summary reset");
-            assert_eq!(
-                credential
-                    .priced_requests
-                    .saturating_add(credential.unpriced_requests),
-                1,
-                "round {round}: only live credential request remains after reset"
-            );
-            assert!((credential.estimated_cost_usd - 0.07).abs() < 1e-12);
         }
 
         store.drop_test_schema().await.unwrap();
@@ -17280,7 +11970,6 @@ mod tests {
             for table in [
                 "usage_rollup_totals",
                 "usage_rollup_time_buckets",
-                "usage_credential_cost_summary",
                 "usage_cache_read_totals",
                 "usage_cache_read_rollup_time_buckets",
                 "usage_duration_rollup_time_buckets",
@@ -17319,20 +12008,6 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(conversation_rows, 1, "round {round}");
-            let credential_requests: i64 = sqlx::query_scalar(
-                "SELECT requests FROM usage_credential_cost_summary WHERE credential_id = $1",
-            )
-            .bind(new_credential as i64)
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-            assert_eq!(credential_requests, 1, "round {round}");
-            let credential_rows: i64 =
-                sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_credential_cost_summary")
-                    .fetch_one(store.pool())
-                    .await
-                    .unwrap();
-            assert_eq!(credential_rows, 1, "round {round}");
             let cache_requests: i64 = sqlx::query_scalar(
                 "SELECT requests FROM usage_cache_read_totals WHERE cache_read_input_tokens = $1",
             )
@@ -17384,65 +12059,6 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(bucket_start, expected);
-    }
-
-    #[test]
-    fn startup_migration_sql_does_not_scan_usage_history_tables() {
-        let startup_sql = [
-            ("SCHEMA_SQL", SCHEMA_SQL),
-            (
-                "CREDENTIAL_STORAGE_REVISION_SQL",
-                CREDENTIAL_STORAGE_REVISION_SQL,
-            ),
-            (
-                "CREDENTIAL_RUNTIME_REVISION_SQL",
-                CREDENTIAL_RUNTIME_REVISION_SQL,
-            ),
-            (
-                "CREDENTIAL_RUNTIME_GENERATION_SQL",
-                CREDENTIAL_RUNTIME_GENERATION_SQL,
-            ),
-            (
-                "CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL",
-                CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL,
-            ),
-            (
-                "CREDENTIAL_STATS_DELTA_BATCH_SQL",
-                CREDENTIAL_STATS_DELTA_BATCH_SQL,
-            ),
-        ];
-        let forbidden = [
-            "FROM usage_records",
-            "UPDATE usage_records",
-            "INSERT INTO usage_rollup",
-            "INSERT INTO usage_cache",
-            "INSERT INTO usage_duration",
-            "INSERT INTO usage_credential",
-            "CREATE INDEX IF NOT EXISTS idx_usage_records",
-            "CREATE INDEX IF NOT EXISTS idx_usage_rollup",
-            "CREATE INDEX IF NOT EXISTS idx_usage_cache",
-            "CREATE INDEX IF NOT EXISTS idx_usage_duration",
-        ];
-
-        for (name, sql) in startup_sql {
-            for forbidden in forbidden {
-                assert!(
-                    !sql.contains(forbidden),
-                    "{name} must not contain historical usage scan/backfill/index statement: {forbidden}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn postgres_rejects_online_rollup_compression_config_before_connecting() {
-        let mut config = Config::default();
-        config.postgres.compress_usage_rollups_on_start = true;
-        let error = PostgresStore::connect(&config).await.unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("compressUsageRollupsOnStart"));
-        assert!(message.contains("maintenance usage-rollup-compression"));
-        assert!(!message.contains("postgres.url"));
     }
 
     #[tokio::test]
@@ -17498,179 +12114,12 @@ mod tests {
             "UPDATE usage_records",
             "UPDATE usage_rollup_totals",
             "UPDATE usage_rollup_time_buckets",
-            "UPDATE usage_credential_cost_summary",
         ] {
             assert!(
                 USAGE_LEGACY_COST_FIELD_BACKFILL_SQL.contains(expected),
                 "legacy cost backfill maintenance SQL should contain expected statement: {expected}"
             );
         }
-    }
-
-    async fn startup_migration_atomicity_snapshot(store: &PostgresStore) -> serde_json::Value {
-        let columns: Vec<String> = sqlx::query_scalar(
-            r#"
-            SELECT concat_ws(
-                ':', table_name, ordinal_position::text, column_name, data_type,
-                is_nullable, COALESCE(column_default, '')
-            )
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-            ORDER BY table_name, ordinal_position
-            "#,
-        )
-        .fetch_all(store.pool())
-        .await
-        .unwrap();
-        let tables: Vec<String> = sqlx::query_scalar(
-            r#"
-            SELECT concat_ws(':', table_name, table_type)
-            FROM information_schema.tables
-            WHERE table_schema = current_schema()
-            ORDER BY table_name
-            "#,
-        )
-        .fetch_all(store.pool())
-        .await
-        .unwrap();
-        let indexes: Vec<String> = sqlx::query_scalar(
-            r#"
-            SELECT concat_ws(':', tablename, indexname, indexdef)
-            FROM pg_indexes
-            WHERE schemaname = current_schema()
-            ORDER BY tablename, indexname
-            "#,
-        )
-        .fetch_all(store.pool())
-        .await
-        .unwrap();
-        let markers: Vec<String> = sqlx::query_scalar(
-            r#"
-            SELECT concat_ws(':', version, checksum, applied_at::text)
-            FROM schema_migrations
-            ORDER BY version
-            "#,
-        )
-        .fetch_all(store.pool())
-        .await
-        .unwrap();
-        let runtime_config: serde_json::Value = sqlx::query_scalar(
-            "SELECT jsonb_build_object('config', config, 'version', version) FROM runtime_config WHERE id = 'current'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        let credentials: Vec<serde_json::Value> = sqlx::query_scalar(
-            r#"
-            SELECT jsonb_build_object(
-                'id', id,
-                'priority', priority,
-                'disabled', disabled,
-                'auth_kind', auth_kind,
-                'api_key_hash', api_key_hash,
-                'refresh_token_hash', refresh_token_hash,
-                'data', data,
-                'deleted_at', deleted_at
-            )
-            FROM credentials
-            ORDER BY id
-            "#,
-        )
-        .fetch_all(store.pool())
-        .await
-        .unwrap();
-
-        serde_json::json!({
-            "columns": columns,
-            "tables": tables,
-            "indexes": indexes,
-            "markers": markers,
-            "runtimeConfig": runtime_config,
-            "credentials": credentials,
-        })
-    }
-
-    #[tokio::test]
-    async fn postgres_startup_migration_checksum_failure_rolls_back_entire_default_chain() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        sqlx::query(
-            r#"
-            INSERT INTO runtime_config (id, config, version)
-            VALUES ('current', '{"fixture":"migration-atomicity"}'::jsonb, 17)
-            "#,
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_migration_atomicity_fixture".to_string()),
-                auth_method: Some("api_key".to_string()),
-                priority: 23,
-                email: Some("migration-atomicity@example.test".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        for statement in [
-            "DROP TABLE credential_stats_delta_batches",
-            "DROP TABLE credential_runtime_mutations",
-            "ALTER TABLE credentials DROP COLUMN revision",
-            "ALTER TABLE credential_runtime_state DROP COLUMN revision",
-            "ALTER TABLE credential_runtime_state DROP COLUMN generation",
-        ] {
-            sqlx::query(statement).execute(store.pool()).await.unwrap();
-        }
-        sqlx::query(
-            r#"
-            DELETE FROM schema_migrations
-            WHERE version IN (
-                'credential-runtime-revision-v1',
-                'credential-runtime-generation-v1',
-                'credential-runtime-mutation-cleanup-v1',
-                'credential-stats-delta-batches-v1'
-            )
-            "#,
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let updated = sqlx::query(
-            r#"
-            UPDATE schema_migrations
-            SET checksum = 'fixture-corrupt-checksum'
-            WHERE version = 'credential-storage-revision-v1'
-            "#,
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(updated.rows_affected(), 1);
-
-        let before = startup_migration_atomicity_snapshot(&store).await;
-        for attempt in 1..=5 {
-            let error = store.migrate_with_options(false).await.unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("credential-storage-revision-v1 checksum mismatch"),
-                "attempt {attempt} returned unexpected error: {error:#}"
-            );
-            assert_eq!(
-                startup_migration_atomicity_snapshot(&store).await,
-                before,
-                "failed startup migration attempt {attempt} left a partial schema, marker, or business-data mutation"
-            );
-        }
-
-        store.drop_test_schema().await.unwrap();
     }
 
     #[tokio::test]
@@ -18043,233 +12492,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_overview_series_breaks_down_routes_pools_and_reasons_and_backfills() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
-        clean(&store).await;
-        let usage_store = PostgresUsageStore::new(store.clone());
-        let base = fixed_utc("2026-07-15T10:00:00Z");
-
-        let mut local_ok = usage_record("series-local-ok", 0);
-        local_ok.created_at = (base + chrono::Duration::minutes(5)).to_rfc3339();
-        local_ok.route_kind = Some(UsageRouteKind::LocalCredential);
-        local_ok.route_subtype = Some(UsageRouteSubtype::LocalSuccess);
-        local_ok.kiro_metering_usage = 3.0;
-        local_ok.estimated_cost_usd = 0.30;
-        local_ok.compat_input_tokens = 200;
-        local_ok.cache_read_input_tokens = 600;
-        local_ok.cache_creation_input_tokens = 200;
-
-        let mut local_rescue = usage_record("series-local-rescue", 0);
-        local_rescue.created_at = (base + chrono::Duration::minutes(40)).to_rfc3339();
-        local_rescue.route_kind = Some(UsageRouteKind::LocalCredential);
-        local_rescue.route_subtype = Some(UsageRouteSubtype::LocalRescueAfterExternal);
-        local_rescue.kiro_metering_usage = 1.5;
-        local_rescue.compat_input_tokens = 900;
-        local_rescue.cache_read_input_tokens = 0;
-        local_rescue.cache_creation_input_tokens = 100;
-
-        let mut external_capacity = external_usage_record("series-ext-capacity", 0.40, 0.30, 0.50);
-        external_capacity.created_at = (base + chrono::Duration::minutes(10)).to_rfc3339();
-        external_capacity.route_subtype = Some(UsageRouteSubtype::ExternalFallbackPreflight);
-        external_capacity.fallback_reason = Some("local_capacity_full".to_string());
-
-        let mut external_direct = external_usage_record("series-ext-direct", 0.20, 0.10, 0.25);
-        external_direct.created_at =
-            (base + chrono::Duration::hours(1) + chrono::Duration::minutes(10)).to_rfc3339();
-        external_direct.route_subtype = Some(UsageRouteSubtype::ExternalDirectPolicy);
-        external_direct.fallback_reason = None;
-        external_direct.external_pool_id = Some(7);
-        external_direct.external_pool_name = Some("direct-b".to_string());
-
-        usage_store
-            .record_batch(vec![
-                local_ok,
-                local_rescue,
-                external_capacity,
-                external_direct,
-            ])
-            .await
-            .unwrap();
-
-        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
-            base + chrono::Duration::hours(3),
-            Some("UTC"),
-            None,
-            Some(&base.to_rfc3339()),
-            Some(&(base + chrono::Duration::hours(2)).to_rfc3339()),
-            Some("hour"),
-            None,
-        )
-        .unwrap();
-
-        let assert_overview = |overview: &UsageOverviewResponse| {
-            assert_eq!(overview.series.len(), 2);
-            let groups = &overview.series_groups;
-            assert_eq!(
-                groups
-                    .local_routes
-                    .iter()
-                    .map(|g| g.key.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["local_success", "local_rescue_after_external"],
-                "local routes are ordered by consumed credits"
-            );
-            assert_eq!(
-                groups
-                    .external_pools
-                    .iter()
-                    .map(|g| (g.key.as_str(), g.label.as_str()))
-                    .collect::<Vec<_>>(),
-                vec![("42", "backup-a"), ("7", "direct-b")],
-                "external pools are ordered by upstream raw cost"
-            );
-            let mut reasons = groups
-                .external_reasons
-                .iter()
-                .map(|g| (g.key.as_str(), g.label.as_str()))
-                .collect::<Vec<_>>();
-            reasons.sort();
-            assert_eq!(
-                reasons,
-                vec![
-                    ("local_capacity", "本地容量不足"),
-                    ("policy_direct", "策略直连")
-                ]
-            );
-
-            let first = &overview.series[0];
-            assert_eq!(first.local_routes.len(), 2);
-            assert!((first.local.kiro_metering_usage - 4.5).abs() < 1e-9);
-            assert!((first.external.raw_cost_usd - 0.40).abs() < 1e-9);
-            assert!((first.external.billable_cost_usd - 0.50).abs() < 1e-9);
-            assert!((first.external.profit_usd - 0.10).abs() < 1e-9);
-            assert_eq!(
-                first.local.raw_cost_usd, 0.0,
-                "local split never carries external cost"
-            );
-            assert_eq!(first.external_pools.len(), 1);
-            assert_eq!(first.external_pools[0].key, "42");
-            assert_eq!(first.external_reasons.len(), 1);
-            assert_eq!(first.external_reasons[0].key, "local_capacity");
-
-            let second = &overview.series[1];
-            assert!(second.local_routes.is_empty());
-            assert_eq!(second.external_pools[0].key, "7");
-            assert!((second.external_pools[0].metrics.raw_cost_usd - 0.20).abs() < 1e-9);
-            assert_eq!(second.external_reasons[0].key, "policy_direct");
-            assert_eq!(second.external_reasons[0].metrics.requests, 1);
-
-            // sub2api 口径的分母：未缓存输入 + 缓存读 + 缓存写，各维度独立求和。
-            let route = |key: &str| {
-                first
-                    .local_routes
-                    .iter()
-                    .find(|row| row.key == key)
-                    .map(|row| row.metrics.clone())
-                    .expect("local route bucket")
-            };
-            let ok = route("local_success");
-            assert_eq!(
-                (
-                    ok.uncached_input_tokens,
-                    ok.cache_read_input_tokens,
-                    ok.cache_creation_input_tokens
-                ),
-                (200, 600, 200)
-            );
-            let rescue = route("local_rescue_after_external");
-            assert_eq!(rescue.uncached_input_tokens, 900);
-            assert_eq!(first.local.uncached_input_tokens, 1_100);
-            assert_eq!(overview.totals.local.uncached_input_tokens, 1_100);
-            assert_eq!(
-                overview.totals.external.uncached_input_tokens,
-                250 * 2,
-                "both external fixtures report 250 uncached input tokens"
-            );
-            assert_eq!(
-                overview.totals.all.uncached_input_tokens,
-                overview.totals.local.uncached_input_tokens
-                    + overview.totals.external.uncached_input_tokens
-            );
-        };
-
-        let overview = usage_store.dashboard_overview(&spec).await.unwrap();
-        assert_overview(&overview);
-
-        // Simulate history recorded before the route dimensions existed.
-        sqlx::query(
-            "DELETE FROM usage_rollup_time_buckets WHERE dimension IN ('local_route', 'external_reason')",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "DELETE FROM usage_rollup_totals WHERE dimension IN ('local_route', 'external_reason')",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let wiped = usage_store.dashboard_overview(&spec).await.unwrap();
-        assert!(wiped.series_groups.local_routes.is_empty());
-        assert!(wiped.series_groups.external_reasons.is_empty());
-
-        let global_before: i64 = sqlx::query_scalar(
-            "SELECT requests FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        let scanned = usage_store.rebuild_usage_route_dimensions().await.unwrap();
-        assert_eq!(scanned, 4);
-        // Running twice must not double count.
-        usage_store.rebuild_usage_route_dimensions().await.unwrap();
-        let global_after: i64 = sqlx::query_scalar(
-            "SELECT requests FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            global_before, global_after,
-            "backfill leaves other dimensions untouched"
-        );
-
-        let rebuilt = usage_store.dashboard_overview(&spec).await.unwrap();
-        assert_overview(&rebuilt);
-
-        // History written before `total_compat_input_tokens` existed reads as 0;
-        // the backfill must restore it for every dimension, idempotently.
-        for table in ["usage_rollup_time_buckets", "usage_rollup_totals"] {
-            sqlx::query(&format!("UPDATE {table} SET total_compat_input_tokens = 0"))
-                .execute(store.pool())
-                .await
-                .unwrap();
-        }
-        let zeroed = usage_store.dashboard_overview(&spec).await.unwrap();
-        assert_eq!(zeroed.totals.all.uncached_input_tokens, 0);
-        usage_store.rebuild_usage_route_dimensions().await.unwrap();
-        usage_store.rebuild_usage_route_dimensions().await.unwrap();
-        let restored = usage_store.dashboard_overview(&spec).await.unwrap();
-        assert_overview(&restored);
-        let credential_compat: i64 = sqlx::query_scalar(
-            "SELECT SUM(total_compat_input_tokens)::bigint FROM usage_rollup_totals WHERE dimension = 'credential'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            credential_compat, 1_100,
-            "non-route dimensions are rebuilt too"
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn postgres_dashboard_uses_exact_utc_boundary_population_for_every_window_metric() {
         let Some(config) = test_config() else {
             eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -18285,12 +12507,10 @@ mod tests {
 
         let mut at_from = external_usage_record("dashboard-at-from", 0.010, 0.006, 0.008);
         at_from.created_at = (base + chrono::Duration::minutes(15)).to_rfc3339();
-        at_from.kiro_metering_usage = 1.0;
 
         let mut first_boundary = usage_record("dashboard-first-boundary", 2_000);
         first_boundary.created_at = (base + chrono::Duration::minutes(30)).to_rfc3339();
         first_boundary.duration_ms = 30;
-        first_boundary.kiro_metering_usage = 2.0;
 
         let mut before_full_hour = usage_record("dashboard-before-full-hour", 0);
         before_full_hour.created_at =
@@ -18298,18 +12518,15 @@ mod tests {
         before_full_hour.status = UsageRecordStatus::Error;
         before_full_hour.usage_source = UsageSource::RequestEstimate;
         before_full_hour.duration_ms = 40;
-        before_full_hour.kiro_metering_usage = 3.0;
 
         let mut full_hour_start = usage_record("dashboard-full-hour-start", 2_000);
         full_hour_start.created_at = (base + chrono::Duration::hours(1)).to_rfc3339();
         full_hour_start.duration_ms = 50;
-        full_hour_start.kiro_metering_usage = 4.0;
 
         let mut full_hour_external =
             external_usage_record("dashboard-full-hour-external", 0.010, 0.006, 0.008);
         full_hour_external.created_at =
             (base + chrono::Duration::hours(1) + chrono::Duration::minutes(30)).to_rfc3339();
-        full_hour_external.kiro_metering_usage = 5.0;
 
         let mut tail_legacy = usage_record("dashboard-tail-legacy", 2_000);
         tail_legacy.created_at =
@@ -18319,7 +12536,6 @@ mod tests {
         tail_legacy.estimated_cost_usd = 0.123;
         tail_legacy.original_cost_usd = 0.0;
         tail_legacy.duration_ms = 60;
-        tail_legacy.kiro_metering_usage = 6.0;
 
         let mut at_to = external_usage_record("dashboard-at-to", 1.0, 0.5, 0.75);
         at_to.created_at =
@@ -18380,12 +12596,9 @@ mod tests {
             (by_key["cross-hour"].summary.total_original_cost_usd - 0.146).abs() < 1e-12,
             "the boundary detail segment must preserve the legacy hourly original-cost fallback"
         );
-        assert!((by_key["cross-hour"].summary.total_kiro_metering_usage - 21.0).abs() < 1e-12);
         assert_eq!(by_key["exact-hour"].summary.total_requests, 2);
         assert_eq!(by_key["exact-hour"].summary.high_cache_requests, 2);
-        assert!((by_key["exact-hour"].summary.total_kiro_metering_usage - 9.0).abs() < 1e-12);
         assert_eq!(by_key["half-hour"].summary.total_requests, 3);
-        assert!((by_key["half-hour"].summary.total_kiro_metering_usage - 9.0).abs() < 1e-12);
 
         let series = usage_store.dashboard_series(&specs).await.unwrap();
         let series_by_key = series
@@ -18394,7 +12607,6 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(series_by_key["same-hour"].requests, 2);
         assert_eq!(series_by_key["cross-hour"].requests, 6);
-        assert!((series_by_key["cross-hour"].total_kiro_metering_usage - 21.0).abs() < 1e-12);
         assert_eq!(series_by_key["exact-hour"].requests, 2);
         assert_eq!(series_by_key["half-hour"].requests, 3);
 
@@ -18403,10 +12615,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(top_credentials.items[0].key, "7");
-        assert!(
-            (top_credentials.items[0].total_kiro_metering_usage - 15.0).abs() < 1e-12,
-            "windowed credential top must preserve Kiro metering from rollup and boundary rows"
-        );
 
         let status = usage_store
             .dashboard_breakdown(&specs, DashboardBreakdownColumn::Status)
@@ -18633,213 +12841,6 @@ mod tests {
         store.drop_test_schema().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn postgres_migration_compresses_second_rollup_buckets_to_hours() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
-        clean(&store).await;
-        sqlx::query(
-            "DELETE FROM schema_migrations WHERE version LIKE 'usage-rollup-hour-bucket-compression-%'",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        for (created_at, requests) in [
-            ("2026-06-11T01:10:35Z", 1i64),
-            ("2026-06-11T01:42:05Z", 2i64),
-        ] {
-            let bucket_start = DateTime::parse_from_rfc3339(created_at)
-                .unwrap()
-                .with_timezone(&Utc);
-            sqlx::query(
-                r#"
-                INSERT INTO usage_rollup_time_buckets (
-                    bucket_start, dimension, dimension_key, requests,
-                    duration_ms_sum, duration_ms_count, duration_ms_max,
-                    total_compat_input_tokens
-                )
-                VALUES ($1, 'global', 'all', $2, $3, $2, $4, $5)
-                "#,
-            )
-            .bind(bucket_start)
-            .bind(requests)
-            .bind(requests * 100)
-            .bind(requests * 100)
-            .bind(requests * 10)
-            .execute(store.pool())
-            .await
-            .unwrap();
-            sqlx::query(
-                r#"
-                INSERT INTO usage_cache_read_rollup_time_buckets (
-                    bucket_start, cache_read_input_tokens, requests
-                )
-                VALUES ($1, 1000, $2)
-                "#,
-            )
-            .bind(bucket_start)
-            .bind(requests)
-            .execute(store.pool())
-            .await
-            .unwrap();
-            sqlx::query(
-                r#"
-                INSERT INTO usage_duration_rollup_time_buckets (
-                    bucket_start, duration_ms, requests
-                )
-                VALUES ($1, 250, $2)
-                "#,
-            )
-            .bind(bucket_start)
-            .bind(requests)
-            .execute(store.pool())
-            .await
-            .unwrap();
-        }
-
-        store.migrate_with_options(false).await.unwrap();
-        let default_rows: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::bigint
-            FROM usage_rollup_time_buckets
-            WHERE dimension = 'global' AND dimension_key = 'all'
-            "#,
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(default_rows, 2);
-        let default_applied: Option<String> =
-            sqlx::query_scalar("SELECT checksum FROM schema_migrations WHERE version = $1")
-                .bind("usage-rollup-hour-bucket-compression-v2")
-                .fetch_optional(store.pool())
-                .await
-                .unwrap();
-        assert!(default_applied.is_none());
-
-        let mut writer = store.pool().begin().await.unwrap();
-        acquire_usage_writer_commit_guard(&mut writer)
-            .await
-            .unwrap();
-        let compression_store = store.clone();
-        let compression = tokio::spawn(async move {
-            compression_store
-                .compress_usage_rollups_to_hour_buckets()
-                .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            !compression.is_finished(),
-            "rollup compression must wait for an active usage writer"
-        );
-        writer.commit().await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), compression)
-            .await
-            .expect("rollup compression must recover after writer commit")
-            .expect("rollup compression task")
-            .expect("rollup compression result");
-
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*)::bigint AS rows,
-                   MIN(bucket_start) AS bucket_start,
-                   SUM(requests)::bigint AS requests,
-                   SUM(duration_ms_sum)::bigint AS duration_ms_sum,
-                   MAX(duration_ms_max)::bigint AS duration_ms_max
-            FROM usage_rollup_time_buckets
-            WHERE dimension = 'global' AND dimension_key = 'all'
-            "#,
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        let rows: i64 = row.try_get("rows").unwrap();
-        let bucket_start: DateTime<Utc> = row.try_get("bucket_start").unwrap();
-        let requests: i64 = row.try_get("requests").unwrap();
-        let duration_ms_sum: i64 = row.try_get("duration_ms_sum").unwrap();
-        let duration_ms_max: i64 = row.try_get("duration_ms_max").unwrap();
-        assert_eq!(rows, 1);
-        assert_eq!(
-            bucket_start,
-            DateTime::parse_from_rfc3339("2026-06-11T01:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc)
-        );
-        assert_eq!(requests, 3);
-        assert_eq!(duration_ms_sum, 300);
-        assert_eq!(duration_ms_max, 200);
-        let compat_input: i64 = sqlx::query_scalar(
-            "SELECT SUM(total_compat_input_tokens)::bigint FROM usage_rollup_time_buckets",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            compat_input, 30,
-            "v2 compression keeps the uncached-input column"
-        );
-
-        let cache_requests: i64 = sqlx::query_scalar(
-            "SELECT SUM(requests)::bigint FROM usage_cache_read_rollup_time_buckets",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(cache_requests, 3);
-        let cache_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_cache_read_rollup_time_buckets")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(cache_rows, 1);
-
-        let duration_requests: i64 = sqlx::query_scalar(
-            "SELECT SUM(requests)::bigint FROM usage_duration_rollup_time_buckets",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(duration_requests, 3);
-        let duration_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_duration_rollup_time_buckets")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(duration_rows, 1);
-
-        // A database that already compressed under v1 must not run v2 again.
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 'usage-rollup-hour-bucket-compression-v2'")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES ('usage-rollup-hour-bucket-compression-v1', 'frozen', now())",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        store
-            .compress_usage_rollups_to_hour_buckets()
-            .await
-            .unwrap();
-        let v2_after_v1: Option<String> =
-            sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = $1")
-                .bind("usage-rollup-hour-bucket-compression-v2")
-                .fetch_optional(store.pool())
-                .await
-                .unwrap();
-        assert!(
-            v2_after_v1.is_none(),
-            "v2 is skipped once v1 has compressed"
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
     fn external_usage_snapshot(
         input_tokens: i32,
         output_tokens: i32,
@@ -18907,7 +12908,7 @@ mod tests {
             cache_creation_1h_input_tokens: reported_usage.cache_creation_1h_input_tokens,
             estimated_cost_usd: uplifted_cost_usd,
             original_cost_usd: raw_cost_usd,
-            kiro_metering_usage: 0.0,
+
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 50,
@@ -18915,14 +12916,10 @@ mod tests {
             response_latency_ms: Some(50),
             latency_trace: None,
             simulated: false,
-            sticky_bound: false,
-            fallback_from_sticky: false,
+
             route_kind: Some(UsageRouteKind::ExternalPool),
-            route_subtype: Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts),
-            fallback_reason: Some("local_transient_exhausted".to_string()),
-            direct_policy_reason: None,
-            local_attempted: Some(true),
-            local_preflight: None,
+            route_subtype: Some(UsageRouteSubtype::External),
+
             external_pool_id: Some(42),
             external_pool_name: Some("backup-a".to_string()),
             external_attempts: Vec::new(),
@@ -18950,7 +12947,7 @@ mod tests {
                 usage_candidate_path: None,
                 body_usage_projection_applied: true,
             }),
-            credential_attempts: Vec::new(),
+
             error_type: None,
             error_message: None,
             error_detail: None,
@@ -18965,3382 +12962,6 @@ mod tests {
             payload_breakdown: None,
             payload_guard_report: None,
         }
-    }
-
-    #[tokio::test]
-    async fn postgres_persists_runtime_config_credentials_stats_usage_and_pricing() {
-        let Some(mut config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-
-        config.load_balancing_mode = "balanced".to_string();
-        config.reported_usage.path_overrides.insert(
-            "/custom".to_string(),
-            ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::sample_input_max(42),
-                ..ReportedUsagePathPolicy::default()
-            },
-        );
-        store.save_runtime_config(&config).await.unwrap();
-        let loaded_config = store.load_runtime_config().await.unwrap().unwrap();
-        assert_eq!(loaded_config.load_balancing_mode, "balanced");
-        assert_eq!(
-            loaded_config
-                .reported_usage
-                .policy_for_path("/custom/v1/messages")
-                .input
-                .max_tokens,
-            42
-        );
-
-        let credential = KiroCredentials {
-            id: Some(7),
-            email: Some("alpha@example.com".to_string()),
-            refresh_token: Some("refresh".to_string()),
-            priority: 3,
-            ..Default::default()
-        };
-        store
-            .save_credentials(std::slice::from_ref(&credential))
-            .await
-            .unwrap();
-        let credentials = store.load_credentials().await.unwrap();
-        assert_eq!(credentials.len(), 1);
-        assert_eq!(credentials[0].id, Some(7));
-        assert_eq!(credentials[0].email.as_deref(), Some("alpha@example.com"));
-        store
-            .save_credential_account_info(
-                7,
-                &CredentialAccountInfoRow {
-                    subscription_title: Some("Kiro Pro".to_string()),
-                    current_usage: 90.0,
-                    usage_limit: 1000.0,
-                    remaining: 910.0,
-                    usage_percentage: 9.0,
-                    credit_limit: 11_000.0,
-                    credit_remaining: 10_910.0,
-                    credit_base: 1_000.0,
-                    credit_bonus: 10_000.0,
-                    overage_status: Some("ENABLED".to_string()),
-                    overage_capability: Some("OVERAGE_CAPABLE".to_string()),
-                    overage_cap: 10.0,
-                    overage_rate: 0.04,
-                    current_overages: 0.0,
-                    next_reset_at: Some(1_780_000_000.0),
-                    checked_at: Utc::now().to_rfc3339(),
-                },
-            )
-            .await
-            .unwrap();
-        let account_info = store.load_credential_account_info().await.unwrap();
-        let account_info = account_info.get(&7).unwrap();
-        assert_eq!(account_info.subscription_title.as_deref(), Some("Kiro Pro"));
-        assert_eq!(account_info.current_usage, 90.0);
-        assert_eq!(account_info.usage_limit, 1000.0);
-
-        let inserted = store
-            .insert_credential(&KiroCredentials {
-                email: Some("beta@example.com".to_string()),
-                kiro_api_key: Some("ksk_beta_key".to_string()),
-                auth_method: Some("api_key".to_string()),
-                priority: 1,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(inserted.id.unwrap() >= 8);
-        assert_eq!(inserted.disabled, false);
-        let credentials = store.load_credentials().await.unwrap();
-        assert_eq!(credentials.len(), 2);
-        store
-            .save_credentials(std::slice::from_ref(&credential))
-            .await
-            .unwrap();
-        let credentials = store.load_credentials().await.unwrap();
-        assert_eq!(
-            credentials.len(),
-            2,
-            "保存旧快照不应软删除数据库中其他未软删除凭据"
-        );
-        store
-            .save_credentials(&[KiroCredentials {
-                email: Some("gamma@example.com".to_string()),
-                kiro_api_key: Some("ksk_gamma_key".to_string()),
-                auth_method: Some("api_key".to_string()),
-                priority: 2,
-                ..Default::default()
-            }])
-            .await
-            .unwrap();
-        let credentials = store.load_credentials().await.unwrap();
-        assert_eq!(credentials.len(), 3);
-        assert!(
-            credentials
-                .iter()
-                .any(
-                    |credential| credential.email.as_deref() == Some("gamma@example.com")
-                        && credential.id.is_some()
-                )
-        );
-
-        let stats = HashMap::from([(
-            7,
-            CredentialStatsRow {
-                success_count: 9,
-                selection_count: 11,
-                last_used_at: Some("2026-05-24T00:00:00Z".to_string()),
-            },
-        )]);
-        store.save_credential_stats(&stats).await.unwrap();
-        let loaded_stats = store.load_credential_stats().await.unwrap();
-        assert_eq!(loaded_stats.get(&7).unwrap().success_count, 9);
-        assert_eq!(loaded_stats.get(&7).unwrap().selection_count, 11);
-        store.record_credential_selection(7).await.unwrap();
-        let loaded_stats = store.load_credential_stats().await.unwrap();
-        assert_eq!(loaded_stats.get(&7).unwrap().selection_count, 12);
-        store
-            .save_credential_stats(&HashMap::from([(
-                7,
-                CredentialStatsRow {
-                    success_count: 10,
-                    selection_count: 3,
-                    last_used_at: Some("2026-05-24T00:01:00Z".to_string()),
-                },
-            )]))
-            .await
-            .unwrap();
-        let loaded_stats = store.load_credential_stats().await.unwrap();
-        assert_eq!(loaded_stats.get(&7).unwrap().selection_count, 12);
-
-        let runtime_state = HashMap::from([(
-            7,
-            CredentialRuntimeStateRow {
-                failure_count: 2,
-                refresh_failure_count: 1,
-                disabled_reason: Some("TooManyFailures".to_string()),
-                warmup_remaining: 4,
-                revision: 0,
-                ..Default::default()
-            },
-        )]);
-        store
-            .save_credential_runtime_state(&runtime_state)
-            .await
-            .unwrap();
-        let loaded_runtime_state = store.load_credential_runtime_state().await.unwrap();
-        let loaded_runtime_state = loaded_runtime_state.get(&7).unwrap();
-        assert_eq!(loaded_runtime_state.failure_count, 2);
-        assert_eq!(loaded_runtime_state.refresh_failure_count, 1);
-        assert_eq!(
-            loaded_runtime_state.disabled_reason.as_deref(),
-            Some("TooManyFailures")
-        );
-        assert_eq!(loaded_runtime_state.warmup_remaining, 4);
-        assert_eq!(loaded_runtime_state.revision, 1);
-        let (loaded_credentials, loaded_runtime_states, loaded_account_info) = store
-            .load_credentials_with_runtime_state_and_account_info()
-            .await
-            .unwrap();
-        assert!(
-            loaded_credentials
-                .iter()
-                .any(|credential| credential.id == Some(7))
-        );
-        assert_eq!(loaded_runtime_states.get(&7).unwrap().failure_count, 2);
-        assert_eq!(
-            loaded_account_info
-                .get(&7)
-                .unwrap()
-                .overage_status
-                .as_deref(),
-            Some("ENABLED")
-        );
-
-        let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
-        let mut usage_1 = usage_record("usage-1", 10);
-        usage_1.kiro_metering_usage = 0.125;
-        usage_store.record(usage_1).await.unwrap();
-        let mut usage_2 = usage_record("usage-2", 20);
-        usage_2.status = UsageRecordStatus::Error;
-        usage_2.model = "claude-opus-4-5".to_string();
-        usage_2.conversation_id = Some("session-b".to_string());
-        usage_2.request_api_key_id = Some("request-key-b".to_string());
-        usage_2.estimated_cost_usd = 0.0;
-        usage_2.kiro_metering_usage = 0.375;
-        usage_2.pricing_available = false;
-        usage_2.pricing_model = None;
-        usage_2.error_message = Some("upstream quota exceeded".to_string());
-        usage_store.record(usage_2).await.unwrap();
-        let page = usage_store
-            .query_page(
-                UsageRecordQuery {
-                    min_cache_read: Some(10),
-                    ..Default::default()
-                },
-                1,
-                1,
-            )
-            .await
-            .unwrap();
-        assert_eq!(page.records.len(), 1);
-        assert!(page.has_next);
-        let queried = usage_store
-            .query(UsageRecordQuery {
-                q: Some("alpha@example.com".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(queried.total, 2);
-        let error_query = usage_store
-            .query(UsageRecordQuery {
-                q: Some("quota".to_string()),
-                status: Some(UsageRecordStatus::Error),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(error_query.total, 1);
-        assert_eq!(error_query.records[0].id, "usage-2");
-        let request_key_query = usage_store
-            .query(UsageRecordQuery {
-                request_api_key_id: Some("request-key-b".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(request_key_query.total, 1);
-        assert_eq!(request_key_query.records[0].id, "usage-2");
-
-        let summary = usage_store.summary(15).await.unwrap();
-        assert_eq!(summary.total_requests, 2);
-        assert_eq!(summary.success_requests, 1);
-        assert_eq!(summary.error_requests, 1);
-        assert_eq!(summary.high_cache_requests, 1);
-        assert_eq!(summary.local_prompt_cache_requests, 2);
-        assert_eq!(summary.priced_requests, 1);
-        assert_eq!(summary.unpriced_requests, 1);
-        assert_eq!(summary.realtime.window_seconds, REALTIME_USAGE_WINDOW_SECS);
-        assert_eq!(summary.realtime.requests, 2);
-        assert_eq!(summary.realtime.success_requests, 1);
-        assert_eq!(summary.realtime.error_requests, 1);
-        assert_eq!(summary.realtime.rpm, 2.0);
-        assert_eq!(summary.realtime.success_rpm, 1.0);
-        assert_eq!(summary.realtime.error_rpm, 1.0);
-        assert_eq!(summary.realtime.total_tpm, 240.0);
-        assert_eq!(summary.realtime.billable_tpm, 60.0);
-        assert_eq!(summary.top_credentials[0].key, "7");
-        assert_eq!(summary.top_conversations.len(), 2);
-
-        let dashboard = usage_store
-            .dashboard(Some("Asia/Shanghai"), 15)
-            .await
-            .unwrap();
-        let today = dashboard
-            .windows
-            .iter()
-            .find(|window| window.key == "today")
-            .unwrap();
-        assert_eq!(today.summary.total_requests, 2);
-        assert_eq!(today.summary.error_requests, 1);
-        assert_eq!(today.summary.high_cache_requests, 1);
-        assert_eq!(today.summary.status_breakdown.len(), 2);
-        assert_eq!(dashboard.series.hourly_24h.len(), 24);
-        assert_eq!(dashboard.series.daily_7d.len(), 7);
-        assert_eq!(dashboard.top.models.len(), 2);
-        assert_eq!(dashboard.top.credentials[0].key, "7");
-        assert_eq!(dashboard.top.errors[0].requests, 1);
-
-        let cost_summary = usage_store.credential_cost_summary().await.unwrap();
-        let cost_summary = cost_summary.get(&7).unwrap();
-        assert_eq!(cost_summary.priced_requests, 1);
-        assert_eq!(cost_summary.unpriced_requests, 1);
-        assert!((cost_summary.estimated_cost_usd - 0.001).abs() < f64::EPSILON);
-        assert!((cost_summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
-
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let cleanup_cutoff = Utc::now();
-        let cleanup = usage_store
-            .soft_delete_cleanup_batch(cleanup_cutoff, 10)
-            .await
-            .unwrap();
-        assert_eq!(cleanup.processed_rows, 2);
-        assert_eq!(cleanup.has_remaining, Some(false));
-        let cleared_summary = usage_store.summary(15).await.unwrap();
-        assert_eq!(cleared_summary.total_requests, 0);
-        assert_eq!(cleared_summary.success_requests, 0);
-        assert_eq!(cleared_summary.error_requests, 0);
-        let cleared_page = usage_store
-            .query(UsageRecordQuery {
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(cleared_page.total, 0);
-        let soft_deleted_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM usage_records WHERE deleted_at IS NOT NULL")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(soft_deleted_count, 2);
-        let mut duplicate_after_cleanup = usage_record("usage-1", 30);
-        duplicate_after_cleanup.created_at =
-            (cleanup_cutoff + chrono::Duration::milliseconds(1)).to_rfc3339();
-        usage_store.record(duplicate_after_cleanup).await.unwrap();
-        let duplicate_page = usage_store
-            .query(UsageRecordQuery {
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            duplicate_page.total, 0,
-            "a tombstoned request id must not be revived"
-        );
-
-        let mut new_after_cleanup = usage_record("usage-3", 30);
-        new_after_cleanup.created_at =
-            (cleanup_cutoff + chrono::Duration::milliseconds(1)).to_rfc3339();
-        usage_store.record(new_after_cleanup).await.unwrap();
-        let restored = usage_store
-            .query(UsageRecordQuery {
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(restored.total, 1);
-        assert_eq!(restored.records[0].id, "usage-3");
-        let restored_summary = usage_store.summary(15).await.unwrap();
-        assert_eq!(restored_summary.total_requests, 1);
-        assert_eq!(restored_summary.high_cache_requests, 1);
-
-        let status = PricingStatus {
-            available: true,
-            source: "test".to_string(),
-            source_url: "local".to_string(),
-            model_count: 1,
-            last_synced_at: Some(Utc::now().to_rfc3339()),
-            last_error: None,
-            models: vec![ModelPriceItem {
-                model: "claude-sonnet-4-5".to_string(),
-                pricing: ModelPricing {
-                    input_cost_per_token: 0.000003,
-                    output_cost_per_token: 0.000015,
-                    cache_creation_input_token_cost: 0.00000375,
-                    cache_creation_1h_input_token_cost: 0.0,
-                    cache_read_input_token_cost: 0.0000003,
-                },
-                source: None,
-            }],
-        };
-        store.save_pricing_status(&status).await.unwrap();
-        let pricing = store.load_model_pricing().await.unwrap();
-        assert!(pricing.contains_key("claude-sonnet-4-5"));
-        let pricing_status = store.load_pricing_status().await.unwrap().unwrap();
-        assert_eq!(pricing_status.source, "test");
-        assert_eq!(pricing_status.source_url, "local");
-        assert_eq!(pricing_status.last_synced_at, status.last_synced_at);
-        assert_eq!(pricing_status.model_count, 1);
-
-        let capabilities_status = ModelCapabilitiesStatus {
-            available: true,
-            source: "test".to_string(),
-            model_count: 1,
-            last_synced_at: Some(Utc::now().to_rfc3339()),
-            last_error: None,
-            models: vec![ModelCapabilityItem {
-                model: "claude-sonnet-4-9".to_string(),
-                display_name: "Claude Sonnet 4.9".to_string(),
-                description: Some("future test model".to_string()),
-                max_input_tokens: Some(1_000_000),
-                max_output_tokens: Some(128_000),
-                supports_prompt_caching: Some(true),
-                supported_input_types: vec!["TEXT".to_string(), "IMAGE".to_string()],
-                source: None,
-            }],
-            reasoning_fields: BTreeMap::from([(
-                "claude-sonnet-4-9".to_string(),
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::Reasoning,
-                    efforts: vec!["low".to_string(), "high".to_string(), "max".to_string()],
-                    default_effort: Some("high".to_string()),
-                },
-            )]),
-            reasoning_capability_cohort_keys: vec![KiroModelCapabilityCohortKey {
-                endpoint_family: "ide".to_string(),
-                auth_method: "social".to_string(),
-                provider: "builderid".to_string(),
-                effective_auth_region: "us-east-1".to_string(),
-                effective_api_region: "us-east-1".to_string(),
-                subscription_class: "kiro pro".to_string(),
-                supported_models: Vec::new(),
-            }],
-            reasoning_capability_cohort_complete: true,
-            reasoning_capability_contract_version: 1,
-            reasoning_invalid_models: vec!["claude-invalid-test".to_string()],
-        };
-        store
-            .save_model_capabilities_status(&capabilities_status)
-            .await
-            .unwrap();
-        let loaded_capabilities = store
-            .load_model_capabilities_status()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded_capabilities.source, "test");
-        assert_eq!(
-            loaded_capabilities.last_synced_at,
-            capabilities_status.last_synced_at
-        );
-        assert_eq!(loaded_capabilities.model_count, 1);
-        assert_eq!(
-            loaded_capabilities.reasoning_capability_cohort_keys,
-            capabilities_status.reasoning_capability_cohort_keys
-        );
-        assert!(loaded_capabilities.reasoning_capability_cohort_complete);
-        assert_eq!(loaded_capabilities.reasoning_capability_contract_version, 1);
-        assert_eq!(
-            loaded_capabilities.reasoning_invalid_models,
-            capabilities_status.reasoning_invalid_models
-        );
-        assert_eq!(loaded_capabilities.models[0].model, "claude-sonnet-4-9");
-        assert_eq!(
-            loaded_capabilities
-                .reasoning_fields
-                .get("claude-sonnet-4-9")
-                .map(|capability| capability.path),
-            Some(KiroReasoningFieldPath::Reasoning)
-        );
-        assert_eq!(
-            loaded_capabilities.models[0].max_input_tokens,
-            Some(1_000_000)
-        );
-        assert_eq!(
-            loaded_capabilities.models[0].supported_input_types,
-            vec!["TEXT".to_string(), "IMAGE".to_string()]
-        );
-
-        let manual_capability = ModelCapabilityItem {
-            model: "claude-opus-5-manual".to_string(),
-            display_name: "Claude Opus 5 Manual".to_string(),
-            description: None,
-            max_input_tokens: Some(1_000_000),
-            max_output_tokens: Some(128_000),
-            supports_prompt_caching: Some(true),
-            supported_input_types: vec!["TEXT".to_string()],
-            source: Some(MANUAL_SOURCE.to_string()),
-        };
-        store
-            .save_manual_model(
-                &manual_capability,
-                Some(ModelPricing {
-                    input_cost_per_token: 0.00001,
-                    output_cost_per_token: 0.00002,
-                    cache_creation_input_token_cost: 0.0000125,
-                    cache_creation_1h_input_token_cost: 0.0,
-                    cache_read_input_token_cost: 0.000001,
-                }),
-                false,
-            )
-            .await
-            .unwrap();
-        store.save_pricing_status(&status).await.unwrap();
-        store
-            .save_model_capabilities_status(&capabilities_status)
-            .await
-            .unwrap();
-        let loaded_pricing = store.load_pricing_status().await.unwrap().unwrap();
-        assert!(
-            loaded_pricing
-                .models
-                .iter()
-                .any(|item| item.model == "claude-opus-5-manual"
-                    && item.source.as_deref() == Some(MANUAL_PRICING_SOURCE))
-        );
-        let loaded_capabilities = store
-            .load_model_capabilities_status()
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            loaded_capabilities
-                .models
-                .iter()
-                .any(|item| item.model == "claude-opus-5-manual"
-                    && item.source.as_deref() == Some(MANUAL_SOURCE))
-        );
-
-        store
-            .record_admin_audit_log(
-                "test",
-                "set_credential_priority",
-                "credential",
-                Some("7"),
-                true,
-                None,
-                serde_json::json!({ "priority": 1 }),
-            )
-            .await
-            .unwrap();
-        let audit_page = store
-            .query_admin_audit_logs_filtered(1, 20, &AdminAuditLogFilter::default())
-            .await
-            .unwrap();
-        assert_eq!(audit_page.records.len(), 1);
-        assert_eq!(audit_page.records[0].action, "set_credential_priority");
-        assert_eq!(audit_page.records[0].object_id.as_deref(), Some("7"));
-
-        store.save_credential_stats(&HashMap::new()).await.unwrap();
-        assert!(
-            store
-                .load_credential_stats()
-                .await
-                .unwrap()
-                .contains_key(&7),
-            "空 stats 快照不应删除已有统计行"
-        );
-        store.delete_credential_stats_and_runtime(7).await.unwrap();
-        assert!(store.load_credential_stats().await.unwrap().is_empty());
-        assert!(
-            store
-                .load_credential_runtime_state()
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_credential_upsert_rejects_soft_deleted_rows() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let inserted = store
-            .insert_credential(&KiroCredentials {
-                email: Some("before-delete@example.com".to_string()),
-                refresh_token: Some("refresh-before-delete".to_string()),
-                auth_method: Some("social".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let credential_id = inserted.id.unwrap();
-        store.soft_delete_credential(credential_id).await.unwrap();
-
-        let mut stale = inserted;
-        stale.email = Some("stale-writer@example.com".to_string());
-        stale.priority = 99;
-        let error = store.upsert_credential(&stale).await.unwrap_err();
-        assert!(error.to_string().contains("已被删除"));
-
-        let row = sqlx::query(
-            r#"
-            SELECT deleted_at IS NOT NULL AS is_deleted,
-                   priority,
-                   data->>'email' AS email
-            FROM credentials
-            WHERE id = $1
-            "#,
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert!(row.try_get::<bool, _>("is_deleted").unwrap());
-        assert_eq!(row.try_get::<i32, _>("priority").unwrap(), 0);
-        assert_eq!(
-            row.try_get::<Option<String>, _>("email")
-                .unwrap()
-                .as_deref(),
-            Some("before-delete@example.com")
-        );
-        assert!(store.load_credentials().await.unwrap().is_empty());
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_credential_revision_cas_preserves_concurrent_field_updates() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let original = store
-            .insert_credential(&KiroCredentials {
-                access_token: Some("revision-access-old".to_string()),
-                refresh_token: Some("revision-refresh-old".to_string()),
-                auth_method: Some("social".to_string()),
-                email: Some("revision-original@example.com".to_string()),
-                priority: 1,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let credential_id = original.id.unwrap();
-        assert_eq!(original.storage_revision, 1);
-
-        let mut priority_update = original.clone();
-        priority_update.priority = 17;
-        let mut email_update = original.clone();
-        email_update.email = Some("revision-concurrent@example.com".to_string());
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (priority_outcome, email_outcome) = tokio::join!(
-            first_store.upsert_credential(&priority_update),
-            second_store.upsert_credential(&email_update),
-        );
-        let priority_outcome = priority_outcome.unwrap();
-        let email_outcome = email_outcome.unwrap();
-        let mut retry = match (priority_outcome, email_outcome) {
-            (
-                CredentialUpsertCasOutcome::Applied(applied),
-                CredentialUpsertCasOutcome::Conflict { current },
-            ) => {
-                assert_eq!(applied.priority, 17);
-                assert_eq!(applied.storage_revision, 2);
-                assert_eq!(current.storage_revision, 2);
-                let mut retry = current;
-                retry.email = Some("revision-concurrent@example.com".to_string());
-                retry
-            }
-            (
-                CredentialUpsertCasOutcome::Conflict { current },
-                CredentialUpsertCasOutcome::Applied(applied),
-            ) => {
-                assert_eq!(
-                    applied.email.as_deref(),
-                    Some("revision-concurrent@example.com")
-                );
-                assert_eq!(applied.storage_revision, 2);
-                assert_eq!(current.storage_revision, 2);
-                let mut retry = current;
-                retry.priority = 17;
-                retry
-            }
-            _ => panic!("exactly one writer must apply for the same base revision"),
-        };
-        let retried = store.upsert_credential(&retry).await.unwrap();
-        let CredentialUpsertCasOutcome::Applied(retried) = retried else {
-            panic!("field-level retry against the authoritative revision must apply");
-        };
-        assert_eq!(retried.priority, 17);
-        assert_eq!(
-            retried.email.as_deref(),
-            Some("revision-concurrent@example.com")
-        );
-        assert_eq!(retried.storage_revision, 3);
-
-        retry = original.clone();
-        retry.email = Some("revision-stale-overwrite@example.com".to_string());
-        let stale = store.upsert_credential(&retry).await.unwrap();
-        let CredentialUpsertCasOutcome::Conflict { current } = stale else {
-            panic!("stale full-row credential update must conflict");
-        };
-        assert_eq!(current.priority, 17);
-        assert_eq!(
-            current.email.as_deref(),
-            Some("revision-concurrent@example.com")
-        );
-        assert_eq!(current.storage_revision, 3);
-
-        let refresh_context = CredentialRefreshExpectedContext::from_credentials(&current).unwrap();
-        let refreshed = store
-            .update_credential_refresh_fields_cas(
-                credential_id,
-                &refresh_context,
-                &CredentialRefreshFieldsPatch {
-                    access_token: Some("revision-access-new".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let CredentialRefreshFieldsCasOutcome::Applied(refreshed) = refreshed else {
-            panic!("refresh fields must apply against the current auth context");
-        };
-        assert_eq!(refreshed.storage_revision, 4);
-
-        let runtime = store
-            .patch_credential_runtime_state(
-                credential_id,
-                Uuid::new_v4(),
-                &CredentialRuntimeStatePatch {
-                    credential_disabled: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(runtime.credential_disabled);
-        let authoritative = store
-            .load_credentials()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|credential| credential.id == Some(credential_id))
-            .unwrap();
-        assert!(authoritative.disabled);
-        assert_eq!(authoritative.storage_revision, 5);
-        assert_eq!(authoritative.priority, 17);
-        assert_eq!(
-            authoritative.email.as_deref(),
-            Some("revision-concurrent@example.com")
-        );
-        assert_eq!(
-            authoritative.access_token.as_deref(),
-            Some("revision-access-new")
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_credential_revision_migration_upgrades_legacy_rows() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_credential_revision_migration".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        sqlx::query("ALTER TABLE credentials DROP COLUMN revision")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        sqlx::query(
-            "DELETE FROM schema_migrations WHERE version = 'credential-storage-revision-v1'",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-
-        store.migrate_with_options(false).await.unwrap();
-        let revision: i64 = sqlx::query_scalar("SELECT revision FROM credentials WHERE id = $1")
-            .bind(credential_id as i64)
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-        assert_eq!(revision, 1);
-        let loaded = store
-            .load_credentials()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|credential| credential.id == Some(credential_id))
-            .unwrap();
-        assert_eq!(loaded.storage_revision, 1);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_atomic_credential_insert_rolls_back_when_runtime_patch_fails() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        sqlx::query(
-            r#"
-            ALTER TABLE credential_runtime_state
-            ADD CONSTRAINT test_atomic_insert_runtime_failure
-            CHECK (warmup_remaining <> 99)
-            "#,
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let credential = KiroCredentials {
-            refresh_token: Some("atomic-insert-refresh".to_string()),
-            auth_method: Some("social".to_string()),
-            email: Some("atomic-insert@example.com".to_string()),
-            ..Default::default()
-        };
-        let operation_id = Uuid::new_v4();
-        let patch = CredentialRuntimeStatePatch {
-            failure_count: Some(2),
-            refresh_failure_count: Some(3),
-            disabled_reason: CredentialRuntimeDisabledReasonPatch::Set("Manual".to_string()),
-            warmup_remaining: Some(99),
-            credential_disabled: Some(true),
-            last_used_at: Some("2026-07-10T08:00:00Z".to_string()),
-            ..Default::default()
-        };
-        assert!(
-            store
-                .insert_credential_with_runtime_patch(&credential, operation_id, &patch)
-                .await
-                .is_err()
-        );
-        let credential_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credentials WHERE data->>'refreshToken' = 'atomic-insert-refresh'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(credential_count, 0);
-        let runtime_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM credential_runtime_state")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(runtime_count, 0);
-        let mutation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
-        )
-        .bind(operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(mutation_count, 0);
-        let stats_count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM credential_stats")
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-        assert_eq!(stats_count, 0);
-
-        sqlx::query(
-            "ALTER TABLE credential_runtime_state DROP CONSTRAINT test_atomic_insert_runtime_failure",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let mut valid_patch = patch;
-        valid_patch.warmup_remaining = Some(4);
-        let (inserted, runtime) = store
-            .insert_credential_with_runtime_patch(&credential, operation_id, &valid_patch)
-            .await
-            .unwrap();
-        assert_eq!(inserted.storage_revision, 1);
-        assert!(inserted.disabled);
-        assert_eq!(runtime.state.failure_count, 2);
-        assert_eq!(runtime.state.refresh_failure_count, 3);
-        assert_eq!(runtime.state.disabled_reason.as_deref(), Some("Manual"));
-        assert_eq!(runtime.state.warmup_remaining, 4);
-        assert_eq!(runtime.state.revision, 1);
-        assert!(runtime.credential_disabled);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_atomic_credential_update_rolls_back_with_runtime_patch() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let (original, original_runtime) = store
-            .insert_credential_with_runtime_patch(
-                &KiroCredentials {
-                    refresh_token: Some("atomic-update-refresh-old".to_string()),
-                    access_token: Some("atomic-update-access-old".to_string()),
-                    auth_method: Some("social".to_string()),
-                    email: Some("atomic-update-old@example.com".to_string()),
-                    ..Default::default()
-                },
-                Uuid::new_v4(),
-                &CredentialRuntimeStatePatch {
-                    failure_count: Some(8),
-                    refresh_failure_count: Some(9),
-                    disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(
-                        "Manual".to_string(),
-                    ),
-                    warmup_remaining: Some(5),
-                    credential_disabled: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(original.storage_revision, 1);
-        assert_eq!(original_runtime.state.revision, 1);
-        let credential_id = original.id.unwrap();
-
-        sqlx::query(
-            r#"
-            ALTER TABLE credential_runtime_state
-            ADD CONSTRAINT test_atomic_update_runtime_failure
-            CHECK (warmup_remaining <> 77)
-            "#,
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let mut updated = original.clone();
-        updated.refresh_token = Some("atomic-update-refresh-new".to_string());
-        updated.access_token = Some("atomic-update-access-new".to_string());
-        updated.email = Some("atomic-update-new@example.com".to_string());
-        let operation_id = Uuid::new_v4();
-        let failing_patch = CredentialRuntimeStatePatch {
-            failure_count: Some(0),
-            refresh_failure_count: Some(0),
-            disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
-            warmup_remaining: Some(77),
-            credential_disabled: Some(false),
-            ..Default::default()
-        };
-        assert!(
-            store
-                .update_credential_with_runtime_patch_cas(&updated, operation_id, &failing_patch,)
-                .await
-                .is_err()
-        );
-        let after_failure = store
-            .load_credentials()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|credential| credential.id == Some(credential_id))
-            .unwrap();
-        assert_eq!(after_failure.storage_revision, 1);
-        assert_eq!(
-            after_failure.refresh_token.as_deref(),
-            Some("atomic-update-refresh-old")
-        );
-        assert!(after_failure.disabled);
-        let after_failure_runtime = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(after_failure_runtime.failure_count, 8);
-        assert_eq!(after_failure_runtime.warmup_remaining, 5);
-        assert_eq!(after_failure_runtime.revision, 1);
-
-        sqlx::query(
-            "ALTER TABLE credential_runtime_state DROP CONSTRAINT test_atomic_update_runtime_failure",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let mut valid_patch = failing_patch;
-        valid_patch.warmup_remaining = Some(0);
-        let outcome = store
-            .update_credential_with_runtime_patch_cas(&updated, operation_id, &valid_patch)
-            .await
-            .unwrap();
-        let CredentialWithRuntimePatchCasOutcome::Applied {
-            credential,
-            runtime,
-        } = outcome
-        else {
-            panic!("fresh credential/runtime revision must apply atomically");
-        };
-        assert_eq!(credential.storage_revision, 2);
-        assert_eq!(
-            credential.refresh_token.as_deref(),
-            Some("atomic-update-refresh-new")
-        );
-        assert!(!credential.disabled);
-        assert_eq!(runtime.state.failure_count, 0);
-        assert_eq!(runtime.state.refresh_failure_count, 0);
-        assert_eq!(runtime.state.disabled_reason, None);
-        assert_eq!(runtime.state.warmup_remaining, 0);
-        assert_eq!(runtime.state.revision, 2);
-        assert!(!runtime.credential_disabled);
-
-        let duplicate = store
-            .update_credential_with_runtime_patch_cas(&updated, operation_id, &valid_patch)
-            .await
-            .unwrap();
-        let CredentialWithRuntimePatchCasOutcome::Conflict { current } = duplicate else {
-            panic!("a retry with the stale credential revision must reconcile as a conflict");
-        };
-        assert_eq!(current.storage_revision, 2);
-        let runtime_after_duplicate = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(runtime_after_duplicate.revision, 2);
-        let applied_mutation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
-        )
-        .bind(operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(applied_mutation_count, 1);
-
-        let stale_operation_id = Uuid::new_v4();
-        let stale = store
-            .update_credential_with_runtime_patch_cas(
-                &original,
-                stale_operation_id,
-                &CredentialRuntimeStatePatch::default(),
-            )
-            .await
-            .unwrap();
-        let CredentialWithRuntimePatchCasOutcome::Conflict { current } = stale else {
-            panic!("stale credential revision must not apply the runtime patch");
-        };
-        assert_eq!(current.storage_revision, 2);
-        let stale_mutation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
-        )
-        .bind(stale_operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(stale_mutation_count, 0);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_refresh_field_cas_preserves_admin_changes_and_rejects_stale_hashes() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let inserted = store
-            .insert_credential(&KiroCredentials {
-                access_token: Some("access-old".to_string()),
-                refresh_token: Some("refresh-old".to_string()),
-                profile_arn: Some("profile-old".to_string()),
-                expires_at: Some("2026-07-10T00:00:00Z".to_string()),
-                scopes: Some("scope-old".to_string()),
-                auth_method: Some("social".to_string()),
-                email: Some("owner@example.com".to_string()),
-                priority: 2,
-                proxy_url: Some("http://proxy-before.example:8080".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let credential_id = inserted.id.unwrap();
-        let expected_old = CredentialRefreshExpectedContext::from_credentials(&inserted).unwrap();
-
-        let mut admin_update = inserted.clone();
-        admin_update.email = Some("admin-update@example.com".to_string());
-        admin_update.priority = 17;
-        admin_update.disabled = true;
-        admin_update.max_concurrent_requests = Some(23);
-        admin_update.proxy_url = Some("http://proxy-after.example:8080".to_string());
-        let admin_update = store.upsert_credential(&admin_update).await.unwrap();
-        let CredentialUpsertCasOutcome::Applied(admin_update) = admin_update else {
-            panic!("fresh admin revision must apply");
-        };
-        assert_eq!(admin_update.storage_revision, 2);
-
-        let applied = store
-            .update_credential_refresh_fields_cas(
-                credential_id,
-                &expected_old,
-                &CredentialRefreshFieldsPatch {
-                    access_token: Some("access-new".to_string()),
-                    refresh_token: Some("refresh-new".to_string()),
-                    profile_arn: Some("profile-new".to_string()),
-                    expires_at: Some("2026-07-11T00:00:00Z".to_string()),
-                    scopes: Some("scope-new".to_string()),
-                },
-            )
-            .await
-            .unwrap();
-        let CredentialRefreshFieldsCasOutcome::Applied(applied) = applied else {
-            panic!("fresh refresh hash must apply");
-        };
-        assert_eq!(applied.access_token.as_deref(), Some("access-new"));
-        assert_eq!(applied.refresh_token.as_deref(), Some("refresh-new"));
-        assert_eq!(applied.profile_arn.as_deref(), Some("profile-new"));
-        assert_eq!(applied.expires_at.as_deref(), Some("2026-07-11T00:00:00Z"));
-        assert_eq!(applied.scopes.as_deref(), Some("scope-new"));
-        assert_eq!(applied.email.as_deref(), Some("admin-update@example.com"));
-        assert_eq!(applied.priority, 17);
-        assert!(applied.disabled);
-        assert_eq!(applied.max_concurrent_requests, Some(23));
-        assert_eq!(
-            applied.proxy_url.as_deref(),
-            Some("http://proxy-after.example:8080")
-        );
-
-        let stored_refresh_hash: Option<String> =
-            sqlx::query_scalar("SELECT refresh_token_hash FROM credentials WHERE id = $1")
-                .bind(credential_id as i64)
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(
-            stored_refresh_hash.as_deref(),
-            Some(sha256_hex("refresh-new").as_str())
-        );
-
-        let stale = store
-            .update_credential_refresh_fields_cas(
-                credential_id,
-                &expected_old,
-                &CredentialRefreshFieldsPatch {
-                    access_token: Some("access-stale".to_string()),
-                    refresh_token: Some("refresh-stale".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let CredentialRefreshFieldsCasOutcome::Conflict {
-            current: Some(current),
-        } = stale
-        else {
-            panic!("stale refresh hash must return the authoritative credential");
-        };
-        assert_eq!(current.access_token.as_deref(), Some("access-new"));
-        assert_eq!(current.refresh_token.as_deref(), Some("refresh-new"));
-        assert_eq!(current.priority, 17);
-        assert!(current.disabled);
-
-        let expected_new = CredentialRefreshExpectedContext::from_credentials(&applied).unwrap();
-        let mut auth_context_update = applied.clone();
-        auth_context_update.auth_method = Some("external_idp".to_string());
-        auth_context_update.provider = Some("EntraId".to_string());
-        auth_context_update.client_id = Some("client-after".to_string());
-        auth_context_update.client_secret = Some("secret-after".to_string());
-        auth_context_update.token_endpoint =
-            Some("https://login.example.test/oauth2/v2.0/token".to_string());
-        auth_context_update.scopes = Some("scope-admin-change".to_string());
-        let auth_context_update = store.upsert_credential(&auth_context_update).await.unwrap();
-        let CredentialUpsertCasOutcome::Applied(auth_context_update) = auth_context_update else {
-            panic!("fresh auth context revision must apply");
-        };
-        let auth_context_conflict = store
-            .update_credential_refresh_fields_cas(
-                credential_id,
-                &expected_new,
-                &CredentialRefreshFieldsPatch {
-                    access_token: Some("access-from-old-auth-context".to_string()),
-                    scopes: Some("scope-from-old-auth-context".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let CredentialRefreshFieldsCasOutcome::Conflict {
-            current: Some(current),
-        } = auth_context_conflict
-        else {
-            panic!("changed auth context must reject an in-flight refresh result");
-        };
-        assert_eq!(current.access_token.as_deref(), Some("access-new"));
-        assert_eq!(current.auth_method.as_deref(), Some("external_idp"));
-        assert_eq!(current.provider.as_deref(), Some("EntraId"));
-        assert_eq!(current.client_id.as_deref(), Some("client-after"));
-        assert_eq!(current.client_secret.as_deref(), Some("secret-after"));
-        assert_eq!(current.scopes.as_deref(), Some("scope-admin-change"));
-
-        let expected_after_auth_update =
-            CredentialRefreshExpectedContext::from_credentials(&auth_context_update).unwrap();
-        store.soft_delete_credential(credential_id).await.unwrap();
-        let deleted = store
-            .update_credential_refresh_fields_cas(
-                credential_id,
-                &expected_after_auth_update,
-                &CredentialRefreshFieldsPatch {
-                    access_token: Some("access-after-delete".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            deleted,
-            CredentialRefreshFieldsCasOutcome::Conflict { current: None }
-        ));
-        let stored_access_token: Option<String> =
-            sqlx::query_scalar("SELECT data->>'accessToken' FROM credentials WHERE id = $1")
-                .bind(credential_id as i64)
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(stored_access_token.as_deref(), Some("access-new"));
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn postgres_refresh_field_cas_fences_non_rotating_refresh_by_access_token_for_five_rounds()
-     {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        for round in 1..=5 {
-            clean(&store).await;
-            let old_access = format!("access-old-{round}");
-            let shared_refresh = format!("refresh-non-rotating-{round}");
-            let inserted = store
-                .insert_credential(&KiroCredentials {
-                    access_token: Some(old_access),
-                    refresh_token: Some(shared_refresh.clone()),
-                    expires_at: Some("2026-07-10T00:00:00Z".to_string()),
-                    auth_method: Some("external_idp".to_string()),
-                    email: Some("before@example.com".to_string()),
-                    priority: 2,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            let credential_id = inserted.id.unwrap();
-            let expected = CredentialRefreshExpectedContext::from_credentials(&inserted).unwrap();
-
-            let mut metadata_update = inserted.clone();
-            metadata_update.email = Some(format!("admin-{round}@example.com"));
-            metadata_update.priority = 20 + round;
-            let CredentialUpsertCasOutcome::Applied(metadata_update) =
-                store.upsert_credential(&metadata_update).await.unwrap()
-            else {
-                panic!("round {round}: metadata update must apply");
-            };
-
-            let first_token = format!("access-winner-a-{round}");
-            let second_token = format!("access-winner-b-{round}");
-            let first_patch = CredentialRefreshFieldsPatch {
-                access_token: Some(first_token.clone()),
-                expires_at: Some("2026-07-11T00:00:00Z".to_string()),
-                ..Default::default()
-            };
-            let second_patch = CredentialRefreshFieldsPatch {
-                access_token: Some(second_token.clone()),
-                expires_at: Some("2026-07-11T00:00:01Z".to_string()),
-                ..Default::default()
-            };
-            let (first, second) = tokio::join!(
-                store.update_credential_refresh_fields_cas(credential_id, &expected, &first_patch,),
-                store
-                    .update_credential_refresh_fields_cas(credential_id, &expected, &second_patch,),
-            );
-            let mut applied = Vec::new();
-            let mut conflicts = Vec::new();
-            for outcome in [first.unwrap(), second.unwrap()] {
-                match outcome {
-                    CredentialRefreshFieldsCasOutcome::Applied(current) => applied.push(current),
-                    CredentialRefreshFieldsCasOutcome::Conflict {
-                        current: Some(current),
-                    } => conflicts.push(current),
-                    CredentialRefreshFieldsCasOutcome::Conflict { current: None } => {
-                        panic!("round {round}: credential disappeared")
-                    }
-                }
-            }
-            assert_eq!(applied.len(), 1, "round {round}");
-            assert_eq!(conflicts.len(), 1, "round {round}");
-            let winner = &applied[0];
-            assert!(
-                matches!(
-                    winner.access_token.as_deref(),
-                    Some(value) if value == first_token || value == second_token
-                ),
-                "round {round}"
-            );
-            assert_eq!(
-                conflicts[0].access_token, winner.access_token,
-                "round {round}: loser must observe the authoritative winner"
-            );
-            assert_eq!(
-                winner.refresh_token.as_deref(),
-                Some(shared_refresh.as_str())
-            );
-            assert_eq!(
-                winner.email, metadata_update.email,
-                "round {round}: unrelated Admin metadata must survive"
-            );
-            assert_eq!(winner.priority, metadata_update.priority, "round {round}");
-            assert_eq!(winner.storage_revision, 3, "round {round}");
-        }
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_credential_hash_repair_backfills_legacy_rows_and_detects_collisions() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let legacy_id = 501_i64;
-        sqlx::query(
-            r#"
-            INSERT INTO credentials (
-                id, priority, disabled, auth_kind,
-                api_key_hash, refresh_token_hash, data
-            )
-            VALUES ($1, 4, false, 'oauth', NULL, NULL, $2)
-            "#,
-        )
-        .bind(legacy_id)
-        .bind(serde_json::json!({
-            "refreshToken": "legacy-refresh-token",
-            "authMethod": "builderId",
-            "clientId": "legacy-client",
-            "clientSecret": "legacy-secret",
-            "scopes": "legacy-scope"
-        }))
-        .execute(store.pool())
-        .await
-        .unwrap();
-
-        store.migrate_with_options(false).await.unwrap();
-        let repaired =
-            sqlx::query("SELECT auth_kind, refresh_token_hash FROM credentials WHERE id = $1")
-                .bind(legacy_id)
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(repaired.try_get::<String, _>("auth_kind").unwrap(), "idc");
-        assert_eq!(
-            repaired
-                .try_get::<Option<String>, _>("refresh_token_hash")
-                .unwrap()
-                .as_deref(),
-            Some(sha256_hex("legacy-refresh-token").as_str())
-        );
-
-        let legacy = store
-            .load_credentials()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|credential| credential.id == Some(legacy_id as u64))
-            .unwrap();
-        assert_eq!(legacy.auth_method.as_deref(), Some("idc"));
-        let expected = CredentialRefreshExpectedContext::from_credentials(&legacy).unwrap();
-        let applied = store
-            .update_credential_refresh_fields_cas(
-                legacy_id as u64,
-                &expected,
-                &CredentialRefreshFieldsPatch {
-                    access_token: Some("legacy-access-new".to_string()),
-                    refresh_token: Some("legacy-refresh-new".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let CredentialRefreshFieldsCasOutcome::Applied(applied) = applied else {
-            panic!("canonical expected context must match a legacy authMethod alias");
-        };
-        assert_eq!(applied.access_token.as_deref(), Some("legacy-access-new"));
-        assert_eq!(applied.refresh_token.as_deref(), Some("legacy-refresh-new"));
-
-        for credential_id in [502_i64, 503_i64] {
-            sqlx::query(
-                r#"
-                INSERT INTO credentials (
-                    id, priority, disabled, auth_kind,
-                    api_key_hash, refresh_token_hash, data
-                )
-                VALUES ($1, 0, false, 'oauth', NULL, NULL, $2)
-                "#,
-            )
-            .bind(credential_id)
-            .bind(serde_json::json!({
-                "refreshToken": "duplicate-legacy-refresh-token",
-                "authMethod": "social"
-            }))
-            .execute(store.pool())
-            .await
-            .unwrap();
-        }
-        let collision = store.migrate_with_options(false).await.unwrap_err();
-        assert!(collision.to_string().contains("refreshToken 重复"));
-        let hashes: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT refresh_token_hash FROM credentials WHERE id IN (502, 503) ORDER BY id",
-        )
-        .fetch_all(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(hashes, vec![None, None]);
-
-        sqlx::query("UPDATE credentials SET deleted_at = now() WHERE id = 503")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        store.migrate_with_options(false).await.unwrap();
-        let repaired_hash: Option<String> =
-            sqlx::query_scalar("SELECT refresh_token_hash FROM credentials WHERE id = 502")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(
-            repaired_hash.as_deref(),
-            Some(sha256_hex("duplicate-legacy-refresh-token").as_str())
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_stats_delta_batches_are_exactly_once_and_payload_bound() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let first_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_stats_exactly_once_first".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let second_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_stats_exactly_once_second".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let deltas = HashMap::from([
-            (
-                first_id,
-                CredentialStatsDeltaRow {
-                    success_delta: 2,
-                    selection_delta: 3,
-                    last_used_at: Some("2026-07-10T03:00:00Z".to_string()),
-                },
-            ),
-            (
-                second_id,
-                CredentialStatsDeltaRow {
-                    success_delta: 5,
-                    selection_delta: 7,
-                    last_used_at: Some("2026-07-10T04:00:00Z".to_string()),
-                },
-            ),
-        ]);
-        let operation_id = Uuid::new_v4();
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (first, duplicate) = tokio::join!(
-            first_store.apply_credential_stats_deltas(operation_id, &deltas),
-            second_store.apply_credential_stats_deltas(operation_id, &deltas),
-        );
-        first.unwrap();
-        duplicate.unwrap();
-        store
-            .apply_credential_stats_deltas(operation_id, &deltas)
-            .await
-            .unwrap();
-
-        let stats = store.load_credential_stats().await.unwrap();
-        assert_eq!(stats.get(&first_id).unwrap().success_count, 2);
-        assert_eq!(stats.get(&first_id).unwrap().selection_count, 3);
-        assert_eq!(
-            stats.get(&first_id).unwrap().last_used_at.as_deref(),
-            Some("2026-07-10T03:00:00Z")
-        );
-        assert_eq!(stats.get(&second_id).unwrap().success_count, 5);
-        assert_eq!(stats.get(&second_id).unwrap().selection_count, 7);
-
-        let different_payload = HashMap::from([(
-            first_id,
-            CredentialStatsDeltaRow {
-                success_delta: 100,
-                ..Default::default()
-            },
-        )]);
-        let payload_error = store
-            .apply_credential_stats_deltas(operation_id, &different_payload)
-            .await
-            .unwrap_err();
-        assert!(payload_error.to_string().contains("不同 payload"));
-        assert_eq!(
-            store
-                .load_credential_stats()
-                .await
-                .unwrap()
-                .get(&first_id)
-                .unwrap()
-                .success_count,
-            2
-        );
-        let ledger_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
-        )
-        .bind(operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(ledger_count, 1);
-
-        sqlx::query(
-            "UPDATE credential_stats_delta_batches SET created_at = now() - interval '2 days' WHERE operation_id = $1",
-        )
-        .bind(operation_id.to_string())
-        .execute(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            store
-                .cleanup_credential_runtime_mutations(std::time::Duration::from_secs(86_400), 1)
-                .await
-                .unwrap(),
-            1
-        );
-        let ledger_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
-        )
-        .bind(operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(ledger_count, 0);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_stats_delta_batch_rolls_back_all_chunks() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        sqlx::query(
-            r#"
-            INSERT INTO credentials (
-                id, priority, disabled, auth_kind,
-                api_key_hash, refresh_token_hash, data
-            )
-            SELECT id,
-                   0,
-                   false,
-                   'api_key',
-                   NULL,
-                   NULL,
-                   jsonb_build_object(
-                       'kiroApiKey', 'ksk_stats_chunk_' || id::text,
-                       'authMethod', 'api_key'
-                   )
-            FROM generate_series(1, 1001) AS id
-            "#,
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            ALTER TABLE credential_stats
-            ADD CONSTRAINT test_stats_second_chunk_failure
-            CHECK (credential_id <> 1001)
-            "#,
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        let deltas = (1_u64..=1001)
-            .map(|credential_id| {
-                (
-                    credential_id,
-                    CredentialStatsDeltaRow {
-                        success_delta: 1,
-                        selection_delta: 1,
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let operation_id = Uuid::new_v4();
-        assert!(
-            store
-                .apply_credential_stats_deltas(operation_id, &deltas)
-                .await
-                .is_err()
-        );
-        let stats_count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM credential_stats")
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-        assert_eq!(stats_count, 0, "earlier chunks must roll back");
-        let ledger_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
-        )
-        .bind(operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            ledger_count, 0,
-            "failed batches must not reserve operation_id"
-        );
-
-        sqlx::query("ALTER TABLE credential_stats DROP CONSTRAINT test_stats_second_chunk_failure")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        store
-            .apply_credential_stats_deltas(operation_id, &deltas)
-            .await
-            .unwrap();
-        let totals = sqlx::query(
-            r#"
-            SELECT COUNT(*)::bigint AS credential_count,
-                   SUM(success_count)::bigint AS success_count,
-                   SUM(selection_count)::bigint AS selection_count
-            FROM credential_stats
-            "#,
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(totals.try_get::<i64, _>("credential_count").unwrap(), 1001);
-        assert_eq!(totals.try_get::<i64, _>("success_count").unwrap(), 1001);
-        assert_eq!(totals.try_get::<i64, _>("selection_count").unwrap(), 1001);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_stats_delta_batch_filters_soft_delete_races() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_stats_soft_delete_race".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let mut delete_tx = store.pool().begin().await.unwrap();
-        sqlx::query("UPDATE credentials SET deleted_at = now(), updated_at = now() WHERE id = $1")
-            .bind(credential_id as i64)
-            .execute(&mut *delete_tx)
-            .await
-            .unwrap();
-
-        let operation_id = Uuid::new_v4();
-        let deltas = HashMap::from([(
-            credential_id,
-            CredentialStatsDeltaRow {
-                success_delta: 9,
-                selection_delta: 11,
-                last_used_at: Some("2026-07-10T05:00:00Z".to_string()),
-            },
-        )]);
-        let task_store = store.clone();
-        let task_deltas = deltas.clone();
-        let mut stats_task = tokio::spawn(async move {
-            task_store
-                .apply_credential_stats_deltas(operation_id, &task_deltas)
-                .await
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut stats_task)
-                .await
-                .is_err(),
-            "stats batch should wait for the credential row lock"
-        );
-        delete_tx.commit().await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), stats_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        store
-            .apply_credential_stats_deltas(operation_id, &deltas)
-            .await
-            .unwrap();
-
-        let stats_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_stats WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(stats_count, 0);
-        let ledger = sqlx::query(
-            r#"
-            SELECT input_credential_count, applied_credential_count
-            FROM credential_stats_delta_batches
-            WHERE operation_id = $1
-            "#,
-        )
-        .bind(operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            ledger.try_get::<i32, _>("input_credential_count").unwrap(),
-            1
-        );
-        assert_eq!(
-            ledger
-                .try_get::<i32, _>("applied_credential_count")
-                .unwrap(),
-            0
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_last_used_at_compares_rfc3339_instants() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_last_used_rfc3339_order".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-
-        for last_used_at in [
-            "2026-07-10T04:00:00Z",
-            "2026-07-10T05:30:00+02:00",
-            "2026-07-10T04:30:00+00:00",
-            "2026-07-10T00:45:00-04:00",
-        ] {
-            store
-                .apply_credential_stats_deltas(
-                    Uuid::new_v4(),
-                    &HashMap::from([(
-                        credential_id,
-                        CredentialStatsDeltaRow {
-                            last_used_at: Some(last_used_at.to_string()),
-                            ..Default::default()
-                        },
-                    )]),
-                )
-                .await
-                .unwrap();
-        }
-        let last_used_at: Option<String> = sqlx::query_scalar(
-            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            last_used_at.as_deref(),
-            Some("2026-07-10T00:45:00-04:00"),
-            "offset timestamps must be ordered by instant rather than text"
-        );
-
-        store
-            .record_credential_api_failure(
-                credential_id,
-                Uuid::new_v4(),
-                "2026-07-10T06:00:00+00:00",
-                10,
-            )
-            .await
-            .unwrap();
-        store
-            .record_credential_refresh_failure(
-                credential_id,
-                Uuid::new_v4(),
-                "2026-07-10T07:30:00+02:00",
-                10,
-            )
-            .await
-            .unwrap();
-        let last_used_at: Option<String> = sqlx::query_scalar(
-            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(last_used_at.as_deref(), Some("2026-07-10T06:00:00+00:00"));
-
-        let invalid_operation_id = Uuid::new_v4();
-        let error = store
-            .apply_credential_stats_deltas(
-                invalid_operation_id,
-                &HashMap::from([(
-                    credential_id,
-                    CredentialStatsDeltaRow {
-                        last_used_at: Some("not-a-timestamp".to_string()),
-                        ..Default::default()
-                    },
-                )]),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("有效 RFC3339"));
-        let invalid_ledger_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
-        )
-        .bind(invalid_operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(invalid_ledger_count, 0);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_mutations_are_idempotent_and_revisioned() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_mutation_revision".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-
-        let failure_operation_id = Uuid::new_v4();
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (failure, duplicate) = tokio::join!(
-            first_store.record_credential_api_failure(
-                credential_id,
-                failure_operation_id,
-                "2026-07-10T00:00:00Z",
-                3,
-            ),
-            second_store.record_credential_api_failure(
-                credential_id,
-                failure_operation_id,
-                "2026-07-10T00:00:00Z",
-                3,
-            ),
-        );
-        let failure = failure.unwrap();
-        let duplicate = duplicate.unwrap();
-        assert_eq!(failure.failure_count, 1);
-        assert_eq!(failure.revision, 1);
-        assert_eq!(duplicate.failure_count, 1);
-        assert_eq!(duplicate.revision, 1);
-
-        let refresh_failure = store
-            .record_credential_refresh_failure(
-                credential_id,
-                Uuid::new_v4(),
-                "2026-07-10T00:00:01Z",
-                3,
-            )
-            .await
-            .unwrap();
-        assert_eq!(refresh_failure.failure_count, 1);
-        assert_eq!(refresh_failure.refresh_failure_count, 1);
-        assert_eq!(refresh_failure.revision, 2);
-
-        let success = store
-            .record_credential_success(credential_id, Uuid::new_v4())
-            .await
-            .unwrap();
-        assert_eq!(success.failure_count, 0);
-        assert_eq!(success.refresh_failure_count, 0);
-        assert_eq!(success.revision, 3);
-
-        let late_duplicate = store
-            .record_credential_api_failure(
-                credential_id,
-                failure_operation_id,
-                "2026-07-10T00:00:00Z",
-                3,
-            )
-            .await
-            .unwrap();
-        assert_eq!(late_duplicate.failure_count, 0);
-        assert_eq!(late_duplicate.revision, 3);
-
-        let mutation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(mutation_count, 3);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_generation_fences_pre_reset_mutations() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_generation_fence".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-
-        let reset_operation_id = Uuid::new_v4();
-        let reset_patch = CredentialRuntimeStatePatch {
-            failure_count: Some(0),
-            refresh_failure_count: Some(0),
-            disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
-            warmup_remaining: Some(0),
-            credential_disabled: Some(false),
-            expected_generation: Some(0),
-            advance_generation: true,
-            ..Default::default()
-        };
-        let reset = store
-            .patch_credential_runtime_state(credential_id, reset_operation_id, &reset_patch)
-            .await
-            .unwrap();
-        assert!(reset.applied);
-        assert_eq!(reset.state.generation, 1);
-        assert_eq!(reset.state.revision, 1);
-        assert!(!reset.credential_disabled);
-
-        let duplicate_reset = store
-            .patch_credential_runtime_state(credential_id, reset_operation_id, &reset_patch)
-            .await
-            .unwrap();
-        assert!(duplicate_reset.applied);
-        assert_eq!(duplicate_reset, reset);
-
-        let stale_failure_operation_id = Uuid::new_v4();
-        let stale_failure = store
-            .record_credential_api_failure_at_generation(
-                credential_id,
-                stale_failure_operation_id,
-                0,
-                "2026-07-10T00:00:01Z",
-                1,
-            )
-            .await
-            .unwrap();
-        assert!(!stale_failure.applied);
-        assert_eq!(stale_failure.state, reset.state);
-
-        let stale_refresh_operation_id = Uuid::new_v4();
-        let stale_refresh = store
-            .record_credential_refresh_failure_at_generation(
-                credential_id,
-                stale_refresh_operation_id,
-                0,
-                "2026-07-10T00:00:02Z",
-                1,
-            )
-            .await
-            .unwrap();
-        assert!(!stale_refresh.applied);
-        assert_eq!(stale_refresh.state, reset.state);
-
-        let stale_disable_operation_id = Uuid::new_v4();
-        let stale_disable = store
-            .mark_credential_disabled_at_generation(
-                credential_id,
-                stale_disable_operation_id,
-                0,
-                "InvalidRefreshToken",
-                CredentialRuntimeFailureCounts {
-                    failure_count: Some(1),
-                    refresh_failure_count: None,
-                },
-                "2026-07-10T00:00:03Z",
-            )
-            .await
-            .unwrap();
-        assert!(!stale_disable.applied);
-        assert_eq!(stale_disable.state, reset.state);
-        assert!(!stale_disable.credential_disabled);
-
-        let stale_ledger_count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::bigint
-            FROM credential_runtime_mutations
-            WHERE operation_id = ANY($1)
-            "#,
-        )
-        .bind(vec![
-            stale_failure_operation_id.to_string(),
-            stale_refresh_operation_id.to_string(),
-            stale_disable_operation_id.to_string(),
-        ])
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(stale_ledger_count, 0);
-        let stale_stats_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_stats WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(stale_stats_count, 0);
-        let credential_disabled: bool =
-            sqlx::query_scalar("SELECT disabled FROM credentials WHERE id = $1")
-                .bind(credential_id as i64)
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert!(!credential_disabled);
-
-        let current_failure = store
-            .record_credential_api_failure_at_generation(
-                credential_id,
-                Uuid::new_v4(),
-                1,
-                "2026-07-10T00:00:04Z",
-                1,
-            )
-            .await
-            .unwrap();
-        assert!(current_failure.applied);
-        assert_eq!(current_failure.state.generation, 1);
-        assert_eq!(current_failure.state.failure_count, 1);
-        assert_eq!(current_failure.state.revision, 2);
-        assert!(current_failure.credential_disabled);
-
-        let healed = store
-            .heal_credential_api_failures(credential_id)
-            .await
-            .unwrap()
-            .expect("threshold failure should be healed");
-        assert_eq!(healed.generation, 2);
-        assert_eq!(healed.failure_count, 0);
-        assert_eq!(healed.disabled_reason, None);
-        assert_eq!(healed.revision, 3);
-
-        let pre_heal_operation_id = Uuid::new_v4();
-        let pre_heal_failure = store
-            .record_credential_api_failure_at_generation(
-                credential_id,
-                pre_heal_operation_id,
-                1,
-                "2026-07-10T00:00:05Z",
-                1,
-            )
-            .await
-            .unwrap();
-        assert!(!pre_heal_failure.applied);
-        assert_eq!(pre_heal_failure.state, healed);
-        let pre_heal_ledger_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
-        )
-        .bind(pre_heal_operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(pre_heal_ledger_count, 0);
-
-        let current_refresh = store
-            .record_credential_refresh_failure_at_generation(
-                credential_id,
-                Uuid::new_v4(),
-                2,
-                "2026-07-10T00:00:06Z",
-                3,
-            )
-            .await
-            .unwrap();
-        assert!(current_refresh.applied);
-        assert_eq!(current_refresh.state.generation, 2);
-        assert_eq!(current_refresh.state.refresh_failure_count, 1);
-        assert_eq!(current_refresh.state.revision, 4);
-
-        let current_success = store
-            .record_credential_success_at_generation_with_count(credential_id, Uuid::new_v4(), 2, 1)
-            .await
-            .unwrap();
-        assert!(current_success.applied);
-        assert_eq!(current_success.state.generation, 2);
-        assert_eq!(current_success.state.failure_count, 0);
-        assert_eq!(current_success.state.refresh_failure_count, 0);
-        assert_eq!(current_success.state.revision, 5);
-
-        let future_operation_id = Uuid::new_v4();
-        let future_error = store
-            .record_credential_success_at_generation_with_count(
-                credential_id,
-                future_operation_id,
-                3,
-                1,
-            )
-            .await
-            .unwrap_err();
-        assert!(future_error.to_string().contains("generation 超前"));
-        let future_ledger_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
-        )
-        .bind(future_operation_id.to_string())
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(future_ledger_count, 0);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_disable_mutations_are_idempotent_and_preserve_unspecified_counts() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_disable_mutation_idempotency".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let initial = store
-            .save_credential_runtime_state_for(
-                credential_id,
-                &CredentialRuntimeStateRow {
-                    failure_count: 2,
-                    refresh_failure_count: 3,
-                    disabled_reason: None,
-                    warmup_remaining: 0,
-                    revision: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let CredentialRuntimeStateCasOutcome::Applied(initial) = initial else {
-            panic!("initial state must be applied");
-        };
-        assert_eq!(initial.revision, 1);
-
-        let duplicate_operation_id = Uuid::new_v4();
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (first, duplicate) = tokio::join!(
-            first_store.mark_credential_disabled(
-                credential_id,
-                duplicate_operation_id,
-                "QuotaExceeded",
-                Some(7),
-                None,
-                "2026-07-10T00:00:00Z",
-            ),
-            second_store.mark_credential_disabled(
-                credential_id,
-                duplicate_operation_id,
-                "QuotaExceeded",
-                Some(7),
-                None,
-                "2026-07-10T00:00:00Z",
-            ),
-        );
-        let first = first.unwrap();
-        let duplicate = duplicate.unwrap();
-        assert_eq!(first, duplicate);
-        assert!(first.credential_disabled);
-        let first = first.state;
-        assert_eq!(first.failure_count, 7);
-        assert_eq!(first.refresh_failure_count, 3);
-        assert_eq!(first.disabled_reason.as_deref(), Some("QuotaExceeded"));
-        assert_eq!(first.revision, 2);
-
-        let refresh_operation_id = Uuid::new_v4();
-        let failure_operation_id = Uuid::new_v4();
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (refresh_update, failure_update) = tokio::join!(
-            first_store.mark_credential_disabled(
-                credential_id,
-                refresh_operation_id,
-                "AccountSuspended",
-                None,
-                Some(11),
-                "2026-07-10T00:00:01Z",
-            ),
-            second_store.mark_credential_disabled(
-                credential_id,
-                failure_operation_id,
-                "InvalidRefreshToken",
-                Some(13),
-                None,
-                "2026-07-10T00:00:02Z",
-            ),
-        );
-        refresh_update.unwrap();
-        failure_update.unwrap();
-
-        let stored = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(stored.failure_count, 13);
-        assert_eq!(stored.refresh_failure_count, 11);
-        assert!(matches!(
-            stored.disabled_reason.as_deref(),
-            Some("AccountSuspended" | "InvalidRefreshToken")
-        ));
-        assert_eq!(stored.revision, 4);
-
-        let late_duplicate = store
-            .mark_credential_disabled(
-                credential_id,
-                duplicate_operation_id,
-                "QuotaExceeded",
-                Some(7),
-                None,
-                "1900-01-01T00:00:00Z",
-            )
-            .await
-            .unwrap();
-        assert_eq!(late_duplicate.state, stored);
-        assert!(late_duplicate.credential_disabled);
-        let last_used_at: Option<String> = sqlx::query_scalar(
-            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_ne!(last_used_at.as_deref(), Some("1900-01-01T00:00:00Z"));
-
-        let credential_row = sqlx::query(
-            "SELECT disabled, data->>'disabled' AS data_disabled FROM credentials WHERE id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert!(credential_row.try_get::<bool, _>("disabled").unwrap());
-        assert_eq!(
-            credential_row
-                .try_get::<Option<String>, _>("data_disabled")
-                .unwrap()
-                .as_deref(),
-            Some("true")
-        );
-        let mutation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(mutation_count, 3);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_patches_are_field_level_and_idempotent() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_patch_idempotency".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let initial = store
-            .save_credential_runtime_state_for(
-                credential_id,
-                &CredentialRuntimeStateRow {
-                    failure_count: 2,
-                    refresh_failure_count: 3,
-                    disabled_reason: Some("Initial".to_string()),
-                    warmup_remaining: 4,
-                    revision: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let CredentialRuntimeStateCasOutcome::Applied(initial) = initial else {
-            panic!("initial state must be applied");
-        };
-        assert_eq!(initial.revision, 1);
-
-        let failure_patch = CredentialRuntimeStatePatch {
-            failure_count: Some(7),
-            disabled_reason: CredentialRuntimeDisabledReasonPatch::Set("QuotaExceeded".to_string()),
-            credential_disabled: Some(true),
-            last_used_at: Some("2026-07-10T01:00:00Z".to_string()),
-            ..Default::default()
-        };
-        let refresh_patch = CredentialRuntimeStatePatch {
-            refresh_failure_count: Some(11),
-            warmup_remaining: Some(9),
-            ..Default::default()
-        };
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (failure_result, refresh_result) = tokio::join!(
-            first_store.patch_credential_runtime_state(
-                credential_id,
-                Uuid::new_v4(),
-                &failure_patch,
-            ),
-            second_store.patch_credential_runtime_state(
-                credential_id,
-                Uuid::new_v4(),
-                &refresh_patch,
-            ),
-        );
-        let failure_result = failure_result.unwrap();
-        let refresh_result = refresh_result.unwrap();
-        let mut applied_revisions = [failure_result.state.revision, refresh_result.state.revision];
-        applied_revisions.sort_unstable();
-        assert_eq!(applied_revisions, [2, 3]);
-
-        let stored = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(stored.failure_count, 7);
-        assert_eq!(stored.refresh_failure_count, 11);
-        assert_eq!(stored.disabled_reason.as_deref(), Some("QuotaExceeded"));
-        assert_eq!(stored.warmup_remaining, 9);
-        assert_eq!(stored.revision, 3);
-
-        let duplicate_operation_id = Uuid::new_v4();
-        let clear_patch = CredentialRuntimeStatePatch {
-            failure_count: Some(13),
-            disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
-            credential_disabled: Some(false),
-            last_used_at: Some("2026-07-10T02:00:00Z".to_string()),
-            ..Default::default()
-        };
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (first, duplicate) = tokio::join!(
-            first_store.patch_credential_runtime_state(
-                credential_id,
-                duplicate_operation_id,
-                &clear_patch,
-            ),
-            second_store.patch_credential_runtime_state(
-                credential_id,
-                duplicate_operation_id,
-                &clear_patch,
-            ),
-        );
-        let first = first.unwrap();
-        let duplicate = duplicate.unwrap();
-        assert_eq!(first, duplicate);
-        assert_eq!(first.state.failure_count, 13);
-        assert_eq!(first.state.refresh_failure_count, 11);
-        assert_eq!(first.state.disabled_reason, None);
-        assert_eq!(first.state.warmup_remaining, 9);
-        assert_eq!(first.state.revision, 4);
-        assert!(!first.credential_disabled);
-
-        let later = store
-            .patch_credential_runtime_state(
-                credential_id,
-                Uuid::new_v4(),
-                &CredentialRuntimeStatePatch {
-                    disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(
-                        "LaterDisable".to_string(),
-                    ),
-                    warmup_remaining: Some(21),
-                    credential_disabled: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(later.state.revision, 5);
-        assert!(later.credential_disabled);
-
-        let late_duplicate = store
-            .patch_credential_runtime_state(credential_id, duplicate_operation_id, &clear_patch)
-            .await
-            .unwrap();
-        assert_eq!(late_duplicate, later);
-        assert_eq!(late_duplicate.state.failure_count, 13);
-        assert_eq!(late_duplicate.state.refresh_failure_count, 11);
-        assert_eq!(late_duplicate.state.warmup_remaining, 21);
-        assert_eq!(
-            late_duplicate.state.disabled_reason.as_deref(),
-            Some("LaterDisable")
-        );
-        assert!(late_duplicate.credential_disabled);
-
-        let credential_row = sqlx::query(
-            "SELECT disabled, data->>'disabled' AS data_disabled FROM credentials WHERE id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert!(credential_row.try_get::<bool, _>("disabled").unwrap());
-        assert_eq!(
-            credential_row
-                .try_get::<Option<String>, _>("data_disabled")
-                .unwrap()
-                .as_deref(),
-            Some("true")
-        );
-        let last_used_at: Option<String> = sqlx::query_scalar(
-            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(last_used_at.as_deref(), Some("2026-07-10T02:00:00Z"));
-        let mutation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1",
-        )
-        .bind(credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(mutation_count, 4);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_mutations_and_snapshots_reject_soft_delete_races() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let mutation_credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_patch_soft_delete".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-
-        let mut delete_tx = store.pool().begin().await.unwrap();
-        sqlx::query("UPDATE credentials SET deleted_at = now(), updated_at = now() WHERE id = $1")
-            .bind(mutation_credential_id as i64)
-            .execute(&mut *delete_tx)
-            .await
-            .unwrap();
-        let patch_store = store.clone();
-        let mut patch_task = tokio::spawn(async move {
-            patch_store
-                .patch_credential_runtime_state(
-                    mutation_credential_id,
-                    Uuid::new_v4(),
-                    &CredentialRuntimeStatePatch {
-                        failure_count: Some(5),
-                        ..Default::default()
-                    },
-                )
-                .await
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut patch_task)
-                .await
-                .is_err(),
-            "runtime patch should wait for the credential row lock"
-        );
-        delete_tx.commit().await.unwrap();
-        let patch_error = tokio::time::timeout(std::time::Duration::from_secs(5), patch_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert!(patch_error.to_string().contains("不存在或已删除"));
-
-        let snapshot_credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_soft_delete".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let mut delete_tx = store.pool().begin().await.unwrap();
-        sqlx::query("UPDATE credentials SET deleted_at = now(), updated_at = now() WHERE id = $1")
-            .bind(snapshot_credential_id as i64)
-            .execute(&mut *delete_tx)
-            .await
-            .unwrap();
-        let snapshot_store = store.clone();
-        let mut snapshot_task = tokio::spawn(async move {
-            snapshot_store
-                .save_credential_runtime_state_snapshot(
-                    snapshot_credential_id,
-                    &CredentialRuntimeStateSnapshot {
-                        state: CredentialRuntimeStateRow {
-                            failure_count: 8,
-                            ..Default::default()
-                        },
-                        expected_revision: 0,
-                    },
-                )
-                .await
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut snapshot_task,)
-                .await
-                .is_err(),
-            "runtime snapshot should wait for the credential row lock"
-        );
-        delete_tx.commit().await.unwrap();
-        let snapshot_error = tokio::time::timeout(std::time::Duration::from_secs(5), snapshot_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert!(snapshot_error.to_string().contains("不存在或已删除"));
-
-        let runtime_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_state WHERE credential_id IN ($1, $2)",
-        )
-        .bind(mutation_credential_id as i64)
-        .bind(snapshot_credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(runtime_count, 0);
-        let mutation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id IN ($1, $2)",
-        )
-        .bind(mutation_credential_id as i64)
-        .bind(snapshot_credential_id as i64)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(mutation_count, 0);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_snapshot_cas_rejects_stale_revision_without_writing() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_stale".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let initial = CredentialRuntimeStateSnapshot {
-            state: CredentialRuntimeStateRow {
-                failure_count: 1,
-                refresh_failure_count: 0,
-                disabled_reason: None,
-                warmup_remaining: 4,
-                revision: 0,
-                ..Default::default()
-            },
-            expected_revision: 0,
-        };
-        let first = store
-            .save_credential_runtime_state_snapshot(credential_id, &initial)
-            .await
-            .unwrap();
-        let CredentialRuntimeStateCasOutcome::Applied(first) = first else {
-            panic!("initial snapshot must be applied");
-        };
-        assert_eq!(first.revision, 1);
-
-        let fresh = CredentialRuntimeStateSnapshot {
-            state: CredentialRuntimeStateRow {
-                failure_count: 2,
-                refresh_failure_count: 1,
-                disabled_reason: Some("TooManyFailures".to_string()),
-                warmup_remaining: 3,
-                revision: first.revision,
-                ..Default::default()
-            },
-            expected_revision: first.revision,
-        };
-        let fresh = store
-            .save_credential_runtime_state_snapshot(credential_id, &fresh)
-            .await
-            .unwrap();
-        let CredentialRuntimeStateCasOutcome::Applied(fresh) = fresh else {
-            panic!("fresh snapshot must be applied");
-        };
-        assert_eq!(fresh.revision, 2);
-
-        let stale = CredentialRuntimeStateSnapshot {
-            state: CredentialRuntimeStateRow {
-                failure_count: 99,
-                refresh_failure_count: 99,
-                disabled_reason: None,
-                warmup_remaining: 99,
-                revision: 1,
-                ..Default::default()
-            },
-            expected_revision: 1,
-        };
-        let conflict = store
-            .save_credential_runtime_state_snapshot(credential_id, &stale)
-            .await
-            .unwrap();
-        assert_eq!(
-            conflict,
-            CredentialRuntimeStateCasOutcome::Conflict {
-                current: Some(fresh.clone())
-            }
-        );
-        let stored = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(stored, fresh);
-
-        let missing_state_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_missing".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let missing_state_snapshot = CredentialRuntimeStateSnapshot {
-            state: CredentialRuntimeStateRow {
-                revision: 7,
-                ..CredentialRuntimeStateRow::default()
-            },
-            expected_revision: 7,
-        };
-        assert_eq!(
-            store
-                .save_credential_runtime_state_snapshot(missing_state_id, &missing_state_snapshot,)
-                .await
-                .unwrap(),
-            CredentialRuntimeStateCasOutcome::Conflict { current: None }
-        );
-        assert!(
-            !store
-                .load_credential_runtime_state()
-                .await
-                .unwrap()
-                .contains_key(&missing_state_id)
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_snapshot_cas_allows_one_concurrent_writer() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_concurrent".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let initial = CredentialRuntimeStateRow {
-            failure_count: 0,
-            refresh_failure_count: 0,
-            disabled_reason: None,
-            warmup_remaining: 0,
-            revision: 0,
-            ..Default::default()
-        };
-        let initial = store
-            .save_credential_runtime_state_for(credential_id, &initial)
-            .await
-            .unwrap();
-        let CredentialRuntimeStateCasOutcome::Applied(initial) = initial else {
-            panic!("initial state must be applied");
-        };
-        assert_eq!(initial.revision, 1);
-
-        let first_snapshot = CredentialRuntimeStateSnapshot {
-            state: CredentialRuntimeStateRow {
-                failure_count: 10,
-                revision: initial.revision,
-                ..initial.clone()
-            },
-            expected_revision: initial.revision,
-        };
-        let second_snapshot = CredentialRuntimeStateSnapshot {
-            state: CredentialRuntimeStateRow {
-                failure_count: 20,
-                revision: initial.revision,
-                ..initial
-            },
-            expected_revision: 1,
-        };
-        let first_store = store.clone();
-        let second_store = store.clone();
-        let (first, second) = tokio::join!(
-            first_store.save_credential_runtime_state_snapshot(credential_id, &first_snapshot,),
-            second_store.save_credential_runtime_state_snapshot(credential_id, &second_snapshot,),
-        );
-        let outcomes = [first.unwrap(), second.unwrap()];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, CredentialRuntimeStateCasOutcome::Applied(_)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(
-                    outcome,
-                    CredentialRuntimeStateCasOutcome::Conflict { current: Some(_) }
-                ))
-                .count(),
-            1
-        );
-        let stored = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(stored.revision, 2);
-        assert!(matches!(stored.failure_count, 10 | 20));
-        for outcome in outcomes {
-            match outcome {
-                CredentialRuntimeStateCasOutcome::Applied(state)
-                | CredentialRuntimeStateCasOutcome::Conflict {
-                    current: Some(state),
-                } => assert_eq!(state, stored),
-                CredentialRuntimeStateCasOutcome::Conflict { current: None } => {
-                    panic!("existing state conflict must return the authoritative row")
-                }
-            }
-        }
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_mutation_cleanup_is_expiry_aware_and_bounded() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_mutation_cleanup".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        let operation_ids = (0..4).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
-        for operation_id in &operation_ids {
-            store
-                .record_credential_success(credential_id, *operation_id)
-                .await
-                .unwrap();
-        }
-        sqlx::query(
-            r#"
-            UPDATE credential_runtime_mutations
-            SET created_at = now() - interval '2 days'
-            WHERE operation_id IN ($1, $2, $3)
-            "#,
-        )
-        .bind(operation_ids[0].to_string())
-        .bind(operation_ids[1].to_string())
-        .bind(operation_ids[2].to_string())
-        .execute(store.pool())
-        .await
-        .unwrap();
-
-        let retention = std::time::Duration::from_secs(24 * 60 * 60);
-        assert_eq!(
-            store
-                .cleanup_credential_runtime_mutations(retention, 2)
-                .await
-                .unwrap(),
-            2
-        );
-        let remaining_expired: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)::bigint
-            FROM credential_runtime_mutations
-            WHERE created_at < now() - interval '1 day'
-            "#,
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(remaining_expired, 1);
-
-        assert_eq!(
-            store
-                .cleanup_credential_runtime_mutations(retention, 1)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            store
-                .cleanup_credential_runtime_mutations(retention, 1)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            store
-                .cleanup_credential_runtime_mutations(retention, 0)
-                .await
-                .unwrap(),
-            0
-        );
-        let remaining_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT operation_id FROM credential_runtime_mutations ORDER BY operation_id",
-        )
-        .fetch_all(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(remaining_ids, vec![operation_ids[3].to_string()]);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_consistent_credential_runtime_load_matches_individual_loads() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let first_id = store
-            .insert_credential(&KiroCredentials {
-                email: Some("consistent-first@example.com".to_string()),
-                kiro_api_key: Some("ksk_consistent_first".to_string()),
-                auth_method: Some("api_key".to_string()),
-                priority: 2,
-                disabled: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        store
-            .insert_credential(&KiroCredentials {
-                email: Some("consistent-second@example.com".to_string()),
-                kiro_api_key: Some("ksk_consistent_second".to_string()),
-                auth_method: Some("api_key".to_string()),
-                priority: 1,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let runtime_state_write = store
-            .save_credential_runtime_state_for(
-                first_id,
-                &CredentialRuntimeStateRow {
-                    failure_count: 2,
-                    refresh_failure_count: 1,
-                    disabled_reason: Some("TooManyFailures".to_string()),
-                    warmup_remaining: 3,
-                    revision: 0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            runtime_state_write,
-            CredentialRuntimeStateCasOutcome::Applied(_)
-        ));
-
-        let individual_credentials = store.load_credentials().await.unwrap();
-        let individual_states = store.load_credential_runtime_state().await.unwrap();
-        let (consistent_credentials, consistent_states) =
-            store.load_credentials_with_runtime_state().await.unwrap();
-
-        assert_eq!(consistent_credentials.len(), individual_credentials.len());
-        for (consistent, individual) in consistent_credentials
-            .iter()
-            .zip(individual_credentials.iter())
-        {
-            assert_eq!(consistent.id, individual.id);
-            assert_eq!(consistent.created_at, individual.created_at);
-            assert_eq!(consistent.updated_at, individual.updated_at);
-            assert_eq!(
-                serde_json::to_value(consistent).unwrap(),
-                serde_json::to_value(individual).unwrap()
-            );
-        }
-        assert_eq!(consistent_states.len(), individual_states.len());
-        for (credential_id, individual) in individual_states {
-            let consistent = consistent_states.get(&credential_id).unwrap();
-            assert_eq!(consistent.failure_count, individual.failure_count);
-            assert_eq!(
-                consistent.refresh_failure_count,
-                individual.refresh_failure_count
-            );
-            assert_eq!(consistent.disabled_reason, individual.disabled_reason);
-            assert_eq!(consistent.warmup_remaining, individual.warmup_remaining);
-            assert_eq!(consistent.generation, individual.generation);
-            assert_eq!(consistent.revision, individual.revision);
-        }
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_revision_migration_upgrades_existing_rows() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_revision_migration".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        sqlx::query(
-            "DELETE FROM schema_migrations WHERE version = 'credential-runtime-revision-v1'",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query("DROP TABLE credential_runtime_mutations")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        sqlx::query("ALTER TABLE credential_runtime_state DROP COLUMN revision")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO credential_runtime_state (
-                credential_id, failure_count, refresh_failure_count,
-                disabled_reason, warmup_remaining, updated_at
-            )
-            VALUES ($1, 2, 1, NULL, 0, now())
-            "#,
-        )
-        .bind(credential_id as i64)
-        .execute(store.pool())
-        .await
-        .unwrap();
-
-        store.migrate_with_options(false).await.unwrap();
-
-        let state = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(state.failure_count, 2);
-        assert_eq!(state.refresh_failure_count, 1);
-        assert_eq!(state.revision, 1);
-        let mutation_table_exists: Option<String> =
-            sqlx::query_scalar("SELECT to_regclass('credential_runtime_mutations')::text")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(
-            mutation_table_exists.as_deref(),
-            Some("credential_runtime_mutations")
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_runtime_generation_migration_upgrades_existing_rows() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-        let credential_id = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_runtime_generation_migration".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .id
-            .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO credential_runtime_state (
-                credential_id, failure_count, refresh_failure_count,
-                disabled_reason, warmup_remaining, generation, revision, updated_at
-            )
-            VALUES ($1, 2, 1, NULL, 0, 0, 1, now())
-            "#,
-        )
-        .bind(credential_id as i64)
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "DELETE FROM schema_migrations WHERE version = 'credential-runtime-generation-v1'",
-        )
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query("ALTER TABLE credential_runtime_state DROP COLUMN generation")
-            .execute(store.pool())
-            .await
-            .unwrap();
-
-        store.migrate_with_options(false).await.unwrap();
-
-        let state = store
-            .load_credential_runtime_state()
-            .await
-            .unwrap()
-            .remove(&credential_id)
-            .unwrap();
-        assert_eq!(state.failure_count, 2);
-        assert_eq!(state.refresh_failure_count, 1);
-        assert_eq!(state.generation, 0);
-        assert_eq!(state.revision, 1);
-        let migration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM schema_migrations WHERE version = 'credential-runtime-generation-v1'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(migration_count, 1);
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_generates_unique_ids_for_concurrent_credential_inserts() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
-        clean(&store).await;
-
-        let mut handles = Vec::new();
-        for index in 0..20 {
-            let store = store.clone();
-            handles.push(tokio::spawn(async move {
-                store
-                    .insert_credential(&KiroCredentials {
-                        email: Some(format!("concurrent-{}@example.com", index)),
-                        kiro_api_key: Some(format!("ksk_concurrent_{}", index)),
-                        auth_method: Some("api_key".to_string()),
-                        priority: index,
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap()
-                    .id
-                    .unwrap()
-            }));
-        }
-
-        let mut ids = Vec::new();
-        for handle in handles {
-            ids.push(handle.await.unwrap());
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), 20);
-
-        let env_first = store
-            .ensure_api_key_credential("ksk_env_import")
-            .await
-            .unwrap();
-        let env_second = store
-            .ensure_api_key_credential("ksk_env_import")
-            .await
-            .unwrap();
-        assert_eq!(env_first.id, env_second.id);
-
-        let duplicate = store
-            .insert_credential(&KiroCredentials {
-                email: Some("duplicate@example.com".to_string()),
-                kiro_api_key: Some("ksk_concurrent_0".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(duplicate.to_string().contains("kiroApiKey 重复"));
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn postgres_explicit_credential_ids_advance_sequence_without_regression() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let store = PostgresStore::connect_test(&config).await.unwrap();
-        clean(&store).await;
-
-        store
-            .save_credentials(&[KiroCredentials {
-                id: Some(7),
-                email: Some("explicit-seven@example.com".to_string()),
-                kiro_api_key: Some("ksk_explicit_seven".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            }])
-            .await
-            .unwrap();
-        let after_explicit = store
-            .insert_credential(&KiroCredentials {
-                email: Some("after-explicit@example.com".to_string()),
-                kiro_api_key: Some("ksk_after_explicit".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(after_explicit.id.unwrap() > 7);
-
-        sqlx::query("SELECT setval('credentials_id_seq', $1, true)")
-            .bind(100_i64)
-            .execute(store.pool())
-            .await
-            .unwrap();
-        store
-            .save_credentials(&[KiroCredentials {
-                id: Some(50),
-                email: Some("explicit-fifty@example.com".to_string()),
-                kiro_api_key: Some("ksk_explicit_fifty".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            }])
-            .await
-            .unwrap();
-        let after_higher_sequence = store
-            .insert_credential(&KiroCredentials {
-                email: Some("after-higher-sequence@example.com".to_string()),
-                kiro_api_key: Some("ksk_after_higher_sequence".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(after_higher_sequence.id, Some(101));
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn postgres_serializes_explicit_and_automatic_credential_id_allocation() {
-        let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        const EXPLICIT_INSERTS: usize = 8;
-        const AUTOMATIC_INSERTS: usize = 16;
-        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
-        clean(&store).await;
-        let barrier = Arc::new(tokio::sync::Barrier::new(
-            EXPLICIT_INSERTS + AUTOMATIC_INSERTS,
-        ));
-        let mut handles = Vec::new();
-
-        for index in 0..EXPLICIT_INSERTS {
-            let store = store.clone();
-            let barrier = barrier.clone();
-            handles.push(tokio::spawn(async move {
-                let id = ((index + 1) * 10_000) as u64;
-                barrier.wait().await;
-                let saved = store
-                    .save_credentials(&[KiroCredentials {
-                        id: Some(id),
-                        email: Some(format!("explicit-concurrent-{index}@example.com")),
-                        kiro_api_key: Some(format!("ksk_explicit_concurrent_{index}")),
-                        auth_method: Some("api_key".to_string()),
-                        ..Default::default()
-                    }])
-                    .await
-                    .unwrap();
-                saved[0].id.unwrap()
-            }));
-        }
-        for index in 0..AUTOMATIC_INSERTS {
-            let store = store.clone();
-            let barrier = barrier.clone();
-            handles.push(tokio::spawn(async move {
-                barrier.wait().await;
-                store
-                    .insert_credential(&KiroCredentials {
-                        email: Some(format!("automatic-concurrent-{index}@example.com")),
-                        kiro_api_key: Some(format!("ksk_automatic_concurrent_{index}")),
-                        auth_method: Some("api_key".to_string()),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap()
-                    .id
-                    .unwrap()
-            }));
-        }
-
-        let mut ids = Vec::with_capacity(handles.len());
-        for handle in handles {
-            ids.push(handle.await.unwrap());
-        }
-        let inserted_count = ids.len();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), inserted_count);
-        assert_eq!(
-            store.load_credentials().await.unwrap().len(),
-            inserted_count
-        );
-        let after_concurrent_inserts = store
-            .insert_credential(&KiroCredentials {
-                email: Some("after-concurrent-allocation@example.com".to_string()),
-                kiro_api_key: Some("ksk_after_concurrent_allocation".to_string()),
-                auth_method: Some("api_key".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(after_concurrent_inserts.id.unwrap() > (EXPLICIT_INSERTS * 10_000) as u64);
-
-        store.drop_test_schema().await.unwrap();
     }
 
     #[tokio::test]

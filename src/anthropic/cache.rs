@@ -2,7 +2,15 @@ use serde_json::json;
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::anthropic::prompt_cache::PromptCacheUsage;
-use crate::kiro::model::events::MetadataTokenUsage;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpstreamUsage {
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
+}
 use crate::model::config::{
     CacheHitShapingPolicy, ReportedUsageFieldMode, ReportedUsageFieldPolicy,
     ReportedUsagePathPolicy,
@@ -2165,7 +2173,7 @@ impl CacheSimulation {
 
 #[cfg(test)]
 pub fn build_usage_with_simulation(
-    metadata_usage: Option<&MetadataTokenUsage>,
+    metadata_usage: Option<&UpstreamUsage>,
     total_input_tokens: i32,
     output_tokens: i32,
     simulation: Option<CacheSimulation>,
@@ -2180,7 +2188,7 @@ pub fn build_usage_with_simulation(
 }
 
 pub fn build_usage_with_simulation_policy(
-    metadata_usage: Option<&MetadataTokenUsage>,
+    metadata_usage: Option<&UpstreamUsage>,
     total_input_tokens: i32,
     output_tokens: i32,
     simulation: Option<CacheSimulation>,
@@ -2188,7 +2196,7 @@ pub fn build_usage_with_simulation_policy(
 ) -> CacheUsage {
     if let Some(usage) = metadata_usage {
         let resolved =
-            usage_from_metadata_or_estimate(Some(usage), total_input_tokens, output_tokens);
+            usage_from_upstream_or_estimate(Some(usage), total_input_tokens, output_tokens);
         if fill_zero_metadata_cache_from_simulation && metadata_cache_is_empty(usage) {
             if let Some(simulation) = simulation {
                 let total_input_tokens = resolved.input_tokens.max(total_input_tokens.max(0));
@@ -2212,8 +2220,8 @@ pub fn build_usage_with_simulation_policy(
         })
 }
 
-pub fn usage_from_metadata_or_estimate(
-    metadata_usage: Option<&MetadataTokenUsage>,
+pub fn usage_from_upstream_or_estimate(
+    metadata_usage: Option<&UpstreamUsage>,
     input_tokens: i32,
     output_tokens: i32,
 ) -> CacheUsage {
@@ -2236,19 +2244,15 @@ pub fn usage_from_metadata_or_estimate(
     } else {
         output_tokens
     };
-    let cache_creation_input_tokens = usage.cache_write_input_tokens.max(0);
+    let cache_creation_input_tokens = usage.cache_creation_input_tokens.max(0);
     let cache_read_input_tokens = usage.cache_read_input_tokens.max(0);
     let cached_input_tokens = cache_creation_input_tokens.saturating_add(cache_read_input_tokens);
-    let metadata_total_input_tokens = usage.total_tokens.max(0).saturating_sub(output_tokens);
-    let fallback_total_input_tokens = if usage.total_tokens > 0 {
-        metadata_total_input_tokens
+    let input_tokens = if usage.input_tokens > 0 {
+        usage.input_tokens
     } else {
         estimated_total_input_tokens
-    };
-    let input_tokens = if usage.uncached_input_tokens > 0 {
-        usage.uncached_input_tokens
-    } else {
-        fallback_total_input_tokens.saturating_sub(cached_input_tokens)
+            .saturating_sub(cached_input_tokens)
+            .max(0)
     };
 
     CacheUsage {
@@ -2259,20 +2263,26 @@ pub fn usage_from_metadata_or_estimate(
         output_tokens,
         cache_creation_input_tokens,
         cache_read_input_tokens,
-        cache_creation_5m_input_tokens: cache_creation_input_tokens,
-        cache_creation_1h_input_tokens: 0,
+        cache_creation_5m_input_tokens: if usage.cache_creation_5m_input_tokens > 0
+            || usage.cache_creation_1h_input_tokens > 0
+        {
+            usage.cache_creation_5m_input_tokens.max(0)
+        } else {
+            cache_creation_input_tokens
+        },
+        cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens.max(0),
     }
 }
 
-pub fn metadata_usage_has_signal(usage: &MetadataTokenUsage) -> bool {
-    usage.uncached_input_tokens > 0
+pub fn metadata_usage_has_signal(usage: &UpstreamUsage) -> bool {
+    usage.input_tokens > 0
         || usage.output_tokens > 0
         || usage.cache_read_input_tokens > 0
-        || usage.cache_write_input_tokens > 0
+        || usage.cache_creation_input_tokens > 0
 }
 
-pub fn metadata_cache_is_empty(usage: &MetadataTokenUsage) -> bool {
-    usage.cache_read_input_tokens <= 0 && usage.cache_write_input_tokens <= 0
+pub fn metadata_cache_is_empty(usage: &UpstreamUsage) -> bool {
+    usage.cache_read_input_tokens <= 0 && usage.cache_creation_input_tokens <= 0
 }
 
 pub fn usage_has_cache(usage: &CacheUsage) -> bool {
@@ -2282,6 +2292,36 @@ pub fn usage_has_cache(usage: &CacheUsage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_usage_preserves_ttl_split_and_clamps_estimated_uncached_input() {
+        let upstream = UpstreamUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 60,
+            cache_creation_input_tokens: 40,
+            cache_creation_5m_input_tokens: 10,
+            cache_creation_1h_input_tokens: 30,
+        };
+        let usage = usage_from_upstream_or_estimate(Some(&upstream), 20, 7);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.total_input_tokens, 100);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 10);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 30);
+        let default_ttl = usage_from_upstream_or_estimate(
+            Some(&UpstreamUsage {
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                ..upstream
+            }),
+            120,
+            7,
+        );
+        assert_eq!(default_ttl.input_tokens, 20);
+        assert_eq!(default_ttl.cache_creation_5m_input_tokens, 40);
+        assert_eq!(default_ttl.cache_creation_1h_input_tokens, 0);
+    }
 
     fn cache_ttl_request(
         markers: &[serde_json::Value],
@@ -2360,11 +2400,6 @@ mod tests {
                 "{mode:?} {request:?} upstream_1h={upstream_1h}"
             );
         }
-        // Local accounts have no channel marker.
-        assert_eq!(
-            UpstreamThenRequestDefault5m.for_local(),
-            FollowRequestDefault5m
-        );
     }
 
     #[test]
@@ -2392,11 +2427,9 @@ mod tests {
                 mode
             );
         }
-        let policy: CacheTtlPolicy = serde_json::from_value(
-            json!({"local": "force_1h", "externalPool": "upstream_then_request_default_5m"}),
-        )
-        .unwrap();
-        assert_eq!(policy.local, CacheTtlMode::Force1h);
+        let policy: CacheTtlPolicy =
+            serde_json::from_value(json!({"externalPool": "upstream_then_request_default_5m"}))
+                .unwrap();
         assert_eq!(
             policy.external_pool,
             CacheTtlMode::UpstreamThenRequestDefault5m
@@ -2442,12 +2475,13 @@ mod tests {
 
     #[test]
     fn metadata_usage_takes_precedence_over_simulated_cache() {
-        let metadata = MetadataTokenUsage {
-            uncached_input_tokens: 1200,
+        let metadata = UpstreamUsage {
+            input_tokens: 1200,
             output_tokens: 900,
-            total_tokens: 207_300,
+
             cache_read_input_tokens: 180_000,
-            cache_write_input_tokens: 24_000,
+            cache_creation_input_tokens: 24_000,
+            ..UpstreamUsage::default()
         };
 
         let usage = build_usage_with_simulation(Some(&metadata), 10_000, 5, None);
@@ -2462,12 +2496,13 @@ mod tests {
 
     #[test]
     fn high_cache_policy_fills_zero_metadata_cache_from_larger_local_total() {
-        let metadata = MetadataTokenUsage {
-            uncached_input_tokens: 50_000,
+        let metadata = UpstreamUsage {
+            input_tokens: 50_000,
             output_tokens: 42,
-            total_tokens: 50_042,
+
             cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            ..UpstreamUsage::default()
         };
         let simulation = CacheSimulation::from_prompt_cache_with_ratio(
             PromptCacheUsage {
@@ -2492,12 +2527,13 @@ mod tests {
 
     #[test]
     fn high_cache_policy_uses_local_totals_when_metadata_is_all_zero() {
-        let metadata = MetadataTokenUsage {
-            uncached_input_tokens: 0,
+        let metadata = UpstreamUsage {
+            input_tokens: 0,
             output_tokens: 0,
-            total_tokens: 0,
+
             cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            ..UpstreamUsage::default()
         };
         let simulation = CacheSimulation::from_prompt_cache_with_ratio(
             PromptCacheUsage {
@@ -2521,7 +2557,7 @@ mod tests {
 
     #[test]
     fn all_zero_metadata_without_simulation_falls_back_to_local_estimates() {
-        let metadata = MetadataTokenUsage::default();
+        let metadata = UpstreamUsage::default();
 
         let usage = build_usage_with_simulation_policy(Some(&metadata), 4_096, 17, None, false);
 
@@ -2535,15 +2571,16 @@ mod tests {
 
     #[test]
     fn partial_metadata_preserves_cache_and_falls_back_missing_fields() {
-        let metadata = MetadataTokenUsage {
-            uncached_input_tokens: 0,
+        let metadata = UpstreamUsage {
+            input_tokens: 0,
             output_tokens: 0,
-            total_tokens: 0,
+
             cache_read_input_tokens: 1_500,
-            cache_write_input_tokens: 250,
+            cache_creation_input_tokens: 250,
+            ..UpstreamUsage::default()
         };
 
-        let usage = usage_from_metadata_or_estimate(Some(&metadata), 4_096, 17);
+        let usage = usage_from_upstream_or_estimate(Some(&metadata), 4_096, 17);
 
         assert_eq!(usage.total_input_tokens, 4_096);
         assert_eq!(usage.input_tokens, 2_346);
@@ -2554,16 +2591,17 @@ mod tests {
     }
 
     #[test]
-    fn partial_metadata_uses_reported_total_to_derive_uncached_input() {
-        let metadata = MetadataTokenUsage {
-            uncached_input_tokens: 0,
+    fn partial_upstream_usage_preserves_reported_uncached_input() {
+        let metadata = UpstreamUsage {
+            input_tokens: 400,
             output_tokens: 100,
-            total_tokens: 2_000,
+
             cache_read_input_tokens: 1_200,
-            cache_write_input_tokens: 300,
+            cache_creation_input_tokens: 300,
+            ..UpstreamUsage::default()
         };
 
-        let usage = usage_from_metadata_or_estimate(Some(&metadata), 4_096, 17);
+        let usage = usage_from_upstream_or_estimate(Some(&metadata), 4_096, 17);
 
         assert_eq!(usage.total_input_tokens, 1_900);
         assert_eq!(usage.input_tokens, 400);
@@ -2574,12 +2612,13 @@ mod tests {
 
     #[test]
     fn high_cache_policy_preserves_nonzero_metadata_cache() {
-        let metadata = MetadataTokenUsage {
-            uncached_input_tokens: 1200,
+        let metadata = UpstreamUsage {
+            input_tokens: 1200,
             output_tokens: 900,
-            total_tokens: 207_300,
+
             cache_read_input_tokens: 180_000,
-            cache_write_input_tokens: 24_000,
+            cache_creation_input_tokens: 24_000,
+            ..UpstreamUsage::default()
         };
         let simulation = CacheSimulation::from_prompt_cache_with_ratio(
             PromptCacheUsage {

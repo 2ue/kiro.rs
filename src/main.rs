@@ -4,7 +4,6 @@ mod common;
 mod diagnostics;
 mod external_pool;
 mod http_client;
-mod kiro;
 mod model;
 mod storage;
 pub mod token;
@@ -18,7 +17,6 @@ mod ui;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::{
-    collections::HashMap,
     future::{Future, IntoFuture},
     sync::{
         Arc,
@@ -35,11 +33,6 @@ use clap::Parser;
 use common::auth::RequestApiKeyStore;
 use external_pool::ExternalPoolManager;
 use futures::StreamExt;
-use kiro::endpoint::{
-    AmazonqEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
-};
-use kiro::provider::KiroProvider;
-use kiro::token_manager::MultiTokenManager;
 use model::arg::{Args, Command, MaintenanceCommand};
 use model::config::Config;
 use serde_json::{Value, json};
@@ -68,75 +61,13 @@ fn server_graceful_shutdown_timeout() -> StdDuration {
 const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(4);
-const SHUTDOWN_LEASE_RELEASE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const READYZ_DEPENDENCY_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 /// A dependency check that misses its timeout is only reported as not ready once the dependency
 /// has had no successful check for this long. Under full load a ping waits behind the requests
 /// sharing its connection pool, and one slow answer is a busy dependency, not a down one.
 const READYZ_DEPENDENCY_GRACE: StdDuration = StdDuration::from_secs(10);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
-const MODEL_CAPABILITY_HEALTH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
-const MODEL_CAPABILITY_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(300);
 const OBSERVABILITY_REDIS_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelCapabilityDiscoveryOutcome {
-    Pending,
-    Complete,
-    Incomplete,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeReasoningUnknownReason {
-    NoLocalCohorts,
-    DiscoveryPending,
-    DiscoveryIncomplete,
-    DiscoveryFailed,
-    ContractMismatch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeReasoningStartupDecision {
-    ContinueReady(anthropic::model_capabilities::KiroReasoningCohortContractMatch),
-    ContinueReasoningUnknown(NativeReasoningUnknownReason),
-}
-
-fn decide_native_reasoning_startup(
-    discovery: ModelCapabilityDiscoveryOutcome,
-    current_cohort_count: usize,
-    contract_match: anthropic::model_capabilities::KiroReasoningCohortContractMatch,
-) -> NativeReasoningStartupDecision {
-    use anthropic::model_capabilities::KiroReasoningCohortContractMatch;
-
-    if current_cohort_count == 0 {
-        return NativeReasoningStartupDecision::ContinueReasoningUnknown(
-            NativeReasoningUnknownReason::NoLocalCohorts,
-        );
-    }
-    if contract_match != KiroReasoningCohortContractMatch::None {
-        return NativeReasoningStartupDecision::ContinueReady(contract_match);
-    }
-    let reason = match discovery {
-        ModelCapabilityDiscoveryOutcome::Pending => NativeReasoningUnknownReason::DiscoveryPending,
-        ModelCapabilityDiscoveryOutcome::Incomplete => {
-            NativeReasoningUnknownReason::DiscoveryIncomplete
-        }
-        ModelCapabilityDiscoveryOutcome::Failed => NativeReasoningUnknownReason::DiscoveryFailed,
-        ModelCapabilityDiscoveryOutcome::Complete => NativeReasoningUnknownReason::ContractMismatch,
-    };
-    NativeReasoningStartupDecision::ContinueReasoningUnknown(reason)
-}
-
-fn model_capability_retry_delay(consecutive_failures: u32) -> StdDuration {
-    let seconds = match consecutive_failures {
-        0 | 1 => 30,
-        2 => 60,
-        3 => 120,
-        _ => MODEL_CAPABILITY_RETRY_MAX_DELAY.as_secs(),
-    };
-    StdDuration::from_secs(seconds)
-}
 
 /// tokio 工作线程与 blocking 线程栈大小。
 ///
@@ -220,15 +151,6 @@ async fn async_main() {
             std::process::exit(1);
         }),
     );
-    let env_kiro_api_key = match std::env::var("KIRO_API_KEY") {
-        Ok(value) if value.trim().is_empty() => {
-            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
-            None
-        }
-        Ok(value) => Some(value.trim().to_string()),
-        Err(_) => None,
-    };
-
     postgres_store
         .bootstrap_runtime_config_from_file(&file_config)
         .await
@@ -236,22 +158,6 @@ async fn async_main() {
             tracing::error!("从配置文件 bootstrap 运行配置到 PgSQL 失败: {}", e);
             std::process::exit(1);
         });
-    if let Some(kiro_api_key) = &env_kiro_api_key {
-        postgres_store
-            .ensure_api_key_credential(kiro_api_key)
-            .await
-            .map(|credential| {
-                tracing::info!(
-                    credential_id = credential.id.unwrap_or_default(),
-                    "KIRO_API_KEY 已作为 API Key 凭据存在或完成一次性导入"
-                );
-            })
-            .unwrap_or_else(|e| {
-                tracing::error!("导入 KIRO_API_KEY 到 PgSQL 失败: {}", e);
-                std::process::exit(1);
-            });
-    }
-
     let mut config = postgres_store
         .load_runtime_config()
         .await
@@ -375,36 +281,6 @@ async fn async_main() {
         "usage/dashboard PgSQL 已使用独立连接池，避免占用主业务 PgSQL pool"
     );
 
-    let (credentials_list, initial_runtime_states, initial_account_info) = postgres_store
-        .load_credentials_with_runtime_state_and_account_info()
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("从 PgSQL 一致性加载凭据和运行态失败: {}", e);
-            std::process::exit(1);
-        });
-
-    if let Err(error) = kiro::kiro_version::initialize_state_if_missing(
-        &postgres_store,
-        config.legacy_auto_sync_migration_pending(),
-    )
-    .await
-    {
-        tracing::error!(
-            "启动前加载或初始化持久化 Kiro 客户端版本失败，拒绝以不确定版本接收请求: {}",
-            error
-        );
-        std::process::exit(1);
-    }
-    tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
-
-    if let Some(first_credentials) = credentials_list.first() {
-        tracing::debug!(
-            credential_id = ?first_credentials.id,
-            disabled = first_credentials.disabled,
-            "已选择主凭证"
-        );
-    }
-
     // 获取客户端请求 API Key。历史配置使用 apiKey；新配置可额外使用 apiKeys。
     let request_api_keys = config.request_api_keys();
     if request_api_keys.is_empty() {
@@ -435,42 +311,6 @@ async fn async_main() {
         tracing::info!("已配置 HTTP 代理");
     }
 
-    // 构建端点注册表
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    {
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = CliEndpoint::new();
-        endpoints.insert(cli.name().to_string(), Arc::new(cli));
-        let codewhisperer = CodewhispererEndpoint::new();
-        endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
-        let amazonq = AmazonqEndpoint::new();
-        endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
-        let runtime = RuntimeEndpoint::new();
-        endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
-    }
-
-    // 校验默认端点存在
-    if !endpoints.contains_key(&config.default_endpoint) {
-        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
-        std::process::exit(1);
-    }
-
-    // 校验所有凭据声明的端点都已注册
-    for cred in &credentials_list {
-        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
-        if !endpoints.contains_key(name) {
-            tracing::error!(
-                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
-                cred.id,
-                name,
-                endpoints.keys().collect::<Vec<_>>()
-            );
-            std::process::exit(1);
-        }
-    }
-
-    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
     let usage_recorder = Arc::new(
         anthropic::usage::UsageRecorder::with_postgres_and_observability_redis(
             config.usage_record_limit,
@@ -511,7 +351,7 @@ async fn async_main() {
                 tracing::info!(
                     source = %status.source,
                     model_count = status.model_count,
-                    "PgSQL 模型能力目录为旧内置目录，使用本地 Kiro seed 刷新"
+                    "PgSQL 模型能力目录为旧内置目录，使用Anthropic seed 刷新"
                 );
                 let status = anthropic::model_capabilities::ModelCapabilitiesCatalog::seed_status();
                 model_capabilities.load_persisted_status(status.clone());
@@ -538,7 +378,7 @@ async fn async_main() {
                 tracing::info!(
                     source = %status.source,
                     model_count = status.model_count,
-                    "已使用本地 Kiro 模型 seed 初始化 PgSQL"
+                    "已使用Anthropic 模型 seed 初始化 PgSQL"
                 );
             }
         }
@@ -551,27 +391,7 @@ async fn async_main() {
     let runtime =
         model::runtime::RuntimeConfigStore::new(config.clone(), Some(postgres_store.clone()));
 
-    // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new_with_stores_and_runtime_state_and_account_info(
-        runtime.clone(),
-        credentials_list,
-        proxy_config.clone(),
-        Some(postgres_store.clone()),
-        Some(redis_store.clone()),
-        Some(initial_runtime_states),
-        Some(initial_account_info),
-    )
-    .unwrap_or_else(|e| {
-        tracing::error!("创建 Token 管理器失败: {}", e);
-        std::process::exit(1);
-    });
-    let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
     common::runtime_lag::spawn_probe();
-    let stats_flush_worker = token_manager.spawn_stats_flush_worker();
-    let _kiro_version_sync_task =
-        kiro::kiro_version::spawn_auto_sync(token_manager.clone(), postgres_store.clone());
-    let scheduler_instance_heartbeat_worker =
-        token_manager.spawn_scheduler_instance_heartbeat_worker();
     let external_pool_manager = Arc::new(ExternalPoolManager::new(
         postgres_store.clone(),
         redis_store.clone(),
@@ -590,47 +410,12 @@ async fn async_main() {
     let runtime_event_listener = spawn_redis_runtime_event_listener(
         runtime.clone(),
         redis_store.clone(),
-        token_manager.clone(),
         external_pool_manager.clone(),
         admin_api_key_store.clone(),
         request_api_key_store.clone(),
         request_admission.clone(),
         runtime_event_health.clone(),
     );
-    let kiro_provider = KiroProvider::with_proxy(
-        token_manager.clone(),
-        proxy_config.clone(),
-        endpoints,
-        config.default_endpoint.clone(),
-    );
-    let kiro_provider = Arc::new(kiro_provider);
-    kiro_provider.attach_runtime(model_capabilities.clone());
-    let initial_capability_cohort_keys = kiro_provider.model_capability_cohort_keys();
-    let initial_contract_match = model_capabilities
-        .reasoning_capability_cohort_contract_match(&initial_capability_cohort_keys);
-    match decide_native_reasoning_startup(
-        ModelCapabilityDiscoveryOutcome::Pending,
-        initial_capability_cohort_keys.len(),
-        initial_contract_match,
-    ) {
-        NativeReasoningStartupDecision::ContinueReady(contract_match) => tracing::info!(
-            cohort_count = initial_capability_cohort_keys.len(),
-            ?contract_match,
-            "已加载可覆盖当前账号 cohort 的 native reasoning 合同；能力恢复任务只检查内存 fence"
-        ),
-        NativeReasoningStartupDecision::ContinueReasoningUnknown(reason) => {
-            if model_capabilities.status().last_error.is_none() {
-                model_capabilities.record_sync_error(
-                    "native reasoning capability is Unknown while background cohort discovery is pending; ordinary and external-only service remains ready",
-                );
-            }
-            tracing::warn!(
-                cohort_count = initial_capability_cohort_keys.len(),
-                ?reason,
-                "native reasoning 能力当前为 Unknown；服务继续启动，显式 native reasoning fail closed，普通及 external-only 流量不受阻断"
-            );
-        }
-    }
     let audit_retention_task = {
         let runtime = runtime.clone();
         storage::account_events::spawn_audit_retention_worker(postgres_store.clone(), move || {
@@ -640,18 +425,6 @@ async fn async_main() {
                 .then_some(config.audit_log_retention_days)
         })
     };
-    // The account inventory renews its own tokens with the pool's refresh settings. It never
-    // touches the scheduler; it only shares the database pool and the refresh helpers.
-    let inventory_renewal_task = admin::spawn_inventory_renewal_worker(
-        token_manager.clone(),
-        storage::credential_inventory::InventoryStore::new(postgres_store.pool().clone()),
-    );
-    let model_capability_recovery_task = spawn_model_capability_recovery_worker(
-        kiro_provider.clone(),
-        model_capabilities.clone(),
-        postgres_store.clone(),
-    );
-
     let startup_pricing_sync_task = {
         let postgres_store = postgres_store.clone();
         let pricing_catalog = pricing_catalog.clone();
@@ -680,9 +453,9 @@ async fn async_main() {
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
-        api_url: config.count_tokens_api_url.clone(),
-        api_key: config.count_tokens_api_key.clone(),
-        auth_type: config.count_tokens_auth_type.clone(),
+        api_url: None,
+        api_key: None,
+        auth_type: Default::default(),
         proxy: proxy_config,
         tls_backend: config.tls_backend,
     });
@@ -694,12 +467,12 @@ async fn async_main() {
         .unwrap_or_else(|| diagnostics::capture::DEFAULT_CAPTURE_DIR.to_string());
     diagnostics::capture::init_global(capture_dir);
 
-    // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider(
+    // 构建 Anthropic API 路由
+    let anthropic_app = anthropic::create_router(
         anthropic::AnthropicRouterDependencies {
             request_api_keys: request_api_key_store.clone(),
             request_admission: request_admission.clone(),
-            kiro_provider: Some(kiro_provider.clone()),
+
             usage_recorder: usage_recorder.clone(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
@@ -712,11 +485,6 @@ async fn async_main() {
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
-    let admin_key_valid = config
-        .admin_api_key
-        .as_ref()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
 
     let app = if let Some(admin_key) = &config.admin_api_key {
         if admin_key.trim().is_empty() {
@@ -725,36 +493,26 @@ async fn async_main() {
         } else {
             let admin_service = admin::AdminService::new(admin::AdminServiceDependencies {
                 runtime: runtime.clone(),
-                token_manager: token_manager.clone(),
-                known_endpoints: endpoint_names.clone(),
+
                 usage_recorder: usage_recorder.clone(),
-                prompt_cache: prompt_cache.clone(),
-                prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
                 pricing_catalog: pricing_catalog.clone(),
                 model_capabilities: model_capabilities.clone(),
-                kiro_provider: kiro_provider.clone(),
+
                 postgres_store: postgres_store.clone(),
                 observability_redis_store: observability_redis_store.clone(),
                 request_api_key_store: request_api_key_store.clone(),
                 request_admission: request_admission.clone(),
                 external_pool_manager: external_pool_manager.clone(),
             });
-            match admin_service.reconcile_inventory_pushes().await {
-                Ok(0) => {}
-                Ok(count) => tracing::info!(count, "已处理上次中断的库存推送"),
-                Err(err) => tracing::warn!(error = %err, "处理中断的库存推送失败"),
-            }
             let admin_state =
                 admin::AdminState::with_key_store(admin_api_key_store.clone(), admin_service);
             // 只读号池视图免登录，默认关闭；它只借用 AdminService 的快照，不挂 Admin 中间件。
-            let public_pool_app = admin::create_public_pool_router(admin_state.service.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
             tracing::info!("Admin API 已启用");
             tracing::info!("管理后台 UI 已启用: /ui");
             anthropic_app
                 .nest("/api/admin", admin_app)
-                .nest("/api/public", public_pool_app)
                 .merge(ui::create_ui_router())
         }
     } else {
@@ -764,7 +522,7 @@ async fn async_main() {
         postgres_store: postgres_store.clone(),
         redis_store: redis_store.clone(),
         runtime_events: runtime_event_health.clone(),
-        token_manager: token_manager.clone(),
+
         postgres_health: DependencyHealth::new(),
         redis_health: DependencyHealth::new(),
     });
@@ -790,118 +548,29 @@ async fn async_main() {
     tracing::info!("  GET  /cc/v1/models");
     tracing::info!("  POST /cc/v1/messages");
     tracing::info!("  POST /cc/v1/messages/count_tokens");
-    if admin_key_valid {
-        tracing::info!("Admin API:");
-        tracing::info!("  GET  /api/admin/credentials");
-        tracing::info!("  GET  /api/admin/credentials/list");
-        tracing::info!("  GET  /api/admin/credentials/summary");
-        tracing::info!("  GET  /api/admin/credentials/runtime");
-        tracing::info!("  GET  /api/admin/credentials/account-info");
-        tracing::info!("  GET  /api/admin/credentials/usage-summary");
-        tracing::info!("  GET  /api/admin/credentials-paged");
-        tracing::info!("  POST /api/admin/credentials/batch-delete");
-        tracing::info!("  GET  /api/admin/credentials/export");
-        tracing::info!("  GET  /api/admin/usage-records");
-        tracing::info!("  GET  /api/admin/usage-records-paged");
-        tracing::info!("  GET  /api/admin/usage-summary");
-        tracing::info!("  GET  /api/admin/usage-dashboard");
-        tracing::info!("  GET  /api/admin/usage-dashboard/accounts");
-        tracing::info!("  GET  /api/admin/model-pricing");
-        tracing::info!("  POST /api/admin/model-pricing/sync");
-        tracing::info!("  POST /api/admin/credentials/:index/disabled");
-        tracing::info!("  POST /api/admin/credentials/:index/priority");
-        tracing::info!("  POST /api/admin/credentials/:index/reset");
-        tracing::info!("  GET  /api/admin/credentials/:index/balance");
-        tracing::info!("Public API（默认关闭）:");
-        tracing::info!("  GET  /api/public/pool");
-        tracing::info!("管理后台 UI:");
-        tracing::info!("  GET  /ui");
-    }
-
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap()
         .tap_io(enable_client_tcp_keepalive);
-    let shutdown_token_manager = token_manager.clone();
-    let server_result = serve_until_shutdown(listener, app, move || async move {
-        // Queued requests answer now instead of waiting for a slot until their wait limit.
-        shutdown_token_manager.begin_shutdown();
-        // Give the concurrency slots back first: `docker stop` sends SIGKILL after 10 seconds
-        // by default, long before in-flight requests finish draining, and leases left in Redis
-        // would otherwise block the next instance.
-        let released = shutdown_token_manager
-            .release_own_in_flight_leases(SHUTDOWN_LEASE_RELEASE_TIMEOUT)
-            .await;
-        tracing::info!(released, "收到停止信号，已释放本实例 Redis 并发租约");
-    })
-    .await;
-    if let Some(worker) = scheduler_instance_heartbeat_worker {
-        worker.abort();
-    }
-
+    let server_result = serve_until_shutdown(listener, app, || async {}).await;
     let shutdown_started_at = Instant::now();
     let shutdown_deadline = shutdown_started_at + BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT;
     runtime_event_health.mark_disconnected();
     tokio::join!(
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
-        abort_task_with_timeout("model capability recovery", model_capability_recovery_task),
         abort_task_with_timeout("audit log retention", audit_retention_task),
-        abort_task_with_timeout("inventory renewal", inventory_renewal_task),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 
     // The stages below are independent; run them together so the usage drain gets the whole
     // budget instead of what is left after the others (the budget fits docker's 10 s window).
-    let storage_stats = kiro::token_manager::best_effort_storage_task_stats();
-    let background_shutdown_timeout =
-        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
+    let storage_stats = common::storage_task::best_effort_storage_task_stats();
     let drain_timeout = remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let (
-        background_token_refresh_report,
-        stats_report,
-        (usage_drain, storage_drain, external_release_drain, scheduler_release_drained),
-    ) = tokio::join!(
-        background_token_refresh_worker.shutdown(background_shutdown_timeout),
-        stats_flush_worker.shutdown(background_shutdown_timeout),
-        async {
-            tokio::join!(
-                usage_recorder.drain(drain_timeout),
-                kiro::token_manager::drain_best_effort_storage_tasks(drain_timeout),
-                external_pool_manager.drain_release_intents(drain_timeout),
-                token_manager.drain_scheduler_redis_releases(drain_timeout),
-            )
-        },
+    let (usage_drain, storage_drain, external_release_drain) = tokio::join!(
+        usage_recorder.drain(drain_timeout),
+        common::storage_task::drain_best_effort_storage_tasks(drain_timeout),
+        external_pool_manager.drain_release_intents(drain_timeout),
     );
-    tracing::info!(
-        signal_sent = background_token_refresh_report.signal_sent,
-        completed = background_token_refresh_report.completed,
-        timed_out = background_token_refresh_report.timed_out,
-        task_failed = background_token_refresh_report.task_failed,
-        last_scanned = background_token_refresh_report.last_pass.scanned,
-        last_attempted = background_token_refresh_report.last_pass.attempted,
-        last_refreshed = background_token_refresh_report.last_pass.refreshed,
-        last_failed = background_token_refresh_report.last_pass.failed,
-        "后台 Token 主动刷新任务已停止"
-    );
-
-    tracing::info!(
-        signal_sent = stats_report.signal_sent,
-        flushed = stats_report.flushed,
-        timed_out = stats_report.timed_out,
-        task_failed = stats_report.task_failed,
-        pending_stats_batches = stats_report.pending_stats_batches,
-        pending_stats_deltas = stats_report.pending_stats_deltas,
-        pending_runtime_mutations = stats_report.pending_runtime_mutations,
-        overflow_runtime_mutations = stats_report.overflow_runtime_mutations,
-        "凭据统计后台任务已停止"
-    );
-    let stats_shutdown_failed = !stats_report.flushed
-        || stats_report.timed_out
-        || stats_report.task_failed
-        || stats_report.pending_stats_batches > 0
-        || stats_report.pending_stats_deltas > 0
-        || stats_report.pending_runtime_mutations > 0;
-
     tracing::info!(
         timed_out = usage_drain.timed_out,
         postgres_target = usage_drain.postgres.target,
@@ -930,19 +599,13 @@ async fn async_main() {
         spawn_failures = external_release_drain.spawn_failures,
         "外部池 Redis release intent 排空阶段已结束"
     );
-    if scheduler_release_drained {
-        tracing::info!("本地 scheduler Redis release intent 排空阶段已结束");
-    } else {
-        tracing::warn!("本地 scheduler Redis release intent 未在关闭预算内排空");
-    }
-
     let usage_shutdown_timeout =
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
     let storage_shutdown_timeout =
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
     let (usage_report, storage_report) = tokio::join!(
         usage_recorder.shutdown(usage_shutdown_timeout),
-        kiro::token_manager::shutdown_best_effort_storage_tasks(storage_shutdown_timeout),
+        common::storage_task::shutdown_best_effort_storage_tasks(storage_shutdown_timeout),
     );
     tracing::info!(
         already_started = usage_report.already_started,
@@ -977,145 +640,9 @@ async fn async_main() {
         panic!("释放 PgSQL usage runtime fence 失败: {err:#}");
     }
 
-    if stats_shutdown_failed {
-        panic!(
-            "凭据统计关闭未完整排空: timed_out={}, task_failed={}, pending_stats_batches={}, pending_stats_deltas={}, pending_runtime_mutations={}",
-            stats_report.timed_out,
-            stats_report.task_failed,
-            stats_report.pending_stats_batches,
-            stats_report.pending_stats_deltas,
-            stats_report.pending_runtime_mutations,
-        );
-    }
     if let Err(err) = server_result {
         panic!("HTTP 服务异常退出: {err}");
     }
-}
-
-fn spawn_model_capability_recovery_worker(
-    kiro_provider: Arc<KiroProvider>,
-    model_capabilities: Arc<anthropic::model_capabilities::ModelCapabilitiesCatalog>,
-    postgres_store: Arc<PostgresStore>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut consecutive_failures = 0u32;
-        let mut reported_empty_local_cohort = false;
-
-        loop {
-            let current_cohort_keys = kiro_provider.model_capability_cohort_keys();
-            if current_cohort_keys.is_empty() {
-                consecutive_failures = 0;
-                if !reported_empty_local_cohort {
-                    let status = model_capabilities.record_sync_error(
-                        "native reasoning capability is Unknown because no local capability cohort is configured; ordinary and external-only service remains ready",
-                    );
-                    if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
-                        tracing::warn!(
-                            "保存 external-only 模式的模型能力健康状态到 PgSQL 失败: {}",
-                            err
-                        );
-                    }
-                    tracing::warn!(
-                        native_reasoning_health = "unknown",
-                        "当前没有本地 capability cohort；跳过上游模型发现并保持服务可用"
-                    );
-                    reported_empty_local_cohort = true;
-                }
-                kiro_provider
-                    .wait_model_capability_cohort_change(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL)
-                    .await;
-                continue;
-            }
-            reported_empty_local_cohort = false;
-
-            let contract_match =
-                model_capabilities.reasoning_capability_cohort_contract_match(&current_cohort_keys);
-            if contract_match
-                != anthropic::model_capabilities::KiroReasoningCohortContractMatch::None
-            {
-                if consecutive_failures > 0 {
-                    tracing::info!(
-                        cohort_count = current_cohort_keys.len(),
-                        ?contract_match,
-                        "native reasoning cohort fence 已恢复；后台任务返回纯内存低频检查"
-                    );
-                }
-                consecutive_failures = 0;
-                kiro_provider
-                    .wait_model_capability_cohort_change(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL)
-                    .await;
-                continue;
-            }
-
-            let (status, discovery) = match kiro_provider.list_available_models().await {
-                Ok(catalog) => {
-                    let discovery = if catalog.complete {
-                        ModelCapabilityDiscoveryOutcome::Complete
-                    } else {
-                        ModelCapabilityDiscoveryOutcome::Incomplete
-                    };
-                    (
-                        model_capabilities.sync_from_kiro_catalog(catalog),
-                        discovery,
-                    )
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "后台模型能力发现失败；native reasoning 保持 Unknown，服务继续运行"
-                    );
-                    (
-                        model_capabilities.record_sync_error(format!(
-                            "native reasoning capability remains Unknown after background discovery failure: {err}"
-                        )),
-                        ModelCapabilityDiscoveryOutcome::Failed,
-                    )
-                }
-            };
-            if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
-                tracing::warn!("保存后台模型能力健康状态到 PgSQL 失败: {}", err);
-            }
-
-            // Cohorts may change while discovery is in flight. Fence the result against a fresh
-            // in-memory snapshot before declaring recovery.
-            let refreshed_cohort_keys = kiro_provider.model_capability_cohort_keys();
-            let refreshed_contract_match = model_capabilities
-                .reasoning_capability_cohort_contract_match(&refreshed_cohort_keys);
-            match decide_native_reasoning_startup(
-                discovery,
-                refreshed_cohort_keys.len(),
-                refreshed_contract_match,
-            ) {
-                NativeReasoningStartupDecision::ContinueReady(contract_match) => {
-                    tracing::info!(
-                        cohort_count = refreshed_cohort_keys.len(),
-                        ?contract_match,
-                        ?discovery,
-                        "native reasoning cohort fence 后台恢复成功"
-                    );
-                    consecutive_failures = 0;
-                    kiro_provider
-                        .wait_model_capability_cohort_change(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL)
-                        .await;
-                }
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(reason) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let retry_delay = model_capability_retry_delay(consecutive_failures);
-                    tracing::warn!(
-                        cohort_count = refreshed_cohort_keys.len(),
-                        ?reason,
-                        ?discovery,
-                        consecutive_failures,
-                        retry_in_secs = retry_delay.as_secs(),
-                        "native reasoning cohort fence 尚未恢复；普通及 external-only 流量继续服务，后台发现按上限退避"
-                    );
-                    kiro_provider
-                        .wait_model_capability_cohort_change(retry_delay)
-                        .await;
-                }
-            }
-        }
-    })
 }
 
 fn remaining_shutdown_budget(deadline: Instant, stage_limit: StdDuration) -> StdDuration {
@@ -1376,7 +903,7 @@ struct AppHealthState {
     postgres_store: Arc<PostgresStore>,
     redis_store: Arc<RedisStore>,
     runtime_events: Arc<RuntimeEventHealth>,
-    token_manager: Arc<kiro::token_manager::MultiTokenManager>,
+
     postgres_health: DependencyHealth,
     redis_health: DependencyHealth,
 }
@@ -1410,7 +937,6 @@ impl DependencyHealth {
 }
 
 /// Queued requests with no dispatch for this long mean the scheduler is not moving.
-const DISPATCH_STALL_AFTER: StdDuration = StdDuration::from_secs(60);
 
 fn create_health_router(state: Arc<AppHealthState>) -> Router {
     Router::new()
@@ -1446,10 +972,7 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
         .runtime_events
         .redis_events_connected
         .load(Ordering::Acquire);
-    let dispatch = state
-        .token_manager
-        .dispatch_is_progressing(DISPATCH_STALL_AFTER);
-    let ready = postgres_ok && redis_ok && redis_events_connected && dispatch.progressing;
+    let ready = postgres_ok && redis_ok && redis_events_connected;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1464,9 +987,7 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
                 "postgres": postgres_ok,
                 "redis": redis_ok,
                 "redisRuntimeEvents": redis_events_connected,
-                "dispatchProgressing": dispatch.progressing
             },
-            "dispatch": dispatch,
             "runtimeLagMs": common::runtime_lag::global().recent_max().as_millis() as u64,
             "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
@@ -1516,58 +1037,10 @@ fn apply_request_api_key_runtime(
     );
 }
 
-/// Runs credential reloads one at a time on a blocking thread and folds notifications that
-/// arrive while one is running into a single follow-up reload. A full reload reads every
-/// credential from PgSQL and rewrites the in-memory pool; running it inline on the event task,
-/// once per notification, kept async worker threads busy during notification bursts.
-#[derive(Clone, Default)]
-struct CredentialsReloadCoalescer {
-    state: Arc<parking_lot::Mutex<CredentialsReloadState>>,
-}
-
-#[derive(Default)]
-struct CredentialsReloadState {
-    running: bool,
-    pending: Option<String>,
-}
-
-impl CredentialsReloadCoalescer {
-    fn request(&self, token_manager: Arc<kiro::token_manager::MultiTokenManager>, reason: String) {
-        {
-            let mut state = self.state.lock();
-            if state.running {
-                state.pending = Some(reason);
-                return;
-            }
-            state.running = true;
-        }
-        let state = self.state.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut reason = reason;
-            loop {
-                match token_manager.reload_credentials_from_postgres() {
-                    Ok(true) => tracing::info!(reason, "已根据 Redis 通知同步凭据快照"),
-                    Ok(false) => tracing::debug!(reason, "收到凭据通知，但凭据快照无变化"),
-                    Err(err) => tracing::warn!(reason, "同步凭据快照失败: {}", err),
-                }
-                token_manager.notify_dispatch_state_changed();
-                let mut guard = state.lock();
-                match guard.pending.take() {
-                    Some(next) => reason = next,
-                    None => {
-                        guard.running = false;
-                        return;
-                    }
-                }
-            }
-        });
-    }
-}
-
 fn spawn_redis_runtime_event_listener(
     runtime: Arc<model::runtime::RuntimeConfigStore>,
     redis_store: Arc<RedisStore>,
-    token_manager: Arc<MultiTokenManager>,
+
     external_pool_manager: Arc<ExternalPoolManager>,
     admin_api_key_store: admin::AdminApiKeyStore,
     request_api_key_store: Arc<RequestApiKeyStore>,
@@ -1577,8 +1050,6 @@ fn spawn_redis_runtime_event_listener(
     tokio::spawn(async move {
         loop {
             let config_channel = redis_store.runtime_config_changed_channel();
-            let credentials_channel = redis_store.credentials_changed_channel();
-            let wakeup_channel = redis_store.dispatch_wakeup_channel();
             let external_pool_data_channel = redis_store.external_pool_data_changed_channel();
             let mut pubsub = match redis_store.subscribe_runtime_events().await {
                 Ok(pubsub) => pubsub,
@@ -1593,7 +1064,6 @@ fn spawn_redis_runtime_event_listener(
             tracing::info!("已订阅 Redis 运行时事件");
             let mut stream = pubsub.on_message();
             let mut periodic_reload = tokio::time::interval(std::time::Duration::from_secs(60));
-            let credentials_reload = CredentialsReloadCoalescer::default();
             loop {
                 tokio::select! {
                     message = stream.next() => {
@@ -1605,24 +1075,7 @@ fn spawn_redis_runtime_event_listener(
                             .get_payload::<String>()
                             .unwrap_or_else(|_| String::new());
                         health.mark_event();
-                        if (channel == config_channel || channel == credentials_channel)
-                            && token_manager.runtime_event_is_from_this_instance(&payload)
-                        {
-                            // Already applied locally when it was published.
-                            continue;
-                        }
                         if channel == config_channel {
-                            let event_kind = serde_json::from_str::<serde_json::Value>(&payload)
-                                .ok()
-                                .and_then(|event| event.get("kind").and_then(serde_json::Value::as_str).map(str::to_string));
-                            if event_kind.as_deref() == Some("kiro_version_state_changed") {
-                                match token_manager.reload_kiro_version_state_from_postgres().await {
-                                    Ok(true) => tracing::debug!(payload, "已根据 Redis 通知热加载 Kiro 版本状态"),
-                                    Ok(false) => tracing::debug!(payload, "收到 Kiro 版本通知，但没有持久化状态"),
-                                    Err(err) => tracing::warn!(payload, "热加载 Kiro 版本状态失败: {}", err),
-                                }
-                                continue;
-                            }
                             match runtime.reload_from_postgres() {
                                 Ok(true) => {
                                     let config = runtime.config();
@@ -1640,12 +1093,6 @@ fn spawn_redis_runtime_event_listener(
                                 Ok(false) => tracing::debug!(payload, "收到运行配置通知，但未执行热加载"),
                                 Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
                             }
-                        } else if channel == credentials_channel {
-                            credentials_reload.request(token_manager.clone(), payload);
-                        } else if channel == wakeup_channel {
-                            if !token_manager.notify_remote_dispatch_state_changed(&payload) {
-                                tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");
-                            }
                         } else if channel == external_pool_data_channel {
                             if external_pool_manager.observe_external_pool_data_event(&payload) {
                                 tracing::debug!(payload, "已失效跨实例外部池数据快照");
@@ -1655,9 +1102,6 @@ fn spawn_redis_runtime_event_listener(
                         }
                     }
                     _ = periodic_reload.tick() => {
-                        if let Err(err) = token_manager.reload_kiro_version_state_from_postgres().await {
-                            tracing::warn!("定时热加载 Kiro 版本状态失败: {}", err);
-                        }
                         match runtime.reload_from_postgres() {
                             Ok(true) => {
                                 let config = runtime.config();
@@ -1674,7 +1118,6 @@ fn spawn_redis_runtime_event_listener(
                             Ok(false) => {}
                             Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),
                         }
-                        credentials_reload.request(token_manager.clone(), "periodic".to_string());
                     }
                 }
             }
@@ -1730,11 +1173,10 @@ async fn handle_maintenance_command(
         MaintenanceCommand::UsageDemoSeed { days, seed, reset } => {
             let report = seed_usage_demo(&store, days, seed, reset).await?;
             println!(
-                "usage demo seed completed: database={} days={} records={} local={} external={} accounts={} pools={}",
+                "usage demo seed completed: database={} days={} records={} external={} accounts={} pools={}",
                 report.database,
                 report.days,
                 report.records,
-                report.local_records,
                 report.external_records,
                 report.accounts,
                 report.pools
@@ -1792,73 +1234,6 @@ mod lifecycle_tests {
         let checksum_error =
             anyhow::anyhow!("schema migration credential-storage-revision-v1 checksum mismatch");
         assert!(!postgres_startup_error_is_retryable(&checksum_error));
-    }
-
-    #[test]
-    fn native_reasoning_startup_decision_never_blocks_service_for_five_rounds() {
-        use anthropic::model_capabilities::KiroReasoningCohortContractMatch;
-
-        for round in 0..5 {
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Failed,
-                    1,
-                    KiroReasoningCohortContractMatch::None,
-                ),
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(
-                    NativeReasoningUnknownReason::DiscoveryFailed
-                ),
-                "round {round}: discovery failure must degrade only native reasoning"
-            );
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Incomplete,
-                    5,
-                    KiroReasoningCohortContractMatch::None,
-                ),
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(
-                    NativeReasoningUnknownReason::DiscoveryIncomplete
-                ),
-                "round {round}: bounded discovery over four cohorts must keep service ready"
-            );
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Failed,
-                    1,
-                    KiroReasoningCohortContractMatch::ConservativeSubset,
-                ),
-                NativeReasoningStartupDecision::ContinueReady(
-                    KiroReasoningCohortContractMatch::ConservativeSubset
-                ),
-                "round {round}: a verified superset contract remains safe after discovery failure"
-            );
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Pending,
-                    0,
-                    KiroReasoningCohortContractMatch::Exact,
-                ),
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(
-                    NativeReasoningUnknownReason::NoLocalCohorts
-                ),
-                "round {round}: an empty local pool must not vacuously enable native reasoning"
-            );
-        }
-    }
-
-    #[test]
-    fn model_capability_recovery_backoff_is_bounded_for_five_rounds() {
-        let expected = [30, 60, 120, 300, 300, 300, 300];
-        for round in 0..5 {
-            for (failure_index, expected_secs) in expected.into_iter().enumerate() {
-                assert_eq!(
-                    model_capability_retry_delay((failure_index + 1) as u32),
-                    StdDuration::from_secs(expected_secs),
-                    "round {round}: failure {}",
-                    failure_index + 1
-                );
-            }
-        }
     }
 
     #[tokio::test]
