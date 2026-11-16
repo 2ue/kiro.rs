@@ -14,6 +14,21 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// 直连旧库，原样导出迁移包
+    ExportLegacy {
+        #[arg(long)]
+        from_postgres: String,
+        #[arg(long)]
+        out: std::path::PathBuf,
+        #[arg(long)]
+        redact_secrets: bool,
+    },
+    /// 预览旧配置迁移差异；--apply 单事务全量覆盖目标库
+    ImportLegacy {
+        file: std::path::PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
     /// 显式运行生产维护任务；不会在普通服务启动时自动执行
     Maintenance {
         #[command(subcommand)]

@@ -1,0 +1,299 @@
+{
+  "formatVersion": 1,
+  "exportedAt": "2026-11-17T00:00:00Z",
+  "exportedFrom": {
+    "kind": "kiro-rs-postgres",
+    "schemaFingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "accounts": [
+    {
+      "id": 101,
+      "revision": 7,
+      "name": "旧账号甲",
+      "base_url": "https://upstream-a.example/v1",
+      "api_key": "fixture-secret-a",
+      "auth_type": "bearer",
+      "header_profile": "generic",
+      "append_beta_query": false,
+      "header_overrides": {
+        "x-fixture": "legacy"
+      },
+      "wire_profile": "default",
+      "tls_profile": "default",
+      "enabled": true,
+      "priority": 10,
+      "max_concurrent_requests": 8,
+      "usage_projection_mode": "pass_through",
+      "stream_response_mode": null,
+      "auto_disable_policy": "inherit",
+      "pre_output_stream_retry_mode": "inherit",
+      "normalize_model_version_dots": true,
+      "model_mapping_mode": "processed_mapping",
+      "model_mapping_require_match": false,
+      "model_mapping_rules": [],
+      "supported_models": [
+        "claude-sonnet-4-5"
+      ],
+      "route_mode": "allow_all",
+      "route_rules": [],
+      "notes": "测试映射",
+      "request_body_mode": "normalized",
+      "raw_model_mode": "passthrough",
+      "preserve_path": true,
+      "skip_non_stream_usage_projection": true,
+      "auto_disabled": true,
+      "auto_disabled_reason": "auth_error",
+      "auto_disabled_at": "2026-11-01T00:00:00Z",
+      "auto_disabled_until": null,
+      "auto_disabled_last_error": "fixture-error",
+      "created_at": "2026-11-01T00:00:00Z",
+      "updated_at": "2026-11-01T00:00:00Z",
+      "deleted_at": null
+    },
+    {
+      "id": 102,
+      "revision": 7,
+      "name": "旧账号乙",
+      "base_url": "https://upstream-b.example",
+      "api_key": "fixture-secret-b",
+      "auth_type": "bearer",
+      "header_profile": "generic",
+      "append_beta_query": false,
+      "header_overrides": {
+        "x-fixture": "legacy"
+      },
+      "wire_profile": "default",
+      "tls_profile": "default",
+      "enabled": true,
+      "priority": 10,
+      "max_concurrent_requests": 12,
+      "usage_projection_mode": "current_path_policy",
+      "stream_response_mode": null,
+      "auto_disable_policy": "inherit",
+      "pre_output_stream_retry_mode": "inherit",
+      "normalize_model_version_dots": true,
+      "model_mapping_mode": "passthrough_mapping",
+      "model_mapping_require_match": false,
+      "model_mapping_rules": [],
+      "supported_models": [
+        "claude-sonnet-4-5"
+      ],
+      "route_mode": "allow_all",
+      "route_rules": [],
+      "notes": "测试映射",
+      "request_body_mode": "raw",
+      "raw_model_mode": "passthrough",
+      "preserve_path": true,
+      "skip_non_stream_usage_projection": true,
+      "auto_disabled": false,
+      "auto_disabled_reason": "auth_error",
+      "auto_disabled_at": "2026-11-01T00:00:00Z",
+      "auto_disabled_until": null,
+      "auto_disabled_last_error": "fixture-error",
+      "created_at": "2026-11-01T00:00:00Z",
+      "updated_at": "2026-11-01T00:00:00Z",
+      "deleted_at": null
+    }
+  ],
+  "runtimeConfig": {
+    "postgres": {
+      "url": "postgres://old/legacy"
+    },
+    "redis": {
+      "url": "redis://old:6379"
+    },
+    "observabilityRedis": {
+      "url": "redis://old:6380"
+    },
+    "host": "old-host",
+    "port": 8990,
+    "apiKey": "fixture-request-key",
+    "apiKeys": [
+      "fixture-extra-key"
+    ],
+    "requestApiKeyPolicies": [],
+    "adminApiKey": "fixture-admin-key",
+    "externalPools": {
+      "externalPoolsEnabled": true,
+      "externalPoolRetryMaxAttempts": 3,
+      "externalPoolRouteMode": "allow_all",
+      "externalPoolRouteRules": [],
+      "externalDirectPolicyEnabled": true,
+      "directExternalOnLocalMaintenance": true,
+      "directExternalModelRules": [
+        "*"
+      ],
+      "directExternalPathRules": [
+        "*"
+      ],
+      "localPoolRouteMode": "allow_all",
+      "localPoolRouteRules": [],
+      "fallbackOnUnavailable": true,
+      "localPoolPreflightEnabled": true,
+      "externalPoolLocalRescueEnabled": true,
+      "localPoolCircuitEnabled": true,
+      "externalPoolMaxInputTokens": 100000,
+      "externalPoolTransientFailureCooldownThreshold": 3
+    },
+    "cachePolicy": {
+      "kiroRsTool": {
+        "cacheTtl": {"local": "force_5m", "externalPool": "upstream_then_request_default_5m"},
+        "cachePoint": {
+          "enabled": true
+        }
+      },
+      "kiroRsToolPlus": {
+        "cachePoint": {
+          "enabled": false
+        }
+      },
+      "pathOverrides": {
+        "/cc": {
+          "cacheType": "kiro_rs_tool",
+          "kiroRsTool": {
+            "cachePoint": {
+              "enabled": true
+            }
+          }
+        },
+        "/dfcache/sample": {
+          "cacheType": "kiro_rs_tool_plus",
+          "kiroRsToolPlus": {}
+        }
+      }
+    },
+    "cacheTtl": {
+      "local": 300,
+      "external": 300
+    },
+    "reportedUsage": {
+      "pathOverrides": {
+        "/cc": {
+          "cacheReadMinPercent": 75
+        }
+      }
+    },
+    "promptInjection": {
+      "defaults": {
+        "taskQuality": {
+          "enabled": true,
+          "externalPool": false
+        },
+        "custom": {
+          "enabled": false,
+          "externalPool": true
+        },
+        "toolFormatHint": {
+          "enabled": true,
+          "externalPool": false
+        }
+      },
+      "texts": {
+        "custom": "自定义测试"
+      },
+      "pathOverrides": {
+        "/cc": {
+          "languageConstraint": {
+            "enabled": true,
+            "externalPool": false
+          }
+        }
+      }
+    },
+    "routeFeatures": {
+      "defaults": {
+        "historySanitize": false,
+        "channelLeakGuardEnabled": true
+      },
+      "pathOverrides": {
+        "/cc": {
+          "thinkingModelName": true,
+          "modelDrivenWebSearch": true
+        }
+      }
+    },
+    "definedCacheRoutes": [
+      "sample"
+    ],
+    "missingMaxTokens": {
+      "policy": "default_value",
+      "defaultValue": 20480
+    },
+    "localRequestCompat": {
+      "dropEffortNone": true,
+      "zeroUsageOnHoldExpiredMessageStart": true
+    },
+    "payloadGuardEnabled": true,
+    "payloadGuardExternalEnabled": true,
+    "payloadGuardMaxBytes": 4194304,
+    "payloadGuardSafetyMarginBytes": 65536,
+    "payloadGuardTrimHistory": true,
+    "payloadGuardKiroMaxWeight": 123,
+    "payloadTooLongHandling": "trim_retry",
+    "payloadShaping": {
+      "enabled": true
+    },
+    "imageProcessing": {
+      "mode": "safe",
+      "resizeEnabled": true
+    },
+    "region": "us-east-1",
+    "kiroVersion": "legacy",
+    "credentialRpm": 100,
+    "tokenRefreshEnabled": true,
+    "bodyConversion": {
+      "codeExecution": true
+    },
+    "runtimeConfigMigrationVersion": 99
+  },
+  "routeScenarios": [
+    {
+      "name": "旧场景",
+      "description": "自然键覆盖",
+      "content": {
+        "local": {
+          "routeMode": "allow_all"
+        },
+        "localAccounts": [
+          {
+            "id": 1
+          }
+        ],
+        "externalAccounts": []
+      }
+    }
+  ],
+  "modelPricing": [
+    {
+      "model": "fixture-model",
+      "input_cost_per_token": 3e-06,
+      "output_cost_per_token": 1.5e-05,
+      "cache_creation_input_token_cost": 3.75e-06,
+      "cache_creation_1h_input_token_cost": 6e-06,
+      "cache_read_input_token_cost": 3e-07,
+      "source": "manual",
+      "source_url": "fixture",
+      "last_synced_at": null,
+      "last_error": null,
+      "updated_at": "2026-11-17T00:00:00Z"
+    }
+  ],
+  "modelCapabilities": [
+    {
+      "model": "fixture-model",
+      "display_name": "Fixture model",
+      "description": "手工模型",
+      "max_input_tokens": 200000,
+      "max_output_tokens": 64000,
+      "supports_prompt_caching": true,
+      "supported_input_types": [
+        "TEXT"
+      ],
+      "source": "manual",
+      "last_synced_at": null,
+      "last_error": null,
+      "reasoning_cohort_enabled": true,
+      "updated_at": "2026-11-17T00:00:00Z"
+    }
+  ]
+}

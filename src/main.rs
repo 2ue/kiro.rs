@@ -4,6 +4,7 @@ mod anthropic;
 mod common;
 mod diagnostics;
 mod http_client;
+mod migration;
 mod model;
 mod storage;
 pub mod token;
@@ -96,6 +97,17 @@ async fn async_main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if matches!(
+        args.command,
+        Some(Command::ExportLegacy { .. } | Command::ImportLegacy { apply: false, .. })
+    ) {
+        if let Err(error) = handle_cli_command(args.command.unwrap(), &Config::default()).await {
+            tracing::error!("{:#}", error);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // 加载配置
     let config_path = args
@@ -1130,6 +1142,14 @@ fn spawn_redis_runtime_event_listener(
 
 async fn handle_cli_command(command: Command, config: &Config) -> anyhow::Result<()> {
     match command {
+        Command::ExportLegacy {
+            from_postgres,
+            out,
+            redact_secrets,
+        } => migration::export_legacy(&from_postgres, &out, redact_secrets).await,
+        Command::ImportLegacy { file, apply } => {
+            migration::import_legacy(&file, apply, config).await
+        }
         Command::Maintenance { command } => handle_maintenance_command(command, config).await,
     }
 }
