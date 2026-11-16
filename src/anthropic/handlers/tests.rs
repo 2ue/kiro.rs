@@ -31,6 +31,7 @@ use crate::model::config::{
     PromptCacheCreationControlConfig, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
     RequestAdmissionConfig, StableSegmentCachePolicy,
 };
+use crate::model::runtime::RuntimeConfigStore;
 use crate::storage::{postgres::PostgresStore, redis_cache::RedisStore};
 use axum::{
     Router,
@@ -671,10 +672,14 @@ fn multimodal_handler_test_provider(config: Config) -> Arc<KiroProvider> {
         rate_limit_auto_disable_enabled: Some(false),
         ..Default::default()
     }];
-    let manager = Arc::new(
-        MultiTokenManager::new(config, credentials, None, None, false)
-            .expect("build multimodal handler token manager"),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .expect("build multimodal handler token manager");
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
     Arc::new(KiroProvider::with_proxy(
@@ -1427,10 +1432,14 @@ fn websearch_handler_test_router_with_config(
             ..Default::default()
         })
         .collect();
-    let manager = Arc::new(
-        MultiTokenManager::new(config.clone(), credentials, None, None, false)
-            .expect("build WebSearch handler token manager"),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config.clone(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .expect("build WebSearch handler token manager");
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
     let provider = Arc::new(KiroProvider::with_proxy(
@@ -1571,10 +1580,14 @@ fn websearch_handler_test_router_with_external_options(
         .external_pool_stream_request_timeout_secs = 10;
     config.external_pools.external_pool_stream_idle_timeout_secs = 10;
 
-    let manager = Arc::new(
-        MultiTokenManager::new(config.clone(), credentials, None, None, false)
-            .expect("build WebSearch external fallback token manager"),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config.clone(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .expect("build WebSearch external fallback token manager");
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
     let provider = Arc::new(KiroProvider::with_proxy(
@@ -4705,10 +4718,14 @@ fn handler_eventstream_fault_router_with_manager(
             ..Default::default()
         })
         .collect();
-    let manager = Arc::new(
-        MultiTokenManager::new(config.clone(), credentials, None, None, false)
-            .expect("build EventStream fault token manager"),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config.clone(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .expect("build EventStream fault token manager");
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
     let provider = Arc::new(KiroProvider::with_proxy(

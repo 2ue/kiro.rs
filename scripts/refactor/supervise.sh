@@ -12,7 +12,9 @@ extra=""
 for i in $(seq 1 "$MAX_ROUNDS"); do
   "$ROOT/scripts/refactor/codex-task.sh" "$TASK_ID" "$extra"
   round_dir=$(ls -d "$RUN_DIR"/round-* | sort -V | tail -1)
-  "$ROOT/scripts/refactor/verify.sh" "$TASK_ID" > "$round_dir/verify.log" 2>&1
+  # 快照验收脚本后再执行，避免运行中编辑 verify.sh 导致 bash 读到错位内容。
+  cp "$ROOT/scripts/refactor/verify.sh" "$round_dir/verify.snapshot.sh"
+  bash "$round_dir/verify.snapshot.sh" "$TASK_ID" > "$round_dir/verify.log" 2>&1
   if grep -q "^VERIFY PASS" "$round_dir/verify.log"; then
     echo "PASS round=$i" > "$STATUS"; echo "[supervise] $TASK_ID PASS 第 $i 轮"; exit 0
   fi

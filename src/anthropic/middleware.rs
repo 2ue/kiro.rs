@@ -263,6 +263,7 @@ fn record_http_egress(response: Response, ingress_id: &str) -> Response {
 /// that own maps and strings are behind `Arc`: a clone must not copy them.
 #[derive(Clone)]
 pub struct AppState {
+    pub runtime: Arc<crate::model::runtime::RuntimeConfigStore>,
     /// 客户端请求 API Key 内存索引。
     pub request_api_keys: Arc<RequestApiKeyStore>,
     /// Kiro Provider（可选，用于实际 API 调用）
@@ -371,7 +372,13 @@ impl AppState {
         compat_profile: CompatProfile,
         expose_proxy_warnings: bool,
     ) -> Self {
+        let mut initial = crate::model::config::Config::default();
+        initial.extract_thinking = extract_thinking;
+        initial.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio.clamp(0.0, 0.99);
+        initial.compat_profile = compat_profile;
+        initial.expose_proxy_warnings = expose_proxy_warnings || compat_profile.is_debug();
         Self {
+            runtime: crate::model::runtime::RuntimeConfigStore::new(initial, None),
             request_api_keys,
             kiro_provider: None,
             extract_thinking,
@@ -426,6 +433,9 @@ impl AppState {
         config: PromptCacheCreationControlConfig,
     ) -> Self {
         self.prompt_cache_creation_control = config.normalized();
+        self.runtime.install_local(|config| {
+            config.prompt_cache_creation_control = self.prompt_cache_creation_control
+        });
         self
     }
 
@@ -436,13 +446,26 @@ impl AppState {
         claude_models_only: bool,
     ) -> Self {
         self.prompt_injection = Arc::new(prompt_injection.normalized());
+        self.runtime.install_local(|config| {
+            config.prompt_injection = self.prompt_injection.as_ref().clone()
+        });
         self.route_features = Arc::new(route_features.normalized());
+        self.runtime
+            .install_local(|config| config.route_features = self.route_features.as_ref().clone());
         self.claude_models_only = claude_models_only;
+        self.runtime
+            .install_local(|config| config.claude_models_only = self.claude_models_only);
         self
     }
 
     pub fn with_prompt_cache_bounds(mut self, bounds: PromptCacheBounds) -> Self {
         self.prompt_cache_bounds = bounds;
+        self.runtime.install_local(|config| {
+            config.prompt_cache_max_entries_per_account = bounds.max_entries_per_account;
+            config.prompt_cache_max_entries_global = bounds.max_entries_global;
+            config.prompt_cache_entry_ttl_secs = bounds.entry_ttl.as_secs();
+            config.prompt_cache_estimated_bytes_limit = bounds.estimated_bytes_limit;
+        });
         self
     }
 
@@ -455,10 +478,26 @@ impl AppState {
         scale_min_input_tokens: i32,
     ) -> Self {
         self.prompt_cache_token_scale = token_scale;
+        self.runtime.install_local(|config| {
+            config.prompt_cache_token_scale = self.prompt_cache_token_scale
+        });
         self.prompt_cache_max_simulated_input_tokens = max_simulated_input_tokens;
+        self.runtime.install_local(|config| {
+            config.prompt_cache_max_simulated_input_tokens =
+                self.prompt_cache_max_simulated_input_tokens
+        });
         self.prompt_cache_cap_jitter_min_tokens = cap_jitter_min_tokens;
+        self.runtime.install_local(|config| {
+            config.prompt_cache_cap_jitter_min_tokens = self.prompt_cache_cap_jitter_min_tokens
+        });
         self.prompt_cache_cap_jitter_max_tokens = cap_jitter_max_tokens;
+        self.runtime.install_local(|config| {
+            config.prompt_cache_cap_jitter_max_tokens = self.prompt_cache_cap_jitter_max_tokens
+        });
         self.prompt_cache_scale_min_input_tokens = scale_min_input_tokens;
+        self.runtime.install_local(|config| {
+            config.prompt_cache_scale_min_input_tokens = self.prompt_cache_scale_min_input_tokens
+        });
         self
     }
 
@@ -485,26 +524,37 @@ impl AppState {
 
     pub fn with_reported_usage(mut self, reported_usage: ReportedUsageConfig) -> Self {
         self.reported_usage = Arc::new(reported_usage.normalized());
+        self.runtime
+            .install_local(|config| config.reported_usage = self.reported_usage.as_ref().clone());
         self
     }
 
     pub fn with_cache_policy(mut self, cache_policy: CachePolicyConfig) -> Self {
         self.cache_policy = Arc::new(cache_policy.normalized());
+        self.runtime
+            .install_local(|config| config.cache_policy = self.cache_policy.as_ref().clone());
         self
     }
 
     pub fn with_defined_cache_routes(mut self, routes: Vec<String>) -> Self {
         self.defined_cache_routes = Arc::new(normalize_defined_cache_routes(&routes));
+        self.runtime.install_local(|config| {
+            config.defined_cache_routes = self.defined_cache_routes.as_ref().clone()
+        });
         self
     }
 
     pub fn with_model_resolution_mode(mut self, mode: ModelResolutionMode) -> Self {
         self.model_resolution_mode = mode;
+        self.runtime
+            .install_local(|config| config.model_resolution_mode = self.model_resolution_mode);
         self
     }
 
     pub fn with_model_mapping(mut self, model_mapping: ModelMappingConfig) -> Self {
         self.model_mapping = Arc::new(model_mapping.normalized());
+        self.runtime
+            .install_local(|config| config.model_mapping = self.model_mapping.as_ref().clone());
         self
     }
 
@@ -526,29 +576,69 @@ impl AppState {
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
+        self.runtime
+            .install_local(|config| config.payload_guard_enabled = self.payload_guard_enabled);
         self.payload_guard_mode = mode;
+        self.runtime
+            .install_local(|config| config.payload_guard_mode = self.payload_guard_mode);
         self.payload_guard_max_bytes = max_bytes;
+        self.runtime
+            .install_local(|config| config.payload_guard_max_bytes = self.payload_guard_max_bytes);
         self.payload_guard_kiro_max_weight = max_kiro_weight;
+        self.runtime.install_local(|config| {
+            config.payload_guard_kiro_max_weight = self.payload_guard_kiro_max_weight
+        });
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
+        self.runtime.install_local(|config| {
+            config.payload_guard_safety_margin_bytes = self.payload_guard_safety_margin_bytes
+        });
         self.payload_guard_trim_history = trim_history;
+        self.runtime.install_local(|config| {
+            config.payload_guard_trim_history = self.payload_guard_trim_history
+        });
         self.payload_guard_external_enabled = external_enabled;
+        self.runtime.install_local(|config| {
+            config.payload_guard_external_enabled = self.payload_guard_external_enabled
+        });
         self.kiro_cache_point_enabled = kiro_cache_point_enabled;
+        self.runtime.install_local(|config| {
+            config.kiro_cache_point_enabled = self.kiro_cache_point_enabled
+        });
         self.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
+        self.runtime.install_local(|config| {
+            config.kiro_cache_point_tools_only = self.kiro_cache_point_tools_only
+        });
         self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
+        self.runtime.install_local(|config| {
+            config.kiro_cache_point_record_plan = self.kiro_cache_point_record_plan
+        });
         self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
+        self.runtime.install_local(|config| {
+            config.kiro_upstream_stream_idle_timeout_secs =
+                self.kiro_upstream_stream_idle_timeout_secs
+        });
         self.image_processing = image_processing.normalized();
+        self.runtime
+            .install_local(|config| config.image_processing = self.image_processing);
         self.body_conversion = Arc::new(body_conversion);
+        self.runtime
+            .install_local(|config| config.body_conversion = self.body_conversion.as_ref().clone());
         self.payload_shaping = payload_shaping;
+        self.runtime
+            .install_local(|config| config.payload_shaping = self.payload_shaping);
         self
     }
 
     pub fn with_missing_max_tokens(mut self, config: MissingMaxTokensConfig) -> Self {
         self.missing_max_tokens = config.normalized();
+        self.runtime
+            .install_local(|config| config.missing_max_tokens = self.missing_max_tokens);
         self
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.runtime = provider.runtime_store();
         self.kiro_provider = Some(provider);
         self
     }
@@ -563,6 +653,8 @@ impl AppState {
 
     pub fn with_external_pools(mut self, external_pools: ExternalPoolsConfig) -> Self {
         self.external_pools = Arc::new(external_pools);
+        self.runtime
+            .install_local(|config| config.external_pools = self.external_pools.as_ref().clone());
         self
     }
 }

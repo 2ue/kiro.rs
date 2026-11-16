@@ -11,11 +11,7 @@ pub(super) async fn handle_messages_endpoint(
     ingress_id: Option<String>,
     attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
-    let runtime_config = state
-        .kiro_provider
-        .as_ref()
-        .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| Arc::new(RequestRuntimeConfig::from_app_state(&state)));
+    let runtime_config = request_runtime_config(&state);
     let inference_attempt_budget = Arc::new(InferenceAttemptBudget::with_auxiliary_max_attempts(
         runtime_config.inference_upstream_max_attempts,
         runtime_config.auxiliary_upstream_max_attempts,
@@ -24,11 +20,7 @@ pub(super) async fn handle_messages_endpoint(
     let local_dispatch_max_wait_secs = state
         .kiro_provider
         .as_ref()
-        .map(|provider| {
-            provider
-                .runtime_config_snapshot()
-                .credential_dispatch_max_wait_secs
-        })
+        .map(|_| state.runtime.snapshot().credential_dispatch_max_wait_secs)
         .unwrap_or(5);
     let shared_dispatch_max_wait_secs = local_dispatch_max_wait_secs
         .max(
@@ -345,11 +337,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     attribution: Option<RequestRejectionAttribution>,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Response {
-    let runtime_config = state
-        .kiro_provider
-        .as_ref()
-        .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| Arc::new(RequestRuntimeConfig::from_app_state(&state)));
+    let runtime_config = request_runtime_config(&state);
     if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
         &state,
         &runtime_config,

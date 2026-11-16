@@ -808,7 +808,7 @@ async fn call_model(
         .get(REQWEST_CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let runtime = ctx.provider.runtime_config_snapshot();
+    let runtime = ctx.state.runtime.snapshot();
     let processing_failure = |detail: String| {
         tracing::warn!(
             request_id = %ctx.request_id,

@@ -8,6 +8,7 @@ use crate::kiro::token_manager::{AcquireMode, MultiTokenManager};
 use crate::model::config::Config;
 use crate::model::config::StableSegmentCachePolicy;
 use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
+use crate::model::runtime::RuntimeConfigStore;
 
 #[test]
 fn external_usage_debug_candidates_collect_raw_usage_from_unusual_paths() {
@@ -2438,10 +2439,14 @@ fn auxiliary_fallback_local_provider(base_url: &str, expired_for_refresh: bool) 
         token_endpoint: Some(format!("{base_url}/token")),
         ..Default::default()
     };
-    let manager = Arc::new(
-        MultiTokenManager::new(config, vec![credentials], None, None, false)
-            .expect("construct auxiliary fallback local manager"),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![credentials],
+        None,
+        None,
+        false,
+    )
+    .expect("construct auxiliary fallback local manager");
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
     KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string())

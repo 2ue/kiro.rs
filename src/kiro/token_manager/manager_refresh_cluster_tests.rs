@@ -203,30 +203,26 @@ fn cluster_managers(
     redis: &[Arc<RedisStore>],
 ) -> [Arc<MultiTokenManager>; 2] {
     [
-        Arc::new(
-            MultiTokenManager::new_with_stores(
-                Config::default(),
-                vec![credential.clone()],
-                None,
-                None,
-                false,
-                Some(postgres[0].clone()),
-                Some(redis[0].clone()),
-            )
-            .unwrap(),
-        ),
-        Arc::new(
-            MultiTokenManager::new_with_stores(
-                Config::default(),
-                vec![credential.clone()],
-                None,
-                None,
-                false,
-                Some(postgres[1].clone()),
-                Some(redis[1].clone()),
-            )
-            .unwrap(),
-        ),
+        MultiTokenManager::new_with_stores(
+            RuntimeConfigStore::new(Config::default(), Some(postgres[0].clone())),
+            vec![credential.clone()],
+            None,
+            None,
+            false,
+            Some(postgres[0].clone()),
+            Some(redis[0].clone()),
+        )
+        .unwrap(),
+        MultiTokenManager::new_with_stores(
+            RuntimeConfigStore::new(Config::default(), Some(postgres[1].clone())),
+            vec![credential.clone()],
+            None,
+            None,
+            false,
+            Some(postgres[1].clone()),
+            Some(redis[1].clone()),
+        )
+        .unwrap(),
     ]
 }
 
@@ -244,7 +240,7 @@ fn refresh_identity_for_manager(manager: &MultiTokenManager, id: u64) -> Refresh
         .resolve_proxy_for_credential(credentials)
         .expect("cluster test credential proxy must resolve");
     let effective_proxy = credentials_for_proxy.effective_proxy(manager.proxy.as_ref());
-    let config = manager.config.read();
+    let config = manager.runtime.snapshot();
     RefreshAttemptIdentity::from_refresh_request(
         &credentials_for_proxy,
         &config,

@@ -1875,6 +1875,7 @@ mod region_rotation_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::runtime::RuntimeConfigStore;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -2437,16 +2438,14 @@ mod tests {
         config.token_refresh_max_rpm = token_refresh_max_rpm;
         config.token_refresh_burst = token_refresh_burst;
         config.tls_backend = tls_backend;
-        Arc::new(
-            MultiTokenManager::new(
-                config,
-                fake_expired_external_idp_credentials(pool_size, request_namespace, token_endpoint),
-                None,
-                None,
-                false,
-            )
-            .expect("construct fake OAuth token manager"),
+        MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_expired_external_idp_credentials(pool_size, request_namespace, token_endpoint),
+            None,
+            None,
+            false,
         )
+        .expect("construct fake OAuth token manager")
     }
 
     fn fake_automatic_recovery_manager(
@@ -2465,10 +2464,14 @@ mod tests {
         config.credential_max_cooldown_secs = 2;
         config.credential_cooldown_jitter_percent = 0;
         config.tls_backend = refresh_test_tls_backend();
-        Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("construct automatic auth recovery manager"),
+        MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
         )
+        .expect("construct automatic auth recovery manager")
     }
 
     async fn acquire_from_fake_refresh_manager(
@@ -3333,10 +3336,14 @@ mod tests {
         config.credential_max_concurrent_requests = 1;
         config.auxiliary_upstream_max_concurrent_requests = auxiliary_max_concurrent_requests;
         config.tls_backend = refresh_test_tls_backend();
-        Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("construct focused fake OAuth token manager"),
+        MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
         )
+        .expect("construct focused fake OAuth token manager")
     }
 
     async fn acquire_with_auxiliary_budget(

@@ -5,6 +5,8 @@
 //! request should take, so every load-balancing mode is expressed as a pure function over the
 //! candidate list and can be tested without the acquire machinery.
 
+#[cfg(test)]
+use crate::model::runtime::RuntimeConfigStore;
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -600,12 +602,24 @@ mod tests {
         let mut config = Config::default();
         config.load_balancing_mode = "round_robin".to_string();
         assert!(
-            super::super::MultiTokenManager::new(config, Vec::new(), None, None, false).is_err()
+            super::super::MultiTokenManager::new(
+                RuntimeConfigStore::new(config, None),
+                Vec::new(),
+                None,
+                None,
+                false
+            )
+            .is_err()
         );
 
-        let manager =
-            super::super::MultiTokenManager::new(Config::default(), Vec::new(), None, None, false)
-                .unwrap();
+        let manager = super::super::MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(
             manager
                 .update_runtime_config(|config| config.load_balancing_mode = "bogus".to_string())

@@ -51,12 +51,25 @@ fn token_refresh_admission_config_is_fail_fast_at_startup_and_runtime_update() {
         let mut invalid = Config::default();
         invalid.token_refresh_max_rpm = 0;
         assert!(
-            MultiTokenManager::new(invalid, Vec::new(), None, None, false).is_err(),
+            MultiTokenManager::new(
+                RuntimeConfigStore::new(invalid, None),
+                Vec::new(),
+                None,
+                None,
+                false
+            )
+            .is_err(),
             "round {round}: file/startup config must not be silently clamped"
         );
 
-        let manager = MultiTokenManager::new(Config::default(), Vec::new(), None, None, false)
-            .expect("valid token refresh admission config");
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
+        .expect("valid token refresh admission config");
         let original = manager.runtime_config().token_refresh_burst;
         assert!(
             manager
@@ -69,13 +82,27 @@ fn token_refresh_admission_config_is_fail_fast_at_startup_and_runtime_update() {
         let mut invalid_interval = Config::default();
         invalid_interval.token_refresh_background_interval_secs = 9;
         assert!(
-            MultiTokenManager::new(invalid_interval, Vec::new(), None, None, false).is_err(),
+            MultiTokenManager::new(
+                RuntimeConfigStore::new(invalid_interval, None),
+                Vec::new(),
+                None,
+                None,
+                false
+            )
+            .is_err(),
             "round {round}: background refresh interval must fail closed"
         );
         let mut invalid_lead = Config::default();
         invalid_lead.token_refresh_background_lead_secs = 59;
         assert!(
-            MultiTokenManager::new(invalid_lead, Vec::new(), None, None, false).is_err(),
+            MultiTokenManager::new(
+                RuntimeConfigStore::new(invalid_lead, None),
+                Vec::new(),
+                None,
+                None,
+                false
+            )
+            .is_err(),
             "round {round}: background refresh lead must fail closed"
         );
         assert!(
@@ -333,7 +360,7 @@ async fn api_key_token_path_does_not_allocate_oauth_refresh_state() {
         ..Default::default()
     };
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![credentials.clone()],
         None,
         None,
@@ -352,7 +379,7 @@ async fn api_key_token_path_does_not_allocate_oauth_refresh_state() {
 #[test]
 fn runtime_state_apply_rejects_stale_and_equal_revisions() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential("runtime-revision", "Pro")],
         None,
         None,
@@ -395,7 +422,7 @@ fn runtime_state_apply_rejects_stale_and_equal_revisions() {
 #[test]
 fn admin_deferred_runtime_patch_advances_generation_and_ignores_older_replay() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential(
             "admin-deferred-runtime",
             "Pro",
@@ -575,16 +602,14 @@ async fn credential_pgsql_sync_bridge_enforces_deadline() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stats_flush_worker_shutdown_flushes_and_releases_manager() {
-    let manager = Arc::new(
-        MultiTokenManager::new(
-            Config::default(),
-            vec![api_key_credential("stats-worker-test")],
-            None,
-            None,
-            false,
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![api_key_credential("stats-worker-test")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let worker = manager.spawn_stats_flush_worker();
 
     let report = worker.shutdown(StdDuration::from_secs(1)).await;
@@ -606,7 +631,14 @@ async fn background_token_refresh_pass_refreshes_idle_oauth_and_persists_rotatio
     let mut config = Config::default();
     config.token_refresh_background_enabled = true;
     config.token_refresh_background_lead_secs = 10 * 60;
-    let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let report = manager.run_background_token_refresh_pass().await;
 
@@ -675,7 +707,7 @@ async fn background_token_refresh_pass_skips_api_key_disabled_and_missing_refres
     let mut config = Config::default();
     config.token_refresh_background_enabled = true;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![api_key, disabled, missing_refresh, outside_window],
         None,
         None,
@@ -705,8 +737,14 @@ async fn background_token_refresh_failure_isolated_and_next_account_still_refres
     succeeds.expires_at = Some((Utc::now() + Duration::minutes(6)).to_rfc3339());
     let mut config = Config::default();
     config.token_refresh_background_enabled = true;
-    let manager =
-        MultiTokenManager::new(config, vec![failed, succeeds], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![failed, succeeds],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let report = manager.run_background_token_refresh_pass().await;
 
@@ -731,16 +769,14 @@ async fn background_token_refresh_failure_isolated_and_next_account_still_refres
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_token_refresh_worker_shutdown_is_bounded() {
-    let manager = Arc::new(
-        MultiTokenManager::new(
-            Config::default(),
-            vec![api_key_credential("background-worker-shutdown")],
-            None,
-            None,
-            false,
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![api_key_credential("background-worker-shutdown")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let worker = manager.spawn_background_token_refresh_worker_inner_for_test(
         tokio::time::Instant::now() + StdDuration::from_secs(60),
     );
@@ -1333,7 +1369,7 @@ async fn postgres_stats_reload_preserves_pending_deltas_and_monotonic_local_valu
         .unwrap();
 
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -1394,7 +1430,7 @@ async fn steady_success_queues_stats_without_rewriting_unchanged_runtime_state()
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -1468,7 +1504,7 @@ async fn postgres_failed_stats_batch_retry_keeps_frozen_payload_and_new_accumula
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -1567,18 +1603,16 @@ async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds
         )
         .await
         .unwrap();
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![credential],
-            None,
-            None,
-            false,
-            Some(store.clone()),
-            None,
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
 
     manager
         .pending_stats_batches
@@ -1687,7 +1721,7 @@ async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
             .unwrap();
     }
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         credentials,
         None,
         None,
@@ -1760,7 +1794,7 @@ async fn postgres_admin_runtime_patches_advance_revision_once_and_ignore_old_res
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -1894,8 +1928,14 @@ fn delete_credential_clears_pending_persistence_for_that_id() {
     let mut credential = api_key_credential("delete-pending-state");
     credential.id = Some(1);
     credential.disabled = true;
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager.pending_stats_deltas.lock().insert(
         1,
@@ -1925,8 +1965,14 @@ fn delete_credential_clears_pending_persistence_for_that_id() {
 fn disabled_credential_cannot_acquire_new_in_flight_lease() {
     let mut credential = api_key_credential("disabled-no-new-lease");
     credential.id = Some(1);
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager.set_disabled(1, true).unwrap();
 
@@ -1939,8 +1985,14 @@ fn disabled_credential_cannot_acquire_new_in_flight_lease() {
 fn delete_disabled_credential_rejects_active_in_flight_until_drained() {
     let mut credential = api_key_credential("delete-active-inflight");
     credential.id = Some(1);
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let lease = manager
         .acquire_in_flight_lease_for_test(1)
@@ -1968,8 +2020,14 @@ fn delete_disabled_credential_rejects_active_in_flight_until_drained() {
 fn invalid_warmup_is_rejected_without_quarantine_or_retry() {
     let mut credential = api_key_credential("invalid-warmup");
     credential.id = Some(1);
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let invalid = (i32::MAX as u32).saturating_add(1);
     let error = manager.set_warmup_remaining(1, invalid).unwrap_err();
@@ -2001,7 +2059,7 @@ fn startup_applies_consistent_runtime_snapshot_before_selecting_current_credenti
     )]);
 
     let manager = MultiTokenManager::new_with_stores_and_runtime_state(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![first, second],
         None,
         None,
@@ -2038,7 +2096,7 @@ fn startup_quota_guard_skips_fresh_exhausted_api_key_and_keeps_runtime_enabled()
     )]);
 
     let manager = MultiTokenManager::new_with_stores_and_runtime_state_and_account_info(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![exhausted, healthy],
         None,
         None,
@@ -2072,7 +2130,7 @@ fn quota_guard_ignores_stale_missing_non_disabled_and_oauth_account_snapshots() 
         ..Default::default()
     };
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key, oauth.clone()],
         None,
         None,
@@ -2169,8 +2227,14 @@ fn apply_account_info_snapshot_for_credential_refreshes_only_one_entry_and_resel
     second.id = Some(2);
     second.priority = 1;
 
-    let manager = MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
-        .expect("quota snapshot fixture");
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![first, second],
+        None,
+        None,
+        false,
+    )
+    .expect("quota snapshot fixture");
     assert_eq!(manager.current_id(), 1);
     assert!(!manager.is_credential_account_quota_blocked(1));
     assert!(!manager.is_credential_account_quota_blocked(2));
@@ -2214,7 +2278,7 @@ async fn reload_remote_delete_clears_pending_persistence_for_removed_id() {
         .await
         .unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![first, removed],
         None,
         None,
@@ -2266,7 +2330,7 @@ async fn reload_account_info_quota_guard_reselects_healthy_credential() {
             .unwrap();
 
         let manager = MultiTokenManager::new_with_stores(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), Some(store.clone())),
             vec![exhausted, healthy],
             None,
             None,
@@ -2417,7 +2481,7 @@ async fn runtime_mutation_history_cleanup_drains_both_ledgers_and_is_minute_thro
     .unwrap();
 
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -2510,7 +2574,7 @@ async fn stale_admin_updates_merge_unrelated_credential_fields() {
     credential.id = Some(1);
     let inserted = store.insert_credential(&credential).await.unwrap();
     let manager_a = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![inserted.clone()],
         None,
         None,
@@ -2520,7 +2584,7 @@ async fn stale_admin_updates_merge_unrelated_credential_fields() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![inserted],
         None,
         None,
@@ -2571,7 +2635,7 @@ async fn runtime_mutation_flush_respects_global_wall_clock_budget() {
         .collect();
     store.save_credentials(&credentials).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         credentials,
         None,
         None,
@@ -2683,8 +2747,14 @@ async fn auxiliary_focus_refresh_step_deadline_drops_future_owned_resources_befo
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn force_refresh_local_lock_wait_respects_coordination_deadline() {
     let credential = force_refresh_test_credential("http://127.0.0.1:1/token".to_string());
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let refresh_state = manager.refresh_state_for_credential(1);
     let _held = refresh_state.gate.lock().await;
     let started_at = Instant::now();
@@ -2723,7 +2793,7 @@ async fn ordinary_refresh_peer_wait_respects_coordination_deadline() {
     let inserted = store.insert_credential(&credential).await.unwrap();
     let credential_id = inserted.id.expect("inserted credential must have an id");
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![inserted.clone()],
         None,
         None,
@@ -2785,7 +2855,7 @@ async fn pending_force_refresh_respects_total_deadline_and_releases_redis_lock()
     let (token_endpoint, request_received, server) = spawn_pending_refresh_token_endpoint().await;
     let credential = force_refresh_test_credential(token_endpoint);
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![credential],
         None,
         None,
@@ -2842,18 +2912,16 @@ async fn aborting_force_refresh_submits_critical_redis_lock_cleanup() {
     };
     let (token_endpoint, request_received, server) = spawn_pending_refresh_token_endpoint().await;
     let credential = force_refresh_test_credential(token_endpoint);
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![credential],
-            None,
-            None,
-            false,
-            None,
-            Some(redis.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis.clone()),
+    )
+    .unwrap();
     prewarm_refresh_client(&manager).await;
     let mut refresh_task = {
         let manager = manager.clone();
@@ -2905,18 +2973,16 @@ async fn aborting_ordinary_refresh_submits_critical_redis_lock_cleanup() {
     let mut credential = force_refresh_test_credential(token_endpoint);
     credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
     let refresh_credentials = credential.clone();
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![credential],
-            None,
-            None,
-            false,
-            None,
-            Some(redis.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis.clone()),
+    )
+    .unwrap();
     prewarm_refresh_client(&manager).await;
     let mut refresh_task = {
         let manager = manager.clone();
@@ -2975,7 +3041,7 @@ async fn ordinary_refresh_with_redis_without_postgres_uses_local_authority_and_r
     credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
     let refresh_credentials = credential.clone();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![credential],
         None,
         None,
@@ -3026,7 +3092,7 @@ async fn force_refresh_runtime_reset_cannot_overrun_total_deadline() {
         .unwrap();
     let inserted = store.insert_credential(&credential).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![inserted],
         None,
         None,
@@ -3098,18 +3164,16 @@ async fn force_refresh_holds_redis_lock_until_postgres_commit() {
         .save_credentials(std::slice::from_ref(&credential))
         .await
         .unwrap();
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![credential],
-            None,
-            None,
-            false,
-            Some(store.clone()),
-            Some(redis.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        Some(redis.clone()),
+    )
+    .unwrap();
 
     let mut transaction = store.pool().begin().await.unwrap();
     sqlx::query("LOCK TABLE credentials IN ACCESS EXCLUSIVE MODE")
@@ -3169,7 +3233,7 @@ async fn ordinary_refresh_postgres_failure_is_typed_and_credential_health_neutra
         .await
         .unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -3236,7 +3300,7 @@ async fn refresh_cas_treats_already_committed_fields_as_success() {
         force_refresh_test_credential("http://127.0.0.1:1/token-that-is-never-called".to_string());
     let inserted = store.insert_credential(&credential).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![inserted.clone()],
         None,
         None,
@@ -3295,7 +3359,7 @@ async fn refresh_cas_treats_already_committed_fields_as_success() {
 #[test]
 fn test_partial_scheduler_state_apply_preserves_unrequested_entries() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![
             test_access_token_credential("token-1", "Pro"),
             test_access_token_credential("token-2", "Pro"),
@@ -3350,7 +3414,7 @@ fn test_partial_scheduler_state_apply_preserves_unrequested_entries() {
 #[test]
 fn test_scheduler_state_apply_preserves_local_in_flight_leases() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential("token-1", "Pro")],
         None,
         None,
@@ -3389,7 +3453,7 @@ fn test_scheduler_state_apply_filters_expired_redis_in_flight_leases() {
     let mut config = Config::default();
     config.credential_in_flight_lease_max_secs = 1;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("token-1", "Pro")],
         None,
         None,
@@ -3454,7 +3518,7 @@ fn test_scheduler_state_apply_filters_expired_redis_in_flight_leases() {
 #[test]
 fn test_scheduler_state_apply_ignores_recently_released_redis_in_flight_lease() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential("token-1", "Pro")],
         None,
         None,
@@ -3511,7 +3575,7 @@ fn test_scheduler_state_apply_ignores_recently_released_redis_in_flight_lease() 
 #[test]
 fn test_scheduler_state_apply_drops_remote_lease_missing_from_next_snapshot() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential("token-1", "Pro")],
         None,
         None,
@@ -3552,7 +3616,7 @@ fn test_scheduler_state_apply_drops_remote_lease_missing_from_next_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential("token-1", "Pro")],
         None,
         None,
@@ -3589,7 +3653,7 @@ async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
 fn dispatch_wakeup_filters_self_and_routes_remote_scope_for_five_rounds() {
     for round in 0..5u64 {
         let manager = MultiTokenManager::new(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), None),
             vec![test_access_token_credential("token-1", "Pro")],
             None,
             None,
@@ -3662,7 +3726,7 @@ async fn remote_scheduler_events_arriving_during_snapshot_are_chased_for_five_ro
 
     for round in 0..5u64 {
         let manager = MultiTokenManager::new_with_stores(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), None),
             vec![api_key_credential(&format!("remote-generation-{round}"))],
             None,
             None,
@@ -3732,7 +3796,7 @@ async fn remote_scheduler_events_arriving_during_snapshot_are_chased_for_five_ro
 #[tokio::test(flavor = "multi_thread")]
 async fn test_scheduler_affinity_timeout_does_not_degrade_capacity_coordination() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential("token-1", "Pro")],
         None,
         None,
@@ -4347,7 +4411,14 @@ async fn test_add_credential_reject_duplicate_refresh_token() {
     let mut existing = KiroCredentials::default();
     existing.refresh_token = Some("a".repeat(150));
 
-    let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![existing],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut duplicate = KiroCredentials::default();
     duplicate.refresh_token = Some("a".repeat(150));
@@ -4360,7 +4431,14 @@ async fn test_add_credential_reject_duplicate_refresh_token() {
 #[tokio::test]
 async fn test_add_credential_api_key_success() {
     let config = Config::default();
-    let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut api_key_cred = KiroCredentials::default();
     api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
@@ -4383,7 +4461,14 @@ async fn test_add_credential_reject_duplicate_machine_id() {
         machine_id: Some("a".repeat(64)),
         ..Default::default()
     };
-    let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![existing],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let duplicate = KiroCredentials {
         kiro_api_key: Some("ksk_other_machine_id".to_string()),
@@ -4410,7 +4495,13 @@ fn test_manager_rejects_duplicate_machine_ids_at_startup() {
         ..Default::default()
     };
 
-    let result = MultiTokenManager::new(Config::default(), vec![first, second], None, None, false);
+    let result = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![first, second],
+        None,
+        None,
+        false,
+    );
     assert!(result.is_err());
     assert!(result.err().unwrap().to_string().contains("共享身份"));
 }
@@ -4424,8 +4515,14 @@ fn test_update_credential_auth_preserves_account_machine_id() {
         ..Default::default()
     };
     let original_machine_id = existing.machine_id.clone();
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![existing],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .update_credential_auth(
@@ -4457,7 +4554,7 @@ async fn postgres_row_level_update_does_not_delete_credentials_added_by_other_in
     store.save_credentials(&[first.clone()]).await.unwrap();
 
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![first],
         None,
         None,
@@ -4505,7 +4602,7 @@ async fn postgres_failure_counts_are_atomic_across_managers() {
     store.save_credentials(&[credential.clone()]).await.unwrap();
 
     let manager_a = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential.clone()],
         None,
         None,
@@ -4515,7 +4612,7 @@ async fn postgres_failure_counts_are_atomic_across_managers() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -4563,7 +4660,7 @@ async fn postgres_failure_deferred_queues_before_runtime_flush() {
     store.save_credentials(&[credential.clone()]).await.unwrap();
 
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -4602,8 +4699,14 @@ async fn postgres_failure_deferred_queues_before_runtime_flush() {
 fn deferred_failure_does_not_recount_disabled_credential_during_persistence_recovery() {
     let mut credential = api_key_credential("ksk_disabled_failure_guard");
     credential.id = Some(1);
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     {
         let mut entries = manager.entries.lock();
@@ -4641,7 +4744,7 @@ async fn postgres_quota_deferred_persists_disable_on_runtime_flush() {
     store.save_credentials(&[credential.clone()]).await.unwrap();
 
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -4705,7 +4808,7 @@ async fn postgres_success_reset_is_ordered_before_next_cross_manager_failure() {
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager_a = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential.clone()],
         None,
         None,
@@ -4715,7 +4818,7 @@ async fn postgres_success_reset_is_ordered_before_next_cross_manager_failure() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -4765,7 +4868,7 @@ async fn postgres_clean_success_reconciliation_is_rate_limited_per_credential() 
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -4792,8 +4895,14 @@ async fn postgres_clean_success_reconciliation_is_rate_limited_per_credential() 
 fn pending_success_runtime_mutations_coalesce_at_queue_tail() {
     let mut credential = api_key_credential("ksk_pending_success_coalesce");
     credential.id = Some(1);
-    let manager = MultiTokenManager::new(Config::default(), vec![credential], None, None, false)
-        .expect("construct token manager");
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .expect("construct token manager");
 
     manager.enqueue_pending_runtime_mutation(
         1,
@@ -4885,7 +4994,7 @@ async fn postgres_refresh_failure_counts_are_atomic_across_managers() {
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager_a = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential.clone()],
         None,
         None,
@@ -4895,7 +5004,7 @@ async fn postgres_refresh_failure_counts_are_atomic_across_managers() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -4939,7 +5048,7 @@ async fn postgres_auto_heal_reenables_credential_for_every_manager() {
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager_a = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential.clone()],
         None,
         None,
@@ -4949,7 +5058,7 @@ async fn postgres_auto_heal_reenables_credential_for_every_manager() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -5008,7 +5117,7 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
     assert_eq!(initial.revision, 1);
 
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -5080,7 +5189,7 @@ async fn postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine
         credential.id = Some(1);
         store.save_credentials(&[credential.clone()]).await.unwrap();
         let manager = MultiTokenManager::new_with_stores(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), Some(store.clone())),
             vec![credential],
             None,
             None,
@@ -5168,7 +5277,7 @@ async fn terminal_deferred_success_does_not_wait_for_pgsql_pool_pressure_for_fiv
         credential.id = Some(1);
         store.save_credentials(&[credential.clone()]).await.unwrap();
         let manager = MultiTokenManager::new_with_stores(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), Some(store.clone())),
             vec![credential],
             None,
             None,
@@ -5325,8 +5434,14 @@ fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five
         let credentials = (0..40)
             .map(|idx| api_key_credential(&format!("ksk_runtime_backlog_{round}_{idx}")))
             .collect::<Vec<_>>();
-        let manager =
-            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         for id in 1..=40_u64 {
             let mutation = match id % 4 {
@@ -5444,7 +5559,7 @@ async fn postgres_reset_generation_fences_pending_failure_and_disable_replay() {
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager_a = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential.clone()],
         None,
         None,
@@ -5454,7 +5569,7 @@ async fn postgres_reset_generation_fences_pending_failure_and_disable_replay() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -5538,7 +5653,7 @@ async fn postgres_admin_capacity_update_defers_runtime_patch_during_recovery() {
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -5614,7 +5729,7 @@ async fn postgres_admin_reset_enable_defers_runtime_patch_during_recovery() {
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -5691,7 +5806,14 @@ async fn test_add_credential_reject_duplicate_api_key() {
     existing.kiro_api_key = Some("ksk_existing_key".to_string());
     existing.auth_method = Some("api_key".to_string());
 
-    let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![existing],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut duplicate = KiroCredentials::default();
     duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
@@ -5711,7 +5833,14 @@ async fn test_add_credential_reject_duplicate_api_key() {
 #[tokio::test]
 async fn test_add_credential_api_key_empty_rejected() {
     let config = Config::default();
-    let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut cred = KiroCredentials::default();
     cred.kiro_api_key = Some(String::new());
@@ -5731,7 +5860,14 @@ async fn test_add_credential_api_key_empty_rejected() {
 #[tokio::test]
 async fn test_add_credential_api_key_missing_key_rejected() {
     let config = Config::default();
-    let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut cred = KiroCredentials::default();
     cred.auth_method = Some("api_key".to_string());
@@ -5755,7 +5891,14 @@ async fn test_add_credential_api_key_and_oauth_coexist() {
     let mut oauth_cred = KiroCredentials::default();
     oauth_cred.refresh_token = Some("a".repeat(150));
 
-    let manager = MultiTokenManager::new(config, vec![oauth_cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![oauth_cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut api_key_cred = KiroCredentials::default();
     api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
@@ -5777,7 +5920,14 @@ fn test_multi_token_manager_new() {
     let mut cred2 = KiroCredentials::default();
     cred2.priority = 1;
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(manager.total_count(), 2);
     assert_eq!(manager.available_count(), 2);
 }
@@ -5785,7 +5935,13 @@ fn test_multi_token_manager_new() {
 #[test]
 fn test_multi_token_manager_empty_credentials() {
     let config = Config::default();
-    let result = MultiTokenManager::new(config, vec![], None, None, false);
+    let result = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![],
+        None,
+        None,
+        false,
+    );
     // 支持 0 个凭据启动（可通过管理面板添加）
     assert!(result.is_ok());
     let manager = result.unwrap();
@@ -5801,7 +5957,13 @@ fn test_multi_token_manager_duplicate_ids() {
     let mut cred2 = KiroCredentials::default();
     cred2.id = Some(1); // 重复 ID
 
-    let result = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false);
+    let result = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    );
     assert!(result.is_err());
     let err_msg = result.err().unwrap().to_string();
     assert!(
@@ -5823,8 +5985,14 @@ fn test_multi_token_manager_api_key_missing_kiro_api_key_auto_disabled() {
     let mut good_cred = KiroCredentials::default();
     good_cred.refresh_token = Some("valid_token".to_string());
 
-    let manager =
-        MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![bad_cred, good_cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(manager.total_count(), 2);
     assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
 }
@@ -5838,7 +6006,14 @@ fn test_multi_token_manager_api_key_with_kiro_api_key_not_disabled() {
     cred.auth_method = Some("api_key".to_string());
     cred.kiro_api_key = Some("ksk_test123".to_string());
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(manager.total_count(), 1);
     assert_eq!(manager.available_count(), 1);
 }
@@ -5849,7 +6024,14 @@ fn test_multi_token_manager_report_failure() {
     let cred1 = KiroCredentials::default();
     let cred2 = KiroCredentials::default();
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     // 凭据会自动分配 ID（从 1 开始）
     // 前两次失败不会禁用（使用 ID 1）
@@ -5871,7 +6053,7 @@ fn test_multi_token_manager_report_failure() {
 #[test]
 fn report_failure_deferred_matches_local_scheduler_semantics() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![KiroCredentials::default(), KiroCredentials::default()],
         None,
         None,
@@ -5904,7 +6086,7 @@ fn report_failure_deferred_matches_local_scheduler_semantics() {
 #[test]
 fn deferred_terminal_disable_variants_update_local_state_without_store() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![
             KiroCredentials::default(),
             KiroCredentials::default(),
@@ -5968,7 +6150,7 @@ fn deferred_terminal_disable_variants_update_local_state_without_store() {
 #[test]
 fn profile_arn_deferred_updates_local_state_without_store() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![KiroCredentials::default()],
         None,
         None,
@@ -6011,7 +6193,14 @@ fn test_multi_token_manager_report_success() {
     let config = Config::default();
     let cred = KiroCredentials::default();
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     // 失败两次（使用 ID 1）
     manager.report_failure(1);
@@ -6034,7 +6223,14 @@ fn test_multi_token_manager_switch_to_next() {
     let mut cred2 = KiroCredentials::default();
     cred2.refresh_token = Some("token2".to_string());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let initial_id = manager.snapshot().current_id;
 
@@ -6046,9 +6242,14 @@ fn test_multi_token_manager_switch_to_next() {
 #[test]
 fn test_set_load_balancing_mode_updates_runtime_memory_without_store() {
     let config = Config::default();
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![KiroCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .set_load_balancing_mode("balanced".to_string())
@@ -6065,9 +6266,14 @@ fn test_update_runtime_config_updates_runtime_memory_without_store() {
     };
 
     let config = Config::default();
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![KiroCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .update_runtime_config(|config| {
@@ -6103,7 +6309,14 @@ fn finite_dispatch_queue_lease_covers_actual_wait_and_unlimited_wait_renews() {
     for round in 1..=5 {
         let mut config = Config::default();
         config.credential_dispatch_max_wait_secs = 120;
-        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         let configured =
             dispatch_queue_lease_policy(manager.dispatch_max_wait(AcquireMode::WaitForCapacity));
@@ -6132,7 +6345,14 @@ async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
     let cred1 = test_access_token_credential("t1", "Pro");
     let cred2 = test_access_token_credential("t2", "Pro");
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     // 凭据会自动分配 ID（从 1 开始）
     for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
@@ -6156,8 +6376,14 @@ async fn acquire_auto_heal_outside_selection_gate_terminates_when_healed_credent
 {
     let cred1 = test_access_token_credential("t1", "Pro");
     let cred2 = test_access_token_credential("t2", "Pro");
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
         manager.report_failure(1);
         manager.report_failure(2);
@@ -6194,7 +6420,7 @@ async fn postgres_acquire_auto_heal_persists_without_the_sync_storage_bridge() {
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential],
         None,
         None,
@@ -6234,18 +6460,16 @@ async fn postgres_concurrent_acquires_auto_heal_with_a_single_pgsql_pass() {
     store.save_credentials(&credentials).await.unwrap();
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 64;
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            credentials,
-            None,
-            None,
-            false,
-            Some(store.clone()),
-            None,
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, Some(store.clone())),
+        credentials,
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
     for id in 1..=3u64 {
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
             manager.report_failure(id);
@@ -6294,18 +6518,16 @@ async fn postgres_concurrent_route_state_checks_auto_heal_with_a_single_pgsql_pa
         credentials.push(credential);
     }
     store.save_credentials(&credentials).await.unwrap();
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            Config::default(),
-            credentials,
-            None,
-            None,
-            false,
-            Some(store.clone()),
-            None,
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
+        credentials,
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
     for id in 1..=3u64 {
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
             manager.report_failure(id);
@@ -6368,8 +6590,14 @@ async fn test_multi_token_manager_acquire_context_balanced_request_excludes_bad_
     good_cred.access_token = Some("good-token".to_string());
     good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager =
-        MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![bad_cred, good_cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut ctx = manager.acquire_context(None).await.unwrap();
     assert_eq!(ctx.id, 2);
@@ -6394,8 +6622,14 @@ async fn test_all_invalid_refresh_configurations_are_request_bounded_and_health_
         let mut second = KiroCredentials::default();
         second.refresh_token = Some("also-bad".to_string());
 
-        let manager =
-            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![first, second],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let started = Instant::now();
         let error = tokio::time::timeout(StdDuration::from_secs(2), manager.acquire_context(None))
             .await
@@ -6476,7 +6710,14 @@ async fn test_acquire_context_sticks_same_session_to_same_credential_in_balanced
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let excluded = HashSet::new();
 
     let first = manager
@@ -6505,7 +6746,14 @@ async fn test_model_specific_cooldown_only_blocks_same_model() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager
         .report_transient_failure_kind(
             1,
@@ -6547,7 +6795,14 @@ async fn test_supported_model_exact_match_allows_local_scheduler_selection() {
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.supported_models = vec!["claude-sonnet-4".to_string()];
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut ctx = manager
         .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
         .await
@@ -6567,7 +6822,14 @@ async fn test_supported_model_filter_aliases_local_scheduler_selection() {
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut ctx = manager
         .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
         .await
@@ -6590,8 +6852,14 @@ async fn test_empty_supported_models_allows_future_model_when_restricted_credent
     unrestricted.priority = 1;
     unrestricted.supported_models = Vec::new();
 
-    let manager =
-        MultiTokenManager::new(config, vec![restricted, unrestricted], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![restricted, unrestricted],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut ctx = manager
         .acquire_context_for_session(Some("claude-sonnet-5"), None, &HashSet::new())
         .await
@@ -6623,8 +6891,14 @@ async fn test_catalog_listed_credentials_win_over_unknown_catalog_for_five_round
             listed.priority = 1;
             listed.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
 
-            let manager =
-                MultiTokenManager::new(config, vec![unknown, listed], None, None, false).unwrap();
+            let manager = MultiTokenManager::new(
+                RuntimeConfigStore::new(config, None),
+                vec![unknown, listed],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             let mut ctx = manager
                 .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
                 .await
@@ -6669,8 +6943,14 @@ async fn empty_catalog_credentials_take_traffic_once_listed_ones_are_full() {
     let mut listed = api_key_credential("listed-api-key");
     listed.priority = 0;
     listed.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
-    let manager =
-        MultiTokenManager::new(config, vec![empty_catalog, listed], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![empty_catalog, listed],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
     let mut first = manager
         .acquire_context_for_session(Some("claude-sonnet-4"), None, &empty)
@@ -6705,7 +6985,14 @@ async fn test_supported_model_alias_does_not_cross_family_in_local_scheduler() {
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.supported_models = vec!["claude-opus-4.8".to_string()];
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let err = manager
         .acquire_context_for_session(Some("claude-sonnet-4.6"), None, &HashSet::new())
         .await
@@ -6743,7 +7030,14 @@ async fn test_model_scoped_429_high_concurrency_disabled_and_model_filters() {
     credentials[10].disabled = true;
     credentials[11].disabled = true;
 
-    let manager = Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     for id in [2_u64, 4, 6] {
         manager
@@ -6875,7 +7169,14 @@ async fn test_acquire_context_excluded_bound_session_can_fallback() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     let first = manager
@@ -6912,7 +7213,14 @@ async fn test_bound_session_falls_back_when_bound_credential_is_full() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     let mut bound = manager
@@ -6970,7 +7278,14 @@ async fn test_transient_failure_cools_down_without_disabling_credential() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     assert!(
         manager
@@ -7003,7 +7318,14 @@ async fn test_transient_failure_does_not_shorten_existing_cooldown() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .report_transient_failure(1, None, Some(StdDuration::from_secs(30)), "long")
@@ -7030,7 +7352,14 @@ fn test_success_does_not_clear_active_transient_cooldown() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .report_transient_failure(1, None, Some(StdDuration::from_secs(30)), "429")
@@ -7050,9 +7379,14 @@ fn test_structured_transient_failure_updates_health_and_backoff() {
     config.credential_max_cooldown_secs = 10;
     config.credential_cooldown_backoff_multiplier = 2.0;
     config.credential_cooldown_jitter_percent = 0;
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![KiroCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
@@ -7086,7 +7420,7 @@ fn test_transient_failure_coalesces_same_burst_without_backoff_amplification() {
     config.credential_cooldown_backoff_multiplier = 2.0;
     config.credential_cooldown_jitter_percent = 0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("token", "Pro")],
         None,
         None,
@@ -7159,7 +7493,7 @@ fn test_error_specific_cooldown_parameters_are_effective() {
         configure(&mut config);
 
         let manager = MultiTokenManager::new(
-            config,
+            RuntimeConfigStore::new(config, None),
             vec![test_access_token_credential("token", "Pro")],
             None,
             None,
@@ -7189,7 +7523,7 @@ fn test_scheduler_error_ewma_alpha_changes_error_rate_update() {
         config.credential_max_cooldown_secs = 10;
         config.credential_cooldown_jitter_percent = 0;
         MultiTokenManager::new(
-            config,
+            RuntimeConfigStore::new(config, None),
             vec![test_access_token_credential("token", "Pro")],
             None,
             None,
@@ -7336,9 +7670,14 @@ fn test_health_balanced_score_parameters_are_effective() {
 fn test_success_updates_health_latency_without_clearing_cooldown() {
     let mut config = Config::default();
     config.credential_stream_error_cooldown_secs = 10;
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![KiroCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager
         .report_transient_failure_kind(
             1,
@@ -7367,7 +7706,14 @@ async fn test_health_balanced_mode_prefers_best_scored_candidate() {
     let mut second = KiroCredentials::default();
     second.access_token = Some("second".to_string());
     second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![first, second],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     {
         let mut entries = manager.entries.lock();
         entries[0].health.recent_error_rate = 1.0;
@@ -7393,7 +7739,7 @@ async fn test_weighted_least_inflight_mode_prefers_lower_load_candidate() {
     config.scheduler_selection_pressure_weight = 0.0;
     config.scheduler_total_selection_weight = 0.0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             test_access_token_credential("busy-token", "Pro"),
             test_access_token_credential("idle-token", "Pro"),
@@ -7428,7 +7774,14 @@ async fn test_health_balanced_mode_penalizes_recent_selection_pressure() {
     let mut second = KiroCredentials::default();
     second.access_token = Some("second".to_string());
     second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![first, second],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     {
         let mut entries = manager.entries.lock();
         entries[0].health.recent_selection_count_60s = 100;
@@ -7449,8 +7802,14 @@ async fn balanced_mode_prefers_configured_priority_before_recent_spread() {
     let mut fallback = test_access_token_credential("fallback-token", "Pro");
     fallback.priority = 10;
 
-    let manager =
-        MultiTokenManager::new(config, vec![preferred, fallback], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![preferred, fallback],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     {
         let mut entries = manager.entries.lock();
         entries[0].health.recent_selection_count_10s = 50;
@@ -7478,8 +7837,14 @@ async fn balanced_mode_falls_back_when_preferred_priority_is_full() {
     let mut fallback = test_access_token_credential("fallback-token", "Pro");
     fallback.priority = 10;
 
-    let manager =
-        MultiTokenManager::new(config, vec![preferred, fallback], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![preferred, fallback],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
     assert_eq!(first.id, 1);
 
@@ -7500,7 +7865,14 @@ async fn balanced_mode_priority_update_preserves_existing_sticky_and_moves_new_s
 
     let first = test_access_token_credential("first-token", "Pro");
     let second = test_access_token_credential("second-token", "Pro");
-    let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![first, second],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     let mut bound = manager
@@ -7550,8 +7922,14 @@ async fn test_balanced_mode_rotates_all_warming_credentials_by_recent_selection(
     let mut third = KiroCredentials::default();
     third.access_token = Some("third".to_string());
     third.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let manager =
-        MultiTokenManager::new(config, vec![first, second, third], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![first, second, third],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(1, 3).unwrap();
     manager.set_warmup_remaining(2, 3).unwrap();
     manager.set_warmup_remaining(3, 3).unwrap();
@@ -7588,7 +7966,14 @@ async fn test_balanced_mode_holds_warming_credentials_to_their_quota() {
     let credentials = (1_u64..=8)
         .map(|id| api_key_credential(&format!("ksk_quota_{id}")))
         .collect::<Vec<_>>();
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(7, 30).unwrap();
     manager.set_warmup_remaining(8, 30).unwrap();
 
@@ -7616,7 +8001,14 @@ async fn few_ready_credentials_share_load_with_warming_ones() {
     let credentials = (1_u64..=3)
         .map(|id| api_key_credential(&format!("ksk_few_{id}")))
         .collect::<Vec<_>>();
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(2, 30).unwrap();
     manager.set_warmup_remaining(3, 30).unwrap();
 
@@ -7648,7 +8040,14 @@ async fn new_credential_in_a_large_pool_ramps_up_slowly() {
     let credentials = (1_u64..=21)
         .map(|id| api_key_credential(&format!("ksk_ramp_{id}")))
         .collect::<Vec<_>>();
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(21, 30).unwrap();
 
     let mut new_picks = Vec::new();
@@ -7695,7 +8094,7 @@ async fn warming_credential_takes_overflow_when_ready_credentials_are_full() {
     config.credential_warmup_requests = 30;
     config.credential_warmup_selection_percent = 0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             api_key_credential("ksk_full"),
             api_key_credential("ksk_new"),
@@ -7728,7 +8127,7 @@ async fn warming_credential_does_not_take_new_session_bindings_while_ready_ones_
     config.credential_warmup_requests = 30;
     config.credential_warmup_selection_percent = 5;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             api_key_credential("ksk_ready"),
             api_key_credential("ksk_new"),
@@ -7783,7 +8182,7 @@ async fn warming_pool_without_ready_credentials_still_binds_sessions() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_warmup_requests = 30;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             api_key_credential("ksk_warm_a"),
             api_key_credential("ksk_warm_b"),
@@ -7825,7 +8224,14 @@ async fn sessions_do_not_migrate_to_a_warming_credential_in_a_better_tier() {
     lower.priority = 10;
     let mut better = test_access_token_credential("better", "Pro");
     better.priority = 0;
-    let manager = MultiTokenManager::new(config, vec![lower, better], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![lower, better],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.bind_session_to_credential("bound-low", 1);
     manager.set_warmup_remaining(2, 30).unwrap();
     let empty = HashSet::new();
@@ -7849,7 +8255,14 @@ async fn test_simulation_balanced_mode_spreads_new_warming_batch() {
     let credentials = (1_u64..=10)
         .map(|id| api_key_credential(&format!("ksk_warmup_{id}")))
         .collect::<Vec<_>>();
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     for id in 1_u64..=10 {
         manager.set_warmup_remaining(id, 3).unwrap();
     }
@@ -7897,7 +8310,14 @@ async fn test_scheduler_handles_500_daily_credentials_1000_rpm_simulation() {
     let credentials = (1..=CREDENTIAL_COUNT)
         .map(|id| api_key_credential(&format!("ksk_daily_{id}")))
         .collect::<Vec<_>>();
-    let manager = Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let started_at = Instant::now();
     let mut selection_counts: HashMap<u64, usize> = HashMap::new();
@@ -7951,7 +8371,14 @@ async fn test_simulation_mixed_large_requests_failures_and_disabled_accounts() {
         .map(|id| api_key_credential(&format!("ksk_mixed_{id}")))
         .collect::<Vec<_>>();
     credentials[1].disabled = true;
-    let manager = Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     assert!(manager.report_quota_exhausted(3));
     assert!(
@@ -8044,9 +8471,14 @@ async fn test_transient_failure_cools_down_only_usable_credential() {
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(
-        MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap(),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![disabled, active],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     assert!(
         !manager
@@ -8097,7 +8529,14 @@ async fn test_rate_limiter_prefers_other_dispatchable_credential() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
     let mut second = manager.acquire_context(None).await.unwrap();
@@ -8125,7 +8564,14 @@ async fn test_rate_limiter_blocks_after_window_capacity_is_full() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
     first.release_in_flight();
 
@@ -8143,7 +8589,7 @@ async fn test_rate_limiter_allows_idle_burst_up_to_rpm_capacity() {
     config.dispatch_global_max_concurrent_requests = 80;
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("t1", "Pro")],
         None,
         None,
@@ -8172,7 +8618,7 @@ fn rpm_window_counts_only_the_last_minute_and_reports_the_oldest_selection() {
     let mut config = Config::default();
     config.credential_rpm = Some(3);
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("rpm-window", "Pro")],
         None,
         None,
@@ -8264,7 +8710,7 @@ async fn test_runtime_config_disabling_credential_rpm_clears_rate_limit_state() 
     config.credential_rpm = Some(1);
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("t1", "Pro")],
         None,
         None,
@@ -8299,7 +8745,14 @@ async fn test_credential_rpm_override_limits_when_global_unlimited() {
     let mut cred = test_access_token_credential("t1", "Pro");
     cred.rpm = Some(1);
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
     first.release_in_flight();
 
@@ -8317,7 +8770,14 @@ async fn test_credential_rpm_override_zero_bypasses_global_limit() {
     let mut cred = test_access_token_credential("t1", "Pro");
     cred.rpm = Some(0);
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
     first.release_in_flight();
 
@@ -8339,7 +8799,14 @@ async fn priority_mode_splits_warmup_only_inside_the_preferred_tier() {
     ready.priority = 0;
     let mut warming = test_access_token_credential("warming", "Pro");
     warming.priority = 10;
-    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![ready, warming],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(2, 5).unwrap();
     for round in 0..5 {
         let mut ctx = manager.acquire_context(None).await.unwrap();
@@ -8358,7 +8825,14 @@ async fn priority_mode_splits_warmup_only_inside_the_preferred_tier() {
     ready.priority = 10;
     let mut warming = test_access_token_credential("warming", "Pro");
     warming.priority = 0;
-    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![ready, warming],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(2, 30).unwrap();
     let mut picks = Vec::new();
     for _ in 0..5 {
@@ -8381,7 +8855,14 @@ async fn priority_mode_splits_warmup_only_inside_the_preferred_tier() {
     ready.priority = 10;
     let mut warming = test_access_token_credential("warming", "Pro");
     warming.priority = 0;
-    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![ready, warming],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(2, 5).unwrap();
     let mut ctx = manager.acquire_context(None).await.unwrap();
     assert_eq!(
@@ -8396,7 +8877,7 @@ fn credential_capacity_updates_preserve_warmup_remaining() {
     let mut config = Config::default();
     config.credential_warmup_requests = 7;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("capacity", "Pro")],
         None,
         None,
@@ -8438,7 +8919,7 @@ fn credential_capacity_updates_do_not_rewind_warmup_progress() {
     let mut config = Config::default();
     config.credential_warmup_requests = 7;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("capacity", "Pro")],
         None,
         None,
@@ -8481,7 +8962,7 @@ fn batch_capacity_updates_preserve_per_account_warmup_progress() {
     let mut config = Config::default();
     config.credential_warmup_requests = 7;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             test_access_token_credential("batch-a", "Pro"),
             test_access_token_credential("batch-b", "Pro"),
@@ -8535,7 +9016,7 @@ fn global_runtime_capacity_change_still_resets_warmup() {
     let mut config = Config::default();
     config.credential_warmup_requests = 7;
     let manager = MultiTokenManager::new(
-        config.clone(),
+        RuntimeConfigStore::new(config.clone(), None),
         vec![test_access_token_credential("global", "Pro")],
         None,
         None,
@@ -8573,8 +9054,14 @@ async fn test_all_transient_cooldown_fails_fast() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager =
-        Arc::new(MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert!(
         manager
             .report_transient_failure(1, None, Some(StdDuration::from_millis(20)), "429")
@@ -8624,7 +9111,14 @@ async fn test_concurrency_limiter_prefers_other_dispatchable_credential() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
     let mut second = manager.acquire_context(None).await.unwrap();
@@ -8662,7 +9156,14 @@ async fn test_priority_mode_prefers_lower_in_flight_with_same_priority() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
     let mut second = manager.acquire_context(None).await.unwrap();
@@ -8684,9 +9185,14 @@ async fn test_global_capacity_limits_dispatch_and_bounds_wait_queue() {
     let mut second_cred = KiroCredentials::default();
     second_cred.access_token = Some("second".to_string());
     second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let manager = Arc::new(
-        MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false).unwrap(),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![first_cred, second_cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
     assert_eq!(manager.snapshot().global_in_flight_requests, 1);
@@ -8730,18 +9236,16 @@ async fn queued_request_keeps_admission_wait_deadline_when_runtime_config_change
         config.dispatch_global_max_concurrent_requests = 1;
         config.dispatch_max_queued_requests = 1;
         config.credential_dispatch_max_wait_secs = 1;
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                vec![api_key_credential(&format!(
-                    "stable-queue-deadline-{round}"
-                ))],
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![api_key_credential(&format!(
+                "stable-queue-deadline-{round}"
+            ))],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut first = manager.acquire_context(None).await.unwrap();
         let waiting_manager = manager.clone();
@@ -8816,9 +9320,14 @@ async fn forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_
         config.dispatch_global_max_concurrent_requests = GLOBAL_LIMIT;
         config.dispatch_max_queued_requests = 1;
         config.credential_dispatch_max_wait_secs = 1;
-        let manager = Arc::new(
-            MultiTokenManager::new(config.clone(), credentials, None, None, false).unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config.clone(), None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut held = Vec::with_capacity(GLOBAL_LIMIT as usize);
         for idx in 0..GLOBAL_LIMIT as usize {
@@ -8881,8 +9390,14 @@ async fn forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_
         let credentials = (0..CREDENTIALS)
             .map(|idx| api_key_credential(&format!("ksk_c501_{round}_{idx}")))
             .collect::<Vec<_>>();
-        let unlimited_global =
-            MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        let unlimited_global = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let mut below_per_credential_total = Vec::with_capacity(GLOBAL_LIMIT as usize);
         for idx in 0..GLOBAL_LIMIT as usize {
             let id = (idx % CREDENTIALS) as u64 + 1;
@@ -8931,9 +9446,14 @@ async fn test_fail_fast_global_capacity_full_returns_without_queueing_for_five_r
 
         let first_cred = test_access_token_credential("first", "Pro");
         let second_cred = test_access_token_credential("second", "Pro");
-        let manager =
-            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![first_cred, second_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         let mut first = manager.acquire_context(None).await.unwrap();
         let err = manager
@@ -8971,7 +9491,7 @@ async fn test_weighted_local_capacity_consumes_single_credential_slots() {
     config.credential_max_concurrent_requests = 4;
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("weighted", "Pro")],
         None,
         None,
@@ -9024,7 +9544,7 @@ async fn test_weighted_local_capacity_consumes_global_slots() {
     config.dispatch_global_max_concurrent_requests = 4;
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             test_access_token_credential("weighted-a", "Pro"),
             test_access_token_credential("weighted-b", "Pro"),
@@ -9075,7 +9595,7 @@ async fn test_weighted_selection_pressure_counts_capacity_units_not_total_reques
     config.scheduler_selection_pressure_weight = 25.0;
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("weighted-selection", "Pro")],
         None,
         None,
@@ -9109,7 +9629,7 @@ async fn test_weighted_rpm_consumes_capacity_units() {
     config.credential_max_concurrent_requests = 8;
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("weighted-rpm", "Pro")],
         None,
         None,
@@ -9137,7 +9657,14 @@ async fn test_weighted_rpm_consumes_capacity_units() {
 
 #[test]
 fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
-    let empty = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+    let empty = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty_state = empty.local_pool_route_state(None);
     assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
     assert_eq!(empty_state.total, 0);
@@ -9145,8 +9672,14 @@ fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
 
     let mut disabled = test_access_token_credential("disabled", "Pro");
     disabled.disabled = true;
-    let disabled_manager =
-        MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
+    let disabled_manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![disabled],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let disabled_state = disabled_manager.local_pool_route_state(None);
     assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
     assert_eq!(disabled_state.total, 1);
@@ -9160,7 +9693,7 @@ async fn test_local_pool_route_state_reports_capacity_full_without_queueing_for_
         config.credential_max_concurrent_requests = 1;
         config.dispatch_max_queued_requests = 10;
         let manager = MultiTokenManager::new(
-            config,
+            RuntimeConfigStore::new(config, None),
             vec![test_access_token_credential("first", "Pro")],
             None,
             None,
@@ -9199,7 +9732,7 @@ async fn selection_failure_summary_records_concurrency_full_accounts() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("first", "Pro")],
         None,
         None,
@@ -9240,7 +9773,7 @@ async fn selection_failure_summary_records_rpm_limited_accounts() {
     let mut config = Config::default();
     config.credential_rpm = Some(60);
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("first", "Pro")],
         None,
         None,
@@ -9273,9 +9806,14 @@ async fn selection_failure_summary_records_rpm_limited_accounts() {
 async fn enabling_an_account_wakes_the_model_catalog_worker_immediately() {
     let mut credential = api_key_credential("ksk_cohort_wake");
     credential.disabled = true;
-    let manager = Arc::new(
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap(),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let waiter = {
         let manager = manager.clone();
         tokio::spawn(async move {
@@ -9300,7 +9838,7 @@ async fn selection_failure_summary_records_model_not_supported() {
     let mut free = api_key_credential("ksk_selection_free");
     free.subscription_title = Some("Free".to_string());
     let manager = MultiTokenManager::new(
-        config_with_free_tier_without_opus(),
+        RuntimeConfigStore::new(config_with_free_tier_without_opus(), None),
         vec![free],
         None,
         None,
@@ -9337,8 +9875,14 @@ fn selection_failure_summary_enforces_sample_limit_and_omits_secrets() {
             credential
         })
         .collect::<Vec<_>>();
-    let manager =
-        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let summary = manager.selection_failure_summary(
         "req_disabled",
@@ -9370,7 +9914,14 @@ fn selection_failure_summary_can_disable_account_samples() {
             credential
         })
         .collect::<Vec<_>>();
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let summary = manager.selection_failure_summary(
         "req_disabled_no_samples",
@@ -9389,7 +9940,14 @@ fn selection_failure_summary_can_disable_account_samples() {
 
 #[tokio::test]
 async fn test_local_pool_route_state_sees_added_credential_after_empty_pool() {
-    let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty_state = manager.local_pool_route_state(None);
     assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
 
@@ -9408,8 +9966,14 @@ async fn test_local_pool_route_state_sees_added_credential_after_empty_pool() {
 fn test_local_pool_route_state_sees_manual_enable_after_all_disabled() {
     let mut disabled = api_key_credential("ksk_dynamic_disabled");
     disabled.disabled = true;
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![disabled],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let disabled_state = manager.local_pool_route_state(None);
     assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
@@ -9427,7 +9991,7 @@ async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
     let mut free = api_key_credential("ksk_model_free");
     free.subscription_title = Some("Free".to_string());
     let manager = MultiTokenManager::new(
-        config_with_free_tier_without_opus(),
+        RuntimeConfigStore::new(config_with_free_tier_without_opus(), None),
         vec![free],
         None,
         None,
@@ -9453,7 +10017,14 @@ fn test_local_pool_route_state_matches_dashed_request_to_dotted_supported_model(
     let mut pro = api_key_credential("ksk_model_dotted_supported");
     pro.subscription_title = Some("Pro".to_string());
     pro.supported_models = vec!["claude-opus-4.8".to_string()];
-    let manager = MultiTokenManager::new(Config::default(), vec![pro], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![pro],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let ready = manager.local_pool_route_state(Some("claude-opus-4-8"));
     assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
@@ -9464,7 +10035,7 @@ fn test_local_pool_route_state_matches_dashed_request_to_dotted_supported_model(
 #[test]
 fn test_local_pool_route_state_auto_heals_too_many_failures() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("ksk_auto_heal_preflight")],
         None,
         None,
@@ -9503,7 +10074,7 @@ async fn redis_auto_healed_credential_is_dispatchable_again() {
         config.credential_warmup_requests = 0;
         config.credential_dispatch_max_wait_secs = 1;
         let manager = MultiTokenManager::new_with_stores(
-            config,
+            RuntimeConfigStore::new(config, None),
             vec![api_key_credential("ksk_auto_heal_redis_block")],
             None,
             None,
@@ -9542,8 +10113,14 @@ async fn redis_auto_healed_credential_is_dispatchable_again() {
 async fn test_local_pool_route_state_proxy_blocked_recovers_after_resource_enabled() {
     let mut credential = api_key_credential("ksk_proxy_dynamic");
     credential.proxy_resource_id = Some(7);
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.proxy_resources.lock().insert(
         7,
         ProxyResourceRuntime {
@@ -9583,16 +10160,14 @@ async fn test_concurrency_limiter_skips_disabled_credentials_and_queues_on_only_
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(
-        MultiTokenManager::new(
-            config,
-            vec![disabled1, disabled2, active],
-            None,
-            None,
-            false,
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![disabled1, disabled2, active],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(manager.available_count(), 1);
 
     let mut first = manager.acquire_context(None).await.unwrap();
@@ -9636,7 +10211,14 @@ async fn test_concurrency_limiter_multiple_waiters_are_served_serially_on_one_cr
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
 
     let (acquired_tx, mut acquired_rx) = tokio::sync::mpsc::channel::<(&'static str, u64)>(2);
@@ -9732,8 +10314,14 @@ async fn test_acquire_context_all_manually_disabled_fails_without_queueing() {
     let mut disabled2 = KiroCredentials::default();
     disabled2.disabled = true;
 
-    let manager =
-        MultiTokenManager::new(config, vec![disabled1, disabled2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![disabled1, disabled2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(manager.available_count(), 0);
 
     let started = Instant::now();
@@ -9763,7 +10351,14 @@ async fn test_all_model_incompatible_credentials_fail_fast_without_queueing() {
 
     let free_a = test_access_token_credential("free-a", "Free");
     let free_b = test_access_token_credential("free-b", "Free");
-    let manager = MultiTokenManager::new(config, vec![free_a, free_b], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![free_a, free_b],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let started = Instant::now();
     let err = manager
@@ -9794,7 +10389,14 @@ async fn test_concurrency_limiter_waits_until_slot_released() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
 
     let waiting_manager = manager.clone();
@@ -9832,9 +10434,14 @@ async fn test_fail_fast_slot_race_reselects_other_available_credential_for_five_
         second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         second_cred.priority = 0;
 
-        let manager =
-            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![first_cred, second_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let mut first = manager.acquire_context(None).await.unwrap();
         assert_eq!(first.id, 1, "round {round}");
 
@@ -9879,7 +10486,14 @@ async fn test_credential_concurrency_override_limits_when_global_unlimited() {
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.max_concurrent_requests = Some(1);
 
-    let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
     let snapshot = manager.snapshot();
     assert_eq!(snapshot.entries[0].max_concurrent_requests, 1);
@@ -9915,7 +10529,14 @@ async fn test_credential_concurrency_override_zero_bypasses_global_limit() {
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.max_concurrent_requests = Some(0);
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
     let mut second = manager.acquire_context(None).await.unwrap();
     let snapshot = manager.snapshot();
@@ -9939,7 +10560,14 @@ async fn test_credential_concurrency_override_exceeds_global_default() {
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.max_concurrent_requests = Some(200);
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut leases = Vec::new();
     for _ in 0..6 {
         leases.push(manager.acquire_context(None).await.unwrap());
@@ -9976,7 +10604,14 @@ async fn test_concurrency_limiter_times_out_after_dispatch_wait_limit() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
 
     let started = Instant::now();
@@ -10014,7 +10649,14 @@ async fn test_in_flight_lease_guard_drop_releases_slot() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.in_flight_lease_id(), Some(1));
@@ -10036,7 +10678,14 @@ async fn test_expired_leaked_in_flight_lease_wakes_waiting_request() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
     manager.age_in_flight_lease_for_test(1, lease.id(), StdDuration::from_secs(2));
     std::mem::forget(lease);
@@ -10066,7 +10715,14 @@ async fn test_manual_clear_in_flight_leases_wakes_waiting_request() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
     let leaked_lease_id = lease.id();
     std::mem::forget(lease);
@@ -10104,7 +10760,14 @@ async fn test_expired_in_flight_lease_is_cleaned_and_dispatch_recovers() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
     manager.age_in_flight_lease_for_test(1, lease.id(), StdDuration::from_secs(2));
     std::mem::forget(lease);
@@ -10125,7 +10788,14 @@ async fn test_summary_snapshot_cleans_expired_in_flight_lease() {
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
     manager.age_in_flight_lease_for_test(1, lease.id(), StdDuration::from_secs(2));
     std::mem::forget(lease);
@@ -10146,7 +10816,14 @@ async fn test_added_credential_warmup_does_not_fake_success_count() {
     existing.access_token = Some("existing".to_string());
     existing.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![existing],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut new_cred = KiroCredentials::default();
     new_cred.kiro_api_key = Some("ksk_new_key".to_string());
@@ -10199,7 +10876,14 @@ async fn test_warmup_selection_percent_allows_real_request_sampling() {
     warming.access_token = Some("warming".to_string());
     warming.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![ready, warming],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.set_warmup_remaining(2, 2).unwrap();
 
     let mut picks = Vec::new();
@@ -10228,30 +10912,26 @@ async fn redis_backed_in_flight_limit_is_shared_between_managers() {
     config.credential_max_concurrent_requests = 1;
     config.credential_dispatch_max_wait_secs = 2;
 
-    let manager_a = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config.clone(),
-            vec![api_key_credential("a")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
-    let manager_b = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            vec![api_key_credential("a")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store),
-        )
-        .unwrap(),
-    );
+    let manager_a = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config.clone(), None),
+        vec![api_key_credential("a")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, None),
+        vec![api_key_credential("a")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
 
     let mut first = manager_a.acquire_context(None).await.unwrap();
     let waiting_manager = manager_b.clone();
@@ -10280,30 +10960,26 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_under_concurrency() {
 
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
-    let manager_a = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config.clone(),
-            vec![api_key_credential("concurrent")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
-    let manager_b = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            vec![api_key_credential("concurrent")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store),
-        )
-        .unwrap(),
-    );
+    let manager_a = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config.clone(), None),
+        vec![api_key_credential("concurrent")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, None),
+        vec![api_key_credential("concurrent")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
 
     const CONTENDERS: usize = 8;
     let barrier = Arc::new(tokio::sync::Barrier::new(CONTENDERS));
@@ -10346,9 +11022,8 @@ async fn redis_two_instance_connections_preserve_lease_queue_and_rpm_authority_f
             let managers = stores
                 .iter()
                 .map(|store| {
-                    Arc::new(
-                        MultiTokenManager::new_with_stores(
-                            config.clone(),
+                    MultiTokenManager::new_with_stores(
+                            RuntimeConfigStore::new(config.clone(), None),
                             credentials.clone(),
                             None,
                             None,
@@ -10356,8 +11031,7 @@ async fn redis_two_instance_connections_preserve_lease_queue_and_rpm_authority_f
                             None,
                             Some(store.clone()),
                         )
-                        .unwrap(),
-                    )
+                        .unwrap()
                 })
                 .collect::<Vec<_>>();
 
@@ -10573,7 +11247,7 @@ async fn redis_backed_rpm_reservation_blocks_third_cross_instance_selection() {
         credential.rpm = Some(2);
 
         let manager_a = MultiTokenManager::new_with_stores(
-            config.clone(),
+            RuntimeConfigStore::new(config.clone(), None),
             vec![credential.clone()],
             None,
             None,
@@ -10583,7 +11257,7 @@ async fn redis_backed_rpm_reservation_blocks_third_cross_instance_selection() {
         )
         .unwrap();
         let manager_b = MultiTokenManager::new_with_stores(
-            config,
+            RuntimeConfigStore::new(config, None),
             vec![credential],
             None,
             None,
@@ -10646,18 +11320,16 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
 
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            vec![api_key_credential("degraded")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, None),
+        vec![api_key_credential("degraded")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
     manager.scheduler_redis_breaker.state.lock().phase = SchedulerRedisBreakerPhase::Open {
         until: Instant::now() + StdDuration::from_secs(1),
     };
@@ -10791,18 +11463,16 @@ async fn redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades() 
     config.dispatch_global_max_concurrent_requests = 1;
     config.dispatch_max_queued_requests = 1;
     config.credential_dispatch_max_wait_secs = 0;
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            vec![api_key_credential("degraded-after-queue-admission")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, None),
+        vec![api_key_credential("degraded-after-queue-admission")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
     let waiting_manager = manager.clone();
@@ -10871,18 +11541,16 @@ async fn redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease()
     config.dispatch_global_max_concurrent_requests = 1;
     config.dispatch_max_queued_requests = 1;
     config.credential_dispatch_max_wait_secs = 5;
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            vec![api_key_credential("cancelled-queue-waiter")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, None),
+        vec![api_key_credential("cancelled-queue-waiter")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
     let waiting_manager = manager.clone();
@@ -10943,18 +11611,16 @@ async fn finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_in
     config.dispatch_global_max_concurrent_requests = 1;
     config.dispatch_max_queued_requests = 1;
     config.credential_dispatch_max_wait_secs = 30;
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            vec![api_key_credential("finite-redis-queue-no-renew")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, None),
+        vec![api_key_credential("finite-redis-queue-no-renew")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
     let waiting_manager = manager.clone();
@@ -11051,7 +11717,7 @@ async fn redis_affinity_latency_does_not_degrade_capacity_coordination() {
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("affinity-latency")],
         None,
         None,
@@ -11104,7 +11770,7 @@ async fn redis_affinity_breaker_open_does_not_block_selection_admission() {
     let mut config = Config::default();
     config.credential_rpm = Some(60);
     let manager = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![api_key_credential("affinity-open-selection")],
         None,
         None,
@@ -11160,7 +11826,7 @@ async fn redis_capacity_latency_boundary_and_recovery_matrix() {
                 return;
             };
             let manager = MultiTokenManager::new_with_stores(
-                Config::default(),
+                RuntimeConfigStore::new(Config::default(), None),
                 vec![api_key_credential(&format!(
                     "capacity-{latency_ms}-{round}"
                 ))],
@@ -11248,7 +11914,7 @@ async fn redis_capacity_consecutive_timeouts_open_breaker_without_all_disabled()
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("capacity-timeout-breaker")],
         None,
         None,
@@ -11328,7 +11994,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
             for latency_ms in LOW_LATENCIES_MS {
                 let scenario = format!("latency-{latency_ms}-round-{round}");
                 let manager = MultiTokenManager::new_with_stores(
-                    Config::default(),
+                    RuntimeConfigStore::new(Config::default(), None),
                     vec![api_key_credential(&scenario)],
                     None,
                     None,
@@ -11422,7 +12088,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
 
             let scenario = format!("latency-500-round-{round}");
             let manager = MultiTokenManager::new_with_stores(
-                Config::default(),
+                RuntimeConfigStore::new(Config::default(), None),
                 vec![api_key_credential(&scenario)],
                 None,
                 None,
@@ -11506,7 +12172,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
 
             let scenario = format!("wrongtype-round-{round}");
             let manager = MultiTokenManager::new_with_stores(
-                Config::default(),
+                RuntimeConfigStore::new(Config::default(), None),
                 vec![api_key_credential(&scenario)],
                 None,
                 None,
@@ -11573,7 +12239,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
 
             let scenario = format!("disconnect-round-{round}");
             let manager = MultiTokenManager::new_with_stores(
-                Config::default(),
+                RuntimeConfigStore::new(Config::default(), None),
                 vec![api_key_credential(&scenario)],
                 None,
                 None,
@@ -11759,7 +12425,7 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
 
         for round in 1..=3 {
             let manager = MultiTokenManager::new_with_stores(
-                Config::default(),
+                RuntimeConfigStore::new(Config::default(), None),
                 vec![api_key_credential(&format!("redis-fault-domain-{round}"))],
                 None,
                 None,
@@ -11865,7 +12531,7 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
             }
 
             let fault_manager = MultiTokenManager::new_with_stores(
-                Config::default(),
+                RuntimeConfigStore::new(Config::default(), None),
                 vec![api_key_credential(&format!("redis-business-fault-{round}"))],
                 None,
                 None,
@@ -11910,7 +12576,7 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
             clear_fault_domain_latency("business").await;
             wait_fault_domain_store_healthy(&business_store, "business").await;
             let recovered_manager = MultiTokenManager::new_with_stores(
-                Config::default(),
+                RuntimeConfigStore::new(Config::default(), None),
                 vec![api_key_credential(&format!("redis-business-recovery-{round}"))],
                 None,
                 None,
@@ -11969,7 +12635,7 @@ async fn redis_lease_release_is_non_blocking_under_latency_and_burst() {
     // unlimited; the production default remains bounded.
     test_config.credential_max_concurrent_requests = 0;
     let manager = MultiTokenManager::new_with_stores(
-        test_config,
+        RuntimeConfigStore::new(test_config, None),
         vec![api_key_credential("release-latency-burst")],
         None,
         None,
@@ -12068,7 +12734,7 @@ async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
             return;
         };
         let manager = MultiTokenManager::new_with_stores(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), None),
             vec![api_key_credential(&format!("disconnect-recovery-{round}"))],
             None,
             None,
@@ -12183,7 +12849,7 @@ async fn redis_capacity_backend_restart_recovers_same_manager() {
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("backend-restart")],
         None,
         None,
@@ -12273,7 +12939,7 @@ async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers()
     config.credential_transient_cooldown_secs = 60;
 
     let manager_a = MultiTokenManager::new_with_stores(
-        config.clone(),
+        RuntimeConfigStore::new(config.clone(), None),
         vec![api_key_credential("a"), api_key_credential("b")],
         None,
         None,
@@ -12283,7 +12949,7 @@ async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers()
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![api_key_credential("a"), api_key_credential("b")],
         None,
         None,
@@ -12347,7 +13013,7 @@ async fn redis_backed_temporary_sticky_capacity_fallback_rebounds_without_full_s
         api_key_credential("sticky-b"),
     ];
     let manager_a = MultiTokenManager::new_with_stores(
-        config.clone(),
+        RuntimeConfigStore::new(config.clone(), None),
         credentials.clone(),
         None,
         None,
@@ -12357,7 +13023,7 @@ async fn redis_backed_temporary_sticky_capacity_fallback_rebounds_without_full_s
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, None),
         credentials,
         None,
         None,
@@ -12524,7 +13190,7 @@ async fn redis_backed_sticky_release_grace_keeps_binding_between_managers() {
         api_key_credential("sticky-release-grace-b"),
     ];
     let manager_a = MultiTokenManager::new_with_stores(
-        config.clone(),
+        RuntimeConfigStore::new(config.clone(), None),
         credentials.clone(),
         None,
         None,
@@ -12534,7 +13200,7 @@ async fn redis_backed_sticky_release_grace_keeps_binding_between_managers() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, None),
         credentials,
         None,
         None,
@@ -12620,7 +13286,7 @@ async fn redis_backed_sticky_holder_still_falls_back_after_release_grace() {
         api_key_credential("sticky-holder-grace-b"),
     ];
     let manager_a = MultiTokenManager::new_with_stores(
-        config.clone(),
+        RuntimeConfigStore::new(config.clone(), None),
         credentials.clone(),
         None,
         None,
@@ -12630,7 +13296,7 @@ async fn redis_backed_sticky_holder_still_falls_back_after_release_grace() {
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, None),
         credentials,
         None,
         None,
@@ -12702,18 +13368,16 @@ async fn redis_dispatch_waiters_share_one_scheduler_state_scan_for_five_rounds()
     let credentials = (0..ACCOUNT_COUNT)
         .map(|index| api_key_credential(&format!("waiter-singleflight-{index}")))
         .collect();
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            Config::default(),
-            credentials,
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(Config::default(), None),
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
 
     for round in 0..5 {
         *manager.last_scheduler_redis_sync_at.lock() = None;
@@ -12766,18 +13430,16 @@ async fn provisional_local_reservation_spreads_concurrent_redis_acquires() {
     let credentials = (0..ACCOUNT_COUNT)
         .map(|index| api_key_credential(&format!("provisional-{index}")))
         .collect();
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            config,
-            credentials,
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
     redis_store.reset_scheduler_state_round_trips();
     manager.refresh_scheduler_state_from_redis_force().unwrap();
     assert_eq!(
@@ -12857,7 +13519,7 @@ async fn redis_rejected_provisional_acquire_rolls_back_without_remote_release() 
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
     let manager_a = MultiTokenManager::new_with_stores(
-        config.clone(),
+        RuntimeConfigStore::new(config.clone(), None),
         vec![api_key_credential("reject-a")],
         None,
         None,
@@ -12867,7 +13529,7 @@ async fn redis_rejected_provisional_acquire_rolls_back_without_remote_release() 
     )
     .unwrap();
     let manager_b = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![api_key_credential("reject-b")],
         None,
         None,
@@ -12919,18 +13581,16 @@ async fn cancelled_provisional_redis_acquire_rolls_back_local_and_tombstones_rem
         eprintln!("跳过 Redis provisional cancel 测试：未设置 KIRO_RS_TEST_REDIS_URL");
         return;
     };
-    let manager = Arc::new(
-        MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![api_key_credential("cancel-provisional")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new_with_stores(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![api_key_credential("cancel-provisional")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
     set_test_redis_latency_toxic(150).await;
 
     let task_manager = manager.clone();
@@ -12983,7 +13643,7 @@ async fn redis_commit_unknown_provisional_acquire_leaves_no_lease() {
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("timeout-provisional")],
         None,
         None,
@@ -13044,7 +13704,7 @@ async fn test_only_available_credential_is_not_an_alternate_after_soft_failure()
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![disabled1, disabled2, active],
         None,
         None,
@@ -13076,7 +13736,14 @@ async fn test_deferred_session_soft_failure_and_unbind_use_local_state() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     let mut bound = manager
@@ -13117,7 +13784,7 @@ fn test_cached_alternate_usable_credential_uses_current_memory_state() {
     config.credential_transient_cooldown_secs = 60;
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             test_access_token_credential("t1", "Pro"),
             test_access_token_credential("t2", "Pro"),
@@ -13152,7 +13819,7 @@ fn test_cached_alternate_usable_credential_is_false_for_single_active_credential
     let mut disabled = KiroCredentials::default();
     disabled.disabled = true;
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![
             disabled,
             test_access_token_credential("active-token", "Pro"),
@@ -13178,8 +13845,14 @@ async fn test_excluding_only_available_credential_reports_temporary_exclusion() 
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager =
-        MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![disabled, active],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut excluded = HashSet::new();
     excluded.insert(2);
 
@@ -13216,7 +13889,14 @@ async fn test_bound_disabled_proxy_resource_is_not_dispatchable() {
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![blocked, active], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![blocked, active],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.proxy_resources.lock().insert(
         7,
         ProxyResourceRuntime {
@@ -13250,7 +13930,7 @@ async fn test_all_proxy_blocked_credentials_fail_fast_with_proxy_error() {
     disabled_proxy.proxy_resource_id = Some(7);
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![missing_proxy, disabled_proxy],
         None,
         None,
@@ -13304,7 +13984,14 @@ async fn test_bound_missing_proxy_resource_does_not_fallback_to_global_proxy() {
     credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     credential.proxy_resource_id = Some(404);
 
-    let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let err = manager
         .acquire_context_for_credential(1)
         .await
@@ -13334,7 +14021,14 @@ fn test_external_import_refresh_preserves_bound_proxy_resource() {
     let mut config = Config::default();
     config.proxy_url = Some("http://global-proxy:8080".to_string());
 
-    let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager.proxy_resources.lock().insert(
         7,
         ProxyResourceRuntime {
@@ -13384,7 +14078,14 @@ async fn test_unbind_session_if_bound_to_does_not_clear_original_binding() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     let bound = manager
@@ -13424,7 +14125,7 @@ async fn test_current_id_respects_opus_model_filter() {
     pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
     let manager = MultiTokenManager::new(
-        config_with_free_tier_without_opus(),
+        RuntimeConfigStore::new(config_with_free_tier_without_opus(), None),
         vec![free, pro],
         None,
         None,
@@ -13454,8 +14155,14 @@ async fn test_sonnet_model_can_use_free_credentials() {
     pro.access_token = Some("pro-token".to_string());
     pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![free, pro],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
     assert_eq!(ctx.id, 1);
@@ -13478,7 +14185,14 @@ async fn test_sonnet_bound_session_falls_back_when_bound_credential_is_full() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     let mut bound = manager
@@ -13522,7 +14236,14 @@ async fn test_sonnet_rate_limiter_prefers_other_dispatchable_credential() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut first = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
     let mut second = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
@@ -13549,7 +14270,14 @@ async fn test_sonnet_rate_limit_cooldown_skips_limited_credential() {
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     assert!(
         manager
@@ -13587,7 +14315,14 @@ async fn test_sonnet_pool_uses_available_credentials_when_one_is_cooldown_and_st
         })
         .collect();
 
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     assert!(
@@ -13658,7 +14393,14 @@ async fn test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load(
             cred
         })
         .collect();
-    let manager = Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     for id in 1..=COOLED_DOWN_CREDENTIALS {
         let kind = if id % 2 == 0 {
@@ -13799,7 +14541,14 @@ fn test_multi_token_manager_report_refresh_failure() {
     let cred1 = KiroCredentials::default();
     let cred2 = KiroCredentials::default();
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(manager.available_count(), 2);
     for _ in 0..(MAX_FAILURES_PER_CREDENTIAL - 1) {
@@ -13823,7 +14572,14 @@ async fn test_multi_token_manager_refresh_failure_disabled_is_not_auto_recovered
     let cred1 = KiroCredentials::default();
     let cred2 = KiroCredentials::default();
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
         manager.report_refresh_failure(1);
@@ -13850,7 +14606,14 @@ fn test_multi_token_manager_report_quota_exhausted() {
     let cred1 = KiroCredentials::default();
     let cred2 = KiroCredentials::default();
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     // 凭据会自动分配 ID（从 1 开始）
     assert_eq!(manager.available_count(), 2);
@@ -13868,7 +14631,14 @@ fn test_report_risk_controlled_disables_with_specific_reason() {
     let cred1 = KiroCredentials::default();
     let cred2 = KiroCredentials::default();
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     assert!(
         manager
@@ -13892,7 +14662,7 @@ fn test_report_risk_controlled_disables_with_specific_reason() {
     assert_eq!(disabled.failure_count, MAX_FAILURES_PER_CREDENTIAL);
 }
 
-fn risk_circuit_manager(count: usize, ratio_percent: u32) -> MultiTokenManager {
+fn risk_circuit_manager(count: usize, ratio_percent: u32) -> Arc<MultiTokenManager> {
     let mut config = Config::default();
     config.external_pools.local_pool_circuit_enabled = true;
     config.external_pools.local_pool_circuit_open_after_failures = 2;
@@ -13905,7 +14675,14 @@ fn risk_circuit_manager(count: usize, ratio_percent: u32) -> MultiTokenManager {
     let credentials = (0..count)
         .map(|index| test_access_token_credential(&format!("risk-{index}"), "Pro"))
         .collect();
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     // Every credential has served traffic before, so its risk control counts for the pool.
     for entry in manager.entries.lock().iter_mut() {
         entry.success_count = 1;
@@ -14063,7 +14840,7 @@ fn runtime_capacity_updates_reset_active_credential_warmup() {
     config.credential_rpm = Some(60);
 
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             test_access_token_credential("warmup-global-1", "Pro"),
             test_access_token_credential("warmup-global-2", "Pro"),
@@ -14101,7 +14878,14 @@ async fn test_multi_token_manager_quota_disabled_is_not_auto_recovered() {
     let cred1 = KiroCredentials::default();
     let cred2 = KiroCredentials::default();
 
-    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![cred1, cred2],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager.report_quota_exhausted(1);
     manager.report_quota_exhausted(2);
@@ -14258,8 +15042,14 @@ fn test_region_update_preserves_matching_profile_arn() {
         ..Default::default()
     };
     credential.id = Some(1);
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .set_credential_regions(1, None, None, Some(Some("eu-central-1".to_string())))
@@ -14287,8 +15077,14 @@ fn test_region_update_clears_conflicting_profile_arn() {
         ..Default::default()
     };
     credential.id = Some(1);
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![credential],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .set_credential_regions(1, None, None, Some(Some("us-east-1".to_string())))
@@ -14352,7 +15148,7 @@ async fn postgres_add_credential_is_atomic_with_initial_runtime_state() {
     let mut config = Config::default();
     config.credential_warmup_requests = 99;
     let manager = MultiTokenManager::new_with_stores(
-        config,
+        RuntimeConfigStore::new(config, Some(store.clone())),
         Vec::new(),
         None,
         None,
@@ -14415,18 +15211,16 @@ async fn postgres_add_credential_is_atomic_with_initial_runtime_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_concurrent_add_credential_assigns_unique_ids_and_rejects_same_account() {
     run_isolated_postgres_fixture(|store| async move {
-        let manager = Arc::new(
-            MultiTokenManager::new_with_stores(
-                Config::default(),
-                Vec::new(),
-                None,
-                None,
-                false,
-                Some(store.clone()),
-                None,
-            )
-            .unwrap(),
-        );
+        let manager = MultiTokenManager::new_with_stores(
+            RuntimeConfigStore::new(Config::default(), Some(store.clone())),
+            Vec::new(),
+            None,
+            None,
+            false,
+            Some(store.clone()),
+            None,
+        )
+        .unwrap();
 
         // 16 个不同账号同时导入：ID 由 PgSQL 序列分配，不能重复，也不能丢。
         let start = Arc::new(tokio::sync::Barrier::new(16));
@@ -14513,7 +15307,7 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
         .unwrap();
     let id = credential.id.unwrap();
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), Some(store.clone())),
         vec![credential.clone()],
         None,
         None,
@@ -14671,7 +15465,7 @@ async fn fast_tiers_fill_highest_tier_before_overflowing_in_every_mode() {
         config.credential_max_concurrent_requests = 2;
         config.credential_warmup_requests = 0;
         let manager = MultiTokenManager::new(
-            config,
+            RuntimeConfigStore::new(config, None),
             vec![
                 fast_test_credential("plain", 0),
                 fast_test_credential("fast-1", 1),
@@ -14707,7 +15501,14 @@ async fn fast_tier_wins_over_priority_and_zero_fast_keeps_priority_order() {
     preferred.priority = 0;
     let mut fast = fast_test_credential("fast", 1);
     fast.priority = 100;
-    let manager = MultiTokenManager::new(config, vec![preferred, fast], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![preferred, fast],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     let mut ctx = manager.acquire_context(None).await.unwrap();
     assert_eq!(ctx.id, 2, "Fast is a higher dimension than priority");
@@ -14727,7 +15528,7 @@ async fn fast_tier_never_bypasses_dispatch_safety_rules() {
     let mut config = Config::default();
     config.credential_warmup_requests = 0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             fast_test_credential("plain", 0),
             fast_test_credential("fast", 5),
@@ -14769,7 +15570,7 @@ fn slot_race_overflows_to_any_dispatchable_tier_in_priority_mode() {
     let mut plain_other = fast_test_credential("plain-other", 0);
     plain_other.priority = 3;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![fast, plain_low, plain_other],
         None,
         None,
@@ -14800,7 +15601,14 @@ async fn fast_sticky_sessions_migrate_gradually_and_rebind() {
     let first = fast_test_credential("first", 0);
     let mut second = fast_test_credential("second", 0);
     second.priority = 5;
-    let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![first, second],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
 
     for session in ["fast-sticky-a", "fast-sticky-b"] {
@@ -14872,7 +15680,7 @@ async fn fast_sticky_session_stays_when_fast_tier_is_full() {
     let mut config = Config::default();
     config.credential_warmup_requests = 0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             fast_test_credential("first", 0),
             fast_test_credential("second", 0),
@@ -14920,8 +15728,14 @@ fn dispatch_neutral_admin_patch_does_not_quarantine_enabled_account_for_five_rou
         let credentials = (0..2)
             .map(|idx| api_key_credential(&format!("ksk_neutral_patch_{round}_{idx}")))
             .collect::<Vec<_>>();
-        let manager =
-            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let enable = CredentialRuntimeStatePatch {
             failure_count: Some(0),
             refresh_failure_count: Some(0),
@@ -14988,7 +15802,7 @@ fn credential_route_rules_scope_exclusions_and_route_state() {
     let mut config = Config::default();
     config.credential_warmup_requests = 0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             route_test_credential("any", AllowAll, &[]),
             route_test_credential("cc-only", AllowList, &["/cc"]),
@@ -15037,7 +15851,7 @@ fn route_rejected_by_all_credentials_drives_route_policy_and_ignores_empty_pool(
     let mut config = Config::default();
     config.credential_warmup_requests = 0;
     let manager = MultiTokenManager::new(
-        config.clone(),
+        RuntimeConfigStore::new(config.clone(), None),
         vec![
             route_test_credential("cc", AllowList, &["/cc"]),
             route_test_credential("not-ha", DenyList, &["/ha"]),
@@ -15063,14 +15877,21 @@ fn route_rejected_by_all_credentials_drives_route_policy_and_ignores_empty_pool(
         .unwrap();
     assert!(!manager.route_rejected_by_all_credentials("/ha/v1/messages"));
 
-    let empty = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+    let empty = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        Vec::new(),
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert!(!empty.route_rejected_by_all_credentials("/ha/v1/messages"));
 }
 
 #[test]
 fn credential_route_policy_setter_normalizes_rules() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![test_access_token_credential("a", "Pro")],
         None,
         None,
@@ -15098,7 +15919,7 @@ fn auto_heal_respects_min_interval_and_consecutive_round_limit() {
     config.credential_auto_heal_min_interval_secs = 300;
     config.credential_auto_heal_max_consecutive_rounds = 2;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![api_key_credential("ksk_auto_heal_throttle")],
         None,
         None,
@@ -15161,7 +15982,7 @@ fn auto_heal_limits_of_zero_mean_unlimited() {
     config.credential_auto_heal_min_interval_secs = 0;
     config.credential_auto_heal_max_consecutive_rounds = 0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![api_key_credential("ksk_auto_heal_unlimited")],
         None,
         None,
@@ -15219,7 +16040,10 @@ enum MatrixStep {
     Rpm(u64, u32),
 }
 
-fn selection_matrix_manager(mode: &str, credentials: &[MatrixCredential]) -> MultiTokenManager {
+fn selection_matrix_manager(
+    mode: &str,
+    credentials: &[MatrixCredential],
+) -> Arc<MultiTokenManager> {
     let mut config = Config::default();
     config.load_balancing_mode = mode.to_string();
     config.credential_max_concurrent_requests = 2;
@@ -15236,7 +16060,14 @@ fn selection_matrix_manager(mode: &str, credentials: &[MatrixCredential]) -> Mul
             credential
         })
         .collect();
-    let manager = MultiTokenManager::new(config, list, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        list,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     for (index, spec) in credentials.iter().enumerate() {
         if spec.warmup > 0 {
             manager
@@ -15756,7 +16587,14 @@ fn selection_failure_samples_list_blocking_accounts_before_disabled_ones() {
     let credentials = (0..5)
         .map(|index| test_access_token_credential(&format!("sample-{index}"), "Pro"))
         .collect();
-    let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     for id in 1..=3 {
         manager.set_disabled(id, true).unwrap();
     }
@@ -15790,7 +16628,14 @@ fn queue_test_manager(credentials: usize, max_queued: u32) -> Arc<MultiTokenMana
     let list = (0..credentials)
         .map(|index| test_access_token_credential(&format!("queue-{index}"), "Pro"))
         .collect();
-    Arc::new(MultiTokenManager::new(config, list, None, None, false).unwrap())
+    MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        list,
+        None,
+        None,
+        false,
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -15878,8 +16723,14 @@ async fn a_full_queue_with_idle_catalog_credentials_is_not_rejected_early() {
     busy.supported_models = vec!["claude-sonnet-4.5".to_string()];
     let mut idle = test_access_token_credential("catalog-idle", "Pro");
     idle.supported_models = vec!["claude-sonnet-4.5".to_string()];
-    let manager =
-        Arc::new(MultiTokenManager::new(config, vec![busy, idle], None, None, false).unwrap());
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![busy, idle],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let empty = HashSet::new();
     let mut holder = manager
         .acquire_context_for_session(Some("claude-sonnet-4.5"), None, &HashSet::from([2]))
@@ -16073,18 +16924,16 @@ async fn killed_instance_leases_are_reclaimed_by_a_live_instance_and_shutdown_re
         let mut credential = api_key_credential("reclaim-killed-instance");
         credential.id = Some(1);
         let manager = |store: Arc<RedisStore>| {
-            Arc::new(
-                MultiTokenManager::new_with_stores(
-                    config.clone(),
-                    vec![credential.clone()],
-                    None,
-                    None,
-                    false,
-                    None,
-                    Some(store),
-                )
-                .unwrap(),
+            MultiTokenManager::new_with_stores(
+                RuntimeConfigStore::new(config.clone(), None),
+                vec![credential.clone()],
+                None,
+                None,
+                false,
+                None,
+                Some(store),
             )
+            .unwrap()
         };
         let killed = manager(stores[0].clone());
         let live = manager(stores[1].clone());
@@ -16150,18 +16999,16 @@ async fn stuck_leases_of_a_live_instance_expire_after_the_max_age() {
         config.credential_in_flight_lease_max_secs = 2;
         let mut credential = api_key_credential("stuck-lease");
         credential.id = Some(1);
-        let manager = Arc::new(
-            MultiTokenManager::new_with_stores(
-                config,
-                vec![credential],
-                None,
-                None,
-                false,
-                None,
-                Some(stores[0].clone()),
-            )
-            .unwrap(),
-        );
+        let manager = MultiTokenManager::new_with_stores(
+            RuntimeConfigStore::new(config, None),
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(stores[0].clone()),
+        )
+        .unwrap();
         manager.heartbeat_and_reclaim_dead_instance_leases().await;
         let held = manager.acquire_context(None).await.unwrap();
         let lease_id = manager.entries.lock()[0].in_flight_leases[0].id;
@@ -16212,18 +17059,16 @@ async fn an_open_redis_breaker_does_not_stop_dispatch_to_idle_accounts_on_a_sing
             })
             .collect::<Vec<_>>();
         let manager = |store: Arc<RedisStore>| {
-            Arc::new(
-                MultiTokenManager::new_with_stores(
-                    config.clone(),
-                    credentials.clone(),
-                    None,
-                    None,
-                    false,
-                    None,
-                    Some(store),
-                )
-                .unwrap(),
+            MultiTokenManager::new_with_stores(
+                RuntimeConfigStore::new(config.clone(), None),
+                credentials.clone(),
+                None,
+                None,
+                false,
+                None,
+                Some(store),
             )
+            .unwrap()
         };
         let open_breakers = |manager: &MultiTokenManager| {
             for breaker in [
@@ -16352,7 +17197,7 @@ fn local_selection_reservation_rechecks_the_rpm_window() {
     let mut config = Config::default();
     config.credential_rpm = Some(2);
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![test_access_token_credential("local-rpm-recheck", "Pro")],
         None,
         None,
@@ -16500,7 +17345,7 @@ fn redis_full_hint_keeps_a_credential_out_of_selection_until_a_slot_frees() {
     let mut config = Config::default();
     config.credential_warmup_requests = 0;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             api_key_credential("ksk_redis_full_a"),
             api_key_credential("ksk_redis_full_b"),
@@ -16557,7 +17402,7 @@ fn redis_full_hint_keeps_a_credential_out_of_selection_until_a_slot_frees() {
 #[test]
 fn redis_full_hint_expires_after_its_ttl() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("ksk_redis_full_ttl")],
         None,
         None,
@@ -16587,7 +17432,7 @@ fn queue_full_fast_path_answer_is_dropped_as_soon_as_a_slot_frees() {
     config.credential_max_concurrent_requests = 1;
     config.dispatch_max_queued_requests = 1;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![api_key_credential("ksk_queue_full_cache")],
         None,
         None,
@@ -16630,16 +17475,14 @@ async fn dispatch_answers_immediately_once_the_process_is_stopping() {
     config.credential_warmup_requests = 0;
     config.credential_max_concurrent_requests = 1;
     config.credential_dispatch_max_wait_secs = 60;
-    let manager = Arc::new(
-        MultiTokenManager::new(
-            config,
-            vec![api_key_credential("ksk_stopping")],
-            None,
-            None,
-            false,
-        )
-        .unwrap(),
-    );
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![api_key_credential("ksk_stopping")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let mut held = manager
         .acquire_context(None)
         .await
@@ -16708,8 +17551,14 @@ fn upstream_outage_on_the_only_active_tier_does_not_cool_it() {
     let credentials = (0..10)
         .map(|index| api_key_credential(&format!("ksk_tier_{index}")))
         .collect();
-    let manager =
-        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     {
         let now = Instant::now();
         let mut entries = manager.entries.lock();
@@ -16740,8 +17589,14 @@ fn a_single_failing_active_account_is_still_cooled() {
     let credentials = (0..4)
         .map(|index| api_key_credential(&format!("ksk_single_{index}")))
         .collect();
-    let manager =
-        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let now = Instant::now();
     for entry in manager.entries.lock().iter_mut() {
         entry.selection_events.push_back(now);
@@ -16766,8 +17621,14 @@ fn dedicated_proxy_timeouts_shared_by_the_active_pool_are_not_concentrated() {
             credential
         })
         .collect();
-    let manager =
-        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let now = Instant::now();
     for entry in manager.entries.lock().iter_mut() {
         entry.selection_events.push_back(now);
@@ -16797,8 +17658,14 @@ fn pool_wide_rate_limit_cooldowns_are_capped() {
     let credentials = (0..6)
         .map(|index| api_key_credential(&format!("ksk_pool_429_{index}")))
         .collect();
-    let manager =
-        MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let ids: Vec<u64> = manager.entries.lock().iter().map(|e| e.id).collect();
     for id in &ids {
         manager
@@ -16851,7 +17718,14 @@ fn subscription_tier_list_limits_accounts_without_their_own_list() {
         "free".to_string(),
         tier_list(&["claude-sonnet-4.5", "claude-haiku-4.5"]),
     );
-    let manager = MultiTokenManager::new(config, vec![free, pro], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![free, pro],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     // The Free list allows sonnet: both accounts take it (Pro has no list, so no limit).
     let sonnet = manager.local_pool_route_state(Some("claude-sonnet-4-5"));
@@ -16883,7 +17757,14 @@ fn account_own_model_list_replaces_the_tier_list() {
     config
         .subscription_model_lists
         .insert("free".to_string(), tier_list(&["claude-haiku-4.5"]));
-    let manager = MultiTokenManager::new(config, vec![free], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        vec![free],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(
         manager
@@ -16904,8 +17785,14 @@ fn tier_name_alone_restricts_nothing_only_model_lists_do() {
     // No tier is special-cased: a Free account without any list takes opus.
     let mut free = api_key_credential("ksk_tier_no_list");
     free.subscription_title = Some("KIRO FREE".to_string());
-    let manager =
-        MultiTokenManager::new(Config::default(), vec![free.clone()], None, None, false).unwrap();
+    let manager = MultiTokenManager::new(
+        RuntimeConfigStore::new(Config::default(), None),
+        vec![free.clone()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(
         manager
             .local_pool_route_state(Some("claude-opus-4-8"))
@@ -16915,7 +17802,7 @@ fn tier_name_alone_restricts_nothing_only_model_lists_do() {
 
     // Once the Free tier has a list, that list decides: opus is out, sonnet is in.
     let manager = MultiTokenManager::new(
-        config_with_free_tier_without_opus(),
+        RuntimeConfigStore::new(config_with_free_tier_without_opus(), None),
         vec![free],
         None,
         None,
@@ -16940,7 +17827,7 @@ fn tier_name_alone_restricts_nothing_only_model_lists_do() {
 fn subscription_change_is_reported_to_the_tier_observer() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("ksk_tier_observer")],
         None,
         None,
@@ -16969,7 +17856,7 @@ fn tier_list_filters_but_does_not_make_accounts_preferred() {
     let mut pro = api_key_credential("ksk_tier_pref_pro");
     pro.subscription_title = Some("KIRO PRO".to_string());
     let manager = MultiTokenManager::new(
-        config_with_free_tier_without_opus(),
+        RuntimeConfigStore::new(config_with_free_tier_without_opus(), None),
         vec![free, pro],
         None,
         None,
@@ -16992,7 +17879,7 @@ fn tier_list_filters_but_does_not_make_accounts_preferred() {
 #[test]
 fn set_subscription_model_list_only_if_missing_keeps_an_existing_list() {
     let manager = MultiTokenManager::new(
-        Config::default(),
+        RuntimeConfigStore::new(Config::default(), None),
         vec![api_key_credential("ksk_tier_set")],
         None,
         None,
@@ -17039,7 +17926,7 @@ fn config_with_free_tier_without_opus() -> Config {
 
 // ============ 劣化分摘除：真实调度链路（acquire_context）============
 
-fn degrade_test_manager(fast15: usize, fast10: usize) -> MultiTokenManager {
+fn degrade_test_manager(fast15: usize, fast10: usize) -> Arc<MultiTokenManager> {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 4;
     config.credential_warmup_requests = 0;
@@ -17052,7 +17939,14 @@ fn degrade_test_manager(fast15: usize, fast10: usize) -> MultiTokenManager {
     for index in 0..fast10 {
         credentials.push(fast_test_credential(&format!("fast10-{index}"), 10));
     }
-    MultiTokenManager::new(config, credentials, None, None, false).unwrap()
+    MultiTokenManager::new(
+        RuntimeConfigStore::new(config, None),
+        credentials,
+        None,
+        None,
+        false,
+    )
+    .unwrap()
 }
 
 /// 让指定账号在当前模型上越过摘除阈值（默认 6.0，空轮次权重 2.0 → 3 次）。
@@ -17213,7 +18107,7 @@ async fn disabling_degrade_keeps_the_old_dispatch_behaviour() {
     config.credential_warmup_requests = 0;
     config.credential_degrade_enabled = false;
     let manager = MultiTokenManager::new(
-        config,
+        RuntimeConfigStore::new(config, None),
         vec![
             fast_test_credential("fast15", 15),
             fast_test_credential("fast10", 10),
@@ -17271,7 +18165,7 @@ async fn disabling_degrade_at_runtime_restores_dispatch_immediately() {
 /// 高并发：16 个并发请求同时抢 fast 10 档，劣化的 fast 15 号不被选中，也不出现排队。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_dispatch_respects_degrade_and_never_queues() {
-    let manager = Arc::new(degrade_test_manager(2, 4));
+    let manager = degrade_test_manager(2, 4);
     degrade_credential(&manager, 1, None);
     degrade_credential(&manager, 2, None);
 

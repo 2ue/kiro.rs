@@ -5,6 +5,7 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
+use crate::model::runtime::RuntimeConfigStore;
 use chrono::Utc;
 use once_cell::sync::OnceCell;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -1346,6 +1347,7 @@ pub(crate) fn refresh_kiro_request_identity(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::runtime::RuntimeConfigStore;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -1753,16 +1755,14 @@ mod tests {
         // 轮次间隔置 0，避免测试为等待退避而空转。
         config.local_berserk_round_delay_ms = 0;
 
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                fake_bad_request_credentials(settings.pool_size),
-                None,
-                None,
-                false,
-            )
-            .expect("rotation token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(settings.pool_size),
+            None,
+            None,
+            false,
+        )
+        .expect("rotation token manager");
         let provider = ide_provider_off_runtime(manager).await;
         let request_body = serde_json::json!({
             "conversationState": {
@@ -1821,16 +1821,14 @@ mod tests {
         config.kiro_upstream_base_url = Some(server.base_url.clone());
         config.kiro_upstream_response_timeout_secs = 5;
         config.credential_retry_max_attempts = 0;
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                fake_bad_request_credentials(pool_size),
-                None,
-                None,
-                false,
-            )
-            .expect("prod-like rotation token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(pool_size),
+            None,
+            None,
+            false,
+        )
+        .expect("prod-like rotation token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider =
@@ -1886,10 +1884,14 @@ mod tests {
             endpoint: Some("ide".to_string()),
             ..Default::default()
         }];
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("endpoint fallback token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("endpoint fallback token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert(
@@ -1944,10 +1946,14 @@ mod tests {
         config.kiro_endpoint_fallback_enabled = true;
         config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
         config.credential_retry_max_attempts = 2;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
-                .expect("send cap token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(2),
+            None,
+            None,
+            false,
+        )
+        .expect("send cap token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert(
@@ -1993,10 +1999,14 @@ mod tests {
         config.kiro_upstream_base_url = Some(server.base_url.clone());
         config.kiro_upstream_response_timeout_secs = 5;
         config.credential_retry_max_attempts = 3;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
-                .expect("identity guard token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(2),
+            None,
+            None,
+            false,
+        )
+        .expect("identity guard token manager");
         let provider = ide_provider_off_runtime(manager).await;
         let request_body = serde_json::json!({
             "conversationState": {
@@ -2051,10 +2061,14 @@ mod tests {
             ),
             ..Default::default()
         }];
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("profile region guard token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("profile region guard token manager");
         let provider = ide_provider_off_runtime(manager).await;
         let request_body = serde_json::json!({
             "conversationState": {
@@ -2101,10 +2115,14 @@ mod tests {
         config.kiro_upstream_region_rotation_enabled = true;
         config.kiro_region_profile_arn_mismatch_allowed = true;
         config.credential_retry_max_attempts = 1;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
-                .expect("region fallback token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(1),
+            None,
+            None,
+            false,
+        )
+        .expect("region fallback token manager");
         let provider = ide_provider_off_runtime(manager).await;
         let request_body = serde_json::json!({
             "conversationState": {
@@ -2152,10 +2170,14 @@ mod tests {
         config.kiro_endpoint_fallback_enabled = true;
         config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
         config.credential_retry_max_attempts = 1;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
-                .expect("500 fallback guard token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(1),
+            None,
+            None,
+            false,
+        )
+        .expect("500 fallback guard token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert(
@@ -2203,10 +2225,14 @@ mod tests {
         config.kiro_endpoint_fallback_enabled = true;
         config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
         config.credential_retry_max_attempts = 1;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
-                .expect("503 classification token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(1),
+            None,
+            None,
+            false,
+        )
+        .expect("503 classification token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert(
@@ -2279,10 +2305,14 @@ mod tests {
                 credential
             })
             .collect();
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("quota 400 token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("quota 400 token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider =
@@ -3887,10 +3917,14 @@ mod tests {
         config.kiro_upstream_base_url = Some(base_url.to_string());
         config.kiro_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 1;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![credential], None, None, false)
-                .expect("final-attempt fixture token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![credential],
+            None,
+            None,
+            false,
+        )
+        .expect("final-attempt fixture token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string())
@@ -4080,10 +4114,14 @@ mod tests {
         if let Some(auxiliary_limit) = auxiliary_limit {
             config.auxiliary_upstream_max_concurrent_requests = auxiliary_limit;
         }
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("fake profile discovery token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("fake profile discovery token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let mut provider =
@@ -4115,10 +4153,14 @@ mod tests {
         let mut config = Config::default();
         config.kiro_upstream_base_url = Some(base_url.to_string());
         config.kiro_upstream_response_timeout_secs = 2;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("fake model discovery token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("fake model discovery token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         Arc::new(KiroProvider::with_proxy(
@@ -4160,10 +4202,14 @@ mod tests {
                 ..Default::default()
             }
         };
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![credentials], None, None, false)
-                .expect("fake body capture token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![credentials],
+            None,
+            None,
+            false,
+        )
+        .expect("fake body capture token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert("cli".to_string(), Arc::new(CliEndpoint::new()));
@@ -5000,7 +5046,7 @@ mod tests {
         assert!(old_ctx.credentials.profile_arn.is_none());
 
         let replacement_manager = MultiTokenManager::new(
-            config.clone(),
+            RuntimeConfigStore::new(config.clone(), None),
             vec![fake_external_idp_credential(1, "replacement-reused-id")],
             None,
             None,
@@ -5031,7 +5077,7 @@ mod tests {
         for index in 0..32 {
             let token = format!("forbidden-bounded-{index}");
             let reused_manager = MultiTokenManager::new(
-                config.clone(),
+                RuntimeConfigStore::new(config.clone(), None),
                 vec![fake_external_idp_credential(1, &token)],
                 None,
                 None,
@@ -5484,10 +5530,14 @@ mod tests {
         for (index, credential) in credentials.iter_mut().enumerate() {
             credential.subscription_title = Some(format!("capability-class-{index}"));
         }
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("fake model discovery token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("fake model discovery token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = Arc::new(KiroProvider::with_proxy(
@@ -5681,8 +5731,14 @@ mod tests {
         for (index, credential) in credentials.iter_mut().enumerate() {
             credential.subscription_title = Some(format!("class-{}", index % 3));
         }
-        let manager = MultiTokenManager::new(Config::default(), credentials, None, None, false)
-            .expect("large capability cohort fixture");
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("large capability cohort fixture");
         for round in 0..5 {
             assert_eq!(
                 manager.local_model_capability_cohorts().len(),
@@ -5706,7 +5762,7 @@ mod tests {
         assert_eq!(manager.model_capability_cohort_rebuilds(), 2);
 
         let sixty = MultiTokenManager::new(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), None),
             fake_bad_request_credentials(60),
             None,
             None,
@@ -5714,7 +5770,7 @@ mod tests {
         )
         .expect("60-account cohort fixture");
         let sixty_one = MultiTokenManager::new(
-            Config::default(),
+            RuntimeConfigStore::new(Config::default(), None),
             fake_bad_request_credentials(61),
             None,
             None,
@@ -5743,9 +5799,14 @@ mod tests {
                     2 => credentials[1].subscription_title = Some("KIRO FREE".to_string()),
                     _ => credentials[1].supported_models = vec!["claude-haiku-4.5".to_string()],
                 }
-                let manager =
-                    MultiTokenManager::new(Config::default(), credentials, None, None, false)
-                        .expect("heterogeneous cohort fixture");
+                let manager = MultiTokenManager::new(
+                    RuntimeConfigStore::new(Config::default(), None),
+                    credentials,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("heterogeneous cohort fixture");
                 assert_eq!(
                     manager.local_model_capability_cohorts().len(),
                     2,
@@ -5858,10 +5919,14 @@ mod tests {
             ),
             ..Default::default()
         }];
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("model endpoint fallback manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("model endpoint fallback manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert(
@@ -5907,10 +5972,14 @@ mod tests {
             auth_method: Some("social".to_string()),
             ..Default::default()
         };
-        let manager = Arc::new(
-            MultiTokenManager::new(config.clone(), vec![credentials], None, None, false)
-                .expect("model region fallback manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config.clone(), None),
+            vec![credentials],
+            None,
+            None,
+            false,
+        )
+        .expect("model region fallback manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -5944,10 +6013,14 @@ mod tests {
             ),
             ..Default::default()
         };
-        let manager = Arc::new(
-            MultiTokenManager::new(blocked_config, vec![blocked_credentials], None, None, false)
-                .expect("profile region guard manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(blocked_config, None),
+            vec![blocked_credentials],
+            None,
+            None,
+            false,
+        )
+        .expect("profile region guard manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -5998,10 +6071,14 @@ mod tests {
         config.credential_retry_max_attempts = 100;
         config.credential_prompt_logic_retry_enabled = prompt_logic_retry_enabled;
         config.credential_prompt_logic_retry_max_attempts = 100;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false)
-                .expect("fake provider token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("fake provider token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -6061,16 +6138,14 @@ mod tests {
         config.credential_network_error_cooldown_secs = 60;
         config.credential_protocol_error_cooldown_secs = 60;
         config.credential_cooldown_jitter_percent = 0;
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                fake_bad_request_credentials(pool_size),
-                None,
-                None,
-                false,
-            )
-            .expect("thinking signature retry token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(pool_size),
+            None,
+            None,
+            false,
+        )
+        .expect("thinking signature retry token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         (
@@ -6257,16 +6332,14 @@ mod tests {
         config.credential_max_cooldown_secs = 60;
         config.credential_cooldown_jitter_percent = 0;
         configure(&mut config);
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                fake_bad_request_credentials(pool_size),
-                None,
-                None,
-                false,
-            )
-            .expect("provider failure token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(pool_size),
+            None,
+            None,
+            false,
+        )
+        .expect("provider failure token manager");
         let provider = ide_provider_off_runtime(manager.clone()).await;
         let request_body = serde_json::json!({
             "testScenario": scenario,
@@ -7807,10 +7880,14 @@ mod tests {
             config.credential_retry_max_attempts = 100;
             let mut credentials = fake_bad_request_credentials(2);
             credentials[1].supported_models = vec!["claude-sonnet-4".to_string()];
-            let manager = Arc::new(
-                MultiTokenManager::new(config, credentials, None, None, false)
-                    .expect("fake provider token manager"),
-            );
+            let manager = MultiTokenManager::new(
+                RuntimeConfigStore::new(config, None),
+                credentials,
+                None,
+                None,
+                false,
+            )
+            .expect("fake provider token manager");
             // Bind the session to the unknown-catalog credential while the listed one is busy.
             let mut bound = manager
                 .acquire_context_for_session(
@@ -7886,9 +7963,14 @@ mod tests {
         config.kiro_upstream_base_url = Some(server.base_url.clone());
         config.kiro_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 3;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, credentials, None, None, false).expect("token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            credentials,
+            None,
+            None,
+            false,
+        )
+        .expect("token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let request = |round: usize| {
@@ -7934,8 +8016,8 @@ mod tests {
         );
         assert!(catalog.contains_model("claude-sonnet-4"));
         let provider = Arc::new(KiroProvider::with_proxy(
-            Arc::new(
-                MultiTokenManager::new(
+            MultiTokenManager::new(
+                RuntimeConfigStore::new(
                     {
                         let mut config = Config::default();
                         config.kiro_upstream_base_url = Some(server.base_url.clone());
@@ -7943,13 +8025,14 @@ mod tests {
                         config.credential_retry_max_attempts = 3;
                         config
                     },
-                    fake_bad_request_credentials(6),
                     None,
-                    None,
-                    false,
-                )
-                .expect("token manager"),
-            ),
+                ),
+                fake_bad_request_credentials(6),
+                None,
+                None,
+                false,
+            )
+            .expect("token manager"),
             None,
             endpoints,
             "ide".to_string(),
@@ -8435,16 +8518,14 @@ mod tests {
                 config.credential_retry_max_attempts = 100;
                 config.credential_server_error_cooldown_secs = 60;
                 config.credential_cooldown_jitter_percent = 0;
-                let manager = Arc::new(
-                    MultiTokenManager::new(
-                        config,
-                        fake_bad_request_credentials(1),
-                        None,
-                        None,
-                        false,
-                    )
-                    .expect("provider recovery token manager"),
-                );
+                let manager = MultiTokenManager::new(
+                    RuntimeConfigStore::new(config, None),
+                    fake_bad_request_credentials(1),
+                    None,
+                    None,
+                    false,
+                )
+                .expect("provider recovery token manager");
                 let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
                 let provider =
@@ -8578,16 +8659,14 @@ mod tests {
                 config.kiro_upstream_base_url = Some(server.base_url.clone());
                 config.kiro_upstream_response_timeout_secs = 10;
                 config.credential_retry_max_attempts = 100;
-                let manager = Arc::new(
-                    MultiTokenManager::new(
-                        config,
-                        fake_bad_request_credentials(1),
-                        None,
-                        None,
-                        false,
-                    )
-                    .expect("eventstream JSON sniff token manager"),
-                );
+                let manager = MultiTokenManager::new(
+                    RuntimeConfigStore::new(config, None),
+                    fake_bad_request_credentials(1),
+                    None,
+                    None,
+                    false,
+                )
+                .expect("eventstream JSON sniff token manager");
                 let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
                 let provider =
@@ -8682,16 +8761,14 @@ mod tests {
                 config.kiro_upstream_base_url = Some(server.base_url.clone());
                 config.kiro_upstream_response_timeout_secs = 10;
                 config.credential_retry_max_attempts = 100;
-                let manager = Arc::new(
-                    MultiTokenManager::new(
-                        config,
-                        fake_bad_request_credentials(1),
-                        None,
-                        None,
-                        false,
-                    )
-                    .expect("JSON content-type sniff token manager"),
-                );
+                let manager = MultiTokenManager::new(
+                    RuntimeConfigStore::new(config, None),
+                    fake_bad_request_credentials(1),
+                    None,
+                    None,
+                    false,
+                )
+                .expect("JSON content-type sniff token manager");
                 let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
                 let provider =
@@ -8930,9 +9007,14 @@ mod tests {
         let mut cred = KiroCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let completion = KiroStreamCompletion::new(
             manager.clone(),
             1,
@@ -8957,9 +9039,14 @@ mod tests {
         let mut cred = KiroCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let completion = KiroStreamCompletion::new(
             manager.clone(),
             1,
@@ -8987,8 +9074,14 @@ mod tests {
             cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
             let mut config = Config::default();
             config.credential_upstream_failure_cooldown_enabled = cooldown_enabled;
-            let manager =
-                Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+            let manager = MultiTokenManager::new(
+                RuntimeConfigStore::new(config, None),
+                vec![cred],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             let completion = KiroStreamCompletion::new(
                 manager.clone(),
                 1,
@@ -9024,9 +9117,14 @@ mod tests {
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
             ..Default::default()
         };
-        let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let completion = || {
             KiroStreamCompletion::new(
                 manager.clone(),
@@ -9066,16 +9164,14 @@ mod tests {
     /// nothing about one account; one account failing while the others keep working still cools.
     #[test]
     fn faults_spread_over_the_pool_do_not_cool_accounts_but_one_failing_account_still_does() {
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                Config::default(),
-                fake_bad_request_credentials(5),
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            fake_bad_request_credentials(5),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let completion = |id: u64| {
             KiroStreamCompletion::new(
                 manager.clone(),
@@ -9126,9 +9222,14 @@ mod tests {
         let mut cred = KiroCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let lease = manager.acquire_in_flight_lease_for_test(1);
 
         {
@@ -9159,16 +9260,14 @@ mod tests {
     }
 
     fn degrade_test_manager() -> Arc<MultiTokenManager> {
-        Arc::new(
-            MultiTokenManager::new(
-                Config::default(),
-                vec![degrade_test_credential()],
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
+        MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            vec![degrade_test_credential()],
+            None,
+            None,
+            false,
         )
+        .unwrap()
     }
 
     const DEGRADE_MODEL: &str = "claude-sonnet-4.5";
@@ -9270,9 +9369,14 @@ mod tests {
         let mut cred = KiroCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(Config::default(), None),
+            vec![cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let lease = manager.acquire_in_flight_lease_for_test(1);
 
         let completion = super::KiroApiCompletion::new(
@@ -9301,10 +9405,14 @@ mod tests {
             let mut credential = KiroCredentials::default();
             credential.access_token = Some("mcp-success-token".to_string());
             credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-            let manager = Arc::new(
-                MultiTokenManager::new(Config::default(), vec![credential], None, None, false)
-                    .unwrap(),
-            );
+            let manager = MultiTokenManager::new(
+                RuntimeConfigStore::new(Config::default(), None),
+                vec![credential],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             let completion = McpCallCompletion::new(
                 manager.clone(),
                 1,
@@ -9358,9 +9466,14 @@ mod tests {
                 let mut credential = KiroCredentials::default();
                 credential.access_token = Some("mcp-failure-token".to_string());
                 credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-                let manager = Arc::new(
-                    MultiTokenManager::new(config, vec![credential], None, None, false).unwrap(),
-                );
+                let manager = MultiTokenManager::new(
+                    RuntimeConfigStore::new(config, None),
+                    vec![credential],
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
                 let completion = McpCallCompletion::new(
                     manager.clone(),
                     1,
@@ -9404,10 +9517,14 @@ mod tests {
             let mut credential = KiroCredentials::default();
             credential.access_token = Some("mcp-cancelled-token".to_string());
             credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-            let manager = Arc::new(
-                MultiTokenManager::new(Config::default(), vec![credential], None, None, false)
-                    .unwrap(),
-            );
+            let manager = MultiTokenManager::new(
+                RuntimeConfigStore::new(Config::default(), None),
+                vec![credential],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             let completion = McpCallCompletion::new(
                 manager.clone(),
                 1,
@@ -9822,10 +9939,14 @@ mod tests {
         config.credential_warmup_requests = 0;
         config.dispatch_max_queued_requests = 1;
         config.credential_dispatch_max_wait_secs = 10;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
-                .expect("full-load token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(2),
+            None,
+            None,
+            false,
+        )
+        .expect("full-load token manager");
         // Credential 2 is busy with another request, and one more request waits in the queue,
         // so the queue is full when credential 1 fails.
         let mut busy = manager
@@ -10376,8 +10497,14 @@ mod tests {
 
         let mut disabled = KiroCredentials::default();
         disabled.disabled = true;
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![disabled], None, None, false).unwrap());
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -10422,10 +10549,14 @@ mod tests {
         config.kiro_upstream_base_url = Some(server.base_url.clone());
         config.kiro_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 1;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
-                .expect("MCP completion token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(1),
+            None,
+            None,
+            false,
+        )
+        .expect("MCP completion token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider =
@@ -10485,16 +10616,14 @@ mod tests {
                 config.kiro_upstream_base_url = Some(server.base_url.clone());
                 config.kiro_upstream_response_timeout_secs = 2;
                 config.credential_retry_max_attempts = 100;
-                let manager = Arc::new(
-                    MultiTokenManager::new(
-                        config,
-                        fake_bad_request_credentials(pool_size),
-                        None,
-                        None,
-                        false,
-                    )
-                    .expect("fake MCP token manager"),
-                );
+                let manager = MultiTokenManager::new(
+                    RuntimeConfigStore::new(config, None),
+                    fake_bad_request_credentials(pool_size),
+                    None,
+                    None,
+                    false,
+                )
+                .expect("fake MCP token manager");
                 let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
                 let provider =
@@ -10571,16 +10700,14 @@ mod tests {
                 config.kiro_upstream_base_url = Some(server.base_url.clone());
                 config.kiro_upstream_response_timeout_secs = 2;
                 config.credential_retry_max_attempts = 1;
-                let manager = Arc::new(
-                    MultiTokenManager::new(
-                        config,
-                        fake_bad_request_credentials(1),
-                        None,
-                        None,
-                        false,
-                    )
-                    .expect("bounded MCP error token manager"),
-                );
+                let manager = MultiTokenManager::new(
+                    RuntimeConfigStore::new(config, None),
+                    fake_bad_request_credentials(1),
+                    None,
+                    None,
+                    false,
+                )
+                .expect("bounded MCP error token manager");
                 let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
                 let provider =
@@ -10644,10 +10771,14 @@ mod tests {
         config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
         config.kiro_upstream_region_rotation_enabled = true;
         config.kiro_region_profile_arn_mismatch_allowed = true;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(2), None, None, false)
-                .expect("MCP invalid request token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(2),
+            None,
+            None,
+            false,
+        )
+        .expect("MCP invalid request token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert(
@@ -10731,10 +10862,14 @@ mod tests {
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
             ..Default::default()
         };
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![credential], None, None, false)
-                .expect("IdC MCP token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![credential],
+            None,
+            None,
+            false,
+        )
+        .expect("IdC MCP token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -10792,10 +10927,14 @@ mod tests {
         config.credential_retry_max_attempts = 1;
         config.kiro_endpoint_fallback_enabled = true;
         config.kiro_endpoint_fallback_order = vec!["runtime".to_string()];
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
-                .expect("MCP endpoint fallback token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(1),
+            None,
+            None,
+            false,
+        )
+        .expect("MCP endpoint fallback token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert(
@@ -10841,16 +10980,14 @@ mod tests {
         config.kiro_upstream_region_rotation_enabled = true;
         config.kiro_region_profile_arn_mismatch_allowed = true;
         config.kiro_endpoint_fallback_enabled = false;
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                config.clone(),
-                fake_bad_request_credentials(1),
-                None,
-                None,
-                false,
-            )
-            .expect("MCP Region fallback token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config.clone(), None),
+            fake_bad_request_credentials(1),
+            None,
+            None,
+            false,
+        )
+        .expect("MCP Region fallback token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -10876,10 +11013,14 @@ mod tests {
             ),
             ..fake_bad_request_credentials(1).remove(0)
         };
-        let manager = Arc::new(
-            MultiTokenManager::new(blocked_config, vec![blocked_credentials], None, None, false)
-                .expect("MCP Profile Region guard manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(blocked_config, None),
+            vec![blocked_credentials],
+            None,
+            None,
+            false,
+        )
+        .expect("MCP Profile Region guard manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -10906,10 +11047,14 @@ mod tests {
         config.kiro_upstream_base_url = Some(server.base_url.clone());
         config.kiro_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 100;
-        let manager = Arc::new(
-            MultiTokenManager::new(config, fake_bad_request_credentials(20), None, None, false)
-                .expect("fake rescue token manager"),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            fake_bad_request_credentials(20),
+            None,
+            None,
+            false,
+        )
+        .expect("fake rescue token manager");
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -10999,8 +11144,14 @@ mod tests {
         let mut disabled = KiroCredentials::default();
         disabled.disabled = true;
         disabled.access_token = Some("secret-token-should-not-leak".to_string());
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![disabled], None, None, false).unwrap());
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
@@ -11164,6 +11315,10 @@ impl KiroProvider {
     /// 获取凭据的脱敏展示名称，用于请求级 usage 记录。
     pub fn credential_label(&self, id: u64) -> Option<String> {
         self.token_manager.credential_display_label(id)
+    }
+
+    pub(crate) fn runtime_store(&self) -> Arc<RuntimeConfigStore> {
+        self.token_manager.runtime_store()
     }
 
     /// 获取当前运行时配置的独立副本。热路径用 [`Self::runtime_config_snapshot`]。

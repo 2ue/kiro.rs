@@ -548,9 +548,12 @@ async fn async_main() {
         ),
     }
 
+    let runtime =
+        model::runtime::RuntimeConfigStore::new(config.clone(), Some(postgres_store.clone()));
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new_with_stores_and_runtime_state_and_account_info(
-        config.clone(),
+        runtime.clone(),
         credentials_list,
         proxy_config.clone(),
         Some(postgres_store.clone()),
@@ -562,7 +565,6 @@ async fn async_main() {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
     });
-    let token_manager = Arc::new(token_manager);
     let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
     common::runtime_lag::spawn_probe();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
@@ -574,10 +576,19 @@ async fn async_main() {
         postgres_store.clone(),
         redis_store.clone(),
     ));
+    let weak_external_pool_manager = Arc::downgrade(&external_pool_manager);
+    runtime.subscribe(Arc::new(move |previous, current, _reason| {
+        if previous.external_pools != current.external_pools {
+            if let Some(manager) = weak_external_pool_manager.upgrade() {
+                manager.invalidate_external_pool_policy_state();
+            }
+        }
+    }));
     let admin_api_key_store =
         admin::AdminApiKeyStore::new(config.admin_api_key.clone().unwrap_or_default());
     let runtime_event_health = Arc::new(RuntimeEventHealth::default());
     let runtime_event_listener = spawn_redis_runtime_event_listener(
+        runtime.clone(),
         redis_store.clone(),
         token_manager.clone(),
         external_pool_manager.clone(),
@@ -621,9 +632,9 @@ async fn async_main() {
         }
     }
     let audit_retention_task = {
-        let token_manager = token_manager.clone();
+        let runtime = runtime.clone();
         storage::account_events::spawn_audit_retention_worker(postgres_store.clone(), move || {
-            let config = token_manager.runtime_config();
+            let config = runtime.config();
             config
                 .audit_log_retention_enabled
                 .then_some(config.audit_log_retention_days)
@@ -713,6 +724,7 @@ async fn async_main() {
             anthropic_app
         } else {
             let admin_service = admin::AdminService::new(admin::AdminServiceDependencies {
+                runtime: runtime.clone(),
                 token_manager: token_manager.clone(),
                 known_endpoints: endpoint_names.clone(),
                 usage_recorder: usage_recorder.clone(),
@@ -1553,6 +1565,7 @@ impl CredentialsReloadCoalescer {
 }
 
 fn spawn_redis_runtime_event_listener(
+    runtime: Arc<model::runtime::RuntimeConfigStore>,
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
     external_pool_manager: Arc<ExternalPoolManager>,
@@ -1610,15 +1623,9 @@ fn spawn_redis_runtime_event_listener(
                                 }
                                 continue;
                             }
-                            let previous_external_pools =
-                                token_manager.runtime_config().external_pools;
-                            match token_manager.reload_runtime_config_from_postgres() {
+                            match runtime.reload_from_postgres() {
                                 Ok(true) => {
-                                    let config = token_manager.runtime_config();
-                                    if config.external_pools != previous_external_pools {
-                                        external_pool_manager
-                                            .invalidate_external_pool_policy_state();
-                                    }
+                                    let config = runtime.config();
                                     apply_request_api_key_runtime(
                                         &config,
                                         &request_api_key_store,
@@ -1651,15 +1658,9 @@ fn spawn_redis_runtime_event_listener(
                         if let Err(err) = token_manager.reload_kiro_version_state_from_postgres().await {
                             tracing::warn!("定时热加载 Kiro 版本状态失败: {}", err);
                         }
-                        let previous_external_pools =
-                            token_manager.runtime_config().external_pools;
-                        match token_manager.reload_runtime_config_from_postgres() {
+                        match runtime.reload_from_postgres() {
                             Ok(true) => {
-                                let config = token_manager.runtime_config();
-                                if config.external_pools != previous_external_pools {
-                                    external_pool_manager
-                                        .invalidate_external_pool_policy_state();
-                                }
+                                let config = runtime.config();
                                 apply_request_api_key_runtime(
                                     &config,
                                     &request_api_key_store,

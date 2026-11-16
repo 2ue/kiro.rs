@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
@@ -40,6 +40,7 @@ use crate::model::config::{
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS,
     MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS, MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM,
 };
+use crate::model::runtime::{RuntimeConfigChangeReason, RuntimeConfigStore};
 use crate::storage::account_events::{
     AccountEvent, AccountEventKind, AccountSource, quota_transition, record_account_event,
 };
@@ -96,8 +97,6 @@ use super::queue::{
     format_effective_concurrency_range, min_dispatch_wait, rate_limit_blocked_count,
 };
 use super::redis_runtime::{
-    apply_scheduler_states as apply_redis_scheduler_states,
-    apply_scheduler_states_for_ids as apply_redis_scheduler_states_for_ids,
     apply_scheduler_states_for_ids_with_global_rpm as apply_redis_scheduler_states_for_ids_with_global_rpm,
     apply_scheduler_states_with_global_rpm as apply_redis_scheduler_states_with_global_rpm,
     clear_scheduler_state_for_credential_local, clear_scheduler_state_for_credential_redis,
@@ -971,16 +970,7 @@ enum DistributedRefreshDecision {
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
-    /// Runtime config snapshot. Readers clone the `Arc` (one atomic increment) instead of the
-    /// whole `Config`; writers swap in a new snapshot. Hot paths must not deep-clone `Config`:
-    /// it carries the cache policy and other maps (tens of KB in production) and, behind one
-    /// lock, every request used to copy it several times.
-    config: RwLock<Arc<Config>>,
-    /// Changes on every config swap, so per-request views derived from the config can be cached
-    /// and rebuilt only when it changes. Drawn from a process-wide counter: two managers (tests,
-    /// or a provider rebuilt at the same address) never share a generation, so a cache keyed by
-    /// it cannot hand one manager's view to another.
-    config_generation: AtomicU64,
+    runtime: Arc<RuntimeConfigStore>,
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
@@ -1149,10 +1139,6 @@ const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_mi
 /// the Fast tier immediately.
 const TIER_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const BOUND_SESSION_COUNT_CACHE_TTL: StdDuration = StdDuration::from_millis(500);
-fn next_config_generation() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
 
 /// How long a "no credential has a free slot" answer may be reused without a capacity signal.
 const NO_FREE_SLOT_CACHE_TTL: StdDuration = StdDuration::from_millis(200);
@@ -2464,27 +2450,27 @@ impl MultiTokenManager {
     /// * `is_multiple_format` - 已废弃，保留参数用于测试和调用兼容
     #[cfg(test)]
     pub fn new(
-        config: Config,
+        runtime: Arc<RuntimeConfigStore>,
         credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let _ = (credentials_path, is_multiple_format);
-        Self::new_with_postgres_store(config, credentials, proxy, None, false, None)
+        Self::new_with_postgres_store(runtime, credentials, proxy, None, false, None)
     }
 
     #[cfg(test)]
     pub fn new_with_postgres_store(
-        config: Config,
+        runtime: Arc<RuntimeConfigStore>,
         credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
         postgres_store: Option<Arc<PostgresStore>>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_with_stores(
-            config,
+            runtime,
             credentials,
             proxy,
             credentials_path,
@@ -2496,17 +2482,17 @@ impl MultiTokenManager {
 
     #[cfg(test)]
     pub fn new_with_stores(
-        config: Config,
+        runtime: Arc<RuntimeConfigStore>,
         credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
         postgres_store: Option<Arc<PostgresStore>>,
         redis_store: Option<Arc<RedisStore>>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let _ = (credentials_path, is_multiple_format);
         Self::new_with_stores_and_runtime_state(
-            config,
+            runtime,
             credentials,
             proxy,
             postgres_store,
@@ -2517,15 +2503,15 @@ impl MultiTokenManager {
 
     #[cfg(test)]
     pub(crate) fn new_with_stores_and_runtime_state(
-        config: Config,
+        runtime: Arc<RuntimeConfigStore>,
         credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         postgres_store: Option<Arc<PostgresStore>>,
         redis_store: Option<Arc<RedisStore>>,
         initial_runtime_states: Option<HashMap<u64, CredentialRuntimeStateRow>>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_with_stores_and_runtime_state_and_account_info(
-            config,
+            runtime,
             credentials,
             proxy,
             postgres_store,
@@ -2536,15 +2522,17 @@ impl MultiTokenManager {
     }
 
     pub(crate) fn new_with_stores_and_runtime_state_and_account_info(
-        config: Config,
+        runtime: Arc<RuntimeConfigStore>,
         mut credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         postgres_store: Option<Arc<PostgresStore>>,
         redis_store: Option<Arc<RedisStore>>,
         initial_runtime_states: Option<HashMap<u64, CredentialRuntimeStateRow>>,
         initial_account_info: Option<HashMap<u64, CredentialAccountInfoRow>>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
+        let config = runtime.snapshot();
         validate_token_refresh_admission_config(&config)?;
+        runtime.set_validator(Box::new(validate_token_refresh_admission_config));
         if credentials.iter().any(|credential| credential.id.is_none()) {
             if let Some(store) = &postgres_store {
                 let store = store.clone();
@@ -2741,9 +2729,8 @@ impl MultiTokenManager {
         let auxiliary_runtime =
             AuxiliaryRuntime::new(&config, proxy.as_ref(), postgres_store.is_some())?;
         auxiliary_runtime.set_token_refresh_redis_store(redis_store.clone());
-        let manager = Self {
-            config: RwLock::new(Arc::new(config)),
-            config_generation: AtomicU64::new(next_config_generation()),
+        let manager = Arc::new(Self {
+            runtime,
             proxy,
             entries: Arc::new(Mutex::new(entries)),
             current_id: Mutex::new(initial_id),
@@ -2804,7 +2791,24 @@ impl MultiTokenManager {
             model_rejection_refreshes: Mutex::new(HashMap::new()),
             subscription_tier_observer: std::sync::OnceLock::new(),
             model_capability_cohort_cache: Mutex::new(ModelCapabilityCohortCache::default()),
-        };
+        });
+        let weak_manager = Arc::downgrade(&manager);
+        manager
+            .runtime
+            .subscribe(Arc::new(move |previous, current, reason| {
+                let Some(manager) = weak_manager.upgrade() else {
+                    return;
+                };
+                if reason != RuntimeConfigChangeReason::LocalInstall {
+                    manager.apply_runtime_config_side_effects(previous, current);
+                }
+                if reason == RuntimeConfigChangeReason::Updated {
+                    manager.publish_runtime_config_changed(
+                        manager.runtime.saved_version(),
+                        "runtime_config_updated",
+                    );
+                }
+            }));
         if let Some(dispatcher) = &manager.scheduler_redis_release_dispatcher {
             let entries = Arc::downgrade(&manager.entries);
             let capacity_signal = Arc::downgrade(&manager.capacity_signal);
@@ -2862,35 +2866,32 @@ impl MultiTokenManager {
     /// 获取当前运行时配置的独立副本（管理端编辑、持久化用）。热路径用
     /// [`Self::runtime_config_snapshot`]，不要深拷贝整份配置。
     pub fn runtime_config(&self) -> Config {
-        Config::clone(&self.config.read())
+        self.runtime.config()
     }
 
-    /// 当前运行时配置的共享快照：只克隆 `Arc`。配置更新会换成新快照，已拿到的快照保持不变，
-    /// 一个请求内看到的配置前后一致。
+    /// 当前运行时配置的共享快照，只克隆 `Arc`。
     pub fn runtime_config_snapshot(&self) -> Arc<Config> {
-        self.config.read().clone()
+        self.runtime.snapshot()
     }
 
-    /// The config snapshot together with its generation. The generation changes whenever a new
-    /// snapshot is installed; both are read under the same lock so they always match.
+    /// 同一代次的配置快照与代次号。
     pub fn runtime_config_snapshot_with_generation(&self) -> (Arc<Config>, u64) {
-        let config = self.config.read();
-        (
-            config.clone(),
-            self.config_generation.load(Ordering::Acquire),
-        )
+        self.runtime.snapshot_with_generation()
     }
 
     fn install_runtime_config(&self, config: Config) {
-        let mut current = self.config.write();
-        *current = Arc::new(config);
-        self.config_generation
-            .store(next_config_generation(), Ordering::Release);
+        self.runtime.install_local(|current| *current = config);
+    }
+
+    pub(crate) fn runtime_store(&self) -> Arc<RuntimeConfigStore> {
+        self.runtime.clone()
     }
 
     /// 空回是否让账号冷却（全局开关，默认关闭）。
     pub fn empty_turn_cooldown_enabled(&self) -> bool {
-        self.config.read().credential_empty_turn_cooldown_enabled
+        self.runtime
+            .snapshot()
+            .credential_empty_turn_cooldown_enabled
     }
 
     /// 记一次与账号无关的上游故障。同一个账号连续出现 [`UPSTREAM_FAULT_STREAK_COOLDOWN`] 次
@@ -2956,8 +2957,8 @@ impl MultiTokenManager {
 
     /// 上游故障（5xx、异常/错误事件、解码/读取/发送失败）是否冷却账号，默认否。
     pub fn upstream_failure_cooldown_enabled(&self) -> bool {
-        self.config
-            .read()
+        self.runtime
+            .snapshot()
             .credential_upstream_failure_cooldown_enabled
     }
 
@@ -2971,7 +2972,7 @@ impl MultiTokenManager {
             return;
         }
         let (enabled, threshold, half_life_ms) = {
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             (
                 config.credential_degrade_enabled,
                 config.credential_degrade_suspend_score,
@@ -3010,8 +3011,12 @@ impl MultiTokenManager {
     /// 测试用：读取某账号某模型当前的劣化分。
     #[cfg(test)]
     pub(crate) fn degrade_score_for_test(&self, id: u64, model: Option<&str>) -> f64 {
-        let half_life_ms =
-            (self.config.read().credential_degrade_half_life_secs.max(1) as f64) * 1000.0;
+        let half_life_ms = (self
+            .runtime
+            .snapshot()
+            .credential_degrade_half_life_secs
+            .max(1) as f64)
+            * 1000.0;
         let now_ms = Utc::now().timestamp_millis();
         self.entries
             .lock()
@@ -3024,12 +3029,12 @@ impl MultiTokenManager {
 
     /// 是否开放免登录的只读号池页面（默认关闭）。
     pub fn public_pool_view_enabled(&self) -> bool {
-        self.config.read().public_pool_view_enabled
+        self.runtime.snapshot().public_pool_view_enabled
     }
 
     /// 只读号池页面对 Free 账号的展示方式。
     pub fn public_pool_free_accounts(&self) -> crate::model::config::PublicPoolFreeAccounts {
-        self.config.read().public_pool_free_accounts
+        self.runtime.snapshot().public_pool_free_accounts
     }
 
     fn runtime_capacity_change_should_reset_warmup(previous: &Config, current: &Config) -> bool {
@@ -3339,82 +3344,37 @@ impl MultiTokenManager {
 
     /// 更新当前运行时配置并写入 PgSQL。
     pub fn update_runtime_config(&self, update: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
-        let previous_config = self.runtime_config();
-        let mut updated = previous_config.clone();
-        update(&mut updated);
-        updated.set_config_path_for_runtime(None);
-        validate_token_refresh_admission_config(&updated)?;
-
-        let mut saved_version: Option<i64> = None;
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            let to_save = updated.clone();
-            saved_version = Some(block_on_credential_pgsql(
-                "持久化运行时配置到 PgSQL",
-                async move { store.save_runtime_config_returning_version(&to_save).await },
-            )?);
-        }
-
-        self.install_runtime_config(updated);
-        let config = self.runtime_config_snapshot();
-        self.reset_active_warmup_after_runtime_capacity_change(
-            &previous_config,
-            &config,
-            "runtime_config_updated",
-        );
-        let auxiliary_limit = config.auxiliary_upstream_max_concurrent_requests;
-        self.auxiliary_runtime.update_limit(auxiliary_limit);
-        self.auxiliary_runtime
-            .update_token_refresh_limits(config.token_refresh_max_rpm, config.token_refresh_burst);
-        self.update_credential_rpm_from_config();
-        self.invalidate_model_capability_cohorts();
-        self.notify_dispatch_state_changed();
-        self.publish_runtime_config_changed(saved_version, "runtime_config_updated");
-
-        Ok(())
+        self.runtime.update(update).map(|_| ())
     }
 
-    /// 从 PgSQL 重新加载运行配置。用于 Redis pub/sub 通知或定时兜底检查。
+    /// 从 PgSQL 重载配置，由 store 通知 Kiro 联动逻辑。
     pub fn reload_runtime_config_from_postgres(&self) -> anyhow::Result<bool> {
-        let Some(store) = &self.postgres_store else {
-            return Ok(false);
-        };
-        let store = store.clone();
-        let Some(mut config) =
-            block_on_credential_pgsql("从 PgSQL 重新加载运行时配置", async move {
-                store.load_runtime_config().await
-            })?
-        else {
-            return Ok(false);
-        };
-        config.set_config_path_for_runtime(None);
-        validate_token_refresh_admission_config(&config)?;
-        let previous_config = self.runtime_config();
-        self.install_runtime_config(config.clone());
+        self.runtime.reload_from_postgres()
+    }
+
+    fn apply_runtime_config_side_effects(&self, previous: &Config, current: &Config) {
         self.reset_active_warmup_after_runtime_capacity_change(
-            &previous_config,
-            &config,
-            "runtime_config_reloaded",
+            previous,
+            current,
+            "runtime_config_changed",
         );
         self.auxiliary_runtime
-            .update_limit(config.auxiliary_upstream_max_concurrent_requests);
-        self.auxiliary_runtime
-            .update_token_refresh_limits(config.token_refresh_max_rpm, config.token_refresh_burst);
-        *self.load_balancing_mode.lock() = parse_load_balancing_mode(&config)?;
+            .update_limit(current.auxiliary_upstream_max_concurrent_requests);
+        self.auxiliary_runtime.update_token_refresh_limits(
+            current.token_refresh_max_rpm,
+            current.token_refresh_burst,
+        );
+        if let Ok(mode) = parse_load_balancing_mode(current) {
+            *self.load_balancing_mode.lock() = mode;
+        }
         self.update_credential_rpm_from_config();
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
-        Ok(true)
     }
 
     pub fn update_load_balancing_mode_in_config(&self, mode: &str) {
-        // Copy, edit and swap under the write lock so a concurrent config update is not lost.
-        let mut current = self.config.write();
-        let mut updated = Config::clone(&current);
-        updated.load_balancing_mode = mode.to_string();
-        *current = Arc::new(updated);
-        self.config_generation
-            .store(next_config_generation(), Ordering::Release);
+        self.runtime
+            .install_local(|config| config.load_balancing_mode = mode.to_string());
     }
 
     /// 获取凭据总数
@@ -3507,7 +3467,7 @@ impl MultiTokenManager {
         let state = self.compute_local_pool_route_state(model, None, true);
         let (stage, primary_reason) =
             Self::selection_failure_stage_and_reason(&state, error_message);
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let sample_limit = if config.selection_failure_record_enabled {
             config.selection_failure_sample_limit
         } else {
@@ -3653,7 +3613,7 @@ impl MultiTokenManager {
     ) {
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let now = Instant::now();
         let global_in_flight = entries
             .iter()
@@ -3755,7 +3715,7 @@ impl MultiTokenManager {
     }
 
     fn local_pool_risk_circuit_snapshot(&self, now: Instant) -> LocalPoolRiskCircuitSnapshot {
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         self.local_pool_risk_circuit_snapshot_from_config(now, &config)
     }
 
@@ -3810,7 +3770,7 @@ impl MultiTokenManager {
     /// Admits one half-open probe, or returns how long to wait when the circuit is open or the
     /// half-open probes are used up.
     fn admit_local_pool_risk_circuit_request(&self, now: Instant) -> Option<StdDuration> {
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         if !config.external_pools.local_pool_circuit_enabled {
             return None;
         }
@@ -3849,7 +3809,7 @@ impl MultiTokenManager {
         ever_succeeded: bool,
         dispatchable_now: usize,
     ) -> LocalPoolRiskCircuitSnapshot {
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         if !config.external_pools.local_pool_circuit_enabled {
             return LocalPoolRiskCircuitSnapshot::default();
         }
@@ -3913,7 +3873,7 @@ impl MultiTokenManager {
         route: Option<&str>,
         refresh_scheduler_state: bool,
     ) -> LocalPoolRouteState {
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let now = Instant::now();
         let risk_circuit = self.local_pool_risk_circuit_snapshot_from_config(now, &config);
         let scheduler_refresh_result = if refresh_scheduler_state && !risk_circuit.open {
@@ -4236,7 +4196,7 @@ impl MultiTokenManager {
     }
 
     fn auto_heal_limits(&self) -> AutoHealLimits {
-        let config = self.config.read();
+        let config = self.runtime.snapshot();
         AutoHealLimits {
             min_interval: StdDuration::from_secs(config.credential_auto_heal_min_interval_secs),
             max_consecutive_rounds: config.credential_auto_heal_max_consecutive_rounds,
@@ -4361,7 +4321,7 @@ impl MultiTokenManager {
     }
 
     fn max_concurrent_requests(&self) -> u32 {
-        self.config.read().credential_max_concurrent_requests
+        self.runtime.snapshot().credential_max_concurrent_requests
     }
 
     fn effective_max_concurrent_requests_for_id(
@@ -4378,7 +4338,9 @@ impl MultiTokenManager {
     }
 
     fn global_max_concurrent_requests(&self) -> u32 {
-        self.config.read().dispatch_global_max_concurrent_requests
+        self.runtime
+            .snapshot()
+            .dispatch_global_max_concurrent_requests
     }
 
     /// Fast path for the request entry: `Some(retry_after_secs)` when the dispatch queue is
@@ -4408,7 +4370,7 @@ impl MultiTokenManager {
         let has_free_slot = {
             let entries = self.entries.lock();
             let proxy_resources = self.proxy_resources.lock();
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             let now = Instant::now();
             let global_in_flight = entries
                 .iter()
@@ -4489,7 +4451,7 @@ impl MultiTokenManager {
     }
 
     fn max_queued_requests(&self) -> u32 {
-        self.config.read().dispatch_max_queued_requests
+        self.runtime.snapshot().dispatch_max_queued_requests
     }
 
     async fn execute_scheduler_redis_operation<T, F>(
@@ -5363,7 +5325,7 @@ impl MultiTokenManager {
     }
 
     fn in_flight_lease_max_age(&self) -> Option<StdDuration> {
-        let secs = self.config.read().credential_in_flight_lease_max_secs;
+        let secs = self.runtime.snapshot().credential_in_flight_lease_max_secs;
         (secs > 0).then(|| StdDuration::from_secs(secs))
     }
 
@@ -5371,7 +5333,7 @@ impl MultiTokenManager {
         &self,
         kind: TransientFailureKind,
     ) -> (StdDuration, StdDuration, f64, f64, StdDuration, f64) {
-        let config = self.config.read();
+        let config = self.runtime.snapshot();
         let base = match kind {
             TransientFailureKind::RateLimit => config.credential_rate_limit_cooldown_secs,
             TransientFailureKind::Server => config.credential_server_error_cooldown_secs,
@@ -5421,7 +5383,7 @@ impl MultiTokenManager {
     }
 
     fn update_credential_rpm_from_config(&self) {
-        let global_rpm = self.config.read().credential_rpm.unwrap_or(0);
+        let global_rpm = self.runtime.snapshot().credential_rpm.unwrap_or(0);
         let ids: Vec<u64> = {
             let mut entries = self.entries.lock();
             entries
@@ -5489,7 +5451,7 @@ impl MultiTokenManager {
     }
 
     fn mark_rate_limited_at(&self, id: u64, now: Instant) -> anyhow::Result<()> {
-        let global_rpm = self.config.read().credential_rpm.unwrap_or(0);
+        let global_rpm = self.runtime.snapshot().credential_rpm.unwrap_or(0);
         {
             let mut entries = self.entries.lock();
             let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
@@ -5515,7 +5477,7 @@ impl MultiTokenManager {
         request_weight_units: u32,
     ) -> SchedulerRedisSelectionAdmission {
         let request_weight_units = normalize_capacity_weight_units(request_weight_units);
-        let global_rpm = self.config.read().credential_rpm.unwrap_or(0);
+        let global_rpm = self.runtime.snapshot().credential_rpm.unwrap_or(0);
         let now = Instant::now();
         let mut entries = self.entries.lock();
         let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
@@ -5556,7 +5518,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         let now_ms = Utc::now().timestamp_millis();
         let rpm = {
-            let global_rpm = self.config.read().credential_rpm.unwrap_or(0);
+            let global_rpm = self.runtime.snapshot().credential_rpm.unwrap_or(0);
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -6392,7 +6354,7 @@ impl MultiTokenManager {
         if let Some(max_wait) = acquire_mode.max_wait_override() {
             return Some(max_wait);
         }
-        let secs = self.config.read().credential_dispatch_max_wait_secs;
+        let secs = self.runtime.snapshot().credential_dispatch_max_wait_secs;
         (secs > 0).then(|| StdDuration::from_secs(secs))
     }
 
@@ -6458,7 +6420,7 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let (global_rpm, tiers) = {
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             (
                 config.credential_rpm.unwrap_or(0),
                 config.subscription_model_lists.clone(),
@@ -6534,7 +6496,7 @@ impl MultiTokenManager {
     ) -> bool {
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
         let global_rpm = config.credential_rpm.unwrap_or(0);
         if self.redis_store.is_none() {
@@ -6577,7 +6539,7 @@ impl MultiTokenManager {
     ) -> bool {
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
         let global_rpm = config.credential_rpm.unwrap_or(0);
         if self.redis_store.is_none() {
@@ -6613,7 +6575,7 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let (max_concurrent_requests, global_rpm, tiers) = {
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             (
                 config.credential_max_concurrent_requests,
                 config.credential_rpm.unwrap_or(0),
@@ -6675,7 +6637,7 @@ impl MultiTokenManager {
             }
             let proxy_resources = self.proxy_resources.lock();
             let now = Instant::now();
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             let global_in_flight = entries
                 .iter()
                 .map(|entry| entry.in_flight_requests)
@@ -6728,7 +6690,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> bool {
-        let tiers = self.config.read().subscription_model_lists.clone();
+        let tiers = self.runtime.snapshot().subscription_model_lists.clone();
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         entries.iter().any(|entry| {
@@ -6757,7 +6719,7 @@ impl MultiTokenManager {
             refresh_local_selection_windows_locked(&mut entries, now);
         }
         let proxy_resources = self.proxy_resources.lock();
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
         let global_rpm = config.credential_rpm.unwrap_or(0);
         let global_in_flight = entries
@@ -6811,7 +6773,7 @@ impl MultiTokenManager {
     /// 权重与请求配额一样受 [`warmup_weight_floor`] 兜底：全局容量配置变更会把所有账号重新
     /// 打回预热，最先完成预热的少数账号不能因此独占新会话绑定。没有就绪账号时照常绑定。
     fn credential_accepts_session_binding(&self, credential_id: u64, model: Option<&str>) -> bool {
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let bound_sessions = self.active_bound_session_counts();
         let entries = self.entries.lock();
         let Some(entry) = entries.iter().find(|entry| entry.id == credential_id) else {
@@ -6876,8 +6838,8 @@ impl MultiTokenManager {
     /// regular slot reservation already enforces.
     fn session_at_concurrency_limit(&self, session_id: &str, credential_id: u64) -> bool {
         let limit = self
-            .config
-            .read()
+            .runtime
+            .snapshot()
             .credential_session_max_concurrent_requests;
         limit > 0
             && session_in_flight_on(&self.session_concurrency, session_id, credential_id) >= limit
@@ -6894,7 +6856,7 @@ impl MultiTokenManager {
         }
 
         let (global_rpm, tiers) = {
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             (
                 config.credential_rpm.unwrap_or(0),
                 config.subscription_model_lists.clone(),
@@ -6904,7 +6866,7 @@ impl MultiTokenManager {
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
         let (max_concurrent_requests, degrade_enabled, degrade_resume_score, degrade_half_life_ms) = {
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             (
                 config.credential_max_concurrent_requests,
                 config.credential_degrade_enabled,
@@ -6981,7 +6943,7 @@ impl MultiTokenManager {
 
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
-        let config = self.config.read();
+        let config = self.runtime.snapshot();
         let Some(entry) = entries.iter().find(|entry| entry.id == bound_id) else {
             return false;
         };
@@ -7318,7 +7280,7 @@ impl MultiTokenManager {
     ///
     /// 仅用于 Admin 手动模型调用测试；即使凭据已被禁用，也允许验证一次上游模型调用。
     pub async fn acquire_context_for_credential(&self, id: u64) -> anyhow::Result<CallContext> {
-        let request_kiro_version = self.runtime_config().effective_kiro_version();
+        let request_kiro_version = self.runtime.config().effective_kiro_version();
         self.acquire_context_for_credential_with_version(id, Some(&request_kiro_version))
             .await
     }
@@ -7744,7 +7706,7 @@ impl MultiTokenManager {
                         } else {
                             let entries = self.entries.lock();
                             let proxy_resources = self.proxy_resources.lock();
-                            let config = self.runtime_config_snapshot();
+                            let config = self.runtime.snapshot();
                             // 注意：必须在 bail! 之前计算 available_count，
                             // 因为 available_count() 会尝试获取 entries 锁，
                             // 而此时我们已经持有该锁，会导致死锁
@@ -8344,7 +8306,7 @@ impl MultiTokenManager {
                 {
                     let global_credential_max_concurrent_requests = self.max_concurrent_requests();
                     let effective_credential_max_concurrent_requests = {
-                        let tiers = self.config.read().subscription_model_lists.clone();
+                        let tiers = self.runtime.snapshot().subscription_model_lists.clone();
                         let entries = self.entries.lock();
                         let proxy_resources = self.proxy_resources.lock();
                         format_effective_concurrency_range(
@@ -8970,7 +8932,7 @@ impl MultiTokenManager {
                     })?;
                 let effective_proxy = current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
                 let refresh_identity = {
-                    let mut config = self.runtime_config();
+                    let mut config = self.runtime.config();
                     if let Some(version) = request_kiro_version {
                         config.pin_kiro_version_for_request(version.to_string());
                     }
@@ -9095,7 +9057,7 @@ impl MultiTokenManager {
                             let authoritative_proxy =
                                 authoritative_for_proxy.effective_proxy(self.proxy.as_ref());
                             let authoritative_identity = {
-                                let mut config = self.runtime_config();
+                                let mut config = self.runtime.config();
                                 if let Some(version) = request_kiro_version {
                                     config.pin_kiro_version_for_request(version.to_string());
                                 }
@@ -9146,7 +9108,7 @@ impl MultiTokenManager {
                         // Invalid local configuration is health-neutral and must not create
                         // avoidable client-cache/RPM/concurrency pressure during a failure wave.
                         validate_refresh_token(&refresh_source_for_proxy)?;
-                        let mut config = self.runtime_config();
+                        let mut config = self.runtime.config();
                         if let Some(version) = request_kiro_version {
                             config.pin_kiro_version_for_request(version.to_string());
                         }
@@ -9490,7 +9452,7 @@ impl MultiTokenManager {
         credentials: &KiroCredentials,
         excluded_id: Option<u64>,
     ) -> anyhow::Result<()> {
-        let config = self.runtime_config();
+        let config = self.runtime.config();
         let candidate = machine_id::generate_from_credentials(credentials, &config);
         let conflict = {
             let entries = self.entries.lock();
@@ -9923,8 +9885,8 @@ impl MultiTokenManager {
             .find(|entry| entry.id == id)
             .map(|entry| entry.credentials.subscription_tier())?;
         let has_list = self
-            .config
-            .read()
+            .runtime
+            .snapshot()
             .subscription_model_lists
             .get(tier)
             .is_some_and(|list| !list.models.is_empty());
@@ -9941,8 +9903,8 @@ impl MultiTokenManager {
     ) -> anyhow::Result<bool> {
         if only_if_missing
             && self
-                .config
-                .read()
+                .runtime
+                .snapshot()
                 .subscription_model_lists
                 .get(tier)
                 .is_some_and(|existing| !existing.models.is_empty())
@@ -11601,7 +11563,7 @@ impl MultiTokenManager {
         self: &Arc<Self>,
     ) -> BackgroundTokenRefreshWorkerHandle {
         let first_tick = tokio::time::Instant::now()
-            + StdDuration::from_secs(self.runtime_config().token_refresh_background_interval_secs);
+            + StdDuration::from_secs(self.runtime.config().token_refresh_background_interval_secs);
         self.spawn_background_token_refresh_worker_inner(first_tick)
     }
 
@@ -11665,7 +11627,7 @@ impl MultiTokenManager {
     }
 
     async fn run_background_token_refresh_pass(&self) -> BackgroundTokenRefreshPassReport {
-        let mut config = self.runtime_config();
+        let mut config = self.runtime.config();
         config.snapshot_kiro_version_for_request();
         let request_kiro_version = config.effective_kiro_version();
         if !config.token_refresh_background_enabled {
@@ -12411,7 +12373,7 @@ impl MultiTokenManager {
         let redis = redis.clone();
         let entries = self.entries.clone();
         let (config_rpm, in_flight_max_age) = {
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             (
                 config.credential_rpm.unwrap_or(0),
                 (config.credential_in_flight_lease_max_secs > 0)
@@ -12628,7 +12590,14 @@ impl MultiTokenManager {
             &self.released_in_flight_lease_tombstones,
             &mut states,
         );
-        apply_redis_scheduler_states(&self.entries, &self.config, states);
+        let config = self.runtime.snapshot();
+        apply_redis_scheduler_states_with_global_rpm(
+            &self.entries,
+            config.credential_rpm.unwrap_or(0),
+            (config.credential_in_flight_lease_max_secs > 0)
+                .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
+            states,
+        );
     }
 
     fn apply_scheduler_states_for_ids(&self, mut states: HashMap<u64, SchedulerCredentialState>) {
@@ -12636,7 +12605,14 @@ impl MultiTokenManager {
             &self.released_in_flight_lease_tombstones,
             &mut states,
         );
-        apply_redis_scheduler_states_for_ids(&self.entries, &self.config, states);
+        let config = self.runtime.snapshot();
+        apply_redis_scheduler_states_for_ids_with_global_rpm(
+            &self.entries,
+            config.credential_rpm.unwrap_or(0),
+            (config.credential_in_flight_lease_max_secs > 0)
+                .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
+            states,
+        );
     }
 
     fn record_scheduler_selection(
@@ -12656,7 +12632,7 @@ impl MultiTokenManager {
         if record_in_redis {
             if let Some(redis) = &self.redis_store {
                 let redis = redis.clone();
-                let global_rpm = self.config.read().credential_rpm.unwrap_or(0);
+                let global_rpm = self.runtime.snapshot().credential_rpm.unwrap_or(0);
                 let rpm = {
                     let entries = self.entries.lock();
                     entries
@@ -12859,7 +12835,7 @@ impl MultiTokenManager {
         latency: Option<StdDuration>,
     ) -> Option<SuccessReportOutcome> {
         let (alpha, degrade_enabled, degrade_decay, degrade_half_life_ms, degrade_resume_score) = {
-            let config = self.config.read();
+            let config = self.runtime.snapshot();
             (
                 config.scheduler_error_ewma_alpha.clamp(0.01, 1.0),
                 config.credential_degrade_enabled,
@@ -13158,7 +13134,7 @@ impl MultiTokenManager {
         let has_alternate = {
             let entries = self.entries.lock();
             let proxy_resources = self.proxy_resources.lock();
-            let config = self.runtime_config_snapshot();
+            let config = self.runtime.snapshot();
             let max_concurrent_requests = config.credential_max_concurrent_requests;
             let global_rpm = config.credential_rpm.unwrap_or(0);
             entries.iter().any(|e| {
@@ -14214,7 +14190,7 @@ impl MultiTokenManager {
         if cache.generation == generation {
             return cache.cohorts.clone();
         }
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let mut cohorts = BTreeMap::<KiroModelCapabilityCohortKey, Vec<u64>>::new();
@@ -14348,7 +14324,7 @@ impl MultiTokenManager {
         self.cleanup_expired_in_flight_leases_local_first();
         self.refresh_stats_from_postgres();
         self.refresh_scheduler_state_from_redis_best_effort();
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let mut entries = self.entries.lock();
         if self.redis_store.is_none() {
             refresh_local_selection_windows_locked(&mut entries, Instant::now());
@@ -14427,7 +14403,7 @@ impl MultiTokenManager {
     /// 该路径不主动同步 PgSQL/Redis，也不计算调度评分，避免列表请求被外部存储拖慢。
     pub fn base_snapshot(&self) -> ManagerBaseSnapshot {
         self.cleanup_expired_in_flight_leases_local_first();
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -14465,7 +14441,7 @@ impl MultiTokenManager {
     /// 该路径只读计数和全局容量，不构造每个凭据的运行态详情，供 Admin 顶部概览高频轮询使用。
     pub fn summary_snapshot(&self) -> ManagerSummarySnapshot {
         self.cleanup_expired_in_flight_leases_local_first();
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let now = Instant::now();
         let (current_id, total, available, local_global_in_flight, account_states) = {
             let entries = self.entries.lock();
@@ -14532,7 +14508,7 @@ impl MultiTokenManager {
             };
         }
 
-        let config = self.runtime_config_snapshot();
+        let config = self.runtime.snapshot();
         let mut entries = self.entries.lock();
         let now = Instant::now();
         if self.redis_store.is_none() {
@@ -15078,7 +15054,7 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let mut config = self.runtime_config();
+        let mut config = self.runtime.config();
         config.snapshot_kiro_version_for_request();
         let request_kiro_version = config.effective_kiro_version();
         let ctx = self
@@ -15209,7 +15185,7 @@ impl MultiTokenManager {
         id: u64,
         enabled: bool,
     ) -> anyhow::Result<UsageLimitsResponse> {
-        let mut config = self.runtime_config();
+        let mut config = self.runtime.config();
         config.snapshot_kiro_version_for_request();
         let request_kiro_version = config.effective_kiro_version();
         let ctx = self
@@ -15240,7 +15216,7 @@ impl MultiTokenManager {
         &self,
         credentials: KiroCredentials,
     ) -> anyhow::Result<CallContext> {
-        let request_kiro_version = self.runtime_config().effective_kiro_version();
+        let request_kiro_version = self.runtime.config().effective_kiro_version();
         self.acquire_context_for_external_credentials_with_version(
             credentials,
             Some(&request_kiro_version),
@@ -15276,7 +15252,7 @@ impl MultiTokenManager {
         let source_credentials = credentials.clone();
         let credentials = self.resolve_proxy_for_credential(credentials)?;
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let mut config = self.runtime_config();
+        let mut config = self.runtime.config();
         if let Some(version) = request_kiro_version {
             config.pin_kiro_version_for_request(version.to_string());
         }
@@ -15329,7 +15305,7 @@ impl MultiTokenManager {
         }
         .ok_or_else(|| anyhow::anyhow!("凭据缺少可用 token"))?;
         let effective_proxy = resolved.effective_proxy(self.proxy.as_ref());
-        let config = self.runtime_config();
+        let config = self.runtime.config();
         get_usage_limits(&resolved, &config, &token, effective_proxy.as_ref()).await
     }
 
@@ -15392,7 +15368,7 @@ impl MultiTokenManager {
         } else {
             let new_cred_for_proxy = self.resolve_proxy_for_credential(new_cred.clone())?;
             let effective_proxy = new_cred_for_proxy.effective_proxy(self.proxy.as_ref());
-            let mut config = self.runtime_config();
+            let mut config = self.runtime.config();
             config.snapshot_kiro_version_for_request();
             let admission = RefreshSendAdmission::new(
                 None,
@@ -15447,7 +15423,7 @@ impl MultiTokenManager {
         validated_cred.normalize_api_key_defaults();
         validated_cred.normalize_external_idp_defaults();
         let initial_disabled = new_cred.disabled;
-        let warmup_remaining = self.runtime_config().credential_warmup_requests;
+        let warmup_remaining = self.runtime.config().credential_warmup_requests;
         let initial_runtime_patch = CredentialRuntimeStatePatch {
             failure_count: Some(0),
             refresh_failure_count: Some(0),
@@ -15499,7 +15475,7 @@ impl MultiTokenManager {
         // 账号 ID 已经确定后再补齐 identity profile，确保无 token 的凭据也不会
         // 因为临时导入对象缺少 id 而落入共享 fallback bucket。
         let identity_changed =
-            machine_id::ensure_identity_fields(&mut validated_cred, &self.runtime_config());
+            machine_id::ensure_identity_fields(&mut validated_cred, &self.runtime.config());
         if identity_changed {
             if let Some(store) = &self.postgres_store {
                 let saved = credential_pgsql_sync_with_timeout(
@@ -15817,7 +15793,7 @@ impl MultiTokenManager {
             })?;
         let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
         let refresh_identity = {
-            let mut config = self.runtime_config();
+            let mut config = self.runtime.config();
             if let Some(version) = request_kiro_version {
                 config.pin_kiro_version_for_request(version.to_string());
             }
@@ -15951,7 +15927,7 @@ impl MultiTokenManager {
                     let authoritative_proxy =
                         authoritative_for_proxy.effective_proxy(self.proxy.as_ref());
                     let authoritative_identity = {
-                        let mut config = self.runtime_config();
+                        let mut config = self.runtime.config();
                         if let Some(version) = request_kiro_version {
                             config.pin_kiro_version_for_request(version.to_string());
                         }
@@ -15993,7 +15969,7 @@ impl MultiTokenManager {
 
         Self::ensure_refresh_state_generation(&refresh_state, refresh_reset_generation, false)?;
         auxiliary_attempt_budget.ensure_available(AuxiliaryAttemptKind::TokenRefresh)?;
-        let mut config = self.runtime_config();
+        let mut config = self.runtime.config();
         if let Some(version) = request_kiro_version {
             config.pin_kiro_version_for_request(version.to_string());
         }
@@ -16201,7 +16177,7 @@ impl MultiTokenManager {
         id: u64,
         budgets: TokenRefreshBudgets,
     ) -> anyhow::Result<()> {
-        let request_kiro_version = self.runtime_config().effective_kiro_version();
+        let request_kiro_version = self.runtime.config().effective_kiro_version();
         let initial_credentials = {
             let entries = self.entries.lock();
             entries
@@ -16225,7 +16201,7 @@ impl MultiTokenManager {
             })?;
         let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
         let refresh_identity = {
-            let mut config = self.runtime_config();
+            let mut config = self.runtime.config();
             config.pin_kiro_version_for_request(request_kiro_version.clone());
             RefreshAttemptIdentity::from_refresh_request(
                 &credentials_for_proxy,
@@ -16382,7 +16358,7 @@ impl MultiTokenManager {
                         ))
                     })?;
                 let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
-                let mut config = self.runtime_config();
+                let mut config = self.runtime.config();
                 config.pin_kiro_version_for_request(request_kiro_version.clone());
                 let admission = RefreshSendAdmission::new_with_send_started_marker(
                     None,
@@ -16563,19 +16539,9 @@ impl MultiTokenManager {
     }
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
-        let mut config = self.runtime_config();
-        config.load_balancing_mode = mode.to_string();
-        config.set_config_path_for_runtime(None);
-        let mut saved_version: Option<i64> = None;
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            saved_version = Some(block_on_credential_pgsql(
-                "持久化负载均衡模式到 PgSQL",
-                async move { store.save_runtime_config_returning_version(&config).await },
-            )?);
-        }
-        self.publish_runtime_config_changed(saved_version, "load_balancing_mode_updated");
-        Ok(())
+        self.runtime
+            .update(|config| config.load_balancing_mode = mode.to_string())
+            .map(|_| ())
     }
 
     /// 设置负载均衡模式（Admin API）
@@ -16595,7 +16561,6 @@ impl MultiTokenManager {
             *self.load_balancing_mode.lock() = previous_mode;
             return Err(err);
         }
-        self.update_load_balancing_mode_in_config(&mode);
         self.notify_dispatch_state_changed();
 
         tracing::info!("负载均衡模式已设置为: {}", mode);

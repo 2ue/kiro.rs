@@ -845,6 +845,7 @@ struct CredentialsBackupExport {
 ///
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
+    runtime: Arc<crate::model::runtime::RuntimeConfigStore>,
     token_manager: Arc<MultiTokenManager>,
     postgres_store: Arc<PostgresStore>,
     /// Optional independent Redis for usage/statistics/Admin caches and cleanup only.
@@ -868,6 +869,7 @@ pub struct AdminService {
 }
 
 pub struct AdminServiceDependencies {
+    pub runtime: Arc<crate::model::runtime::RuntimeConfigStore>,
     pub token_manager: Arc<MultiTokenManager>,
     pub known_endpoints: Vec<String>,
     pub usage_recorder: Arc<UsageRecorder>,
@@ -947,6 +949,7 @@ impl Default for UsageCleanupRuntime {
 impl AdminService {
     pub fn new(dependencies: AdminServiceDependencies) -> Self {
         let AdminServiceDependencies {
+            runtime,
             token_manager,
             known_endpoints,
             usage_recorder,
@@ -968,6 +971,7 @@ impl AdminService {
             "Admin observability caches must not receive the business Redis store"
         );
         let service = Self {
+            runtime,
             token_manager,
             postgres_store,
             observability_redis_store,
@@ -1137,7 +1141,7 @@ impl AdminService {
     }
 
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         access_keys_response(
             &config.request_api_keys(),
             &config.request_api_key_policies(),
@@ -1161,13 +1165,13 @@ impl AdminService {
         validate_request_api_key_policies(&keys, &policies)
             .map_err(AdminServiceError::InvalidCredential)?;
 
-        self.token_manager
-            .update_runtime_config(|config| {
+        self.runtime
+            .update(|config| {
                 config.set_request_api_keys(keys.clone());
                 config.set_request_api_key_policies(policies.clone());
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         self.refresh_request_api_key_runtime(&config);
         self.seed_request_key_usage_counters(&config);
         self.audit(
@@ -1195,7 +1199,7 @@ impl AdminService {
     pub async fn get_request_key_usage_limits(
         &self,
     ) -> Result<RequestKeyUsageLimitsResponse, AdminServiceError> {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let limiter = self.request_admission.usage_limits().clone();
         let now = chrono::Utc::now();
         let mut items = Vec::new();
@@ -1227,7 +1231,7 @@ impl AdminService {
         key_id: &str,
         period: KeyLimitPeriod,
     ) -> Result<(), AdminServiceError> {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         if !config
             .request_api_keys()
             .iter()
@@ -1303,7 +1307,7 @@ impl AdminService {
             ));
         }
 
-        let current_config = self.token_manager.runtime_config();
+        let current_config = self.runtime.config();
         let mut keys = current_config.request_api_keys();
         let mut policies = current_config.request_api_key_policies();
         if keys.iter().any(|key| key == &next_key) {
@@ -1345,7 +1349,7 @@ impl AdminService {
         req: UpdateRequestApiKeyRequest,
         admin_api_key: &str,
     ) -> Result<AccessKeysResponse, AdminServiceError> {
-        let current_config = self.token_manager.runtime_config();
+        let current_config = self.runtime.config();
         let mut keys = current_config.request_api_keys();
         let mut policies = current_config.request_api_key_policies();
         let index = keys
@@ -1435,7 +1439,7 @@ impl AdminService {
         key_id: &str,
         admin_api_key: &str,
     ) -> Result<AccessKeysResponse, AdminServiceError> {
-        let current_config = self.token_manager.runtime_config();
+        let current_config = self.runtime.config();
         let mut keys = current_config.request_api_keys();
         let mut policies = current_config.request_api_key_policies();
         remove_request_api_key_by_id(&mut keys, key_id)?;
@@ -1637,7 +1641,7 @@ impl AdminService {
         let url = external_pool_models_url(&base_url).map_err(|err| {
             AdminServiceError::InvalidCredential(format!("外部池模型列表 URL 无效: {err}"))
         })?;
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let timeout_secs = config
             .external_pools
             .external_pool_request_timeout_secs
@@ -1790,7 +1794,7 @@ impl AdminService {
         }
 
         let manager = self.external_pool_manager.clone();
-        let config = self.token_manager.runtime_config().external_pools;
+        let config = self.runtime.config().external_pools;
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let response = ExternalPoolsStatusResponse { pools };
@@ -1927,8 +1931,8 @@ impl AdminService {
         }
 
         let next_admin_api_key = next_admin_api_key.to_string();
-        self.token_manager
-            .update_runtime_config(|config| {
+        self.runtime
+            .update(|config| {
                 config.admin_api_key = Some(next_admin_api_key.clone());
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -2519,7 +2523,7 @@ impl AdminService {
                 .map(|credential| credential.id)
                 .collect();
             let snapshot = self.token_manager.base_snapshot();
-            let default_endpoint = self.token_manager.runtime_config().default_endpoint;
+            let default_endpoint = self.runtime.config().default_endpoint;
             let mut filtered: Vec<_> = snapshot
                 .entries
                 .into_iter()
@@ -2547,7 +2551,7 @@ impl AdminService {
             };
         }
         let snapshot = self.token_manager.base_snapshot();
-        let default_endpoint = self.token_manager.runtime_config().default_endpoint;
+        let default_endpoint = self.runtime.config().default_endpoint;
         let mut filtered: Vec<_> = snapshot
             .entries
             .into_iter()
@@ -2870,7 +2874,7 @@ impl AdminService {
         Vec<CredentialStatusItem>,
     ) {
         let snapshot = self.token_manager.snapshot();
-        let default_endpoint = self.token_manager.runtime_config().default_endpoint;
+        let default_endpoint = self.runtime.config().default_endpoint;
         let cost_summary = options
             .include_cost_summary
             .then(|| self.usage_recorder.credential_cost_summary());
@@ -3324,8 +3328,7 @@ impl AdminService {
                 MAX_CREDENTIALS_PAGE_LIMIT
             )));
         }
-        let concurrency =
-            effective_credential_info_refresh_concurrency(&self.token_manager.runtime_config());
+        let concurrency = effective_credential_info_refresh_concurrency(&self.runtime.config());
         let labels = self.credential_lookup();
         let snapshot = self.token_manager.base_snapshot();
         let mut items = stream::iter(ids.into_iter().map(|id| {
@@ -3445,8 +3448,7 @@ impl AdminService {
         }
 
         let deadline = tokio::time::Instant::now() + CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET;
-        let concurrency =
-            effective_credential_info_refresh_concurrency(&self.token_manager.runtime_config());
+        let concurrency = effective_credential_info_refresh_concurrency(&self.runtime.config());
         let labels = self.credential_lookup();
         let mut items = stream::iter(ids.into_iter().map(|id| {
             let label = labels.get(&id).cloned();
@@ -3506,7 +3508,7 @@ impl AdminService {
             .call_api_with_credential(id, &request_body)
             .await
             .map_err(|e| self.classify_test_error(e, id))?;
-        let runtime_config = self.token_manager.runtime_config();
+        let runtime_config = self.runtime.config();
         let credential_id = api_response.credential_id();
         let (response, completion) = api_response.into_parts();
         let body_bytes = match response_bytes_with_limit_and_body_timeout(
@@ -3557,7 +3559,7 @@ impl AdminService {
             ));
         }
 
-        let runtime_config = self.token_manager.runtime_config();
+        let runtime_config = self.runtime.config();
         let model_resolution = self.model_capabilities.resolve_model_with_mapping(
             model,
             runtime_config.model_resolution_mode,
@@ -4502,7 +4504,7 @@ impl AdminService {
         let client = match build_client(
             Some(&proxy),
             PROXY_TEST_TIMEOUT_SECS,
-            self.token_manager.runtime_config().tls_backend,
+            self.runtime.config().tls_backend,
         ) {
             Ok(client) => client,
             Err(err) => {
@@ -5338,7 +5340,7 @@ impl AdminService {
 
     /// 获取 usage 汇总。
     pub fn get_usage_summary(&self) -> UsageSummary {
-        let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
+        let high_cache_threshold = self.runtime.config().high_cache_threshold;
         let cache_key = admin_usage_summary_cache_key(high_cache_threshold);
         if let Some(cached) = self.read_admin_cache::<UsageSummary>(&cache_key) {
             return cached;
@@ -5356,7 +5358,7 @@ impl AdminService {
         &self,
         timezone: Option<String>,
     ) -> Result<UsageDashboardResponse, AdminServiceError> {
-        let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
+        let high_cache_threshold = self.runtime.config().high_cache_threshold;
         let cache_key = admin_usage_dashboard_cache_key(timezone.as_deref(), high_cache_threshold);
         if let Some(cached) = self.read_admin_cache::<UsageDashboardResponse>(&cache_key) {
             return Ok(cached);
@@ -5576,7 +5578,7 @@ impl AdminService {
         &self,
         timezone: Option<String>,
     ) -> Result<crate::anthropic::usage::UsageDashboardWindowsResponse, AdminServiceError> {
-        let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
+        let high_cache_threshold = self.runtime.config().high_cache_threshold;
         self.usage_recorder
             .dashboard_windows(timezone.as_deref(), high_cache_threshold)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
@@ -5850,7 +5852,7 @@ impl AdminService {
         &self,
         query: UsageExternalPoolRiskQuery,
     ) -> Result<UsageExternalPoolRiskResponse, AdminServiceError> {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let cost_config = UsageExternalPoolRiskCostConfig {
             cost_floor_enabled: config
                 .external_pools
@@ -6102,7 +6104,7 @@ impl AdminService {
     /// 订阅等级模型列表：每个已知等级一行，附带该等级的账号数。
     pub fn get_subscription_model_lists(&self) -> SubscriptionModelListsResponse {
         const TIERS: [&str; 6] = ["free", "students", "pro", "pro_plus", "pro_max", "power"];
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let snapshot = self.token_manager.snapshot();
         let mut counts: HashMap<&'static str, (usize, usize)> = HashMap::new();
         for entry in &snapshot.entries {
@@ -6173,8 +6175,8 @@ impl AdminService {
             source_credential_id: None,
         };
         let key = tier.clone();
-        self.token_manager
-            .update_runtime_config(move |config| {
+        self.runtime
+            .update(move |config| {
                 if removed {
                     config.subscription_model_lists.remove(&key);
                 } else {
@@ -6253,8 +6255,8 @@ impl AdminService {
             source_credential_id: Some(credential_id),
         };
         let key = tier.clone();
-        self.token_manager
-            .update_runtime_config(move |config| {
+        self.runtime
+            .update(move |config| {
                 config.subscription_model_lists.insert(key, list);
             })
             .map_err(|e| {
@@ -6730,7 +6732,7 @@ impl AdminService {
     pub async fn check_kiro_client_version(
         &self,
     ) -> Result<crate::kiro::kiro_version::LifecycleSnapshot, AdminServiceError> {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let check = crate::kiro::kiro_version::check_now(&config).await;
         let check_error = check.as_ref().err().map(ToString::to_string);
         let next = match &check {
@@ -6788,7 +6790,7 @@ impl AdminService {
         version: Option<&str>,
         pin: bool,
     ) -> Result<crate::kiro::kiro_version::LifecycleSnapshot, AdminServiceError> {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let current = self
             .postgres_store
             .load_kiro_version_state()
@@ -6852,7 +6854,7 @@ impl AdminService {
     pub async fn rollback_kiro_client_version(
         &self,
     ) -> Result<crate::kiro::kiro_version::LifecycleSnapshot, AdminServiceError> {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let current = self
             .postgres_store
             .load_kiro_version_state()
@@ -6900,7 +6902,7 @@ impl AdminService {
 
     /// 获取运行时全局配置。
     pub fn get_runtime_config(&self) -> RuntimeConfigResponse {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let auxiliary_concurrency = self.token_manager.auxiliary_concurrency_snapshot();
         let token_refresh_admission = self.token_manager.token_refresh_admission_snapshot();
         let refresh_clients = self.token_manager.refresh_client_cache_snapshot();
@@ -7101,7 +7103,7 @@ impl AdminService {
         &self,
         body: super::types::PromptInjectionPreviewBody,
     ) -> Result<crate::anthropic::PromptInjectionPreviewResponse, AdminServiceError> {
-        let mut config = self.token_manager.runtime_config();
+        let mut config = self.runtime.config();
         if let Some(draft) = body.draft {
             if let Some(prompt_injection) = draft.prompt_injection {
                 let prompt_injection = prompt_injection.normalized();
@@ -7123,7 +7125,7 @@ impl AdminService {
         &self,
         req: UpdateRuntimeConfigRequest,
     ) -> Result<RuntimeConfigResponse, AdminServiceError> {
-        let current_config = self.token_manager.runtime_config();
+        let current_config = self.runtime.config();
         if req.prompt_steering.is_some() || req.thinking_trigger_mode.is_some() {
             return Err(AdminServiceError::InvalidCredential(
                 "promptSteering 和 thinkingTriggerMode 已停用，请改用 promptInjection 和 routeFeatures（请在新版管理后台的提示词注入页面编辑）".to_string(),
@@ -7860,8 +7862,8 @@ impl AdminService {
         let credential_rpm = (req.credential_rpm > 0).then_some(req.credential_rpm);
         let compression = req.compression();
 
-        self.token_manager
-            .update_runtime_config(|config| {
+        self.runtime
+            .update(|config| {
                 config.credential_rpm = credential_rpm;
                 config.request_admission = request_admission;
                 config.credential_max_concurrent_requests = req.credential_max_concurrent_requests;
@@ -8019,7 +8021,7 @@ impl AdminService {
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         self.request_admission.update_config(request_admission);
-        let updated_config = self.token_manager.runtime_config();
+        let updated_config = self.runtime.config();
         self.refresh_request_api_key_runtime(&updated_config);
         let audit_detail = Self::runtime_config_audit_detail(&current_config, &updated_config);
         self.audit(
@@ -8031,8 +8033,6 @@ impl AdminService {
             audit_detail,
         );
         if external_pool_policy_changed {
-            self.external_pool_manager
-                .invalidate_external_pool_policy_state();
             self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
         }
 
@@ -11523,7 +11523,7 @@ impl AdminService {
     pub(super) fn route_scenario_runtime_config(
         &self,
     ) -> crate::model::config::ExternalPoolsConfig {
-        self.token_manager.runtime_config().external_pools
+        self.runtime.config().external_pools
     }
 
     /// Local accounts as (id, label, route policy). Accounts disabled because their quota ran out
@@ -11571,7 +11571,7 @@ impl AdminService {
     /// Routes listed on the route policy page: built-in routes, configured path overrides and
     /// registered /dfcache routes.
     pub(super) fn route_scenario_routes(&self) -> Vec<String> {
-        let config = self.token_manager.runtime_config();
+        let config = self.runtime.config();
         let mut routes: std::collections::BTreeSet<String> = ["/v1", "/cc", "/ha", "/na"]
             .into_iter()
             .map(str::to_string)
@@ -11597,13 +11597,13 @@ impl AdminService {
     }
 
     pub(super) fn route_scenario_active_id(&self) -> Option<u64> {
-        self.token_manager.runtime_config().active_route_scenario_id
+        self.runtime.config().active_route_scenario_id
     }
 
     pub(super) fn set_route_scenario_active_id(&self, id: Option<u64>) {
         if let Err(err) = self
-            .token_manager
-            .update_runtime_config(|config| config.active_route_scenario_id = id)
+            .runtime
+            .update(|config| config.active_route_scenario_id = id)
         {
             tracing::warn!(error = %err, "记录当前路由场景失败");
         }
@@ -11615,18 +11615,16 @@ impl AdminService {
         local: &super::route_scenarios::RoutePolicy,
         external: &super::route_scenarios::RoutePolicy,
     ) -> Result<(), AdminServiceError> {
-        let mut external_pools = self.token_manager.runtime_config().external_pools;
+        let mut external_pools = self.runtime.config().external_pools;
         external_pools.local_pool_route_mode = local.route_mode;
         external_pools.local_pool_route_rules = local.route_rules.clone();
         external_pools.external_pool_route_mode = external.route_mode;
         external_pools.external_pool_route_rules = external.route_rules.clone();
         validate_external_pools_config(&external_pools)
             .map_err(AdminServiceError::InvalidCredential)?;
-        self.token_manager
-            .update_runtime_config(|config| config.external_pools = external_pools.clone())
+        self.runtime
+            .update(|config| config.external_pools = external_pools.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        self.external_pool_manager
-            .invalidate_external_pool_policy_state();
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
         Ok(())
     }
@@ -11677,7 +11675,7 @@ impl AdminService {
     }
 
     pub(super) fn inventory_runtime_config(&self) -> crate::model::config::Config {
-        self.token_manager.runtime_config()
+        self.runtime.config()
     }
 
     /// Same parsing and normalisation as the pool import.
@@ -11725,8 +11723,8 @@ impl AdminService {
         enabled: bool,
         free_accounts: crate::model::config::PublicPoolFreeAccounts,
     ) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .update_runtime_config(|config| {
+        self.runtime
+            .update(|config| {
                 config.public_pool_view_enabled = enabled;
                 config.public_pool_free_accounts = free_accounts;
             })

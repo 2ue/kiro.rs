@@ -11,6 +11,7 @@
 - `src/kiro/token_manager/mod.rs` 与 manager 的构造函数：接收 `Arc<RuntimeConfigStore>`
 - `src/kiro/provider.rs`：`runtime_config*` 三个方法改为转发 store（可以继续经 token_manager 转发，但 token_manager 内部必须是 store）
 - `src/anthropic/middleware.rs`：`AppState` 新增 `runtime: Arc<RuntimeConfigStore>` 字段
+- `src/anthropic/handlers/request_entry.rs`、`src/anthropic/handlers/model_driven_websearch.rs`：这两个是 handlers 的子模块，同样允许改；其中经 `provider.runtime_config_snapshot()` 读配置的地方改为经 `state.runtime`（或 ctx 里传入的 store）
 - `src/anthropic/handlers.rs`：`request_runtime_config`（约 1626 行）改为从 `state.runtime` 取快照与代次，缓存 key 中的 `provider` 指针改为 store 指针；`live_runtime_config`（约 7891 行）、`request_image_processing_config`、dfcache 路由定义读取（约 7948 行）等所有 `state.kiro_provider.as_ref().map(|p| p.runtime_config_snapshot…)` 改为 `state.runtime`
 - `src/admin/service.rs`：全部 35 处 `self.token_manager.runtime_config()` 改为 `self.runtime.runtime_config()`；`update_runtime_config` 相关调用改为 `self.runtime.update(...)`（Kiro 侧副作用由 store 的订阅回调触发，见下）
 - `src/main.rs`：构造 store，注入 token_manager、AppState、AdminService；Redis 事件监听（约 1566-1660 行）里的 `token_manager.reload_runtime_config_from_postgres()` 与 `token_manager.runtime_config()` 改为 store
@@ -44,6 +45,10 @@ pub enum RuntimeConfigChangeReason { Updated, Reloaded, LocalInstall }
 - 现有 `validate_token_refresh_admission_config(&updated)?` 校验保留：store 提供 `set_validator(Box<dyn Fn(&Config) -> anyhow::Result<()>>)`，由 Kiro manager 在构造时注册，这样阶段 2 删 Kiro 时只需不再注册。
 - `block_on_credential_pgsql` 这种在同步上下文里等待 PG 的做法沿用（搬到 runtime.rs 或 common），保持调用方签名同步。
 - Redis `publish_runtime_config_changed` 仍由 manager 在订阅回调里做（它需要 manager 的实例 id），不要搬进 store。
+
+## 收尾
+
+- 阶段完成时 `cargo build` 不应有 `never used` 警告：manager.rs / provider.rs 上被 store 取代而不再被调用的方法（如 `install_runtime_config`、`reload_runtime_config_from_postgres`、`update_load_balancing_mode_in_config`、`runtime_config_snapshot_with_generation`）要么删除，要么让现有调用方继续经它们转发；`redis_runtime.rs` 里不再使用的 `apply_scheduler_states*` 同理。
 
 ## 不要做的事
 

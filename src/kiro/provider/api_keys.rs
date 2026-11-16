@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::model::runtime::RuntimeConfigStore;
 use chrono::Utc;
 use serde_json::Value;
 
@@ -439,10 +441,14 @@ mod tests {
             kiro_api_key: Some("ksk_existing".to_string()),
             ..Default::default()
         };
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![credential, key_credential], None, None, false)
-                .unwrap(),
-        );
+        let manager = MultiTokenManager::new(
+            RuntimeConfigStore::new(config, None),
+            vec![credential, key_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let mut endpoints: std::collections::HashMap<
             String,
             Arc<dyn crate::kiro::endpoint::KiroEndpoint>,

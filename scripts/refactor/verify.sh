@@ -36,6 +36,45 @@ case "$TASK_ID" in
     step "全量单测（非集成）"
     run cargo test --bin kiro-rs -q
     ;;
+  s2a-entry-kiro-free)
+    step "编译"
+    run cargo build -q --bin kiro-rs
+    step "anthropic/external_pool 不再引用 kiro"
+    hits=$(grep -rn "crate::kiro\|kiro_provider\|KiroProvider\|MetadataTokenUsage" src/anthropic src/external_pool.rs src/external_pool/ || true)
+    [ -z "$hits" ] || { echo "!! 仍有引用:"; echo "$hits" | head -30; fail=1; }
+    step "handlers.rs 行数 ≤ 2500"
+    n=$(wc -l < src/anthropic/handlers.rs | tr -d ' '); echo "行数: $n"; [ "$n" -le 2500 ] || { echo "!! 超过 2500"; fail=1; }
+    step "删除清单文件不存在"
+    for f in src/anthropic/converter.rs src/anthropic/stream.rs src/anthropic/websearch.rs src/anthropic/files.rs src/anthropic/openai src/anthropic/handlers/local_body_pipeline.rs src/anthropic/handlers/model_driven_websearch.rs src/anthropic/signature.rs src/anthropic/structured_output.rs; do [ -e "$f" ] && { echo "!! 仍存在 $f"; fail=1; }; done
+    step "golden"
+    run cargo test --bin kiro-rs -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin kiro-rs -q
+    ;;
+  s2b-admin-kiro-free)
+    step "编译"
+    run cargo build -q --bin kiro-rs
+    step "admin 不再引用 kiro"
+    hits=$(grep -rn "crate::kiro\|KiroProvider\|MultiTokenManager\|token_manager" src/admin || true)
+    [ -z "$hits" ] || { echo "!! 仍有引用:"; echo "$hits" | head -30; fail=1; }
+    for f in src/admin/inventory.rs src/admin/public_pool.rs src/storage/credential_inventory.rs src/storage/kiro_api_keys.rs; do [ -e "$f" ] && { echo "!! 仍存在 $f"; fail=1; }; done
+    step "golden"
+    run cargo test --bin kiro-rs -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin kiro-rs -q
+    ;;
+  s2c-delete-kiro)
+    step "编译（含 bins）"
+    run cargo build -q --bins
+    step "src/kiro 已删除且无引用"
+    [ -d src/kiro ] && { echo "!! src/kiro 仍存在"; fail=1; }
+    hits=$(grep -rn "crate::kiro" src || true)
+    [ -z "$hits" ] || { echo "!! 仍有引用:"; echo "$hits" | head -30; fail=1; }
+    step "golden"
+    run cargo test --bin kiro-rs -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin kiro-rs -q
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac

@@ -1623,10 +1623,10 @@ impl CachePointRetryRequest {
 /// KB in production). Every request needs it, including requests that are about to be turned
 /// away during an overload, so it is built once per config generation and route fallback and
 /// handed out as an `Arc`.
-fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> Arc<RequestRuntimeConfig> {
-    let (config, generation) = provider.runtime_config_snapshot_with_generation();
+fn request_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
+    let (config, generation) = state.runtime.snapshot_with_generation();
     let key = RequestRuntimeConfigCacheKey {
-        provider: std::ptr::from_ref(provider) as usize,
+        runtime: Arc::as_ptr(&state.runtime) as usize,
         generation,
         prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
         prompt_cache_target_read_ratio_bits: state.prompt_cache_target_read_ratio.to_bits(),
@@ -1645,7 +1645,7 @@ fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> Arc<Requ
     let mut cache = REQUEST_RUNTIME_CONFIG_CACHE.lock();
     // Entries of older generations are never asked for again.
     cache.retain(|(cached_key, _)| {
-        cached_key.provider != key.provider || cached_key.generation == key.generation
+        cached_key.runtime != key.runtime || cached_key.generation == key.generation
     });
     if cache.len() >= REQUEST_RUNTIME_CONFIG_CACHE_MAX {
         cache.remove(0);
@@ -1654,12 +1654,12 @@ fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> Arc<Requ
     built
 }
 
-/// One entry per route fallback (routers carry different prompt-cache defaults) and provider.
+/// One entry per route fallback (routers carry different prompt-cache defaults) and runtime store.
 const REQUEST_RUNTIME_CONFIG_CACHE_MAX: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestRuntimeConfigCacheKey {
-    provider: usize,
+    runtime: usize,
     generation: u64,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio_bits: u64,
@@ -1673,11 +1673,7 @@ static REQUEST_RUNTIME_CONFIG_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
-    state
-        .kiro_provider
-        .as_ref()
-        .map(|provider| request_runtime_config(state, provider).image_processing)
-        .unwrap_or_else(|| state.image_processing.normalized())
+    request_runtime_config(state).image_processing
 }
 
 fn external_pool_enabled_for_endpoint(config: &ExternalPoolsConfig, endpoint: &str) -> bool {
@@ -1702,9 +1698,9 @@ async fn maybe_raw_external_direct_response(
     ingress_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<Response> {
-    let provider = state.kiro_provider.as_ref()?.clone();
+    state.kiro_provider.as_ref()?;
     let manager = state.external_pool_manager.clone()?;
-    let runtime_config = request_runtime_config(state, &provider);
+    let runtime_config = request_runtime_config(state);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
     if !external_pool_enabled_for_endpoint(&config, endpoint) {
@@ -1763,7 +1759,7 @@ async fn maybe_raw_external_preflight_response(
 ) -> Option<RawExternalPreflightDecision> {
     let provider = state.kiro_provider.as_ref()?.clone();
     let manager = state.external_pool_manager.clone()?;
-    let runtime_config = request_runtime_config(state, &provider);
+    let runtime_config = request_runtime_config(state);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
     if !config.local_pool_preflight_enabled
@@ -2708,7 +2704,7 @@ fn clamp_acquire_mode_to_dispatch_deadline(
 }
 
 fn capacity_weight_units_for_local_request(provider: &KiroProvider, input_tokens: i32) -> u32 {
-    let config = provider.runtime_config_snapshot();
+    let config = provider.runtime_store().snapshot();
     if !config.weighted_capacity.enabled {
         return 1;
     }
@@ -7888,10 +7884,7 @@ pub(crate) fn missing_max_tokens_default_value(state: &AppState) -> i32 {
 
 /// Live runtime config so admin changes apply without a restart.
 fn live_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
-    match state.kiro_provider.as_ref() {
-        Some(provider) => request_runtime_config(state, provider),
-        None => Arc::new(RequestRuntimeConfig::from_app_state(state)),
-    }
+    request_runtime_config(state)
 }
 
 /// 路由功能"渠道信息输出过滤"是否作用于这个请求。
@@ -7945,13 +7938,8 @@ pub(crate) fn resolve_defined_cache_route(
             format!("dfcache route is invalid: {candidate}"),
         ));
     };
-    let defined_cache_routes = state
-        .kiro_provider
-        .as_ref()
-        .map(|provider| {
-            normalize_defined_cache_routes(&provider.runtime_config_snapshot().defined_cache_routes)
-        })
-        .unwrap_or_else(|| state.defined_cache_routes.to_vec());
+    let defined_cache_routes =
+        normalize_defined_cache_routes(&state.runtime.snapshot().defined_cache_routes);
     if !defined_cache_routes.iter().any(|item| item == &prefix) {
         return Err(envelope::error_response(
             StatusCode::NOT_FOUND,
@@ -8242,7 +8230,7 @@ async fn post_messages_inner(
             return response;
         }
     };
-    let runtime_config = request_runtime_config(&state, &provider);
+    let runtime_config = request_runtime_config(&state);
     let request_body_bytes = raw_body.len().max(effective_raw_body.len());
     record_external_pool_wire_debug_handler_ingress(
         &runtime_config.external_pools,
@@ -10473,7 +10461,7 @@ async fn handle_stream_request(
 
     // 创建 SSE 流
     let response_request_id = credential_usage.request.request_id.clone();
-    let empty_turn_config = provider.runtime_config_snapshot();
+    let empty_turn_config = provider.runtime_store().snapshot();
     credential_usage.request.latency.empty_turn_status.store(
         super::empty_turn_policy::empty_turn_status(&empty_turn_config)
             .0
@@ -11753,7 +11741,7 @@ async fn wait_before_empty_turn_retry(
     retry_index: u32,
 ) {
     let delay = super::empty_turn_policy::empty_turn_retry_delay(
-        &provider.runtime_config_snapshot(),
+        &provider.runtime_store().snapshot(),
         retry_index,
         fastrand::f64(),
     );
@@ -11936,7 +11924,7 @@ async fn retry_stream_before_downstream_commit_inner(
     if reason == StreamRetryReason::UsageOnly || is_empty_turn_detail(&detail) {
         // 空回重试的等待：原账号的并发已经释放，等待期间不占账号。等待不能越过首输出前的
         // 保留窗口——窗口一到就要开始给客户端发字节，之后不能再换号。
-        let config = plan.provider.runtime_config_snapshot();
+        let config = plan.provider.runtime_store().snapshot();
         let delay = super::empty_turn_policy::empty_turn_retry_delay(
             &config,
             state.attempt_number,
@@ -13038,7 +13026,7 @@ fn create_sse_stream(
                         // 正常请求的最终 usage 仍以 message_delta 为准。
                         let zero_usage = state.retry_plan.as_ref().is_some_and(|plan| {
                             plan.provider
-                                .runtime_config_snapshot()
+                                .runtime_store().snapshot()
                                 .local_request_compat
                                 .zero_usage_on_hold_expired_message_start
                         });
@@ -13888,7 +13876,7 @@ async fn handle_non_stream_request(
             .map(str::to_string);
 
         // 读取响应体
-        let runtime = provider.runtime_config_snapshot();
+        let runtime = provider.runtime_store().snapshot();
         let body_read = read_non_stream_body_with_first_output_deadline(
             response,
             runtime.kiro_upstream_stream_idle_timeout_secs,
@@ -14004,7 +13992,7 @@ async fn handle_non_stream_request(
                             error.internal_detail,
                         );
                         return empty_turn_error_response(
-                            &provider.runtime_config_snapshot(),
+                            &provider.runtime_store().snapshot(),
                             &credential_usage.request.request_id,
                         );
                     } else {
@@ -14074,7 +14062,7 @@ async fn handle_non_stream_request(
                             detail,
                         );
                         return empty_turn_error_response(
-                            &provider.runtime_config_snapshot(),
+                            &provider.runtime_store().snapshot(),
                             &credential_usage.request.request_id,
                         );
                     }
@@ -14763,7 +14751,7 @@ async fn handle_non_stream_request(
         completion.report_empty_turn(detail);
         credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
         return empty_turn_error_response(
-            &provider.runtime_config_snapshot(),
+            &provider.runtime_store().snapshot(),
             &credential_usage.request.request_id,
         );
     }
@@ -14792,7 +14780,7 @@ async fn handle_non_stream_request(
                 completion.report_empty_turn(detail);
                 credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
                 return empty_turn_error_response(
-                    &provider.runtime_config_snapshot(),
+                    &provider.runtime_store().snapshot(),
                     &credential_usage.request.request_id,
                 );
             }
@@ -15360,10 +15348,7 @@ async fn count_tokens_for_endpoint(
 
     // Use the provider's live runtime config, like the messages path, so admin changes to prompt
     // injection are reflected in token counts without a restart.
-    let runtime_config = match state.kiro_provider.as_ref() {
-        Some(provider) => request_runtime_config(&state, provider),
-        None => Arc::new(RequestRuntimeConfig::from_app_state(&state)),
-    };
+    let runtime_config = request_runtime_config(&state);
     // count_tokens 按本地 Kiro 链路估算，与 messages 请求注入的 system 一致。
     super::prompt_injection::apply_to_count_tokens_request(
         &runtime_config.prompt_injection,
