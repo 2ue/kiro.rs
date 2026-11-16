@@ -1,9 +1,29 @@
 use super::*;
+use crate::anthropic::model_capabilities::ModelCapabilitiesCatalog;
 use crate::anthropic::model_capabilities::ModelResolutionSource;
+use crate::anthropic::pricing::PricingCatalog;
 use crate::anthropic::prompt_cache::PromptCacheTracker;
 use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
+use crate::anthropic::request_admission::RequestAdmissionController;
+use crate::anthropic::router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router};
 use crate::anthropic::types::{Message, OutputConfig};
-use crate::anthropic::usage::UsageRecorder;
+use crate::anthropic::usage::{
+    UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecorder, UsageRouteKind,
+};
+use crate::common::auth::RequestApiKeyStore;
+use crate::external_pool::*;
+use crate::storage::{postgres::PostgresStore, redis_cache::RedisStore};
+use axum::{Router, body::Body, http::Request, routing::post};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+use tower::ServiceExt;
 
 fn messages_request_for_model(model: &str) -> MessagesRequest {
     MessagesRequest {
@@ -126,9 +146,7 @@ async fn parse_messages_payload_rejects_empty_model_before_routing() {
             .to_string(),
         );
 
-        let response = request_entry::parse_messages_payload(&body, "req_test_empty_model")
-            .expect_err("empty model rejected")
-            .to_response(&envelope::request_id());
+        let response = parse_messages_payload(&body).expect_err("empty model rejected");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -839,4 +857,1264 @@ async fn count_tokens_keeps_local_estimation_available_without_an_external_manag
         .unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert!(body["input_tokens"].as_i64().unwrap() > 0);
+}
+
+#[test]
+fn all_multimodal_handlers_reject_21_remote_sources_before_upstream_for_five_rounds() {
+    run_handler_fixture_on_large_stack_thread("multimodal-handler-matrix", || async {
+        const MESSAGE_PATHS: [&str; 5] = [
+            "/v1/messages",
+            "/cc/v1/messages",
+            "/na/v1/messages",
+            "/ha/v1/messages",
+            "/dfcache/demo/v1/messages",
+        ];
+        const COUNT_TOKEN_PATHS: [&str; 5] = [
+            "/v1/messages/count_tokens",
+            "/cc/v1/messages/count_tokens",
+            "/na/v1/messages/count_tokens",
+            "/ha/v1/messages/count_tokens",
+            "/dfcache/demo/v1/messages/count_tokens",
+        ];
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let Some(app) = multimodal_handler_test_router(&upstream.base_url).await else {
+            return;
+        };
+
+        for round in 1..=5 {
+            for path in MESSAGE_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        remote_multimodal_limit_body(true),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("round {round} path {path}: handler waited on I/O"))
+                .expect("message handler response");
+                assert_remote_multimodal_limit_response(response, path, round).await;
+            }
+            for path in COUNT_TOKEN_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        remote_multimodal_limit_body(false),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("round {round} path {path}: handler waited on I/O"))
+                .expect("count_tokens handler response");
+                assert_remote_multimodal_limit_response(response, path, round).await;
+            }
+        }
+
+        assert_eq!(
+            upstream.hits(),
+            0,
+            "remote source preflight must run before inference HTTP"
+        );
+
+        for round in 1..=5 {
+            for path in COUNT_TOKEN_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        inline_multimodal_body(false),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("inline round {round} path {path}: handler timed out"))
+                .expect("inline count_tokens response");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "inline round {round} path {path}"
+                );
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("read inline count_tokens response");
+                let value: Value = serde_json::from_slice(&body).expect("count_tokens JSON");
+                assert!(
+                    value["input_tokens"]
+                        .as_i64()
+                        .is_some_and(|tokens| tokens > 0),
+                    "inline round {round} path {path}: {value}"
+                );
+            }
+        }
+        assert_eq!(
+            upstream.hits(),
+            0,
+            "count_tokens inline controls must remain local"
+        );
+
+        for round in 1..=5 {
+            for path in MESSAGE_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        inline_multimodal_body(true),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("inline message round {round} path {path}: handler timed out")
+                })
+                .expect("inline message response");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "inline message round {round} path {path}"
+                );
+                let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .expect("read inline message response");
+                let value: Value = serde_json::from_slice(&body).expect("inline message JSON");
+                assert_eq!(value["content"][0]["type"], "text");
+                assert_eq!(value["content"][0]["text"], "inline-ok");
+            }
+        }
+        assert_eq!(
+            upstream.hits(),
+            25,
+            "five rounds across five inline message routes should each reach inference exactly once"
+        );
+    });
+}
+
+async fn assert_remote_multimodal_limit_response(response: Response, path: &str, round: usize) {
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "round {round} path {path}"
+    );
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("remote source limit response carries request-id")
+        .to_string();
+    assert_eq!(
+        response
+            .headers()
+            .get("anthropic-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(request_id.as_str()),
+        "round {round} path {path}"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read remote source limit response");
+    let value: Value = serde_json::from_slice(&body).expect("Anthropic error JSON");
+    assert_eq!(value["type"], "error", "round {round} path {path}");
+    assert_eq!(
+        value["error"]["type"], "invalid_request_error",
+        "round {round} path {path}"
+    );
+    assert_eq!(value["request_id"], request_id, "round {round} path {path}");
+    assert_eq!(
+        value["error"]["message"],
+        "remote image/document source count 21 exceeds the request limit of 20",
+        "round {round} path {path}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("b07-source-"),
+        "round {round} path {path}: public error must not echo source URLs"
+    );
+}
+
+#[test]
+fn builtin_routes_follow_runtime_cache_and_prompt_config_matrix() {
+    run_handler_fixture_on_large_stack_thread("route-policy-config-matrix", || async {
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let config = route_policy_matrix_config(&upstream.base_url);
+        let Some((app, usage_recorder)) =
+            multimodal_handler_test_router_from_config(config.clone(), &upstream.base_url).await
+        else {
+            return;
+        };
+
+        let cc_policy = config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(
+            cc_policy.policy.cache_type,
+            PromptCacheStrategyType::NoCache
+        );
+        assert_eq!(cc_policy.namespace, None);
+        let na_policy = config.cache_policy_for_path("/na/v1/messages");
+        assert_eq!(
+            na_policy.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(na_policy.namespace, None);
+        let ha_policy = config.cache_policy_for_path("/ha/v1/messages");
+        assert_eq!(
+            ha_policy.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(ha_policy.namespace.as_deref(), Some("/ha"));
+
+        let (v1_body, v1_record, v1_upstream_body) = route_policy_matrix_message_request(
+            &app,
+            &usage_recorder,
+            &upstream,
+            "/v1/messages",
+            "shared",
+        )
+        .await;
+        assert!(
+            !v1_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/v1 should not receive /ha prompt steering"
+        );
+        assert!(usage_field(&v1_body, "cache_creation_input_tokens") > 0);
+        assert_eq!(usage_field(&v1_body, "cache_read_input_tokens"), 0);
+        assert!(v1_record.cache_creation_input_tokens > 0);
+        assert_eq!(v1_record.cache_read_input_tokens, 0);
+
+        let (cc_body, cc_record, cc_upstream_body) = route_policy_matrix_message_request(
+            &app,
+            &usage_recorder,
+            &upstream,
+            "/cc/v1/messages",
+            "shared",
+        )
+        .await;
+        assert!(
+            !cc_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/cc should not receive /ha prompt steering"
+        );
+        assert_eq!(usage_field(&cc_body, "cache_creation_input_tokens"), 0);
+        assert_eq!(usage_field(&cc_body, "cache_read_input_tokens"), 0);
+        assert_eq!(cc_record.cache_creation_input_tokens, 0);
+        assert_eq!(cc_record.cache_read_input_tokens, 0);
+
+        let (na_body, na_record, na_upstream_body) = route_policy_matrix_message_request(
+            &app,
+            &usage_recorder,
+            &upstream,
+            "/na/v1/messages",
+            "shared",
+        )
+        .await;
+        assert!(
+            !na_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/na should not receive /ha prompt steering"
+        );
+        assert!(
+            usage_field(&na_body, "cache_read_input_tokens") > 0,
+            "/na is configured high-cache with shared namespace, so it should read the /v1 cache entry"
+        );
+        assert!(na_record.cache_read_input_tokens > 0);
+
+        let (ha_first_body, ha_first_record, ha_first_upstream_body) =
+            route_policy_matrix_message_request(
+                &app,
+                &usage_recorder,
+                &upstream,
+                "/ha/v1/messages",
+                "shared",
+            )
+            .await;
+        assert!(
+            ha_first_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/ha should receive configured prompt steering"
+        );
+        assert_eq!(
+            usage_field(&ha_first_body, "cache_read_input_tokens"),
+            0,
+            "/ha is configured with independent namespace, so it must not read /v1 or /na cache entries"
+        );
+        assert!(usage_field(&ha_first_body, "cache_creation_input_tokens") > 0);
+        assert_eq!(ha_first_record.cache_read_input_tokens, 0);
+        assert!(ha_first_record.cache_creation_input_tokens > 0);
+
+        let (ha_second_body, ha_second_record, ha_second_upstream_body) =
+            route_policy_matrix_message_request(
+                &app,
+                &usage_recorder,
+                &upstream,
+                "/ha/v1/messages",
+                "shared",
+            )
+            .await;
+        assert!(ha_second_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER));
+        assert!(
+            usage_field(&ha_second_body, "cache_read_input_tokens") > 0,
+            "second /ha request should read from its own independent namespace"
+        );
+        assert!(ha_second_record.cache_read_input_tokens > 0);
+
+        let hits_before_count_tokens = upstream.hits();
+        let v1_count = route_policy_matrix_count_tokens(&app, "/v1/messages/count_tokens").await;
+        let cc_count = route_policy_matrix_count_tokens(&app, "/cc/v1/messages/count_tokens").await;
+        let na_count = route_policy_matrix_count_tokens(&app, "/na/v1/messages/count_tokens").await;
+        let ha_count = route_policy_matrix_count_tokens(&app, "/ha/v1/messages/count_tokens").await;
+        assert_eq!(
+            upstream.hits(),
+            hits_before_count_tokens,
+            "count_tokens must stay local for all built-in routes"
+        );
+        assert_eq!(
+            cc_count, v1_count,
+            "/cc should not receive /ha prompt steering"
+        );
+        assert_eq!(
+            na_count, v1_count,
+            "/na should not receive /ha prompt steering"
+        );
+        assert!(
+            ha_count > v1_count,
+            "/ha count_tokens should include configured prompt steering: ha={ha_count}, v1={v1_count}"
+        );
+    });
+}
+
+/// 逐项关闭：每次只关一个注入项，真实请求里只有这一项消失，其余文本逐字节不变。
+#[test]
+fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
+    use crate::model::config::InjectionId;
+    use crate::model::prompt_injection::{ItemSetting, TextKey};
+    run_handler_fixture_on_large_stack_thread("prompt-injection-independence", || async {
+        if crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL").is_none()
+            || crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL").is_none()
+        {
+            return;
+        }
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let base = {
+            let mut config = route_policy_matrix_config(&upstream.base_url);
+            let injection = &mut config.prompt_injection;
+            *injection = crate::model::config::PromptInjectionConfig::default();
+            injection.path_overrides.clear();
+            for id in InjectionId::ALL {
+                injection.defaults.insert(id, ItemSetting { enabled: true });
+            }
+            injection
+                .texts
+                .insert(TextKey::Custom, "independence custom text".to_string());
+            config
+        };
+        let request: super::injection_preview::PromptInjectionPreviewRequest =
+            serde_json::from_value(json!({
+                "route": "/v1",
+                "model": "claude-sonnet-4-20250514",
+                "toolChoice": "any",
+            }))
+            .unwrap();
+        let payload =
+            serde_json::to_string(&super::injection_preview::preview_payload(&request)).unwrap();
+        let send = |config: Config| {
+            let upstream = &upstream;
+            let payload = payload.clone();
+            async move {
+                let (app, _usage) =
+                    multimodal_handler_test_router_from_config(config, &upstream.base_url)
+                        .await
+                        .expect("handler test storage available");
+                let index = upstream.hits();
+                let response = app
+                    .oneshot(multimodal_handler_request("/v1/messages", payload))
+                    .await
+                    .expect("message response");
+                assert_eq!(response.status(), StatusCode::OK);
+                upstream.bodies_snapshot()[index].clone()
+            }
+        };
+        let all_on = send(base.clone()).await;
+        // 这些项在这个请求里会出现，关掉后它们的文本必须从请求里消失。
+        let markers = [
+            (InjectionId::TaskQuality, "<task_quality_policy>"),
+            (InjectionId::LanguageConstraint, "<language_constraint>"),
+            (InjectionId::Custom, "independence custom text"),
+            (InjectionId::IdentityPrompt, "<assistant_identity"),
+        ];
+        for (_, marker) in markers {
+            assert!(
+                all_on.contains(marker),
+                "all-on request must contain {marker}"
+            );
+        }
+        for (off, off_marker) in markers {
+            let mut config = base.clone();
+            config
+                .prompt_injection
+                .defaults
+                .insert(off, ItemSetting { enabled: false });
+            let body = send(config).await;
+            assert!(
+                !body.contains(off_marker),
+                "{off:?} off: {off_marker} still injected"
+            );
+            for (other, marker) in markers {
+                if other != off {
+                    assert!(body.contains(marker), "{off:?} off removed {other:?}");
+                }
+            }
+        }
+    });
+}
+
+fn inline_multimodal_body(include_max_tokens: bool) -> String {
+    const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let mut content = Vec::new();
+    for index in 0..21 {
+        content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": format!("data:image/png;base64,{ONE_PIXEL_PNG}")
+            }
+        }));
+        content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": ONE_PIXEL_PNG
+            }
+        }));
+        content.push(json!({"type": "text", "text": format!("inline image pair {index}")}));
+    }
+    let mut body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": content}]
+    });
+    if include_max_tokens {
+        body["max_tokens"] = json!(16);
+        body["stream"] = json!(false);
+    }
+    body.to_string()
+}
+
+/// The `usage` object of the first `message_start` event in an SSE body.
+fn message_start_usage(body: &str) -> serde_json::Value {
+    body.split("\n\n")
+        .find(|chunk| chunk.starts_with("event: message_start"))
+        .and_then(|chunk| chunk.lines().find_map(|line| line.strip_prefix("data: ")))
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .map(|event| event["message"]["usage"].clone())
+        .expect("message_start with usage")
+}
+
+fn multimodal_handler_request(path: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-api-key", "b07-handler-key")
+        .body(Body::from(body))
+        .expect("build multimodal handler request")
+}
+
+async fn multimodal_handler_test_router(base_url: &str) -> Option<Router> {
+    Some(multimodal_handler_test_router_with_usage(base_url).await?.0)
+}
+
+async fn multimodal_handler_test_router_with_usage(
+    base_url: &str,
+) -> Option<(Router, Arc<UsageRecorder>)> {
+    let mut config = Config::default();
+
+    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+
+    multimodal_handler_test_router_from_config(config, base_url).await
+}
+
+#[test]
+fn on_too_long_initial_guard_repairs_without_size_trimming() {
+    let runtime_config =
+        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+    let initial = runtime_config.initial_payload_guard_config();
+
+    assert!(initial.enabled);
+    assert_eq!(initial.max_bytes, 0);
+    assert!(!initial.trim_history);
+    assert!(runtime_config.too_long_retry_enabled());
+    assert_eq!(runtime_config.payload_guard_config().max_bytes, 460_800);
+    assert!(runtime_config.payload_guard_config().trim_history);
+}
+
+#[test]
+fn on_too_long_retry_requires_enabled_guard_and_positive_limit() {
+    assert!(
+        !runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, false, 460_800)
+            .too_long_retry_enabled()
+    );
+    assert!(
+        !runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 0)
+            .too_long_retry_enabled()
+    );
+    assert!(
+        !runtime_config_for_payload_guard(PayloadGuardMode::Preemptive, true, 460_800)
+            .too_long_retry_enabled()
+    );
+}
+
+#[test]
+fn oversized_current_image_is_resized_when_switched_on() {
+    run_handler_fixture_on_large_stack_thread(
+        "oversized-image-resize",
+        run_oversized_current_image_is_resized_when_switched_on,
+    );
+}
+
+/// A noisy PNG over the 5 MB inline limit (noise does not compress, so the PNG stays large).
+fn oversized_noise_png_base64() -> String {
+    let (width, height) = (1600u32, 1200u32);
+    let mut state = 0x2545_f491_u32;
+    let image = image::RgbImage::from_fn(width, height, |_, _| {
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        };
+        image::Rgb([next(), next(), next()])
+    });
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode noise png");
+    let encoded = BASE64_STANDARD.encode(png);
+    assert!(encoded.len() > 5 * 1024 * 1024, "fixture must exceed 5 MB");
+    encoded
+}
+
+fn parse_test_sse(body: &[u8]) -> Vec<(String, Value)> {
+    String::from_utf8_lossy(body)
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut name = None;
+            let mut data = None;
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event:") {
+                    name = Some(value.trim().to_string());
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data = serde_json::from_str::<Value>(value.trim()).ok();
+                }
+            }
+            Some((name?, data?))
+        })
+        .collect()
+}
+
+#[test]
+fn payload_guard_safety_margin_reduces_effective_size_target() {
+    let mut runtime_config =
+        runtime_config_for_payload_guard(PayloadGuardMode::Preemptive, true, 460_800);
+    runtime_config.payload_guard_safety_margin_bytes = 32 * 1024;
+
+    assert_eq!(runtime_config.payload_guard_config().max_bytes, 428_032);
+
+    runtime_config.payload_guard_max_bytes = 0;
+    assert_eq!(runtime_config.payload_guard_config().max_bytes, 0);
+}
+
+fn remote_multimodal_limit_body(include_max_tokens: bool) -> String {
+    let content = (0..21)
+        .map(|index| {
+            let block_type = if index % 2 == 0 { "image" } else { "document" };
+            json!({
+                "type": block_type,
+                "source": {
+                    "type": "url",
+                    "url": format!("https://b07-source-{index}.invalid/resource")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": content}]
+    });
+    if include_max_tokens {
+        body["max_tokens"] = json!(16);
+        body["stream"] = json!(false);
+    }
+    body.to_string()
+}
+
+fn response_request_id(response: &Response) -> String {
+    response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("response request-id")
+        .to_string()
+}
+
+fn route_policy_matrix_config(_base_url: &str) -> Config {
+    let mut config = Config::default();
+
+    config.cache_policy.path_overrides.insert(
+        "/cc".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::NoCache),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    config.cache_policy.path_overrides.insert(
+        "/na".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(false),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    config.cache_policy.path_overrides.insert(
+        "/ha".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(true),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+
+    // 只有 /ha 显式开启自定义注入项；其他注入项全部关闭。
+    {
+        use crate::model::config::InjectionId;
+        use crate::model::prompt_injection::{ItemOverride, ItemSetting, TextKey};
+        let injection = &mut config.prompt_injection;
+        injection.path_overrides.clear();
+        for id in InjectionId::ALL {
+            injection
+                .defaults
+                .insert(id, ItemSetting { enabled: false });
+        }
+        injection.path_overrides.insert(
+            "/ha".to_string(),
+            [(
+                InjectionId::Custom,
+                ItemOverride {
+                    enabled: Some(true),
+                },
+            )]
+            .into(),
+        );
+        injection.texts.insert(
+            TextKey::Custom,
+            format!(
+                "{ROUTE_POLICY_MATRIX_PROMPT_MARKER} {}",
+                "extra route policy prompt tokens ".repeat(50)
+            ),
+        );
+    }
+
+    config
+}
+
+async fn route_policy_matrix_count_tokens(app: &Router, path: &str) -> i64 {
+    let response = app
+        .clone()
+        .oneshot(multimodal_handler_request(
+            path,
+            route_policy_matrix_count_tokens_body(),
+        ))
+        .await
+        .expect("route policy matrix count_tokens response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{path} count_tokens status"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read route policy matrix count_tokens response");
+    let value: Value = serde_json::from_slice(&body).expect("route policy count_tokens JSON");
+    value["input_tokens"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{path}: missing input_tokens: {value}"))
+}
+
+fn route_policy_matrix_count_tokens_body() -> String {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "system": "stable route policy count tokens system prompt ".repeat(20),
+        "messages": [{"role": "user", "content": "same count_tokens payload"}]
+    })
+    .to_string()
+}
+
+async fn route_policy_matrix_message_request(
+    app: &Router,
+    usage_recorder: &UsageRecorder,
+    upstream: &MultimodalHandlerUpstream,
+    path: &str,
+    label: &str,
+) -> (Value, UsageRecord, String) {
+    let body_index = upstream.hits();
+    let response = app
+        .clone()
+        .oneshot(multimodal_handler_request(
+            path,
+            route_policy_matrix_messages_body(label),
+        ))
+        .await
+        .expect("route policy matrix message response");
+    assert_eq!(response.status(), StatusCode::OK, "{path} message status");
+    let request_id = response_request_id(&response);
+    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .expect("read route policy matrix message response");
+    let value: Value = serde_json::from_slice(&body).expect("route policy matrix message JSON");
+    assert_eq!(value["content"][0]["text"], "inline-ok", "{path}");
+    let record = usage_record_for_request(usage_recorder, &request_id);
+    assert_eq!(record.endpoint, path, "{path} usage endpoint");
+    assert_eq!(
+        record.route_kind,
+        Some(UsageRouteKind::ExternalPool),
+        "{path} route kind"
+    );
+    let bodies = upstream.bodies_snapshot();
+    let upstream_body = bodies
+        .get(body_index)
+        .unwrap_or_else(|| panic!("{path}: upstream body at index {body_index} missing"))
+        .clone();
+    (value, record, upstream_body)
+}
+
+fn route_policy_matrix_messages_body(label: &str) -> String {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 32,
+        "stream": false,
+        "system": [{
+            "type": "text",
+            "text": "stable route policy cache system prompt ".repeat(700),
+            "cache_control": {"type": "ephemeral"}
+        }],
+        "metadata": {
+            "user_id": r#"{"session_id":"11111111-2222-4333-8444-555555555555"}"#
+        },
+        "messages": [{"role": "user", "content": format!("route policy matrix {label}")}]
+    })
+    .to_string()
+}
+
+async fn run_strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let mut config = Config::default();
+
+    config.compat_profile = CompatProfile::AnthropicStrict;
+    let (app, usage_recorder) = handler_test_router(config, None);
+
+    for round in 1..=5 {
+        let hidden = format!("credential-like-output-{round}");
+        let response = app
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 32,
+                    "stream": false,
+                    "messages": [{
+                        "role": "assistant",
+                        "content": format!("safe prefix\nuser Continue\n\nbashHashd1e9567d: {hidden}")
+                    }],
+                    "tools": [{"name": "bashHashd1e9567d", "input_schema": {"type": "object"}}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("strict contamination response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "round {round}");
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("request-id")
+            .to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get("anthropic-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id.as_str())
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-error-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id.as_str())
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("strict contamination body");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf-8 error body");
+        let value: Value = serde_json::from_str(&body_text).expect("error JSON");
+        assert_eq!(value["request_id"], request_id);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&request_id))
+        );
+        assert!(!body_text.contains(&hidden));
+        assert!(!body_text.contains("bashHashd1e9567d"));
+
+        let records = usage_recorder.query(UsageRecordQuery {
+            request_id: Some(request_id.clone()),
+            ..UsageRecordQuery::default()
+        });
+        assert_eq!(records.records.len(), 1, "round {round}");
+        let record = records.records.first().expect("strict error usage record");
+        assert_eq!(record.status, UsageRecordStatus::Error);
+        assert_eq!(record.error_source.as_deref(), Some("request_rejection"));
+        assert_eq!(record.error_status_code, Some(400));
+        assert_eq!(record.error_id.as_deref(), Some(request_id.as_str()));
+        assert_eq!(record.total_input_tokens, 0);
+        assert_eq!(record.output_tokens, 0);
+        let metadata = record.error_metadata.as_ref().expect("error metadata");
+        assert_eq!(metadata["stage"], "request_entry");
+        assert_eq!(metadata["sampled"], true);
+        assert_eq!(metadata["observedCountIsExact"], false);
+        assert_eq!(metadata["observedCount"], round);
+        assert_eq!(
+            metadata.get("reason").and_then(Value::as_str),
+            Some("strict_request_protocol_contamination")
+        );
+        let serialized_record = serde_json::to_string(record).expect("serialize usage record");
+        assert!(!serialized_record.contains(&hidden));
+        assert!(!serialized_record.contains("bashHashd1e9567d"));
+    }
+
+    assert_eq!(
+        upstream.hits(),
+        0,
+        "strict contamination must never hit upstream"
+    );
+}
+
+#[test]
+fn strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds() {
+    run_handler_fixture_on_large_stack_thread("strict-contamination-matrix", || async {
+        run_strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds()
+            .await;
+    });
+}
+
+fn usage_field(value: &Value, field: &str) -> i64 {
+    value["usage"][field]
+        .as_i64()
+        .unwrap_or_else(|| panic!("missing usage.{field}: {value}"))
+}
+
+fn usage_numbers(value: &serde_json::Value) -> Vec<i64> {
+    match value {
+        serde_json::Value::Number(number) => vec![number.as_i64().unwrap_or(-1)],
+        serde_json::Value::Object(map) => map.values().flat_map(usage_numbers).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn usage_record_for_request(recorder: &UsageRecorder, request_id: &str) -> UsageRecord {
+    let records = recorder.query(UsageRecordQuery {
+        request_id: Some(request_id.to_string()),
+        ..UsageRecordQuery::default()
+    });
+    assert_eq!(records.records.len(), 1, "one usage record per request");
+    records.records.into_iter().next().unwrap()
+}
+
+fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response> {
+    let request_id = envelope::request_id();
+    request_entry::parse_messages_payload(raw_body, &request_id)
+        .map_err(|error| error.to_response(&request_id))
+}
+
+const ROUTE_POLICY_MATRIX_PROMPT_MARKER: &str = "ROUTE_POLICY_MATRIX_PROMPT_20260803";
+
+fn run_handler_fixture_on_large_stack_thread<F, Fut>(thread_name: &'static str, fixture: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build handler fixture runtime");
+            runtime.block_on(fixture());
+        })
+        .expect("spawn handler fixture thread")
+        .join()
+        .expect("run handler fixture thread");
+}
+
+/// With image resizing on, a current-turn image over the 5 MB limit is shrunk and sent instead
+/// of being rejected; with it off the request is still the official 400 and never reaches the
+/// upstream.
+async fn run_oversized_current_image_is_resized_when_switched_on() {
+    let data = oversized_noise_png_base64();
+    for resize in [false, true] {
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let mut config = Config::default();
+        config.image_processing.resize_enabled = resize;
+        let Some((app, _usage_recorder)) =
+            multimodal_handler_test_router_from_config(config, &upstream.base_url).await
+        else {
+            return;
+        };
+        let request = multimodal_handler_request(
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": data
+                    }}
+                ]}]
+            })
+            .to_string(),
+        );
+        let response = tokio::time::timeout(Duration::from_secs(60), app.oneshot(request))
+            .await
+            .expect("oversized image response timed out")
+            .expect("oversized image response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        if resize {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(upstream.hits(), 1);
+            let sent = upstream.bodies_snapshot()[0].to_string();
+            assert!(
+                sent.len() < 5 * 1024 * 1024,
+                "resized body is {} bytes",
+                sent.len()
+            );
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("image exceeds 5 MB maximum"), "{body}");
+            assert_eq!(upstream.hits(), 0);
+        }
+    }
+}
+
+fn runtime_config_for_payload_guard(
+    mode: PayloadGuardMode,
+    enabled: bool,
+    max_bytes: usize,
+) -> RequestRuntimeConfig {
+    let state = AppState::new(
+        Arc::new(RequestApiKeyStore::new(["test-key"])),
+        Arc::new(UsageRecorder::new(10)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.98,
+        CompatProfile::ClaudeCode,
+    );
+    let mut runtime_config = RequestRuntimeConfig::from_app_state(&state);
+    runtime_config.payload_guard_enabled = enabled;
+    runtime_config.payload_guard_mode = mode;
+    runtime_config.payload_guard_max_bytes = max_bytes;
+    runtime_config.payload_guard_safety_margin_bytes = 0;
+    runtime_config.payload_guard_trim_history = true;
+    runtime_config.payload_guard_external_enabled = true;
+    runtime_config
+}
+
+#[derive(Clone, Default)]
+struct MultimodalHandlerUpstreamState {
+    hits: Arc<AtomicUsize>,
+    bodies: Arc<StdMutex<Vec<String>>>,
+}
+
+struct MultimodalHandlerUpstream {
+    base_url: String,
+    state: MultimodalHandlerUpstreamState,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MultimodalHandlerUpstream {
+    async fn start() -> Self {
+        let state = MultimodalHandlerUpstreamState::default();
+        let app = Router::new()
+            .route("/v1/messages", post(multimodal_handler_upstream))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind multimodal handler upstream probe");
+        let address = listener
+            .local_addr()
+            .expect("multimodal handler upstream probe address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve multimodal handler upstream probe");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            state,
+            task,
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.state.hits.load(Ordering::Acquire)
+    }
+
+    fn bodies_snapshot(&self) -> Vec<String> {
+        self.state
+            .bodies
+            .lock()
+            .expect("upstream bodies lock")
+            .clone()
+    }
+}
+
+impl Drop for MultimodalHandlerUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn multimodal_handler_upstream(
+    State(state): State<MultimodalHandlerUpstreamState>,
+    body: Bytes,
+) -> Response {
+    state.hits.fetch_add(1, Ordering::AcqRel);
+    state
+        .bodies
+        .lock()
+        .expect("upstream bodies lock")
+        .push(String::from_utf8_lossy(&body).to_string());
+    Json(json!({
+        "id": "msg_inline", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514",
+        "content": [{"type": "text", "text": "inline-ok"}], "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {"input_tokens": 100, "output_tokens": 3, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    })).into_response()
+}
+
+async fn multimodal_handler_test_router_from_config(
+    mut config: Config,
+    base_url: &str,
+) -> Option<(Router, Arc<UsageRecorder>)> {
+    let manager =
+        test_external_pool_manager_for_handlers(base_url, ExternalPoolRequestBodyMode::Normalized)
+            .await?;
+    config.external_pools.external_pools_enabled = true;
+    config.external_pools.external_pool_same_pool_retry_count = 0;
+    Some(handler_test_router(config, Some(manager)))
+}
+
+fn handler_test_router(
+    config: Config,
+    manager: Option<Arc<ExternalPoolManager>>,
+) -> (Router, Arc<UsageRecorder>) {
+    let usage_recorder = Arc::new(UsageRecorder::new(1_000));
+    let router = create_router(
+        AnthropicRouterDependencies {
+            request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
+            usage_recorder: usage_recorder.clone(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            external_pool_manager: manager,
+        },
+        AnthropicRouterConfig::from_runtime_config(&config),
+    );
+    (router, usage_recorder)
+}
+
+async fn test_external_pool_manager_for_handlers(
+    base_url: &str,
+    body_mode: ExternalPoolRequestBodyMode,
+) -> Option<Arc<ExternalPoolManager>> {
+    let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+    else {
+        eprintln!("跳过 账号池入口 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return None;
+    };
+    let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
+        eprintln!("跳过 账号池入口 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return None;
+    };
+
+    let mut postgres_config = Config::default();
+    postgres_config.postgres.url = Some(postgres_url);
+    postgres_config.postgres.max_connections = 2;
+    let postgres = Arc::new(
+        PostgresStore::connect_test(&postgres_config)
+            .await
+            .expect("connect handler account pool test Postgres"),
+    );
+
+    let mut redis_config = Config::default();
+    redis_config.redis.url = Some(redis_url);
+    redis_config.redis.key_prefix =
+        format!("kiro_rs:test:handlers:messages:{}", uuid::Uuid::new_v4());
+    let redis = Arc::new(
+        RedisStore::connect(&redis_config)
+            .await
+            .expect("connect handler account pool test Redis"),
+    );
+
+    let manager = Arc::new(ExternalPoolManager::new(postgres.clone(), redis));
+    postgres
+        .create_external_pool(CreateExternalPoolRequest {
+            name: format!("handler-messages-{body_mode:?}"),
+            base_url: base_url.to_string(),
+            api_key: "sk-handler-external-test".to_string(),
+            auth_type: ExternalPoolAuthType::XApiKey,
+            header_profile: ExternalPoolHeaderProfile::Generic,
+            append_beta_query: false,
+            header_overrides: HashMap::new(),
+            wire_profile: ExternalPoolWireProfile::Default,
+            tls_profile: ExternalPoolTlsProfile::Default,
+            enabled: true,
+            priority: 1,
+            max_concurrent_requests: 10,
+            usage_projection_mode: ExternalPoolUsageProjectionMode::CurrentPathPolicy,
+            stream_response_mode: None,
+            request_body_mode: body_mode,
+            raw_model_mode: ExternalPoolRawModelMode::None,
+            auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+            pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
+            preserve_path: true,
+            normalize_model_version_dots: false,
+            model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
+            model_mapping_require_match: false,
+            model_mapping_rules: Vec::new(),
+            supported_models: Vec::new(),
+            route_mode: crate::model::config::ExternalPoolRouteMode::AllowAll,
+            route_rules: Vec::new(),
+            notes: None,
+        })
+        .await
+        .expect("create handler account pool pool");
+    manager.invalidate_static_pool_snapshot();
+    Some(manager)
+}
+
+#[tokio::test]
+async fn content_length_threshold_error_is_not_reported_as_context_window_full() {
+    let response = ExternalPoolFinalError {
+        status: StatusCode::BAD_REQUEST,
+        response_error_type: "invalid_request_error".to_string(),
+        route_error_type: "bad_request".to_string(),
+        message: r#"流式 API 请求失败（凭据 #1 test@example.com）: 400 Bad Request {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#.to_string(),
+        error_id: "err_test_payload_limit".to_string(),
+        retryable: false,
+        attempts: Vec::new(),
+        pool_id: None,
+        pool_name: None,
+    }.into_response("req_test_payload_limit");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.starts_with("prompt is too long"), "{message}");
+    // 账号池路径的公开文案（原 Kiro 路径写的是 "content length limit"）。
+    assert!(message.contains("content length exceeded"), "{message}");
+    assert!(message.contains("separate from the model context window"));
+    assert!(!message.contains("Context window is full"));
+}
+
+#[tokio::test]
+async fn prompt_too_long_error_maps_to_input_length_message() {
+    let response = ExternalPoolFinalError {
+        status: StatusCode::BAD_REQUEST,
+        response_error_type: "invalid_request_error".to_string(),
+        route_error_type: "bad_request".to_string(),
+        message: r#"流式 API 请求失败（账号 #9 hidden）: 400 Bad Request {"error":{"message":"prompt is too long: > 1000000 maximum","type":"invalid_request_error"},"type":"error"}"#.to_string(),
+        error_id: "err_test_payload_limit".to_string(),
+        retryable: false,
+        attempts: Vec::new(),
+        pool_id: None,
+        pool_name: None,
+    }.into_response("req_test_payload_limit");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.starts_with("prompt is too long"), "{message}");
+    assert!(!message.contains("hidden"));
+    assert!(!message.contains("1000000"));
+}
+
+#[tokio::test]
+async fn external_pool_endpoint_gate_applies_global_enable_and_route_policy() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let Some(manager) = test_external_pool_manager_for_handlers(
+        &upstream.base_url,
+        ExternalPoolRequestBodyMode::Normalized,
+    )
+    .await
+    else {
+        return;
+    };
+    let mut config = ExternalPoolsConfig::default();
+
+    assert!(!external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
+
+    config.external_pools_enabled = true;
+    assert!(external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
+
+    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::DenyList;
+    config.external_pool_route_rules = vec!["/cc".to_string()];
+    assert!(!external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
+    assert!(external_pool_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
+
+    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::AllowList;
+    config.external_pool_route_rules = vec!["/dfcache/team-a".to_string()];
+    assert!(!external_pool_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
+    assert!(
+        external_pool_enabled_for_endpoint(&config, "/dfcache/team-a/v1/messages", &manager).await
+    );
+}
+
+async fn external_pool_enabled_for_endpoint(
+    external_pools: &ExternalPoolsConfig,
+    endpoint: &str,
+    manager: &Arc<ExternalPoolManager>,
+) -> bool {
+    let mut config = Config::default();
+    config.external_pools = external_pools.clone();
+    let (app, _usage) = handler_test_router(config, Some(manager.clone()));
+    let response = app
+        .oneshot(multimodal_handler_request(
+            endpoint,
+            json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("endpoint gate response");
+    response.status() == StatusCode::OK
 }

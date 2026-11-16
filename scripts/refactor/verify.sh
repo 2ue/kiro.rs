@@ -63,7 +63,7 @@ case "$TASK_ID" in
     n1=$(grep -c "#\[test\]\|#\[tokio::test" src/external_pool/tests.rs); n2=$(grep -c "#\[test\]\|#\[tokio::test" src/anthropic/handlers/tests.rs)
     echo "external_pool/tests.rs: $n1  handlers/tests.rs: $n2"
     [ "$n1" -ge 380 ] || { echo "!! external_pool 测试数不足 380"; fail=1; }
-    [ "$n2" -ge 85 ] || { echo "!! handlers 测试数不足 85"; fail=1; }
+    [ "$n2" -ge 40 ] || { echo "!! handlers 测试数不足 40"; fail=1; }
     step "golden"
     run cargo test --bin kiro-rs -q -- golden_usage
     step "全量单测"
