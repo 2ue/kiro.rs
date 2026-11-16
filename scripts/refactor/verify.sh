@@ -141,6 +141,38 @@ case "$TASK_ID" in
     step "全量单测"
     run cargo test --bin claude-pool -q
     ;;
+  s7-admin-and-console)
+    step "编译"
+    run cargo build -q --bins
+    step "admin 单测"
+    run cargo test --bin claude-pool -q -- admin
+    step "golden"
+    run cargo test --bin claude-pool -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin claude-pool -q
+    step "前端"
+    run pnpm --dir ui check
+    run pnpm --dir ui build
+    step "前端无旧页面残留"
+    hits=$(grep -rn "credentials\|Credential\|inventory\|Inventory\|public-pool\|PublicPool\|proxy-resources" ui/src --include=*.ts --include=*.tsx 2>/dev/null | grep -v "request_api_key\|requestApiKey\|RequestApiKey" || true)
+    [ -z "$hits" ] || { echo "!! 前端仍有旧页面引用:"; echo "$hits" | head -20; fail=1; }
+    [ ! -d ui/src/features/credentials ] && [ -d ui/src/features/routes ] || { echo "!! 页面目录不符"; fail=1; }
+    ;;
+  s8-docs-and-release)
+    step "全仓 Kiro 字样清零（设计文档与 migration 除外）"
+    hits=$(grep -rni "kiro" . --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules --exclude-dir=claude-pool-refactor --exclude-dir=refactor --exclude=config.toml 2>/dev/null | grep -v "src/migration/" | grep -v "^./ui/node_modules" || true)
+    [ -z "$hits" ] || { echo "!! 仍有 Kiro 字样:"; echo "$hits" | head -40; echo "共 $(echo "$hits" | wc -l) 处"; fail=1; }
+    step "文档目录已清理"
+    for d in feature docs/refactor-plan docs/plantree docs/analysis docs/archive; do [ -d "$d" ] && { echo "!! 仍存在 $d"; fail=1; }; done
+    step "release 构建与版本"
+    run cargo build -q --release --locked --bin claude-pool
+    v=$(/tmp/kiro-rs-rust-analyzer-target/release/claude-pool --version 2>/dev/null); echo "$v"; echo "$v" | grep -q "claude-pool 1.0.0" || { echo "!! 版本输出不符"; fail=1; }
+    step "全量单测"
+    run cargo test --bin claude-pool -q
+    step "前端"
+    run pnpm --dir ui check
+    run pnpm --dir ui build
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac
