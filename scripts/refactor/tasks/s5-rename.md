@@ -53,7 +53,7 @@ golden 测试的 `expected` 数值**一个都不能变**：改名后 `cargo test
 2. 再改 serde 名与配置键，更新 `config.example.json` 与 golden 文件名/strategy 值。
 3. 再改 Postgres schema 与 Redis key 字符串。
 4. 再改 Admin 路径与类型。
-5. 最后改前端：`pnpm --dir ui install --frozen-lockfile`（若 node_modules 不存在可软链 `../2ue_kiro.rs/ui/node_modules`），改完跑 `pnpm --dir ui lint && pnpm --dir ui build && pnpm --dir ui test`。
+5. 最后改前端：`pnpm --dir ui install --frozen-lockfile`（若 node_modules 不存在可软链 `../2ue_kiro.rs/ui/node_modules`），改完跑 `pnpm --dir ui check && pnpm --dir ui build`（这个前端没有 lint/test 脚本，`check` 是 tsc 类型检查）。
 6. Docker、scripts、CI。
 7. 全局 grep 清零。
 
@@ -65,6 +65,6 @@ cargo build -q --bins
 grep -rni "kiro" src ui/src ui/tests Cargo.toml Dockerfile docker-compose*.yml scripts config.example.json data tests .github 2>/dev/null | grep -v "scripts/refactor/"   # 应为空
 cargo test --bin claude-pool -q -- golden_usage      # 注意二进制名已改
 cargo test --bin claude-pool -q 2>&1 | tail -30
-pnpm --dir ui lint && pnpm --dir ui build && pnpm --dir ui test
+pnpm --dir ui check && pnpm --dir ui build
 ls src/account/ && test ! -f src/external_pool.rs && echo "moved"
 ```

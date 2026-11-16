@@ -121,9 +121,8 @@ case "$TASK_ID" in
     step "全量单测"
     run cargo test --bin claude-pool -q
     step "前端"
-    run pnpm --dir ui lint
+    run pnpm --dir ui check
     run pnpm --dir ui build
-    run pnpm --dir ui test
     ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
