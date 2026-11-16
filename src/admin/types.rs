@@ -1126,6 +1126,77 @@ pub struct AddCredentialResponse {
     pub warning: Option<String>,
 }
 
+/// 为现有 OAuth 凭据创建一个 Kiro 官方 API Key。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateKiroApiKeyRequest {
+    pub credential_id: u64,
+    pub label: String,
+}
+
+/// 批量创建 Kiro 官方 API Key。未传 ids 时使用全部账号；已有 API Key 的账号会跳过。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCreateKiroApiKeysRequest {
+    #[serde(default)]
+    pub credential_ids: Vec<u64>,
+    #[serde(default)]
+    pub label_prefix: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateKiroApiKeyItem {
+    #[serde(flatten)]
+    pub key: crate::storage::kiro_api_keys::StoredKiroApiKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListKiroApiKeysRequest {
+    #[serde(default)]
+    pub credential_ids: Vec<u64>,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteKiroApiKeyRequest {
+    pub credential_id: u64,
+    pub key_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCreateKiroApiKeyItem {
+    pub credential_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub ok: bool,
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<CreateKiroApiKeyItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCreateKiroApiKeysResponse {
+    pub total: usize,
+    pub success: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub items: Vec<BatchCreateKiroApiKeyItem>,
+    pub keys: Vec<CreateKiroApiKeyItem>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchCredentialImportDefaults {

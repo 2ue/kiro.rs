@@ -1093,6 +1093,7 @@ impl PostgresStore {
                 // maintenance commands, otherwise a normal docker compose upgrade can block on
                 // multi-GB production usage history before the service becomes available.
                 execute_sql_statements_in_tx(&mut tx, SCHEMA_SQL).await?;
+                execute_sql_statements_in_tx(&mut tx, super::kiro_api_keys::SCHEMA).await?;
                 ensure_usage_indexes_if_startup_safe(&mut tx).await?;
                 repair_active_credential_hashes_in_tx(&mut tx).await?;
                 run_versioned_migration_in_tx(

@@ -76,6 +76,8 @@ const INSUFFICIENT_MODEL_CAPACITY_REASON: &str = "INSUFFICIENT_MODEL_CAPACITY";
 const MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS: usize = 4;
 const MODEL_DISCOVERY_MAX_HTTP_SENDS: usize = 20;
 
+mod api_keys;
+
 #[derive(Debug)]
 struct ModelDiscoverySendBudget {
     consumed: usize,

@@ -188,6 +188,13 @@ const DETAIL_LABELS: Record<string, string> = {
   accountSource: '账号来源',
   accountLabel: '账号',
   credentialLabel: '账号',
+  label: '密钥名称',
+  persisted: '已保存到账号',
+  region: '区域',
+  total: '总数',
+  success: '成功',
+  skipped: '跳过',
+  failed: '失败',
   message: '说明',
 }
 

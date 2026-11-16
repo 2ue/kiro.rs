@@ -4,6 +4,8 @@ import type {
   PublicPoolConfig,
   AddCredentialRequest,
   AddCredentialResponse,
+  BatchCreateKiroApiKeysRequest,
+  BatchCreateKiroApiKeysResponse,
   BalanceResponse,
   BatchUpdateCredentialsRequest,
   BatchDeleteCredentialsRequest,
@@ -24,6 +26,8 @@ import type {
   CredentialsPageQuery,
   CredentialsPageResponse,
   CredentialsStatusResponse,
+  CreateKiroApiKeyItem,
+  CreateKiroApiKeyRequest,
   CreateProxyResourceRequest,
   BatchProxyResourceImportRequest,
   BatchProxyResourceImportResponse,
@@ -332,6 +336,18 @@ export async function addCredential(req: AddCredentialRequest): Promise<AddCrede
   return data
 }
 
+export async function createKiroApiKey(req: CreateKiroApiKeyRequest): Promise<CreateKiroApiKeyItem> {
+  const { data } = await api.post<CreateKiroApiKeyItem>('/credentials/kiro-api-key', req)
+  return data
+}
+
+export async function batchCreateKiroApiKeys(
+  req: BatchCreateKiroApiKeysRequest = {},
+): Promise<BatchCreateKiroApiKeysResponse> {
+  const { data } = await api.post<BatchCreateKiroApiKeysResponse>('/credentials/kiro-api-keys/batch', req)
+  return data
+}
+
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
   return data
@@ -630,4 +646,18 @@ export async function previewRouteScenario(id: number): Promise<RouteScenarioPre
 export async function applyRouteScenario(id: number, only: RouteScenarioItemKey[] = []): Promise<RouteScenarioApplyResponse> {
   const { data } = await api.post<RouteScenarioApplyResponse>(`/route-scenarios/${id}/apply`, { only })
   return data
+}
+
+export async function listKiroApiKeys(credentialIds: number[], offset = 0): Promise<CreateKiroApiKeyItem[]> {
+  const { data } = await api.post<CreateKiroApiKeyItem[]>('/credentials/kiro-api-keys/list', { credentialIds, offset })
+  return data
+}
+
+export async function saveKiroApiKey(key: CreateKiroApiKeyItem): Promise<CreateKiroApiKeyItem> {
+  const { data } = await api.post<CreateKiroApiKeyItem>('/credentials/kiro-api-keys/save', key)
+  return data
+}
+
+export async function deleteKiroApiKey(credentialId: number, keyId: string): Promise<void> {
+  await api.post('/credentials/kiro-api-keys/delete', { credentialId, keyId })
 }
