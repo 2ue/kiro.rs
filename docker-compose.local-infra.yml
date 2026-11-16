@@ -9,7 +9,7 @@ services:
     ports:
       - "${CLAUDE_POOL_POSTGRES_PORT:-25432}:5432"
     volumes:
-      - claude-pool-postgres-local-data:/var/lib/postgresql
+      - claude-pool-postgres-local-data:/var/lib/postgresql/data
     healthcheck:
       test:
         [

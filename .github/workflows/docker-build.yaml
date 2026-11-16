@@ -134,7 +134,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ steps.platform.outputs.pair }}
+          name: claude-pool-digests-${{ steps.platform.outputs.pair }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -233,7 +233,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: claude-pool-digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx

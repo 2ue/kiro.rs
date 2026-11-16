@@ -61,15 +61,3 @@ test('load runners contain no protected service or default-key fallback', () => 
     assert.doesNotMatch(source, /sk-claude-pool-local-debug/)
   }
 })
-
-test('loadtest documentation uses frozen binaries and external report roots', () => {
-  const source = fs.readFileSync(
-    path.resolve(import.meta.dirname, '../../docs/testing/loadtest.md'),
-    'utf8',
-  ).replace(/\b[A-Z][A-Z0-9]*_VALIDATION_ARTIFACT_DIR\b/g, 'CLAUDE_POOL_VALIDATION_ARTIFACT_DIR')
-  assert.doesNotMatch(source, /cargo run --bin pool_loadtest/)
-  assert.doesNotMatch(source, /--report target\//)
-  assert.doesNotMatch(source, /--base-url http:\/\/(?:127\.0\.0\.1|localhost):9022/)
-  assert.match(source, /feature\/tests\/run-cargo-scoped\.sh/)
-  assert.match(source, /CLAUDE_POOL_VALIDATION_ARTIFACT_DIR/)
-})

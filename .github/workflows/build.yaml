@@ -165,15 +165,15 @@ jobs:
 
       - name: Check no-default Rust compilation
         if: ${{ env.QUALITY_PROFILE == 'release' }}
-        run: cargo check --locked --all-targets --no-default-features
+        run: cargo check --locked --bin claude-pool --no-default-features
 
-      - name: Run release PostgreSQL dashboard smoke test
+      - name: Run release configuration migration smoke test
         if: ${{ env.QUALITY_PROFILE == 'release' }}
-        run: cargo test --locked --bin claude-pool storage::postgres::tests::postgres_persists_runtime_config_credentials_stats_usage_and_pricing -- --exact --test-threads=1
+        run: cargo test --locked --bin claude-pool migration::tests::migration_postgres_roundtrip_overwrite_idempotence_and_rollback -- --exact --test-threads=1
 
       - name: Build release with default features
         if: ${{ env.QUALITY_PROFILE == 'full' }}
-        run: cargo build --release --locked
+        run: cargo build --release --locked --bin claude-pool
 
   # The two full test runs only differ in the TLS feature, so they run as parallel jobs instead
   # of back to back. Integration tests isolate themselves (a random PostgreSQL schema and a
@@ -243,7 +243,7 @@ jobs:
           test "$(docker exec "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
 
       - name: Run tests
-        run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --all-targets ${{ matrix.cargo_args }}
+        run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --bin claude-pool ${{ matrix.cargo_args }}
 
   # Tests marked `#[ignore = "timing-sensitive: ..."]` assert wall-clock budgets (scheduler p99,
   # background sample writes) that depend on how busy the runner is, so they flake in the

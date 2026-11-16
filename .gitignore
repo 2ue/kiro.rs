@@ -3,14 +3,8 @@
 /CLAUDE.md
 /AGENTS.md
 /config.json
-/credentials.json
 /.idea
 /test.json
-/credentials.*
-/kiro-credentials-*.json
-/kiro_balance_cache.json
-/kiro_stats.json
-/kiro_usage_records.jsonl
 /.local-run/
 /backups/
 /logs/

@@ -1,107 +1,70 @@
-# 前端开发预览环境
+# 前端开发环境
 
-本文档只解决一个问题：本地开发时到底看哪个地址。
+开发访问 Vite 的 `http://127.0.0.1:9023/ui`；后端提供 API。debug 后端的 `/ui` 默认重定向到 Vite，release 后端默认提供嵌入页面。
 
-结论很简单：开发看 Vite 热更新地址，后端只当 API 服务用。debug 构建下，后端 `/ui` 默认会重定向到 Vite 服务，不再依赖 Rust embedded 页面。
+## 工具与配置
 
-## 固定地址
-
-| 目标 | 地址 | 启动命令 | 说明 |
-|------|------|----------|------|
-| 后端 API | `http://127.0.0.1:9022` | 见下方后端启动命令 | 当前仓库本地 `config.json` 的端口。debug 下 `/ui` 等入口会跳到 Vite。 |
-| UI | `http://127.0.0.1:9023/ui/runtime` | `bash scripts/dev-ui.sh ui` | 主要开发入口，改源码后热更新。 |
-| 本地调试登录 Key | `dev123` | 写在本地 `config.json` 的 `adminApiKey` | 仅用于本机开发调试；线上或共享环境不要使用这个短 Key。 |
-
-如果后端没有跑在 9022，前端支持用 `VITE_API_PROXY_TARGET` 改代理目标：
+Node.js `22.23.0`、pnpm `11.11.0`、Rust `1.92.0`。从仓库根执行：
 
 ```bash
-VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
-```
-
-## 推荐启动顺序
-
-先启动本地依赖：
-
-```bash
+pnpm --dir ui install --frozen-lockfile
 docker compose -f docker-compose.local-infra.yml up -d
+cp config.example.json config.json
 ```
 
-再启动后端 API。debug 构建不需要构建前端 dist：
+编辑 `config.json` 的管理密钥与下游密钥。示例数据库和 Redis 使用本地编排端口 `25432`、`26379`；不需要凭据文件，账号在控制台或管理 API 中创建。
+
+## 启动
+
+一个终端启动后端，将端口明确设为 Vite 默认代理目标 `9022`：
 
 ```bash
-cargo run -- -c config.json
+CLAUDE_POOL_HOST=127.0.0.1 CLAUDE_POOL_PORT=9022 \
+  cargo run --bin claude-pool -- -c config.json
 ```
 
-这样 `9022` 主要承担 API 后端职责。服务启动不读取凭据文件，本地库为空时在管理后台账号页导入凭据。访问 `http://127.0.0.1:9022/ui` 会自动重定向到对应 Vite 服务。
-
-如果你想直接跑 release 二进制但仍走 Vite，可显式指定：
+另一个终端启动前端：
 
 ```bash
-KIRO_NEW_UI_MODE=redirect \
-KIRO_NEW_UI_DEV_SERVER=http://127.0.0.1:9023/ui \
-  ./target/release/kiro-rs -c config.json
+pnpm --dir ui dev
 ```
 
-最后启动需要看的前端。通常只需要新版 UI：
+| 目标 | 地址 | 作用 |
+|---|---|---|
+| API | `http://127.0.0.1:9022` | 后端服务 |
+| 控制台 | `http://127.0.0.1:9023/ui/runtime` | 开发入口与热更新 |
+| 后端 UI | `http://127.0.0.1:9022/ui` | debug 下重定向到 Vite |
+
+登录使用实际配置中的 `adminApiKey`。数据库已有运行配置时，以数据库中的密钥为准。
+
+如果后端运行在示例端口 `8990`，覆盖 Vite 的 API 代理：
 
 ```bash
-bash scripts/dev-ui.sh ui
+VITE_API_PROXY_TARGET=http://127.0.0.1:8990 pnpm --dir ui dev
 ```
 
-然后打开：
+后端 API 路由 `/cc/v1` 与前端 `/ui` 分别使用；Claude Code 入口 `/cc` 不是控制台页面。
 
-```text
-http://127.0.0.1:9023/ui/runtime
-```
-
-登录 Key 使用 `config.json` 里的实际 `adminApiKey`。本仓库本地调试默认是 `dev123`；如果你临时改过本地配置，以当前 `config.json` 为准，不要按旧文档或记忆里的默认值猜。
-
-## pnpm dev、build、preview 的区别
-
-`pnpm dev` 是开发入口，有热更新。改 TS/TSX/CSS 后浏览器会立刻更新，这是日常开发应该看的环境。
-
-`pnpm build` 是生成 `dist`。这些产物用于发布包、Docker 构建，或者专门验证生产构建。它不是热更新。
-
-`pnpm preview` 是本地查看刚 build 出来的 `dist`，适合检查生产构建结果。它也不是热更新。
-
-## 后端 UI 入口
-
-debug 构建下，后端 UI 入口默认只是跳转到 Vite：
-
-```text
-http://127.0.0.1:9022/ui       -> http://127.0.0.1:9023/ui/
-```
-
-热更新由 Vite 提供，所以浏览器最终停留在 `9023` 才是正常现象。release 二进制默认不会这样跳转，仍使用 embedded 页面。
-
-## 发布验证
-
-验证发布产物时，先构建前端：
+## 使用 release 后端配合 Vite
 
 ```bash
+CLAUDE_POOL_UI_MODE=redirect \
+CLAUDE_POOL_UI_DEV_SERVER=http://127.0.0.1:9023/ui \
+CLAUDE_POOL_PORT=9022 \
+  cargo run --release --locked --bin claude-pool -- -c config.json
+```
+
+`CLAUDE_POOL_NEW_UI_MODE`、`CLAUDE_POOL_NEW_UI_DEV_SERVER` 是优先读取的同义变量。支持 `embedded`、`redirect`、`proxy`、`filesystem`、`disabled`；文件目录通过 `CLAUDE_POOL_UI_DIR` 指定。
+
+## 验证发布产物
+
+```bash
+pnpm --dir ui check
 pnpm --dir ui build
+cargo build --release --locked --bin claude-pool
+cargo run --release --locked --bin claude-pool -- -c config.json
 ```
 
-再重新构建 Rust：
+访问后端 `/ui` 验证嵌入页面。设置过 redirect 环境变量时先在启动环境中移除相应覆盖。Rust 编译会嵌入当时的 `ui/dist`，前端变更后需要重新构建 release 后端。
 
-```bash
-cargo build --release
-```
-
-这时再用发布启动方式访问后端挂载入口才有意义：
-
-```text
-http://127.0.0.1:9022/ui
-```
-
-如果只是看源码改动，不要走这条路。
-
-## 常见误区
-
-不要把临时测试端口当成当前 UI 开发入口。本项目本地开发只认这些端口：后端 API `9022`，UI `9023`。
-
-不要在开发时说“我已经 pnpm build 了，为什么页面没变”。开发要看 Vite 热更新地址，`pnpm build` 不是开发预览入口。
-
-不要把 `/cc`、`/cc/v1` 和前端页面混在一起。`/cc` 是 Claude Code API 兼容入口，不是前端预览入口。
-
-不要同时开多个来源不明的 UI 服务来对比同一个问题。先按本文档固定入口复现，再判断问题属于 UI 还是后端 API。
+`pnpm dev` 提供热更新，`pnpm build` 生成发布文件，`pnpm preview` 预览已构建的文件。一般开发直接使用 Vite，无需反复构建 Rust 发布产物。

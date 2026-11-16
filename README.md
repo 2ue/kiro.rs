@@ -1,758 +1,367 @@
-# kiro-rs
+# claude-pool
 
-一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
-
-## 免责声明
-
-本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
-本项目与 AWS/KIRO/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
-
-## 注意！
-
-运行时默认使用 rustls；默认 feature 构建和官方 Docker 镜像同时包含 rustls 与 native-tls，可通过 `config.json` 的 `tlsBackend` 切换。只有显式使用 `--no-default-features` 构建时才不包含 native-tls。
-如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
-
-**Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，通常与输出过长被截断有关，可尝试调低输出相关 token 上限。
+Claude Code 协议（Anthropic Messages）账号池调度网关。账号通过 `baseUrl + key` 接入，路由决定账号范围、模型限制、usage 整形和可选请求处理策略。
 
 ## 功能特性
 
-- **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
-- **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
-- **Token 自动刷新**: 自动管理和刷新 OAuth Token
-- **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
-- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（优先级内均衡分配）两种模式
-- **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
-- **数据库持久化**: 运行配置、凭据、凭据运行态、usage 记录和模型价格使用 PgSQL；会话绑定、冷却、限流、并发 lease、刷新锁和余额缓存使用 Redis
-- **Thinking 模式**: 支持 Claude 的 extended thinking 功能
-- **工具调用**: 完整支持 function calling / tool use
-- **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
-- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
-- **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
-- **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
+- **账号池调度**：优先级、并发 lease、容量排队、失败换号、首输出前重试、冷却、自动禁用与可选质量评分。
+- **统一路由**：最长前缀匹配；路由和账号双向放行；路由策略与账号传输覆盖分层配置。
+- **六种 usage 策略**：`no_cache`、`current_high_cache`、`prefix_tool`、`stable_segment_cache`、`prefix_tool_plus`、`bounded_high_cache`；记录 raw / shaped / reported 用量与成本。
+- **模型限制与映射**：目录管理、账号模型发现、路由模型规则、账号映射；模型目录只展示 `listed` 且路由可用的条目。
+- **下游密钥与额度**：独立密钥、允许路由、RPM、并发、排队和用量额度。
+- **管理控制台**：账号、路由、策略模板、模型、用量、风险、运行配置、密钥与审计。
+- **多实例协调**：PostgreSQL 保存配置和记录，Redis 协调 lease、运行态与热加载；运行中协调服务异常时可使用进程内 lease。
+- **配置迁移**：管理 API 导出导入新系统配置包；CLI 从旧版网关数据库导出、预览迁移并导入。见[旧版迁移](#从旧版网关迁移)。
 
----
+协议默认透传。模型映射、鉴权、必要 beta 兼容、usage 改写和错误脱敏按系统契约执行；缺省参数补全、thinking 处理、历史清洗、图片处理、payload 裁剪等功能需要显式开启。
 
-- [开始](#开始)
-  - [1. 编译](#1-编译)
-  - [2. 最小配置](#2-最小配置)
-  - [3. 导入凭据](#3-导入凭据)
-  - [4. 启动](#4-启动)
-  - [5. 验证](#5-验证)
-  - [Docker](#docker)
-- [前端开发预览](docs/frontend-dev-environment.md)
-- [配置详解](#配置详解)
-  - [config.json](#configjson)
-  - [凭据字段](#凭据字段)
-  - [Region 配置](#region-配置)
-  - [代理配置](#代理配置)
-  - [认证方式](#认证方式)
-  - [环境变量](#环境变量)
-- [API 端点](#api-端点)
-  - [标准端点 (/v1)](#标准端点-v1)
-  - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
-  - [Thinking 模式](#thinking-模式)
-  - [工具调用](#工具调用)
-- [本地 Claude Code CLI 测试](docs/claude-code-cli-local-testing.md)
-- [模型映射](#模型映射)
-- [Admin（可选）](#admin可选)
-- [注意事项](#注意事项)
-- [项目结构](#项目结构)
-- [技术栈](#技术栈)
-- [License](#license)
-- [致谢](#致谢)
+## 快速开始
 
-## 开始
+### 编译
 
-### 1. 编译
-
-> PS: 如果不想编辑可以直接前往 Release 下载二进制文件
-
-CI、Docker 和发布构建固定使用 Node.js `22.23.0`、pnpm `11.11.0` 与 Rust `1.92.0`。
-
-> **发布/嵌入式构建前置步骤**：从干净 checkout 构建二进制时，必须先生成前端 `ui` 的 `dist`：
-> ```bash
-> npm install --global pnpm@11.11.0  # 仅用于安装 pnpm；项目命令统一使用 pnpm
-> pnpm --dir ui install --frozen-lockfile
-> pnpm --dir ui build
-> ```
->
-> 日常前端开发不要靠重新构建 Rust 二进制看效果，直接使用 Vite 热更新入口，见 [前端开发预览](docs/frontend-dev-environment.md)。
+工具链：Rust **1.92.0**、Node.js **22.23.0**、pnpm **11.11.0**。发布二进制嵌入 `ui/dist`，先构建前端：
 
 ```bash
-rustup toolchain install 1.92.0
-cargo +1.92.0 build --release --locked
+pnpm --dir ui install --frozen-lockfile
+pnpm --dir ui check
+pnpm --dir ui build
+cargo build --release --locked --bin claude-pool
 ```
 
-默认构建同时支持 `rustls` 和 `native-tls`，运行时仍默认选择 `rustls`。仅需要 rustls 的自定义构建可以使用 `cargo +1.92.0 build --release --locked --no-default-features`；该二进制不能把 `tlsBackend` 切换为 `native-tls`。
+默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。
 
-### 构建门禁
+### 准备数据库与最小配置
 
-PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `ui`，检查 Rust 格式和 Clippy 告警基线，使用真实 PgSQL/Redis 分别执行默认 feature 与无默认 feature 测试，并用默认 feature 生成 release 二进制。发布 tag 必须严格等于 `v` 加 `Cargo.toml` 中的版本，例如 Cargo 版本 `0.0.101` 对应 `v0.0.101`。
-
-本地执行存储集成测试时必须显式提供测试实例；测试会在 PgSQL 中创建临时 schema，并在 Redis 中使用随机 key prefix：
+服务启动需要 PostgreSQL 和 Redis；可用仓库的本地依赖编排启动：
 
 ```bash
-export KIRO_RS_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/kiro_rs_test'
-export KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:6379/0'
-cargo +1.92.0 test --locked --all-targets --no-default-features
+docker compose -f docker-compose.local-infra.yml up -d
 ```
 
-CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定现有 Clippy 债务，新增或增加任何 lint/file 告警桶都会失败。清理告警后使用固定 Rust 版本执行 `node scripts/ci/check-clippy-baseline.mjs --update`，把基线同步下调。
-
-### 2. 最小配置
-
-创建 `config.json`：
+在仓库根新建 `config.json`：
 
 ```json
 {
-   "postgres": {
-      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
-   },
-   "redis": {
-      "url": "redis://127.0.0.1:26379/0"
-   },
-   "observabilityRedis": {
-      "url": null,
-      "keyPrefix": "kiro_rs:observability"
-   },
-   "host": "127.0.0.1",
-   "port": 8990,
-   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "apiKeys": [],
-   "region": "us-east-1"
+  "host": "127.0.0.1",
+  "port": 8990,
+  "postgres": {
+    "url": "postgres://claude_pool:claude_pool_dev_password@127.0.0.1:25432/claude_pool"
+  },
+  "redis": { "url": "redis://127.0.0.1:26379/0" },
+  "apiKey": "sk-downstream-change-me",
+  "adminApiKey": "sk-admin-change-me"
 }
 ```
-> PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
-> PgSQL 和业务 Redis 为必需依赖。首次启动时会把 `config.json` 导入 PgSQL；凭据通过 Admin 管理后台或 `POST /api/admin/credentials`、`POST /api/admin/credentials/import` 导入，服务启动时不读取任何凭据文件。之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用、external fencing 和跨实例 Token 刷新锁只使用业务 `redis`。
->
-> `observabilityRedis` 是可选的独立观测故障域，用于 usage 派生 materialization、Admin/余额缓存和 usage cleanup 的 Redis 阶段。未配置时这些能力使用 PostgreSQL/进程内状态，绝不会回落到业务 Redis。配置后必须使用不同的 Redis 网络 authority；只改 logical DB 或 `keyPrefix` 仍共享同一个 Redis 单线程，启动会拒绝这种伪隔离。也可以通过 `KIRO_RS_OBSERVABILITY_REDIS_URL` 和 `KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX` 设置。
 
-### 3. 导入凭据
+更完整的示例见 [config.example.json](config.example.json)。首次启动把文件中的运行配置写入 PostgreSQL，后续在控制台或管理 API 修改；修改文件不会覆盖数据库已有运行配置。监听地址及存储连接可用部署环境变量覆盖。
 
-服务启动后，在管理后台（`/ui`，需要配置 `adminApiKey`）的账号页导入凭据。导入会自动识别来源，也可以手动指定：本项目导出、KAM / Kiro-Go 导出包、kiro-manager-lite 导出和整库备份、Kiro-Go `config.json`、KAM / lite 的卡密 / CSV / TXT 文本、`ksk_xxx|region` 文本，以及通用 JSON / JSONL。也可以直接调用管理接口：
+### 启动并接入账号
 
 ```bash
-# 单个凭据
-curl http://127.0.0.1:8990/api/admin/credentials \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: <adminApiKey>" \
-  -d '{"refreshToken": "你的刷新token", "authMethod": "social"}'
-
-# 批量导入
-curl http://127.0.0.1:8990/api/admin/credentials/import \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: <adminApiKey>" \
-  -d '{"duplicateMode": "skip", "continueOnError": true, "credentials": [{"kiroApiKey": "ksk_xxxxxxxx|eu-central-1"}]}'
+cargo run --release --locked --bin claude-pool -- -c config.json
 ```
 
-导入时会先刷新一次 Token 验证凭据，再写入 PgSQL。字段说明见 [凭据字段](#凭据字段)，地域说明见 [Region 配置](#region-配置)。只使用一个 Kiro API Key 时，也可以设置 `KIRO_API_KEY` 环境变量，服务启动时自动导入。
-
-### 4. 启动
+打开 `http://127.0.0.1:8990/ui`，使用 `adminApiKey` 登录，在账号页填写上游地址和密钥。也可通过管理 API 创建：
 
 ```bash
-./target/release/kiro-rs
-```
-
-或指定配置文件路径：
-
-```bash
-./target/release/kiro-rs -c /path/to/config.json
-```
-
-本地开发时，仓库里的 `config.json` 当前监听 `127.0.0.1:9022`。这个端口只作为后端 API 使用；前端页面使用 Vite 热更新地址预览。
-
-### 5. 验证
-
-```bash
-curl http://127.0.0.1:8990/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: sk-kiro-rs-qazWSXedcRFV123456" \
+curl --fail-with-body http://127.0.0.1:8990/api/admin/accounts \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: sk-admin-change-me' \
   -d '{
-    "model": "claude-sonnet-4-20250514",
-    "max_tokens": 1024,
-    "stream": true,
-    "messages": [
-      {"role": "user", "content": "Hello, Claude!"}
-    ]
+    "name": "primary",
+    "baseUrl": "https://api.anthropic.com",
+    "apiKey": "replace-with-upstream-key",
+    "authType": "x_api_key",
+    "supportedModels": ["claude-sonnet-4-5"],
+    "maxConcurrentRequests": 10
   }'
 ```
 
-### Docker
+`baseUrl` 末尾是 `/v1` 时追加 `/messages`，否则追加 `/v1/messages`。支持 `bearer` 和 `x_api_key` 鉴权；按上游要求选择。账号保存在数据库中，`config.json` 的 `accounts` 对象是调度默认值。
 
-完整部署请使用不会覆盖旧文件的 `docker-compose.database.yml`，它包含当前服务、PgSQL 和 Redis：
+### 验证
 
 ```bash
+curl --fail-with-body http://127.0.0.1:8990/healthz
+curl --fail-with-body http://127.0.0.1:8990/readyz
+curl --fail-with-body http://127.0.0.1:8990/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'x-api-key: sk-downstream-change-me' \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 128,
+    "messages": [{"role": "user", "content": "回复 ok"}]
+  }'
+```
+
+模型名应与接入账号实际支持的模型一致。Claude Code 的 `ANTHROPIC_BASE_URL` 可设置为 `http://127.0.0.1:8990/cc`，鉴权使用下游密钥。
+
+### Docker
+
+把配置放在 `config/config.json`；容器监听设置为 `0.0.0.0:8990`。使用完整编排时，数据库连接由 `CLAUDE_POOL_POSTGRES_URL`、`CLAUDE_POOL_REDIS_URL` 覆盖：
+
+```bash
+mkdir -p config logs
+cp config.example.json config/config.json
+# 编辑 config/config.json 中的下游密钥与管理密钥
+export CLAUDE_POOL_POSTGRES_PASSWORD='replace-with-database-password'
+export CLAUDE_POOL_VERSION=1.0.0
 docker compose -f docker-compose.database.yml up -d
 ```
 
-需要将首次导入用的 `config.json` 挂载到容器中，具体参见 `docker-compose.database.yml`。凭据在服务启动后通过管理后台导入。
-
-使用已发布镜像部署：
+自建镜像：
 
 ```bash
-docker compose -f docker-compose.deploy.yml up -d
+docker build -t claude-pool:1.0.0 .
+CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.0 \
+  docker compose -f docker-compose.database.yml up -d
 ```
 
-部署版默认使用 `ghcr.io/2ue/kiro-rs:latest`，可通过环境变量固定版本：
+`docker-compose.yml` 和 `docker-compose.deploy.yml` 连接已有基础设施；`docker-compose.database.yml` 启动应用、PostgreSQL 和 Redis；`docker-compose.local-infra.yml` 只启动本地开发依赖。详见 [Docker 部署](docs/ai-docker-compose-deployment.md)。
 
-```bash
-KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
-```
+## 核心概念
 
-如需改用 Docker Hub 镜像，可通过 `KIRO_RS_IMAGE` 覆盖镜像仓库。
-
-容器端口固定为 `8990`，请确保挂载的 `config/config.json` 中 `host` 配置为 `0.0.0.0`，否则宿主机端口映射后可能无法访问服务。
-
-## 配置详解
-
-### config.json
-
-| 字段 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `host` | string | `127.0.0.1` | 服务监听地址 |
-| `port` | number | `8080` | 服务监听端口 |
-| `apiKey` | string | - | 主客户端 API Key（用于调用 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1`，历史兼容字段） |
-| `apiKeys` | string[] | `[]` | 额外客户端 API Key 列表；实际生效集合为 `apiKey + apiKeys` 去空去重，管理后台可新增、替换、删除 |
-| `region` | string | `us-east-1` | AWS 区域 |
-| `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
-| `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.11.107` | Kiro 版本号 |
-| `kiroVersionAutoSyncEnabled` | boolean | `false` | 每 12 小时检查官方客户端版本并更新 candidate；不会自动应用。后台检查开关关闭后，已显式应用或固定的版本不会回退。通过管理后台可立即检查、应用 candidate、固定版本或回退到 previous。active 状态单独保存在 PgSQL，并通过 Redis 通知其他实例。 |
-| `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
-| `systemVersion` | string | 随机 | 系统版本标识 |
-| `nodeVersion` | string | `22.22.0` | Node.js 版本标识 |
-| `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
-| `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
-| `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
-| `countTokensAuthType` | string | `x-api-key` | 外部 API 认证类型：`x-api-key` 或 `bearer` |
-| `proxyUrl` | string | - | HTTP/SOCKS5 代理地址 |
-| `proxyUsername` | string | - | 代理用户名 |
-| `proxyPassword` | string | - | 代理密码 |
-| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `postgres.url` | string | 必填 | PgSQL 连接地址。服务启动必须能连接；首次启动可从配置文件导入运行配置和凭据 |
-| `postgres.maxConnections` | number | `10` | PgSQL 连接池最大连接数 |
-| `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表；生产升级必须保持开启或通过 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true` 覆盖配置，否则旧/半迁移 schema 会在启动兼容校验中被拒绝 |
-| `postgres.compressUsageRollupsOnStart` | boolean | `false` | 已废弃的兼容字段；设置为 `true` 会在连接数据库前拒绝启动。请先停止并排空所有网关实例，再运行 `maintenance usage-rollup-compression` |
-| `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
-| `redis.keyPrefix` | string | `kiro_rs:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（先用满优先级最高的一档，满了立刻降到下一档；预热只在这一档内分流；绑定在低档的会话在高档空闲后逐个迁回）、`balanced`（与 priority 同样按优先级排序，但不限定只用首选档）、`health_balanced` / `weighted_least_inflight`（按健康分在前几名中加权随机）。未知值启动时报错 |
-| `credentialRpm` | number/null | `null` | 单凭据本地 RPM 限速；`null` 或 `0` 表示关闭。开启后会优先分流到其他可用凭据 |
-| `credentialMaxConcurrentRequests` | number | `30` | 单凭据最大并发请求数；`0` 表示不限制。开启后同一凭据达到并发上限时，新请求会优先换其他可用凭据 |
-| `credentialTransientCooldownSecs` | number | `10` | 上游 408/429/5xx 且没有 Retry-After 时的凭据临时冷却秒数；只有存在其他可用凭据时才冷却当前凭据 |
-| `credentialMaxCooldownSecs` | number | `300` | 单凭据临时冷却上限，用于限制 Retry-After 的影响范围 |
-| `credentialDispatchMaxWaitSecs` | number | `5` | 单个请求等待凭据可调度的最长秒数；`0` 表示不限制。超时后返回本地调度限流错误，避免请求长期挂起。建议 30–60 秒 |
-| `credentialSessionMaxConcurrentRequests` | number | `0` | 同一会话在单个凭据上的最大并发；`0` 表示等于该凭据自身的并发上限。超出的请求临时借用其他凭据，不改绑；没有其他空闲凭据时仍用绑定凭据 |
-| `credentialInFlightLeaseMaxSecs` | number | `900` | 单个并发占用超过多久未活跃时自动释放；`0` 表示关闭。用于兜底异常路径导致的并发槽长期占用 |
-| `credentialWarmupRequests` | number | `3` | 新增凭据默认预热次数；预热只通过真实业务请求成功递减，不伪造 success_count |
-| `credentialWarmupSelectionPercent` | number | `5` | 预热起始比例：新凭据起步时的流量为同档位就绪凭据平均流量的这个百分比，随预热进度线性升到 100%。只在有就绪凭据可用时限流，就绪凭据全满/冷却/限流时预热凭据照常接溢出流量。`0` 表示有就绪凭据时预热凭据只接溢出流量。详见 `docs/scheduler-credential-warmup-slow-start-20261109.md` |
-| `credentialWarmupMaxSelectionPercent` | number | `50` | 所有预热凭据合计最多承接的近期流量比例。就绪凭据很少时（例如全局容量配置变更后整个号池重新预热）会自动放宽，避免少数就绪凭据超过公平份额 2 倍 |
-| `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
-| `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
-| `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Kiro 上游前的最终 payload 防护 |
-| `payloadGuardMode` | string | `on_too_long` | payload 防护触发模式。`on_too_long` 首次请求只做协议修复、不按大小预裁剪；仅在上游返回输入过长/请求体过大后按预算裁剪并重试一次。`preemptive` 保持旧行为，发送前超过预算即裁剪 |
-| `payloadGuardMaxBytes` | number | `460800` | 本地 payload 经验预算，按最终发送的 Kiro JSON body 字节数计算；它不是模型上下文上限。`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复 |
-| `payloadGuardTrimHistory` | boolean | `true` | payload 超出本地预算时是否允许裁剪最旧历史；关闭后只做协议修复，仍超预算会标记后透传给 Kiro |
-| `payloadShaping.enabled` | boolean | `true` | 超出本地预算时是否先执行低风险内容整形 |
-| `payloadShaping.truncateHistoricalToolResults` | boolean | `true` | 是否对历史 `tool_result` 做头尾保留截断；当前合法 `tool_result` 不受影响 |
-| `payloadShaping.historicalToolResultMaxChars` | number | `8000` | 单个普通历史 `tool_result` 最多保留字符数 |
-| `payloadShaping.discardHistoricalThinking` | boolean | `true` | 是否移除旧 assistant 历史中的 `<thinking>` 块 |
-| `payloadShaping.compressToolDefinitions` | boolean | `true` | 是否压缩工具描述和 JSON Schema 注释字段；不会删除 `type`、`properties`、`required`、`enum` |
-| `payloadShaping.toolDefinitionsBudgetBytes` | number | `20000` | 当前 tools 定义超过多少 JSON 字节后开始压缩描述和注释；`0` 表示关闭工具定义预算压缩 |
-| `payloadShaping.webFetchTrimEnabled` | boolean | `true` | 是否对历史 WebFetch 内容移除 data image、重复行和明显噪声 |
-| `payloadShaping.webFetchBodyMaxChars` | number | `12000` | 历史 WebFetch 正文去噪后的字符预算 |
-| `payloadShaping.fitCurrentPayloadToBudget` | boolean | `false` | 是否在历史裁剪后仍超预算时自动启用当前 tool_result、当前文本、当前 document 和当前图片兜底裁剪 |
-| `payloadShaping.truncateCurrentToolResults` | boolean | `false` | 是否允许在仍超预算时截断当前合法 `tool_result`；默认关闭 |
-| `payloadShaping.currentToolResultMaxChars` | number | `80000` | 单个当前 `tool_result` 的头尾保留字符预算 |
-| `payloadShaping.truncateCurrentUserContent` | boolean | `false` | 是否允许在仍超预算时截断当前 user content；包含 document 标签时会保留文档块并只裁文档外侧文本 |
-| `payloadShaping.currentUserContentMaxChars` | number | `120000` | 当前纯文本 user content 的头尾保留字符预算 |
-| `payloadShaping.truncateCurrentDocuments` | boolean | `false` | 是否允许在仍超预算时截断当前 `<document>` 块正文，并保留 document 标签 |
-| `payloadShaping.currentDocumentMaxChars` | number | `80000` | 单个当前 document 正文的头尾保留字符预算 |
-| `payloadShaping.truncateCurrentImages` | boolean | `false` | 是否允许在仍超预算时丢弃当前图片；图片不会本地重编码压缩 |
-| `payloadShaping.currentImagesMaxBytes` | number | `180000` | 当前 images 数组允许保留的 JSON 字节预算 |
-| `payloadShaping.oversizedImageHandling` | string | `drop-with-placeholder` | 单张图片超过上游 5 MB 限制时的处理方式：`drop-with-placeholder` 移除图片并给模型占位说明；`reject` 直接返回 400 |
-| `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
-| `kiroAgentModeStrategy` | string | `vibe` | Kiro IDE `x-amzn-kiro-agent-mode` 策略：`vibe` 保持当前成功链路，`spec` 强制规格模式，`auto` 按账号协议自动判定 |
-| `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 的目标 cache read 中心比例；`/na/v1/messages` 默认是 no-cache，不进入本地缓存模拟 |
-| `promptCacheTokenScale` | number | `1.6` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 模拟专用的 total input 放大倍数，只影响本地模拟 cache usage |
-| `promptCacheMaxSimulatedInputTokens` | number | `300000` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 模拟 total input 的上限；触顶时会做确定性 soft-cap 抖动 |
-| `promptCacheCapJitterMinTokens` | number | `12000` | high-cache 触顶 soft-cap 的最小扣减 token |
-| `promptCacheCapJitterMaxTokens` | number | `24000` | high-cache 触顶 soft-cap 的最大扣减 token |
-| `promptCacheScaleMinInputTokens` | number | `20000` | 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大 |
-| `reportedUsage.default` | object | input/output 原始值，cache read/write 保留计算值 | 控制所有路径的默认 usage 上报方式，只影响响应和后台 usage record，不影响 reader 计算、本地缓存 tracker 或上游请求 |
-| `reportedUsage.pathOverrides` | object | `/cc`、`/ha` | 按路径前缀独立覆盖默认 usage 上报策略，最长前缀优先；例如 `/cc` 会匹配 `/cc/v1/messages`，`/ha` 不会继承 `/cc` 的 writer 配置 |
-| `reportedUsage.*.finalCacheReadMaxTokens` | number | `700000` | 每个路径策略最终上报的 `cache_read_input_tokens` 上限；在 input 差值转入 cache read 后执行，0 表示关闭 |
-| `reportedUsage.*.finalCacheReadJitterMinTokens` | number | `0` | 最终读取缓存上限的确定性扣减下限 |
-| `reportedUsage.*.finalCacheReadJitterMaxTokens` | number | `0` | 最终读取缓存上限的确定性扣减上限 |
-| `reportedUsage.*.finalCacheCreationMaxTokens` | number | `400000` | 每个路径策略最终上报的 `cache_creation_input_tokens` 上限；在 input 差值转入 cache write 后执行，0 表示关闭 |
-| `reportedUsage.*.finalCacheCreationJitterMinTokens` | number | `20000` | 最终写入缓存上限的确定性扣减下限 |
-| `reportedUsage.*.finalCacheCreationJitterMaxTokens` | number | `45000` | 最终写入缓存上限的确定性扣减上限，生效后的 cap 不会高于 `finalCacheCreationMaxTokens` |
-| `reportedUsage.*.finalOutputGuardEnabled` | boolean | `true` | 是否启用最终输出限制。关闭后不执行 output 百分比放大和最终上限裁剪，只保留 `output` 字段自身的改写结果 |
-| `reportedUsage.*.outputUpliftMinTokens` | number | `1000` | `output_tokens` 完成字段改写后，大于该阈值才进入百分比放大；等于阈值不放大 |
-| `reportedUsage.*.outputUpliftPercent` | number | `50` | `output_tokens` 超过阈值后的放大百分比；0 表示关闭放大，最大 200 |
-| `reportedUsage.*.finalOutputMaxTokens` | number | `200000` | 放大后的 `output_tokens` 最终上限；0 表示关闭最终上限 |
-| `reportedUsage.*.finalOutputJitterMinTokens` | number | `5000` | 最终输出上限的确定性扣减下限 |
-| `reportedUsage.*.finalOutputJitterMaxTokens` | number | `12000` | 最终输出上限的确定性扣减上限，避免稳定撞到模型或展示硬上限 |
-| `usageRecordLimit` | number | `5000` | 内存中保留的最近 usage 记录数量；完整 usage 记录写入 PgSQL |
-| `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
-| `defaultEndpoint` | string | `ide` | 默认协议端点。凭据未显式指定 `endpoint` 时使用。内置端点：`ide`、`cli`、`codewhisperer`、`amazonq`、`runtime`。 |
-| `kiroEndpointFallbackEnabled` | boolean | `false` | 允许推理请求在同一个账号内切换到备用协议端点。仅传输错误和 HTTP 502/503/504 可触发；候选必须支持该凭据认证类型。API Key 账号仍走 `cli`，不会跨到 OAuth 协议。 |
-| `kiroEndpointFallbackOrder` | string[] | `codewhisperer, amazonq, runtime` | 同账号协议端点 fallback 顺序。primary 仍按凭据 `endpoint` 优先、再按 `defaultEndpoint` 解析；默认关闭 fallback 时该列表不生效。 |
-| `kiroUpstreamRegionRotationEnabled` | boolean | `false` | 推理请求遇瞬态错误时，可在内置 `us-east-1` / `eu-central-1` Region 候选间重试；与协议端点 fallback 分开控制。 |
-| `kiroRegionProfileArnMismatchAllowed` | boolean | `false` | 允许带 Profile ARN 的账号跨到 ARN 所属 Region 以外的备用 Region。关闭时会跳过不匹配的备用 Region；没有 Profile ARN 的账号不受此项阻止。 |
-| `exposeProxyWarnings` | boolean | `false` | 是否通过 `x-kiro-rs-warnings` 暴露代理侧兜底改写。`anthropic-strict` 下会强制关闭 |
-
-最小配置示例：
-
-```json
-{
-   "postgres": {
-      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
-   },
-   "redis": {
-      "url": "redis://127.0.0.1:26379/0"
-   },
-   "host": "127.0.0.1",
-   "port": 8990,
-   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "apiKeys": [],
-   "adminApiKey": "sk-admin-your-secret-key",
-   "payloadGuardEnabled": true,
-   "payloadGuardMode": "on_too_long",
-   "payloadGuardMaxBytes": 460800,
-   "payloadGuardTrimHistory": true,
-   "payloadShaping": {
-      "enabled": true,
-      "truncateHistoricalToolResults": true,
-      "historicalToolResultMaxChars": 8000,
-      "discardHistoricalThinking": true,
-      "compressToolDefinitions": true,
-      "toolDefinitionsBudgetBytes": 20000,
-      "webFetchTrimEnabled": true,
-      "webFetchBodyMaxChars": 12000,
-      "fitCurrentPayloadToBudget": false,
-      "truncateCurrentToolResults": false,
-      "currentToolResultMaxChars": 80000,
-      "truncateCurrentUserContent": false,
-      "currentUserContentMaxChars": 120000,
-      "truncateCurrentDocuments": false,
-      "currentDocumentMaxChars": 80000,
-      "truncateCurrentImages": false,
-      "currentImagesMaxBytes": 180000,
-      "oversizedImageHandling": "drop-with-placeholder"
-   }
-}
-```
-
-未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、payload 防护、本地模拟缓存和路径级 usage 上报策略。
-
-`payloadShaping` 默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Kiro JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务会记录 `still_oversized=true` 并继续请求 Kiro，让上游返回真实错误。
-
-缓存模式由路径固定选择：
-
-- `/v1/messages`：high-cache。即使请求没有显式 `cache_control`，也会按稳定前缀建立本地缓存；如果上游 metadata 返回的 cache read/write 都是 0，会用本地缓存 usage 补足 cache 字段。
-- `/cc/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/cc"]` 改写下游 input 和 cache write 上报。
-- `/ha/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/ha"]` 改写下游 input 上报。后续如果要改 writer，需要单独改 `/ha` 覆盖项。
-- `/na/v1/messages`：no-cache 路由；不进入本地缓存模拟，响应和后台记录直接使用原始 usage。
-
-本地模拟缓存按实际解析后的上游模型判断 prompt cache 能力和最小缓存长度。Anthropic prompt caching 支持 active Claude 模型；Haiku 不是无缓存模型，但 Haiku 4.5 的最小可缓存长度是 4096 tokens，Haiku 3.5 是 2048 tokens。低于模型最小长度时本地不会模拟 cache creation/read。
-
-路径级 usage 上报策略支持这些字段：
-
-- `input`：控制 `input_tokens`。使用 `sample-max` 时会采样到 `maxTokens` 以内；`moveDeltaToCacheRead` 为 true 时，减少的 input 差值会加入 `cache_read_input_tokens`。
-- `output`：控制 `output_tokens`。默认建议 `raw`，也就是直接使用上游返回的原始输出。
-- `cacheRead`：控制 `cache_read_input_tokens`。默认建议 `preserve`。
-- `cacheCreation`：控制 `cache_creation_input_tokens`。`/cc` 默认使用 `sample-target`，`targetTokens` 为 `3000`，`normalMaxMultiplier` 为 `1.2`。
-
-每个路径策略还会在所有字段改写完成后应用 `finalCacheReadMaxTokens` 和 `finalCacheCreationMaxTokens`。默认把最终 `cache_read_input_tokens` 限制在 `700000` 以内，并把最终 `cache_creation_input_tokens` 限制在 `400000 - deterministic_jitter(20000..45000)` 以内。`finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` 与 `finalCacheCreationJitterMinTokens` / `finalCacheCreationJitterMaxTokens` 可让触顶值在上限以下确定性波动；守护只会向下裁剪，不会抬高原本较小的读取或写入缓存值。
-
-#### 上下限优先缓存策略（`bounded_high_cache`）
-
-参数和 `current_high_cache` 完全相同（`simulation`、`creationControl`、`reportedUsage`、`hitShaping`、`coldRequestGuard`），模板写在 `cachePolicy.boundedHighCache`，不读取 `default` / `currentHighCache`。区别只在最终 usage：各字段上下限是最终约束，整形之后不再改写。
-
-- 范围：`input` ≤ `reportedUsage.input` 上限；`cache_read` ≤ min(最终读取上限, 原始输入 × `hitShaping.maxReadMultiplier`)；`cache_creation` ≤ min(最终写入上限, `creationControl.maxCreationTokensPerEvent`)，未放行写入时为 0。上限在配置值以下确定性浮动（input 15%，读写 5%），不会集中在同一个整数上。
-- 优先级：上下限 > 写入频次控制 > 命中率 > 不亏损。超出范围的部分直接丢弃，不挪到其他字段；非零读写低于最小值时抬到最小值，上限低于最小值时清零。
-- 计费：`hitShaping.minCostRatio` 只在范围内补（依次抬高写入、读取、input）。本次补不上的差额按 creation control 的维度累计（上限为当次下限的 20 倍，状态在进程内存中，随会话空闲过期），之后放行写入的请求在写入上限内补回。
-- `hitShaping.costFloorTopUpInput`（默认 `true`）：写入、读取补完仍低于计费下限时是否用 input 补差额。设为 `false` 时仍先按计费下限分配读写，补不齐的差额直接舍弃，不记入 input，也不跨请求累计；`current_high_cache` 同样适用（关闭后写入补到上限或未放行写入时不再往 input 补）。
-- 外部池路径同样在计费补偿之后按上下限收口。
-
-#### Kiro-RS Tool Plus 缓存策略（`kiro_rs_tool_plus`）
-
-在 Kiro-RS Tool 前缀追踪的基础上，对下游 usage 的 `input`、`output`、`cache_read`、`cache_creation` 分别整形，不叠加 `hitShaping`、`coldRequestGuard` 和 `reportedUsage`。模板写在 `cachePolicy.kiroRsToolPlus.kiroRsToolPlus`，路径级 `pathOverrides[...].kiroRsToolPlus` 会整体替换模板参数（缺省字段取默认值）。默认参数下的行为与 Kiro-RS Tool 的前缀拆分一致。
-
-执行顺序：放大与浮动 → 写入频次限制 → 读写上下限 → input / output 上下限 → 计费下限。
-
-```json
-{
-  "cachePolicy": {
-    "pathOverrides": {
-      "/dfcache/plus": {
-        "cacheType": "kiro_rs_tool_plus",
-        "kiroRsToolPlus": {
-          "creationFrequency": { "enabled": true, "minSuccessfulRequestsBetweenCreation": 3, "minCreationIntervalSecs": 60 },
-          "suppressedCreationTarget": "cache_read",
-          "shaping": {
-            "cacheRead": { "multiplier": 2.5, "jitterRatio": 0.05, "maxTokens": 600000, "maxJitterTokens": 20000 },
-            "cacheCreation": { "multiplier": 1.5, "minTokens": 1024, "maxTokens": 80000 },
-            "input": { "minTokens": 32, "maxTokens": 4096 },
-            "output": { "multiplier": 1.0 },
-            "minCostRatio": 1.0
-          },
-          "nonStream": { "mode": "custom", "profile": { "cacheRead": { "multiplier": 1.5 } } },
-          "smallRequest": { "enabled": true, "maxInputTokens": 1024, "disableCache": true }
-        }
-      }
-    }
-  }
-}
-```
-
-- 字段整形（`shaping.input|output|cacheRead|cacheCreation`）：`multiplier` 放大倍数（0~1000，可大于 1），`jitterRatio` 确定性浮动（结果在 `×(1±r)` 内），`minTokens` 非零值下限，`maxTokens` 上限，`maxJitterTokens` 触顶时随机少报 0~该值；0 表示不限。
-- `capOverflowToInput`：读写被上限裁掉的部分是否转入 input，默认丢弃。`minCostRatio`：计费不低于真实输入计费 × 该倍数（0~100），差额补到 input，不受 input 上限约束。
-- `creationFrequency`：参数同 `promptCacheCreationControl`，默认关闭；额度按放大后的写入计算。`suppressedCreationTarget` 决定被拦下的写入记为 `input`（默认）、`cache_read` 或 `drop`。
-- `nonStream.mode` / `smallRequest.mode`：`inherit` 沿用 `shaping`，`custom` 使用本节 `profile`，`raw` 不整形也不做频次控制。小请求（真实输入 ≤ `maxInputTokens`）优先于非流式；`disableCache` 让小请求的读写全部并回 input。
-
-#### 提示词注入
-
-代理注入的提示词按注入项逐项开关，由路由显式关联，配置写在 `config.json` 顶层（完整示例见 `config.example.json`）：
-
-- `promptInjection`：`defaults` 是 14 个注入项的全局默认（`enabled`，任务质量、语言约束、自定义、身份声明 4 项另有 `externalPool`）；`pathOverrides` 按路由前缀覆盖，逐项取设置了该项的最长前缀；`texts` 保存改过的文本；`applyToCountTokens` 控制 count_tokens 是否计入写进 system 的注入项。
-- `routeFeatures`：不注入提示词的路由功能，`defaults` 与 `pathOverrides` 规则同上，含 `thinkingModelName`、`thinkingTrigger`（`real_request` / `always` / `off`）、`channelLeakGuard`、`channelLeakGuardStream`、`modelDrivenWebSearch`。
-- `claudeModelsOnly`：`/v1/models` 是否只列出 Claude 模型，默认 `false`。
-
-新装默认：任务质量全局关、`/cc` 显式开；语言、身份、自定义相关项关；分块写入、thinking、tool_choice、WebSearch 引导、空轮续写等其余项开。`anthropic-strict` 下部分项不注入，thinking 兼容标签只由 `thinkingControls` 控制，它关闭且模型没有原生 reasoning 字段时，带 reasoning 的请求返回 400。`bodyConversion.toolChoiceSteering` 只控制结构化 `tool_choice` 过滤和响应侧拦截。
-
-全局默认和文本在新版控制台「提示词注入」页面（`/ui/prompt-injection`）编辑，可按路由和请求条件预览实际注入内容；单个路由在路由策略编辑弹窗的「提示词注入」「功能」分区设置。旧版 `promptSteering` 等配置加载时自动迁移为等价设置。注入项说明和默认值依据见 [提示词注入改造方案](feature/todo/prompt-injection-routes-20261023/README.md)。
-
-### 凭据字段
-
-管理后台导入和 `POST /api/admin/credentials`、`POST /api/admin/credentials/import` 接受以下字段（同时接受 snake_case 写法）。
-
-| 字段             | 类型     | 描述                                          |
-|----------------|--------|---------------------------------------------|
-| `id`           | number | 凭据唯一 ID（导入时由服务分配，不需要填写）        |
-| `accessToken`  | string | OAuth 访问令牌（可选，可自动刷新）                        |
-| `refreshToken` | string | OAuth 刷新令牌                                  |
-| `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
-| `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
-| `authMethod`   | string | 认证方式：`social`、`idc`、`external_idp` 或 `api_key`；决定 Token 刷新协议 |
-| `provider`     | string | 身份提供方（`Github`、`Google`、`BuilderId`、`Enterprise` 等），用于展示和 Portal 查询；`authMethod` 缺失时参与推断认证方式。为空时，查询额度后用 Portal 返回的身份提供方补齐 |
-| `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
-| `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
-| `kiroApiKey`   | string | Kiro API Key / headless 凭据，格式 `ksk_xxx`；也支持 `ksk_xxx|region` 便捷写法 |
-| `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
-| `region`       | string | 凭据级 Auth Region, 兼容字段                       |
-| `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
-| `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
-| `machineId`    | string | 凭据级机器码（64位十六进制）                             |
-| `email`        | string | 用户邮箱（可选，从 API 获取）                           |
-| `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
-| `proxyUsername`| string | 凭据级代理用户名（可选）                                |
-| `proxyPassword`| string | 凭据级代理密码（可选）                                 |
-| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`；API Key 凭据默认补为 `cli`）|
-
-说明：
-- IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
-- 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
-- 显式的 `authMethod` 决定刷新协议；`provider` 只在 `authMethod` 缺失时参与推断。`authMethod: "IdC"` + `provider: "Enterprise"` 的组织 IdC 账号按 IdC（AWS OIDC）刷新
-- 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
-
-### Region 配置
-
-支持多级 Region 配置，分别控制 Token 刷新和 API 请求使用的区域。
-
-**Auth Region**（Token 刷新）优先级：
-`凭据.authRegion` > `凭据.region` > `config.authRegion` > `config.region`
-
-**API Region**（API 请求）优先级：
-`凭据.apiRegion` > `config.apiRegion` > `config.region`
-
-### 代理配置
-
-支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
-
-**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
-
-| 凭据 `proxyUrl` 值 | 行为 |
+| 概念 | 含义与生效规则 |
 |---|---|
-| 具体 URL（如 `http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理 |
-| `direct` | 显式不使用代理（即使全局配置了代理） |
-| 未配置（留空） | 回退到全局代理配置 |
+| 账号 | 一个 `baseUrl + apiKey` 上游接入点；保存优先级、并发、支持模型和路由规则。`overrides` 中设置的超时与 usage 放大参数覆盖全局账号默认值；未设置时继承。 |
+| 路由 | 一个入口前缀与其完整行为配置，如 `/cc` 或 `/dfcache/team`。按最长前缀匹配；路由 `accountRule` 和账号 `routeRules` 都允许，账号才进入候选。 |
+| 策略 | 路由的 `cachePolicy` 和 `reportedUsage`，决定返回用量的模拟、字段整形、频次、TTL 与上下限。账号 `usageProjectionMode=pass_through` 可跳过整形。 |
+| 路由功能 | `features` 中显式启用的请求处理，包括补 `max_tokens`、reasoning 兼容、thinking 名称/触发、历史清洗、payload 和图片处理。默认关闭；全局默认可被路由覆盖。 |
+| 下游密钥 | 调用者使用的 key，与上游账号密钥分离。只控制鉴权、准入、额度和 `allowedRoutes`，不决定 usage 策略；限制逐层收紧。 |
 
-凭据级代理示例：
+完整字段与配置合并规则见 [03 领域模型与配置分层](docs/claude-pool-refactor/03-领域模型与配置分层.md)。
 
-```json
-[
-   {
-      "refreshToken": "凭据A：使用自己的代理",
-      "authMethod": "social",
-      "proxyUrl": "socks5://proxy-a.example.com:1080",
-      "proxyUsername": "user_a",
-      "proxyPassword": "pass_a"
-   },
-   {
-      "refreshToken": "凭据B：显式不走代理（直连）",
-      "authMethod": "social",
-      "proxyUrl": "direct"
-   },
-   {
-      "refreshToken": "凭据C：使用全局代理（或直连，取决于 config.json）",
-      "authMethod": "social"
-   }
-]
-```
+## 配置
 
-### 认证方式
+### config.json 字段
 
-客户端请求本服务时，支持两种认证方式：
+下表按当前 `Config` 与 [配置示例](config.example.json) 整理。示例只显式写常用字段；未写的字段使用代码默认值。
 
-1. **x-api-key Header**
-   ```
-   x-api-key: sk-your-api-key
-   ```
+| 字段 | 示例 / 默认 | 作用 |
+|---|---|---|
+| `host`、`port` | 示例 `0.0.0.0`、`8990`；代码默认 `127.0.0.1`、`8080` | 监听地址与端口 |
+| `postgres.url` | 示例本地 `25432` | 配置、账号、用量、模型、审计的权威存储；启动必需 |
+| `postgres.maxConnections`、`usageMaxConnections` | `10`、`4` | 业务与 usage 独立连接池 |
+| `postgres.migrateOnStart`、`compressUsageRollupsOnStart` | `true`、`false` | schema 初始化与历史 rollup 压缩开关 |
+| `redis.url`、`keyPrefix` | 示例本地 `26379`；前缀默认 `claude_pool:local` | 调度协调与热加载；同集群实例使用相同前缀 |
+| `observabilityRedis.url`、`keyPrefix` | `null`、`claude_pool:observability` | 可选观测 Redis；必须与业务 Redis 属于不同服务进程；未配置则使用 PostgreSQL/本机观测 |
+| `apiKey`、`apiKeys` | 一个主密钥及附加数组 | 下游鉴权密钥集合 |
+| `requestApiKeyPolicies` | `[]` | 管理密钥对象：启用、名称、准入、额度、`allowedRoutes` |
+| `adminApiKey` | 示例 `sk-admin-your-secret-key` | 非空时启用管理 API |
+| `requestAdmission` | 示例 RPM `300`、并发 `32`、队列 `64`、等待 `1000ms` | 单实例下游密钥准入；各实例独立计数 |
+| `tlsBackend` | `rustls` | 默认 TLS 实现 |
+| `proxyUrl`、`proxyUsername`、`proxyPassword` | 未设置 | 全局出口代理；账号可覆盖代理 URL |
+| `streamPreOutputHoldSecs` | `15` | 首输出前静默保留窗口，范围 `0–60`，`0` 表示持续保留到首输出 |
+| `inferenceUpstreamMaxAttempts` | `4` | 单次下游请求的上游调用总预算 |
+| `promptInjection` | 示例四项均关闭 | `custom`、`identityPrompt`、`languageConstraint`、`taskQuality` 的默认开关和文本；`applyToCountTokens` 控制估算时是否应用 |
+| `routeFeatures.defaults` | `{}` | 可选路由功能默认参数；空对象关闭所有功能 |
+| `compatProfile` | `claude-code` | 兼容配置画像 |
+| `modelResolutionMode`、`modelMapping` | `compatible`、默认规则 | 内部模型解析与映射；账号的外发模型映射独立配置 |
+| `promptCacheTargetReadRatio`、`promptCacheTokenScale` | `0.98`、`1.6` | 高缓存模拟的读取目标与输入倍率 |
+| `promptCacheMaxSimulatedInputTokens`、`promptCacheScaleMinInputTokens` | `300000`、`20000` | 模拟上限与倍率生效门槛 |
+| `promptCacheCapJitterMinTokens`、`promptCacheCapJitterMaxTokens` | `12000`、`24000` | 模拟上限的确定性浮动 |
+| `promptCacheCreationControl` | 默认频次配置 | 写入频率、增量、窗口预算等 |
+| `promptCacheMaxEntriesPerAccount`、`promptCacheMaxEntriesGlobal` | `200`、`20000` | 前缀追踪条目上限 |
+| `promptCacheEntryTtlSecs`、`promptCacheEstimatedBytesLimit` | `86400`、`268435456` | 追踪条目 TTL 与估算内存限制 |
+| `cachePolicy`、`reportedUsage` | 默认模板 | 全局六种策略模板和字段整形默认值；路由负责挂载 |
+| `routes` | 示例四条内置路由 | 路由前缀、策略、功能、注入、账号和模型规则 |
+| `accounts` | 示例启用、等待 `60s`、队列 `64`、`wait` | 全局账号池容量、重试、质量、自动禁用、冷却、传输、usage 放大等默认值 |
+| `activeRouteScenarioId` | 未设置 | 最近完整应用的路由场景标识 |
+| `usageRecordLimit`、`highCacheThreshold` | `5000`、`10000` | 内存记录上限与管理端高缓存判定阈值 |
+| `auditLogRetentionEnabled`、`auditLogRetentionDays` | `false`、`15` | 审计自动清理默认关闭 |
+| `runtimeConfigMigrationVersion` | `2` | 内部配置迁移标记 |
 
-2. **Authorization Bearer**
-   ```
-   Authorization: Bearer sk-your-api-key
-   ```
+账号池常用默认值为全局并发 `512`、排队 `64`、调度等待 `60s`、跨账号尝试 `3`、请求超时 `180s`、流空闲超时 `180s`、首输出超时 `120s`。质量评分和自动禁用默认关闭。详见 [04 调度](docs/claude-pool-refactor/04-调度.md)。
+
+### usage 策略
+
+| `cacheType` | 用途 |
+|---|---|
+| `no_cache` | 关闭本地缓存模拟 |
+| `current_high_cache` | 沿用高缓存模拟、字段整形与成本下限行为 |
+| `prefix_tool` | 前缀与工具上下文缓存策略 |
+| `stable_segment_cache` | 稳定片段缓存策略 |
+| `prefix_tool_plus` | 四字段倍率、浮动、写入频次和计费下限 |
+| `bounded_high_cache` | 对最终用量执行严格上下限收口 |
+
+`no_cache` 控制模拟策略；需要账号完全保留上游 usage 时，设置 `usageProjectionMode=pass_through`。`current_high_cache` 的既有成本下限行为可能突破 input 上限；需要严格上下限时选择 `bounded_high_cache`。具体顺序与行为见 [05 usage 整形](docs/claude-pool-refactor/05-usage整形与缓存策略.md)。
 
 ### 环境变量
 
-服务运行时主要使用配置文件和启动参数。以下环境变量可选：
+| 变量 | 作用 |
+|---|---|
+| `RUST_LOG` | 日志等级，默认 `info` |
+| `CLAUDE_POOL_HOST`、`CLAUDE_POOL_PORT` | 覆盖监听地址、端口；Compose 中 `PORT` 也用于宿主机映射 |
+| `CLAUDE_POOL_POSTGRES_URL` | 覆盖 PostgreSQL 连接 |
+| `CLAUDE_POOL_POSTGRES_MAX_CONNECTIONS`、`CLAUDE_POOL_POSTGRES_USAGE_MAX_CONNECTIONS` | 覆盖两类连接池容量 |
+| `CLAUDE_POOL_POSTGRES_MIGRATE_ON_START` | 控制启动 schema 迁移 |
+| `CLAUDE_POOL_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START` | 控制历史 rollup 压缩，默认关闭 |
+| `CLAUDE_POOL_REDIS_URL` | 覆盖业务 Redis 连接 |
+| `CLAUDE_POOL_OBSERVABILITY_REDIS_URL`、`CLAUDE_POOL_OBSERVABILITY_REDIS_KEY_PREFIX` | 可选独立观测 Redis |
+| `CLAUDE_POOL_UI_MODE`、`CLAUDE_POOL_UI_DIR` | UI 模式及 filesystem 目录；模式为 `embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `CLAUDE_POOL_UI_DEV_SERVER`、`CLAUDE_POOL_UI_EXTERNAL_URL` | UI 开发服务地址；debug 默认指向 `http://127.0.0.1:9023/ui` |
+| `CLAUDE_POOL_NEW_UI_*` | 对应 UI 变量的优先读取形式 |
+| `CLAUDE_POOL_CAPTURE_DIR` | 诊断采集目录，默认 `logs/llm-capture` |
+| `CLAUDE_POOL_HTTP_DRAIN_SECS` | 优雅退出时 HTTP 排空等待，默认 `45s` |
+| `CLAUDE_POOL_IMAGE`、`CLAUDE_POOL_VERSION` | Compose 镜像仓库与 tag，默认 `ghcr.io/2ue/claude-pool:latest` |
+| `CLAUDE_POOL_POSTGRES_DB`、`CLAUDE_POOL_POSTGRES_USER`、`CLAUDE_POOL_POSTGRES_PASSWORD` | Compose 数据库名、用户、密码 |
+| `CLAUDE_POOL_POSTGRES_PORT`、`CLAUDE_POOL_REDIS_PORT` | 本地依赖宿主端口，默认 `25432`、`26379` |
 
-```bash
-RUST_LOG=debug ./target/release/kiro-rs
+### 路由定义示例
+
+在控制台编辑路由，或把下面对象加入 `routes` 数组；四条内置路由继续保留：
+
+```json
+{
+  "prefix": "/dfcache/team",
+  "name": "团队严格边界策略",
+  "enabled": true,
+  "cachePolicy": { "cacheType": "bounded_high_cache", "routeNamespace": true },
+  "features": { "thinkingModelName": false, "historySanitize": false },
+  "accountRule": { "mode": "allow_list", "rules": ["1", "2"] },
+  "modelRule": { "mode": "allow_list", "rules": ["claude-sonnet-*"] }
+}
 ```
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
-| `KIRO_API_KEY` | - | 启动时自动导入一个最高优先级的 Kiro API Key 凭据并写入 PgSQL；已存在时跳过；支持 `ksk_xxx|region` |
-| `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
-| `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
-| `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
-| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
-| `KIRO_NEW_UI_DIR` / `KIRO_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | debug: `http://127.0.0.1:9023/ui` | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
-
-生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/ui` 会重定向到 Vite 服务；旧的 `/admin` 及其子路径永久重定向到 `/ui`；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
-
-本地开发预览地址：
-
-| 前端 | 命令 | 浏览器地址 | 用途 |
-|------|------|------------|------|
-| UI | `bash scripts/dev-ui.sh ui` | `http://127.0.0.1:9023/ui/runtime` | 当前主要开发入口 |
-
-后端 API 示例：
-
-```bash
-# 当前本地 config.json 监听 9022；config.example.json 的默认示例是 8990
-./target/release/kiro-rs -c config.json
-```
-
-前端默认把 `/api` 代理到 `http://127.0.0.1:9022`。如果后端不是 9022，用 `VITE_API_PROXY_TARGET` 覆盖：
-
-```bash
-VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
-```
-
-日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/ui`，后端也会自动重定向到 Vite 地址。release 二进制仍默认使用 embedded 页面。
+请求地址为 `/dfcache/team/v1/messages`。`accountRule.rules` 写实际账号 ID；`allow_list` 的空列表拒绝全部，`deny_list` 的空列表允许全部。模型限制与账号 `supportedModels` 取交集；账号列表为空表示不限。模型解析、映射与目录管理见 [06](docs/claude-pool-refactor/06-模型目录映射与限制.md)。
 
 ## API 端点
 
-### 标准端点 (/v1)
+`{prefix}` 表示空字符串、`/cc`、`/ha`、`/na` 或已配置的路由前缀。推理与模型接口支持 `x-api-key` 或 `Authorization: Bearer` 下游鉴权。
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/v1/models` | GET | 获取可用模型列表 |
-| `/v1/messages` | POST | 创建消息（对话，固定 high-cache 本地 usage 模拟） |
-| `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| POST | `{prefix}/v1/messages` | Anthropic Messages；支持 SSE、thinking、工具调用和服务端工具透传 |
+| POST | `{prefix}/v1/messages/count_tokens` | 当前实现使用本地 token 估算；应用配置允许的注入和图片处理 |
+| GET | `{prefix}/v1/models` | 返回目录与该路由可用账号模型的交集 |
+| GET | `{prefix}/v1/models/{model_id}` | 单个模型详情 |
+| GET / HEAD | `/api/hello`、`/cc/api/hello`、`/ha/api/hello`、`/na/api/hello`、`/dfcache/{name}/api/hello` | 无需鉴权的 Claude Code 预连接探测 |
+| GET | `/healthz` | 进程存活检查 |
+| GET | `/readyz` | PostgreSQL、Redis、事件订阅与调度就绪检查 |
 
-### No-Cache 端点 (/na/v1)
+`count_tokens` 的完整路径在 `/messages` 下。自定义路由必须先定义，未知前缀返回 404。
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/na/v1/models` | GET | 获取可用模型列表 |
-| `/na/v1/messages` | POST | 创建消息（对话；默认不进入本地缓存模拟，直接使用原始 usage） |
-| `/na/v1/messages/count_tokens` | POST | 估算 Token 数量 |
+| 内置前缀 | 默认 `cacheType` | 默认 reportedUsage |
+|---|---|---|
+| `""`，即 `/v1` | `current_high_cache` | 继承默认字段策略 |
+| `/cc` | `current_high_cache` | input `sample-max=96`；creation `sample-target=3000`，倍率 `1.2` |
+| `/ha` | `current_high_cache` | input `sample-max=96` |
+| `/na` | `no_cache` | 继承默认字段策略 |
 
-### Claude Code 兼容端点 (/cc/v1)
+这些差异来自路由定义，修改路由策略即可改变。流保活使用 SSE 注释帧，详见[流式保活与代理超时](docs/streaming-keepalive.md)。
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/cc/v1/models` | GET | 获取可用模型列表 |
-| `/cc/v1/messages` | POST | 创建消息（实时流式返回，最终 `message_delta.usage` 修正 token 用量） |
-| `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
+账号池错误出口遵循 [11 章 3.10](docs/claude-pool-refactor/11-实施说明与关键逻辑契约.md#310-错误分类与对外映射)：
 
-> **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
-> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
-> - `/cc/v1/messages`：实时流式返回，`message_start` 先给估算用量；最终 `message_delta.usage` 会优先使用上游 metadata，缺失时用 `contextUsageEvent` 和模型输入窗口换算后修正
-> - 上游长时间无内容时仍会发送 `ping` 事件保活
+| 条件 | HTTP | `error.type` | 处理 |
+|---|---|---|---|
+| 上游限流且重试耗尽 | 429 | `rate_limit_error` | 固定公开文案 |
+| 上游 400 且不可重试 | 400 | `invalid_request_error` | 图片、payload、上下文或通用固定文案 |
+| 容量不足、排队超时、全局并发满 | 529 | `overloaded_error` | 固定公开文案 |
+| 其余账号上游错误 | 502 | `api_error` | 固定公开文案 |
 
-### Thinking 模式
+账号池出口错误附 `x-error-id`，原始上游错误只进入内部记录和日志。入口另有鉴权 401、规则/模型拒绝 404、请求体过大 413、准入限流 429；对下游输出开始后的失败通过流式 error 事件结束。
 
-支持 Claude 的 extended thinking 功能：
+## 管理 API 与控制台
 
-```json
-{
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 16000,
-  "thinking": {
-    "type": "enabled",
-    "budget_tokens": 10000
-  },
-  "messages": [...]
-}
+控制台入口 `/ui`；管理 API 前缀 `/api/admin`，使用 `adminApiKey`，支持与下游相同的两种头部鉴权方式。
+
+| 能力 | 主要端点（省略 `/api/admin`） |
+|---|---|
+| 账号 | `GET/POST /accounts`、`PUT/DELETE /accounts/{id}`、测试、模型发现、清冷却与自动禁用 |
+| 路由 | `GET/PUT /routes`、`GET /routes/effective?prefix=%2Fcc` |
+| 生效配置 | `GET /accounts/{id}/effective` |
+| 模型 | `/model-capabilities`、`/model-capabilities/manual`、`PATCH /model-capabilities/{model}/listed`、`POST /accounts/{id}/models/promote` |
+| 配置包 | `GET /config/export`、`POST /config/import` |
+| 运行配置与密钥 | `GET/PUT /config/runtime`、`/security/request-keys` |
+| 用量与审计 | `/usage-records-paged`、`/usage-dashboard/overview`、`/audit-logs` |
+| 清理与诊断 | `/usage-records/cleanup/*`、`/diagnostics/capture/*` |
+
+控制台支持路由场景快照、raw / shaped / reported 用量与成本查看。自动删除类功能默认关闭。管理模块说明见 [08](docs/claude-pool-refactor/08-管理API与控制台.md)；开发入口见[前端开发环境](docs/frontend-dev-environment.md)。
+
+## 从旧版网关迁移
+
+使用新二进制直接读取旧 PostgreSQL，导出账号、运行配置、下游密钥、路由场景、价格和手工模型目录；usage 历史不迁移。完整旧版本名称、字段映射和行为差异见 [07 章第 4 节](docs/claude-pool-refactor/07-存储与迁移.md)。
+
+```bash
+cargo run --release --locked --bin claude-pool -- export-legacy \
+  --from-postgres 'postgres://reader:password@old-db/legacy' \
+  --out legacy.json
+
+# 默认 dry-run，先检查丢弃字段、容量、功能开关与映射变化
+cargo run --release --locked --bin claude-pool -- -c config.json import-legacy legacy.json
+
+# 显式 apply 后，单事务全量覆盖目标配置
+cargo run --release --locked --bin claude-pool -- -c config.json import-legacy legacy.json --apply
 ```
 
-### 工具调用
+导出以只读快照读取旧库，文件只允许当前用户读写且不覆盖已有文件。`--redact-secrets` 生成的脱敏包只用于检查，不能 apply。正式导入需要新库和 Redis；目标实例应使用独立数据库与 Redis 前缀。导入保留目标机器的存储与监听配置，保留旧账号 `usageProjectionMode`，按报告审查容量、注入、原字节透传及新默认值变化。新系统之间迁移使用管理 API 配置包接口。
 
-完整支持 Anthropic 的 tool use 功能：
+## 测试
 
-```json
-{
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 1024,
-  "tools": [
-    {
-      "name": "get_weather",
-      "description": "获取指定城市的天气",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "city": {"type": "string"}
-        },
-        "required": ["city"]
-      }
-    }
-  ],
-  "messages": [...]
-}
+本项目是 bin 包，单测指定二进制：
+
+```bash
+cargo fmt --all
+cargo test --bin claude-pool -q
+cargo test --bin claude-pool -- account::golden_tests
+pnpm --dir ui check
+pnpm --dir ui build
 ```
 
-## 模型映射
+存储集成测试读取 `CLAUDE_POOL_TEST_POSTGRES_URL`、`CLAUDE_POOL_TEST_REDIS_URL`。未设置时相关测试自动跳过；需要强制验证的 CI 另设 `CLAUDE_POOL_REQUIRE_STORAGE_TESTS=1`。使用专门的测试数据库和 Redis，PostgreSQL 测试按 schema 隔离，Redis 测试按随机前缀隔离。
 
-| Anthropic 模型 | Kiro 模型 |
-|----------------|-----------|
-| `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
-| `*haiku*` | `claude-haiku-4.5` |
+```bash
+CLAUDE_POOL_TEST_POSTGRES_URL='postgres://claude_pool:password@127.0.0.1:25432/claude_pool_test' \
+CLAUDE_POOL_TEST_REDIS_URL='redis://127.0.0.1:26379/15' \
+CLAUDE_POOL_REQUIRE_STORAGE_TESTS=1 \
+  cargo test --bin claude-pool -q
+```
 
-## Admin（可选）
-
-当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
-
-- **Admin API（认证同 API Key）**
-  - `GET /api/admin/credentials` - 获取所有凭据状态
-  - `POST /api/admin/credentials` - 添加新凭据
-  - `DELETE /api/admin/credentials/:id` - 删除凭据
-  - `POST /api/admin/credentials/batch-delete` - 按选中 ID 批量删除已禁用凭据
-  - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
-  - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
-  - `POST /api/admin/credentials/:id/warmup` - 设置凭据预热次数
-  - `POST /api/admin/credentials/:id/in-flight/clear` - 清理凭据并发占用
-  - `POST /api/admin/credentials/:id/reset` - 重置失败计数
-  - `POST /api/admin/credentials/:id/refresh` - 强制刷新 Token
-  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
-  - `POST /api/admin/credentials/:id/test` - 测试指定凭据的模型调用
-  - `GET /api/admin/usage-records-paged` - 分页查询 Usage 记录
-  - `POST /api/admin/usage-records/clear` - 软删除当前 Usage 展示记录
-  - `GET /api/admin/model-pricing` - 获取模型价格目录
-  - `POST /api/admin/model-pricing/sync` - 手动同步模型价格目录
-  - `GET /api/admin/audit-logs` - 分页查询后台审计日志
-
-- **管理后台 UI**
-  - `GET /ui` - 访问管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。旧的 `/admin` 及其子路径永久重定向到 `/ui`。
-
-## 注意事项
-
-1. **凭证安全**: 凭据保存在 PgSQL 中，请妥善保管数据库和管理后台的 `adminApiKey`；导出的凭据文件不要提交到版本控制
-2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
+`tests/golden/usage/` 保存 48 个固定种子的用量快照，覆盖六种策略 × 流式/非流式 × 有无读取证据 × 有无 1h 写入。普通运行只比较预期输出；发布验收不设置 `GOLDEN_UPDATE`。压测工具为 `pool_loadtest`，先用 `cargo run --bin pool_loadtest -- --help` 查看参数。
 
 ## 项目结构
 
-```
-kiro-rs/
-├── src/
-│   ├── main.rs                 # 程序入口
-│   ├── http_client.rs          # HTTP 客户端构建
-│   ├── token.rs                # Token 计算模块
-│   ├── debug.rs                # 调试工具
-│   ├── test.rs                 # 测试
-│   ├── model/                  # 配置和参数模型
-│   │   ├── config.rs           # 应用配置
-│   │   └── arg.rs              # 命令行参数
-│   ├── anthropic/              # Anthropic API 兼容层
-│   │   ├── router.rs           # 路由配置
-│   │   ├── handlers.rs         # 请求处理器
-│   │   ├── middleware.rs       # 认证中间件
-│   │   ├── types.rs            # 类型定义
-│   │   ├── converter.rs        # 协议转换器
-│   │   ├── stream.rs           # 流式响应处理
-│   │   └── websearch.rs        # WebSearch 工具处理
-│   ├── kiro/                   # Kiro API 客户端
-│   │   ├── provider.rs         # API 提供者
-│   │   ├── token_manager.rs    # Token 管理
-│   │   ├── machine_id.rs       # 设备指纹生成
-│   │   ├── model/              # 数据模型
-│   │   │   ├── credentials.rs  # OAuth 凭证
-│   │   │   ├── events/         # 响应事件类型
-│   │   │   ├── requests/       # 请求类型
-│   │   │   ├── common/         # 共享类型
-│   │   │   ├── token_refresh.rs # Token 刷新模型
-│   │   │   └── usage_limits.rs # 使用额度模型
-│   │   └── parser/             # AWS Event Stream 解析器
-│   │       ├── decoder.rs      # 流式解码器
-│   │       ├── frame.rs        # 帧解析
-│   │       ├── header.rs       # 头部解析
-│   │       ├── error.rs        # 错误类型
-│   │       └── crc.rs          # CRC 校验
-│   ├── admin/                  # Admin API 模块
-│   │   ├── router.rs           # 路由配置
-│   │   ├── handlers.rs         # 请求处理器
-│   │   ├── service.rs          # 业务逻辑服务
-│   │   ├── types.rs            # 类型定义
-│   │   ├── middleware.rs       # 认证中间件
-│   │   └── error.rs            # 错误处理
-│   ├── ui/                     # 管理后台 UI 静态文件服务（/ui）
-│   │   └── router.rs           # embedded / redirect / proxy / filesystem 路由
-│   ├── storage/                # PgSQL 和 Redis 存储
-│   │   ├── postgres.rs         # PgSQL 表结构和读写
-│   │   └── redis_cache.rs      # Redis 缓存和调度运行态
-│   └── common/                 # 公共模块
-│       └── auth.rs             # 认证工具函数
-├── ui/                         # UI 前端工程（开发用 Vite，发布产物可嵌入二进制）
-├── tools/                      # 辅助工具
-├── Cargo.toml                  # 项目配置
-├── config.example.json         # 配置示例
-├── docker-compose.yml          # 旧版单服务 Docker Compose 配置
-├── docker-compose.local-infra.yml # 本地 PgSQL/Redis 测试依赖
-├── docker-compose.database.yml # 服务 + PgSQL + Redis 部署配置
-└── Dockerfile                  # Docker 构建文件
+以下路径以当前实现为准，设计目录目标见 [11 章第 2 节](docs/claude-pool-refactor/11-实施说明与关键逻辑契约.md#2-目标目录结构)。
+
+```text
+src/
+├── main.rs                       装配、启动、健康检查、后台任务
+├── model/
+│   ├── config.rs                 配置类型、默认值、校验
+│   ├── runtime.rs                RuntimeConfigStore 与热加载
+│   ├── routes.rs                 路由定义、预编译与合并
+│   ├── prefix_tool_plus_policy.rs plus 策略配置
+│   └── prompt_injection/         注入与路由功能配置
+├── anthropic/
+│   ├── router.rs、middleware.rs   协议路由、鉴权与路由限制
+│   ├── handlers.rs、handlers/    请求入口与路由功能处理
+│   ├── body_patch.rs             定点改写白名单
+│   ├── conversation_id.rs        稳定会话标识
+│   ├── cache.rs、prompt_cache.rs、prompt_cache_creation_control.rs
+│   ├── bounded_shaping.rs、prefix_tool_plus_shaping.rs  usage 算法
+│   └── usage.rs、pricing.rs、model_capabilities.rs      用量与目录
+├── account/
+│   ├── mod.rs                    账号、调度、lease、传输、流处理与投影编排
+│   ├── body_pipeline.rs、model_pipeline.rs、retry_pipeline.rs
+│   ├── usage_projection.rs、early_commit.rs
+│   └── tests.rs、golden_tests.rs
+├── storage/                      PostgreSQL、Redis、账号事件与演示数据
+├── admin/                        管理 API、配置包、路由场景与诊断入口
+├── migration/                    旧配置包导出、映射、差异报告与导入
+├── common/、diagnostics/         公共工具与采集
+├── ui/                           静态页面服务
+├── http_client.rs、token.rs      HTTP 客户端与 token 估算
+└── bin/pool_loadtest.rs          压测工具
+ui/                              React 控制台
+tests/golden/usage/               usage 快照
+docs/                            部署、开发说明与设计记录
 ```
 
 ## 技术栈
 
-- **Web 框架**: [Axum](https://github.com/tokio-rs/axum) 0.8
-- **异步运行时**: [Tokio](https://tokio.rs/)
-- **HTTP 客户端**: [Reqwest](https://github.com/seanmonstar/reqwest)
-- **序列化**: [Serde](https://serde.rs/)
-- **日志**: [tracing](https://github.com/tokio-rs/tracing)
-- **命令行**: [Clap](https://github.com/clap-rs/clap)
-- **数据库**: [SQLx](https://github.com/launchbadge/sqlx) + PostgreSQL
-- **缓存**: [Redis](https://redis.io/)
+Rust 2024、Axum 0.8、Tokio、Reqwest、Serde、tracing、Clap、SQLx / PostgreSQL、Redis；前端使用 React 18、TypeScript、Vite 5、Tailwind CSS 4、Radix UI 与 TanStack Query。Docker 使用多阶段构建，支持 amd64 / arm64；CI 校验格式、既有 Clippy 基线、前端构建与 Rust 测试。
 
 ## License
 
-MIT
-
-## 致谢
-
-本项目的实现离不开前辈的努力:  
- - [kiro2api](https://github.com/caidaoli/kiro2api)
- - [proxycast](https://github.com/aiclientproxy/proxycast)
-
-本项目部分逻辑参考了以上的项目, 再次由衷的感谢!
+[MIT](LICENSE)

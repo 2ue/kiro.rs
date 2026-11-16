@@ -1,7 +1,7 @@
 services:
   claude-pool:
     image: ${CLAUDE_POOL_IMAGE:-ghcr.io/2ue/claude-pool}:${CLAUDE_POOL_VERSION:-latest}
-    container_name: claude-pool
+    container_name: claude-pool-app
     restart: unless-stopped
     ports:
       - "${CLAUDE_POOL_PORT:-8990}:8990"
