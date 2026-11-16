@@ -1,0 +1,75 @@
+{
+  "mappingEnabled": true,
+  "capture": "capture-20261116T143039Z-23ec81bf",
+  "captureSha256": "de4b07773d62726d4c0e822baf86e70993aa59080988d467852577ac0b65fe2c",
+  "results": [
+    {
+      "case": "forced-pdf-probe-pdf",
+      "pass": true,
+      "status": 200,
+      "requestId": "req_01Fnh25Qv1PzpQHCU6R84ATy",
+      "durationSecs": 1.32,
+      "model": "claude-opus-5-5",
+      "stream": false,
+      "stop": "end_turn",
+      "usage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 290,
+        "output_tokens": 8,
+        "output_tokens_details": null,
+        "server_tool_use": null
+      },
+      "text": "cctest-isolated-doc-17",
+      "blocks": [
+        "thinking",
+        "text"
+      ],
+      "events": {}
+    },
+    {
+      "case": "forced-pdf-probe-pdf",
+      "pass": true,
+      "status": 200,
+      "requestId": "req_01JgWorBs2bp253Dwu4igJop",
+      "durationSecs": 1.77,
+      "model": "claude-opus-5-5",
+      "stream": false,
+      "stop": "end_turn",
+      "usage": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 290,
+        "output_tokens": 8,
+        "output_tokens_details": null,
+        "server_tool_use": null
+      },
+      "text": "cctest-isolated-doc-17",
+      "blocks": [
+        "thinking",
+        "text"
+      ],
+      "events": {}
+    }
+  ],
+  "upstreamEvidence": [
+    {
+      "requestId": "req_01Fnh25Qv1PzpQHCU6R84ATy",
+      "documentTextPresent": true,
+      "inlineDocumentInstructionPresent": true,
+      "upstreamPayloadSha256": [
+        "cf37d5bf4590636c0228760350ed76410bba6ef8859427e872e7d0a00a3bf502"
+      ],
+      "upstreamTextSha256": "2b28afdc27d44b562220834e84260faa0c147c2aef9bbac9d0fa798ef0f66a52"
+    },
+    {
+      "requestId": "req_01JgWorBs2bp253Dwu4igJop",
+      "documentTextPresent": true,
+      "inlineDocumentInstructionPresent": true,
+      "upstreamPayloadSha256": [
+        "cf37d5bf4590636c0228760350ed76410bba6ef8859427e872e7d0a00a3bf502"
+      ],
+      "upstreamTextSha256": "9c472658c88edaa3762fd7ce0ef775013c1ef2209ed6a604f8056de95dfb39d8"
+    }
+  ]
+}

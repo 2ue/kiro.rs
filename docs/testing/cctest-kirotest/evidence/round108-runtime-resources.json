@@ -1,0 +1,110 @@
+[
+  {
+    "file": "round108-capabilities-baseline-resources.jsonl",
+    "samples": 13,
+    "memAvailableMinMiB": 10010,
+    "load1Max": 1.29833984375,
+    "health": {
+      "59138": {
+        "200": 13
+      },
+      "59140": {
+        "200": 13
+      },
+      "59141": {
+        "200": 13
+      }
+    },
+    "rssKiB": {
+      "start": 224608,
+      "peak": 252056,
+      "end": 251744
+    },
+    "fds": {
+      "start": 30,
+      "peak": 38,
+      "end": 38
+    }
+  },
+  {
+    "file": "round108-regression-resources.jsonl",
+    "samples": 7,
+    "memAvailableMinMiB": 10225.83203125,
+    "load1Max": 1.22021484375,
+    "health": {
+      "59138": {
+        "200": 7
+      },
+      "59140": {
+        "200": 7
+      },
+      "59141": {
+        "200": 7
+      }
+    },
+    "rssKiB": {
+      "start": 216404,
+      "peak": 228812,
+      "end": 223368
+    },
+    "fds": {
+      "start": 34,
+      "peak": 35,
+      "end": 35
+    }
+  },
+  {
+    "file": "round108-release-258-confirm-resources.jsonl",
+    "samples": 16,
+    "memAvailableMinMiB": 10280,
+    "load1Max": 1.1787109375,
+    "health": {
+      "59138": {
+        "200": 16
+      },
+      "59140": {
+        "200": 16
+      },
+      "59141": {
+        "200": 16
+      }
+    },
+    "rssKiB": {
+      "start": 224396,
+      "peak": 224396,
+      "end": 216132
+    },
+    "fds": {
+      "start": 36,
+      "peak": 36,
+      "end": 35
+    }
+  },
+  {
+    "file": "round108-release-258-resources.jsonl",
+    "samples": 18,
+    "memAvailableMinMiB": 10414,
+    "load1Max": 2.0126953125,
+    "health": {
+      "59138": {
+        "200": 18
+      },
+      "59140": {
+        "200": 18
+      },
+      "59141": {
+        "200": 18
+      }
+    },
+    "rssKiB": {
+      "start": 148684,
+      "peak": 229936,
+      "end": 224228
+    },
+    "fds": {
+      "start": 30,
+      "peak": 38,
+      "end": 38
+    }
+  }
+]

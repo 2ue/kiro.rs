@@ -1,0 +1,16 @@
+{"ts": 1794839285.6294215, "memAvailableMiB": 10398, "swapFreeMiB": 14290, "load1": 0.83154296875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 224396, "fds": 36}}
+{"ts": 1794839290.6373115, "memAvailableMiB": 10419, "swapFreeMiB": 14290, "load1": 0.92529296875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 223028, "fds": 35}}
+{"ts": 1794839295.6465545, "memAvailableMiB": 10430, "swapFreeMiB": 14290, "load1": 0.85107421875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 216932, "fds": 35}}
+{"ts": 1794839300.653531, "memAvailableMiB": 10429, "swapFreeMiB": 14290, "load1": 0.86328125, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 203408, "fds": 35}}
+{"ts": 1794839305.7147858, "memAvailableMiB": 10440, "swapFreeMiB": 14290, "load1": 0.7939453125, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 195068, "fds": 35}}
+{"ts": 1794839310.7267568, "memAvailableMiB": 10461, "swapFreeMiB": 14290, "load1": 0.72998046875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 195068, "fds": 35}}
+{"ts": 1794839315.7358737, "memAvailableMiB": 10434, "swapFreeMiB": 14290, "load1": 0.67138671875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 195068, "fds": 35}}
+{"ts": 1794839320.744169, "memAvailableMiB": 10413, "swapFreeMiB": 14290, "load1": 0.6171875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 210784, "fds": 35}}
+{"ts": 1794839325.7529168, "memAvailableMiB": 10408, "swapFreeMiB": 14290, "load1": 0.64794921875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 210784, "fds": 35}}
+{"ts": 1794839330.762284, "memAvailableMiB": 10419, "swapFreeMiB": 14290, "load1": 0.75634765625, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 205928, "fds": 35}}
+{"ts": 1794839335.7700207, "memAvailableMiB": 10395, "swapFreeMiB": 14289, "load1": 0.77587890625, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 221800, "fds": 35}}
+{"ts": 1794839340.7787383, "memAvailableMiB": 10323, "swapFreeMiB": 14289, "load1": 0.7939453125, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 218884, "fds": 35}}
+{"ts": 1794839345.7866302, "memAvailableMiB": 10318, "swapFreeMiB": 14289, "load1": 0.72998046875, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 216040, "fds": 36}}
+{"ts": 1794839351.0771837, "memAvailableMiB": 10280, "swapFreeMiB": 14289, "load1": 0.83203125, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 219640, "fds": 35}}
+{"ts": 1794839356.0856085, "memAvailableMiB": 10323, "swapFreeMiB": 14289, "load1": 0.845703125, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 219644, "fds": 35}}
+{"ts": 1794839361.0937743, "memAvailableMiB": 10326, "swapFreeMiB": 14289, "load1": 1.1787109375, "health": {"59138": 200, "59140": 200, "59141": 200}, "process": {"pid": 447746, "rssKiB": 216132, "fds": 35}}

@@ -147,7 +147,7 @@ fn append_final_answer_contract(
         return;
     };
     let mut reminder = format!(
-        "<structured_output_contract>\nThe API requires the final answer to conform to the JSON schema declared by `{tool_name}`. Call `{tool_name}` with that answer as its input; ordinary text is not a valid final answer. If information or actions are needed first, use the available client tools and wait for their results, then call `{tool_name}` on the final turn. Respect an explicitly named client tool for the current turn.\n</structured_output_contract>"
+        "<structured_output_contract>\nThe API requires the final answer to conform to the JSON schema declared by `{tool_name}`. Call `{tool_name}` with that answer as its input; ordinary text is not a valid final answer. This response format also applies when an answer expresses uncertainty, explains limitations, or disagrees with a premise: put that explanation in the schema's descriptive fields where the schema permits it, without inventing facts or adding fields. If information or actions are needed first, use the available client tools and wait for their results, then call `{tool_name}` on the final turn. Respect an explicitly named client tool for the current turn.\n</structured_output_contract>"
     );
     if !client_roles.is_empty() {
         reminder.push_str(&format!(
@@ -613,6 +613,8 @@ mod tests {
         let reminder = mapped.messages.last().unwrap().content.to_string();
         assert!(reminder.contains("You are Orbit, a terminal coding client."));
         assert!(reminder.contains("Model deployment metadata does not replace"));
+        assert!(reminder.contains("expresses uncertainty, explains limitations"));
+        assert!(reminder.contains("without inventing facts or adding fields"));
         assert_eq!(
             serde_json::to_value(&mapped.system).unwrap(),
             serde_json::to_value(&request.system).unwrap()

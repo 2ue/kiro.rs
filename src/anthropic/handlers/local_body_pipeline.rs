@@ -280,12 +280,7 @@ pub(super) fn prepare_with_plan(
         .as_ref()
         .map(|(request, _)| request)
         .unwrap_or(payload);
-    let integer_output_payload = crate::anthropic::integer_output::from_messages_request(payload)
-        .and_then(|constraint| {
-            let mut request = payload.clone();
-            crate::anthropic::integer_output::append_to_messages_request(&mut request, constraint)
-                .then_some(request)
-        });
+    let integer_output_payload = integer_output_payload(payload, model_resolution.forced.is_some());
     let payload = integer_output_payload.as_ref().unwrap_or(payload);
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
     let discovered_reasoning_capability = matches!(
@@ -551,6 +546,19 @@ pub(super) fn prepare_with_plan(
     })
 }
 
+fn integer_output_payload(payload: &MessagesRequest, forced_mode: bool) -> Option<MessagesRequest> {
+    // A mapped request already carries deployment instructions. Repeating user constraints as
+    // another system policy can trigger instruction-conflict replies instead of the requested data.
+    if forced_mode {
+        return None;
+    }
+    crate::anthropic::integer_output::from_messages_request(payload).and_then(|constraint| {
+        let mut request = payload.clone();
+        crate::anthropic::integer_output::append_to_messages_request(&mut request, constraint)
+            .then_some(request)
+    })
+}
+
 fn should_expose_downstream_thinking(
     payload: &MessagesRequest,
     kiro_request: &KiroRequest,
@@ -640,6 +648,30 @@ mod tests {
             tool_cache_point_insert_after: Vec::new(),
             cache_point_plan_recording_enabled: true,
         }
+    }
+
+    #[test]
+    fn mapped_integer_requests_keep_client_constraints_without_an_extra_system_policy() {
+        let mut payload = messages_request(None, None);
+        payload.messages[0].content = serde_json::json!(
+            "Return 12 integers between 1 and 20. Use spaces, and do not call tools."
+        );
+        let original = serde_json::to_value(&payload).unwrap();
+        assert!(integer_output_payload(&payload, true).is_none());
+        assert_eq!(serde_json::to_value(&payload).unwrap(), original);
+
+        let normal = integer_output_payload(&payload, false).expect("existing normal-mode policy");
+        assert_eq!(
+            serde_json::to_value(&normal.messages).unwrap(),
+            original["messages"]
+        );
+        assert!(
+            normal
+                .system
+                .unwrap()
+                .iter()
+                .any(|block| { block.text.contains("Output exactly 12 integer values") })
+        );
     }
 
     #[test]

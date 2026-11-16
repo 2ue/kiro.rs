@@ -1,0 +1,19 @@
+{
+  "state": "running",
+  "sessionId": "capture-20261116T142805Z-f161e5ff",
+  "startedAt": "2026-11-16T14:28:05.627069355Z",
+  "stoppedAt": null,
+  "expiresAt": "2026-11-16T14:43:05.627069355Z",
+  "limits": {
+    "maxDurationSecs": 900,
+    "maxBytes": 67108864,
+    "maxEvents": 100000,
+    "includeSecrets": false
+  },
+  "eventCount": 0,
+  "bytesWritten": 0,
+  "droppedEvents": 0,
+  "archiveBytes": null,
+  "stopReason": null,
+  "error": null
+}

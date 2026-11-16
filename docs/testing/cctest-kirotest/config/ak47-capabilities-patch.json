@@ -1,0 +1,16 @@
+{
+  "bodyConversion": {
+    "codeExecution": {
+      "pathOverrides": {
+        "/dfcache/ak47": true
+      }
+    }
+  },
+  "routeFeatures": {
+    "pathOverrides": {
+      "/dfcache/ak47": {
+        "modelDrivenWebSearch": true
+      }
+    }
+  }
+}

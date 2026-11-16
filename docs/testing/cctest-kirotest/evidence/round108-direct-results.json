@@ -1,0 +1,258 @@
+[
+  {
+    "case": "forced-text-False",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01TouqnW6FXH7EDZTWdk5j5k",
+    "durationSecs": 0.79,
+    "model": "claude-opus-5-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 10,
+      "output_tokens": 3,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "probe-ok",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {}
+  },
+  {
+    "case": "forced-json-False",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01qQfa8C5T67KA4NJCskCCPD",
+    "durationSecs": 1.12,
+    "model": "claude-opus-5-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 30,
+      "output_tokens": 16,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "{\"answer\":\"I am Kiro. Quoted data.\",\"n\":17}",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {}
+  },
+  {
+    "case": "forced-tool-False",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01uBCf8Rqxq7pBgs3o6NvGG4",
+    "durationSecs": 1.02,
+    "model": "claude-opus-5-5",
+    "stream": false,
+    "stop": "tool_use",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 51,
+      "output_tokens": 3,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "",
+    "blocks": [
+      "thinking",
+      "tool_use"
+    ],
+    "events": {}
+  },
+  {
+    "case": "forced-text-True",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_011n4ici2wQuxV48Rpk71dge",
+    "durationSecs": 0.78,
+    "model": "claude-opus-5-5",
+    "stream": true,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 10,
+      "output_tokens": 37,
+      "output_tokens_details": {
+        "thinking_tokens": 35
+      },
+      "server_tool_use": null
+    },
+    "text": "probe-ok",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 2,
+      "ping": 1,
+      "content_block_delta": 3,
+      "content_block_stop": 2,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "forced-json-True",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01djdRmGeQvSaKc1HwLBPfJ8",
+    "durationSecs": 1.11,
+    "model": "claude-opus-5-5",
+    "stream": true,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 30,
+      "output_tokens": 76,
+      "output_tokens_details": {
+        "thinking_tokens": 60
+      },
+      "server_tool_use": null
+    },
+    "text": "{\"n\": 17, \"answer\": \"I am Kiro. Quoted data.\"}",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 2,
+      "content_block_delta": 10,
+      "ping": 1,
+      "content_block_stop": 2,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "forced-tool-True",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_018NwwQojJcqCxkT2arDDc3v",
+    "durationSecs": 0.92,
+    "model": "claude-opus-5-5",
+    "stream": true,
+    "stop": "tool_use",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 51,
+      "output_tokens": 50,
+      "output_tokens_details": {
+        "thinking_tokens": 46
+      },
+      "server_tool_use": null
+    },
+    "text": "",
+    "blocks": [
+      "thinking",
+      "tool_use"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 2,
+      "ping": 1,
+      "content_block_delta": 4,
+      "content_block_stop": 2,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "forced-adaptive-nonstream",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01NqCMLHs3TQR7ADvQo7JdUC",
+    "durationSecs": 1.01,
+    "model": "claude-opus-5-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 1,
+      "output_tokens": 1,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "2",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {}
+  },
+  {
+    "case": "forced-thinking",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01d9KXSsuy1bxQFxXjfdMMA5",
+    "durationSecs": 0.97,
+    "model": "claude-opus-5-5",
+    "stream": true,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 22,
+      "output_tokens": 61,
+      "output_tokens_details": {
+        "thinking_tokens": 61
+      },
+      "server_tool_use": null
+    },
+    "text": "323",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 2,
+      "ping": 1,
+      "content_block_delta": 14,
+      "content_block_stop": 2,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "forced-pdf",
+    "pass": false,
+    "status": 200,
+    "requestId": "req_01wx3CKqCE8mEPQs938gEaMG",
+    "durationSecs": 1.88,
+    "model": "claude-opus-5-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 290,
+      "output_tokens": 76,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "The document block does not contain extracted text—only a reference identifier \"cctest-isolated-doc-17\". The PDF content was not successfully extracted or is not available in the provided document data.",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {}
+  }
+]

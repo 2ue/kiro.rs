@@ -956,6 +956,14 @@ async fn call_model(
         }
         (token::count_tokens(&counted) as i32).max(1)
     };
+    if ctx.model_resolution.forced.is_some()
+        && prepared.extract_xml_thinking
+        && request_hides_reasoning(&ctx.payload, Some(upstream_model))
+    {
+        // Inner model calls bypass the ordinary response processor. Hidden reasoning must
+        // also be removed here, before it can become a preamble or a cited answer paragraph.
+        output.text = super::super::stream::extract_thinking_from_complete_text(&output.text).1;
+    }
     accounting.input_tokens = accounting.input_tokens.saturating_add(output.input_tokens);
     accounting.output_tokens = accounting
         .output_tokens

@@ -1,0 +1,178 @@
+{
+  "status": "done",
+  "step": 11,
+  "stepName": "evaluate",
+  "checkTokenUsage": false,
+  "progress": 1,
+  "scores": {
+    "tag_check": 10,
+    "stream_structure": 5,
+    "non_stream": 0,
+    "websearch": 0,
+    "signature_proto": 0,
+    "output_config": 10,
+    "server_tool": 10,
+    "knowledge": 10,
+    "model_attribution": 0,
+    "doc_recognition": 10,
+    "image_recognition": 0
+  },
+  "infoChecks": {
+    "server_tool": true,
+    "knowledge": true
+  },
+  "stepStatus": {
+    "tag_check": "done",
+    "stream_structure": "done",
+    "non_stream": "done",
+    "websearch": "done",
+    "output_config": "done",
+    "signature_proto": "done",
+    "server_tool": "done",
+    "knowledge": "done",
+    "model_attribution": "done",
+    "doc_recognition": "done",
+    "image_recognition": "done"
+  },
+  "total": 50,
+  "verdictKey": "reversed",
+  "hasVertex": false,
+  "streamChannel": null,
+  "nonStreamChannel": null,
+  "expectedModel": "claude-opus-5-5",
+  "tokenAudit": null,
+  "tokenBaseline": [
+    {
+      "input_tokens": 4,
+      "output_tokens": 130,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 23814,
+      "msg_count": 1
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 134,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 24194,
+      "msg_count": 3
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 4333,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 24340,
+      "msg_count": 5
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 2420,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 25158,
+      "msg_count": 7
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 2435,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 25534,
+      "msg_count": 9
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 1470,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 26206,
+      "msg_count": 11
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 1958,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 26774,
+      "msg_count": 13
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 1259,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 29211,
+      "msg_count": 15
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 362,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 30126,
+      "msg_count": 17
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 403,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 31261,
+      "msg_count": 19
+    },
+    {
+      "input_tokens": 2,
+      "output_tokens": 232,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 31658,
+      "msg_count": 21
+    }
+  ],
+  "responseModel": "claude-opus-5-5",
+  "metrics": {
+    "latencyMs": 3648,
+    "ttfbMs": 1291,
+    "tokensPerSec": 165.3,
+    "inputTokens": 1,
+    "outputTokens": 92
+  },
+  "attribution": {
+    "prediction": "claude-sonnet-4-6",
+    "probability": 100,
+    "family": "claude",
+    "familyProbability": 100,
+    "claimedInBank": true,
+    "usedOutputs": 1,
+    "swapSuspected": true,
+    "top": [
+      {
+        "model": "claude-sonnet-4-6",
+        "probability": 100
+      },
+      {
+        "model": "claude-opus-4-6",
+        "probability": 0
+      },
+      {
+        "model": "claude-opus-4-7",
+        "probability": 0
+      }
+    ],
+    "reason": "指纹归因为同家族的 claude-sonnet-4-6(100%),声称 claude-opus-5-5 仅 0%,疑似被替换或降级"
+  },
+  "_label": "round108-capabilities-baseline",
+  "_url": "https://kirotest.okmcode.com/dfcache/ak47",
+  "_route": "/dfcache/ak47",
+  "_model": "claude-opus-5-5",
+  "_startedAt": "2026-11-16T13:49:14.298159+00:00",
+  "_finishedAt": "2026-11-16T13:50:13.750229+00:00",
+  "_kiro": {
+    "requests": 14,
+    "local": 14,
+    "rawInput": 270732,
+    "billableInput": 66083,
+    "compatInput": 4438,
+    "cacheRead": 170708,
+    "cacheCreation": 61645,
+    "output": 6433,
+    "usd": 0.48877860000000006,
+    "originalUsd": 1.211588,
+    "credits": 0.726529007628524,
+    "cacheHitRate": 72.1,
+    "usdPerCredit": 0.673
+  },
+  "_actualForcedTarget": "claude-haiku-4-5",
+  "_forcedMappingEnabled": true
+}

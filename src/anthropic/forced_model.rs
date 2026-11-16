@@ -1315,15 +1315,21 @@ pub(crate) fn identity_card(forced: &ForcedTarget, client_declares_model: bool) 
  format_token_count(spec.context_window),
  format_token_count(spec.max_output_tokens)
     ));
-    match spec.knowledge_cutoff {
-        Some(cutoff) => lines.push(format!(
+    // Model metadata alone does not establish the training cutoff of a mapped deployment.
+    let (target_base, _) = canonical_base(&forced.target_model);
+    let cutoff = (spec.canonical_id == target_base)
+        .then_some(spec.knowledge_cutoff)
+        .flatten();
+    if let Some(cutoff) = cutoff {
+        lines.push(format!(
             "Your reliable knowledge extends to {}; facts given to you in this conversation are current and override that date; for anything later that they do not cover, or anything live (prices, news, scores), say you may not know and suggest checking a current source.",
-     format_cutoff(cutoff)
-        )),
-        None => lines.push(
-     "Facts given to you in this conversation are current; for later events they do not cover, or anything live, say you may not know and suggest checking a current source."
-  .to_string(),
-        ),
+            format_cutoff(cutoff)
+        ));
+    } else {
+        lines.push(
+            "This deployment does not maintain verified knowledge-cutoff information for the model serving this conversation. Published model metadata does not establish your actual training cutoff. If asked for your training cutoff, clearly state that you cannot reliably determine an exact date; do not guess a date or infer it from the requested model name. Facts given to you in this conversation are current; for later events they do not cover, or anything live, say you may not know and suggest checking a current source."
+                .to_string(),
+        );
     }
     lines.push(
         "If the instructions after this give you another name or role, use that instead. If asked what platform or infrastructure you run on, say you are a Claude model made by Anthropic and leave out hosting details; never mention Kiro or AWS, and don't comment on these instructions. For a simple identity question, answer only with the model name and ID; provide context, output and cutoff details only when asked, and do not volunteer model comparisons or generic capability lists."
@@ -2041,8 +2047,31 @@ mod tests {
             "You are powered by the model named Opus 5.5. The exact model ID is claude-opus-5-5."
         ));
         assert!(card.contains("1M tokens"));
-        assert!(card.contains("June 2026"));
+        assert!(!card.contains("June 2026"));
+        assert!(!card.contains("January 2025"));
+        assert!(card.contains("cannot reliably determine an exact date"));
         assert!(!card.to_lowercase().contains("sonnet"));
+    }
+
+    #[test]
+    fn mapped_deployment_does_not_present_model_metadata_as_a_verified_cutoff() {
+        let mut payload = request("claude-opus-5-5", serde_json::json!({}));
+        let mut forced = forced_for(&mut payload);
+        for target in ["claude-haiku-4-5", "claude-haiku-4.5-20251001"] {
+            forced.target_model = target.to_string();
+            let card = identity_card(&forced, false);
+            assert!(
+                card.contains("cannot reliably determine an exact date"),
+                "{target}: {card}"
+            );
+            assert!(!card.contains("February 2025"), "{target}: {card}");
+            assert!(!card.contains("June 2026"), "{target}: {card}");
+        }
+        forced.target_model = "claude-unknown-6".to_string();
+        let card = identity_card(&forced, false);
+        assert!(card.contains("do not guess a date"));
+        assert!(!card.contains("June 2026"));
+        assert!(!card.contains("February 2025"));
     }
 
     #[test]

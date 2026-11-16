@@ -1,0 +1,143 @@
+[
+  {
+    "label": "round108-capabilities-baseline",
+    "resultFile": "results/20261116T134914-round108-capabilities-baseline.json",
+    "resultUrl": "https://cctest.ai/zh/result/5aa50e71-e39d-45b3-80ba-76a722bb9aae",
+    "total": 50,
+    "scores": {
+      "tag_check": 10,
+      "stream_structure": 5,
+      "non_stream": 0,
+      "websearch": 0,
+      "signature_proto": 0,
+      "output_config": 10,
+      "server_tool": 10,
+      "knowledge": 10,
+      "model_attribution": 0,
+      "doc_recognition": 10,
+      "image_recognition": 0
+    },
+    "attribution": {
+      "prediction": "claude-sonnet-4-6",
+      "probability": 100,
+      "family": "claude",
+      "familyProbability": 100,
+      "claimedInBank": true,
+      "usedOutputs": 1,
+      "swapSuspected": true,
+      "top": [
+        {
+          "model": "claude-sonnet-4-6",
+          "probability": 100
+        },
+        {
+          "model": "claude-opus-4-6",
+          "probability": 0
+        },
+        {
+          "model": "claude-opus-4-7",
+          "probability": 0
+        }
+      ],
+      "reason": "指纹归因为同家族的 claude-sonnet-4-6(100%),声称 claude-opus-5-5 仅 0%,疑似被替换或降级"
+    },
+    "requestedModel": "claude-opus-5-5",
+    "forcedTarget": "claude-haiku-4-5",
+    "forcedMappingEnabled": true,
+    "checkTokenUsage": false
+  },
+  {
+    "label": "round108-release-258",
+    "resultFile": "results/20261116T142639-round108-release-258.json",
+    "resultUrl": "https://cctest.ai/zh/result/c03471cc-f23b-4ef8-aaba-83d9c06eaa5a",
+    "total": 50,
+    "scores": {
+      "tag_check": 10,
+      "stream_structure": 5,
+      "non_stream": 0,
+      "websearch": 0,
+      "signature_proto": 0,
+      "output_config": 10,
+      "server_tool": 10,
+      "knowledge": 10,
+      "model_attribution": 0,
+      "doc_recognition": 10,
+      "image_recognition": 0
+    },
+    "attribution": {
+      "prediction": "claude-sonnet-4-6",
+      "probability": 97,
+      "family": "claude",
+      "familyProbability": 100,
+      "claimedInBank": true,
+      "usedOutputs": 2,
+      "swapSuspected": true,
+      "top": [
+        {
+          "model": "claude-sonnet-4-6",
+          "probability": 97
+        },
+        {
+          "model": "claude-opus-4-6",
+          "probability": 1
+        },
+        {
+          "model": "claude-opus-4-8",
+          "probability": 1
+        }
+      ],
+      "reason": "指纹归因为同家族的 claude-sonnet-4-6(97%),声称 claude-opus-5-5 仅 0%,疑似被替换或降级"
+    },
+    "requestedModel": "claude-opus-5-5",
+    "forcedTarget": "claude-haiku-4-5",
+    "forcedMappingEnabled": true,
+    "checkTokenUsage": false
+  },
+  {
+    "label": "round108-release-258-confirm",
+    "resultFile": "results/20261116T142805-round108-release-258-confirm.json",
+    "resultUrl": "https://cctest.ai/zh/result/60113460-df32-48f4-b0af-92d846301e7f",
+    "total": 59,
+    "scores": {
+      "tag_check": 10,
+      "stream_structure": 5,
+      "non_stream": 0,
+      "websearch": 0,
+      "signature_proto": 0,
+      "output_config": 10,
+      "server_tool": 10,
+      "knowledge": 10,
+      "model_attribution": 0,
+      "doc_recognition": 10,
+      "image_recognition": 10
+    },
+    "attribution": {
+      "prediction": "claude-sonnet-4-6",
+      "probability": 100,
+      "family": "claude",
+      "familyProbability": 100,
+      "claimedInBank": true,
+      "usedOutputs": 3,
+      "swapSuspected": true,
+      "top": [
+        {
+          "model": "claude-sonnet-4-6",
+          "probability": 100
+        },
+        {
+          "model": "claude-opus-4-7",
+          "probability": 0
+        },
+        {
+          "model": "gpt-5.6-terra",
+          "probability": 0
+        }
+      ],
+      "reason": "指纹归因为同家族的 claude-sonnet-4-6(100%),声称 claude-opus-5-5 仅 0%,疑似被替换或降级"
+    },
+    "requestedModel": "claude-opus-5-5",
+    "forcedTarget": "claude-haiku-4-5",
+    "forcedMappingEnabled": true,
+    "checkTokenUsage": false
+  }
+]

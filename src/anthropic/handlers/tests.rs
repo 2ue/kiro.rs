@@ -17590,6 +17590,7 @@ struct ModelDrivenUpstreamState {
     mcp_hits: Arc<AtomicUsize>,
     fail_answer_round: Arc<std::sync::atomic::AtomicBool>,
     mcp_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    xml_reasoning: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn model_driven_eventstream(frames: Vec<Vec<u8>>) -> Response {
@@ -17619,11 +17620,19 @@ async fn model_driven_model_upstream(
     state.model_hits.fetch_add(1, Ordering::AcqRel);
     let body = String::from_utf8_lossy(&body);
     if !body.contains("toolResults") {
-        return model_driven_eventstream(vec![eventstream_test_frame(
+        let mut frames = Vec::new();
+        if state.xml_reasoning.load(Ordering::Acquire) {
+            frames.push(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content": "<thinking>\nprivate-search-plan\n</thinking>\n\nSearching now."}),
+            ));
+        }
+        frames.push(eventstream_test_frame(
             "toolUseEvent",
             json!({"name": "web_search", "toolUseId": "tooluse_md_1",
                 "input": "{\"query\":\"rust release\"}", "stop": true}),
-        )]);
+        ));
+        return model_driven_eventstream(frames);
     }
     if state.fail_answer_round.load(Ordering::Acquire) {
         return (
@@ -17632,9 +17641,14 @@ async fn model_driven_model_upstream(
         )
             .into_response();
     }
+    let answer = if state.xml_reasoning.load(Ordering::Acquire) {
+        "<thinking>\nprivate-answer-plan\n</thinking>\n\nRust shipped a new release [1]. More details later."
+    } else {
+        "Rust shipped a new release [1]. More details later."
+    };
     model_driven_eventstream(vec![eventstream_test_frame(
         "assistantResponseEvent",
-        json!({"content": "Rust shipped a new release [1]. More details later."}),
+        json!({"content": answer}),
     )])
 }
 
@@ -17896,6 +17910,60 @@ async fn run_model_driven_websearch_non_stream_and_template_mode_record_their_mo
 fn model_driven_websearch_non_stream_and_template_mode_record_their_mode() {
     run_handler_fixture_on_large_stack_thread("model-driven-non-stream", || async {
         run_model_driven_websearch_non_stream_and_template_mode_record_their_mode().await;
+    });
+}
+
+#[test]
+fn forced_websearch_hides_inner_xml_reasoning_and_keeps_citations_and_usage() {
+    run_handler_fixture_on_large_stack_thread("forced-websearch-hidden-reasoning", || async {
+        for stream in [false, true] {
+            let upstream = ModelDrivenUpstream::start().await;
+            upstream.state.xml_reasoning.store(true, Ordering::Release);
+            let (router, recorder) =
+                websearch_handler_test_router_with_config(&upstream.base_url, |config| {
+                    config.route_features.defaults.model_driven_web_search = true;
+                    config.forced_model_mapping.enabled = true;
+                    config.forced_model_mapping.default_target = "claude-haiku-4-5".to_string();
+                    config.kiro_upstream_response_timeout_secs = 10;
+                });
+            let mut payload: Value =
+                serde_json::from_str(&single_query_websearch_body("What is new in Rust?", stream))
+                    .unwrap();
+            payload["model"] = json!("claude-opus-5-5");
+            let response = router
+                .oneshot(multimodal_handler_request(
+                    "/v1/messages",
+                    payload.to_string(),
+                ))
+                .await
+                .expect("forced websearch response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let request_id = response_request_id(&response);
+            let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+                .await
+                .expect("forced websearch body");
+            let serialized = String::from_utf8_lossy(&body);
+            assert!(!serialized.contains("private-search-plan"), "{serialized}");
+            assert!(!serialized.contains("private-answer-plan"), "{serialized}");
+            assert!(!serialized.contains("<thinking>"), "{serialized}");
+            assert!(serialized.contains("Searching now."), "{serialized}");
+            assert!(
+                serialized.contains("Rust shipped a new release"),
+                "{serialized}"
+            );
+            assert!(
+                serialized.contains("web_search_result_location"),
+                "{serialized}"
+            );
+            let record = usage_record_for_request(&recorder, &request_id);
+            assert_eq!(record.status, UsageRecordStatus::Success);
+            assert_eq!(
+                record.output_tokens, 80,
+                "hidden tokens still count toward usage"
+            );
+            assert_eq!(upstream.state.model_hits.load(Ordering::Acquire), 2);
+            assert_eq!(upstream.state.mcp_hits.load(Ordering::Acquire), 1);
+        }
     });
 }
 

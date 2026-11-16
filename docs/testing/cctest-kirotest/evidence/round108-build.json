@@ -1,0 +1,60 @@
+{
+  "version": "0.0.258",
+  "buildMode": "release opt-level=0, lto=false, debug=0, incremental=false, jobs=1, nice=15, ionice=3",
+  "attempts": [
+    {
+      "attempt": 1,
+      "logSha256": "92e620d81f38fd23145a5601851b12d0ea1b2ace3bdb5060f22d0e1fb3b24630",
+      "testResult": "FAILED. 3225 passed; 1 failed; 18 ignored; 0 measured; 0 filtered out; finished in 314.77s",
+      "sampleCount": 179,
+      "memAvailableMinMiB": 5000.48046875,
+      "swapFreeMinMiB": 14243.4453125,
+      "load1Max": 2.775390625,
+      "pausedSamples": 0,
+      "health": {
+        "59138": {
+          "200": 179
+        },
+        "59140": {
+          "200": 179
+        },
+        "59141": {
+          "200": 179
+        }
+      },
+      "scopedCleanup": true
+    },
+    {
+      "attempt": 2,
+      "logSha256": "b0dde1975e43ebf289e30b3a0165f25556b92fbe28c440ae8d55f54309376e78",
+      "testResult": "ok. 3226 passed; 0 failed; 18 ignored; 0 measured; 0 filtered out; finished in 318.15s",
+      "sampleCount": 205,
+      "memAvailableMinMiB": 5055.03515625,
+      "swapFreeMinMiB": 14243.9453125,
+      "load1Max": 4.13427734375,
+      "pausedSamples": 0,
+      "health": {
+        "59138": {
+          "200": 205
+        },
+        "59140": {
+          "200": 205
+        },
+        "59141": {
+          "200": 205
+        }
+      },
+      "scopedCleanup": true
+    }
+  ],
+  "sourceHashes": {
+    "Cargo.toml": "469f346c6759ccc2ac4cdacd7ecb0542f45b0b48e131f2cca2fe95a9759300e7",
+    "Cargo.lock": "7982f64dcd9f6831fa320b8807b4e445064c294a112468b96ed054b36d016ef9",
+    "src/anthropic/forced_model.rs": "84d871b33d70f28d1e444794eb781c77385b027ddad36f8f4be13256c7921f68",
+    "src/anthropic/structured_output.rs": "9219d188f0fb219d467c4f55b3275bfe6ed5002d4d053df38b139636d198f744",
+    "src/anthropic/handlers/local_body_pipeline.rs": "e82651658ca999c7f5778479b0cf7f6ede0e913f7920fc4fe195378762723158",
+    "src/anthropic/handlers/model_driven_websearch.rs": "436495ed10abcc0cfb826a6a87a5e827344336dbca4ed769fd9e5474ae5b1ad8",
+    "src/anthropic/handlers/tests.rs": "e3d9c1d3693981f7246f1c3963fc4301ab06b4e49d82e6c2f62f0a79d47f54f8"
+  },
+  "binarySha256": "ee51b698c973983740b7189804253c4518054310b0970f72fdba2aa87c371ef5"
+}

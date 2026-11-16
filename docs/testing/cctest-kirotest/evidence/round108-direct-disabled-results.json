@@ -1,0 +1,241 @@
+[
+  {
+    "case": "mapping-disabled-text-False",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01axYUGt82LD1ba2edCjYuQP",
+    "durationSecs": 0.65,
+    "model": "claude-haiku-4-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4110,
+      "output_tokens": 3,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "probe-ok",
+    "blocks": [
+      "text"
+    ],
+    "events": {}
+  },
+  {
+    "case": "mapping-disabled-json-False",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01D4EL13Db6JL1qqcgG97zw6",
+    "durationSecs": 0.87,
+    "model": "claude-haiku-4-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4853,
+      "output_tokens": 16,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "{\"answer\":\"I am Kiro. Quoted data.\",\"n\":17}",
+    "blocks": [
+      "text"
+    ],
+    "events": {}
+  },
+  {
+    "case": "mapping-disabled-tool-False",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01Vrf4J5XyEj4sffYeFHbPaL",
+    "durationSecs": 0.74,
+    "model": "claude-haiku-4-5",
+    "stream": false,
+    "stop": "tool_use",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4707,
+      "output_tokens": 3,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "",
+    "blocks": [
+      "tool_use"
+    ],
+    "events": {}
+  },
+  {
+    "case": "mapping-disabled-text-True",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01B1EWqJhyaGmX8v1jFLByHb",
+    "durationSecs": 0.61,
+    "model": "claude-haiku-4-5",
+    "stream": true,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4110,
+      "output_tokens": 2,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "probe-ok",
+    "blocks": [
+      "text"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 1,
+      "content_block_delta": 2,
+      "content_block_stop": 1,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "mapping-disabled-json-True",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01EUc3YspsiFoiEQAKt1XvgN",
+    "durationSecs": 0.76,
+    "model": "claude-haiku-4-5",
+    "stream": true,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4853,
+      "output_tokens": 16,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "{\"n\": 17, \"answer\": \"I am Kiro. Quoted data.\"}",
+    "blocks": [
+      "text"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 1,
+      "content_block_delta": 8,
+      "content_block_stop": 1,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "mapping-disabled-tool-True",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01b4HfQQTwTcVMVFwdat2vPH",
+    "durationSecs": 0.8,
+    "model": "claude-haiku-4-5",
+    "stream": true,
+    "stop": "tool_use",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4707,
+      "output_tokens": 4,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "",
+    "blocks": [
+      "tool_use"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 1,
+      "content_block_delta": 2,
+      "content_block_stop": 1,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "mapping-disabled-adaptive-nonstream",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01ETFt9YdZzYi61U2yDHVgS2",
+    "durationSecs": 0.63,
+    "model": "claude-haiku-4-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4140,
+      "output_tokens": 1,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "2",
+    "blocks": [
+      "text"
+    ],
+    "events": {}
+  },
+  {
+    "case": "mapping-disabled-thinking",
+    "pass": true,
+    "status": 200,
+    "requestId": "req_01p91q1w3s66Yz2s37h8hX2P",
+    "durationSecs": 0.93,
+    "model": "claude-haiku-4-5",
+    "stream": true,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4272,
+      "output_tokens": 49,
+      "output_tokens_details": {
+        "thinking_tokens": 48
+      },
+      "server_tool_use": null
+    },
+    "text": "323",
+    "blocks": [
+      "thinking",
+      "text"
+    ],
+    "events": {
+      "message_start": 1,
+      "content_block_start": 2,
+      "content_block_delta": 23,
+      "ping": 1,
+      "content_block_stop": 2,
+      "message_delta": 1,
+      "message_stop": 1
+    }
+  },
+  {
+    "case": "mapping-disabled-pdf",
+    "pass": false,
+    "status": 200,
+    "requestId": "req_01sNnp4z5sw6gWU8jGmgUjL3",
+    "durationSecs": 1.37,
+    "model": "claude-haiku-4-5",
+    "stream": false,
+    "stop": "end_turn",
+    "usage": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 4243,
+      "output_tokens": 143,
+      "output_tokens_details": null,
+      "server_tool_use": null
+    },
+    "text": "I don't have the ability to access or read the PDF document you've referenced. I can't process files that are passed by reference without using tools, and you've asked me not to use any tools.\n\nTo help you transcribe the PDF, I would need either:\n- You to paste the text content directly\n- Permission to use file-reading tools to access the document\n\nCould you share the PDF content another way, or would you like me to use tools to read it?",
+    "blocks": [
+      "text"
+    ],
+    "events": {}
+  }
+]

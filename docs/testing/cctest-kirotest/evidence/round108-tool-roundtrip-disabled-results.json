@@ -1,0 +1,22 @@
+{
+  "case": "tool-roundtrip-structured",
+  "mappingEnabled": false,
+  "pass": true,
+  "firstBlocks": [
+    "tool_use"
+  ],
+  "secondBlocks": [
+    "text"
+  ],
+  "firstStop": "tool_use",
+  "secondStop": "end_turn",
+  "text": "{\"answer\":37}",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "input_tokens": 4913,
+    "output_tokens": 4,
+    "output_tokens_details": null,
+    "server_tool_use": null
+  }
+}

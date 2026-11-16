@@ -1,0 +1,32 @@
+[
+  {
+    "mode": "forced",
+    "script": "direct.py",
+    "exit": 1
+  },
+  {
+    "mode": "forced",
+    "script": "tool-roundtrip.py",
+    "exit": 0
+  },
+  {
+    "mode": "forced",
+    "script": "cli.py",
+    "exit": 0
+  },
+  {
+    "mode": "disabled",
+    "script": "direct.py",
+    "exit": 1
+  },
+  {
+    "mode": "disabled",
+    "script": "tool-roundtrip.py",
+    "exit": 0
+  },
+  {
+    "mode": "disabled",
+    "script": "cli.py",
+    "exit": 0
+  }
+]

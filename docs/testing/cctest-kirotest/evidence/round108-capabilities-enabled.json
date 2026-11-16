@@ -1,0 +1,13 @@
+{
+  "port": 59141,
+  "productionReadOnly": true,
+  "changedTopLevelKeys": [
+    "bodyConversion",
+    "routeFeatures"
+  ],
+  "codeExecutionAk47": true,
+  "modelDrivenWebSearchAk47": true,
+  "usageEnabled": true,
+  "forcedTarget": "claude-haiku-4-5",
+  "forcedMappingEnabled": true
+}

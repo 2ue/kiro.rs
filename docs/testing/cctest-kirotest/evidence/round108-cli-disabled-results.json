@@ -1,0 +1,76 @@
+[
+  {
+    "case": "normal-text",
+    "pass": true,
+    "exit": 0,
+    "durationSecs": 1.78,
+    "result": "cli-pong",
+    "usage": {
+      "input_tokens": 5980,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 35,
+      "output_tokens_details": {
+        "thinking_tokens": 33
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard"
+    },
+    "tools": 0,
+    "toolResults": 0,
+    "thinkingDeltas": 13,
+    "assistantModels": [
+      "claude-haiku-4-5"
+    ],
+    "rawStdoutSha256": "eee7704d9c4ab8916f7509ca684838b8c7f5b4c6cac6917043bb7f8d18cd318c",
+    "rawStderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rawCaptureRetained": false
+  },
+  {
+    "case": "normal-tool",
+    "pass": true,
+    "exit": 0,
+    "durationSecs": 2.85,
+    "result": "cli-tool-ok",
+    "usage": {
+      "input_tokens": 12296,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 125,
+      "output_tokens_details": {
+        "thinking_tokens": 103
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard"
+    },
+    "tools": 1,
+    "toolResults": 1,
+    "thinkingDeltas": 38,
+    "assistantModels": [
+      "claude-haiku-4-5"
+    ],
+    "rawStdoutSha256": "00477ef12f06352b404903ddf4bd88293d9354de7ecd9214be34faedd66d9061",
+    "rawStderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rawCaptureRetained": false
+  }
+]

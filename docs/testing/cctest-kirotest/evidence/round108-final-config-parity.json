@@ -1,0 +1,28 @@
+{
+  "ts": 1794839514.8531141,
+  "sourceReadOnly": true,
+  "isolatedPort": 59141,
+  "ignoredInfrastructureFields": [
+    "port",
+    "postgres",
+    "redis",
+    "observabilityRedis"
+  ],
+  "businessDifferences": [
+    "/bodyConversion/codeExecution/pathOverrides//dfcache/ak47",
+    "/routeFeatures/pathOverrides//dfcache/ak47"
+  ],
+  "matchesSourcePlusApprovedCapabilities": true,
+  "expectedBusinessSha256": "d836bfdcae0854102d59e6d3e691f2363203926031947780e681bccf03d2ba14",
+  "testBusinessSha256": "d836bfdcae0854102d59e6d3e691f2363203926031947780e681bccf03d2ba14",
+  "forcedEnabled": true,
+  "forcedTarget": "claude-haiku-4-5",
+  "usageEnabled": true,
+  "codeExecutionForAk47": true,
+  "modelDrivenWebSearchForAk47": true,
+  "health": {
+    "59138": 200,
+    "59140": 200,
+    "59141": 200
+  }
+}
