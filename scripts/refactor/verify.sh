@@ -88,6 +88,22 @@ case "$TASK_ID" in
     step "全量单测"
     run cargo test --bin kiro-rs -q
     ;;
+  s4-routes-and-overrides)
+    step "编译"
+    run cargo build -q --bins
+    step "pathOverrides 已收口"
+    hits=$(grep -rn "path_overrides\|defined_cache_routes\|external_pool_route_mode\|external_pool_route_rules" src --include=*.rs 2>/dev/null | grep -v "migrate\|legacy\|tests.rs" || true)
+    [ -z "$hits" ] || { echo "!! 仍有残留:"; echo "$hits" | head -30; fail=1; }
+    [ -f src/model/routes.rs ] || { echo "!! 缺 src/model/routes.rs"; fail=1; }
+    step "golden"
+    run cargo test --bin kiro-rs -q -- golden_usage
+    step "usage 投影"
+    run cargo test --bin kiro-rs -q -- external_pool::tests::usage_projection
+    step "routes 单测"
+    run cargo test --bin kiro-rs -q -- model::routes
+    step "全量单测"
+    run cargo test --bin kiro-rs -q
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac
