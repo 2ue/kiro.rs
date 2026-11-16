@@ -159,9 +159,18 @@ case "$TASK_ID" in
     [ -z "$hits" ] || { echo "!! 前端仍有旧页面引用:"; echo "$hits" | head -20; fail=1; }
     [ ! -d ui/src/features/credentials ] && [ -d ui/src/features/routes ] || { echo "!! 页面目录不符"; fail=1; }
     ;;
-  s8-docs-and-release)
-    step "全仓 Kiro 字样清零（设计文档与 migration 除外）"
-    hits=$(grep -rni "kiro" . --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules --exclude-dir=claude-pool-refactor --exclude-dir=refactor --exclude=config.toml 2>/dev/null | grep -v "src/migration/" | grep -v "^./ui/node_modules" || true)
+  s8-docs-and-release|s8b-e2e-fixes)
+    step "编译"
+    run cargo build -q --bins
+    step "共享 store 回归测试"
+    run cargo test --bin claude-pool -q -- admin_route_update_is_visible_to_request_path
+    step "pools 键已改名"
+    hits=$(grep -rn '"pools"\|\.pool\b' src/admin src/account/mod.rs ui/src --include='*.rs' --include='*.ts' --include='*.tsx' 2>/dev/null | grep -v "pool_id\|pool_name\|postgres_store.pool()\|UsageOverviewPool\|\.pool()" || true)
+    [ -z "$hits" ] || { echo "!! 仍有 pools/pool 键:"; echo "$hits" | head -10; fail=1; }
+    step "Account 不再省略空集合"
+    n=$(grep -n "skip_serializing_if" src/account/mod.rs | grep -c "Vec::is_empty\|HashMap::is_empty"); [ "$n" -eq 0 ] || { echo "!! 仍有 $n 处省略空集合"; fail=1; }
+    step "全仓 Kiro 字样清零（设计文档、migration、.vscode 除外）"
+    hits=$(grep -rni "kiro" . --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules --exclude-dir=claude-pool-refactor --exclude-dir=refactor --exclude-dir=.vscode --exclude-dir=migration --exclude=config.toml 2>/dev/null | grep -v "src/migration/" | grep -v "^./ui/node_modules" || true)
     [ -z "$hits" ] || { echo "!! 仍有 Kiro 字样:"; echo "$hits" | head -40; echo "共 $(echo "$hits" | wc -l) 处"; fail=1; }
     step "文档目录已清理"
     for d in feature docs/refactor-plan docs/plantree docs/analysis docs/archive; do [ -d "$d" ] && { echo "!! 仍存在 $d"; fail=1; }; done
