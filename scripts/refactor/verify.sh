@@ -104,6 +104,27 @@ case "$TASK_ID" in
     step "全量单测"
     run cargo test --bin kiro-rs -q
     ;;
+  s5-rename)
+    step "编译"
+    run cargo build -q --bins
+    step "Kiro 字样清零（src/ui/构建/脚本/配置）"
+    hits=$(grep -rni "kiro" src ui/src ui/tests Cargo.toml Dockerfile docker-compose*.yml scripts config.example.json data tests .github 2>/dev/null | grep -v "scripts/refactor/" || true)
+    [ -z "$hits" ] || { echo "!! 仍有 Kiro 字样:"; echo "$hits" | head -40; echo "共 $(echo "$hits" | wc -l) 处"; fail=1; }
+    step "模块已移动"
+    [ -d src/account ] && [ ! -f src/external_pool.rs ] || { echo "!! external_pool 未移动到 account/"; fail=1; }
+    step "包名"
+    grep -q '^name = "claude-pool"' Cargo.toml || { echo "!! Cargo 包名未改"; fail=1; }
+    step "golden（expected 不得改变）"
+    changed=$(git diff --name-only HEAD -- tests/golden | xargs -I{} sh -c 'git diff HEAD -- {} | grep -E "^[-+]\s+\"(input_tokens|output_tokens|cache_read_input_tokens|cache_creation_input_tokens|ephemeral_5m_input_tokens|ephemeral_1h_input_tokens|total_input_tokens)\"" | head -1' 2>/dev/null || true)
+    [ -z "$changed" ] || { echo "!! golden expected 数值被改动"; fail=1; }
+    run cargo test --bin claude-pool -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin claude-pool -q
+    step "前端"
+    run pnpm --dir ui lint
+    run pnpm --dir ui build
+    run pnpm --dir ui test
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac
