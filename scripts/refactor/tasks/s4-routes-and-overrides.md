@@ -16,6 +16,7 @@
 ## 先读
 
 - 设计 03 章第 4、5 节；11 章第 3.1、3.2、3.3、3.12 节；06 章第 1、3 节。
+- 阶段 3 已完成：路由功能集 `RouteFeatureSet` 在 `src/model/prompt_injection/mod.rs:~470`，含 8 个功能；`RouteFeatureOverride` 用 `Option<Option<T>>` 三态；`routeFeatures.path_overrides` 仍是按前缀的表，本任务一并收口进 `routes[]`。
 - 现有代码：`src/model/config.rs`（`CachePolicyConfig` ~2933、`ReportedUsageConfig` ~893、`resolve_cache_policy_for_path` ~3243、`external_pool_route_allowed` ~3964、`normalize_route_rule` ~5143、`route_rule_matches` ~5173、`normalize_defined_cache_routes` ~5134、`RequestRuntimeConfig::cache_policy_for_path` ~5303）、`src/model/prompt_injection/mod.rs`（`PromptInjectionConfig.path_overrides` ~137、`RouteFeaturesConfig` ~484）、`src/anthropic/router.rs:308-341`（五组前缀注册）、`src/anthropic/handlers.rs`（`route_features_for`、`injections_for`、`cache_policy_for_path`、dfcache 404）、`src/external_pool.rs`（`ExternalPool` 结构 ~580、候选过滤 `select_pool_for_route` 与路由双向放行、`supported_models` 变体匹配）、`src/storage/postgres.rs`（`external_upstream_pools` 表与 `EXTERNAL_POOL_SELECT_SQL`、`model_capabilities` 表）、`src/admin/route_scenarios.rs`。
 
 ## 允许改动的文件
