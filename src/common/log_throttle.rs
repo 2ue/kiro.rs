@@ -90,14 +90,17 @@ mod tests {
     fn concurrent_callers_log_once_per_window() {
         let throttle = std::sync::Arc::new(LogThrottle::new(Duration::from_secs(60)));
         let admitted = std::sync::Arc::new(AtomicU64::new(0));
+        let reported_suppressed = std::sync::Arc::new(AtomicU64::new(0));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let throttle = throttle.clone();
                 let admitted = admitted.clone();
+                let reported_suppressed = reported_suppressed.clone();
                 std::thread::spawn(move || {
                     for _ in 0..1000 {
-                        if throttle.admit().is_some() {
+                        if let Some(skipped) = throttle.admit() {
                             admitted.fetch_add(1, Ordering::Relaxed);
+                            reported_suppressed.fetch_add(skipped, Ordering::Relaxed);
                         }
                     }
                 })
@@ -107,6 +110,10 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(admitted.load(Ordering::Relaxed), 1);
-        assert_eq!(throttle.suppressed.load(Ordering::Relaxed), 7999);
+        assert_eq!(
+            reported_suppressed.load(Ordering::Relaxed)
+                + throttle.suppressed.load(Ordering::Relaxed),
+            7999
+        );
     }
 }
