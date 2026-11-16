@@ -56,6 +56,19 @@ case "$TASK_ID" in
     step "全量单测"
     run cargo test --bin kiro-rs -q
     ;;
+  s2b-restore-tests)
+    step "编译"
+    run cargo build -q --bins
+    step "测试数量回到基线附近"
+    n1=$(grep -c "#\[test\]\|#\[tokio::test" src/external_pool/tests.rs); n2=$(grep -c "#\[test\]\|#\[tokio::test" src/anthropic/handlers/tests.rs)
+    echo "external_pool/tests.rs: $n1  handlers/tests.rs: $n2"
+    [ "$n1" -ge 380 ] || { echo "!! external_pool 测试数不足 380"; fail=1; }
+    [ "$n2" -ge 85 ] || { echo "!! handlers 测试数不足 85"; fail=1; }
+    step "golden"
+    run cargo test --bin kiro-rs -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin kiro-rs -q
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac
