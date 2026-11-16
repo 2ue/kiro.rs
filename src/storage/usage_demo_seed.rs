@@ -5,15 +5,15 @@ use chrono::{Datelike, Duration, FixedOffset, Timelike, Utc};
 use fastrand::Rng;
 use serde_json::json;
 
+use crate::account::CreateAccountRequest;
 use crate::anthropic::usage::{
-    ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRecord, UsageRecordStatus, UsageRouteKind,
+    AccountBilling, AccountUsageSnapshot, UsageRecord, UsageRecordStatus, UsageRouteKind,
     UsageRouteSubtype, UsageSource,
 };
-use crate::external_pool::CreateExternalPoolRequest;
 
 use super::postgres::{PostgresStore, PostgresUsageStore};
 
-const DEMO_DATABASE_PREFIX: &str = "kiro_overview_demo_";
+const DEMO_DATABASE_PREFIX: &str = "pool_overview_demo_";
 
 const DEMO_POOL_NAMES: [&str; 3] = ["demo-pool-alpha", "demo-pool-beta", "demo-pool-gamma"];
 const DEMO_MODELS: [&str; 3] = ["claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5"];
@@ -151,7 +151,7 @@ pub async fn seed_usage_demo(
                 } else {
                     0.0
                 };
-                let snapshot = ExternalPoolUsageSnapshot {
+                let snapshot = AccountUsageSnapshot {
                     total_input_tokens,
                     input_tokens: billable_input_tokens,
                     billable_input_tokens,
@@ -167,7 +167,7 @@ pub async fn seed_usage_demo(
                     Some((pool, floor)),
                     billable_cost_usd,
                     raw_cost_usd,
-                    Some(ExternalPoolBilling {
+                    Some(AccountBilling {
                         request_input_tokens: Some(total_input_tokens),
                         raw_usage: snapshot,
                         shaped_usage: snapshot,
@@ -192,7 +192,7 @@ pub async fn seed_usage_demo(
                     }),
                 )
             };
-            let (external_pool_id, external_pool_name) = pool
+            let (account_id, account_name) = pool
                 .as_ref()
                 .map(|(pool, _)| (Some(pool.id), Some(pool.name.clone())))
                 .unwrap_or((None, None));
@@ -222,7 +222,7 @@ pub async fn seed_usage_demo(
                 requested_max_tokens: Some(output_tokens.saturating_mul(2)),
                 downstream_stop_reason: Some("end_turn".to_string()),
                 upstream_model: Some(model.to_string()),
-                external_outbound_model: external_pool_id.map(|_| model.to_string()),
+                external_outbound_model: account_id.map(|_| model.to_string()),
                 model_resolution_source: Some("demo".to_string()),
                 model_resolution_note: None,
                 conversation_id: Some(format!("demo-conv-{}", rng.u64(0..900_000))),
@@ -249,14 +249,14 @@ pub async fn seed_usage_demo(
                 response_latency_ms: Some(duration_ms),
                 latency_trace: None,
                 simulated: false,
-                route_kind: Some(UsageRouteKind::ExternalPool),
-                route_subtype: Some(UsageRouteSubtype::External),
+                route_kind: Some(UsageRouteKind::Account),
+                route_subtype: Some(UsageRouteSubtype::Account),
 
-                external_pool_id,
-                external_pool_name,
+                account_id,
+                account_name,
                 external_attempts: Vec::new(),
                 usage_projection_applied: billing.as_ref().map(|_| true),
-                external_pool_billing: billing,
+                account_billing: billing,
                 error_type,
                 error_message: if status == UsageRecordStatus::Success {
                     None
@@ -310,13 +310,13 @@ async fn clear_usage_tables(store: &PostgresStore) -> anyhow::Result<()> {
 }
 
 async fn ensure_demo_pools(store: &PostgresStore) -> anyhow::Result<Vec<DemoPool>> {
-    let existing = store.list_external_pools(false).await?;
+    let existing = store.list_accounts(false).await?;
     let mut pools = Vec::with_capacity(DEMO_POOL_NAMES.len());
     for (index, name) in DEMO_POOL_NAMES.iter().enumerate() {
         let pool = if let Some(pool) = existing.iter().find(|pool| pool.name == *name) {
             pool.clone()
         } else {
-            let request: CreateExternalPoolRequest = serde_json::from_value(json!({
+            let request: CreateAccountRequest = serde_json::from_value(json!({
                 "name": name,
                 "baseUrl": "http://127.0.0.1:1",
                 "apiKey": format!("demo-pool-key-{index}"),
@@ -326,7 +326,7 @@ async fn ensure_demo_pools(store: &PostgresStore) -> anyhow::Result<Vec<DemoPool
                 "supportedModels": DEMO_MODELS,
                 "notes": "overview demo seed; never sends real traffic"
             }))?;
-            store.create_external_pool(request).await?
+            store.create_account(request).await?
         };
         pools.push(DemoPool {
             id: pool.id,

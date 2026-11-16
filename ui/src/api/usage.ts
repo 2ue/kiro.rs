@@ -1,6 +1,5 @@
 import { api } from '@/api/http'
 import type {
-  SubscriptionModelListsResponse,
   AdminAuditLogPage,
   AccountEventSummaryResponse,
   AdminAuditLogPageQuery,
@@ -12,7 +11,7 @@ import type {
   UsageDashboardResponse,
   UsageDashboardAccountsResponse,
   UsageDashboardBreakdownResponse,
-  UsageDashboardExternalPoolBillingResponse,
+  UsageDashboardAccountBillingResponse,
   UsageDashboardSeriesResponse,
   UsageDashboardTopResponse,
   UsageDashboardWindowsResponse,
@@ -25,8 +24,8 @@ import type {
   UsageCleanupPreviewResponse,
   UsageCleanupRequest,
   UsageCleanupStatusResponse,
-  UsageExternalPoolRiskQuery,
-  UsageExternalPoolRiskResponse,
+  UsageAccountRiskQuery,
+  UsageAccountRiskResponse,
   UsageRecorderStats,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
@@ -119,7 +118,7 @@ export async function getUsageOverviewLocal(params: UsageOverviewQuery = {}): Pr
 }
 
 export async function getUsageOverviewExternal(params: UsageOverviewQuery = {}): Promise<UsageOverviewExternalResponse> {
-  const { data } = await api.get<UsageOverviewExternalResponse>('/usage-dashboard/overview/external', {
+  const { data } = await api.get<UsageOverviewExternalResponse>('/usage-dashboard/overview', {
     params: usageOverviewParams(params),
   })
   return data
@@ -187,20 +186,20 @@ export async function getUsageDashboardBreakdown(
   return data
 }
 
-export async function getUsageDashboardExternalPoolBilling(
+export async function getUsageDashboardAccountBilling(
   timezone = 'Asia/Shanghai',
   windowKey = 'today'
-): Promise<UsageDashboardExternalPoolBillingResponse> {
-  const { data } = await api.get<UsageDashboardExternalPoolBillingResponse>('/usage-dashboard/external-pool-billing', {
+): Promise<UsageDashboardAccountBillingResponse> {
+  const { data } = await api.get<UsageDashboardAccountBillingResponse>('/usage-dashboard/account-billing', {
     params: { timezone, windowKey },
   })
   return data
 }
 
-export async function getUsageDashboardExternalPoolRisk(
-  query: UsageExternalPoolRiskQuery = {}
-): Promise<UsageExternalPoolRiskResponse> {
-  const { data } = await api.get<UsageExternalPoolRiskResponse>('/usage-dashboard/external-pool-risk', {
+export async function getUsageDashboardAccountRisk(
+  query: UsageAccountRiskQuery = {}
+): Promise<UsageAccountRiskResponse> {
+  const { data } = await api.get<UsageAccountRiskResponse>('/usage-dashboard/account-risk', {
     params: query,
   })
   return data
@@ -277,25 +276,5 @@ export async function upsertManualModel(payload: UpsertManualModelRequest): Prom
 
 export async function deleteManualModel(model: string): Promise<ManualModelResponse> {
   const { data } = await api.delete<ManualModelResponse>(`/model-capabilities/manual/${encodeURIComponent(model)}`)
-  return data
-}
-
-// ============ 订阅等级模型列表 ============
-
-export async function getSubscriptionModelLists(): Promise<SubscriptionModelListsResponse> {
-  const { data } = await api.get<SubscriptionModelListsResponse>('/subscription-model-lists')
-  return data
-}
-
-export async function setSubscriptionModelList(tier: string, models: string[]): Promise<SubscriptionModelListsResponse> {
-  const { data } = await api.put<SubscriptionModelListsResponse>(`/subscription-model-lists/${encodeURIComponent(tier)}`, { models })
-  return data
-}
-
-export async function syncSubscriptionModelList(tier: string, credentialId?: number): Promise<SubscriptionModelListsResponse> {
-  const { data } = await api.post<SubscriptionModelListsResponse>(
-    `/subscription-model-lists/${encodeURIComponent(tier)}/sync`,
-    credentialId === undefined ? {} : { credentialId },
-  )
   return data
 }

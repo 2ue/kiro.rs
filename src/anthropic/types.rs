@@ -179,8 +179,8 @@ pub enum ThinkingDisplay {
     /// thinking 块只下发空文本和 signature。
     Omitted,
     /// Beta `thinking-display-updates-2026-08-18`（Claude Code 交互请求会发送）：推理块与
-    /// `omitted` 一样只有空文本和 signature，只有工具调用之间的进度说明带文字。Kiro 不区分
-    /// 进度说明和推理，所以本地上游按 `omitted` 下发；外部池原样转发该值。
+    /// `omitted` 一样只有空文本和 signature，只有工具调用之间的进度说明带文字。上游 不区分
+    /// 进度说明和推理，所以本地上游按 `omitted` 下发；账号原样转发该值。
     Updates,
 }
 
@@ -201,7 +201,7 @@ impl ThinkingDisplay {
     /// The official default `display` for a model when the request leaves it out. Claude Opus 5,
     /// Opus 5.5, Sonnet 5, Sonnet 5.5 and the Fable/Mythos 5 family default to `omitted`
     /// (thinking runs, its text stays hidden until the request opts in); earlier models default
-    /// to `summarized`. `model` may be the client name (`claude-sonnet-5-5`) or the Kiro one
+    /// to `summarized`. `model` may be the client name (`claude-sonnet-5-5`) or the 上游 one
     /// (`claude-sonnet-5.5`).
     pub fn default_for_model(model: &str) -> Self {
         let name = model.trim().to_ascii_lowercase().replace('.', "-");
@@ -688,11 +688,11 @@ mod tests {
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct OutputConfig {
     /// Client-selected reasoning effort. `None` means the field was omitted and must remain
-    /// distinct from an explicit `high`; native Kiro routing resolves it from the authoritative
+    /// distinct from an explicit `high`; native 上游 routing resolves it from the authoritative
     /// model capability default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Structured output format (`{"type": "json_schema", "schema": {...}}`). Kiro has no
+    /// Structured output format (`{"type": "json_schema", "schema": {...}}`). 上游 has no
     /// native equivalent; the local path serves it through an internal tool
     /// (see `structured_output`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -702,7 +702,7 @@ pub struct OutputConfig {
 /// Compatibility default used only by the legacy synthetic thinking prompt transport.
 ///
 /// It is not an Anthropic request default and must never be serialized as a client-selected
-/// `output_config.effort` or used in place of an authoritative Kiro schema default.
+/// `output_config.effort` or used in place of an authoritative 上游 schema default.
 
 impl OutputConfig {}
 
@@ -750,7 +750,7 @@ pub struct MessagesRequest {
     /// Claude Code 请求中的 metadata，包含 session 信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// 自定义停止序列。Kiro 无对应参数，由代理在输出侧检测并截断。
+    /// 自定义停止序列。上游 无对应参数，由代理在输出侧检测并截断。
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

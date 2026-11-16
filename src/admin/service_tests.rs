@@ -7,7 +7,7 @@ fn normalize_admin_request_admission(
     Ok(config.normalized())
 }
 use super::*;
-use crate::model::config::{ExternalPoolsConfig, RequestAdmissionConfig, RequestApiKeyPolicy};
+use crate::model::config::{AccountsConfig, RequestAdmissionConfig, RequestApiKeyPolicy};
 use std::sync::Arc;
 
 fn cleanup_request() -> UsageCleanupRequest {
@@ -92,132 +92,122 @@ fn audit_detail_normalization_is_bounded_without_returning_an_error() {
 }
 
 #[test]
-fn external_pool_cost_floor_margin_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_usage_projection_cost_floor_margin_percent: 200,
-        ..ExternalPoolsConfig::default()
+fn account_cost_floor_margin_validation_is_bounded() {
+    let mut config = AccountsConfig {
+        usage_projection_cost_floor_margin_percent: 200,
+        ..AccountsConfig::default()
     };
-    validate_external_pools_config(&config).expect("upper bound should be accepted");
+    validate_accounts_config(&config).expect("upper bound should be accepted");
 
-    config.external_pool_usage_projection_cost_floor_margin_percent = 201;
-    let err = validate_external_pools_config(&config).unwrap_err();
+    config.usage_projection_cost_floor_margin_percent = 201;
+    let err = validate_accounts_config(&config).unwrap_err();
     assert!(
-        err.contains("externalPoolUsageProjectionCostFloorMarginPercent"),
+        err.contains("usageProjectionCostFloorMarginPercent"),
         "unexpected validation error: {err}"
     );
 }
 
 #[test]
-fn external_pool_degrade_error_rate_threshold_is_a_ratio() {
-    let mut config = ExternalPoolsConfig::default();
+fn account_degrade_error_rate_threshold_is_a_ratio() {
+    let mut config = AccountsConfig::default();
     for valid in [0.0, 0.5, 1.0] {
-        config.external_pool_degrade_error_rate_threshold = valid;
-        validate_external_pools_config(&config).expect("合法比率必须被接受");
+        config.degrade_error_rate_threshold = valid;
+        validate_accounts_config(&config).expect("合法比率必须被接受");
     }
     for invalid in [-0.1, 1.1] {
-        config.external_pool_degrade_error_rate_threshold = invalid;
-        let err = validate_external_pools_config(&config).unwrap_err();
+        config.degrade_error_rate_threshold = invalid;
+        let err = validate_accounts_config(&config).unwrap_err();
         assert!(
-            err.contains("externalPoolDegradeErrorRateThreshold"),
+            err.contains("degradeErrorRateThreshold"),
             "unexpected validation error: {err}"
         );
     }
 }
 
 #[test]
-fn external_pool_probation_ceiling_cannot_be_below_single_probation() {
+fn account_probation_ceiling_cannot_be_below_single_probation() {
     // 避让上限小于单次避让时长会让指数退避的上限语义自相矛盾。
-    let mut config = ExternalPoolsConfig {
-        external_pool_degrade_probation_secs: 600,
-        external_pool_max_probation_secs: 300,
+    let mut config = AccountsConfig {
+        degrade_probation_secs: 600,
+        max_probation_secs: 300,
         ..Default::default()
     };
-    let err = validate_external_pools_config(&config).unwrap_err();
+    let err = validate_accounts_config(&config).unwrap_err();
     assert!(
-        err.contains("externalPoolMaxProbationSecs"),
+        err.contains("maxProbationSecs"),
         "unexpected validation error: {err}"
     );
 
-    config.external_pool_max_probation_secs = 600;
-    validate_external_pools_config(&config).expect("相等必须被接受");
+    config.max_probation_secs = 600;
+    validate_accounts_config(&config).expect("相等必须被接受");
 }
 
 #[test]
-fn external_pool_quality_defaults_pass_validation() {
+fn account_quality_defaults_pass_validation() {
     // Quality-aware scheduling changes runtime decisions and must be opt-in on
     // upgrades. The remaining defaults still need to validate as a whole.
-    let config = ExternalPoolsConfig::default();
+    let config = AccountsConfig::default();
     assert!(
-        !config.external_pool_quality_aware_scheduling_enabled,
+        !config.quality_aware_scheduling_enabled,
         "质量感知调度主开关必须默认关闭"
     );
-    validate_external_pools_config(&config).expect("默认配置必须通过校验");
+    validate_accounts_config(&config).expect("默认配置必须通过校验");
 }
 
 #[test]
-fn external_pool_quality_ewma_alpha_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_quality_ewma_alpha: 0.01,
+fn account_quality_ewma_alpha_validation_is_bounded() {
+    let mut config = AccountsConfig {
+        quality_ewma_alpha: 0.01,
         ..Default::default()
     };
-    validate_external_pools_config(&config).expect("下界必须被接受");
-    config.external_pool_quality_ewma_alpha = 1.0;
-    validate_external_pools_config(&config).expect("上界必须被接受");
+    validate_accounts_config(&config).expect("下界必须被接受");
+    config.quality_ewma_alpha = 1.0;
+    validate_accounts_config(&config).expect("上界必须被接受");
 
     for invalid in [0.0, 1.0001, -0.5, f64::NAN] {
-        config.external_pool_quality_ewma_alpha = invalid;
-        let err = validate_external_pools_config(&config).unwrap_err();
+        config.quality_ewma_alpha = invalid;
+        let err = validate_accounts_config(&config).unwrap_err();
         assert!(
-            err.contains("externalPoolQualityEwmaAlpha"),
+            err.contains("qualityEwmaAlpha"),
             "alpha={invalid} 应被拒绝，实际错误: {err}"
         );
     }
 }
 
 #[test]
-fn external_pool_quality_probe_share_and_top_k_are_bounded() {
-    let config = ExternalPoolsConfig {
-        external_pool_probe_share_percent: 101,
+fn account_quality_probe_share_and_top_k_are_bounded() {
+    let config = AccountsConfig {
+        probe_share_percent: 101,
         ..Default::default()
     };
-    let err = validate_external_pools_config(&config).unwrap_err();
-    assert!(err.contains("externalPoolProbeSharePercent"), "{err}");
+    let err = validate_accounts_config(&config).unwrap_err();
+    assert!(err.contains("probeSharePercent"), "{err}");
 
-    let config = ExternalPoolsConfig {
-        external_pool_quality_top_k: 101,
+    let config = AccountsConfig {
+        quality_top_k: 101,
         ..Default::default()
     };
-    let err = validate_external_pools_config(&config).unwrap_err();
-    assert!(err.contains("externalPoolQualityTopK"), "{err}");
+    let err = validate_accounts_config(&config).unwrap_err();
+    assert!(err.contains("qualityTopK"), "{err}");
 }
 
 #[test]
-fn external_pool_quality_weights_reject_negative_and_non_finite() {
+fn account_quality_weights_reject_negative_and_non_finite() {
     // 负权重会把"差"变成"好"，是最危险的误配置方向。
     for mutate in [
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_error_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_latency_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_probation_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_priority_weight = value
-        },
-        |config: &mut ExternalPoolsConfig, value: f64| {
-            config.external_pool_quality_load_weight = value
-        },
+        |config: &mut AccountsConfig, value: f64| config.quality_error_weight = value,
+        |config: &mut AccountsConfig, value: f64| config.quality_latency_weight = value,
+        |config: &mut AccountsConfig, value: f64| config.quality_probation_weight = value,
+        |config: &mut AccountsConfig, value: f64| config.quality_priority_weight = value,
+        |config: &mut AccountsConfig, value: f64| config.quality_load_weight = value,
     ] {
         for invalid in [-1.0, f64::NAN, f64::INFINITY, 1_000_001.0] {
-            let mut config = ExternalPoolsConfig::default();
+            let mut config = AccountsConfig::default();
             mutate(&mut config, invalid);
-            let err = validate_external_pools_config(&config)
-                .expect_err(&format!("权重 {invalid} 必须被拒绝"));
+            let err =
+                validate_accounts_config(&config).expect_err(&format!("权重 {invalid} 必须被拒绝"));
             assert!(
-                err.contains("externalPoolQuality"),
+                err.contains("quality"),
                 "unexpected validation error: {err}"
             );
         }
@@ -225,9 +215,9 @@ fn external_pool_quality_weights_reject_negative_and_non_finite() {
 }
 
 #[test]
-fn external_pool_supported_models_canonicalize_legacy_claude_35_commands() {
+fn account_supported_models_canonicalize_legacy_claude_35_commands() {
     assert_eq!(
-        AdminService::normalize_external_pool_supported_models(vec![
+        AdminService::normalize_account_supported_models(vec![
             "claude-3-5-sonnet-20241022".to_string(),
             "claude-3.5-sonnet".to_string(),
             "claude-3-5-haiku-20241022-thinking[1m]".to_string(),
@@ -246,9 +236,9 @@ fn external_pool_supported_models_canonicalize_legacy_claude_35_commands() {
 }
 
 #[test]
-fn external_pool_supported_models_use_claude_code_family_commands() {
+fn account_supported_models_use_claude_code_family_commands() {
     assert_eq!(
-        AdminService::normalize_external_pool_supported_models(vec![
+        AdminService::normalize_account_supported_models(vec![
             "claude-sonnet-4-5-20250929".to_string(),
             "claude-haiku-4.5".to_string(),
             "claude-opus-4-6-thinking".to_string(),
@@ -266,42 +256,42 @@ fn external_pool_supported_models_use_claude_code_family_commands() {
 }
 
 #[test]
-fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_transient_failure_priority_penalty: 10_000,
-        ..ExternalPoolsConfig::default()
+fn account_transient_failure_priority_penalty_validation_is_bounded() {
+    let mut config = AccountsConfig {
+        transient_failure_priority_penalty: 10_000,
+        ..AccountsConfig::default()
     };
-    validate_external_pools_config(&config).expect("upper bound should be accepted");
+    validate_accounts_config(&config).expect("upper bound should be accepted");
 
-    config.external_pool_transient_failure_priority_penalty = 10_001;
-    let err = validate_external_pools_config(&config).unwrap_err();
+    config.transient_failure_priority_penalty = 10_001;
+    let err = validate_accounts_config(&config).unwrap_err();
     assert!(
-        err.contains("externalPoolTransientFailurePriorityPenalty"),
+        err.contains("transientFailurePriorityPenalty"),
         "unexpected validation error: {err}"
     );
 }
 
 #[test]
-fn external_pool_wire_debug_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_wire_debug_max_body_bytes: 1024 * 1024,
-        external_pool_wire_debug_max_files: 100_000,
-        ..ExternalPoolsConfig::default()
+fn account_wire_debug_validation_is_bounded() {
+    let mut config = AccountsConfig {
+        wire_debug_max_body_bytes: 1024 * 1024,
+        wire_debug_max_files: 100_000,
+        ..AccountsConfig::default()
     };
-    validate_external_pools_config(&config).expect("upper bounds should be accepted");
+    validate_accounts_config(&config).expect("upper bounds should be accepted");
 
-    config.external_pool_wire_debug_max_body_bytes = 1024 * 1024 + 1;
-    let err = validate_external_pools_config(&config).unwrap_err();
+    config.wire_debug_max_body_bytes = 1024 * 1024 + 1;
+    let err = validate_accounts_config(&config).unwrap_err();
     assert!(
-        err.contains("externalPoolWireDebugMaxBodyBytes"),
+        err.contains("wireDebugMaxBodyBytes"),
         "unexpected validation error: {err}"
     );
 
-    config.external_pool_wire_debug_max_body_bytes = 1024 * 1024;
-    config.external_pool_wire_debug_max_files = 100_001;
-    let err = validate_external_pools_config(&config).unwrap_err();
+    config.wire_debug_max_body_bytes = 1024 * 1024;
+    config.wire_debug_max_files = 100_001;
+    let err = validate_accounts_config(&config).unwrap_err();
     assert!(
-        err.contains("externalPoolWireDebugMaxFiles"),
+        err.contains("wireDebugMaxFiles"),
         "unexpected validation error: {err}"
     );
 }
@@ -322,7 +312,7 @@ fn extracts_model_ids_from_anthropic_and_openai_models_response() {
 }
 
 #[test]
-fn extracts_model_ids_from_kiro_compatible_models_response() {
+fn extracts_model_ids_from_pool_compatible_models_response() {
     let body = r#"{
             "defaultModel": {"modelId": "auto"},
             "models": [
@@ -445,7 +435,7 @@ fn runtime_config_audit_array_summary_survives_normalization() {
     let detail = AdminService::normalize_audit_detail(serde_json::json!({
         "kind": "runtime_config_change",
         "changes": [{
-            "path": "kiroEndpointFallbackOrder",
+            "path": "endpointFallbackOrder",
             "before": {"count": 0, "items": []},
             "after": {"count": 2, "items": ["first", "second"]},
         }],
@@ -501,8 +491,8 @@ fn usage_cleanup_include_summary_is_simple_full_history_mode() {
 
 #[tokio::test]
 async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_rounds() {
-    let Some(url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL") else {
-        eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+    let Some(url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL") else {
+        eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
         return;
     };
     let mut config = crate::model::config::Config::default();

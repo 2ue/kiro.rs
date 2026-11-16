@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // Capacity probe: do requests queue or get turned away while accounts still have room?
 //
-// Ramps concurrency step by step against a kiro-rs on mock upstreams. Once a second it samples
+// Ramps concurrency step by step against a claude-pool on mock upstreams. Once a second it samples
 // the dispatch queue (/readyz) and, from the mock upstream, how many calls each account has in
 // flight right now and how many it took in the last minute. A second in which requests were
 // queued or rejected while some account was below both its concurrency and its RPM limit is an
 // "idle while waiting" second: capacity was there but was not used.
 //
-// Usage: node capacity-probe.mjs --base-url URL --api-key KEY --kiro-mock URL
+// Usage: node capacity-probe.mjs --base-url URL --api-key KEY --pool-mock URL
 //          --accounts 100 --per-account-concurrency 3 --per-account-rpm 20
 //          --steps 60,90,120,150,200,300 --step-secs 20 [--stream-share 0.5]
 //          [--sessions 40] [--out file.json]
@@ -32,7 +32,7 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const baseUrl = new URL(args.baseUrl);
 const apiKey = args.apiKey;
-const kiroMock = args.kiroMock;
+const poolMock = args.poolMock;
 const accounts = Number(args.accounts || 100);
 const perConcurrency = Number(args.perAccountConcurrency || 3);
 const perRpm = Number(args.perAccountRpm || 20);
@@ -130,7 +130,7 @@ async function main() {
   const sampler = (async () => {
     while (!stop) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      const [ready, mock] = await Promise.all([getJson(`${baseUrl.origin}/readyz`), getJson(`${kiroMock}/__control`)]);
+      const [ready, mock] = await Promise.all([getJson(`${baseUrl.origin}/readyz`), getJson(`${poolMock}/__control`)]);
       const perToken = mock.body?.counters?.perToken || {};
       const values = Object.values(perToken);
       const inFlightTotal = values.reduce((sum, stats) => sum + stats.inFlight, 0);
@@ -193,7 +193,7 @@ async function main() {
       stalledSeconds: samples.filter((sample) => sample.progressing === false || sample.ready === 503).length,
     };
   });
-  const finalMock = await getJson(`${kiroMock}/__control`);
+  const finalMock = await getJson(`${poolMock}/__control`);
   const perToken = finalMock.body?.counters?.perToken || {};
   const maxInFlights = Object.values(perToken).map((stats) => stats.maxInFlight);
   const maxPerMinute = Object.values(perToken).map((stats) => stats.maxPerMinute);

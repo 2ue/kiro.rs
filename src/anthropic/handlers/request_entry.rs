@@ -18,7 +18,7 @@ pub(super) async fn handle_messages_endpoint(
     inference_attempt_budget.set_dispatch_route(&endpoint);
     inference_attempt_budget.set_dispatch_deadline_after(Duration::from_secs(
         runtime_config
-            .external_pools
+            .accounts
             .effective_dispatch_max_wait_secs()
             .max(1),
     ));
@@ -76,7 +76,7 @@ pub(super) async fn route_body_patches(
 ) -> Result<super::super::body_patch::BodyPatchSet, EntryRequestError> {
     use super::super::body_patch::BodyPatchSet;
     let features = runtime.route_features_for(endpoint);
-    let injections = runtime.injections_for(endpoint, UpstreamKind::ExternalPool);
+    let injections = runtime.injections_for(endpoint);
     let inject = InjectionId::ALL.iter().any(|id| injections.allows(*id));
     let mut patches = BodyPatchSet::default();
     if features.is_empty() && !inject {
@@ -617,7 +617,7 @@ fn message_content_text(content: &Value) -> String {
 }
 
 /// Rejects roles the Anthropic API rejects, and normalizes content shapes Claude Code
-/// clients may send but Kiro cannot take directly: scalar content becomes text, scalar list
+/// clients may send but 上游 cannot take directly: scalar content becomes text, scalar list
 /// items become text blocks, and nulls are dropped. Normalizing here keeps every later stage
 /// (conversion, history, token counting) on the same string-or-block-list shape.
 fn normalize_message_roles_and_content(

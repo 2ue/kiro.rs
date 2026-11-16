@@ -41,7 +41,7 @@ pub(crate) struct BoundedShapingInput {
     /// 下游 cache_read / cache_creation 最终上限（0 表示不限）。
     pub max_cache_read_tokens: i32,
     pub max_cache_creation_tokens: i32,
-    /// creation control 允许的本次写入上限（本地链路为本次放行量，外部池为单次上限；
+    /// creation control 允许的本次写入上限（本地链路为本次放行量，账号为单次上限；
     /// 0 表示不限）。
     pub max_creation_event_tokens: i32,
     /// 同一控制维度此前累计、尚未补回的计费差额（美元），只在放行写入的请求上补。

@@ -19,7 +19,7 @@ use super::{
 /// 创建 Admin API 路由
 ///
 /// # 端点
-/// 外部池、路由策略、运行配置、usage 和诊断采集管理。
+/// 账号、路由策略、运行配置、usage 和诊断采集管理。
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -51,48 +51,39 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/route-scenarios/{id}/apply",
             post(route_scenario_http::apply),
         )
+        .route("/accounts", get(get_accounts).post(create_account))
+        .route("/accounts/status", get(get_account_status))
         .route(
-            "/external-pools",
-            get(get_external_pools).post(create_external_pool),
+            "/accounts/supported-models/discover",
+            post(discover_account_supported_models_from_request),
         )
-        .route("/external-pools/status", get(get_external_pool_status))
+        .route("/accounts/{id}", put(update_account).delete(delete_account))
+        .route("/accounts/{id}/enabled", post(set_account_enabled))
         .route(
-            "/external-pools/supported-models/discover",
-            post(discover_external_pool_supported_models_from_request),
-        )
-        .route(
-            "/external-pools/{id}",
-            put(update_external_pool).delete(delete_external_pool),
-        )
-        .route(
-            "/external-pools/{id}/enabled",
-            post(set_external_pool_enabled),
+            "/accounts/{id}/models/promote",
+            post(promote_account_models),
         )
         .route(
-            "/external-pools/{id}/models/promote",
-            post(promote_external_pool_models),
+            "/accounts/{id}/supported-models",
+            post(set_account_supported_models),
         )
         .route(
-            "/external-pools/{id}/supported-models",
-            post(set_external_pool_supported_models),
+            "/accounts/{id}/supported-models/sync",
+            post(sync_account_supported_models),
         )
         .route(
-            "/external-pools/{id}/supported-models/sync",
-            post(sync_external_pool_supported_models),
+            "/accounts/{id}/supported-models/discover",
+            post(discover_account_supported_models),
         )
         .route(
-            "/external-pools/{id}/supported-models/discover",
-            post(discover_external_pool_supported_models),
+            "/accounts/{id}/auto-disabled/clear",
+            post(clear_account_auto_disabled),
         )
         .route(
-            "/external-pools/{id}/auto-disabled/clear",
-            post(clear_external_pool_auto_disabled),
+            "/accounts/{id}/cooldown/clear",
+            post(clear_account_cooldown),
         )
-        .route(
-            "/external-pools/{id}/cooldown/clear",
-            post(clear_external_pool_cooldown),
-        )
-        .route("/external-pools/{id}/test", post(test_external_pool))
+        .route("/accounts/{id}/test", post(test_account))
         .route("/usage-records", get(get_usage_records))
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))
@@ -110,10 +101,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage-summary", get(get_usage_summary))
         .route("/usage-dashboard", get(get_usage_dashboard))
         .route(
-            "/usage-dashboard/overview",
-            get(get_usage_dashboard_overview),
-        )
-        .route(
             "/usage-dashboard/overview/summary",
             get(get_usage_dashboard_overview_summary),
         )
@@ -122,7 +109,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_usage_dashboard_overview_series),
         )
         .route(
-            "/usage-dashboard/overview/external",
+            "/usage-dashboard/overview",
             get(get_usage_dashboard_overview_external),
         )
         .route(
@@ -137,12 +124,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_usage_dashboard_breakdown),
         )
         .route(
-            "/usage-dashboard/external-pool-billing",
-            get(get_usage_dashboard_external_pool_billing),
+            "/usage-dashboard/account-billing",
+            get(get_usage_dashboard_account_billing),
         )
         .route(
-            "/usage-dashboard/external-pool-risk",
-            get(get_usage_dashboard_external_pool_risk),
+            "/usage-dashboard/account-risk",
+            get(get_usage_dashboard_account_risk),
         )
         .route("/usage-writer-stats", get(get_usage_writer_stats))
         .route("/audit-logs", get(get_audit_logs))

@@ -3,14 +3,14 @@ export interface TestModelOption {
   label: string
 }
 
-// Local credential tests send Kiro upstream model names.
+// Local credential tests send 上游 upstream model names.
 export const TEST_MODELS: TestModelOption[] = [
-  { id: 'claude-sonnet-4.5', label: 'Claude Sonnet 4.5 (Kiro)' },
-  { id: 'claude-haiku-4.5', label: 'Claude Haiku 4.5 (Kiro)' },
-  { id: 'claude-opus-4.5', label: 'Claude Opus 4.5 (Kiro)' },
-  { id: 'claude-sonnet-4.6', label: 'Claude Sonnet 4.6 (Kiro)' },
-  { id: 'claude-opus-4.6', label: 'Claude Opus 4.6 (Kiro)' },
-  { id: 'claude-opus-4.7', label: 'Claude Opus 4.7 (Kiro)' },
+  { id: 'claude-sonnet-4.5', label: 'Claude Sonnet 4.5 (上游)' },
+  { id: 'claude-haiku-4.5', label: 'Claude Haiku 4.5 (上游)' },
+  { id: 'claude-opus-4.5', label: 'Claude Opus 4.5 (上游)' },
+  { id: 'claude-sonnet-4.6', label: 'Claude Sonnet 4.6 (上游)' },
+  { id: 'claude-opus-4.6', label: 'Claude Opus 4.6 (上游)' },
+  { id: 'claude-opus-4.7', label: 'Claude Opus 4.7 (上游)' },
 ]
 
 export const DEFAULT_TEST_MODEL = TEST_MODELS[0].id
@@ -57,10 +57,10 @@ export function defaultTestModelForOptions(options: TestModelOption[]) {
   return options.find((option) => !isAutoModel(option.id))?.id || DEFAULT_TEST_MODEL
 }
 
-// External pools speak the Claude Code / Anthropic protocol, so both the options shown and the
+// Accounts speak the Claude Code / Anthropic protocol, so both the options shown and the
 // model sent in a test request use standard Claude Code model ids (claude-opus-4-6), never
-// Kiro's dotted ids (claude-opus-4.6), shorthand aliases (sonnet) or -thinking/[1m] variants.
-export const EXTERNAL_POOL_TEST_MODELS: TestModelOption[] = [
+// 上游's dotted ids (claude-opus-4.6), shorthand aliases (sonnet) or -thinking/[1m] variants.
+export const ACCOUNT_TEST_MODELS: TestModelOption[] = [
   { id: 'claude-sonnet-5', label: 'claude-sonnet-5' },
   { id: 'claude-sonnet-4-6', label: 'claude-sonnet-4-6' },
   { id: 'claude-sonnet-4-5', label: 'claude-sonnet-4-5' },
@@ -74,14 +74,14 @@ export const EXTERNAL_POOL_TEST_MODELS: TestModelOption[] = [
   { id: 'claude-fable-5-1', label: 'claude-fable-5-1' },
 ]
 
-export const DEFAULT_EXTERNAL_POOL_TEST_MODEL = 'claude-sonnet-4-5'
+export const DEFAULT_ACCOUNT_TEST_MODEL = 'claude-sonnet-4-5'
 
 /**
  * Standard Claude Code model id for any spelling of a Claude model, or `null` when the value
  * is not a Claude model. `claude-opus-4.6`, `opus-4.6`, `claude-opus-4-6-thinking` and
  * `claude-opus-4-6[1m]` all become `claude-opus-4-6`; dated ids keep their date.
  */
-export function toExternalPoolTestModelName(model: string): string | null {
+export function toAccountTestModelName(model: string): string | null {
   let value = model.trim().toLowerCase()
   if (!value) return null
   if (value.endsWith('[1m]')) value = value.slice(0, -4)
@@ -94,7 +94,7 @@ export function toExternalPoolTestModelName(model: string): string | null {
   return `claude-${family}-${major}${minor ? `-${minor}` : ''}${date ? `-${date}` : ''}`
 }
 
-export function buildExternalPoolTestModelOptions(
+export function buildAccountTestModelOptions(
   catalogModels?: TestModelCatalogItem[],
   supportedModels?: string[]
 ): TestModelOption[] {
@@ -107,21 +107,21 @@ export function buildExternalPoolTestModelOptions(
   }
   // An explicit allowlist restricts the pool; otherwise offer the standard set plus the
   // Claude models known to the catalog.
-  const allowed = (supportedModels || []).map(toExternalPoolTestModelName)
+  const allowed = (supportedModels || []).map(toAccountTestModelName)
   allowed.forEach(push)
   if (options.length > 0) return options
-  EXTERNAL_POOL_TEST_MODELS.forEach((item) => push(item.id))
+  ACCOUNT_TEST_MODELS.forEach((item) => push(item.id))
   ;[...(catalogModels || [])]
-    .map((item) => toExternalPoolTestModelName(item.model))
+    .map((item) => toAccountTestModelName(item.model))
     .sort()
     .forEach(push)
   return options
 }
 
-export function defaultExternalPoolTestModelForOptions(options: TestModelOption[]) {
+export function defaultAccountTestModelForOptions(options: TestModelOption[]) {
   return (
-    options.find((option) => option.id === DEFAULT_EXTERNAL_POOL_TEST_MODEL)?.id ||
+    options.find((option) => option.id === DEFAULT_ACCOUNT_TEST_MODEL)?.id ||
     options[0]?.id ||
-    DEFAULT_EXTERNAL_POOL_TEST_MODEL
+    DEFAULT_ACCOUNT_TEST_MODEL
   )
 }

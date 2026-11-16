@@ -103,15 +103,15 @@ def main() -> int:
                     destination = transport.destination
                     if destination_ips:
                         local_is_unspecified = source_filter.is_unspecified
-                        local_to_kiro = (
+                        local_to_pool = (
                             (local_is_unspecified or source == args.source_ip)
                             and destination in destination_ips
                         )
-                        kiro_to_local = (
+                        pool_to_local = (
                             (local_is_unspecified or destination == args.source_ip)
                             and source in destination_ips
                         )
-                        if not (local_to_kiro or kiro_to_local):
+                        if not (local_to_pool or pool_to_local):
                             continue
                     elif source_filter.is_unspecified:
                         pass

@@ -1,4 +1,5 @@
 use super::*;
+use crate::account::*;
 use crate::anthropic::model_capabilities::ModelCapabilitiesCatalog;
 use crate::anthropic::model_capabilities::ModelResolutionSource;
 use crate::anthropic::pricing::PricingCatalog;
@@ -11,7 +12,6 @@ use crate::anthropic::usage::{
     UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecorder, UsageRouteKind,
 };
 use crate::common::auth::RequestApiKeyStore;
-use crate::external_pool::*;
 use crate::storage::{postgres::PostgresStore, redis_cache::RedisStore};
 use axum::{Router, body::Body, http::Request, routing::post};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -1186,8 +1186,8 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
     use crate::model::config::InjectionId;
     use crate::model::prompt_injection::{ItemSetting, TextKey};
     run_handler_fixture_on_large_stack_thread("prompt-injection-independence", || async {
-        if crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL").is_none()
-            || crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL").is_none()
+        if crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL").is_none()
+            || crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL").is_none()
         {
             return;
         }
@@ -1564,7 +1564,7 @@ async fn route_policy_matrix_message_request(
     assert_eq!(record.endpoint, path, "{path} usage endpoint");
     assert_eq!(
         record.route_kind,
-        Some(UsageRouteKind::ExternalPool),
+        Some(UsageRouteKind::Account),
         "{path} route kind"
     );
     let bodies = upstream.bodies_snapshot();
@@ -1908,15 +1908,15 @@ async fn multimodal_handler_test_router_from_config(
     mut config: Config,
     base_url: &str,
 ) -> Option<(Router, Arc<UsageRecorder>)> {
-    let manager = test_external_pool_manager_for_handlers(base_url).await?;
-    config.external_pools.external_pools_enabled = true;
-    config.external_pools.external_pool_same_pool_retry_count = 0;
+    let manager = test_account_manager_for_handlers(base_url).await?;
+    config.accounts.enabled = true;
+    config.accounts.same_pool_retry_count = 0;
     Some(handler_test_router(config, Some(manager)))
 }
 
 fn handler_test_router(
     config: Config,
-    manager: Option<Arc<ExternalPoolManager>>,
+    manager: Option<Arc<AccountManager>>,
 ) -> (Router, Arc<UsageRecorder>) {
     let usage_recorder = Arc::new(UsageRecorder::new(1_000));
     let router = create_router(
@@ -1930,23 +1930,21 @@ fn handler_test_router(
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            external_pool_manager: manager,
+            account_manager: manager,
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );
     (router, usage_recorder)
 }
 
-async fn test_external_pool_manager_for_handlers(
-    base_url: &str,
-) -> Option<Arc<ExternalPoolManager>> {
-    let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+async fn test_account_manager_for_handlers(base_url: &str) -> Option<Arc<AccountManager>> {
+    let Some(postgres_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL")
     else {
-        eprintln!("跳过 账号池入口 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 账号池入口 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
         return None;
     };
-    let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-        eprintln!("跳过 账号池入口 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+    let Some(redis_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL") else {
+        eprintln!("跳过 账号池入口 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
         return None;
     };
 
@@ -1961,17 +1959,19 @@ async fn test_external_pool_manager_for_handlers(
 
     let mut redis_config = Config::default();
     redis_config.redis.url = Some(redis_url);
-    redis_config.redis.key_prefix =
-        format!("kiro_rs:test:handlers:messages:{}", uuid::Uuid::new_v4());
+    redis_config.redis.key_prefix = format!(
+        "claude_pool:test:handlers:messages:{}",
+        uuid::Uuid::new_v4()
+    );
     let redis = Arc::new(
         RedisStore::connect(&redis_config)
             .await
             .expect("connect handler account pool test Redis"),
     );
 
-    let manager = Arc::new(ExternalPoolManager::new(postgres.clone(), redis));
+    let manager = Arc::new(AccountManager::new(postgres.clone(), redis));
     postgres
-        .create_external_pool(CreateExternalPoolRequest {
+        .create_account(CreateAccountRequest {
             tags: Vec::new(),
             proxy_url: None,
             cost_multiplier: 1.0,
@@ -1979,27 +1979,27 @@ async fn test_external_pool_manager_for_handlers(
             name: "handler-messages".to_string(),
             base_url: base_url.to_string(),
             api_key: "sk-handler-external-test".to_string(),
-            auth_type: ExternalPoolAuthType::XApiKey,
-            header_profile: ExternalPoolHeaderProfile::Generic,
+            auth_type: AccountAuthType::XApiKey,
+            header_profile: AccountHeaderProfile::Generic,
             append_beta_query: false,
             header_overrides: HashMap::new(),
-            wire_profile: ExternalPoolWireProfile::Default,
-            tls_profile: ExternalPoolTlsProfile::Default,
+            wire_profile: AccountWireProfile::Default,
+            tls_profile: AccountTlsProfile::Default,
             enabled: true,
             priority: 1,
             max_concurrent_requests: 10,
-            usage_projection_mode: ExternalPoolUsageProjectionMode::CurrentPathPolicy,
+            usage_projection_mode: UsageProjectionMode::CurrentPathPolicy,
             stream_response_mode: None,
 
-            auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
-            pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
+            auto_disable_policy: AutoDisablePolicy::Inherit,
+            pre_output_stream_retry_mode: StreamRetryMode::Inherit,
 
             normalize_model_version_dots: false,
-            model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
+            model_mapping_mode: ModelMappingMode::PassthroughMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
             supported_models: Vec::new(),
-            route_mode: crate::model::config::ExternalPoolRouteMode::AllowAll,
+            route_mode: crate::model::config::RouteRuleMode::AllowAll,
             route_rules: Vec::new(),
             notes: None,
         })
@@ -2011,7 +2011,7 @@ async fn test_external_pool_manager_for_handlers(
 
 #[tokio::test]
 async fn content_length_threshold_error_is_not_reported_as_context_window_full() {
-    let response = ExternalPoolFinalError {
+    let response = AccountFinalError {
         status: StatusCode::BAD_REQUEST,
         response_error_type: "invalid_request_error".to_string(),
         route_error_type: "bad_request".to_string(),
@@ -2034,7 +2034,7 @@ async fn content_length_threshold_error_is_not_reported_as_context_window_full()
         .expect("error message");
 
     assert!(message.starts_with("prompt is too long"), "{message}");
-    // 账号池路径的公开文案（原 Kiro 路径写的是 "content length limit"）。
+    // 账号池路径的公开文案（原 上游 路径写的是 "content length limit"）。
     assert!(message.contains("content length exceeded"), "{message}");
     assert!(message.contains("separate from the model context window"));
     assert!(!message.contains("Context window is full"));
@@ -2042,7 +2042,7 @@ async fn content_length_threshold_error_is_not_reported_as_context_window_full()
 
 #[tokio::test]
 async fn prompt_too_long_error_maps_to_input_length_message() {
-    let response = ExternalPoolFinalError {
+    let response = AccountFinalError {
         status: StatusCode::BAD_REQUEST,
         response_error_type: "invalid_request_error".to_string(),
         route_error_type: "bad_request".to_string(),
@@ -2070,46 +2070,44 @@ async fn prompt_too_long_error_maps_to_input_length_message() {
 }
 
 #[tokio::test]
-async fn external_pool_endpoint_gate_applies_global_enable_and_route_policy() {
+async fn account_endpoint_gate_applies_global_enable_and_route_policy() {
     let upstream = MultimodalHandlerUpstream::start().await;
-    let Some(manager) = test_external_pool_manager_for_handlers(&upstream.base_url).await else {
+    let Some(manager) = test_account_manager_for_handlers(&upstream.base_url).await else {
         return;
     };
-    let mut config = ExternalPoolsConfig::default();
+    let mut config = AccountsConfig::default();
 
-    assert!(!external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
+    assert!(!account_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
 
-    config.external_pools_enabled = true;
-    assert!(external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
+    config.enabled = true;
+    assert!(account_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
 
     config.routes.route_mut("/cc").account_rule = crate::model::routes::RouteRule {
-        mode: crate::model::config::ExternalPoolRouteMode::DenyList,
+        mode: crate::model::config::RouteRuleMode::DenyList,
         rules: vec!["*".into()],
     };
-    assert!(!external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
-    assert!(external_pool_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
+    assert!(!account_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
+    assert!(account_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
 
     for route in &mut config.routes.routes {
         route.account_rule = crate::model::routes::RouteRule {
-            mode: crate::model::config::ExternalPoolRouteMode::DenyList,
+            mode: crate::model::config::RouteRuleMode::DenyList,
             rules: vec!["*".into()],
         };
     }
     config.routes.route_mut("/dfcache/team-a").account_rule = Default::default();
-    assert!(!external_pool_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
-    assert!(
-        external_pool_enabled_for_endpoint(&config, "/dfcache/team-a/v1/messages", &manager).await
-    );
+    assert!(!account_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
+    assert!(account_enabled_for_endpoint(&config, "/dfcache/team-a/v1/messages", &manager).await);
 }
 
-async fn external_pool_enabled_for_endpoint(
-    external_pools: &ExternalPoolsConfig,
+async fn account_enabled_for_endpoint(
+    accounts: &AccountsConfig,
     endpoint: &str,
-    manager: &Arc<ExternalPoolManager>,
+    manager: &Arc<AccountManager>,
 ) -> bool {
     let mut config = Config::default();
-    config.external_pools = external_pools.clone();
-    config.routes = external_pools.routes.clone();
+    config.accounts = accounts.clone();
+    config.routes = accounts.routes.clone();
     let (app, _usage) = handler_test_router(config, Some(manager.clone()));
     let response = app
         .oneshot(multimodal_handler_request(

@@ -507,7 +507,7 @@ const EVENT_TYPE_DOCS: &[(&str, &str)] = &[
     ),
     (
         "upstream_request",
-        "每次发往 Kiro 上游的请求：attempt、凭据 ID、endpoint/Region/clientVersion、URL、请求头、完整请求体",
+        "每次发往 上游 上游的请求：attempt、凭据 ID、endpoint/Region/clientVersion、URL、请求头、完整请求体",
     ),
     (
         "upstream_response",
@@ -866,7 +866,7 @@ mod tests {
     use super::*;
 
     fn temp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("kiro-capture-{}", Uuid::new_v4().simple()))
+        std::env::temp_dir().join(format!("pool-capture-{}", Uuid::new_v4().simple()))
     }
 
     fn read_events(manager: &CaptureManager, id: &str) -> Vec<Value> {

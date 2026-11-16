@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Anthropic-compatible mock external pool for scheduler and fallback tests.
+// Anthropic-compatible mock account for scheduler and fallback tests.
 //
 // POST /v1/messages answers like Anthropic (JSON or SSE when "stream": true).
 // POST /__control with a JSON patch changes behaviour for following requests:
@@ -128,5 +128,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`external pool mock ${NAME} listening on http://${HOST}:${PORT}`);
+  console.log(`account mock ${NAME} listening on http://${HOST}:${PORT}`);
 });

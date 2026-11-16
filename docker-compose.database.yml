@@ -1,27 +1,27 @@
 services:
-  kiro-rs-postgres:
+  claude-pool-postgres:
     image: postgres:18-alpine
-    container_name: kiro-rs-postgres
+    container_name: claude-pool-postgres
     environment:
-      POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}
-      POSTGRES_USER: ${KIRO_RS_POSTGRES_USER:-kiro_rs}
-      POSTGRES_PASSWORD: ${KIRO_RS_POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${CLAUDE_POOL_POSTGRES_DB:-claude_pool}
+      POSTGRES_USER: ${CLAUDE_POOL_POSTGRES_USER:-claude_pool}
+      POSTGRES_PASSWORD: ${CLAUDE_POOL_POSTGRES_PASSWORD:-change-me}
     volumes:
-      - kiro-rs-postgres-data:/var/lib/postgresql
+      - claude-pool-postgres-data:/var/lib/postgresql
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U ${KIRO_RS_POSTGRES_USER:-kiro_rs} -d ${KIRO_RS_POSTGRES_DB:-kiro_rs}"
+          "pg_isready -U ${CLAUDE_POOL_POSTGRES_USER:-claude_pool} -d ${CLAUDE_POOL_POSTGRES_DB:-claude_pool}"
         ]
       interval: 10s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
-  kiro-rs-redis:
+  claude-pool-redis:
     image: redis:7-alpine
-    container_name: kiro-rs-redis
+    container_name: claude-pool-redis
     command:
       [
         "redis-server",
@@ -29,7 +29,7 @@ services:
         "yes"
       ]
     volumes:
-      - kiro-rs-redis-data:/data
+      - claude-pool-redis-data:/data
     healthcheck:
       test:
         [
@@ -42,20 +42,20 @@ services:
       retries: 10
     restart: unless-stopped
 
-  kiro-rs-app:
-    image: ${KIRO_RS_IMAGE:-ghcr.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
-    container_name: kiro-rs-app
+  claude-pool-app:
+    image: ${CLAUDE_POOL_IMAGE:-ghcr.io/2ue/claude-pool}:${CLAUDE_POOL_VERSION:-latest}
+    container_name: claude-pool-app
     depends_on:
-      kiro-rs-postgres:
+      claude-pool-postgres:
         condition: service_healthy
-      kiro-rs-redis:
+      claude-pool-redis:
         condition: service_healthy
     environment:
-      KIRO_RS_POSTGRES_URL: postgres://${KIRO_RS_POSTGRES_USER:-kiro_rs}:${KIRO_RS_POSTGRES_PASSWORD:-change-me}@kiro-rs-postgres:5432/${KIRO_RS_POSTGRES_DB:-kiro_rs}
-      KIRO_RS_POSTGRES_MIGRATE_ON_START: ${KIRO_RS_POSTGRES_MIGRATE_ON_START:-true}
-      KIRO_RS_REDIS_URL: redis://kiro-rs-redis:6379/0
+      CLAUDE_POOL_POSTGRES_URL: postgres://${CLAUDE_POOL_POSTGRES_USER:-claude_pool}:${CLAUDE_POOL_POSTGRES_PASSWORD:-change-me}@claude-pool-postgres:5432/${CLAUDE_POOL_POSTGRES_DB:-claude_pool}
+      CLAUDE_POOL_POSTGRES_MIGRATE_ON_START: ${CLAUDE_POOL_POSTGRES_MIGRATE_ON_START:-true}
+      CLAUDE_POOL_REDIS_URL: redis://claude-pool-redis:6379/0
     ports:
-      - "${KIRO_RS_PORT:-8990}:8990"
+      - "${CLAUDE_POOL_PORT:-8990}:8990"
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
@@ -64,5 +64,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  kiro-rs-postgres-data:
-  kiro-rs-redis-data:
+  claude-pool-postgres-data:
+  claude-pool-redis-data:

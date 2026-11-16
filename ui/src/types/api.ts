@@ -100,8 +100,8 @@ export interface CredentialStatusItem {
   priority: number
   /** Fast 值：0 表示未开启，数字越大越先打满。 */
   fast: number
-  /** 路由调度规则，语义与外部池相同；allow_all 表示不限制。 */
-  routeMode: ExternalPoolRouteMode
+  /** 路由调度规则，语义与账号相同；allow_all 表示不限制。 */
+  routeMode: RouteRuleMode
   routeRules: string[]
   disabled: boolean
   failureCount: number
@@ -165,7 +165,6 @@ export interface CredentialStatusItem {
   schedulerScore?: number
   estimatedCostUsd: number
   originalCostUsd: number
-  kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   rpm: number
@@ -282,7 +281,7 @@ export interface CredentialAccountInfoListResponse {
 
 export type CredentialUsageSummaryItem = Pick<
   CredentialStatusItem,
-  'id' | 'estimatedCostUsd' | 'originalCostUsd' | 'kiroMeteringUsage' | 'pricedRequests' | 'unpricedRequests'
+  'id' | 'estimatedCostUsd' | 'originalCostUsd' | 'pricedRequests' | 'unpricedRequests'
 >
 
 export interface CredentialUsageSummaryResponse {
@@ -316,7 +315,6 @@ export interface UsageDashboardAccountItem {
   windowTotalOutputTokens: number
   windowEstimatedCostUsd: number
   windowOriginalCostUsd: number
-  windowKiroMeteringUsage: number
   windowPricedRequests: number
   windowUnpricedRequests: number
   lifetimeRequests: number
@@ -325,7 +323,6 @@ export interface UsageDashboardAccountItem {
   lifetimeTotalOutputTokens: number
   lifetimeEstimatedCostUsd: number
   lifetimeOriginalCostUsd: number
-  lifetimeKiroMeteringUsage: number
   lifetimePricedRequests: number
   lifetimeUnpricedRequests: number
 }
@@ -548,7 +545,7 @@ export interface SetCredentialFastRequest {
 }
 
 export interface SetCredentialRoutePolicyRequest {
-  routeMode: ExternalPoolRouteMode
+  routeMode: RouteRuleMode
   routeRules: string[]
 }
 
@@ -629,7 +626,6 @@ export interface AddCredentialRequest {
   proxyUsername?: string
   proxyPassword?: string
   proxyResourceId?: number | null
-  kiroApiKey?: string
   endpoint?: string
   supportedModels?: string[]
   tags?: string[]
@@ -642,48 +638,6 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
   warning?: string
-}
-
-export interface CreateKiroApiKeyRequest {
-  credentialId: number
-  label: string
-}
-
-export interface CreateKiroApiKeyItem {
-  keyId: string
-  keyPrefix: string
-  profileArn: string
-  persisted: boolean
-  warning?: string
-  credentialId: number
-  email?: string | null
-  label: string
-  apiKey: string
-  region: string
-  createdAt: number
-}
-
-export interface BatchCreateKiroApiKeysRequest {
-  credentialIds?: number[]
-  labelPrefix?: string
-}
-
-export interface BatchCreateKiroApiKeyItem {
-  credentialId: number
-  email?: string | null
-  ok: boolean
-  skipped: boolean
-  result?: CreateKiroApiKeyItem
-  error?: string
-}
-
-export interface BatchCreateKiroApiKeysResponse {
-  total: number
-  success: number
-  skipped: number
-  failed: number
-  items: BatchCreateKiroApiKeyItem[]
-  keys: CreateKiroApiKeyItem[]
 }
 
 export interface TestCredentialRequest {
@@ -829,7 +783,7 @@ export type UsageSource =
   | 'request_estimate'
   | 'none'
 
-export type UsageRouteKindFilter = 'local_credential' | 'external_pool'
+export type UsageRouteKindFilter = 'local_credential' | 'account'
 
 export interface InferenceAttemptSnapshot {
   maxAttempts: number
@@ -900,20 +854,6 @@ export interface UsageLatencyTrace {
   webSearchRequests?: number
 }
 
-export interface KiroCredentialAttempt {
-  attempt: number
-  credentialId: number
-  credentialLabel?: string
-  status?: number
-  statusText?: string
-  action: string
-  model?: string
-  errorType?: string
-  errorMessage?: string
-  rawUpstreamError?: RawUpstreamError
-  durationMs: number
-}
-
 export interface RawUpstreamError {
   source: string
   statusCode?: number
@@ -950,7 +890,6 @@ export interface UsageRecord {
   cacheCreation1hInputTokens: number
   estimatedCostUsd: number
   originalCostUsd: number
-  kiroMeteringUsage: number
   pricingAvailable: boolean
   pricingModel?: string
   durationMs: number
@@ -960,18 +899,17 @@ export interface UsageRecord {
   simulated: boolean
   stickyBound: boolean
   fallbackFromSticky: boolean
-  credentialAttempts?: KiroCredentialAttempt[]
-  routeKind?: 'local_credential' | 'external_pool'
-  routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_external' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_route_policy' | 'external_error'
+  routeKind?: 'local_credential' | 'account'
+  routeSubtype?: 'account'
   fallbackReason?: string
   directPolicyReason?: string
   localAttempted?: boolean
   localPreflight?: unknown
-  externalPoolId?: number
-  externalPoolName?: string
-  externalAttempts?: ExternalPoolAttempt[]
+  accountId?: number
+  accountName?: string
+  externalAttempts?: AccountAttempt[]
   usageProjectionApplied?: boolean
-  externalPoolBilling?: ExternalPoolBilling
+  accountBilling?: AccountBilling
   errorType?: string
   errorMessage?: string
   errorDetail?: string
@@ -1002,7 +940,7 @@ export interface UsageRecorderStats {
   droppedPersistRecords: number
 }
 
-export interface ExternalPoolUsageSnapshot {
+export interface AccountUsageSnapshot {
   totalInputTokens: number
   inputTokens: number
   billableInputTokens: number
@@ -1013,11 +951,11 @@ export interface ExternalPoolUsageSnapshot {
   cacheCreation1hInputTokens: number
 }
 
-export interface ExternalPoolBilling {
+export interface AccountBilling {
   requestInputTokens?: number
-  rawUsage: ExternalPoolUsageSnapshot
-  shapedUsage?: ExternalPoolUsageSnapshot
-  reportedUsage: ExternalPoolUsageSnapshot
+  rawUsage: AccountUsageSnapshot
+  shapedUsage?: AccountUsageSnapshot
+  reportedUsage: AccountUsageSnapshot
   usageProjectionApplied: boolean
   rawCostUsd: number
   shapedCostUsd?: number
@@ -1030,14 +968,14 @@ export interface ExternalPoolBilling {
   pricingAvailable: boolean
   pricingModel?: string
   usageProjectionMode: string
-  streamResponseMode?: ExternalPoolStreamResponseMode
+  streamResponseMode?: StreamResponseMode
   usageEstimated?: boolean
   usageEstimateReason?: string
   usageCandidatePath?: string
   bodyUsageProjectionApplied?: boolean
 }
 
-export interface ExternalPoolAttempt {
+export interface AccountAttempt {
   attempt: number
   poolId: number
   poolName: string
@@ -1097,7 +1035,6 @@ export interface UsageSummary {
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
-  totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   localPromptCacheRequests: number
@@ -1106,13 +1043,13 @@ export interface UsageSummary {
   localPromptCacheCreationInputTokens: number
   simulatedRequests: number
   upstreamMetadataRequests: number
-  externalPoolBilling?: UsageExternalPoolBillingSummary
+  accountBilling?: UsageAccountBillingSummary
   realtime: UsageRealtimeStats
   topCredentials: UsageAggregate[]
   topConversations: UsageAggregate[]
 }
 
-export interface UsageExternalPoolBillingSummary {
+export interface UsageAccountBillingSummary {
   requests: number
   pricedRequests: number
   unpricedRequests: number
@@ -1126,7 +1063,7 @@ export interface UsageExternalPoolBillingSummary {
   costFloorDeltaUsd: number
 }
 
-export interface UsageExternalPoolBillingByPool extends UsageExternalPoolBillingSummary {
+export interface UsageAccountBillingByPool extends UsageAccountBillingSummary {
   poolId: number
   poolName: string
 }
@@ -1152,7 +1089,6 @@ export interface UsageOverviewMetrics {
   cacheCreationInputTokens: number
   estimatedCostUsd: number
   originalCostUsd: number
-  kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   averageDurationMs: number
@@ -1168,12 +1104,11 @@ export interface UsageOverviewSeriesMetrics {
   cacheCreationInputTokens: number
   estimatedCostUsd: number
   originalCostUsd: number
-  kiroMeteringUsage: number
-  /** 外部池上游原始成本（只有外部池记录有值） */
+  /** 账号上游原始成本（只有账号记录有值） */
   rawCostUsd: number
-  /** 外部池最终可计费金额 */
+  /** 账号最终可计费金额 */
   billableCostUsd: number
-  /** 外部池补偿后成本 - 上游原始成本 */
+  /** 账号补偿后成本 - 上游原始成本 */
   profitUsd: number
 }
 
@@ -1189,7 +1124,7 @@ export interface UsageOverviewSeriesPoint {
   local: UsageOverviewSeriesMetrics
   external: UsageOverviewSeriesMetrics
   localRoutes: UsageOverviewSeriesBreakdown[]
-  externalPools: UsageOverviewSeriesBreakdown[]
+  accounts: UsageOverviewSeriesBreakdown[]
   externalReasons: UsageOverviewSeriesBreakdown[]
 }
 
@@ -1202,7 +1137,7 @@ export interface UsageOverviewSeriesGroups {
   /** 按消耗积分降序 */
   localRoutes: UsageOverviewSeriesGroup[]
   /** 按上游原始成本降序 */
-  externalPools: UsageOverviewSeriesGroup[]
+  accounts: UsageOverviewSeriesGroup[]
   /** 按请求数降序 */
   externalReasons: UsageOverviewSeriesGroup[]
 }
@@ -1366,35 +1301,35 @@ export interface UsageDashboardBreakdownResponse {
   usageSourceBreakdown: UsageBreakdownItem[]
 }
 
-export interface UsageDashboardExternalPoolBillingResponse {
+export interface UsageDashboardAccountBillingResponse {
   generatedAt: string
   timezone: string
   windowKey: string
-  externalPoolBillingByPool: UsageExternalPoolBillingByPool[]
+  accountBillingByPool: UsageAccountBillingByPool[]
 }
 
-export interface UsageExternalPoolRiskQuery {
+export interface UsageAccountRiskQuery {
   timezone?: string
   windowKey?: string
   since?: string
   until?: string
   warningThresholdTokens?: number
   criticalThresholdTokens?: number
-  externalPoolId?: number
+  accountId?: number
   endpoint?: string
   model?: string
   stream?: boolean
   limit?: number
 }
 
-export interface UsageExternalPoolRiskWindow {
+export interface UsageAccountRiskWindow {
   key: string
   label: string
   from: string
   to: string
 }
 
-export interface UsageExternalPoolRiskThresholds {
+export interface UsageAccountRiskThresholds {
   warningTokens: number
   criticalTokens: number
   costFloorEnabled: boolean
@@ -1402,14 +1337,14 @@ export interface UsageExternalPoolRiskThresholds {
   costTargetMultiplier: number
 }
 
-export interface UsageExternalPoolRiskFilters {
+export interface UsageAccountRiskFilters {
   poolId?: number
   endpoint?: string
   model?: string
   stream?: boolean
 }
 
-export interface UsageExternalPoolRiskTotals {
+export interface UsageAccountRiskTotals {
   records: number
   successRecords: number
   errorRecords: number
@@ -1419,11 +1354,11 @@ export interface UsageExternalPoolRiskTotals {
   unpricedRecords: number
   rawUsageRecords: number
   reportedUsageRecords: number
-  missingExternalPoolBillingRecords: number
+  missingAccountBillingRecords: number
   outputZeroRecords: number
 }
 
-export interface UsageExternalPoolRiskCacheStats {
+export interface UsageAccountRiskCacheStats {
   minReadTokens: number
   maxReadTokens: number
   avgReadTokens: number
@@ -1440,7 +1375,7 @@ export interface UsageExternalPoolRiskCacheStats {
   eitherCriticalCount: number
 }
 
-export interface UsageExternalPoolRiskCostStats {
+export interface UsageAccountRiskCostStats {
   rawCostUsd: number
   reportedCostUsd: number
   targetCostUsd: number
@@ -1459,7 +1394,7 @@ export interface UsageExternalPoolRiskCostStats {
   maxCostRatio?: number | null
 }
 
-export interface UsageExternalPoolRiskBucket {
+export interface UsageAccountRiskBucket {
   key: string
   label: string
   minTokens?: number | null
@@ -1470,7 +1405,7 @@ export interface UsageExternalPoolRiskBucket {
   reportedWriteCount: number
 }
 
-export interface UsageExternalPoolRiskGroup {
+export interface UsageAccountRiskGroup {
   key: string
   label: string
   records: number
@@ -1492,18 +1427,18 @@ export interface UsageExternalPoolRiskGroup {
   belowTargetCount: number
 }
 
-export interface UsageExternalPoolRiskSample {
+export interface UsageAccountRiskSample {
   id: string
   createdAt: string
   endpoint: string
   stream: boolean
   model: string
   status: string
-  externalPoolId?: number
-  externalPoolName?: string
+  accountId?: number
+  accountName?: string
   pricingModel?: string
   usageProjectionMode?: string
-  externalPoolBillingPresent: boolean
+  accountBillingPresent: boolean
   costFloorApplied: boolean
   rawInputTokens: number
   rawOutputTokens: number
@@ -1522,21 +1457,21 @@ export interface UsageExternalPoolRiskSample {
   riskReasons: string[]
 }
 
-export interface UsageExternalPoolRiskResponse {
+export interface UsageAccountRiskResponse {
   generatedAt: string
   timezone: string
-  window: UsageExternalPoolRiskWindow
-  thresholds: UsageExternalPoolRiskThresholds
-  filters: UsageExternalPoolRiskFilters
-  totals: UsageExternalPoolRiskTotals
-  rawCache: UsageExternalPoolRiskCacheStats
-  reportedCache: UsageExternalPoolRiskCacheStats
-  cost: UsageExternalPoolRiskCostStats
-  buckets: UsageExternalPoolRiskBucket[]
-  byPool: UsageExternalPoolRiskGroup[]
-  byPath: UsageExternalPoolRiskGroup[]
-  byModel: UsageExternalPoolRiskGroup[]
-  samples: UsageExternalPoolRiskSample[]
+  window: UsageAccountRiskWindow
+  thresholds: UsageAccountRiskThresholds
+  filters: UsageAccountRiskFilters
+  totals: UsageAccountRiskTotals
+  rawCache: UsageAccountRiskCacheStats
+  reportedCache: UsageAccountRiskCacheStats
+  cost: UsageAccountRiskCostStats
+  buckets: UsageAccountRiskBucket[]
+  byPool: UsageAccountRiskGroup[]
+  byPath: UsageAccountRiskGroup[]
+  byModel: UsageAccountRiskGroup[]
+  samples: UsageAccountRiskSample[]
 }
 
 export interface UsageDashboardWindow {
@@ -1563,7 +1498,6 @@ export interface UsageDashboardSummary {
   cacheReadRatio: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
-  totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   averageDurationMs: number
@@ -1572,8 +1506,8 @@ export interface UsageDashboardSummary {
   fallbackFromStickyRequests: number
   simulatedRequests: number
   upstreamMetadataRequests: number
-  externalPoolBilling?: UsageExternalPoolBillingSummary
-  externalPoolBillingByPool?: UsageExternalPoolBillingByPool[]
+  accountBilling?: UsageAccountBillingSummary
+  accountBillingByPool?: UsageAccountBillingByPool[]
   statusBreakdown: UsageBreakdownItem[]
   usageSourceBreakdown: UsageBreakdownItem[]
 }
@@ -1603,7 +1537,6 @@ export interface UsageSeriesPoint {
   totalOutputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
-  totalKiroMeteringUsage: number
 }
 
 export interface UsageDashboardTop {
@@ -1636,7 +1569,6 @@ export interface UsageTopAggregate {
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
-  totalKiroMeteringUsage: number
 }
 
 export interface UsageRecordsQuery {
@@ -1647,7 +1579,7 @@ export interface UsageRecordsQuery {
   endpoint?: string
   conversationId?: string
   credentialId?: number
-  externalPoolId?: number
+  accountId?: number
   routeKind?: UsageRouteKindFilter
   model?: string
   status?: UsageRecordStatus
@@ -1728,26 +1660,25 @@ export interface AccountEventSummaryResponse {
 }
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
-export type KiroAgentModeStrategy = 'vibe' | 'spec' | 'auto'
 export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
 export type ThinkingTriggerMode = 'real_request' | 'always' | 'off'
 export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
-export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
-export type ExternalPoolHeaderProfile = 'generic' | 'anthropic_passthrough' | 'claude_code_mimic'
-export type ExternalPoolWireProfile = 'default' | 'http1_title_case'
-export type ExternalPoolTlsProfile = 'default' | 'native_tls'
-export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
-export type ExternalPoolStreamResponseMode = 'event_passthrough'
-export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled' | 'early_commit'
-export type ExternalPoolModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
-export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
-export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
-export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
-export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
-export type ExternalPoolRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
+export type AccountAuthType = 'bearer' | 'x_api_key'
+export type AccountHeaderProfile = 'generic' | 'anthropic_passthrough' | 'claude_code_mimic'
+export type AccountWireProfile = 'default' | 'http1_title_case'
+export type AccountTlsProfile = 'default' | 'native_tls'
+export type UsageProjectionMode = 'pass_through' | 'current_path_policy'
+export type StreamResponseMode = 'event_passthrough'
+export type StreamRetryMode = 'inherit' | 'enabled' | 'disabled' | 'early_commit'
+export type ModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
+export type AccountRequestBodyMode = 'normalized' | 'raw_passthrough'
+export type AccountRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
+export type AutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
+export type ModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
+export type RouteRuleMode = 'allow_all' | 'allow_list' | 'deny_list'
 
-export interface ExternalPoolModelMappingRule {
+export interface AccountModelMappingRule {
   enabled?: boolean
   source: string
   target: string
@@ -1834,7 +1765,7 @@ export interface CacheBoundsPolicyPatch {
   estimatedBytesLimit?: number
 }
 
-/** Kiro-RS Tool Plus：单个 usage 字段的放大、浮动与上下限。 */
+/** 前缀追踪 Plus：单个 usage 字段的放大、浮动与上下限。 */
 export interface UsageFieldShaping {
   multiplier?: number
   jitterRatio?: number
@@ -1854,7 +1785,7 @@ export interface UsageShapingProfile {
 
 export type UsageShapingProfileMode = 'inherit' | 'custom' | 'raw'
 
-export interface KiroRsToolPlusCachePolicy {
+export interface PrefixToolPlusCachePolicy {
   coverageRatio?: number
   maxCoverageTokens?: number
   incrementalCreateEnabled?: boolean
@@ -1873,7 +1804,7 @@ export interface KiroRsToolPlusCachePolicy {
   }
 }
 
-export interface KiroRsToolCachePolicyPatch {
+export interface PrefixToolCachePolicyPatch {
   coverageRatio?: number
   maxCoverageTokens?: number
   incrementalCreateEnabled?: boolean
@@ -1921,7 +1852,7 @@ export interface StableSegmentCachePolicyPatch {
   finalOutputJitterMaxTokens?: number
 }
 
-export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool' | 'stable_segment_cache' | 'kiro_rs_tool_plus' | 'bounded_high_cache'
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'prefix_tool' | 'stable_segment_cache' | 'prefix_tool_plus' | 'bounded_high_cache'
 
 export interface CacheRoutePolicyPatch {
   cacheType?: PromptCacheStrategyType
@@ -1931,8 +1862,8 @@ export interface CacheRoutePolicyPatch {
   reportedUsage?: ReportedUsagePathPolicy
   cachePoint?: CachePointPolicyPatch
   bounds?: CacheBoundsPolicyPatch
-  kiroRsTool?: KiroRsToolCachePolicyPatch
-  kiroRsToolPlus?: KiroRsToolPlusCachePolicy
+  prefixTool?: PrefixToolCachePolicyPatch
+  prefixToolPlus?: PrefixToolPlusCachePolicy
   stableSegment?: StableSegmentCachePolicyPatch
   hitShaping?: CacheHitShapingPolicyPatch
   coldRequestGuard?: ColdRequestGuardPolicyPatch
@@ -1942,7 +1873,7 @@ export interface CacheRoutePolicyPatch {
 /**
  * 缓存写入时长：最终 usage 的写入全部记为 5 分钟（ephemeral_5m，普通缓存）或 1 小时（ephemeral_1h）。
  * "请求标记"指 cache_control.ttl；只写 cache_control 不写 ttl 视为未指定。
- * upstream_then_request_default_5m 只用于外部池。
+ * upstream_then_request_default_5m 只用于账号。
  */
 export type CacheTtlMode =
   | 'follow_request_default_5m'
@@ -1953,7 +1884,7 @@ export type CacheTtlMode =
 
 export interface CacheTtlPolicyPatch {
   local?: CacheTtlMode
-  externalPool?: CacheTtlMode
+  account?: CacheTtlMode
 }
 
 /** 冷请求 usage 约束：默认关闭，关闭时与未引入该约束的行为一致。 */
@@ -1979,9 +1910,9 @@ export interface CacheHitShapingPolicyPatch {
 export interface CachePolicyConfig {
   default: CacheRoutePolicyPatch
   currentHighCache: CacheRoutePolicyPatch
-  kiroRsTool: CacheRoutePolicyPatch
+  prefixTool: CacheRoutePolicyPatch
   stableSegmentCache: CacheRoutePolicyPatch
-  kiroRsToolPlus?: CacheRoutePolicyPatch
+  prefixToolPlus?: CacheRoutePolicyPatch
   /** 上下限优先缓存策略模板，不继承 default。 */
   boundedHighCache?: CacheRoutePolicyPatch
   pathOverrides: Record<string, CacheRoutePolicyPatch>
@@ -2069,13 +2000,13 @@ export type InjectionTextKey =
 
 export interface InjectionItemSetting {
   enabled: boolean
-  /** Only present on items that can be injected into external-pool requests. */
-  externalPool?: boolean
+  /** Only present on items that can be injected into account requests. */
+  account?: boolean
 }
 
 export interface InjectionItemOverride {
   enabled?: boolean
-  externalPool?: boolean
+  account?: boolean
 }
 
 export interface PromptInjectionConfig {
@@ -2122,7 +2053,7 @@ export interface InjectionCatalogEntry {
   recommendation: InjectionRecommendation
   recommendationNote: string
   defaultEnabled: boolean
-  externalPool: boolean
+  account: boolean
   strictBlocks: boolean
   editable: boolean
   texts: InjectionTextVariant[]
@@ -2148,7 +2079,6 @@ export type PreviewThinking = 'off' | 'enabled' | 'adaptive'
 
 export interface PromptInjectionPreviewRequest {
   route: string
-  upstream?: 'local' | 'external_pool'
   model?: string
   nativeReasoning?: boolean
   withSystem?: boolean
@@ -2163,7 +2093,7 @@ export interface PromptInjectionPreviewRequest {
   draft?: { promptInjection?: PromptInjectionConfig; routeFeatures?: RouteFeaturesConfig }
 }
 
-export type PreviewBlockReason = 'off' | 'external_pool_unsupported' | 'external_pool_off' | 'strict'
+export type PreviewBlockReason = 'off' | 'account_unsupported' | 'account_off' | 'strict'
 
 export interface PromptInjectionPreviewItem {
   id: InjectionId
@@ -2214,45 +2144,45 @@ export interface PayloadShapingConfig {
   oversizedImageHandling: OversizedImageHandling
 }
 
-export interface ExternalPoolsConfig {
-  externalPoolsEnabled: boolean
-  externalPoolGlobalMaxConcurrentRequests: number
-  externalPoolMaxQueuedRequests: number
-  externalPoolMaxInputTokens: number
-  externalPoolCapacityMode: 'fail_fast' | 'wait'
-  externalPoolDispatchMaxWaitSecs: number
-  externalPoolRetryMaxAttempts: number
-  externalPoolRetryStatusCodes: number[]
-  externalPoolRetryOnNetworkError: boolean
-  externalPoolRetryOnProtocolError: boolean
-  externalPoolSamePoolRetryCount: number
-  externalPoolSamePoolRetryStatusCodes: number[]
-  externalPoolSamePoolRetryDelayMs: number
-  externalPoolTransientFailurePriorityPenalty: number
-  externalPoolTransientFailureCooldownThreshold: number
-  externalPoolQualityAwareSchedulingEnabled: boolean
-  externalPoolQualityEwmaAlpha: number
-  externalPoolQualitySampleTtlSecs: number
-  externalPoolQualityMinSamples: number
-  externalPoolQualityPriorityWeight: number
-  externalPoolQualityLoadWeight: number
-  externalPoolQualityErrorWeight: number
-  externalPoolQualityLatencyWeight: number
-  externalPoolQualityProbationWeight: number
-  externalPoolQualityTopK: number
-  externalPoolDegradeWindowSecs: number
-  externalPoolDegradeErrorRateThreshold: number
-  externalPoolDegradeProbationSecs: number
-  externalPoolMaxProbationSecs: number
-  externalPoolProbeSharePercent: number
-  externalPoolRecoveryRampSecs: number
+export interface AccountsConfig {
+  enabled: boolean
+  globalMaxConcurrentRequests: number
+  maxQueuedRequests: number
+  accountMaxInputTokens: number
+  capacityMode: 'fail_fast' | 'wait'
+  dispatchMaxWaitSecs: number
+  retryMaxAttempts: number
+  retryStatusCodes: number[]
+  retryOnNetworkError: boolean
+  retryOnProtocolError: boolean
+  samePoolRetryCount: number
+  samePoolRetryStatusCodes: number[]
+  samePoolRetryDelayMs: number
+  transientFailurePriorityPenalty: number
+  accountTransientFailureCooldownThreshold: number
+  qualityAwareSchedulingEnabled: boolean
+  qualityEwmaAlpha: number
+  qualitySampleTtlSecs: number
+  qualityMinSamples: number
+  qualityPriorityWeight: number
+  qualityLoadWeight: number
+  qualityErrorWeight: number
+  qualityLatencyWeight: number
+  qualityProbationWeight: number
+  qualityTopK: number
+  degradeWindowSecs: number
+  degradeErrorRateThreshold: number
+  degradeProbationSecs: number
+  maxProbationSecs: number
+  probeSharePercent: number
+  recoveryRampSecs: number
   externalDirectPolicyEnabled: boolean
   directExternalOnLocalMaintenance: boolean
   directExternalModelRules: string[]
   directExternalPathRules: string[]
-  externalPoolRouteMode: ExternalPoolRouteMode
-  externalPoolRouteRules: string[]
-  localPoolRouteMode: ExternalPoolRouteMode
+  accountRouteMode: RouteRuleMode
+  accountRouteRules: string[]
+  localPoolRouteMode: RouteRuleMode
   localPoolRouteRules: string[]
   fallbackOnLocalCapacityExhausted: boolean
   fallbackOnSchedulerRedisDegraded: boolean
@@ -2260,11 +2190,11 @@ export interface ExternalPoolsConfig {
   fallbackOnLocalTransientExhausted: boolean
   fallbackOnUnsupportedModel: boolean
   localPoolPreflightEnabled: boolean
-  externalPoolLocalRescueEnabled: boolean
-  externalPoolLocalRescueOnRateLimit: boolean
-  externalPoolLocalRescueOnTimeout: boolean
-  externalPoolLocalRescueOnCapacity: boolean
-  externalPoolLocalRescueMaxWaitSecs: number
+  accountLocalRescueEnabled: boolean
+  accountLocalRescueOnRateLimit: boolean
+  accountLocalRescueOnTimeout: boolean
+  accountLocalRescueOnCapacity: boolean
+  accountLocalRescueMaxWaitSecs: number
   localPoolCircuitEnabled: boolean
   localPoolCircuitWindowSecs: number
   localPoolCircuitOpenAfterFailures: number
@@ -2272,60 +2202,60 @@ export interface ExternalPoolsConfig {
   localPoolCircuitMinRatioPercent: number
   localPoolCircuitOpenSecs: number
   localPoolCircuitHalfOpenProbes: number
-  externalPoolAutoDisableEnabled: boolean
-  externalPoolAutoDisableOnAuthError: boolean
-  externalPoolAutoDisableOnSecurityLock: boolean
-  externalPoolAutoDisableOnQuotaExhausted: boolean
-  externalPoolAutoDisableOnMisconfiguredEndpoint: boolean
-  externalPoolAutoDisableFailureThreshold: number
-  externalPoolAutoDisableWindowSecs: number
-  externalPoolAutoDisableDurationSecs: number
-  externalPoolRateLimitCooldownSecs: number
-  externalPoolServerErrorCooldownSecs: number
-  externalPoolNetworkErrorCooldownSecs: number
-  externalPoolProtocolErrorCooldownSecs: number
-  externalPoolModelUnavailableCooldownMode: ExternalPoolModelUnavailableCooldownMode
-  externalPoolModelUnavailableCooldownSecs: number
-  externalPoolRequestTimeoutSecs: number
-  externalPoolStreamRequestTimeoutSecs: number
-  externalPoolStreamIdleTimeoutSecs: number
-  /** 首个语义输出的最长等待秒数（每个外部池尝试单独计时）；超时且未输出时换池，0 表示不限制。 */
-  externalPoolStreamFirstOutputTimeoutSecs: number
-  externalPoolStreamPreOutputRetryEnabled: boolean
-  externalPoolAutoDisableOnChannelDisabled: boolean
-  externalPoolUsageProjectionUpliftPercent: number
-  externalPoolUsageProjectionCostFloorEnabled: boolean
-  externalPoolUsageProjectionCostFloorMarginPercent: number
-  externalPoolUsageProjectionOutputUpliftMinTokens: number
-  externalPoolUsageProjectionOutputUpliftPercent: number
-  externalPoolStreamResponseMode: ExternalPoolStreamResponseMode
-  externalPoolUsageDebugEnabled: boolean
-  externalPoolUsageDebugDir: string
-  externalPoolUsageDebugMaxBodyBytes: number
-  externalPoolUsageDebugMaxFiles: number
+  autoDisableEnabled: boolean
+  autoDisableOnAuthError: boolean
+  autoDisableOnSecurityLock: boolean
+  autoDisableOnQuotaExhausted: boolean
+  autoDisableOnMisconfiguredEndpoint: boolean
+  autoDisableFailureThreshold: number
+  autoDisableWindowSecs: number
+  autoDisableDurationSecs: number
+  rateLimitCooldownSecs: number
+  serverErrorCooldownSecs: number
+  networkErrorCooldownSecs: number
+  protocolErrorCooldownSecs: number
+  modelUnavailableCooldownMode: ModelUnavailableCooldownMode
+  modelUnavailableCooldownSecs: number
+  requestTimeoutSecs: number
+  streamRequestTimeoutSecs: number
+  streamIdleTimeoutSecs: number
+  /** 首个语义输出的最长等待秒数（每个账号尝试单独计时）；超时且未输出时换池，0 表示不限制。 */
+  streamFirstOutputTimeoutSecs: number
+  streamPreOutputRetryEnabled: boolean
+  autoDisableOnChannelDisabled: boolean
+  usageProjectionUpliftPercent: number
+  usageProjectionCostFloorEnabled: boolean
+  usageProjectionCostFloorMarginPercent: number
+  usageProjectionOutputUpliftMinTokens: number
+  usageProjectionOutputUpliftPercent: number
+  streamResponseMode: StreamResponseMode
+  usageDebugEnabled: boolean
+  usageDebugDir: string
+  usageDebugMaxBodyBytes: number
+  usageDebugMaxFiles: number
 }
 
-export interface ExternalPool {
+export interface Account {
   id: number
   name: string
   baseUrl: string
   apiKey?: string
   maskedApiKey?: string
-  authType: ExternalPoolAuthType
-  headerProfile: ExternalPoolHeaderProfile
+  authType: AccountAuthType
+  headerProfile: AccountHeaderProfile
   appendBetaQuery: boolean
   headerOverrides: Record<string, string>
-  wireProfile: ExternalPoolWireProfile
-  tlsProfile: ExternalPoolTlsProfile
+  wireProfile: AccountWireProfile
+  tlsProfile: AccountTlsProfile
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
-  usageProjectionMode: ExternalPoolUsageProjectionMode
-  streamResponseMode?: ExternalPoolStreamResponseMode
-  requestBodyMode: ExternalPoolRequestBodyMode
-  rawModelMode: ExternalPoolRawModelMode
-  autoDisablePolicy: ExternalPoolAutoDisablePolicy
-  preOutputStreamRetryMode: ExternalPoolStreamRetryMode
+  usageProjectionMode: UsageProjectionMode
+  streamResponseMode?: StreamResponseMode
+  requestBodyMode: AccountRequestBodyMode
+  rawModelMode: AccountRawModelMode
+  autoDisablePolicy: AutoDisablePolicy
+  preOutputStreamRetryMode: StreamRetryMode
   autoDisabled: boolean
   autoDisabledReason?: string
   autoDisabledAt?: string
@@ -2333,23 +2263,23 @@ export interface ExternalPool {
   autoDisabledLastError?: string
   preservePath: boolean
   normalizeModelVersionDots: boolean
-  modelMappingMode: ExternalPoolModelMappingMode
+  modelMappingMode: ModelMappingMode
   modelMappingRequireMatch: boolean
-  modelMappingRules: ExternalPoolModelMappingRule[]
+  modelMappingRules: AccountModelMappingRule[]
   supportedModels: string[]
-  routeMode: ExternalPoolRouteMode
+  routeMode: RouteRuleMode
   routeRules: string[]
   notes?: string
   createdAt: string
   updatedAt: string
 }
 
-export interface ExternalPoolsListResponse {
-  pools: ExternalPool[]
+export interface AccountsListResponse {
+  pools: Account[]
 }
 
-export interface ExternalPoolStatus {
-  pool: ExternalPool
+export interface AccountStatus {
+  pool: Account
   inFlight: number
   cooldownRemainingSecs: number
   cooldownReason?: string
@@ -2357,10 +2287,10 @@ export interface ExternalPoolStatus {
   transientFailureTtlSecs: number
   dispatchable: boolean
   skippedReason?: string
-  quality?: ExternalPoolQualityView
+  quality?: AccountQualityView
 }
 
-export interface ExternalPoolQualityView {
+export interface AccountQualityView {
   recentErrorRate: number
   ttftEwmaMs?: number
   latencyEwmaMs?: number
@@ -2372,66 +2302,66 @@ export interface ExternalPoolQualityView {
   recoveryProgress: number
 }
 
-export interface ExternalPoolsStatusResponse {
-  pools: ExternalPoolStatus[]
+export interface AccountsStatusResponse {
+  pools: AccountStatus[]
 }
 
-export interface CreateExternalPoolRequest {
+export interface CreateAccountRequest {
   name: string
   baseUrl: string
   apiKey: string
-  authType?: ExternalPoolAuthType
-  headerProfile?: ExternalPoolHeaderProfile
+  authType?: AccountAuthType
+  headerProfile?: AccountHeaderProfile
   appendBetaQuery?: boolean
   headerOverrides?: Record<string, string>
-  wireProfile?: ExternalPoolWireProfile
-  tlsProfile?: ExternalPoolTlsProfile
+  wireProfile?: AccountWireProfile
+  tlsProfile?: AccountTlsProfile
   enabled?: boolean
   priority?: number
   maxConcurrentRequests?: number
-  usageProjectionMode?: ExternalPoolUsageProjectionMode
-  streamResponseMode?: ExternalPoolStreamResponseMode | null
-  requestBodyMode?: ExternalPoolRequestBodyMode
-  rawModelMode?: ExternalPoolRawModelMode
-  autoDisablePolicy?: ExternalPoolAutoDisablePolicy
-  preOutputStreamRetryMode?: ExternalPoolStreamRetryMode
+  usageProjectionMode?: UsageProjectionMode
+  streamResponseMode?: StreamResponseMode | null
+  requestBodyMode?: AccountRequestBodyMode
+  rawModelMode?: AccountRawModelMode
+  autoDisablePolicy?: AutoDisablePolicy
+  preOutputStreamRetryMode?: StreamRetryMode
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
-  modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingMode?: ModelMappingMode
   modelMappingRequireMatch?: boolean
-  modelMappingRules?: ExternalPoolModelMappingRule[]
+  modelMappingRules?: AccountModelMappingRule[]
   supportedModels?: string[]
-  routeMode?: ExternalPoolRouteMode
+  routeMode?: RouteRuleMode
   routeRules?: string[]
   notes?: string
 }
 
-export interface UpdateExternalPoolRequest {
+export interface UpdateAccountRequest {
   name?: string
   baseUrl?: string
   apiKey?: string
-  authType?: ExternalPoolAuthType
-  headerProfile?: ExternalPoolHeaderProfile
+  authType?: AccountAuthType
+  headerProfile?: AccountHeaderProfile
   appendBetaQuery?: boolean
   headerOverrides?: Record<string, string>
-  wireProfile?: ExternalPoolWireProfile
-  tlsProfile?: ExternalPoolTlsProfile
+  wireProfile?: AccountWireProfile
+  tlsProfile?: AccountTlsProfile
   enabled?: boolean
   priority?: number
   maxConcurrentRequests?: number
-  usageProjectionMode?: ExternalPoolUsageProjectionMode
-  streamResponseMode?: ExternalPoolStreamResponseMode | null
-  requestBodyMode?: ExternalPoolRequestBodyMode
-  rawModelMode?: ExternalPoolRawModelMode
-  autoDisablePolicy?: ExternalPoolAutoDisablePolicy
-  preOutputStreamRetryMode?: ExternalPoolStreamRetryMode
+  usageProjectionMode?: UsageProjectionMode
+  streamResponseMode?: StreamResponseMode | null
+  requestBodyMode?: AccountRequestBodyMode
+  rawModelMode?: AccountRawModelMode
+  autoDisablePolicy?: AutoDisablePolicy
+  preOutputStreamRetryMode?: StreamRetryMode
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
-  modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingMode?: ModelMappingMode
   modelMappingRequireMatch?: boolean
-  modelMappingRules?: ExternalPoolModelMappingRule[]
+  modelMappingRules?: AccountModelMappingRule[]
   supportedModels?: string[]
-  routeMode?: ExternalPoolRouteMode
+  routeMode?: RouteRuleMode
   routeRules?: string[]
   notes?: string
 }
@@ -2440,7 +2370,7 @@ export interface SetSupportedModelsRequest {
   supportedModels: string[]
 }
 
-export interface DiscoverExternalPoolSupportedModelsRequest {
+export interface DiscoverAccountSupportedModelsRequest {
   baseUrl?: string | null
   apiKey?: string | null
   authType?: 'bearer' | 'x_api_key' | null
@@ -2451,7 +2381,7 @@ export interface SupportedModelsResponse {
   count: number
 }
 
-export interface ExternalPoolTestResponse {
+export interface AccountTestResponse {
   ok: boolean
   status?: number
   message: string
@@ -2459,7 +2389,7 @@ export interface ExternalPoolTestResponse {
   response?: string
 }
 
-export interface ExternalPoolTestRequest {
+export interface AccountTestRequest {
   model: string
   prompt?: string
 }
@@ -2535,20 +2465,6 @@ export interface TokenRefreshAdmissionRuntime {
   remainingMilliTokens: number
 }
 
-export type KiroVersionActiveSource = 'configured' | 'applied' | 'pinned' | string
-
-export interface KiroVersionLifecycleSnapshot {
-  configuredVersion: string
-  activeVersion: string
-  activeSource: KiroVersionActiveSource
-  previousVersion?: string | null
-  candidateVersion?: string | null
-  checkedAt?: string | null
-  lastError?: string | null
-  generation: number
-  autoSyncEnabled: boolean
-}
-
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -2557,8 +2473,6 @@ export interface RuntimeConfig {
   requestAdmission: RequestAdmissionConfig
   credentialMaxConcurrentRequests: number
   credentialInfoRefreshConcurrency: number
-  /** 每个 Kiro 积分的真实成本（美元），只用于总览把积分换算成成本；null 表示未配置 */
-  kiroCreditUnitPriceUsd?: number | null
   credentialTransientCooldownSecs: number
   credentialRateLimitCooldownSecs: number
   credentialServerErrorCooldownSecs: number
@@ -2582,14 +2496,6 @@ export interface RuntimeConfig {
   emptyTurnRetryJitterPercent: number
   credentialAutoHealMinIntervalSecs: number
   credentialAutoHealMaxConsecutiveRounds: number
-  /** 自动同步 Kiro 客户端版本号（默认关闭）。 */
-  kiroVersionAutoSyncEnabled: boolean
-  /** 最近一次自动同步读到的官方版本。 */
-  kiroVersionLatest?: string
-  /** 版本检查、显式应用与回退状态；candidate 不会自动成为 active。 */
-  kiroVersionLifecycle: KiroVersionLifecycleSnapshot
-  /** IDE 端点的对话和联网搜索改走 runtime.{region}.kiro.dev（默认关闭）。 */
-  kiroRuntimeDomainEnabled: boolean
   credentialProtocolErrorCooldownSecs: number
   credentialAuthErrorCooldownSecs: number
   credentialCooldownBackoffMultiplier: number
@@ -2598,15 +2504,9 @@ export interface RuntimeConfig {
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
   credentialSessionMaxConcurrentRequests: number
-  kiroUpstreamResponseTimeoutSecs: number
-  kiroUpstreamStreamIdleTimeoutSecs: number
-  kiroUpstreamStreamMaxDurationSecs: number
   streamKeepaliveIntervalSecs: number
   streamPreOutputHoldSecs: number
   streamFirstOutputTimeoutSecs: number
-  kiroUpstreamStreamRetryEnabled: boolean
-  kiroUpstreamStreamRetryMaxAttempts: number
-  kiroUpstreamUsageOnlyRetryMaxAttempts: number
   inferenceUpstreamMaxAttempts: number
   auxiliaryUpstreamMaxAttempts: number
   auxiliaryUpstreamMaxConcurrentRequests: number
@@ -2617,19 +2517,9 @@ export interface RuntimeConfig {
   tokenRefreshBackgroundIntervalSecs: number
   tokenRefreshBackgroundLeadSecs: number
   tokenRefreshAdmissionRuntime: TokenRefreshAdmissionRuntime
-  kiroUpstreamStreamRetryOnIdleTimeout: boolean
-  kiroUpstreamStreamRetryOnReadError: boolean
-  kiroUpstreamStreamRetryOnStatusError: boolean
   credentialRetryMaxAttempts: number
   credentialPromptLogicRetryEnabled: boolean
   credentialPromptLogicRetryMaxAttempts: number
-  kiroUpstreamRegionRotationEnabled: boolean
-  /** 允许 Region rotation 使用与 Profile ARN 区域不一致的候选。 */
-  kiroRegionProfileArnMismatchAllowed: boolean
-  /** 同一认证类型的协议端点故障转移开关。 */
-  kiroEndpointFallbackEnabled: boolean
-  /** 协议端点候选顺序，例如 ide, runtime。 */
-  kiroEndpointFallbackOrder: string[]
   localBerserkModeEnabled: boolean
   localBerserkMaxRounds: number
   localBerserkRoundDelayMs: number
@@ -2664,13 +2554,9 @@ export interface RuntimeConfig {
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number
-  payloadGuardKiroMaxWeight: number
   payloadGuardSafetyMarginBytes: number
   payloadGuardTrimHistory: boolean
   payloadGuardExternalEnabled: boolean
-  kiroCachePointEnabled: boolean
-  kiroCachePointToolsOnly: boolean
-  kiroCachePointRecordPlan: boolean
   payloadShaping: PayloadShapingConfig
   promptCacheTargetReadRatio: number
   promptCacheTokenScale: number
@@ -2685,10 +2571,9 @@ export interface RuntimeConfig {
   promptCacheEstimatedBytesLimit: number
   reportedUsage: ReportedUsageConfig
   cachePolicy: CachePolicyConfig
-  externalPools: ExternalPoolsConfig
+  accounts: AccountsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile
-  kiroAgentModeStrategy: KiroAgentModeStrategy
   modelResolutionMode: ModelResolutionMode
   modelMapping: ModelMappingConfig
   extractThinking: boolean
@@ -2698,7 +2583,7 @@ export interface RuntimeConfig {
   definedCacheRoutes: string[]
 }
 
-export type UpdateRuntimeConfigRequest = Omit<RuntimeConfig, 'kiroVersionLatest' | 'kiroVersionLifecycle'>
+export type UpdateRuntimeConfigRequest = RuntimeConfig
 
 export interface AccessKeysResponse {
   requestApiKey: string
@@ -2867,7 +2752,7 @@ export type CredentialExportScope = { ids: number[] } | { filter: CredentialExpo
 
 /** A route rule set, as used by every route policy. */
 export interface RoutePolicy {
-  routeMode: ExternalPoolRouteMode
+  routeMode: RouteRuleMode
   routeRules: string[]
 }
 
@@ -2911,7 +2796,7 @@ export interface SaveRouteScenarioRequest {
   content: RouteScenarioContent
 }
 
-export type RouteScenarioItemKind = 'local_pool' | 'external_pool' | 'local_account' | 'external_account'
+export type RouteScenarioItemKind = 'local_pool' | 'account' | 'local_account' | 'external_account'
 
 export interface RouteScenarioItemKey {
   kind: RouteScenarioItemKind
@@ -3230,8 +3115,4 @@ export interface SubscriptionModelListItem {
   credentialCount: number
   /** 没有设置自身支持模型、因而按等级列表限制的账号数。 */
   tierLimitedCount: number
-}
-
-export interface SubscriptionModelListsResponse {
-  items: SubscriptionModelListItem[]
 }

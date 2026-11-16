@@ -40,7 +40,7 @@ export const ACTOR_LABELS: Record<string, string> = {
   'admin-api': '管理员',
   'system-scheduler': '调度器',
   'system-account-info': '额度查询',
-  'system-external-pool': '外部池',
+  'system-account': '账号',
 }
 
 export function accountEventMeta(kind: string | undefined): { label: string; tone: EventTone } {
@@ -72,7 +72,7 @@ export function accountEventView(record: AdminAuditLogRow): AccountEventView | n
     kind,
     label: meta.label,
     tone: meta.tone,
-    source: text(detail.accountSource) || (record.objectType === 'external_pool' ? 'external' : 'local'),
+    source: text(detail.accountSource) || (record.objectType === 'account' ? 'external' : 'local'),
     accountId: record.objectId ?? '',
     accountLabel: text(detail.accountLabel) || text(detail.credentialLabel) || (record.objectId ? `#${record.objectId}` : '—'),
     reason: text(detail.reasonLabel) || text(detail.message) || text(detail.reason),

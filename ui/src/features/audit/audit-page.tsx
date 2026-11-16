@@ -74,12 +74,9 @@ const ACTION_LABELS: Record<string, string> = {
   auto_disable_credential: '自动禁用账号',
   auto_enable_credential: '自动恢复账号',
   credential_account_event: '账号异动',
-  external_pool_account_event: '外部池异动',
-  clear_external_pool_cooldown: '清除账号池冷却',
+  account_account_event: '账号异动',
+  clear_account_cooldown: '清除账号池冷却',
   batch_import_credentials: '批量导入账号',
-  create_kiro_api_key: '创建官方 Key',
-  delete_kiro_api_key: '删除官方 Key',
-  batch_create_kiro_api_keys: '批量创建官方 Key',
   batch_update_credentials: '批量修改账号',
   delete_disabled_credentials: '删除已禁用账号',
   batch_delete_credentials: '批量删除账号',
@@ -100,11 +97,11 @@ const ACTION_LABELS: Record<string, string> = {
   create_proxy_resource: '新增代理资源',
   update_proxy_resource: '更新代理资源',
   delete_proxy_resource: '删除代理资源',
-  create_external_pool: '新增外部账号池',
-  update_external_pool: '更新外部账号池',
-  delete_external_pool: '删除外部账号池',
-  set_external_pool_enabled: '设置账号池启用状态',
-  clear_external_pool_auto_disabled: '清除账号池自动禁用',
+  create_account: '新增外部账号池',
+  update_account: '更新外部账号池',
+  delete_account: '删除外部账号池',
+  set_account_enabled: '设置账号池启用状态',
+  clear_account_auto_disabled: '清除账号池自动禁用',
 }
 
 const OBJECT_LABELS: Record<string, string> = {
@@ -119,7 +116,7 @@ const OBJECT_LABELS: Record<string, string> = {
   admin_api_key: '登录 Key',
   security_keys: '密钥配置',
   proxy_resource: '代理资源',
-  external_pool: '外部账号池',
+  account: '外部账号池',
   load_balancing: '负载均衡',
   route_scenario: '路由场景',
 }
@@ -132,7 +129,7 @@ const ACTION_CATEGORIES = [
   { value: 'pricing', label: '价格同步' },
   { value: 'usage', label: '用量操作' },
   { value: 'proxy', label: '代理资源' },
-  { value: 'external_pool', label: '外部账号池' },
+  { value: 'account', label: '外部账号池' },
 ]
 
 const ACTION_TO_CATEGORY: Record<string, string> = {
@@ -153,9 +150,6 @@ const ACTION_TO_CATEGORY: Record<string, string> = {
   auto_disable_credential: 'credential',
   auto_enable_credential: 'credential',
   batch_import_credentials: 'credential',
-  create_kiro_api_key: 'credential',
-  delete_kiro_api_key: 'credential',
-  batch_create_kiro_api_keys: 'credential',
   batch_update_credentials: 'credential',
   delete_disabled_credentials: 'credential',
   batch_delete_credentials: 'credential',
@@ -176,14 +170,14 @@ const ACTION_TO_CATEGORY: Record<string, string> = {
   create_proxy_resource: 'proxy',
   update_proxy_resource: 'proxy',
   delete_proxy_resource: 'proxy',
-  create_external_pool: 'external_pool',
-  update_external_pool: 'external_pool',
-  delete_external_pool: 'external_pool',
-  set_external_pool_enabled: 'external_pool',
-  clear_external_pool_auto_disabled: 'external_pool',
-  clear_external_pool_cooldown: 'external_pool',
+  create_account: 'account',
+  update_account: 'account',
+  delete_account: 'account',
+  set_account_enabled: 'account',
+  clear_account_auto_disabled: 'account',
+  clear_account_cooldown: 'account',
   credential_account_event: 'credential',
-  external_pool_account_event: 'external_pool',
+  account_account_event: 'account',
 }
 
 function actionLabel(action: string): string { return ACTION_LABELS[action] ?? action }
@@ -206,7 +200,7 @@ function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow 
             {
               label: event ? '账号' : '对象',
               value: event
-                ? `${event.source === 'external' ? '外部池' : '本地'} #${event.accountId} · ${event.accountLabel}`
+                ? `${event.source === 'external' ? '账号' : '本地'} #${event.accountId} · ${event.accountLabel}`
                 : `${objectLabel(record.objectType)}${record.objectId ? ` #${record.objectId}` : ''}`,
             },
             ...(event?.reason ? [{ label: '原因', value: event.reason }] : []),
@@ -401,7 +395,7 @@ function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) 
           <SelectContent>
             <SelectItem value="__all__">全部来源</SelectItem>
             <SelectItem value="local">本地账号</SelectItem>
-            <SelectItem value="external">外部池</SelectItem>
+            <SelectItem value="external">账号</SelectItem>
           </SelectContent>
         </Select>
         <div className="min-w-48 flex-1">
@@ -458,7 +452,7 @@ function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) 
                         >
                           {event.accountLabel}
                         </button>
-                        <div className="text-[0.62rem] text-muted-foreground/70">{event.source === 'external' ? '外部池' : '本地'} #{event.accountId}</div>
+                        <div className="text-[0.62rem] text-muted-foreground/70">{event.source === 'external' ? '账号' : '本地'} #{event.accountId}</div>
                       </TableCell>
                       <TableCell><Badge tone={event.tone}>{event.label}</Badge></TableCell>
                       <TableCell className="max-w-72 truncate text-xs" title={event.reason}>{event.reason || '—'}</TableCell>
@@ -502,7 +496,7 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
     page,
     limit: pageSize,
     success: successFilter === '__all__' ? undefined : successFilter === 'success',
-    objectType: categoryFilter === 'credential' || categoryFilter === 'external_pool' ? categoryFilter : undefined,
+    objectType: categoryFilter === 'credential' || categoryFilter === 'account' ? categoryFilter : undefined,
   }), [page, pageSize, successFilter, categoryFilter])
   const logs = useAuditLogsPage(query)
   const pending = logs.isPlaceholderData || logs.isFetching
@@ -523,7 +517,7 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
           (r.errorMessage && r.errorMessage.toLowerCase().includes(lower))
       )
     }
-    if (categoryFilter !== '__all__' && categoryFilter !== 'credential' && categoryFilter !== 'external_pool') {
+    if (categoryFilter !== '__all__' && categoryFilter !== 'credential' && categoryFilter !== 'account') {
       filtered = filtered.filter((r) => ACTION_TO_CATEGORY[r.action] === categoryFilter)
     }
     return filtered

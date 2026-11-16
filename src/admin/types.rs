@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
+    AccountsConfig, CachePolicyConfig, CompatProfile, ModelMappingConfig, ModelResolutionMode,
     PromptCacheCreationControlConfig, PromptInjectionConfig, ReportedUsageConfig,
     RequestAdmissionConfig, RouteFeaturesConfig,
 };
@@ -21,17 +21,17 @@ pub struct SetSupportedModelsRequest {
     pub supported_models: Vec<String>,
 }
 
-/// 使用外部池兼容 /v1/models 接口发现支持模型。创建态需要传 baseUrl/apiKey；
+/// 使用账号兼容 /v1/models 接口发现支持模型。创建态需要传 baseUrl/apiKey；
 /// 编辑态可只传覆盖项，空 key 表示使用已保存 key。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DiscoverExternalPoolSupportedModelsRequest {
+pub struct DiscoverAccountSupportedModelsRequest {
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
-    pub auth_type: Option<crate::external_pool::ExternalPoolAuthType>,
+    pub auth_type: Option<crate::account::AccountAuthType>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,7 +165,7 @@ pub struct UsageCleanupStatusResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalPoolTestRequest {
+pub struct AccountTestRequest {
     pub model: String,
     #[serde(default)]
     pub prompt: Option<String>,
@@ -308,7 +308,7 @@ pub struct RuntimeConfigResponse {
     pub reported_usage: ReportedUsageConfig,
     pub cache_policy: CachePolicyConfig,
     pub routes: crate::model::routes::RoutesConfig,
-    pub external_pools: ExternalPoolsConfig,
+    pub accounts: AccountsConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
     pub model_resolution_mode: ModelResolutionMode,
@@ -388,7 +388,7 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub routes: Option<crate::model::routes::RoutesConfig>,
     #[serde(default)]
-    pub external_pools: Option<ExternalPoolsConfig>,
+    pub accounts: Option<AccountsConfig>,
     #[serde(default)]
     pub high_cache_threshold: Option<i32>,
     #[serde(default)]

@@ -57,24 +57,11 @@ export function statusTone(status: string): NonNullable<BadgeProps['tone']> {
 }
 
 export function routeLabel(record: UsageRecord): string {
-  const labels: Record<string, string> = {
-    local_success: '本地成功',
-    local_error_no_fallback: '本地错误',
-    local_rescue_after_external: '外部账号后回本地',
-    external_fallback_preflight: '预检 fallback',
-    external_fallback_after_local_attempts: '失败后 fallback',
-    external_direct_policy: '外部直连',
-    external_route_policy: '路由策略',
-    external_error: '外部错误',
-  }
-  return labels[record.routeSubtype || ''] || (record.routeKind === 'external_pool' ? '外部账号' : '本地')
+  return record.routeKind === 'account' ? '账号' : '本地'
 }
 
 export function routeTone(record: UsageRecord): NonNullable<BadgeProps['tone']> {
-  if (record.routeSubtype === 'external_direct_policy') return 'warning'
-  if (record.routeSubtype === 'external_route_policy') return 'warning'
-  if (record.routeSubtype === 'local_rescue_after_external') return 'info'
-  if (record.routeKind === 'external_pool') return record.status === 'success' ? 'info' : 'error'
+  if (record.routeKind === 'account') return record.status === 'success' ? 'info' : 'error'
   return record.status === 'success' ? 'success' : 'neutral'
 }
 
@@ -91,32 +78,6 @@ export function attemptActionLabel(action: string): string {
   return labels[action] || action || '-'
 }
 
-export function attemptOutcomeLabel(
-  record: NonNullable<UsageRecord['credentialAttempts']>[number]
-): string {
-  if (typeof record.status === 'number') return String(record.status)
-  if (record.errorType) return record.errorType
-  return attemptActionLabel(record.action)
-}
-
-export function formatAttemptChain(record: UsageRecord): string {
-  return (record.credentialAttempts || [])
-    .map((attempt) => `#${attempt.credentialId}(${attemptOutcomeLabel(attempt)})`)
-    .join(' > ')
-}
-
-export function formatAttemptSummary(record: UsageRecord): string {
-  const attempts = record.credentialAttempts || []
-  if (attempts.length === 0) return '无本地尝试'
-  const uniqueCredentialIds = new Set(attempts.map((attempt) => attempt.credentialId))
-  if (attempts.length === 1) {
-    return record.fallbackFromSticky ? '本地尝试 1 次 · sticky换号' : '本地尝试 1 次'
-  }
-  if (uniqueCredentialIds.size <= 1)
-    return `本地尝试 ${attempts.length} 次 · 同账号重试 ${attempts.length - 1} 次`
-  return `本地尝试 ${attempts.length} 次 · 切换 ${uniqueCredentialIds.size} 个账号`
-}
-
 export function formatExternalAttemptChain(record: UsageRecord): string {
   return (record.externalAttempts || [])
     .map(
@@ -127,10 +88,10 @@ export function formatExternalAttemptChain(record: UsageRecord): string {
 }
 
 export function upstreamModelLabel(record: UsageRecord): string {
-  const model = record.routeKind === 'external_pool'
+  const model = record.routeKind === 'account'
     ? record.externalOutboundModel || record.upstreamModel || record.model || '-'
     : record.upstreamModel || record.model || '-'
-  if (record.routeKind === 'external_pool' && record.externalOutboundModel) return model
+  if (record.routeKind === 'account' && record.externalOutboundModel) return model
   const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
   return `${model}${source}`
 }

@@ -13,6 +13,11 @@ use serde_json::{Value, json};
 
 use super::error::AdminServiceError;
 use super::types::*;
+use crate::account::{
+    Account, AccountAuthType, AccountManager, AccountTestResponse, AccountsStatusResponse,
+    CreateAccountRequest, SetAccountEnabledRequest, UpdateAccountRequest, account_messages_url,
+    account_models_url,
+};
 use crate::anthropic::request_key_limits::{
     KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
 };
@@ -24,26 +29,18 @@ use crate::anthropic::{
     pricing::{PricingCatalog, PricingStatus},
     request_admission::RequestAdmissionController,
     usage::{
-        UsageDashboardResponse, UsageExternalPoolRiskCostConfig, UsageExternalPoolRiskQuery,
-        UsageExternalPoolRiskResponse, UsageOverviewExternalResponse,
-        UsageOverviewRankingsResponse, UsageOverviewResponse, UsageOverviewSeriesResponse,
-        UsageOverviewSpec, UsageOverviewSummaryResponse, UsageRecordQuery, UsageRecorder,
-        UsageRecorderStats, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
-        resolve_usage_overview_spec,
+        UsageAccountRiskCostConfig, UsageAccountRiskQuery, UsageAccountRiskResponse,
+        UsageDashboardResponse, UsageOverviewExternalResponse, UsageOverviewRankingsResponse,
+        UsageOverviewResponse, UsageOverviewSeriesResponse, UsageOverviewSpec,
+        UsageOverviewSummaryResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
+        UsageRecordsPageResult, UsageRecordsResult, UsageSummary, resolve_usage_overview_spec,
     },
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
-use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolManager,
-    ExternalPoolTestResponse, ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest,
-    UpdateExternalPoolRequest, external_pool_messages_url, external_pool_models_url,
-};
 use crate::http_client::{
     build_client, response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
-use crate::model::config::{
-    Config, ExternalPoolsConfig, RequestAdmissionConfig, RequestApiKeyPolicy,
-};
+use crate::model::config::{AccountsConfig, Config, RequestAdmissionConfig, RequestApiKeyPolicy};
 use crate::model::model_support::normalize_supported_models;
 use crate::storage::account_events::{AccountEvent, AccountEventKind, AccountSource};
 use crate::storage::postgres::{
@@ -158,12 +155,12 @@ const USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRIES: usize = 5;
 const USAGE_CLEANUP_LOCK_CONTENTION_RETRY_MS: u64 = 25;
 const USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRY_MS: u64 = 400;
 const ADMIN_USAGE_CACHE_TTL_SECS: usize = 2;
-const ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS: usize = 2;
+const ADMIN_ACCOUNT_STATUS_CACHE_TTL_SECS: usize = 2;
 const ADMIN_CACHE_DEFAULT_LOCAL_TTL_SECS: usize = 2;
 const ADMIN_CACHE_REDIS_READ_TIMEOUT: StdDuration = StdDuration::from_millis(250);
 const ADMIN_CACHE_LOCAL_STALE_TTL_SECS: u64 = 30;
 
-const ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+const ADMIN_ACCOUNT_TEST_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 
 fn admin_usage_summary_cache_key(high_cache_threshold: i32) -> String {
     format!("admin_cache:usage:summary:{}", high_cache_threshold)
@@ -202,12 +199,12 @@ fn admin_usage_overview_cache_key(spec: &UsageOverviewSpec) -> String {
     )
 }
 
-fn admin_external_pool_status_cache_key() -> &'static str {
-    "admin_cache:external_pools:status"
+fn admin_account_status_cache_key() -> &'static str {
+    "admin_cache:accounts:status"
 }
 
-fn admin_external_pool_list_cache_key() -> &'static str {
-    "admin_cache:external_pools:list"
+fn admin_account_list_cache_key() -> &'static str {
+    "admin_cache:accounts:list"
 }
 
 fn mask_secret(value: &str) -> String {
@@ -300,7 +297,7 @@ fn generate_request_api_key() -> String {
     let mut bytes = [0u8; 32];
     bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    format!("sk-kiro-rs-{}", URL_SAFE_NO_PAD.encode(bytes))
+    format!("sk-claude-pool-{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn remove_request_api_key_by_id(
@@ -332,7 +329,7 @@ pub struct AdminService {
     usage_recorder: Arc<UsageRecorder>,
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    external_pool_manager: Arc<ExternalPoolManager>,
+    account_manager: Arc<AccountManager>,
     usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
     admin_cache_shadow: Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
 }
@@ -346,7 +343,7 @@ pub struct AdminServiceDependencies {
     pub observability_redis_store: Option<Arc<RedisStore>>,
     pub request_api_key_store: Arc<RequestApiKeyStore>,
     pub request_admission: Arc<RequestAdmissionController>,
-    pub external_pool_manager: Arc<ExternalPoolManager>,
+    pub account_manager: Arc<AccountManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -421,7 +418,7 @@ impl AdminService {
             observability_redis_store,
             request_api_key_store,
             request_admission,
-            external_pool_manager,
+            account_manager,
         } = dependencies;
         assert!(
             observability_redis_store
@@ -438,7 +435,7 @@ impl AdminService {
             usage_recorder,
             pricing_catalog,
             model_capabilities,
-            external_pool_manager,
+            account_manager,
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
             admin_cache_shadow: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -566,20 +563,15 @@ impl AdminService {
         });
     }
 
-    fn invalidate_external_pool_admin_cache_with_pool(
-        &self,
-        reason: &'static str,
-        pool: &ExternalPool,
-    ) {
-        self.external_pool_manager
-            .notify_external_pool_data_changed_with_local_pool(reason, pool);
-        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+    fn invalidate_account_admin_cache_with_pool(&self, reason: &'static str, pool: &Account) {
+        self.account_manager
+            .notify_account_data_changed_with_local_pool(reason, pool);
+        self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
     }
 
-    fn invalidate_external_pool_admin_cache_for_delete(&self, reason: &'static str, pool_id: u64) {
-        self.external_pool_manager
-            .notify_external_pool_deleted(reason, pool_id);
-        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+    fn invalidate_account_admin_cache_for_delete(&self, reason: &'static str, pool_id: u64) {
+        self.account_manager.notify_account_deleted(reason, pool_id);
+        self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
     }
 
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
@@ -895,122 +887,119 @@ impl AdminService {
         Ok(self.get_access_keys(admin_api_key))
     }
 
-    pub fn list_external_pools(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
-        let cache_key = admin_external_pool_list_cache_key();
-        if let Some(cached) = self.read_admin_cache::<Vec<ExternalPool>>(cache_key) {
+    pub fn list_accounts(&self) -> Result<Vec<Account>, AdminServiceError> {
+        let cache_key = admin_account_list_cache_key();
+        if let Some(cached) = self.read_admin_cache::<Vec<Account>>(cache_key) {
             return Ok(cached);
         }
 
         let store = self.postgres_store.clone();
-        let pools = block_on_admin_store(async move { store.list_external_pools(true).await })
+        let pools = block_on_admin_store(async move { store.list_accounts(true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.write_admin_cache(
             cache_key.to_string(),
             pools.clone(),
-            ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+            ADMIN_ACCOUNT_STATUS_CACHE_TTL_SECS,
         );
         Ok(pools)
     }
 
-    pub fn create_external_pool(
+    pub fn create_account(
         &self,
-        mut request: CreateExternalPoolRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+        mut request: CreateAccountRequest,
+    ) -> Result<Account, AdminServiceError> {
         request.supported_models =
-            Self::normalize_external_pool_supported_models(request.supported_models);
+            Self::normalize_account_supported_models(request.supported_models);
         let store = self.postgres_store.clone();
         let pool =
-            block_on_admin_store(async move { store.create_external_pool_unmasked(request).await })
+            block_on_admin_store(async move { store.create_account_unmasked(request).await })
                 .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
         self.audit(
-            "create_external_pool",
-            "external_pool",
+            "create_account",
+            "account",
             Some(pool.id.to_string()),
             true,
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("create", &pool);
+        self.invalidate_account_admin_cache_with_pool("create", &pool);
         Ok(pool.masked_for_admin_response())
     }
 
-    pub fn update_external_pool(
+    pub fn update_account(
         &self,
         id: u64,
-        mut request: UpdateExternalPoolRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+        mut request: UpdateAccountRequest,
+    ) -> Result<Account, AdminServiceError> {
         request.supported_models = request
             .supported_models
-            .map(Self::normalize_external_pool_supported_models);
+            .map(Self::normalize_account_supported_models);
         let store = self.postgres_store.clone();
         let pool =
-            block_on_admin_store(
-                async move { store.update_external_pool_unmasked(id, request).await },
-            )
-            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
-            .ok_or(AdminServiceError::NotFound { id })?;
+            block_on_admin_store(async move { store.update_account_unmasked(id, request).await })
+                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+                .ok_or(AdminServiceError::NotFound { id })?;
         self.audit(
-            "update_external_pool",
-            "external_pool",
+            "update_account",
+            "account",
             Some(id.to_string()),
             true,
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("update", &pool);
+        self.invalidate_account_admin_cache_with_pool("update", &pool);
         Ok(pool.masked_for_admin_response())
     }
 
-    pub fn set_external_pool_supported_models(
+    pub fn set_account_supported_models(
         &self,
         id: u64,
         request: SetSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
-        let supported_models =
-            Self::normalize_external_pool_supported_models(request.supported_models);
+        let supported_models = Self::normalize_account_supported_models(request.supported_models);
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models_unmasked(id, supported_models)
+                .set_account_supported_models_unmasked(id, supported_models)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
         .ok_or(AdminServiceError::NotFound { id })?;
         self.audit(
-            "set_external_pool_supported_models",
-            "external_pool",
+            "set_account_supported_models",
+            "account",
             Some(id.to_string()),
             true,
             None,
             json!({ "supportedModels": pool.supported_models.clone() }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("supported_models", &pool);
+        self.invalidate_account_admin_cache_with_pool("supported_models", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
         })
     }
 
-    pub async fn sync_external_pool_supported_models(
+    pub async fn sync_account_supported_models(
         &self,
         id: u64,
-        request: DiscoverExternalPoolSupportedModelsRequest,
+        request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(Some(id), request)
+            .discover_account_supported_model_ids(Some(id), request)
             .await?;
         let store = self.postgres_store.clone();
         let supported_models_for_store = supported_models.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models_unmasked(id, supported_models_for_store)
+                .set_account_supported_models_unmasked(id, supported_models_for_store)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
         .ok_or(AdminServiceError::NotFound { id })?;
         self.audit(
-            "sync_external_pool_supported_models",
-            "external_pool",
+            "sync_account_supported_models",
+            "account",
             Some(id.to_string()),
             true,
             None,
@@ -1018,20 +1007,20 @@ impl AdminService {
                 "supportedModels": pool.supported_models.clone(),
             }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("supported_models_sync", &pool);
+        self.invalidate_account_admin_cache_with_pool("supported_models_sync", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
         })
     }
 
-    pub async fn promote_external_pool_models(
+    pub async fn promote_account_models(
         &self,
         id: u64,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let pool = self
             .postgres_store
-            .get_external_pool(id, false)
+            .get_account(id, false)
             .await
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or_else(|| AdminServiceError::InvalidCredential("账号不存在".into()))?;
@@ -1054,14 +1043,14 @@ impl AdminService {
         })
     }
 
-    /// 使用外部池自身的兼容 /v1/models 接口发现模型，只返回可编辑建议，不写回。
-    pub async fn discover_external_pool_supported_models(
+    /// 使用账号自身的兼容 /v1/models 接口发现模型，只返回可编辑建议，不写回。
+    pub async fn discover_account_supported_models(
         &self,
         id: Option<u64>,
-        request: DiscoverExternalPoolSupportedModelsRequest,
+        request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(id, request)
+            .discover_account_supported_model_ids(id, request)
             .await?;
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
@@ -1069,15 +1058,15 @@ impl AdminService {
         })
     }
 
-    async fn discover_external_pool_supported_model_ids(
+    async fn discover_account_supported_model_ids(
         &self,
         id: Option<u64>,
-        request: DiscoverExternalPoolSupportedModelsRequest,
+        request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<Vec<String>, AdminServiceError> {
         let saved_pool = if let Some(id) = id {
             let store = self.postgres_store.clone();
             Some(
-                block_on_admin_store(async move { store.get_external_pool(id, false).await })
+                block_on_admin_store(async move { store.get_account(id, false).await })
                     .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
                     .ok_or(AdminServiceError::NotFound { id })?,
             )
@@ -1093,7 +1082,7 @@ impl AdminService {
             .map(str::to_string)
             .or_else(|| saved_pool.as_ref().map(|pool| pool.base_url.clone()))
             .ok_or_else(|| {
-                AdminServiceError::InvalidCredential("外部池 Base URL 不能为空".to_string())
+                AdminServiceError::InvalidCredential("账号 Base URL 不能为空".to_string())
             })?;
         let api_key = request
             .api_key
@@ -1102,21 +1091,16 @@ impl AdminService {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .or_else(|| saved_pool.as_ref().and_then(|pool| pool.api_key.clone()))
-            .ok_or_else(|| {
-                AdminServiceError::InvalidCredential("外部池 Key 不能为空".to_string())
-            })?;
+            .ok_or_else(|| AdminServiceError::InvalidCredential("账号 Key 不能为空".to_string()))?;
         let auth_type = request
             .auth_type
             .or_else(|| saved_pool.as_ref().map(|pool| pool.auth_type))
-            .unwrap_or(ExternalPoolAuthType::Bearer);
-        let url = external_pool_models_url(&base_url).map_err(|err| {
-            AdminServiceError::InvalidCredential(format!("外部池模型列表 URL 无效: {err}"))
+            .unwrap_or(AccountAuthType::Bearer);
+        let url = account_models_url(&base_url).map_err(|err| {
+            AdminServiceError::InvalidCredential(format!("账号模型列表 URL 无效: {err}"))
         })?;
         let config = self.runtime.config();
-        let timeout_secs = config
-            .external_pools
-            .external_pool_request_timeout_secs
-            .clamp(1, 60);
+        let timeout_secs = config.accounts.request_timeout_secs.clamp(1, 60);
         let client = build_client(None, timeout_secs, config.tls_backend)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let mut request_builder = client
@@ -1124,73 +1108,71 @@ impl AdminService {
             .header("accept", "application/json")
             .header("anthropic-version", "2023-06-01");
         match auth_type {
-            ExternalPoolAuthType::Bearer => {
+            AccountAuthType::Bearer => {
                 request_builder = request_builder.bearer_auth(api_key);
             }
-            ExternalPoolAuthType::XApiKey => {
+            AccountAuthType::XApiKey => {
                 request_builder = request_builder.header("x-api-key", api_key);
             }
         }
         let response = send_with_response_header_timeout(request_builder, timeout_secs)
             .await
             .map_err(|err| {
-                AdminServiceError::InvalidCredential(format!("外部池模型列表请求失败: {err}"))
+                AdminServiceError::InvalidCredential(format!("账号模型列表请求失败: {err}"))
             })?;
         let status = response.status();
         let body =
             response_text_with_limit_and_body_timeout(response, timeout_secs, 4 * 1024 * 1024)
                 .await
                 .map_err(|err| {
-                    AdminServiceError::InvalidCredential(format!("读取外部池模型列表失败: {err}"))
+                    AdminServiceError::InvalidCredential(format!("读取账号模型列表失败: {err}"))
                 })?;
         if !status.is_success() {
             let suffix = body.chars().take(500).collect::<String>();
             return Err(AdminServiceError::InvalidCredential(format!(
-                "外部池模型列表请求失败: {} {}",
+                "账号模型列表请求失败: {} {}",
                 status, suffix
             )));
         }
-        let supported_models = Self::normalize_external_pool_supported_models(
-            extract_model_ids_from_models_response(&body),
-        );
+        let supported_models =
+            Self::normalize_account_supported_models(extract_model_ids_from_models_response(&body));
         if supported_models.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
-                "外部池模型列表响应中没有可识别的模型 ID".to_string(),
+                "账号模型列表响应中没有可识别的模型 ID".to_string(),
             ));
         }
         Ok(supported_models)
     }
 
-    pub fn delete_external_pool(&self, id: u64) -> Result<(), AdminServiceError> {
+    pub fn delete_account(&self, id: u64) -> Result<(), AdminServiceError> {
         let store = self.postgres_store.clone();
-        let deleted =
-            block_on_admin_store(async move { store.soft_delete_external_pool(id).await })
-                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let deleted = block_on_admin_store(async move { store.soft_delete_account(id).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         if !deleted {
             return Err(AdminServiceError::NotFound { id });
         }
         self.audit_account_change(
-            "delete_external_pool",
+            "delete_account",
             AccountEventKind::Deleted,
             AccountSource::External,
             id,
             format!("#{id}"),
-            "删除外部池",
+            "删除账号",
             json!({}),
         );
-        self.invalidate_external_pool_admin_cache_for_delete("delete", id);
+        self.invalidate_account_admin_cache_for_delete("delete", id);
         Ok(())
     }
 
-    pub fn set_external_pool_enabled(
+    pub fn set_account_enabled(
         &self,
         id: u64,
-        request: SetExternalPoolEnabledRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+        request: SetAccountEnabledRequest,
+    ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_enabled_unmasked(id, request.enabled)
+                .set_account_enabled_unmasked(id, request.enabled)
                 .await
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
@@ -1201,7 +1183,7 @@ impl AdminService {
             (AccountEventKind::ManualDisabled, "手动禁用")
         };
         self.audit_account_change(
-            "set_external_pool_enabled",
+            "set_account_enabled",
             kind,
             AccountSource::External,
             id,
@@ -1209,22 +1191,20 @@ impl AdminService {
             reason_label,
             json!({ "enabled": request.enabled }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("enabled", &pool);
+        self.invalidate_account_admin_cache_with_pool("enabled", &pool);
         Ok(pool.masked_for_admin_response())
     }
 
-    pub fn clear_external_pool_auto_disabled(
-        &self,
-        id: u64,
-    ) -> Result<ExternalPool, AdminServiceError> {
+    pub fn clear_account_auto_disabled(&self, id: u64) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool = block_on_admin_store(async move {
-            store.clear_external_pool_auto_disabled_unmasked(id).await
-        })
-        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
-        .ok_or(AdminServiceError::NotFound { id })?;
+        let pool =
+            block_on_admin_store(
+                async move { store.clear_account_auto_disabled_unmasked(id).await },
+            )
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
         self.audit_account_change(
-            "clear_external_pool_auto_disabled",
+            "clear_account_auto_disabled",
             AccountEventKind::ManualEnabled,
             AccountSource::External,
             id,
@@ -1232,58 +1212,56 @@ impl AdminService {
             "清除自动禁用",
             json!({}),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("clear_auto_disabled", &pool);
+        self.invalidate_account_admin_cache_with_pool("clear_auto_disabled", &pool);
         Ok(pool.masked_for_admin_response())
     }
 
-    pub fn clear_external_pool_cooldown(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
+    pub fn clear_account_cooldown(&self, id: u64) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
+        let pool = block_on_admin_store(async move { store.get_account(id, true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
-        let manager = self.external_pool_manager.clone();
+        let manager = self.account_manager.clone();
         let deleted = block_on_admin_store(async move { manager.clear_pool_cooldowns(id).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.audit(
-            "clear_external_pool_cooldown",
-            "external_pool",
+            "clear_account_cooldown",
+            "account",
             Some(id.to_string()),
             true,
             None,
             json!({ "deletedKeys": deleted }),
         );
-        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
         Ok(pool.masked_for_admin_response())
     }
 
-    pub fn get_external_pool_status(
-        &self,
-    ) -> Result<ExternalPoolsStatusResponse, AdminServiceError> {
-        let cache_key = admin_external_pool_status_cache_key();
-        if let Some(cached) = self.read_admin_cache::<ExternalPoolsStatusResponse>(cache_key) {
+    pub fn get_account_status(&self) -> Result<AccountsStatusResponse, AdminServiceError> {
+        let cache_key = admin_account_status_cache_key();
+        if let Some(cached) = self.read_admin_cache::<AccountsStatusResponse>(cache_key) {
             return Ok(cached);
         }
 
-        let manager = self.external_pool_manager.clone();
-        let config = self.runtime.config().external_pools;
+        let manager = self.account_manager.clone();
+        let config = self.runtime.config().accounts;
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-        let response = ExternalPoolsStatusResponse { pools };
+        let response = AccountsStatusResponse { pools };
         self.write_admin_cache(
             cache_key.to_string(),
             response.clone(),
-            ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+            ADMIN_ACCOUNT_STATUS_CACHE_TTL_SECS,
         );
         Ok(response)
     }
 
-    pub fn test_external_pool(
+    pub fn test_account(
         &self,
         id: u64,
-        req: Option<ExternalPoolTestRequest>,
-    ) -> Result<ExternalPoolTestResponse, AdminServiceError> {
+        req: Option<AccountTestRequest>,
+    ) -> Result<AccountTestResponse, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool = block_on_admin_store(async move { store.get_external_pool(id, false).await })
+        let pool = block_on_admin_store(async move { store.get_account(id, false).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
         block_on_admin_store(async move {
@@ -1292,9 +1270,9 @@ impl AdminService {
                 .map(|req| req.model.trim().to_string())
                 .filter(|model| !model.is_empty());
             let url = if model.is_some() {
-                external_pool_messages_url(&pool.base_url)?
+                account_messages_url(&pool.base_url)?
             } else {
-                external_pool_models_url(&pool.base_url)?
+                account_models_url(&pool.base_url)?
             };
             let client = reqwest::Client::builder()
                 .timeout(StdDuration::from_secs(15))
@@ -1318,62 +1296,62 @@ impl AdminService {
                 client.get(url)
             };
             match pool.auth_type {
-                crate::external_pool::ExternalPoolAuthType::Bearer => {
+                crate::account::AccountAuthType::Bearer => {
                     request = request.bearer_auth(pool.api_key.unwrap_or_default());
                 }
-                crate::external_pool::ExternalPoolAuthType::XApiKey => {
+                crate::account::AccountAuthType::XApiKey => {
                     request = request.header("x-api-key", pool.api_key.unwrap_or_default());
                 }
             }
             let result = request.send().await;
-            Ok::<ExternalPoolTestResponse, anyhow::Error>(match result {
+            Ok::<AccountTestResponse, anyhow::Error>(match result {
                 Ok(response) => {
                     let status = response.status();
                     let body = match response_text_with_limit_and_body_timeout(
                         response,
                         15,
-                        ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES,
+                        ADMIN_ACCOUNT_TEST_RESPONSE_MAX_BYTES,
                     )
                     .await
                     {
                         Ok(body) => body,
                         Err(error) => {
-                            return Ok(ExternalPoolTestResponse {
+                            return Ok(AccountTestResponse {
                                 ok: false,
                                 status: Some(status.as_u16()),
-                                message: format!("读取外部池测试响应失败: {error}"),
+                                message: format!("读取账号测试响应失败: {error}"),
                                 model,
                                 response: None,
                             });
                         }
                     };
                     let response_text = if status.is_success() {
-                        extract_external_pool_test_response_text(&body)
+                        extract_account_test_response_text(&body)
                     } else {
                         None
                     };
-                    ExternalPoolTestResponse {
+                    AccountTestResponse {
                         ok: status.is_success(),
                         status: Some(status.as_u16()),
                         message: if status.is_success() {
                             if model.is_some() {
-                                "外部池模型调用测试通过".to_string()
+                                "账号模型调用测试通过".to_string()
                             } else {
-                                "外部池模型列表测试通过".to_string()
+                                "账号模型列表测试通过".to_string()
                             }
                         } else {
                             let suffix = body.chars().take(300).collect::<String>();
                             if suffix.is_empty() {
-                                format!("外部池测试失败: {}", status)
+                                format!("账号测试失败: {}", status)
                             } else {
-                                format!("外部池测试失败: {}; {}", status, suffix)
+                                format!("账号测试失败: {}; {}", status, suffix)
                             }
                         },
                         model,
                         response: response_text,
                     }
                 }
-                Err(err) => ExternalPoolTestResponse {
+                Err(err) => AccountTestResponse {
                     ok: false,
                     status: None,
                     message: err.to_string(),
@@ -1549,7 +1527,7 @@ impl AdminService {
                         | "apiToken"
                         | "authorization"
                         | "clientSecret"
-                        | "kiroApiKey"
+                        | "upstreamApiKey"
                         | "proxyPassword"
                         | "password"
                         | "refreshToken"
@@ -1697,7 +1675,7 @@ impl AdminService {
     /// External-pool allowlists are exposed in Claude Code command syntax.
     /// Keep arbitrary provider-specific IDs intact, but collapse official
     /// Claude dated/dashed IDs to a stable family/version command.
-    fn normalize_external_pool_supported_models(model_ids: Vec<String>) -> Vec<String> {
+    fn normalize_account_supported_models(model_ids: Vec<String>) -> Vec<String> {
         let mut normalized = Vec::new();
         for model in normalize_supported_models(model_ids) {
             let canonical = claude_code_model_name(&model);
@@ -1967,32 +1945,28 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
-    pub fn get_usage_dashboard_external_pool_billing(
+    pub fn get_usage_dashboard_account_billing(
         &self,
         timezone: Option<String>,
         window_key: String,
-    ) -> Result<crate::anthropic::usage::UsageDashboardExternalPoolBillingResponse, AdminServiceError>
+    ) -> Result<crate::anthropic::usage::UsageDashboardAccountBillingResponse, AdminServiceError>
     {
         self.usage_recorder
-            .dashboard_external_pool_billing(timezone.as_deref(), &window_key)
+            .dashboard_account_billing(timezone.as_deref(), &window_key)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
-    pub fn get_usage_dashboard_external_pool_risk(
+    pub fn get_usage_dashboard_account_risk(
         &self,
-        query: UsageExternalPoolRiskQuery,
-    ) -> Result<UsageExternalPoolRiskResponse, AdminServiceError> {
+        query: UsageAccountRiskQuery,
+    ) -> Result<UsageAccountRiskResponse, AdminServiceError> {
         let config = self.runtime.config();
-        let cost_config = UsageExternalPoolRiskCostConfig {
-            cost_floor_enabled: config
-                .external_pools
-                .external_pool_usage_projection_cost_floor_enabled,
-            cost_floor_margin_percent: config
-                .external_pools
-                .external_pool_usage_projection_cost_floor_margin_percent,
+        let cost_config = UsageAccountRiskCostConfig {
+            cost_floor_enabled: config.accounts.usage_projection_cost_floor_enabled,
+            cost_floor_margin_percent: config.accounts.usage_projection_cost_floor_margin_percent,
         };
         self.usage_recorder
-            .external_pool_usage_risk(query, cost_config)
+            .account_usage_risk(query, cost_config)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
@@ -2035,7 +2009,7 @@ impl AdminService {
         status
     }
 
-    /// 获取 Kiro 模型能力同步状态。
+    /// 获取 上游 模型能力同步状态。
     pub fn get_model_capabilities(&self) -> ModelCapabilitiesStatus {
         self.model_capabilities.status()
     }
@@ -2512,7 +2486,7 @@ impl AdminService {
             reported_usage: config.reported_usage.clone(),
             cache_policy: config.cache_policy.clone(),
             routes: config.routes.clone(),
-            external_pools: config.external_pools.clone(),
+            accounts: config.accounts.clone(),
             high_cache_threshold: config.high_cache_threshold.clone(),
             compat_profile: config.compat_profile.clone(),
             model_resolution_mode: config.model_resolution_mode.clone(),
@@ -2620,8 +2594,8 @@ impl AdminService {
             if let Some(value) = req.routes {
                 config.routes = value;
             }
-            if let Some(value) = req.external_pools {
-                config.external_pools = value;
+            if let Some(value) = req.accounts {
+                config.accounts = value;
             }
             if let Some(value) = req.high_cache_threshold {
                 config.high_cache_threshold = value;
@@ -2651,9 +2625,8 @@ impl AdminService {
         self.request_admission
             .update_config(updated.request_admission);
         self.refresh_request_api_key_runtime(&updated);
-        self.external_pool_manager
-            .invalidate_external_pool_policy_state();
-        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        self.account_manager.invalidate_account_policy_state();
+        self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
         self.audit(
             "update_runtime_config",
             "runtime_config",
@@ -2677,7 +2650,7 @@ fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), Stri
     config
         .cache_policy
         .validate(config.legacy_cache_route_policy_default())?;
-    validate_external_pools_config(&config.external_pools)?;
+    validate_accounts_config(&config.accounts)?;
     if !(1..=10).contains(&config.inference_upstream_max_attempts) {
         return Err("inferenceUpstreamMaxAttempts 必须在 1 到 10 之间".to_string());
     }
@@ -2863,7 +2836,7 @@ fn validate_request_api_key_policies(
     Ok(())
 }
 
-fn extract_external_pool_test_response_text(body: &str) -> Option<String> {
+fn extract_account_test_response_text(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     value
         .get("content")
@@ -4029,7 +4002,7 @@ impl AdminService {
         self.runtime
             .update(|config| config.routes = routes.clone())
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
-        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
         Ok(())
     }
     pub(super) fn route_scenario_audit(
@@ -4049,75 +4022,58 @@ impl AdminService {
     }
 }
 
-pub(crate) fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {
-    if config.external_pool_global_max_concurrent_requests > 100_000 {
-        return Err("externalPoolGlobalMaxConcurrentRequests 不能大于 100000".to_string());
+pub(crate) fn validate_accounts_config(config: &AccountsConfig) -> Result<(), String> {
+    if config.global_max_concurrent_requests > 100_000 {
+        return Err("globalMaxConcurrentRequests 不能大于 100000".to_string());
     }
-    if config.external_pool_max_queued_requests > 100_000 {
-        return Err("externalPoolMaxQueuedRequests 不能大于 100000".to_string());
+    if config.max_queued_requests > 100_000 {
+        return Err("maxQueuedRequests 不能大于 100000".to_string());
     }
-    if config.external_pool_dispatch_max_wait_secs > 86_400 {
-        return Err("externalPoolDispatchMaxWaitSecs 不能大于 86400".to_string());
+    if config.dispatch_max_wait_secs > 86_400 {
+        return Err("dispatchMaxWaitSecs 不能大于 86400".to_string());
     }
-    if config.external_pool_retry_max_attempts > 10_000 {
-        return Err("externalPoolRetryMaxAttempts 不能大于 10000".to_string());
+    if config.retry_max_attempts > 10_000 {
+        return Err("retryMaxAttempts 不能大于 10000".to_string());
     }
     if config
-        .external_pool_retry_status_codes
+        .retry_status_codes
         .iter()
         .any(|code| !(100..=599).contains(code))
     {
-        return Err("externalPoolRetryStatusCodes 只能包含 100 到 599 的 HTTP 状态码".to_string());
+        return Err("retryStatusCodes 只能包含 100 到 599 的 HTTP 状态码".to_string());
     }
-    if config.external_pool_retry_status_codes.len() > 100 {
-        return Err("externalPoolRetryStatusCodes 不能超过 100 个".to_string());
+    if config.retry_status_codes.len() > 100 {
+        return Err("retryStatusCodes 不能超过 100 个".to_string());
     }
-    if config.external_pool_same_pool_retry_count > 10 {
-        return Err("externalPoolSamePoolRetryCount 不能大于 10".to_string());
+    if config.same_pool_retry_count > 10 {
+        return Err("samePoolRetryCount 不能大于 10".to_string());
     }
-    if config.external_pool_same_pool_retry_delay_ms > 60_000 {
-        return Err("externalPoolSamePoolRetryDelayMs 不能大于 60000".to_string());
+    if config.same_pool_retry_delay_ms > 60_000 {
+        return Err("samePoolRetryDelayMs 不能大于 60000".to_string());
     }
     if config
-        .external_pool_same_pool_retry_status_codes
+        .same_pool_retry_status_codes
         .iter()
         .any(|code| !(100..=599).contains(code))
     {
-        return Err(
-            "externalPoolSamePoolRetryStatusCodes 只能包含 100 到 599 的 HTTP 状态码".to_string(),
-        );
+        return Err("samePoolRetryStatusCodes 只能包含 100 到 599 的 HTTP 状态码".to_string());
     }
-    if config.external_pool_same_pool_retry_status_codes.len() > 100 {
-        return Err("externalPoolSamePoolRetryStatusCodes 不能超过 100 个".to_string());
+    if config.same_pool_retry_status_codes.len() > 100 {
+        return Err("samePoolRetryStatusCodes 不能超过 100 个".to_string());
     }
-    if config.external_pool_transient_failure_priority_penalty > 10_000 {
-        return Err("externalPoolTransientFailurePriorityPenalty 不能大于 10000".to_string());
+    if config.transient_failure_priority_penalty > 10_000 {
+        return Err("transientFailurePriorityPenalty 不能大于 10000".to_string());
     }
 
-    if !(0.01..=1.0).contains(&config.external_pool_quality_ewma_alpha) {
-        return Err("externalPoolQualityEwmaAlpha 必须在 0.01 到 1 之间".to_string());
+    if !(0.01..=1.0).contains(&config.quality_ewma_alpha) {
+        return Err("qualityEwmaAlpha 必须在 0.01 到 1 之间".to_string());
     }
     for (label, weight) in [
-        (
-            "externalPoolQualityPriorityWeight",
-            config.external_pool_quality_priority_weight,
-        ),
-        (
-            "externalPoolQualityLoadWeight",
-            config.external_pool_quality_load_weight,
-        ),
-        (
-            "externalPoolQualityErrorWeight",
-            config.external_pool_quality_error_weight,
-        ),
-        (
-            "externalPoolQualityLatencyWeight",
-            config.external_pool_quality_latency_weight,
-        ),
-        (
-            "externalPoolQualityProbationWeight",
-            config.external_pool_quality_probation_weight,
-        ),
+        ("qualityPriorityWeight", config.quality_priority_weight),
+        ("qualityLoadWeight", config.quality_load_weight),
+        ("qualityErrorWeight", config.quality_error_weight),
+        ("qualityLatencyWeight", config.quality_latency_weight),
+        ("qualityProbationWeight", config.quality_probation_weight),
     ] {
         if !weight.is_finite() || weight < 0.0 {
             return Err(format!("{label} 必须是大于等于 0 的有限数"));
@@ -4126,102 +4082,97 @@ pub(crate) fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Re
             return Err(format!("{label} 不能大于 1000000"));
         }
     }
-    if config.external_pool_quality_top_k > 100 {
-        return Err("externalPoolQualityTopK 不能大于 100".to_string());
+    if config.quality_top_k > 100 {
+        return Err("qualityTopK 不能大于 100".to_string());
     }
-    if config.external_pool_quality_min_samples > 10_000 {
-        return Err("externalPoolQualityMinSamples 不能大于 10000".to_string());
+    if config.quality_min_samples > 10_000 {
+        return Err("qualityMinSamples 不能大于 10000".to_string());
     }
-    if config.external_pool_quality_sample_ttl_secs > 86_400 {
-        return Err("externalPoolQualitySampleTtlSecs 不能大于 86400".to_string());
+    if config.quality_sample_ttl_secs > 86_400 {
+        return Err("qualitySampleTtlSecs 不能大于 86400".to_string());
     }
-    if config.external_pool_degrade_window_secs > 86_400 {
-        return Err("externalPoolDegradeWindowSecs 不能大于 86400".to_string());
+    if config.degrade_window_secs > 86_400 {
+        return Err("degradeWindowSecs 不能大于 86400".to_string());
     }
-    if !(0.0..=1.0).contains(&config.external_pool_degrade_error_rate_threshold) {
-        return Err("externalPoolDegradeErrorRateThreshold 必须在 0 到 1 之间".to_string());
+    if !(0.0..=1.0).contains(&config.degrade_error_rate_threshold) {
+        return Err("degradeErrorRateThreshold 必须在 0 到 1 之间".to_string());
     }
-    if config.external_pool_degrade_probation_secs > 86_400 {
-        return Err("externalPoolDegradeProbationSecs 不能大于 86400".to_string());
+    if config.degrade_probation_secs > 86_400 {
+        return Err("degradeProbationSecs 不能大于 86400".to_string());
     }
-    if config.external_pool_max_probation_secs > 86_400 {
-        return Err("externalPoolMaxProbationSecs 不能大于 86400".to_string());
+    if config.max_probation_secs > 86_400 {
+        return Err("maxProbationSecs 不能大于 86400".to_string());
     }
     // 避让上限必须不小于单次避让时长，否则指数退避的上限语义自相矛盾。
-    if config.external_pool_max_probation_secs < config.external_pool_degrade_probation_secs {
-        return Err(
-            "externalPoolMaxProbationSecs 不能小于 externalPoolDegradeProbationSecs".to_string(),
-        );
+    if config.max_probation_secs < config.degrade_probation_secs {
+        return Err("maxProbationSecs 不能小于 degradeProbationSecs".to_string());
     }
-    if config.external_pool_probe_share_percent > 100 {
-        return Err("externalPoolProbeSharePercent 不能大于 100".to_string());
+    if config.probe_share_percent > 100 {
+        return Err("probeSharePercent 不能大于 100".to_string());
     }
-    if config.external_pool_recovery_ramp_secs > 86_400 {
-        return Err("externalPoolRecoveryRampSecs 不能大于 86400".to_string());
+    if config.recovery_ramp_secs > 86_400 {
+        return Err("recoveryRampSecs 不能大于 86400".to_string());
     }
 
-    if config.external_pool_auto_disable_failure_threshold == 0
-        || config.external_pool_auto_disable_failure_threshold > 10_000
+    if config.auto_disable_failure_threshold == 0 || config.auto_disable_failure_threshold > 10_000
     {
-        return Err("externalPoolAutoDisableFailureThreshold 必须在 1 到 10000 之间".to_string());
+        return Err("autoDisableFailureThreshold 必须在 1 到 10000 之间".to_string());
     }
-    if config.external_pool_auto_disable_window_secs == 0
-        || config.external_pool_auto_disable_window_secs > 24 * 60 * 60
+    if config.auto_disable_window_secs == 0 || config.auto_disable_window_secs > 24 * 60 * 60 {
+        return Err("autoDisableWindowSecs 必须在 1 到 86400 之间".to_string());
+    }
+    if config.auto_disable_duration_secs > 365 * 24 * 60 * 60 {
+        return Err("autoDisableDurationSecs 不能超过 365 天".to_string());
+    }
+    if config.rate_limit_cooldown_secs == 0
+        || config.server_error_cooldown_secs == 0
+        || config.network_error_cooldown_secs == 0
+        || config.protocol_error_cooldown_secs == 0
+        || config.model_unavailable_cooldown_secs == 0
     {
-        return Err("externalPoolAutoDisableWindowSecs 必须在 1 到 86400 之间".to_string());
+        return Err("账号错误冷却秒数必须大于 0".to_string());
     }
-    if config.external_pool_auto_disable_duration_secs > 365 * 24 * 60 * 60 {
-        return Err("externalPoolAutoDisableDurationSecs 不能超过 365 天".to_string());
+    if config.request_timeout_secs > 86_400 {
+        return Err("requestTimeoutSecs 不能大于 86400".to_string());
     }
-    if config.external_pool_rate_limit_cooldown_secs == 0
-        || config.external_pool_server_error_cooldown_secs == 0
-        || config.external_pool_network_error_cooldown_secs == 0
-        || config.external_pool_protocol_error_cooldown_secs == 0
-        || config.external_pool_model_unavailable_cooldown_secs == 0
-    {
-        return Err("外部池错误冷却秒数必须大于 0".to_string());
+    if config.stream_request_timeout_secs > 86_400 {
+        return Err("streamRequestTimeoutSecs 不能大于 86400".to_string());
     }
-    if config.external_pool_request_timeout_secs > 86_400 {
-        return Err("externalPoolRequestTimeoutSecs 不能大于 86400".to_string());
+    if config.stream_idle_timeout_secs > 86_400 {
+        return Err("streamIdleTimeoutSecs 不能大于 86400".to_string());
     }
-    if config.external_pool_stream_request_timeout_secs > 86_400 {
-        return Err("externalPoolStreamRequestTimeoutSecs 不能大于 86400".to_string());
+    if config.stream_first_output_timeout_secs > 86_400 {
+        return Err("streamFirstOutputTimeoutSecs 不能大于 86400".to_string());
     }
-    if config.external_pool_stream_idle_timeout_secs > 86_400 {
-        return Err("externalPoolStreamIdleTimeoutSecs 不能大于 86400".to_string());
+    if config.usage_projection_uplift_percent > 200 {
+        return Err("usageProjectionUpliftPercent 不能大于 200".to_string());
     }
-    if config.external_pool_stream_first_output_timeout_secs > 86_400 {
-        return Err("externalPoolStreamFirstOutputTimeoutSecs 不能大于 86400".to_string());
+    if config.usage_projection_cost_floor_margin_percent > 200 {
+        return Err("usageProjectionCostFloorMarginPercent 不能大于 200".to_string());
     }
-    if config.external_pool_usage_projection_uplift_percent > 200 {
-        return Err("externalPoolUsageProjectionUpliftPercent 不能大于 200".to_string());
+    if config.usage_projection_output_uplift_min_tokens < 0 {
+        return Err("usageProjectionOutputUpliftMinTokens 不能小于 0".to_string());
     }
-    if config.external_pool_usage_projection_cost_floor_margin_percent > 200 {
-        return Err("externalPoolUsageProjectionCostFloorMarginPercent 不能大于 200".to_string());
+    if config.usage_projection_output_uplift_percent > 200 {
+        return Err("usageProjectionOutputUpliftPercent 不能大于 200".to_string());
     }
-    if config.external_pool_usage_projection_output_uplift_min_tokens < 0 {
-        return Err("externalPoolUsageProjectionOutputUpliftMinTokens 不能小于 0".to_string());
+    if config.usage_debug_dir.chars().count() > 512 {
+        return Err("usageDebugDir 不能超过 512 个字符".to_string());
     }
-    if config.external_pool_usage_projection_output_uplift_percent > 200 {
-        return Err("externalPoolUsageProjectionOutputUpliftPercent 不能大于 200".to_string());
+    if config.usage_debug_max_body_bytes > 1024 * 1024 {
+        return Err("usageDebugMaxBodyBytes 不能大于 1048576".to_string());
     }
-    if config.external_pool_usage_debug_dir.chars().count() > 512 {
-        return Err("externalPoolUsageDebugDir 不能超过 512 个字符".to_string());
+    if config.usage_debug_max_files > 100_000 {
+        return Err("usageDebugMaxFiles 不能大于 100000".to_string());
     }
-    if config.external_pool_usage_debug_max_body_bytes > 1024 * 1024 {
-        return Err("externalPoolUsageDebugMaxBodyBytes 不能大于 1048576".to_string());
+    if config.wire_debug_dir.chars().count() > 512 {
+        return Err("wireDebugDir 不能超过 512 个字符".to_string());
     }
-    if config.external_pool_usage_debug_max_files > 100_000 {
-        return Err("externalPoolUsageDebugMaxFiles 不能大于 100000".to_string());
+    if config.wire_debug_max_body_bytes > 1024 * 1024 {
+        return Err("wireDebugMaxBodyBytes 不能大于 1048576".to_string());
     }
-    if config.external_pool_wire_debug_dir.chars().count() > 512 {
-        return Err("externalPoolWireDebugDir 不能超过 512 个字符".to_string());
-    }
-    if config.external_pool_wire_debug_max_body_bytes > 1024 * 1024 {
-        return Err("externalPoolWireDebugMaxBodyBytes 不能大于 1048576".to_string());
-    }
-    if config.external_pool_wire_debug_max_files > 100_000 {
-        return Err("externalPoolWireDebugMaxFiles 不能大于 100000".to_string());
+    if config.wire_debug_max_files > 100_000 {
+        return Err("wireDebugMaxFiles 不能大于 100000".to_string());
     }
     Ok(())
 }

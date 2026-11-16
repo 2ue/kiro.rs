@@ -39,7 +39,7 @@ import { formatDate } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   AccountRoutePolicy,
-  ExternalPoolRouteMode,
+  RouteRuleMode,
   RoutePolicy,
   RouteScenario,
   RouteScenarioAccountOption,
@@ -61,13 +61,13 @@ import {
   type AccountRow,
 } from './account-rules'
 
-const MODE_LABELS: Record<ExternalPoolRouteMode, string> = {
+const MODE_LABELS: Record<RouteRuleMode, string> = {
   allow_all: '不限制',
   allow_list: '仅允许所选路由',
   deny_list: '禁止所选路由',
 }
 
-const SCENARIO_FILE_FORMAT = 'kiro-rs-route-scenario'
+const SCENARIO_FILE_FORMAT = 'claude-pool-route-scenario'
 
 /** Account rows rendered per step; selection and batch actions always cover the whole list. */
 const RENDER_STEP = 200
@@ -99,11 +99,11 @@ function PolicyEditor({
         <label className="text-xs font-medium text-muted-foreground" htmlFor={`${idPrefix}-mode`}>模式</label>
         <Select
           value={value.routeMode}
-          onValueChange={(mode) => onChange({ routeMode: mode as ExternalPoolRouteMode, routeRules: mode === 'allow_all' ? [] : value.routeRules })}
+          onValueChange={(mode) => onChange({ routeMode: mode as RouteRuleMode, routeRules: mode === 'allow_all' ? [] : value.routeRules })}
         >
           <SelectTrigger id={`${idPrefix}-mode`} size="sm"><SelectValue /></SelectTrigger>
           <SelectContent>
-            {(Object.keys(MODE_LABELS) as ExternalPoolRouteMode[]).map((mode) => (
+            {(Object.keys(MODE_LABELS) as RouteRuleMode[]).map((mode) => (
               <SelectItem key={mode} value={mode}>{MODE_LABELS[mode]}</SelectItem>
             ))}
           </SelectContent>
@@ -434,7 +434,7 @@ function ScenarioEditor({
         onChange={(localAccounts) => setContent({ localAccounts })}
       />
       <SectionCard title="外部整体" description="哪些路由可以进入外部账号。">
-        <PolicyEditor value={state.content.external} routes={routes} onChange={(external) => setContent({ external })} idPrefix="external-pool" />
+        <PolicyEditor value={state.content.external} routes={routes} onChange={(external) => setContent({ external })} idPrefix="account" />
       </SectionCard>
       <AccountRulesEditor
         idPrefix="external"
@@ -454,12 +454,12 @@ function itemKey(item: RouteScenarioItemKey) {
 }
 
 function isPoolItem(item: RouteScenarioItemKey) {
-  return item.kind === 'local_pool' || item.kind === 'external_pool'
+  return item.kind === 'local_pool' || item.kind === 'account'
 }
 
 const KIND_LABELS: Record<RouteScenarioItemKey['kind'], string> = {
   local_pool: '本地整体',
-  external_pool: '外部整体',
+  account: '外部整体',
   local_account: '本地账号',
   external_account: '外部账号',
 }
@@ -657,8 +657,8 @@ export function RouteScenariosPage() {
     queryClient.invalidateQueries({ queryKey: ['route-scenarios'] })
     queryClient.invalidateQueries({ queryKey: ['route-scenario-options'] })
     queryClient.invalidateQueries({ queryKey: ['runtime-config'] })
-    queryClient.invalidateQueries({ queryKey: ['external-pools'] })
-    queryClient.invalidateQueries({ queryKey: ['external-pools-status'] })
+    queryClient.invalidateQueries({ queryKey: ['accounts'] })
+    queryClient.invalidateQueries({ queryKey: ['accounts-status'] })
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
     queryClient.invalidateQueries({ queryKey: ['credential-list'] })
     queryClient.invalidateQueries({ queryKey: ['credentials-page'] })

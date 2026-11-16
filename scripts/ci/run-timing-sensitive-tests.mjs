@@ -32,7 +32,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   console.log(`Running ${names.length} timing-sensitive tests:\n  ${names.join("\n  ")}`);
   const result = spawnSync(
     "cargo",
-    ["test", "--locked", "--bin", "kiro-rs", "--", "--ignored", "--test-threads=1", ...names],
+    ["test", "--locked", "--bin", "claude-pool", "--", "--ignored", "--test-threads=1", ...names],
     { stdio: "inherit" },
   );
   process.exit(result.status ?? 1);

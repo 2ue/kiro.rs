@@ -13,8 +13,6 @@ import {
 } from '@/components/ui'
 import { ModalShell } from '@/components/patterns'
 import {
-  formatAttemptChain,
-  formatAttemptSummary,
   formatExternalAttemptChain,
   formatLatency,
   attemptActionLabel,
@@ -248,35 +246,18 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     appendDiagnostic(items, seen, '内部错误摘要', record.errorMessage, 'error')
   }
 
-  record.credentialAttempts?.forEach((attempt) => {
-    appendDiagnostic(
-      items,
-      seen,
-      `本地上游错误片段 #${attempt.attempt} · 账号 #${attempt.credentialId} · ${attempt.statusText || attempt.status || attempt.action || '-'}`,
-      formatRawUpstreamError(attempt.rawUpstreamError),
-      'warning'
-    )
-    appendDiagnostic(
-      items,
-      seen,
-      `本地上游尝试 #${attempt.attempt} · 账号 #${attempt.credentialId} · ${attempt.statusText || attempt.status || attempt.errorType || attempt.action || '-'}`,
-      attempt.errorMessage || attempt.errorType,
-      'error'
-    )
-  })
-
   record.externalAttempts?.forEach((attempt) => {
     appendDiagnostic(
       items,
       seen,
-      `外部池上游错误片段 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
+      `账号上游错误片段 #${attempt.attempt} · 账号 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
       formatRawUpstreamError(attempt.rawUpstreamError),
       'warning'
     )
     appendDiagnostic(
       items,
       seen,
-      `外部池上游尝试 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
+      `账号上游尝试 #${attempt.attempt} · 账号 #${attempt.poolId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
       attempt.errorMessage || attempt.errorType,
       'error'
     )
@@ -324,11 +305,10 @@ export function UsageDetailModal({
 }) {
   if (!record) return null
 
-  const hasLocalAttempts = (record.credentialAttempts?.length ?? 0) > 0
   const hasExternalAttempts = (record.externalAttempts?.length ?? 0) > 0
   const costModel = usageRecordCostModel(record)
   const showExternalResolvedModel =
-    record.routeKind === 'external_pool'
+    record.routeKind === 'account'
     && !!record.upstreamModel
     && record.upstreamModel !== (record.externalOutboundModel || record.upstreamModel)
   const errorDiagnostics = buildErrorDiagnostics(record)
@@ -359,8 +339,8 @@ export function UsageDetailModal({
               </div>
             )}
             <DetailField label="账号" value={record.credentialId != null ? `#${record.credentialId}${record.credentialLabel ? ' ' + record.credentialLabel : ''}` : '-'} />
-            {record.routeKind === 'external_pool' && (
-              <DetailField label="外部账号" value={`#${record.externalPoolId ?? '-'}${record.externalPoolName ? ' ' + record.externalPoolName : ''}`} />
+            {record.routeKind === 'account' && (
+              <DetailField label="外部账号" value={`#${record.accountId ?? '-'}${record.accountName ? ' ' + record.accountName : ''}`} />
             )}
             <DetailField
               label="路由"
@@ -594,59 +574,10 @@ export function UsageDetailModal({
         </div>
 
         {/* 本地调用链路 Table */}
-        {hasLocalAttempts && (
-          <div>
-            <SectionTitle>本地调用链路</SectionTitle>
-            <div className="mb-2 flex flex-wrap items-center gap-2">
-              <Badge tone="secondary">{formatAttemptSummary(record)}</Badge>
-            </div>
-            <div className="mb-2 rounded-lg bg-muted/30 px-3 py-2 font-mono text-xs break-all">
-              {formatAttemptChain(record) || '-'}
-            </div>
-            <div className="scrollbar-thin overflow-x-auto">
-              <Table className="min-w-[640px]">
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>顺序</TableHead>
-                    <TableHead>账号</TableHead>
-                    <TableHead>模型</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>动作</TableHead>
-                    <TableHead className="text-right">耗时</TableHead>
-                    <TableHead>错误</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {record.credentialAttempts?.map((a) => (
-                    <TableRow key={`${a.attempt}-${a.credentialId}-${a.durationMs}`}>
-                      <TableCell>{a.attempt}</TableCell>
-                      <TableCell>
-                        <div className="font-medium">#{a.credentialId}</div>
-                        {a.credentialLabel && (
-                          <div className="max-w-[180px] truncate text-[0.68rem] text-muted-foreground/70">{a.credentialLabel}</div>
-                        )}
-                      </TableCell>
-                      <TableCell className="max-w-[160px] truncate text-xs">{a.model || '-'}</TableCell>
-                      <TableCell>{a.statusText || (a.status != null ? String(a.status) : '-')}</TableCell>
-                      <TableCell>{attemptActionLabel(a.action)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{formatLatency(a.durationMs)}</TableCell>
-                      <TableCell>
-                        <div className="max-w-[360px] whitespace-normal break-words text-xs" title={a.errorMessage || a.errorType || ''}>
-                          {a.errorMessage || a.errorType || '-'}
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          </div>
-        )}
-
-        {/* 外部池链路 Table */}
+        {/* 账号链路 Table */}
         {hasExternalAttempts && (
           <div>
-            <SectionTitle>外部池链路</SectionTitle>
+            <SectionTitle>账号链路</SectionTitle>
             <div className="mb-2 rounded-lg bg-muted/30 px-3 py-2 font-mono text-xs break-all">
               {formatExternalAttemptChain(record) || '-'}
             </div>

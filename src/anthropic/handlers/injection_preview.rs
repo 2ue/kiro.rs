@@ -1,11 +1,11 @@
 //! 管理端"注入预览"：按给定的路由和请求条件构造一个合成请求，走和真实请求相同的注入与
-//! Kiro 转换代码，返回每个注入项的结果和发给上游的完整文本。不访问上游，不写缓存或 usage。
+//! 上游 转换代码，返回每个注入项的结果和发给上游的完整文本。不访问上游，不写缓存或 usage。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::model::config::{InjectionId, ResolvedInjections, UpstreamKind};
+use crate::model::config::{InjectionId, ResolvedInjections};
 use crate::model::prompt_injection::BlockReason;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -102,7 +102,7 @@ pub(crate) struct PromptInjectionPreviewResponse {
     pub endpoint: String,
     pub items: Vec<PreviewItem>,
     pub features: PreviewFeatures,
-    /// 外部池：发往外部上游的 system（Anthropic 格式）。
+    /// 账号：发往外部上游的 system（Anthropic 格式）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_system: Option<Vec<String>>,
 }
@@ -219,7 +219,7 @@ pub(crate) fn preview_prompt_injection(
     };
     let mut payload = preview_payload(&req);
 
-    let injections = runtime_config.injections_for(&endpoint, UpstreamKind::ExternalPool);
+    let injections = runtime_config.injections_for(&endpoint);
     let applied =
         super::super::prompt_injection::apply_to_messages_request(&injections, &mut payload);
     Ok(PromptInjectionPreviewResponse {

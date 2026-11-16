@@ -18,9 +18,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use crate::anthropic::usage::{
-    REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem, UsageDashboardResponse,
-    UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow,
-    UsageDashboardWindowSpec, UsageExternalPoolBillingByPool, UsageExternalPoolBillingSummary,
+    REALTIME_USAGE_WINDOW_SECS, UsageAccountBillingByPool, UsageAccountBillingSummary,
+    UsageAggregate, UsageBreakdownItem, UsageDashboardResponse, UsageDashboardSeries,
+    UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec,
     UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
     UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
     usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
@@ -31,12 +31,12 @@ use crate::model::config::{Config, RedisConfig};
 const REDIS_PATTERN_DELETE_SCAN_COUNT: usize = 128;
 const REDIS_PATTERN_DELETE_COMMAND_KEY_LIMIT: usize = 64;
 const REDIS_PATTERN_DELETE_MAX_PASSES: usize = 8;
-const EXTERNAL_POOL_PENDING_LEASE_TOMBSTONE_TTL_MILLIS: i64 = 5 * 60 * 1_000;
-const EXTERNAL_POOL_COORDINATOR_EPOCH_KEY: &str = "external_pool:coordinator:coordination_epoch";
-const EXTERNAL_POOL_COORDINATOR_RECOVERY_KEY: &str = "external_pool:coordinator:recovery_until";
-const EXTERNAL_POOL_DATA_GENERATION_KEY: &str = "external_pool:data:generation";
+const ACCOUNT_PENDING_LEASE_TOMBSTONE_TTL_MILLIS: i64 = 5 * 60 * 1_000;
+const ACCOUNT_COORDINATOR_EPOCH_KEY: &str = "account:coordinator:coordination_epoch";
+const ACCOUNT_COORDINATOR_RECOVERY_KEY: &str = "account:coordinator:recovery_until";
+const ACCOUNT_DATA_GENERATION_KEY: &str = "account:data:generation";
 /// Lua 侧在遇到非预期 Redis 类型时回填的哨兵值。
-const INVALID_REDIS_TYPE_SENTINEL: &str = "__kiro_rs_invalid_redis_type__";
+const INVALID_REDIS_TYPE_SENTINEL: &str = "__claude_pool_invalid_redis_type__";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RedisPatternDeleteStats {
@@ -64,17 +64,17 @@ impl RedisPatternDeleteStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ExternalPoolCapacityState {
+pub struct AccountCapacityState {
     pub pool_in_flight_requests: u32,
     pub global_in_flight_requests: u32,
 }
 
-/// 外部池质量采样的调参项。
+/// 账号质量采样的调参项。
 ///
 /// 这三个值都来自运行时配置而非单次请求，打包传递可以让采样入口的签名
 /// 只保留「这次请求发生了什么」，避免调用点把一串裸标量排错顺序。
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ExternalPoolQualitySampleTuning {
+pub struct AccountQualitySampleTuning {
     /// 失败率/延迟 EWMA 的平滑系数。
     pub alpha: f64,
     /// 质量状态在 Redis 中的存活时长。
@@ -83,13 +83,13 @@ pub struct ExternalPoolQualitySampleTuning {
     pub degrade_window: StdDuration,
 }
 
-/// 外部池被动质量采样状态。
+/// 账号被动质量采样状态。
 ///
 /// 全部字段都来自真实用户请求，不做任何主动探测。该状态只在 Redis 中保存
 /// 短窗口数据，实例重启或 Redis 清空后重新累积；调度器读取失败时必须退化为
 /// 中性值，不得阻塞主请求。
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ExternalPoolQualityState {
+pub struct AccountQualityState {
     /// 失败率 EWMA，范围 `0.0..=1.0`。
     pub recent_error_rate: f64,
     /// 首字延迟 EWMA（毫秒）。仅流式请求有值。
@@ -116,7 +116,7 @@ pub struct ExternalPoolQualityState {
     pub degrade_window_started_at_ms: Option<i64>,
 }
 
-impl ExternalPoolQualityState {
+impl AccountQualityState {
     /// 样本是否足够参与质量评分。
     pub fn has_enough_samples(&self, min_samples: u64) -> bool {
         self.sample_count >= min_samples.max(1)
@@ -150,18 +150,18 @@ impl ExternalPoolQualityState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ExternalPoolCoordinatorSnapshot {
-    pub capacity: ExternalPoolCapacityState,
+pub struct AccountCoordinatorSnapshot {
+    pub capacity: AccountCapacityState,
     pub cooldown_values: Vec<Option<String>>,
     pub cooldown_ttls: Vec<Option<StdDuration>>,
     pub transient_failure_streak: u32,
     pub transient_failure_ttl: Option<StdDuration>,
     /// 被动质量采样状态；Redis 中无记录或解析失败时为 `None`（中性值）。
-    pub quality: Option<ExternalPoolQualityState>,
+    pub quality: Option<AccountQualityState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalPoolCoordinatorSnapshotRequest {
+pub struct AccountCoordinatorSnapshotRequest {
     pub pool_id: u64,
     pub cooldown_keys: Vec<String>,
     pub transient_failure_key: String,
@@ -170,7 +170,7 @@ pub struct ExternalPoolCoordinatorSnapshotRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalPoolLeaseAcquireResult {
+pub enum AccountLeaseAcquireResult {
     Acquired {
         lease_id: String,
         pool_in_flight_requests: u32,
@@ -199,20 +199,20 @@ pub enum ExternalPoolLeaseAcquireResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalPoolLeaseReleaseRequest {
+pub struct AccountLeaseReleaseRequest {
     pub pool_id: u64,
     pub lease_id: String,
     pub pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExternalPoolLeaseReleaseResult {
+pub struct AccountLeaseReleaseResult {
     pub completed: bool,
     pub removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalPoolCoordinatorGuardState {
+pub enum AccountCoordinatorGuardState {
     Ready {
         coordination_epoch: String,
     },
@@ -226,32 +226,32 @@ pub enum ExternalPoolCoordinatorGuardState {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExternalPoolCoordinatorGuardError {
-    pub state: ExternalPoolCoordinatorGuardState,
+pub struct AccountCoordinatorGuardError {
+    pub state: AccountCoordinatorGuardState,
 }
 
-impl std::fmt::Display for ExternalPoolCoordinatorGuardError {
+impl std::fmt::Display for AccountCoordinatorGuardError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
-            ExternalPoolCoordinatorGuardState::Ready { .. } => {
-                formatter.write_str("external pool coordinator guard is ready")
+            AccountCoordinatorGuardState::Ready { .. } => {
+                formatter.write_str("account coordinator guard is ready")
             }
-            ExternalPoolCoordinatorGuardState::EpochMismatch { .. } => {
-                formatter.write_str("external pool coordinator Redis epoch requires reconciliation")
+            AccountCoordinatorGuardState::EpochMismatch { .. } => {
+                formatter.write_str("account coordinator Redis epoch requires reconciliation")
             }
-            ExternalPoolCoordinatorGuardState::Recovering { remaining, .. } => write!(
+            AccountCoordinatorGuardState::Recovering { remaining, .. } => write!(
                 formatter,
-                "external pool coordinator is recovering for {}ms",
+                "account coordinator is recovering for {}ms",
                 remaining.as_millis().max(1)
             ),
         }
     }
 }
 
-impl std::error::Error for ExternalPoolCoordinatorGuardError {}
+impl std::error::Error for AccountCoordinatorGuardError {}
 
 #[derive(Debug, Clone)]
-struct RedisExternalPoolIndexItem {
+struct RedisAccountIndexItem {
     id: String,
     label: String,
 }
@@ -307,7 +307,7 @@ pub struct RedisStore {
     key_prefix: String,
     usage_cleanup_watermark_micros: Arc<AtomicI64>,
     #[cfg(test)]
-    external_pool_hot_path_round_trips: Arc<AtomicU64>,
+    account_hot_path_round_trips: Arc<AtomicU64>,
     #[cfg(test)]
     usage_summary_write_round_trips: Arc<AtomicU64>,
 }
@@ -330,8 +330,8 @@ const USAGE_DASHBOARD_TOP_MODELS_KEY: &str = "usage:dashboard:top:models";
 const USAGE_DASHBOARD_TOP_CREDENTIALS_KEY: &str = "usage:dashboard:top:credentials";
 const USAGE_DASHBOARD_TOP_ENDPOINTS_KEY: &str = "usage:dashboard:top:endpoints";
 const USAGE_DASHBOARD_TOP_ERRORS_KEY: &str = "usage:dashboard:top:errors";
-const USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY: &str = "usage:dashboard:top:external_pools";
-const USAGE_DASHBOARD_EXTERNAL_POOL_LIMIT: isize = 19;
+const USAGE_DASHBOARD_TOP_ACCOUNTS_KEY: &str = "usage:dashboard:top:accounts";
+const USAGE_DASHBOARD_ACCOUNT_LIMIT: isize = 19;
 const USAGE_RECORDS_INDEX_KEY: &str = "usage:records:index";
 const USAGE_RECORDS_TTL_SECS: usize = 35 * 24 * 60 * 60;
 const USAGE_RECORDS_MAX_CACHED: usize = 100_000;
@@ -645,19 +645,19 @@ impl GuardedUsagePipeline {
 
 impl RedisStore {
     #[cfg(test)]
-    pub async fn external_pool_dispatch_queue_size(&self) -> anyhow::Result<u32> {
+    pub async fn account_dispatch_queue_size(&self) -> anyhow::Result<u32> {
         let mut manager = self.scheduler_capacity_manager();
         let count: i64 = redis::cmd("EVAL")
             .arg(DISPATCH_QUEUE_PRUNE_AND_COUNT_SCRIPT)
             .arg(1)
-            .arg(self.key(external_pool_global_queue_key()))
+            .arg(self.key(account_global_queue_key()))
             .query_async(&mut manager)
             .await?;
         Ok(count.max(0) as u32)
     }
 
     #[cfg(test)]
-    pub async fn record_external_pool_quality_sample(
+    pub async fn record_account_quality_sample(
         &self,
         pool_id: u64,
         success: bool,
@@ -665,13 +665,13 @@ impl RedisStore {
         latency_ms: Option<u64>,
         alpha: f64,
         ttl: StdDuration,
-    ) -> anyhow::Result<ExternalPoolQualityState> {
-        self.record_external_pool_quality_sample_with_window(
+    ) -> anyhow::Result<AccountQualityState> {
+        self.record_account_quality_sample_with_window(
             pool_id,
             success,
             ttft_ms,
             latency_ms,
-            ExternalPoolQualitySampleTuning {
+            AccountQualitySampleTuning {
                 alpha,
                 ttl,
                 degrade_window: StdDuration::ZERO,
@@ -681,31 +681,30 @@ impl RedisStore {
     }
 
     #[cfg(test)]
-    pub fn external_pool_hot_path_round_trips(&self) -> u64 {
-        self.external_pool_hot_path_round_trips
-            .load(Ordering::Relaxed)
+    pub fn account_hot_path_round_trips(&self) -> u64 {
+        self.account_hot_path_round_trips.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
-    pub fn reset_external_pool_hot_path_round_trips(&self) {
-        self.external_pool_hot_path_round_trips
+    pub fn reset_account_hot_path_round_trips(&self) {
+        self.account_hot_path_round_trips
             .store(0, Ordering::Relaxed);
     }
 
     #[cfg(test)]
-    pub async fn external_pool_coordinator_snapshot(
+    pub async fn account_coordinator_snapshot(
         &self,
         pool_id: u64,
         max_age: Option<StdDuration>,
         cooldown_keys: &[String],
         coordination_epoch: &str,
-    ) -> anyhow::Result<ExternalPoolCoordinatorSnapshot> {
+    ) -> anyhow::Result<AccountCoordinatorSnapshot> {
         let mut snapshots = self
-            .external_pool_coordinator_snapshots(
-                &[ExternalPoolCoordinatorSnapshotRequest {
+            .account_coordinator_snapshots(
+                &[AccountCoordinatorSnapshotRequest {
                     pool_id,
                     cooldown_keys: cooldown_keys.to_vec(),
-                    transient_failure_key: format!("external_pool:{pool_id}:transient_failures"),
+                    transient_failure_key: format!("account:{pool_id}:transient_failures"),
                     // 单池路径只用于测试与诊断；调度热路径统一走批量接口，
                     // 质量数据在那里读取。
                     quality_key: None,
@@ -716,7 +715,7 @@ impl RedisStore {
             .await?;
         snapshots
             .pop()
-            .ok_or_else(|| anyhow::anyhow!("Redis returned no external pool coordinator snapshot"))
+            .ok_or_else(|| anyhow::anyhow!("Redis returned no account coordinator snapshot"))
     }
 
     #[cfg(test)]
@@ -730,7 +729,7 @@ impl RedisStore {
         pool_id: u64,
         poisoned: bool,
     ) -> anyhow::Result<()> {
-        let key = self.key(&external_pool_in_flight_keys(pool_id).last_seen);
+        let key = self.key(&account_in_flight_keys(pool_id).last_seen);
         let mut manager = self.scheduler_capacity_manager();
         if poisoned {
             redis::cmd("SET")
@@ -748,13 +747,13 @@ impl RedisStore {
     }
 
     #[cfg(test)]
-    pub async fn release_external_pool_confirmed_lease(
+    pub async fn release_account_confirmed_lease(
         &self,
         pool_id: u64,
         lease_id: &str,
     ) -> anyhow::Result<bool> {
         let result = self
-            .release_external_pool_leases_batch(&[ExternalPoolLeaseReleaseRequest {
+            .release_account_leases_batch(&[AccountLeaseReleaseRequest {
                 pool_id,
                 lease_id: lease_id.to_string(),
                 pending: false,
@@ -826,11 +825,12 @@ impl RedisStore {
             RedisStoreRole::Observability => (manager.clone(), manager.clone()),
         };
         #[cfg(test)]
-        let usage_summary_write_permits = std::env::var("KIRO_RS_TEST_USAGE_SUMMARY_WRITE_PERMITS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(|value| value.clamp(1, 4))
-            .unwrap_or(DEFAULT_USAGE_SUMMARY_WRITE_PERMITS);
+        let usage_summary_write_permits =
+            std::env::var("CLAUDE_POOL_TEST_USAGE_SUMMARY_WRITE_PERMITS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|value| value.clamp(1, 4))
+                .unwrap_or(DEFAULT_USAGE_SUMMARY_WRITE_PERMITS);
         #[cfg(not(test))]
         let usage_summary_write_permits = DEFAULT_USAGE_SUMMARY_WRITE_PERMITS;
         Ok(Self {
@@ -843,7 +843,7 @@ impl RedisStore {
             key_prefix: config.key_prefix.trim_end_matches(':').to_string(),
             usage_cleanup_watermark_micros: Arc::new(AtomicI64::new(0)),
             #[cfg(test)]
-            external_pool_hot_path_round_trips: Arc::new(AtomicU64::new(0)),
+            account_hot_path_round_trips: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             usage_summary_write_round_trips: Arc::new(AtomicU64::new(0)),
         })
@@ -898,17 +898,12 @@ impl RedisStore {
         window_specs: &[UsageDashboardWindowSpec],
         hourly_specs: &[UsageDashboardWindowSpec],
         daily_specs: &[UsageDashboardWindowSpec],
-        external_pool_index: &[RedisExternalPoolIndexItem],
+        account_index: &[RedisAccountIndexItem],
     ) -> anyhow::Result<DashboardBucketCache> {
         let mut suffixes = Vec::new();
         let mut seen = HashSet::new();
         for spec in window_specs {
-            collect_dashboard_window_bucket_keys(
-                &mut suffixes,
-                &mut seen,
-                spec,
-                external_pool_index,
-            );
+            collect_dashboard_window_bucket_keys(&mut suffixes, &mut seen, spec, account_index);
         }
         for spec in hourly_specs.iter().chain(daily_specs.iter()) {
             collect_dashboard_global_bucket_keys(&mut suffixes, &mut seen, spec);
@@ -1045,40 +1040,40 @@ impl RedisStore {
         items
     }
 
-    fn dashboard_external_pool_billing_by_pool_from_cache(
+    fn dashboard_account_billing_by_pool_from_cache(
         &self,
         spec: &UsageDashboardWindowSpec,
-        external_pool_index: &[RedisExternalPoolIndexItem],
+        account_index: &[RedisAccountIndexItem],
         cache: &DashboardBucketCache,
-    ) -> Vec<UsageExternalPoolBillingByPool> {
-        if external_pool_index.is_empty() {
+    ) -> Vec<UsageAccountBillingByPool> {
+        if account_index.is_empty() {
             return Vec::new();
         }
 
-        let mut items = Vec::with_capacity(external_pool_index.len());
-        for pool in external_pool_index {
-            let totals = cache.sum_bucket("external_pool", &pool.id, spec);
-            let requests = usage_usize(&totals, "external_pool_requests");
+        let mut items = Vec::with_capacity(account_index.len());
+        for pool in account_index {
+            let totals = cache.sum_bucket("account", &pool.id, spec);
+            let requests = usage_usize(&totals, "account_requests");
             if requests == 0 {
                 continue;
             }
-            items.push(UsageExternalPoolBillingByPool {
+            items.push(UsageAccountBillingByPool {
                 pool_id: pool.id.parse::<u64>().unwrap_or(0),
                 pool_name: pool.label.clone(),
                 requests,
-                priced_requests: usage_usize(&totals, "external_pool_priced_requests"),
-                unpriced_requests: usage_usize(&totals, "external_pool_unpriced_requests"),
+                priced_requests: usage_usize(&totals, "account_priced_requests"),
+                unpriced_requests: usage_usize(&totals, "account_unpriced_requests"),
                 cost_floor_applied_requests: usage_usize(
                     &totals,
-                    "external_pool_cost_floor_applied_requests",
+                    "account_cost_floor_applied_requests",
                 ),
-                raw_cost_usd: usage_f64(&totals, "external_pool_raw_cost_usd"),
-                shaped_cost_usd: usage_f64(&totals, "external_pool_shaped_cost_usd"),
-                uplifted_cost_usd: usage_f64(&totals, "external_pool_uplifted_cost_usd"),
-                profit_usd: usage_f64(&totals, "external_pool_profit_usd"),
-                reported_cost_usd: usage_f64(&totals, "external_pool_reported_cost_usd"),
-                billable_cost_usd: usage_f64(&totals, "external_pool_billable_cost_usd"),
-                cost_floor_delta_usd: usage_f64(&totals, "external_pool_cost_floor_delta_usd"),
+                raw_cost_usd: usage_f64(&totals, "account_raw_cost_usd"),
+                shaped_cost_usd: usage_f64(&totals, "account_shaped_cost_usd"),
+                uplifted_cost_usd: usage_f64(&totals, "account_uplifted_cost_usd"),
+                profit_usd: usage_f64(&totals, "account_profit_usd"),
+                reported_cost_usd: usage_f64(&totals, "account_reported_cost_usd"),
+                billable_cost_usd: usage_f64(&totals, "account_billable_cost_usd"),
+                cost_floor_delta_usd: usage_f64(&totals, "account_cost_floor_delta_usd"),
             });
         }
         items.sort_by(|left, right| {
@@ -1211,8 +1206,8 @@ impl RedisStore {
         self.key("events:dispatch_wakeup")
     }
 
-    pub fn external_pool_data_changed_channel(&self) -> String {
-        self.key("events:external_pool_data_changed")
+    pub fn account_data_changed_channel(&self) -> String {
+        self.key("events:account_data_changed")
     }
 
     pub async fn subscribe_runtime_events(&self) -> anyhow::Result<PubSub> {
@@ -1222,21 +1217,21 @@ impl RedisStore {
             .await?;
         pubsub.subscribe(self.dispatch_wakeup_channel()).await?;
         pubsub
-            .subscribe(self.external_pool_data_changed_channel())
+            .subscribe(self.account_data_changed_channel())
             .await?;
         Ok(pubsub)
     }
 
-    pub async fn publish_external_pool_data_changed(
+    pub async fn publish_account_data_changed(
         &self,
         reason: &str,
         pool_id: Option<u64>,
     ) -> anyhow::Result<u64> {
-        self.publish_external_pool_data_changed_with_origin(reason, pool_id, None)
+        self.publish_account_data_changed_with_origin(reason, pool_id, None)
             .await
     }
 
-    pub async fn publish_external_pool_data_changed_with_origin(
+    pub async fn publish_account_data_changed_with_origin(
         &self,
         reason: &str,
         pool_id: Option<u64>,
@@ -1257,8 +1252,8 @@ impl RedisStore {
         let generation: u64 = redis::cmd("EVAL")
             .arg(SCRIPT)
             .arg(2)
-            .arg(self.key(EXTERNAL_POOL_DATA_GENERATION_KEY))
-            .arg(self.external_pool_data_changed_channel())
+            .arg(self.key(ACCOUNT_DATA_GENERATION_KEY))
+            .arg(self.account_data_changed_channel())
             .arg(reason)
             .arg(pool_id.map(|id| id.to_string()).unwrap_or_default())
             .arg(origin.unwrap_or_default())
@@ -1524,7 +1519,7 @@ impl RedisStore {
 
     /// Counts an auto-disable failure and elects at most one worker for the
     /// pool revision that crossed the configured threshold.
-    pub async fn claim_external_pool_auto_disable_transition(
+    pub async fn claim_account_auto_disable_transition(
         &self,
         pool_id: u64,
         pool_revision: u64,
@@ -1533,9 +1528,9 @@ impl RedisStore {
         window_secs: usize,
         claim_ttl_secs: usize,
     ) -> anyhow::Result<(u64, bool)> {
-        let counter_key = format!("external_pool:{}:auto_disable_failures:{}", pool_id, reason);
+        let counter_key = format!("account:{}:auto_disable_failures:{}", pool_id, reason);
         let claim_key = format!(
-            "external_pool:{}:auto_disable_transition:{}:{}",
+            "account:{}:auto_disable_transition:{}:{}",
             pool_id, pool_revision, reason
         );
         let script = r#"
@@ -1568,12 +1563,12 @@ impl RedisStore {
         let count = result
             .first()
             .copied()
-            .ok_or_else(|| anyhow::anyhow!("Redis 未返回外部池自动禁用失败计数"))?
+            .ok_or_else(|| anyhow::anyhow!("Redis 未返回账号自动禁用失败计数"))?
             .max(0) as u64;
         let claimed = result
             .get(1)
             .copied()
-            .ok_or_else(|| anyhow::anyhow!("Redis 未返回外部池自动禁用 transition claim"))?
+            .ok_or_else(|| anyhow::anyhow!("Redis 未返回账号自动禁用 transition claim"))?
             != 0;
         Ok((count, claimed))
     }
@@ -1754,7 +1749,7 @@ impl RedisStore {
             .arg(&realtime_key)
             .arg(USAGE_REALTIME_BUCKET_TTL_SECS);
 
-        append_external_pool_usage_summary(&mut pipe, &totals_key, record);
+        append_account_usage_summary(&mut pipe, &totals_key, record);
         append_usage_top_aggregate(
             &mut pipe,
             &self.key(USAGE_SUMMARY_TOP_CREDENTIALS_KEY),
@@ -1801,12 +1796,12 @@ impl RedisStore {
         );
         append_usage_dashboard_top_aggregate(
             &mut pipe,
-            &self.key(USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY),
-            "external_pool",
-            record.external_pool_id.map(|id| id.to_string()),
-            record.external_pool_name.clone(),
+            &self.key(USAGE_DASHBOARD_TOP_ACCOUNTS_KEY),
+            "account",
+            record.account_id.map(|id| id.to_string()),
+            record.account_name.clone(),
             record,
-            |key| self.key(usage_dashboard_top_metrics_key("external_pool", key)),
+            |key| self.key(usage_dashboard_top_metrics_key("account", key)),
         );
         if record.status != UsageRecordStatus::Success {
             append_usage_dashboard_top_aggregate(
@@ -2048,21 +2043,21 @@ impl RedisStore {
             ),
             simulated_requests: usage_usize(&totals, "simulated_requests"),
             upstream_metadata_requests: usage_usize(&totals, "upstream_metadata_requests"),
-            external_pool_billing: UsageExternalPoolBillingSummary {
-                requests: usage_usize(&totals, "external_pool_requests"),
-                priced_requests: usage_usize(&totals, "external_pool_priced_requests"),
-                unpriced_requests: usage_usize(&totals, "external_pool_unpriced_requests"),
+            account_billing: UsageAccountBillingSummary {
+                requests: usage_usize(&totals, "account_requests"),
+                priced_requests: usage_usize(&totals, "account_priced_requests"),
+                unpriced_requests: usage_usize(&totals, "account_unpriced_requests"),
                 cost_floor_applied_requests: usage_usize(
                     &totals,
-                    "external_pool_cost_floor_applied_requests",
+                    "account_cost_floor_applied_requests",
                 ),
-                raw_cost_usd: usage_f64(&totals, "external_pool_raw_cost_usd"),
-                shaped_cost_usd: usage_f64(&totals, "external_pool_shaped_cost_usd"),
-                uplifted_cost_usd: usage_f64(&totals, "external_pool_uplifted_cost_usd"),
-                profit_usd: usage_f64(&totals, "external_pool_profit_usd"),
-                reported_cost_usd: usage_f64(&totals, "external_pool_reported_cost_usd"),
-                billable_cost_usd: usage_f64(&totals, "external_pool_billable_cost_usd"),
-                cost_floor_delta_usd: usage_f64(&totals, "external_pool_cost_floor_delta_usd"),
+                raw_cost_usd: usage_f64(&totals, "account_raw_cost_usd"),
+                shaped_cost_usd: usage_f64(&totals, "account_shaped_cost_usd"),
+                uplifted_cost_usd: usage_f64(&totals, "account_uplifted_cost_usd"),
+                profit_usd: usage_f64(&totals, "account_profit_usd"),
+                reported_cost_usd: usage_f64(&totals, "account_reported_cost_usd"),
+                billable_cost_usd: usage_f64(&totals, "account_billable_cost_usd"),
+                cost_floor_delta_usd: usage_f64(&totals, "account_cost_floor_delta_usd"),
             },
             realtime,
             top_credentials,
@@ -2132,21 +2127,16 @@ impl RedisStore {
         let window_specs = usage_dashboard_windows(now, offset);
         let hourly_specs = usage_dashboard_hourly_windows(now, offset);
         let daily_specs = usage_dashboard_daily_windows(now, offset);
-        let external_pool_index = self.dashboard_external_pool_index().await?;
+        let account_index = self.dashboard_account_index().await?;
         let bucket_cache = self
-            .dashboard_bucket_cache(
-                &window_specs,
-                &hourly_specs,
-                &daily_specs,
-                &external_pool_index,
-            )
+            .dashboard_bucket_cache(&window_specs, &hourly_specs, &daily_specs, &account_index)
             .await?;
         let mut windows = Vec::with_capacity(window_specs.len());
         for spec in &window_specs {
             windows.push(self.dashboard_window_from_cache(
                 spec,
                 high_cache_threshold,
-                &external_pool_index,
+                &account_index,
                 &bucket_cache,
             ));
         }
@@ -2188,13 +2178,13 @@ impl RedisStore {
         if elapsed_ms >= 250 {
             tracing::warn!(
                 elapsed_ms = elapsed_ms.min(u128::from(u64::MAX)) as u64,
-                external_pool_count = external_pool_index.len(),
+                account_count = account_index.len(),
                 "Redis usage dashboard read was slow"
             );
         } else {
             tracing::debug!(
                 elapsed_ms = elapsed_ms.min(u128::from(u64::MAX)) as u64,
-                external_pool_count = external_pool_index.len(),
+                account_count = account_index.len(),
                 "Redis usage dashboard read"
             );
         }
@@ -2225,16 +2215,16 @@ impl RedisStore {
         let now = Utc::now();
         let (timezone, offset) = usage_dashboard_timezone(timezone);
         let window_specs = usage_dashboard_windows(now, offset);
-        let external_pool_index = self.dashboard_external_pool_index().await?;
+        let account_index = self.dashboard_account_index().await?;
         let bucket_cache = self
-            .dashboard_bucket_cache(&window_specs, &[], &[], &external_pool_index)
+            .dashboard_bucket_cache(&window_specs, &[], &[], &account_index)
             .await?;
         let mut windows = Vec::with_capacity(window_specs.len());
         for spec in &window_specs {
             windows.push(self.dashboard_window_from_cache(
                 spec,
                 high_cache_threshold,
-                &external_pool_index,
+                &account_index,
                 &bucket_cache,
             ));
         }
@@ -2431,7 +2421,7 @@ impl RedisStore {
         &self,
         spec: &UsageDashboardWindowSpec,
         high_cache_threshold: i32,
-        external_pool_index: &[RedisExternalPoolIndexItem],
+        account_index: &[RedisAccountIndexItem],
         cache: &DashboardBucketCache,
     ) -> UsageDashboardWindow {
         let totals = cache.sum_bucket("global", "all", spec);
@@ -2454,8 +2444,8 @@ impl RedisStore {
             total_requests,
             cache,
         );
-        summary.external_pool_billing_by_pool = self
-            .dashboard_external_pool_billing_by_pool_from_cache(spec, external_pool_index, cache);
+        summary.account_billing_by_pool =
+            self.dashboard_account_billing_by_pool_from_cache(spec, account_index, cache);
 
         UsageDashboardWindow {
             key: spec.key.clone(),
@@ -2466,15 +2456,13 @@ impl RedisStore {
         }
     }
 
-    async fn dashboard_external_pool_index(
-        &self,
-    ) -> anyhow::Result<Vec<RedisExternalPoolIndexItem>> {
+    async fn dashboard_account_index(&self) -> anyhow::Result<Vec<RedisAccountIndexItem>> {
         let mut manager = self.manager.clone();
         let pool_ids: Vec<String> = manager
             .zrevrange(
-                self.key(USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY),
+                self.key(USAGE_DASHBOARD_TOP_ACCOUNTS_KEY),
                 0,
-                USAGE_DASHBOARD_EXTERNAL_POOL_LIMIT,
+                USAGE_DASHBOARD_ACCOUNT_LIMIT,
             )
             .await?;
         if pool_ids.is_empty() {
@@ -2483,7 +2471,7 @@ impl RedisStore {
         let mut pipe = redis::pipe();
         for pool_id in pool_ids {
             pipe.cmd("HGETALL")
-                .arg(self.key(usage_dashboard_top_metrics_key("external_pool", &pool_id)));
+                .arg(self.key(usage_dashboard_top_metrics_key("account", &pool_id)));
         }
         let metrics_list: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
         Ok(metrics_list
@@ -2495,7 +2483,7 @@ impl RedisStore {
                     .filter(|value| !value.trim().is_empty())
                     .cloned()
                     .unwrap_or_else(|| format!("#{}", id));
-                RedisExternalPoolIndexItem { id, label }
+                RedisAccountIndexItem { id, label }
             })
             .filter(|item| !item.id.trim().is_empty())
             .collect())
@@ -2555,14 +2543,14 @@ impl RedisStore {
         Ok((items, total))
     }
 
-    /// External pool coordination uses atomic multi-key Lua scripts and is
+    /// Account coordination uses atomic multi-key Lua scripts and is
     /// intentionally supported only on standalone Redis. Redis Cluster would
     /// require a shared hash tag and a cluster-aware client, neither of which
     /// is part of the current storage contract.
-    pub async fn external_pool_redis_run_id(&self) -> anyhow::Result<String> {
+    pub async fn account_redis_run_id(&self) -> anyhow::Result<String> {
         let mut manager = self.scheduler_capacity_manager();
         #[cfg(test)]
-        self.external_pool_hot_path_round_trips
+        self.account_hot_path_round_trips
             .fetch_add(1, Ordering::Relaxed);
         let (server_info, cluster_info): (String, String) = redis::pipe()
             .cmd("INFO")
@@ -2578,7 +2566,7 @@ impl RedisStore {
         });
         if cluster_enabled {
             anyhow::bail!(
-                "external pool coordination supports standalone Redis only; Redis Cluster is not supported"
+                "account coordination supports standalone Redis only; Redis Cluster is not supported"
             );
         }
         server_info
@@ -2593,10 +2581,10 @@ impl RedisStore {
             .ok_or_else(|| anyhow::anyhow!("Redis INFO server did not include run_id"))
     }
 
-    pub async fn external_pool_coordinator_guard_state_for_epoch(
+    pub async fn account_coordinator_guard_state_for_epoch(
         &self,
         expected_epoch: &str,
-    ) -> anyhow::Result<ExternalPoolCoordinatorGuardState> {
+    ) -> anyhow::Result<AccountCoordinatorGuardState> {
         let script = r#"
             local stored = redis.pcall('GET', KEYS[1])
             if type(stored) == 'table' and stored.err then
@@ -2616,24 +2604,24 @@ impl RedisStore {
         "#;
         let mut manager = self.scheduler_capacity_manager();
         #[cfg(test)]
-        self.external_pool_hot_path_round_trips
+        self.account_hot_path_round_trips
             .fetch_add(1, Ordering::Relaxed);
         let values: Vec<redis::Value> = redis::cmd("EVAL")
             .arg(script)
             .arg(2)
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_EPOCH_KEY))
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_RECOVERY_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_EPOCH_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_RECOVERY_KEY))
             .arg(expected_epoch)
             .query_async(&mut manager)
             .await?;
-        decode_external_pool_coordinator_guard_state(&values)
+        decode_account_coordinator_guard_state(&values)
     }
 
-    pub async fn install_external_pool_coordinator_guard(
+    pub async fn install_account_coordinator_guard(
         &self,
         coordination_epoch: &str,
         recovery_grace: StdDuration,
-    ) -> anyhow::Result<ExternalPoolCoordinatorGuardState> {
+    ) -> anyhow::Result<AccountCoordinatorGuardState> {
         let recovery_grace_ms = recovery_grace.as_millis().min(i64::MAX as u128) as i64;
         let script = r#"
             local redis_time = redis.call('TIME')
@@ -2651,21 +2639,21 @@ impl RedisStore {
         "#;
         let mut manager = self.scheduler_capacity_manager();
         #[cfg(test)]
-        self.external_pool_hot_path_round_trips
+        self.account_hot_path_round_trips
             .fetch_add(1, Ordering::Relaxed);
         let values: Vec<redis::Value> = redis::cmd("EVAL")
             .arg(script)
             .arg(2)
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_EPOCH_KEY))
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_RECOVERY_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_EPOCH_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_RECOVERY_KEY))
             .arg(coordination_epoch)
             .arg(recovery_grace_ms)
             .query_async(&mut manager)
             .await?;
-        decode_external_pool_coordinator_guard_state(&values)
+        decode_account_coordinator_guard_state(&values)
     }
 
-    pub async fn acquire_external_pool_lease(
+    pub async fn acquire_account_lease(
         &self,
         pool_id: u64,
         lease_id: &str,
@@ -2674,9 +2662,9 @@ impl RedisStore {
         global_max_concurrent_requests: u32,
         max_age: Option<StdDuration>,
         cooldown_keys: &[String],
-    ) -> anyhow::Result<ExternalPoolLeaseAcquireResult> {
+    ) -> anyhow::Result<AccountLeaseAcquireResult> {
         if cooldown_keys.is_empty() {
-            anyhow::bail!("external pool lease acquire requires the pool cooldown key");
+            anyhow::bail!("account lease acquire requires the pool cooldown key");
         }
         let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
         let ttl_secs = max_age
@@ -2754,18 +2742,18 @@ impl RedisStore {
             end
             return {1, 0, count + 1, global_count + 1}
         "#;
-        let keys = external_pool_in_flight_keys(pool_id);
-        let global_keys = external_pool_global_in_flight_keys();
+        let keys = account_in_flight_keys(pool_id);
+        let global_keys = account_global_in_flight_keys();
         let mut manager = self.scheduler_capacity_manager();
         #[cfg(test)]
-        self.external_pool_hot_path_round_trips
+        self.account_hot_path_round_trips
             .fetch_add(1, Ordering::Relaxed);
         let mut command = redis::cmd("EVAL");
         command
             .arg(script)
             .arg(7usize.saturating_add(cooldown_keys.len()))
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_EPOCH_KEY))
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_RECOVERY_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_EPOCH_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_RECOVERY_KEY))
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&global_keys.last_seen))
@@ -2791,7 +2779,7 @@ impl RedisStore {
             .unwrap_or_default()
             .clamp(0, u32::MAX as i64) as u32;
         match status {
-            1 => Ok(ExternalPoolLeaseAcquireResult::Acquired {
+            1 => Ok(AccountLeaseAcquireResult::Acquired {
                 lease_id: lease_id.to_string(),
                 pool_in_flight_requests,
                 global_in_flight_requests,
@@ -2801,35 +2789,35 @@ impl RedisStore {
                 let remaining = (remaining_ms >= 0)
                     .then(|| StdDuration::from_millis(remaining_ms.max(1) as u64));
                 if redis_value_i64(&result, 4)?.unwrap_or(1) == 1 {
-                    Ok(ExternalPoolLeaseAcquireResult::PoolCooldown { remaining })
+                    Ok(AccountLeaseAcquireResult::PoolCooldown { remaining })
                 } else {
-                    Ok(ExternalPoolLeaseAcquireResult::ModelCooldown { remaining })
+                    Ok(AccountLeaseAcquireResult::ModelCooldown { remaining })
                 }
             }
-            3 => Ok(ExternalPoolLeaseAcquireResult::PoolCapacityFull {
+            3 => Ok(AccountLeaseAcquireResult::PoolCapacityFull {
                 in_flight_requests: pool_in_flight_requests,
             }),
-            4 => Ok(ExternalPoolLeaseAcquireResult::GlobalCapacityFull {
+            4 => Ok(AccountLeaseAcquireResult::GlobalCapacityFull {
                 in_flight_requests: global_in_flight_requests,
             }),
-            5 => Ok(ExternalPoolLeaseAcquireResult::Released),
-            6 => Ok(ExternalPoolLeaseAcquireResult::CoordinatorEpochMismatch {
+            5 => Ok(AccountLeaseAcquireResult::Released),
+            6 => Ok(AccountLeaseAcquireResult::CoordinatorEpochMismatch {
                 coordination_epoch: redis_value_string(&result, 4)?.unwrap_or_default(),
             }),
-            7 => Ok(ExternalPoolLeaseAcquireResult::CoordinatorRecovering {
+            7 => Ok(AccountLeaseAcquireResult::CoordinatorRecovering {
                 coordination_epoch: redis_value_string(&result, 4)?.unwrap_or_default(),
                 remaining: StdDuration::from_millis(
                     redis_value_i64(&result, 1)?.unwrap_or(1).max(1) as u64,
                 ),
             }),
-            _ => anyhow::bail!("Redis returned an invalid external pool lease acquire status"),
+            _ => anyhow::bail!("Redis returned an invalid account lease acquire status"),
         }
     }
 
-    pub async fn release_external_pool_leases_batch(
+    pub async fn release_account_leases_batch(
         &self,
-        requests: &[ExternalPoolLeaseReleaseRequest],
-    ) -> anyhow::Result<Vec<ExternalPoolLeaseReleaseResult>> {
+        requests: &[AccountLeaseReleaseRequest],
+    ) -> anyhow::Result<Vec<AccountLeaseReleaseResult>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -2894,11 +2882,11 @@ impl RedisStore {
 
             return result
         "#;
-        let global_keys = external_pool_global_in_flight_keys();
+        let global_keys = account_global_in_flight_keys();
         let mut command = redis::cmd("EVAL");
         command.arg(script).arg(requests.len().saturating_mul(5));
         for request in requests {
-            let keys = external_pool_in_flight_keys(request.pool_id);
+            let keys = account_in_flight_keys(request.pool_id);
             command
                 .arg(self.key(&keys.last_seen))
                 .arg(self.key(&keys.acquired))
@@ -2908,7 +2896,7 @@ impl RedisStore {
         }
         command
             .arg(requests.len())
-            .arg(EXTERNAL_POOL_PENDING_LEASE_TOMBSTONE_TTL_MILLIS);
+            .arg(ACCOUNT_PENDING_LEASE_TOMBSTONE_TTL_MILLIS);
         for request in requests {
             command
                 .arg(if request.pending { 1 } else { 0 })
@@ -2917,26 +2905,26 @@ impl RedisStore {
         let mut manager = self.scheduler_capacity_manager();
         let values: Vec<i64> = command.query_async(&mut manager).await?;
         if values.len() != requests.len().saturating_mul(2) {
-            anyhow::bail!("Redis returned an incomplete external pool lease release batch");
+            anyhow::bail!("Redis returned an incomplete account lease release batch");
         }
         Ok(values
             .chunks_exact(2)
-            .map(|values| ExternalPoolLeaseReleaseResult {
+            .map(|values| AccountLeaseReleaseResult {
                 completed: values[0] == 1,
                 removed: values[1] > 0,
             })
             .collect())
     }
 
-    pub async fn touch_external_pool_lease(
+    pub async fn touch_account_lease(
         &self,
         pool_id: u64,
         lease_id: &str,
         ttl_secs: usize,
         coordination_epoch: &str,
     ) -> anyhow::Result<bool> {
-        let keys = external_pool_in_flight_keys(pool_id);
-        let global_keys = external_pool_global_in_flight_keys();
+        let keys = account_in_flight_keys(pool_id);
+        let global_keys = account_global_in_flight_keys();
         let script = r#"
             local lease_id = ARGV[1]
             local expected_epoch = ARGV[3]
@@ -2976,8 +2964,8 @@ impl RedisStore {
         let touched: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(6)
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_EPOCH_KEY))
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_RECOVERY_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_EPOCH_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_RECOVERY_KEY))
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&global_keys.last_seen))
@@ -2990,12 +2978,12 @@ impl RedisStore {
         Ok(touched == 1)
     }
 
-    pub async fn external_pool_coordinator_snapshots(
+    pub async fn account_coordinator_snapshots(
         &self,
-        requests: &[ExternalPoolCoordinatorSnapshotRequest],
+        requests: &[AccountCoordinatorSnapshotRequest],
         max_age: Option<StdDuration>,
         coordination_epoch: &str,
-    ) -> anyhow::Result<Vec<ExternalPoolCoordinatorSnapshot>> {
+    ) -> anyhow::Result<Vec<AccountCoordinatorSnapshot>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -3047,7 +3035,7 @@ impl RedisStore {
                 for _ = 1, cooldown_count do
                     local cooldown_value = redis.pcall('GET', KEYS[key_index])
                     if type(cooldown_value) == 'table' and cooldown_value.err then
-                        table.insert(result, '__kiro_rs_invalid_redis_type__')
+                        table.insert(result, '__claude_pool_invalid_redis_type__')
                     else
                         table.insert(result, cooldown_value or '')
                     end
@@ -3056,20 +3044,20 @@ impl RedisStore {
                 end
                 local transient_value = redis.pcall('GET', KEYS[key_index])
                 if type(transient_value) == 'table' and transient_value.err then
-                    table.insert(result, '__kiro_rs_invalid_redis_type__')
+                    table.insert(result, '__claude_pool_invalid_redis_type__')
                 else
                     table.insert(result, transient_value or '')
                 end
                 table.insert(result, redis.call('PTTL', KEYS[key_index]))
                 key_index = key_index + 1
                 -- 质量状态与并发/冷却在同一次往返中读取。
-                -- 外部池选择运行态快照 TTL 只有 100ms，是真正的热路径，
+                -- 账号选择运行态快照 TTL 只有 100ms，是真正的热路径，
                 -- 不允许为质量数据新增第二次 Redis 往返。
                 local quality_requested = tonumber(ARGV[3 + pool_count + pool_index])
                 if quality_requested == 1 then
                     local quality_value = redis.pcall('GET', KEYS[key_index])
                     if type(quality_value) == 'table' and quality_value.err then
-                        table.insert(result, '__kiro_rs_invalid_redis_type__')
+                        table.insert(result, '__claude_pool_invalid_redis_type__')
                     else
                         table.insert(result, quality_value or '')
                     end
@@ -3080,7 +3068,7 @@ impl RedisStore {
             end
             return result
         "#;
-        let global_keys = external_pool_global_in_flight_keys();
+        let global_keys = account_global_in_flight_keys();
         let mut manager = self.scheduler_capacity_manager();
         let redis_key_count = requests.iter().fold(4usize, |count, request| {
             count.saturating_add(
@@ -3093,12 +3081,12 @@ impl RedisStore {
         command
             .arg(script)
             .arg(redis_key_count)
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_EPOCH_KEY))
-            .arg(self.key(EXTERNAL_POOL_COORDINATOR_RECOVERY_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_EPOCH_KEY))
+            .arg(self.key(ACCOUNT_COORDINATOR_RECOVERY_KEY))
             .arg(self.key(&global_keys.last_seen))
             .arg(self.key(&global_keys.acquired));
         for request in requests {
-            let keys = external_pool_in_flight_keys(request.pool_id);
+            let keys = account_in_flight_keys(request.pool_id);
             command
                 .arg(self.key(&keys.last_seen))
                 .arg(self.key(&keys.acquired));
@@ -3119,16 +3107,14 @@ impl RedisStore {
             command.arg(i64::from(request.quality_key.is_some()));
         }
         #[cfg(test)]
-        self.external_pool_hot_path_round_trips
+        self.account_hot_path_round_trips
             .fetch_add(1, Ordering::Relaxed);
         let result: Vec<redis::Value> = command.query_async(&mut manager).await?;
-        let guard_state = decode_external_pool_coordinator_guard_state(&result)?;
+        let guard_state = decode_account_coordinator_guard_state(&result)?;
         match guard_state {
-            ExternalPoolCoordinatorGuardState::Ready { .. } => {}
+            AccountCoordinatorGuardState::Ready { .. } => {}
             state => {
-                return Err(anyhow::Error::new(ExternalPoolCoordinatorGuardError {
-                    state,
-                }));
+                return Err(anyhow::Error::new(AccountCoordinatorGuardError { state }));
             }
         }
         // 每个池固定返回：pool_in_flight、global_in_flight、每个 cooldown 的
@@ -3140,7 +3126,7 @@ impl RedisStore {
             )
         });
         if result.len() != expected_values {
-            anyhow::bail!("Redis returned an incomplete external pool coordinator snapshot batch");
+            anyhow::bail!("Redis returned an incomplete account coordinator snapshot batch");
         }
 
         let mut cursor = 3usize;
@@ -3181,10 +3167,10 @@ impl RedisStore {
             // 绝不能因为质量数据解析失败而让整个调度快照报错。
             let quality = (!quality_value.is_empty()
                 && quality_value != INVALID_REDIS_TYPE_SENTINEL)
-                .then(|| decode_external_pool_quality_state(&quality_value))
+                .then(|| decode_account_quality_state(&quality_value))
                 .flatten();
-            snapshots.push(ExternalPoolCoordinatorSnapshot {
-                capacity: ExternalPoolCapacityState {
+            snapshots.push(AccountCoordinatorSnapshot {
+                capacity: AccountCapacityState {
                     pool_in_flight_requests,
                     global_in_flight_requests,
                 },
@@ -3200,17 +3186,17 @@ impl RedisStore {
 
     /// 记录质量样本，并维护独立的劣化判定窗口。
     ///
-    /// 保留不带窗口参数的 `record_external_pool_quality_sample` 作为兼容入口，
+    /// 保留不带窗口参数的 `record_account_quality_sample` 作为兼容入口，
     /// 让现有诊断/测试调用仍保持原有语义；调度主路径传入配置的窗口时长。
-    pub async fn record_external_pool_quality_sample_with_window(
+    pub async fn record_account_quality_sample_with_window(
         &self,
         pool_id: u64,
         success: bool,
         ttft_ms: Option<u64>,
         latency_ms: Option<u64>,
-        tuning: ExternalPoolQualitySampleTuning,
-    ) -> anyhow::Result<ExternalPoolQualityState> {
-        let ExternalPoolQualitySampleTuning {
+        tuning: AccountQualitySampleTuning,
+    ) -> anyhow::Result<AccountQualityState> {
+        let AccountQualitySampleTuning {
             alpha,
             ttl,
             degrade_window,
@@ -3234,7 +3220,7 @@ impl RedisStore {
             local ttl_ms = tonumber(ARGV[5])
             local degrade_window_ms = tonumber(ARGV[6]) or 0
             -- 采样发生在避让期内时，不得用较短的样本 TTL 抹掉
-            -- `mark_external_pool_probation` 写入的避让/恢复状态。
+            -- `mark_account_probation` 写入的避让/恢复状态。
             local existing_ttl_ms = redis.call('PTTL', KEYS[1])
             local redis_time = redis.call('TIME')
             local now_ms = tonumber(redis_time[1]) * 1000
@@ -3306,7 +3292,7 @@ impl RedisStore {
         let encoded: String = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
-            .arg(self.key(external_pool_quality_key(pool_id)))
+            .arg(self.key(account_quality_key(pool_id)))
             .arg(i64::from(success))
             .arg(ttft_ms.map(|value| value as i64).unwrap_or(-1))
             .arg(latency_ms.map(|value| value as i64).unwrap_or(-1))
@@ -3315,11 +3301,11 @@ impl RedisStore {
             .arg(degrade_window.as_millis() as i64)
             .query_async(&mut manager)
             .await?;
-        Ok(decode_external_pool_quality_state(&encoded).unwrap_or_default())
+        Ok(decode_account_quality_state(&encoded).unwrap_or_default())
     }
 
-    /// 写入外部池临时避让状态，并在已完成恢复爬坡时显式重置退避层级。
-    pub async fn mark_external_pool_probation_with_reset(
+    /// 写入账号临时避让状态，并在已完成恢复爬坡时显式重置退避层级。
+    pub async fn mark_account_probation_with_reset(
         &self,
         pool_id: u64,
         probation_until_ms: i64,
@@ -3362,7 +3348,7 @@ impl RedisStore {
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
-            .arg(self.key(external_pool_quality_key(pool_id)))
+            .arg(self.key(account_quality_key(pool_id)))
             .arg(probation_until_ms)
             .arg(i64::from(probation_level))
             .arg(ttl.as_millis().max(1) as i64)
@@ -3372,7 +3358,7 @@ impl RedisStore {
         Ok(())
     }
 
-    pub async fn try_enter_external_pool_dispatch_queue(
+    pub async fn try_enter_account_dispatch_queue(
         &self,
         lease_id: &str,
         max_queued: u32,
@@ -3382,7 +3368,7 @@ impl RedisStore {
         let admitted: i64 = redis::cmd("EVAL")
             .arg(DISPATCH_QUEUE_ADMIT_SCRIPT)
             .arg(1)
-            .arg(self.key(external_pool_global_queue_key()))
+            .arg(self.key(account_global_queue_key()))
             .arg(max_queued)
             .arg(ttl_secs.max(60))
             .arg(lease_id)
@@ -3391,7 +3377,7 @@ impl RedisStore {
         Ok(admitted == 1)
     }
 
-    pub async fn renew_external_pool_dispatch_queue(
+    pub async fn renew_account_dispatch_queue(
         &self,
         lease_id: &str,
         ttl_secs: u64,
@@ -3400,7 +3386,7 @@ impl RedisStore {
         let renewed: i64 = redis::cmd("EVAL")
             .arg(DISPATCH_QUEUE_RENEW_SCRIPT)
             .arg(1)
-            .arg(self.key(external_pool_global_queue_key()))
+            .arg(self.key(account_global_queue_key()))
             .arg(ttl_secs.max(60))
             .arg(lease_id)
             .query_async(&mut manager)
@@ -3408,12 +3394,12 @@ impl RedisStore {
         Ok(renewed == 1)
     }
 
-    pub async fn leave_external_pool_dispatch_queue(&self, lease_id: &str) -> anyhow::Result<bool> {
+    pub async fn leave_account_dispatch_queue(&self, lease_id: &str) -> anyhow::Result<bool> {
         let mut manager = self.scheduler_capacity_manager();
         let removed: i64 = redis::cmd("EVAL")
             .arg(DISPATCH_QUEUE_RELEASE_SCRIPT)
             .arg(1)
-            .arg(self.key(external_pool_global_queue_key()))
+            .arg(self.key(account_global_queue_key()))
             .arg(lease_id)
             .query_async(&mut manager)
             .await?;
@@ -3522,12 +3508,12 @@ fn append_usage_dashboard_rollups(
         )),
         record,
     );
-    if let Some(external_pool_id) = record.external_pool_id {
+    if let Some(account_id) = record.account_id {
         append_usage_dashboard_bucket_aggregate(
             pipe,
             &store.key(usage_dashboard_bucket_key(
-                "external_pool",
-                &external_pool_id.to_string(),
+                "account",
+                &account_id.to_string(),
                 hour_epoch,
             )),
             record,
@@ -3627,7 +3613,7 @@ fn append_usage_dashboard_bucket_aggregate(
         .arg("duration_ms_count")
         .arg(1i64);
 
-    append_external_pool_usage_summary(pipe, key, record);
+    append_account_usage_summary(pipe, key, record);
 
     pipe.cmd("__USAGE_DURATION_MAX__")
         .arg(key)
@@ -3635,31 +3621,31 @@ fn append_usage_dashboard_bucket_aggregate(
         .arg(USAGE_DASHBOARD_BUCKET_TTL_SECS);
 }
 
-fn append_external_pool_usage_summary(
+fn append_account_usage_summary(
     pipe: &mut GuardedUsagePipeline,
     totals_key: &str,
     record: &UsageRecord,
 ) {
-    if record.route_kind != Some(UsageRouteKind::ExternalPool) {
+    if record.route_kind != Some(UsageRouteKind::Account) {
         return;
     }
 
     pipe.cmd("HINCRBY")
         .arg(totals_key)
-        .arg("external_pool_requests")
+        .arg("account_requests")
         .arg(1i64);
-    if let Some(billing) = &record.external_pool_billing {
+    if let Some(billing) = &record.account_billing {
         pipe.cmd("HINCRBY")
             .arg(totals_key)
             .arg(if billing.pricing_available {
-                "external_pool_priced_requests"
+                "account_priced_requests"
             } else {
-                "external_pool_unpriced_requests"
+                "account_unpriced_requests"
             })
             .arg(1i64)
             .cmd("HINCRBY")
             .arg(totals_key)
-            .arg("external_pool_cost_floor_applied_requests")
+            .arg("account_cost_floor_applied_requests")
             .arg(if billing.cost_floor_applied {
                 1i64
             } else {
@@ -3667,36 +3653,36 @@ fn append_external_pool_usage_summary(
             })
             .cmd("HINCRBYFLOAT")
             .arg(totals_key)
-            .arg("external_pool_raw_cost_usd")
+            .arg("account_raw_cost_usd")
             .arg(billing.raw_cost_usd)
             .cmd("HINCRBYFLOAT")
             .arg(totals_key)
-            .arg("external_pool_shaped_cost_usd")
+            .arg("account_shaped_cost_usd")
             .arg(billing.effective_shaped_cost_usd())
             .cmd("HINCRBYFLOAT")
             .arg(totals_key)
-            .arg("external_pool_uplifted_cost_usd")
+            .arg("account_uplifted_cost_usd")
             .arg(billing.effective_uplifted_cost_usd())
             .cmd("HINCRBYFLOAT")
             .arg(totals_key)
-            .arg("external_pool_profit_usd")
+            .arg("account_profit_usd")
             .arg(billing.effective_profit_usd())
             .cmd("HINCRBYFLOAT")
             .arg(totals_key)
-            .arg("external_pool_reported_cost_usd")
+            .arg("account_reported_cost_usd")
             .arg(billing.reported_cost_usd)
             .cmd("HINCRBYFLOAT")
             .arg(totals_key)
-            .arg("external_pool_billable_cost_usd")
+            .arg("account_billable_cost_usd")
             .arg(billing.billable_cost_usd)
             .cmd("HINCRBYFLOAT")
             .arg(totals_key)
-            .arg("external_pool_cost_floor_delta_usd")
+            .arg("account_cost_floor_delta_usd")
             .arg(billing.cost_floor_delta_usd);
     } else {
         pipe.cmd("HINCRBY")
             .arg(totals_key)
-            .arg("external_pool_unpriced_requests")
+            .arg("account_unpriced_requests")
             .arg(1i64);
     }
 }
@@ -3857,23 +3843,20 @@ fn dashboard_summary_from_values(
 
         simulated_requests: usage_usize(values, "simulated_requests"),
         upstream_metadata_requests: usage_usize(values, "upstream_metadata_requests"),
-        external_pool_billing: UsageExternalPoolBillingSummary {
-            requests: usage_usize(values, "external_pool_requests"),
-            priced_requests: usage_usize(values, "external_pool_priced_requests"),
-            unpriced_requests: usage_usize(values, "external_pool_unpriced_requests"),
-            cost_floor_applied_requests: usage_usize(
-                values,
-                "external_pool_cost_floor_applied_requests",
-            ),
-            raw_cost_usd: usage_f64(values, "external_pool_raw_cost_usd"),
-            shaped_cost_usd: usage_f64(values, "external_pool_shaped_cost_usd"),
-            uplifted_cost_usd: usage_f64(values, "external_pool_uplifted_cost_usd"),
-            profit_usd: usage_f64(values, "external_pool_profit_usd"),
-            reported_cost_usd: usage_f64(values, "external_pool_reported_cost_usd"),
-            billable_cost_usd: usage_f64(values, "external_pool_billable_cost_usd"),
-            cost_floor_delta_usd: usage_f64(values, "external_pool_cost_floor_delta_usd"),
+        account_billing: UsageAccountBillingSummary {
+            requests: usage_usize(values, "account_requests"),
+            priced_requests: usage_usize(values, "account_priced_requests"),
+            unpriced_requests: usage_usize(values, "account_unpriced_requests"),
+            cost_floor_applied_requests: usage_usize(values, "account_cost_floor_applied_requests"),
+            raw_cost_usd: usage_f64(values, "account_raw_cost_usd"),
+            shaped_cost_usd: usage_f64(values, "account_shaped_cost_usd"),
+            uplifted_cost_usd: usage_f64(values, "account_uplifted_cost_usd"),
+            profit_usd: usage_f64(values, "account_profit_usd"),
+            reported_cost_usd: usage_f64(values, "account_reported_cost_usd"),
+            billable_cost_usd: usage_f64(values, "account_billable_cost_usd"),
+            cost_floor_delta_usd: usage_f64(values, "account_cost_floor_delta_usd"),
         },
-        external_pool_billing_by_pool: Vec::new(),
+        account_billing_by_pool: Vec::new(),
         status_breakdown: Vec::new(),
         usage_source_breakdown: Vec::new(),
     }
@@ -3905,7 +3888,7 @@ fn collect_dashboard_window_bucket_keys(
     suffixes: &mut Vec<String>,
     seen: &mut HashSet<String>,
     spec: &UsageDashboardWindowSpec,
-    external_pool_index: &[RedisExternalPoolIndexItem],
+    account_index: &[RedisAccountIndexItem],
 ) {
     for epoch in usage_dashboard_hour_epochs(spec.from, spec.to) {
         push_dashboard_bucket_suffix(
@@ -3928,11 +3911,11 @@ fn collect_dashboard_window_bucket_keys(
                 usage_dashboard_bucket_key("usage_source", source, epoch),
             );
         }
-        for pool in external_pool_index {
+        for pool in account_index {
             push_dashboard_bucket_suffix(
                 suffixes,
                 seen,
-                usage_dashboard_bucket_key("external_pool", &pool.id, epoch),
+                usage_dashboard_bucket_key("account", &pool.id, epoch),
             );
         }
     }
@@ -4083,8 +4066,8 @@ fn usage_record_matches_query(record: &UsageRecord, query: &UsageRecordQuery) ->
             return false;
         }
     }
-    if let Some(external_pool_id) = query.external_pool_id {
-        if record.external_pool_id != Some(external_pool_id) {
+    if let Some(account_id) = query.account_id {
+        if record.account_id != Some(account_id) {
             return false;
         }
     }
@@ -4157,7 +4140,7 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let status = usage_status_value(record.status);
     let source = usage_source_value(record.usage_source);
     let credential_id = record.credential_id.map(|id| id.to_string());
-    let external_pool_id = record.external_pool_id.map(|id| id.to_string());
+    let account_id = record.account_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
 
     [
@@ -4171,8 +4154,8 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.model_resolution_note.as_deref(),
         record.conversation_id.as_deref(),
         record.request_api_key_id.as_deref(),
-        external_pool_id.as_deref(),
-        record.external_pool_name.as_deref(),
+        account_id.as_deref(),
+        record.account_name.as_deref(),
         record.credential_label.as_deref(),
         Some(status),
         Some(source),
@@ -4213,8 +4196,8 @@ fn usage_f64(values: &HashMap<String, String>, key: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn external_pool_global_queue_key() -> &'static str {
-    "external_pool:global:queue_leases:v1"
+fn account_global_queue_key() -> &'static str {
+    "account:global:queue_leases:v1"
 }
 
 fn redis_value_i64(values: &[redis::Value], index: usize) -> anyhow::Result<Option<i64>> {
@@ -4233,26 +4216,25 @@ fn redis_value_string(values: &[redis::Value], index: usize) -> anyhow::Result<O
         .map_err(Into::into)
 }
 
-fn decode_external_pool_coordinator_guard_state(
+fn decode_account_coordinator_guard_state(
     values: &[redis::Value],
-) -> anyhow::Result<ExternalPoolCoordinatorGuardState> {
-    let status = redis_value_i64(values, 0)?.ok_or_else(|| {
-        anyhow::anyhow!("Redis returned no external pool coordinator guard status")
-    })?;
+) -> anyhow::Result<AccountCoordinatorGuardState> {
+    let status = redis_value_i64(values, 0)?
+        .ok_or_else(|| anyhow::anyhow!("Redis returned no account coordinator guard status"))?;
     let coordination_epoch = redis_value_string(values, 1)?.unwrap_or_default();
     if coordination_epoch.is_empty() && status != 2 {
-        anyhow::bail!("Redis returned no external pool coordinator epoch");
+        anyhow::bail!("Redis returned no account coordinator epoch");
     }
     match status {
-        1 => Ok(ExternalPoolCoordinatorGuardState::Ready { coordination_epoch }),
-        2 => Ok(ExternalPoolCoordinatorGuardState::EpochMismatch { coordination_epoch }),
-        3 => Ok(ExternalPoolCoordinatorGuardState::Recovering {
+        1 => Ok(AccountCoordinatorGuardState::Ready { coordination_epoch }),
+        2 => Ok(AccountCoordinatorGuardState::EpochMismatch { coordination_epoch }),
+        3 => Ok(AccountCoordinatorGuardState::Recovering {
             coordination_epoch,
             remaining: StdDuration::from_millis(
                 redis_value_i64(values, 2)?.unwrap_or(1).max(1) as u64
             ),
         }),
-        _ => anyhow::bail!("Redis returned an invalid external pool coordinator guard status"),
+        _ => anyhow::bail!("Redis returned an invalid account coordinator guard status"),
     }
 }
 
@@ -4262,37 +4244,37 @@ struct InFlightKeys {
     released: String,
 }
 
-fn external_pool_in_flight_keys(pool_id: u64) -> InFlightKeys {
+fn account_in_flight_keys(pool_id: u64) -> InFlightKeys {
     InFlightKeys {
-        last_seen: format!("external_pool:inflight:{}:last_seen", pool_id),
-        acquired: format!("external_pool:inflight:{}:acquired", pool_id),
-        released: format!("external_pool:inflight:{}:released", pool_id),
+        last_seen: format!("account:inflight:{}:last_seen", pool_id),
+        acquired: format!("account:inflight:{}:acquired", pool_id),
+        released: format!("account:inflight:{}:released", pool_id),
     }
 }
 
-fn external_pool_global_in_flight_keys() -> InFlightKeys {
+fn account_global_in_flight_keys() -> InFlightKeys {
     InFlightKeys {
-        last_seen: "external_pool:global:inflight:last_seen".to_string(),
-        acquired: "external_pool:global:inflight:acquired".to_string(),
-        released: "external_pool:global:inflight:released".to_string(),
+        last_seen: "account:global:inflight:last_seen".to_string(),
+        acquired: "account:global:inflight:acquired".to_string(),
+        released: "account:global:inflight:released".to_string(),
     }
 }
 
-/// 外部池被动质量采样状态的 Redis 键。
-pub fn external_pool_quality_key(pool_id: u64) -> String {
-    format!("external_pool:{pool_id}:quality")
+/// 账号被动质量采样状态的 Redis 键。
+pub fn account_quality_key(pool_id: u64) -> String {
+    format!("account:{pool_id}:quality")
 }
 
 /// 解析 Redis 中的质量状态 JSON。
 ///
 /// 任何解析失败都返回 `None`，由调用方退化为中性值——质量数据是调度优化项，
 /// 不是可用性依赖项，绝不能因为它的损坏而影响主请求。
-fn decode_external_pool_quality_state(raw: &str) -> Option<ExternalPoolQualityState> {
+fn decode_account_quality_state(raw: &str) -> Option<AccountQualityState> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let object = value.as_object()?;
     let read_f64 = |key: &str| object.get(key).and_then(serde_json::Value::as_f64);
     let positive_f64 = |key: &str| read_f64(key).filter(|value| value.is_finite() && *value >= 0.0);
-    Some(ExternalPoolQualityState {
+    Some(AccountQualityState {
         recent_error_rate: read_f64("recent_error_rate")
             .filter(|value| value.is_finite())
             .unwrap_or(0.0)
@@ -4395,10 +4377,10 @@ mod tests {
     }
 
     fn test_config() -> Option<Config> {
-        let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
+        let url = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL")?;
         let mut config = Config::default();
         config.redis.url = Some(url);
-        config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+        config.redis.key_prefix = format!("claude_pool:test:{}", uuid::Uuid::new_v4());
         Some(config)
     }
 
@@ -4443,7 +4425,7 @@ mod tests {
     #[tokio::test]
     async fn redis_pattern_delete_is_bounded_and_cancellable() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
             return;
         };
 
@@ -4510,10 +4492,10 @@ mod tests {
             .unwrap();
     }
 
-    // ---- 外部池被动质量采样：纯逻辑单元测试（不依赖 Redis） ----
+    // ---- 账号被动质量采样：纯逻辑单元测试（不依赖 Redis） ----
 
     #[test]
-    fn external_pool_quality_decode_rejects_corrupt_payloads_as_neutral() {
+    fn account_quality_decode_rejects_corrupt_payloads_as_neutral() {
         // 质量数据是调度优化项而非可用性依赖项，任何损坏都必须退化为 None，
         // 由调用方按中性值处理，绝不能让它影响主请求。
         for raw in [
@@ -4526,17 +4508,17 @@ mod tests {
             "{\"recent_error_rate\":",
         ] {
             assert!(
-                decode_external_pool_quality_state(raw).is_none(),
+                decode_account_quality_state(raw).is_none(),
                 "损坏载荷必须解析为 None: {raw:?}"
             );
         }
     }
 
     #[test]
-    fn external_pool_quality_decode_clamps_and_drops_invalid_fields() {
+    fn account_quality_decode_clamps_and_drops_invalid_fields() {
         // 越界失败率被夹紧，负数/非有限延迟被丢弃为 None 而不是变成 0——
         // 0 毫秒延迟会被评分器当成"极快"，是危险的误判方向。
-        let state = decode_external_pool_quality_state(
+        let state = decode_account_quality_state(
             r#"{
                 "recent_error_rate": 7.5,
                 "ttft_ewma_ms": -3.0,
@@ -4561,19 +4543,19 @@ mod tests {
         assert_eq!(state.degrade_window_failure_count, 7);
         assert_eq!(state.degrade_window_started_at_ms, Some(1000));
 
-        let negative = decode_external_pool_quality_state(r#"{"recent_error_rate": -2.0}"#)
+        let negative = decode_account_quality_state(r#"{"recent_error_rate": -2.0}"#)
             .expect("合法 JSON 对象应能解析");
         assert_eq!(negative.recent_error_rate, 0.0);
 
         // 缺失字段一律走中性默认值，不应报错。
-        let empty = decode_external_pool_quality_state("{}").expect("空对象应能解析");
-        assert_eq!(empty, ExternalPoolQualityState::default());
+        let empty = decode_account_quality_state("{}").expect("空对象应能解析");
+        assert_eq!(empty, AccountQualityState::default());
     }
 
     #[test]
-    fn external_pool_quality_sample_threshold_guards_cold_start() {
+    fn account_quality_sample_threshold_guards_cold_start() {
         // 样本不足时不得参与质量评分，否则一两次抖动就能把账号打下去。
-        let state = ExternalPoolQualityState {
+        let state = AccountQualityState {
             sample_count: 4,
             ..Default::default()
         };
@@ -4581,10 +4563,10 @@ mod tests {
         assert!(state.has_enough_samples(4));
 
         // min_samples 配成 0 时按 1 处理：零样本永远不参与评分。
-        let cold = ExternalPoolQualityState::default();
+        let cold = AccountQualityState::default();
         assert!(!cold.has_enough_samples(0));
         assert!(
-            ExternalPoolQualityState {
+            AccountQualityState {
                 sample_count: 1,
                 ..Default::default()
             }
@@ -4593,21 +4575,21 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_quality_probation_window_is_exclusive_at_expiry() {
-        let state = ExternalPoolQualityState {
+    fn account_quality_probation_window_is_exclusive_at_expiry() {
+        let state = AccountQualityState {
             probation_until_ms: Some(1_000),
             ..Default::default()
         };
         assert!(state.is_in_probation(999));
         assert!(!state.is_in_probation(1_000), "到期瞬间即视为已恢复");
         assert!(!state.is_in_probation(1_001));
-        assert!(!ExternalPoolQualityState::default().is_in_probation(1_000));
+        assert!(!AccountQualityState::default().is_in_probation(1_000));
     }
 
     #[test]
-    fn external_pool_quality_recovery_ramp_is_linear_and_saturating() {
+    fn account_quality_recovery_ramp_is_linear_and_saturating() {
         // 避让到期后线性回流，避免高优先级账号恢复瞬间被重新打满。
-        let state = ExternalPoolQualityState {
+        let state = AccountQualityState {
             probation_until_ms: Some(1_000),
             probation_cleared_at_ms: Some(1_000),
             ..Default::default()
@@ -4625,31 +4607,31 @@ mod tests {
 
         // 从未避让过的账号不应被爬坡罚分。
         assert_eq!(
-            ExternalPoolQualityState::default().recovery_progress(1_000, 100),
+            AccountQualityState::default().recovery_progress(1_000, 100),
             1.0
         );
     }
 
     #[test]
-    fn external_pool_quality_key_is_namespaced_per_pool() {
-        assert_eq!(external_pool_quality_key(7), "external_pool:7:quality");
-        assert_ne!(external_pool_quality_key(7), external_pool_quality_key(8));
+    fn account_quality_key_is_namespaced_per_pool() {
+        assert_eq!(account_quality_key(7), "account:7:quality");
+        assert_ne!(account_quality_key(7), account_quality_key(8));
     }
 
-    // ---- 外部池被动质量采样：Redis Lua 往返测试 ----
+    // ---- 账号被动质量采样：Redis Lua 往返测试 ----
 
     #[tokio::test]
-    async fn redis_external_pool_queue_admission_and_renewal_only_update_their_own_lease() {
+    async fn redis_account_queue_admission_and_renewal_only_update_their_own_lease() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
             return;
         };
 
         let store = RedisStore::connect(&config).await.unwrap();
-        let queue_key = store.key(external_pool_global_queue_key());
+        let queue_key = store.key(account_global_queue_key());
         assert!(
             store
-                .try_enter_external_pool_dispatch_queue("earlier-waiter", 2, 60)
+                .try_enter_account_dispatch_queue("earlier-waiter", 2, 60)
                 .await
                 .unwrap()
         );
@@ -4663,7 +4645,7 @@ mod tests {
 
         assert!(
             store
-                .try_enter_external_pool_dispatch_queue("later-waiter", 2, 120)
+                .try_enter_account_dispatch_queue("later-waiter", 2, 120)
                 .await
                 .unwrap()
         );
@@ -4684,7 +4666,7 @@ mod tests {
 
         assert!(
             store
-                .renew_external_pool_dispatch_queue("earlier-waiter", 180)
+                .renew_account_dispatch_queue("earlier-waiter", 180)
                 .await
                 .unwrap(),
             "an unbounded waiter must be able to renew its own lease"
@@ -4705,20 +4687,20 @@ mod tests {
         assert_eq!(later_before_renewal, later_after_renewal);
         assert!(
             !store
-                .renew_external_pool_dispatch_queue("missing-waiter", 180)
+                .renew_account_dispatch_queue("missing-waiter", 180)
                 .await
                 .unwrap()
         );
 
         assert!(
             store
-                .leave_external_pool_dispatch_queue("earlier-waiter")
+                .leave_account_dispatch_queue("earlier-waiter")
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .leave_external_pool_dispatch_queue("later-waiter")
+                .leave_account_dispatch_queue("later-waiter")
                 .await
                 .unwrap()
         );

@@ -1,17 +1,17 @@
 {
   "postgres": {
-    "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
+    "url": "postgres://claude_pool:claude_pool_dev_password@127.0.0.1:25432/claude_pool"
   },
   "redis": {
     "url": "redis://127.0.0.1:26379/0"
   },
   "observabilityRedis": {
     "url": null,
-    "keyPrefix": "kiro_rs:observability"
+    "keyPrefix": "claude_pool:observability"
   },
   "host": "127.0.0.1",
   "port": 8990,
-  "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "apiKey": "sk-claude-pool-qazWSXedcRFV123456",
   "apiKeys": [],
   "adminApiKey": "sk-admin-your-secret-key",
   "requestAdmission": {
@@ -85,11 +85,11 @@
     "oversizedImageHandling": "drop-with-placeholder"
   },
   "runtimeConfigMigrationVersion": 2,
-  "externalPools": {
-    "externalPoolsEnabled": true,
-    "externalPoolDispatchMaxWaitSecs": 60,
-    "externalPoolCapacityMode": "wait",
-    "externalPoolMaxQueuedRequests": 64
+  "accounts": {
+    "enabled": true,
+    "dispatchMaxWaitSecs": 60,
+    "capacityMode": "wait",
+    "maxQueuedRequests": 64
   },
   "routes": [
     {

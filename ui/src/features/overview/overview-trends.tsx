@@ -47,13 +47,6 @@ const OTHER_COLOR = 'var(--trend-other)'
 const INK_COLOR = 'var(--trend-line)'
 const SURFACE = 'hsl(var(--card))'
 const MAX_STACK_MEMBERS = 5
-
-// 颜色跟随实体而不是排名：已知成员固定槽位，切换范围不会互换颜色。
-const LOCAL_ROUTE_COLORS: Record<string, string> = {
-  local_success: SLOT_COLORS[0],
-  local_rescue_after_external: SLOT_COLORS[2],
-  local_error_no_fallback: SLOT_COLORS[3],
-}
 // 策略直连是主动选择用蓝；容量不足琥珀；账号不可用紫；模型不支持玫红；系统降级青。
 // 这个顺序与相邻关系已单独做过色盲校验，改动前先重跑校验。
 const EXTERNAL_REASON_COLORS: Record<string, string> = {
@@ -217,10 +210,10 @@ function hitRateLines(
 
 // ─── 三个分区的视图定义 ─────────────────────────────────────────────────────────
 
-export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[] {
+export function summaryTrendViews(_creditUnitPriceUsd: number | null): TrendView[] {
   const splitBars = (pick: (metrics: UsageOverviewSeriesMetrics) => number): TrendSeries[] => [
     { key: 'local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => pick(point.local) },
-    { key: 'external', name: '外部池', color: SLOT_COLORS[1], value: (point) => pick(point.external) },
+    { key: 'external', name: '账号', color: SLOT_COLORS[1], value: (point) => pick(point.external) },
   ]
   const errorRow: TrendExtraRow = { label: '错误率', value: (point) => errorRate(point.all) }
   const views: TrendView[] = [
@@ -230,7 +223,7 @@ export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[
       label: '对外计费',
       format: 'usd',
       bars: splitBars((m) => m.estimatedCostUsd),
-      footnote: '本地为估算计费，外部池为最终可计费金额，两者都是对下游收的钱，可以直接相加。',
+      footnote: '本地为估算计费，账号为最终可计费金额，两者都是对下游收的钱，可以直接相加。',
     },
     { key: 'tokens', label: 'Token', format: 'count', bars: splitBars(totalTokens) },
     {
@@ -243,107 +236,19 @@ export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[
       lines: [
         { key: 'hit:all', name: '整体', color: INK_COLOR, reference: true, value: (point) => cacheHitRate(point.all), aggregate: (points) => aggregateHitRate(points, (point) => point.all) },
         { key: 'hit:local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => cacheHitRate(point.local), aggregate: (points) => aggregateHitRate(points, (point) => point.local) },
-        { key: 'hit:external', name: '外部池', color: SLOT_COLORS[1], value: (point) => cacheHitRate(point.external), aggregate: (points) => aggregateHitRate(points, (point) => point.external) },
+        { key: 'hit:external', name: '账号', color: SLOT_COLORS[1], value: (point) => cacheHitRate(point.external), aggregate: (points) => aggregateHitRate(points, (point) => point.external) },
       ],
       headline: { label: '整体命中率', value: (points) => aggregateHitRate(points, (point) => point.all) },
       footnote: HIT_RATE_FOOTNOTE,
     },
   ]
-  if (creditUnitPriceUsd != null) {
-    const localCost = (point: UsageOverviewSeriesPoint) => point.local.kiroMeteringUsage * creditUnitPriceUsd
-    const cost = (point: UsageOverviewSeriesPoint) => localCost(point) + point.external.rawCostUsd
-    views.push({
-      key: 'margin',
-      label: '成本与毛利',
-      format: 'usd',
-      bars: [
-        { key: 'localCost', name: '本地积分成本', color: SLOT_COLORS[0], value: localCost },
-        { key: 'externalCost', name: '外部上游成本', color: SLOT_COLORS[1], value: (point) => point.external.rawCostUsd },
-      ],
-      lines: [{
-        key: 'revenue',
-        name: '对外计费',
-        color: INK_COLOR,
-        reference: true,
-        value: (point) => point.all.estimatedCostUsd,
-        aggregate: (points) => sumOver(points, (point) => point.all.estimatedCostUsd),
-      }],
-      extraRows: [
-        { label: '毛利', value: (point) => formatUsdFixed2(point.all.estimatedCostUsd - cost(point)) },
-      ],
-      footnote: `本地成本 = 积分 × 积分单价 $${creditUnitPriceUsd}；折线高于柱子表示该时段赚钱。`,
-    })
-  }
   return views
-}
-
-export function localTrendViews(groups: UsageOverviewSeriesGroups, creditUnitPriceUsd: number | null): TrendView[] {
-  const hasRoutes = groups.localRoutes.length > 0
-  const byRoute = (pick: (metrics: UsageOverviewSeriesMetrics) => number): TrendSeries[] => (hasRoutes
-    ? stackSeries(groups.localRoutes, (point) => point.localRoutes, pick, LOCAL_ROUTE_COLORS)
-    : [{ key: 'local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => pick(point.local) }])
-  const routeHint = hasRoutes
-    ? undefined
-    : '当前范围没有路由拆分数据。历史记录需要离线运行 maintenance usage-route-dimension-backfill 回灌，已按本地合计展示。'
-  return [
-    { key: 'credits', label: '积分', format: 'credits', bars: byRoute((m) => m.kiroMeteringUsage), footnote: routeHint },
-    {
-      key: 'requests',
-      label: '请求',
-      format: 'count',
-      bars: byRoute((m) => m.requests),
-      extraRows: [{ label: '错误率', value: (point) => errorRate(point.local) }],
-      footnote: routeHint,
-    },
-    {
-      key: 'cacheHitRate',
-      label: '缓存命中率',
-      format: 'percent',
-      bars: [],
-      ratioAxis: true,
-      reference: HIT_RATE_REFERENCE,
-      lines: hasRoutes
-        ? hitRateLines(groups.localRoutes, (point) => point.localRoutes, LOCAL_ROUTE_COLORS)
-        : [{ key: 'hit:local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => cacheHitRate(point.local), aggregate: (points) => aggregateHitRate(points, (point) => point.local) }],
-      headline: { label: '本地命中率', value: (points) => aggregateHitRate(points, (point) => point.local) },
-      footnote: routeHint ?? HIT_RATE_FOOTNOTE,
-    },
-    {
-      key: 'revenuePerCredit',
-      label: '每积分收入',
-      format: 'usdPerCredit',
-      bars: [],
-      lines: [{
-        key: 'revenuePerCredit',
-        name: '每积分收入',
-        color: SLOT_COLORS[0],
-        value: (point) => (point.local.kiroMeteringUsage > 0
-          ? point.local.estimatedCostUsd / point.local.kiroMeteringUsage
-          : null),
-        aggregate: (points) => {
-          const credits = sumOver(points, (point) => point.local.kiroMeteringUsage)
-          return credits > 0 ? sumOver(points, (point) => point.local.estimatedCostUsd) / credits : null
-        },
-      }],
-      headline: {
-        label: '每积分收入',
-        value: (points) => {
-          const credits = sumOver(points, (point) => point.local.kiroMeteringUsage)
-          return credits > 0 ? sumOver(points, (point) => point.local.estimatedCostUsd) / credits : null
-        },
-      },
-      reference: creditUnitPriceUsd != null ? { value: creditUnitPriceUsd, label: '积分单价' } : undefined,
-      footnote: creditUnitPriceUsd != null
-        ? '估算计费 ÷ 消耗积分。折线低于积分单价参考线的时段，本地账号在亏钱。'
-        : '估算计费 ÷ 消耗积分。在“运行配置 → 请求容量”填写积分单价后会显示盈亏参考线。',
-    },
-  ]
 }
 
 export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView[] {
   const byPool = (pick: (metrics: UsageOverviewSeriesMetrics) => number) => stackSeries(
-    groups.externalPools,
-    (point) => point.externalPools,
+    groups.accounts,
+    (point) => point.accounts,
     pick,
   )
   return [
@@ -361,7 +266,7 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
         aggregate: (points) => sumOver(points, (point) => point.external.billableCostUsd),
       }],
       extraRows: [{ label: '毛利', value: (point) => formatUsdFixed2(point.external.profitUsd) }],
-      footnote: '柱子是外部池实际花出去的上游成本，折线是对下游的可计费金额。',
+      footnote: '柱子是账号实际花出去的上游成本，折线是对下游的可计费金额。',
     },
     {
       key: 'profit',
@@ -377,7 +282,7 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
       bars: [],
       ratioAxis: true,
       reference: HIT_RATE_REFERENCE,
-      lines: hitRateLines(groups.externalPools, (point) => point.externalPools),
+      lines: hitRateLines(groups.accounts, (point) => point.accounts),
       headline: { label: '外部命中率', value: (points) => aggregateHitRate(points, (point) => point.external) },
       footnote: HIT_RATE_FOOTNOTE,
     },

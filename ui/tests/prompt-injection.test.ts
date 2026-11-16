@@ -14,14 +14,14 @@ function config(): PromptInjectionConfig {
   return {
     applyToCountTokens: true,
     defaults: {
-      taskQuality: { enabled: false, externalPool: false },
-      identityPrompt: { enabled: false, externalPool: false },
+      taskQuality: { enabled: false, account: false },
+      identityPrompt: { enabled: false, account: false },
     } as PromptInjectionConfig['defaults'],
     texts: {},
     pathOverrides: {
       '/cc': { taskQuality: { enabled: true } },
       '/dfcache': { taskQuality: { enabled: true } },
-      '/dfcache/a': { taskQuality: { enabled: false }, identityPrompt: { externalPool: true } },
+      '/dfcache/a': { taskQuality: { enabled: false }, identityPrompt: { account: true } },
     },
   }
 }
@@ -34,14 +34,14 @@ test('routeEndpoint maps /v1 to its mounted messages path', () => {
 
 test('effectiveItem uses the longest matching prefix and reports its source', () => {
   const c = config()
-  assert.deepEqual(effectiveItem(c, '/v1', 'taskQuality'), { enabled: false, externalPool: false, source: { kind: 'default' } })
+  assert.deepEqual(effectiveItem(c, '/v1', 'taskQuality'), { enabled: false, account: false, source: { kind: 'default' } })
   assert.equal(effectiveItem(c, '/cc', 'taskQuality').enabled, true)
   assert.deepEqual(effectiveItem(c, '/dfcache/b', 'taskQuality').source, { kind: 'route', prefix: '/dfcache' })
   assert.equal(effectiveItem(c, '/dfcache/a', 'taskQuality').enabled, false)
-  // Fields resolve separately: externalPool comes from /dfcache/a, enabled from the default.
+  // Fields resolve separately: account comes from /dfcache/a, enabled from the default.
   const identity = effectiveItem(c, '/dfcache/a', 'identityPrompt')
   assert.equal(identity.enabled, false)
-  assert.equal(identity.externalPool, true)
+  assert.equal(identity.account, true)
   // A prefix only matches at a segment boundary.
   assert.equal(effectiveItem(c, '/ccx', 'taskQuality').enabled, false)
 })
@@ -75,22 +75,22 @@ test('effectiveFeatures applies shorter prefixes first, longer ones win', () => 
 
 test('version 1 route files convert identity and WebSearch into the new sections', () => {
   const parsed = parseRoutePolicyImport(JSON.stringify({
-    format: 'kiro-rs-route-policy',
+    format: 'claude-pool-route-policy',
     version: 1,
     cachePolicy: { cacheType: 'current_high_cache' },
-    identity: { enabled: true, turnReminderEnabled: false, applyToExternalPool: true },
+    identity: { enabled: true, turnReminderEnabled: false, applyToAccount: true },
     webSearch: true,
   }))
   assert.equal(parsed.ok, true)
   if (!parsed.ok) return
   assert.deepEqual(parsed.promptInjection, {
-    identityPrompt: { enabled: true, externalPool: true },
+    identityPrompt: { enabled: true, account: true },
     identityTurnReminder: { enabled: false },
   })
   assert.deepEqual(parsed.features, { channelLeakGuard: true, modelDrivenWebSearch: true })
 
   const off = parseRoutePolicyImport(JSON.stringify({
-    format: 'kiro-rs-route-policy',
+    format: 'claude-pool-route-policy',
     version: 1,
     cachePolicy: { cacheType: 'no_cache' },
     identity: { enabled: false, promptEnabled: true },
@@ -108,7 +108,7 @@ test('version 2 files round-trip and reject unknown items', () => {
   const file = buildRoutePolicyFile(
     '/dfcache/team',
     { cacheType: 'current_high_cache' },
-    { taskQuality: { enabled: true }, identityPrompt: { externalPool: true } },
+    { taskQuality: { enabled: true }, identityPrompt: { account: true } },
     { thinkingTrigger: 'always', modelDrivenWebSearch: true },
   )
   const parsed = parseRoutePolicyImport(JSON.stringify(file))

@@ -4,8 +4,6 @@ import type {
   PublicPoolConfig,
   AddCredentialRequest,
   AddCredentialResponse,
-  BatchCreateKiroApiKeysRequest,
-  BatchCreateKiroApiKeysResponse,
   BalanceResponse,
   BatchUpdateCredentialsRequest,
   BatchDeleteCredentialsRequest,
@@ -26,14 +24,11 @@ import type {
   CredentialsPageQuery,
   CredentialsPageResponse,
   CredentialsStatusResponse,
-  CreateKiroApiKeyItem,
-  CreateKiroApiKeyRequest,
   CreateProxyResourceRequest,
   BatchProxyResourceImportRequest,
   BatchProxyResourceImportResponse,
   AccessKeysResponse,
   RuntimeConfig,
-  KiroVersionLifecycleSnapshot,
   SetCredentialConcurrencyRequest,
   SetCredentialRateLimitAutoDisableRequest,
   SetCredentialRpmRequest,
@@ -50,7 +45,7 @@ import type {
   SystemVersionResponse,
   TestCredentialRequest,
   TestCredentialResponse,
-  DiscoverExternalPoolSupportedModelsRequest,
+  DiscoverAccountSupportedModelsRequest,
   ProxyResource,
   ProxyResourceTestRequest,
   ProxyResourceTestResponse,
@@ -62,9 +57,9 @@ import type {
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
   LoadBalancingMode,
-  CreateExternalPoolRequest,
-  ExternalPool,
-  ExternalPoolsListResponse,
+  CreateAccountRequest,
+  Account,
+  AccountsListResponse,
   RouteScenario,
   RouteScenarioApplyResponse,
   RouteScenarioContent,
@@ -73,10 +68,10 @@ import type {
   RouteScenarioOptions,
   RouteScenarioPreview,
   SaveRouteScenarioRequest,
-  ExternalPoolsStatusResponse,
-  ExternalPoolTestRequest,
-  ExternalPoolTestResponse,
-  UpdateExternalPoolRequest,
+  AccountsStatusResponse,
+  AccountTestRequest,
+  AccountTestResponse,
+  UpdateAccountRequest,
   KeyLimitPeriod,
   PromptInjectionCatalog,
   PromptInjectionPreviewRequest,
@@ -122,7 +117,6 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     schedulerScore: 0,
     estimatedCostUsd: 0,
     originalCostUsd: 0,
-    kiroMeteringUsage: 0,
     pricedRequests: 0,
     unpricedRequests: 0,
   }
@@ -336,18 +330,6 @@ export async function addCredential(req: AddCredentialRequest): Promise<AddCrede
   return data
 }
 
-export async function createKiroApiKey(req: CreateKiroApiKeyRequest): Promise<CreateKiroApiKeyItem> {
-  const { data } = await api.post<CreateKiroApiKeyItem>('/credentials/kiro-api-key', req)
-  return data
-}
-
-export async function batchCreateKiroApiKeys(
-  req: BatchCreateKiroApiKeysRequest = {},
-): Promise<BatchCreateKiroApiKeysResponse> {
-  const { data } = await api.post<BatchCreateKiroApiKeysResponse>('/credentials/kiro-api-keys/batch', req)
-  return data
-}
-
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
   return data
@@ -452,26 +434,6 @@ export async function updateRuntimeConfig(req: UpdateRuntimeConfigRequest): Prom
   return data
 }
 
-export async function checkKiroClientVersion(): Promise<KiroVersionLifecycleSnapshot> {
-  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/check')
-  return data
-}
-
-export async function applyKiroClientVersion(version?: string): Promise<KiroVersionLifecycleSnapshot> {
-  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/apply', version ? { version } : {})
-  return data
-}
-
-export async function pinKiroClientVersion(version: string): Promise<KiroVersionLifecycleSnapshot> {
-  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/pin', { version })
-  return data
-}
-
-export async function rollbackKiroClientVersion(): Promise<KiroVersionLifecycleSnapshot> {
-  const { data } = await api.post<KiroVersionLifecycleSnapshot>('/config/kiro-version/rollback')
-  return data
-}
-
 export async function getAccessKeys(): Promise<AccessKeysResponse> {
   const { data } = await api.get<AccessKeysResponse>('/security/keys')
   return data
@@ -506,76 +468,76 @@ export async function deleteRequestApiKey(id: string): Promise<AccessKeysRespons
   return data
 }
 
-export async function getExternalPools(): Promise<ExternalPoolsListResponse> {
-  const { data } = await api.get<ExternalPoolsListResponse>('/external-pools')
+export async function getAccounts(): Promise<AccountsListResponse> {
+  const { data } = await api.get<AccountsListResponse>('/accounts')
   return data
 }
 
-export async function getExternalPoolsStatus(): Promise<ExternalPoolsStatusResponse> {
-  const { data } = await api.get<ExternalPoolsStatusResponse>('/external-pools/status')
+export async function getAccountsStatus(): Promise<AccountsStatusResponse> {
+  const { data } = await api.get<AccountsStatusResponse>('/accounts/status')
   return data
 }
 
-export async function createExternalPool(req: CreateExternalPoolRequest): Promise<ExternalPool> {
-  const { data } = await api.post<ExternalPool>('/external-pools', req)
+export async function createAccount(req: CreateAccountRequest): Promise<Account> {
+  const { data } = await api.post<Account>('/accounts', req)
   return data
 }
 
-export async function updateExternalPool(id: number, req: UpdateExternalPoolRequest): Promise<ExternalPool> {
-  const { data } = await api.put<ExternalPool>(`/external-pools/${id}`, req)
+export async function updateAccount(id: number, req: UpdateAccountRequest): Promise<Account> {
+  const { data } = await api.put<Account>(`/accounts/${id}`, req)
   return data
 }
 
-export async function deleteExternalPool(id: number): Promise<SuccessResponse> {
-  const { data } = await api.delete<SuccessResponse>(`/external-pools/${id}`)
+export async function deleteAccount(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/accounts/${id}`)
   return data
 }
 
-export async function setExternalPoolEnabled(id: number, enabled: boolean): Promise<ExternalPool> {
-  const { data } = await api.post<ExternalPool>(`/external-pools/${id}/enabled`, { enabled })
+export async function setAccountEnabled(id: number, enabled: boolean): Promise<Account> {
+  const { data } = await api.post<Account>(`/accounts/${id}/enabled`, { enabled })
   return data
 }
 
-export async function clearExternalPoolAutoDisabled(id: number): Promise<ExternalPool> {
-  const { data } = await api.post<ExternalPool>(`/external-pools/${id}/auto-disabled/clear`)
+export async function clearAccountAutoDisabled(id: number): Promise<Account> {
+  const { data } = await api.post<Account>(`/accounts/${id}/auto-disabled/clear`)
   return data
 }
 
-export async function clearExternalPoolCooldown(id: number): Promise<ExternalPool> {
-  const { data } = await api.post<ExternalPool>(`/external-pools/${id}/cooldown/clear`)
+export async function clearAccountCooldown(id: number): Promise<Account> {
+  const { data } = await api.post<Account>(`/accounts/${id}/cooldown/clear`)
   return data
 }
 
-export async function setExternalPoolSupportedModels(id: number, req: SetSupportedModelsRequest): Promise<SupportedModelsResponse> {
-  const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models`, req)
+export async function setAccountSupportedModels(id: number, req: SetSupportedModelsRequest): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models`, req)
   return data
 }
 
-export async function syncExternalPoolSupportedModels(
+export async function syncAccountSupportedModels(
   id: number,
-  req: DiscoverExternalPoolSupportedModelsRequest = {}
+  req: DiscoverAccountSupportedModelsRequest = {}
 ): Promise<SupportedModelsResponse> {
-  const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models/sync`, req)
+  const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models/sync`, req)
   return data
 }
 
-export async function discoverExternalPoolSupportedModels(
-  req: DiscoverExternalPoolSupportedModelsRequest
+export async function discoverAccountSupportedModels(
+  req: DiscoverAccountSupportedModelsRequest
 ): Promise<SupportedModelsResponse> {
-  const { data } = await api.post<SupportedModelsResponse>('/external-pools/supported-models/discover', req)
+  const { data } = await api.post<SupportedModelsResponse>('/accounts/supported-models/discover', req)
   return data
 }
 
-export async function discoverStoredExternalPoolSupportedModels(
+export async function discoverStoredAccountSupportedModels(
   id: number,
-  req: DiscoverExternalPoolSupportedModelsRequest = {}
+  req: DiscoverAccountSupportedModelsRequest = {}
 ): Promise<SupportedModelsResponse> {
-  const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models/discover`, req)
+  const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models/discover`, req)
   return data
 }
 
-export async function testExternalPool(id: number, req?: ExternalPoolTestRequest): Promise<ExternalPoolTestResponse> {
-  const { data } = await api.post<ExternalPoolTestResponse>(`/external-pools/${id}/test`, req)
+export async function testAccount(id: number, req?: AccountTestRequest): Promise<AccountTestResponse> {
+  const { data } = await api.post<AccountTestResponse>(`/accounts/${id}/test`, req)
   return data
 }
 
@@ -646,18 +608,4 @@ export async function previewRouteScenario(id: number): Promise<RouteScenarioPre
 export async function applyRouteScenario(id: number, only: RouteScenarioItemKey[] = []): Promise<RouteScenarioApplyResponse> {
   const { data } = await api.post<RouteScenarioApplyResponse>(`/route-scenarios/${id}/apply`, { only })
   return data
-}
-
-export async function listKiroApiKeys(credentialIds: number[], offset = 0): Promise<CreateKiroApiKeyItem[]> {
-  const { data } = await api.post<CreateKiroApiKeyItem[]>('/credentials/kiro-api-keys/list', { credentialIds, offset })
-  return data
-}
-
-export async function saveKiroApiKey(key: CreateKiroApiKeyItem): Promise<CreateKiroApiKeyItem> {
-  const { data } = await api.post<CreateKiroApiKeyItem>('/credentials/kiro-api-keys/save', key)
-  return data
-}
-
-export async function deleteKiroApiKey(credentialId: number, keyId: string): Promise<void> {
-  await api.post('/credentials/kiro-api-keys/delete', { credentialId, keyId })
 }

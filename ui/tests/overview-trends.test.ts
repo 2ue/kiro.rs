@@ -11,7 +11,7 @@ import {
 import {
   compareUsageTier,
   credentialUsageTier,
-  externalPoolUsageTier,
+  accountUsageTier,
 } from '../src/features/overview/usage-order.ts'
 
 test('cache hit rate uses the sub2api denominator', () => {
@@ -55,11 +55,11 @@ test('tier order is stable and ignores the in-flight count within a tier', () =>
   )
 })
 
-test('external pools: deleted, disabled or auto-disabled pools are unavailable', () => {
+test('accounts: deleted, disabled or auto-disabled pools are unavailable', () => {
   const pool = { enabled: true, autoDisabled: false }
-  assert.equal(externalPoolUsageTier(pool, { inFlight: 2, cooldownRemainingSecs: 0 }), 'active')
-  assert.equal(externalPoolUsageTier(pool, undefined), 'ready')
-  assert.equal(externalPoolUsageTier(pool, { inFlight: 0, cooldownRemainingSecs: 5 }), 'cooling')
-  assert.equal(externalPoolUsageTier({ ...pool, autoDisabled: true }, { inFlight: 1, cooldownRemainingSecs: 0 }), 'unavailable')
-  assert.equal(externalPoolUsageTier(undefined, undefined), 'unavailable')
+  assert.equal(accountUsageTier(pool, { inFlight: 2, cooldownRemainingSecs: 0 }), 'active')
+  assert.equal(accountUsageTier(pool, undefined), 'ready')
+  assert.equal(accountUsageTier(pool, { inFlight: 0, cooldownRemainingSecs: 5 }), 'cooling')
+  assert.equal(accountUsageTier({ ...pool, autoDisabled: true }, { inFlight: 1, cooldownRemainingSecs: 0 }), 'unavailable')
+  assert.equal(accountUsageTier(undefined, undefined), 'unavailable')
 })

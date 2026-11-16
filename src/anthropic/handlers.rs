@@ -1,4 +1,4 @@
-//! Anthropic Messages 入口与外部池编排。
+//! Anthropic Messages 入口与账号编排。
 use super::{
     body_processing, envelope,
     inference_attempt_budget::InferenceAttemptBudget,
@@ -15,7 +15,7 @@ use super::{
     },
     usage::{RequestRejectionUsageContext, UsageRouteSubtype},
 };
-use crate::external_pool::{ExternalRouteRequest, ExternalRouteRequestPreparationCache};
+use crate::account::{AccountRouteRequest, AccountRouteRequestPreparationCache};
 use crate::{model::config::*, token};
 use axum::{
     Json as JsonExtractor,
@@ -71,7 +71,7 @@ struct RequestRuntimeConfig {
     missing_max_tokens: MissingMaxTokensConfig,
     local_request_compat: crate::model::config::LocalRequestCompatConfig,
     payload_shaping: PayloadShapingConfig,
-    external_pools: ExternalPoolsConfig,
+    accounts: AccountsConfig,
 }
 
 impl RequestRuntimeConfig {
@@ -84,19 +84,14 @@ impl RequestRuntimeConfig {
     }
 
     /// `endpoint` 上允许注入的项。
-    fn injections_for(
-        &self,
-        endpoint: &str,
-        upstream: crate::model::config::UpstreamKind,
-    ) -> crate::model::config::ResolvedInjections {
-        let _ = upstream;
+    fn injections_for(&self, endpoint: &str) -> crate::model::config::ResolvedInjections {
         self.compiled_routes
             .match_endpoint(endpoint)
             .map(|route| route.injections.clone())
             .unwrap_or_default()
     }
 
-    /// 外部池流式首输出前的静默保留窗口；0 表示一直保留到首个语义输出。
+    /// 账号流式首输出前的静默保留窗口；0 表示一直保留到首个语义输出。
     fn external_stream_pre_output_hold(&self) -> Option<Duration> {
         (self.stream_pre_output_hold_secs > 0)
             .then(|| Duration::from_secs(self.stream_pre_output_hold_secs))
@@ -138,8 +133,8 @@ impl RequestRuntimeConfig {
             missing_max_tokens: state.missing_max_tokens.normalized(),
             local_request_compat: crate::model::config::LocalRequestCompatConfig::default(),
             payload_shaping: state.payload_shaping,
-            external_pools: {
-                let mut accounts = ExternalPoolsConfig::clone(&state.external_pools);
+            accounts: {
+                let mut accounts = AccountsConfig::clone(&state.accounts);
                 accounts.routes = config.routes.clone();
                 accounts
             },
@@ -263,8 +258,8 @@ impl RequestRuntimeConfig {
                 .defaults
                 .payload_shaping
                 .unwrap_or_default(),
-            external_pools: {
-                let mut accounts = config.external_pools.clone();
+            accounts: {
+                let mut accounts = config.accounts.clone();
                 accounts.routes = config.routes.clone();
                 accounts.transport_proxy_url = config.proxy_url.clone();
                 accounts.transport_proxy_username = config.proxy_username.clone();
@@ -338,11 +333,11 @@ impl RequestRuntimeConfig {
                 entry_ttl_secs: self.prompt_cache_bounds.entry_ttl.as_secs(),
                 estimated_bytes_limit: self.prompt_cache_bounds.estimated_bytes_limit,
             },
-            kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            prefix_tool: PrefixToolCachePolicy::default(),
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: crate::model::config::CacheHitShapingPolicy::default(),
             cold_request_guard: crate::model::config::ColdRequestGuardPolicy::default(),
-            kiro_rs_tool_plus: crate::model::config::KiroRsToolPlusCachePolicy::default(),
+            prefix_tool_plus: crate::model::config::PrefixToolPlusCachePolicy::default(),
             cache_ttl: crate::model::config::CacheTtlPolicy::default(),
         }
         .normalized()
@@ -393,8 +388,8 @@ fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptC
         PromptCacheStrategyType::NoCache
         | PromptCacheStrategyType::CurrentHighCache
         | PromptCacheStrategyType::BoundedHighCache
-        | PromptCacheStrategyType::KiroRsTool
-        | PromptCacheStrategyType::KiroRsToolPlus
+        | PromptCacheStrategyType::PrefixTool
+        | PromptCacheStrategyType::PrefixToolPlus
         | PromptCacheStrategyType::StableSegmentCache => PromptCacheSimulationMode::Disabled,
     }
 }
@@ -445,7 +440,7 @@ fn request_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
 
 fn external_request_model_resolution(requested_model: &str) -> ModelResolution {
     let mut resolution = ModelResolution::pass_through(normalize_model_id(requested_model));
-    // External pools apply their own mapping pipeline. Do not expose the local
+    // Accounts apply their own mapping pipeline. Do not expose the local
     // resolver's diagnostic note for a deliberate external pass-through.
     resolution.note = None;
     resolution
@@ -489,7 +484,7 @@ async fn route_models(state: &AppState, endpoint: &str) -> Vec<super::types::Mod
     let Some(route) = config.routes.match_endpoint(endpoint) else {
         return Vec::new();
     };
-    let Some(manager) = &state.external_pool_manager else {
+    let Some(manager) = &state.account_manager else {
         return Vec::new();
     };
     manager
@@ -753,7 +748,7 @@ async fn count_tokens_for_endpoint(
     // count_tokens 使用与 messages 相同的 system 注入后估算。
     super::prompt_injection::apply_to_count_tokens_request(
         &runtime_config.prompt_injection,
-        &runtime_config.injections_for(endpoint, crate::model::config::UpstreamKind::ExternalPool),
+        &runtime_config.injections_for(endpoint),
         &mut payload,
     );
 
@@ -1076,7 +1071,7 @@ fn external_route_request_raw(
     request_api_key_id: Option<String>,
     ingress_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
-) -> ExternalRouteRequest {
+) -> AccountRouteRequest {
     let model_hint = raw_probe.model.clone();
     let stream_hint = raw_probe.stream;
     crate::diagnostics::capture::record("client_request", Some(&request_id), || {
@@ -1096,10 +1091,10 @@ fn external_route_request_raw(
         cache_route_for_request_stream(cache_route.clone(), stream_hint.unwrap_or(false));
     let policy = &effective_cache_route.policy;
     let projection_payload = serde_json::from_slice::<MessagesRequest>(&raw_body).ok();
-    ExternalRouteRequest {
+    AccountRouteRequest {
         effective_raw_body: raw_body.clone(),
         effective_raw_probe: Some(raw_probe),
-        preparation_cache: Arc::new(ExternalRouteRequestPreparationCache::default()),
+        preparation_cache: Arc::new(AccountRouteRequestPreparationCache::default()),
         raw_body,
         headers,
         endpoint: endpoint.to_string(),
@@ -1111,14 +1106,14 @@ fn external_route_request_raw(
         upstream_model: None,
         model_resolution_source: None,
         model_resolution_note: None,
-        route_subtype: UsageRouteSubtype::External,
+        route_subtype: UsageRouteSubtype::Account,
         reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
         prompt_cache: state.prompt_cache.clone(),
         prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
         prompt_cache_strategy_type: policy.cache_type,
         prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
         prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
-        cache_ttl_mode: policy.cache_ttl.external_pool,
+        cache_ttl_mode: policy.cache_ttl.account,
         prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
         prompt_cache_token_scale: policy.simulation.token_scale,
         prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
@@ -1127,8 +1122,8 @@ fn external_route_request_raw(
         prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
-        kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
-        kiro_rs_tool_plus_cache_policy: policy.kiro_rs_tool_plus,
+        prefix_tool_cache_policy: policy.prefix_tool,
+        prefix_tool_plus_cache_policy: policy.prefix_tool_plus,
         stable_segment_cache_policy: policy.stable_segment,
         cache_hit_shaping_policy: policy.hit_shaping,
         model_capabilities: state.model_capabilities.clone(),
@@ -1141,7 +1136,7 @@ fn external_route_request_raw(
         stream_pre_output_hold: runtime_config.external_stream_pre_output_hold(),
         early_commit: None,
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
-        latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
+        latency_trace: Arc::new(crate::account::ExternalLatencyTraceState::default()),
         payload_breakdown: None,
         payload_guard_report: None,
         payload_guard_external_enabled: false,
@@ -1167,9 +1162,9 @@ async fn post_messages_inner(
 ) -> Response {
     let runtime = request_runtime_config(&state);
     let Some(manager) = state
-        .external_pool_manager
+        .account_manager
         .as_ref()
-        .filter(|_| runtime.external_pools.external_pools_enabled)
+        .filter(|_| runtime.accounts.enabled)
     else {
         let request_id = envelope::request_id();
         let response = envelope::error_response_with_id_and_headers(
@@ -1222,7 +1217,7 @@ async fn post_messages_inner(
         .map(|config| request_entry::route_guard_config(config, features.payload_shaping));
 
     manager
-        .forward_with_failover(runtime.external_pools.clone(), route)
+        .forward_with_failover(runtime.accounts.clone(), route)
         .await
 }
 

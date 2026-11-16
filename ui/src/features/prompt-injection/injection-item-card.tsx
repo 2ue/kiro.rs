@@ -54,14 +54,14 @@ export function InjectionItemCard({
             默认开启
             <Switch id={switchId} checked={setting.enabled} onCheckedChange={(enabled) => setSetting({ enabled })} />
           </label>
-          {entry.externalPool && (
+          {entry.account && (
             <label className="flex items-center gap-2 text-xs text-muted-foreground" htmlFor={externalId}>
-              外部池也注入
+              账号也注入
               <Switch
                 id={externalId}
-                checked={setting.externalPool ?? false}
+                checked={setting.account ?? false}
                 disabled={!setting.enabled}
-                onCheckedChange={(externalPool) => setSetting({ externalPool })}
+                onCheckedChange={(account) => setSetting({ account })}
               />
             </label>
           )}

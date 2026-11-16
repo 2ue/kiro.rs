@@ -59,18 +59,18 @@ pub enum UsageRecordStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageRouteKind {
-    ExternalPool,
+    Account,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageRouteSubtype {
-    External,
+    Account,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalPoolAttempt {
+pub struct AccountAttempt {
     pub attempt: u32,
     pub pool_id: u64,
     pub pool_name: String,
@@ -90,7 +90,7 @@ pub struct ExternalPoolAttempt {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalPoolUsageSnapshot {
+pub struct AccountUsageSnapshot {
     pub total_input_tokens: i32,
     pub input_tokens: i32,
     pub billable_input_tokens: i32,
@@ -103,13 +103,13 @@ pub struct ExternalPoolUsageSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalPoolBilling {
+pub struct AccountBilling {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_input_tokens: Option<i32>,
-    pub raw_usage: ExternalPoolUsageSnapshot,
+    pub raw_usage: AccountUsageSnapshot,
     #[serde(default)]
-    pub shaped_usage: ExternalPoolUsageSnapshot,
-    pub reported_usage: ExternalPoolUsageSnapshot,
+    pub shaped_usage: AccountUsageSnapshot,
+    pub reported_usage: AccountUsageSnapshot,
     #[serde(default)]
     pub usage_projection_applied: bool,
     pub raw_cost_usd: f64,
@@ -143,7 +143,7 @@ pub struct ExternalPoolBilling {
     pub body_usage_projection_applied: bool,
 }
 
-impl ExternalPoolBilling {
+impl AccountBilling {
     pub fn effective_shaped_cost_usd(&self) -> f64 {
         if self.pricing_available && self.shaped_cost_usd == 0.0 && self.reported_cost_usd > 0.0 {
             self.reported_cost_usd
@@ -223,7 +223,7 @@ pub struct UsageLatencyTrace {
     pub credential_dispatch_elapsed_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_header_wait_ms: Option<u64>,
-    /// 外部池提前提交模式下，下游收到首个字节（message_start）的时间，从请求开始计。
+    /// 账号提前提交模式下，下游收到首个字节（message_start）的时间，从请求开始计。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downstream_first_byte_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,7 +310,7 @@ pub struct UsageLatencyTrace {
     pub filtered_trivial_text_blocks: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filtered_trivial_text_chars: Option<u32>,
-    /// 响应未满足 tool_choice any/tool（Kiro 无法强制工具调用），例如 `any_without_tool_use`。
+    /// 响应未满足 tool_choice any/tool（上游 无法强制工具调用），例如 `any_without_tool_use`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice_violation: Option<String>,
     /// 因违反本轮工具约束被丢弃的 tool_use，格式 `reason:tool`。
@@ -333,7 +333,7 @@ pub enum StreamTerminalReason {
     UpstreamIdleTimeout,
     /// Upstream sent headers but no content event within the first-output limit.
     FirstOutputTimeout,
-    /// The response body ran longer than `kiroUpstreamStreamMaxDurationSecs`.
+    /// The response body ran longer than `streamMaxDurationSecs`.
     UpstreamMaxDuration,
     MalformedSse,
     ProtocolContamination,
@@ -447,7 +447,7 @@ pub struct UsageRecord {
     pub status: UsageRecordStatus,
     pub usage_source: UsageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_usage: Option<ExternalPoolUsageSnapshot>,
+    pub raw_usage: Option<AccountUsageSnapshot>,
     pub total_input_tokens: i32,
     pub compat_input_tokens: i32,
     pub billable_input_tokens: i32,
@@ -479,14 +479,14 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_subtype: Option<UsageRouteSubtype>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_pool_id: Option<u64>,
+    pub account_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_pool_name: Option<String>,
-    pub external_attempts: Vec<ExternalPoolAttempt>,
+    pub account_name: Option<String>,
+    pub external_attempts: Vec<AccountAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_projection_applied: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_pool_billing: Option<ExternalPoolBilling>,
+    pub account_billing: Option<AccountBilling>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -659,11 +659,11 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
         route_kind: None,
         route_subtype: None,
 
-        external_pool_id: None,
-        external_pool_name: None,
+        account_id: None,
+        account_name: None,
         external_attempts: Vec::new(),
         usage_projection_applied: None,
-        external_pool_billing: None,
+        account_billing: None,
         error_type: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
         error_message: Some(REQUEST_REJECTION_ERROR_MESSAGE.to_string()),
         error_detail: Some(error_detail),
@@ -680,7 +680,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
     }
 }
 
-/// Metadata keys whose values are closed diagnostic categories set by kiro-rs itself. Free
+/// Metadata keys whose values are closed diagnostic categories set by claude-pool itself. Free
 /// text fields (entry messages, conversion diagnostics) are left to `errorMetadata` so the
 /// detail line never carries request content.
 const REQUEST_REJECTION_DETAIL_KEYS: [(&str, &str); 6] = [
@@ -737,7 +737,7 @@ pub struct UsageRecordQuery {
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
-    pub external_pool_id: Option<u64>,
+    pub account_id: Option<u64>,
     pub route_kind: Option<UsageRouteKind>,
     pub model: Option<String>,
     pub status: Option<UsageRecordStatus>,
@@ -759,7 +759,7 @@ impl Default for UsageRecordQuery {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
-            external_pool_id: None,
+            account_id: None,
             route_kind: None,
             model: None,
             status: None,
@@ -895,7 +895,7 @@ pub struct UsageSummary {
     pub local_prompt_cache_creation_input_tokens: i64,
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
-    pub external_pool_billing: UsageExternalPoolBillingSummary,
+    pub account_billing: UsageAccountBillingSummary,
     pub realtime: UsageRealtimeStats,
     pub top_credentials: Vec<UsageAggregate>,
     pub top_conversations: Vec<UsageAggregate>,
@@ -903,7 +903,7 @@ pub struct UsageSummary {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolBillingSummary {
+pub struct UsageAccountBillingSummary {
     pub requests: usize,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
@@ -919,7 +919,7 @@ pub struct UsageExternalPoolBillingSummary {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolBillingByPool {
+pub struct UsageAccountBillingByPool {
     pub pool_id: u64,
     pub pool_name: String,
     pub requests: usize,
@@ -980,15 +980,15 @@ pub struct UsageDashboardBreakdownResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageDashboardExternalPoolBillingResponse {
+pub struct UsageDashboardAccountBillingResponse {
     pub generated_at: String,
     pub timezone: String,
     pub window_key: String,
-    pub external_pool_billing_by_pool: Vec<UsageExternalPoolBillingByPool>,
+    pub account_billing_by_pool: Vec<UsageAccountBillingByPool>,
 }
 
 #[derive(Debug, Clone)]
-pub struct UsageExternalPoolRiskQuery {
+pub struct UsageAccountRiskQuery {
     pub timezone: String,
     pub window_key: String,
     pub window_label: String,
@@ -1004,33 +1004,33 @@ pub struct UsageExternalPoolRiskQuery {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct UsageExternalPoolRiskCostConfig {
+pub struct UsageAccountRiskCostConfig {
     pub cost_floor_enabled: bool,
     pub cost_floor_margin_percent: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskResponse {
+pub struct UsageAccountRiskResponse {
     pub generated_at: String,
     pub timezone: String,
-    pub window: UsageExternalPoolRiskWindow,
-    pub thresholds: UsageExternalPoolRiskThresholds,
-    pub filters: UsageExternalPoolRiskFilters,
-    pub totals: UsageExternalPoolRiskTotals,
-    pub raw_cache: UsageExternalPoolRiskCacheStats,
-    pub reported_cache: UsageExternalPoolRiskCacheStats,
-    pub cost: UsageExternalPoolRiskCostStats,
-    pub buckets: Vec<UsageExternalPoolRiskBucket>,
-    pub by_pool: Vec<UsageExternalPoolRiskGroup>,
-    pub by_path: Vec<UsageExternalPoolRiskGroup>,
-    pub by_model: Vec<UsageExternalPoolRiskGroup>,
-    pub samples: Vec<UsageExternalPoolRiskSample>,
+    pub window: UsageAccountRiskWindow,
+    pub thresholds: UsageAccountRiskThresholds,
+    pub filters: UsageAccountRiskFilters,
+    pub totals: UsageAccountRiskTotals,
+    pub raw_cache: UsageAccountRiskCacheStats,
+    pub reported_cache: UsageAccountRiskCacheStats,
+    pub cost: UsageAccountRiskCostStats,
+    pub buckets: Vec<UsageAccountRiskBucket>,
+    pub by_pool: Vec<UsageAccountRiskGroup>,
+    pub by_path: Vec<UsageAccountRiskGroup>,
+    pub by_model: Vec<UsageAccountRiskGroup>,
+    pub samples: Vec<UsageAccountRiskSample>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskWindow {
+pub struct UsageAccountRiskWindow {
     pub key: String,
     pub label: String,
     pub from: String,
@@ -1039,7 +1039,7 @@ pub struct UsageExternalPoolRiskWindow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskThresholds {
+pub struct UsageAccountRiskThresholds {
     pub warning_tokens: i64,
     pub critical_tokens: i64,
     pub cost_floor_enabled: bool,
@@ -1049,7 +1049,7 @@ pub struct UsageExternalPoolRiskThresholds {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskFilters {
+pub struct UsageAccountRiskFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1062,7 +1062,7 @@ pub struct UsageExternalPoolRiskFilters {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskTotals {
+pub struct UsageAccountRiskTotals {
     pub records: usize,
     pub success_records: usize,
     pub error_records: usize,
@@ -1072,13 +1072,13 @@ pub struct UsageExternalPoolRiskTotals {
     pub unpriced_records: usize,
     pub raw_usage_records: usize,
     pub reported_usage_records: usize,
-    pub missing_external_pool_billing_records: usize,
+    pub missing_account_billing_records: usize,
     pub output_zero_records: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskCacheStats {
+pub struct UsageAccountRiskCacheStats {
     pub min_read_tokens: i64,
     pub max_read_tokens: i64,
     pub avg_read_tokens: f64,
@@ -1097,7 +1097,7 @@ pub struct UsageExternalPoolRiskCacheStats {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskCostStats {
+pub struct UsageAccountRiskCostStats {
     pub raw_cost_usd: f64,
     pub reported_cost_usd: f64,
     pub target_cost_usd: f64,
@@ -1121,7 +1121,7 @@ pub struct UsageExternalPoolRiskCostStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskBucket {
+pub struct UsageAccountRiskBucket {
     pub key: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1136,7 +1136,7 @@ pub struct UsageExternalPoolRiskBucket {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskGroup {
+pub struct UsageAccountRiskGroup {
     pub key: String,
     pub label: String,
     pub records: usize,
@@ -1160,7 +1160,7 @@ pub struct UsageExternalPoolRiskGroup {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskSample {
+pub struct UsageAccountRiskSample {
     pub id: String,
     pub created_at: String,
     pub endpoint: String,
@@ -1168,14 +1168,14 @@ pub struct UsageExternalPoolRiskSample {
     pub model: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_pool_id: Option<u64>,
+    pub account_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_pool_name: Option<String>,
+    pub account_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_projection_mode: Option<String>,
-    pub external_pool_billing_present: bool,
+    pub account_billing_present: bool,
     pub cost_floor_applied: bool,
     pub raw_input_tokens: i64,
     pub raw_output_tokens: i64,
@@ -1232,9 +1232,9 @@ pub struct UsageDashboardSummary {
 
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
-    pub external_pool_billing: UsageExternalPoolBillingSummary,
+    pub account_billing: UsageAccountBillingSummary,
     #[serde(default)]
-    pub external_pool_billing_by_pool: Vec<UsageExternalPoolBillingByPool>,
+    pub account_billing_by_pool: Vec<UsageAccountBillingByPool>,
     pub status_breakdown: Vec<UsageBreakdownItem>,
     pub usage_source_breakdown: Vec<UsageBreakdownItem>,
 }
@@ -1363,7 +1363,7 @@ pub struct UsageOverviewSeriesMetrics {
     pub estimated_cost_usd: f64,
     pub original_cost_usd: f64,
 
-    /// External-pool upstream cost. Only external-pool rows contribute, so the
+    /// External-pool upstream cost. Only account rows contribute, so the
     /// value is zero for local-route breakdowns.
     #[serde(default)]
     pub raw_cost_usd: f64,
@@ -1375,7 +1375,7 @@ pub struct UsageOverviewSeriesMetrics {
     pub profit_usd: f64,
 }
 
-/// One breakdown member (local route, external pool or external reason) in a
+/// One breakdown member (local route, account or external reason) in a
 /// single series bucket. Labels live once in `UsageOverviewSeriesGroups`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1392,7 +1392,7 @@ pub struct UsageOverviewSeriesPoint {
     pub all: UsageOverviewSeriesMetrics,
     pub external: UsageOverviewSeriesMetrics,
     #[serde(default)]
-    pub external_pools: Vec<UsageOverviewSeriesBreakdown>,
+    pub accounts: Vec<UsageOverviewSeriesBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1403,12 +1403,12 @@ pub struct UsageOverviewSeriesGroup {
 }
 
 /// Breakdown members present in the range, ordered by business weight:
-/// local routes by credits, external pools by upstream cost, reasons by requests.
+/// local routes by credits, accounts by upstream cost, reasons by requests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageOverviewSeriesGroups {
     #[serde(default)]
-    pub external_pools: Vec<UsageOverviewSeriesGroup>,
+    pub accounts: Vec<UsageOverviewSeriesGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3452,49 +3452,49 @@ impl UsageRecorder {
         anyhow::bail!("usage dashboard breakdown 的精确窗口人口需要 PgSQL 聚合存储")
     }
 
-    pub fn dashboard_external_pool_billing(
+    pub fn dashboard_account_billing(
         &self,
         timezone: Option<&str>,
         window_key: &str,
-    ) -> anyhow::Result<UsageDashboardExternalPoolBillingResponse> {
+    ) -> anyhow::Result<UsageDashboardAccountBillingResponse> {
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
             let window_key = window_key.to_string();
-            let (generated_at, timezone, window_key, external_pool_billing_by_pool) = self
+            let (generated_at, timezone, window_key, account_billing_by_pool) = self
                 .dashboard_query(
-                    "PgSQL usage dashboard external pool billing",
+                    "PgSQL usage dashboard account billing",
                     USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
                     async move {
                         store
-                            .dashboard_external_pool_billing_only(timezone.as_deref(), &window_key)
+                            .dashboard_account_billing_only(timezone.as_deref(), &window_key)
                             .await
                     },
                 )?;
-            return Ok(UsageDashboardExternalPoolBillingResponse {
+            return Ok(UsageDashboardAccountBillingResponse {
                 generated_at,
                 timezone,
                 window_key,
-                external_pool_billing_by_pool,
+                account_billing_by_pool,
             });
         }
-        anyhow::bail!("usage dashboard external pool billing 的精确窗口人口需要 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard account billing 的精确窗口人口需要 PgSQL 聚合存储")
     }
 
-    pub fn external_pool_usage_risk(
+    pub fn account_usage_risk(
         &self,
-        query: UsageExternalPoolRiskQuery,
-        cost_config: UsageExternalPoolRiskCostConfig,
-    ) -> anyhow::Result<UsageExternalPoolRiskResponse> {
+        query: UsageAccountRiskQuery,
+        cost_config: UsageAccountRiskCostConfig,
+    ) -> anyhow::Result<UsageAccountRiskResponse> {
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             return self.dashboard_query(
-                "PgSQL external pool usage risk",
+                "PgSQL account usage risk",
                 USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
-                async move { store.external_pool_usage_risk(query, cost_config).await },
+                async move { store.account_usage_risk(query, cost_config).await },
             );
         }
-        anyhow::bail!("外部池 usage 风控需要 PgSQL usage 明细存储")
+        anyhow::bail!("账号 usage 风控需要 PgSQL usage 明细存储")
     }
 
     fn summary_memory(&self, high_cache_threshold: i32) -> UsageSummary {
@@ -3519,7 +3519,7 @@ impl UsageRecorder {
             local_prompt_cache_creation_input_tokens: 0,
             simulated_requests: 0,
             upstream_metadata_requests: 0,
-            external_pool_billing: UsageExternalPoolBillingSummary::default(),
+            account_billing: UsageAccountBillingSummary::default(),
             realtime: UsageRealtimeStats::empty(REALTIME_USAGE_WINDOW_SECS),
             top_credentials: Vec::new(),
             top_conversations: Vec::new(),
@@ -3550,29 +3550,27 @@ impl UsageRecorder {
             if record.usage_source == UsageSource::UpstreamMetadata {
                 summary.upstream_metadata_requests += 1;
             }
-            if record.route_kind == Some(UsageRouteKind::ExternalPool) {
-                summary.external_pool_billing.requests += 1;
-                if let Some(billing) = &record.external_pool_billing {
+            if record.route_kind == Some(UsageRouteKind::Account) {
+                summary.account_billing.requests += 1;
+                if let Some(billing) = &record.account_billing {
                     if billing.pricing_available {
-                        summary.external_pool_billing.priced_requests += 1;
+                        summary.account_billing.priced_requests += 1;
                     } else {
-                        summary.external_pool_billing.unpriced_requests += 1;
+                        summary.account_billing.unpriced_requests += 1;
                     }
                     if billing.cost_floor_applied {
-                        summary.external_pool_billing.cost_floor_applied_requests += 1;
+                        summary.account_billing.cost_floor_applied_requests += 1;
                     }
-                    summary.external_pool_billing.raw_cost_usd += billing.raw_cost_usd;
-                    summary.external_pool_billing.shaped_cost_usd +=
-                        billing.effective_shaped_cost_usd();
-                    summary.external_pool_billing.uplifted_cost_usd +=
+                    summary.account_billing.raw_cost_usd += billing.raw_cost_usd;
+                    summary.account_billing.shaped_cost_usd += billing.effective_shaped_cost_usd();
+                    summary.account_billing.uplifted_cost_usd +=
                         billing.effective_uplifted_cost_usd();
-                    summary.external_pool_billing.profit_usd += billing.effective_profit_usd();
-                    summary.external_pool_billing.reported_cost_usd += billing.reported_cost_usd;
-                    summary.external_pool_billing.billable_cost_usd += billing.billable_cost_usd;
-                    summary.external_pool_billing.cost_floor_delta_usd +=
-                        billing.cost_floor_delta_usd;
+                    summary.account_billing.profit_usd += billing.effective_profit_usd();
+                    summary.account_billing.reported_cost_usd += billing.reported_cost_usd;
+                    summary.account_billing.billable_cost_usd += billing.billable_cost_usd;
+                    summary.account_billing.cost_floor_delta_usd += billing.cost_floor_delta_usd;
                 } else {
-                    summary.external_pool_billing.unpriced_requests += 1;
+                    summary.account_billing.unpriced_requests += 1;
                 }
             }
             summary.total_input_tokens += record.total_input_tokens as i64;
@@ -4081,7 +4079,7 @@ fn usage_fallback_runtime() -> &'static Runtime {
     FALLBACK_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("kiro-usage-store")
+            .thread_name("pool-usage-store")
             .enable_all()
             .build()
             .expect("创建 usage 存储 runtime 失败")
@@ -4140,8 +4138,8 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
             return false;
         }
     }
-    if let Some(external_pool_id) = query.external_pool_id {
-        if record.external_pool_id != Some(external_pool_id) {
+    if let Some(account_id) = query.account_id {
+        if record.account_id != Some(account_id) {
             return false;
         }
     }
@@ -4214,7 +4212,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let status = usage_status_value(record.status);
     let source = usage_source_value(record.usage_source);
     let credential_id = record.credential_id.map(|id| id.to_string());
-    let external_pool_id = record.external_pool_id.map(|id| id.to_string());
+    let account_id = record.account_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
     let original_cost = record.original_cost_usd.to_string();
 
@@ -4229,8 +4227,8 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.model_resolution_note.as_deref(),
         record.conversation_id.as_deref(),
         record.request_api_key_id.as_deref(),
-        external_pool_id.as_deref(),
-        record.external_pool_name.as_deref(),
+        account_id.as_deref(),
+        record.account_name.as_deref(),
         Some(original_cost.as_str()),
         record.credential_label.as_deref(),
         Some(status),
@@ -4407,7 +4405,7 @@ mod tests {
             "cacheCreationInputTokens": 0,
             "estimatedCostUsd": 0.1,
             "originalCostUsd": 0.1,
-            "kiroMeteringUsage": 0.5,
+            "upstreamMeteringUsage": 0.5,
         })
     }
 
@@ -4459,11 +4457,11 @@ mod tests {
             route_kind: None,
             route_subtype: None,
 
-            external_pool_id: None,
-            external_pool_name: None,
+            account_id: None,
+            account_name: None,
             external_attempts: Vec::new(),
             usage_projection_applied: None,
-            external_pool_billing: None,
+            account_billing: None,
             error_type: None,
             error_message: None,
             error_detail: None,
@@ -4779,14 +4777,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dashboard_windows_uses_redis_observability_without_postgres_for_three_rounds() {
-        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        let Some(redis_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL")
+        else {
+            eprintln!("跳过 Redis 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
             return;
         };
         let mut config = crate::model::config::Config::default();
         config.redis.url = Some(redis_url);
         config.redis.key_prefix = format!(
-            "kiro_rs:test:recorder-dashboard-redis-first:{}",
+            "claude_pool:test:recorder-dashboard-redis-first:{}",
             uuid::Uuid::new_v4()
         );
         let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
@@ -4889,21 +4888,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
     async fn production_postgres_only_usage_never_materializes_redis_for_five_rounds() {
-        let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+        let Some(postgres_url) =
+            crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL")
         else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
-        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        let Some(redis_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL")
+        else {
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
             return;
         };
         let mut config = crate::model::config::Config::default();
         config.postgres.url = Some(postgres_url);
         config.postgres.max_connections = 2;
         config.redis.url = Some(redis_url);
-        config.redis.key_prefix =
-            format!("kiro_rs:test:usage-postgres-only:{}", uuid::Uuid::new_v4());
+        config.redis.key_prefix = format!(
+            "claude_pool:test:usage-postgres-only:{}",
+            uuid::Uuid::new_v4()
+        );
         let postgres = Arc::new(
             crate::storage::postgres::PostgresStore::connect_test(&config)
                 .await

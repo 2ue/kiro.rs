@@ -119,7 +119,7 @@ fn system_contains(system: &Option<Vec<SystemMessage>>, marker: &str) -> bool {
 mod tests {
     use super::*;
     use crate::anthropic::types::Message;
-    use crate::model::config::{CompatProfile, UpstreamKind};
+    use crate::model::config::CompatProfile;
     use crate::model::prompt_injection::catalog::{
         DEFAULT_IDENTITY_PROMPT, DEFAULT_LANGUAGE_CONSTRAINT_PROMPT,
     };
@@ -150,12 +150,7 @@ mod tests {
     }
 
     fn resolve(config: &PromptInjectionConfig, endpoint: &str) -> ResolvedInjections {
-        ResolvedInjections::resolve(
-            endpoint,
-            UpstreamKind::ExternalPool,
-            CompatProfile::ClaudeCode,
-            config,
-        )
+        ResolvedInjections::resolve(endpoint, CompatProfile::ClaudeCode, config)
     }
 
     #[test]
@@ -322,12 +317,8 @@ mod tests {
     fn strict_blocks_request_prompts_but_not_identity() {
         let mut config = PromptInjectionConfig::default();
         set(&mut config, InjectionId::IdentityPrompt, true);
-        let injections = ResolvedInjections::resolve(
-            "/cc/v1/messages",
-            UpstreamKind::ExternalPool,
-            CompatProfile::AnthropicStrict,
-            &config,
-        );
+        let injections =
+            ResolvedInjections::resolve("/cc/v1/messages", CompatProfile::AnthropicStrict, &config);
         let mut req = request();
         let applied = apply_to_messages_request(&injections, &mut req);
         assert_eq!(applied.items, vec![InjectionId::IdentityPrompt]);

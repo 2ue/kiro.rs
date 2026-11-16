@@ -1,0 +1,20663 @@
+use super::*;
+use crate::anthropic::types::{Message, Metadata, OutputConfig, SystemMessage, Thinking};
+use crate::anthropic::usage::UsageRecordQuery;
+use crate::model::config::Config;
+use crate::model::config::StableSegmentCachePolicy;
+use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
+
+fn test_postgres_config() -> Option<Config> {
+    let url = crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL")?;
+    let mut config = Config::default();
+    config.postgres.url = Some(url);
+    config.postgres.max_connections = 2;
+    Some(config)
+}
+
+fn test_redis_config() -> Option<Config> {
+    let url = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL")?;
+    let mut config = Config::default();
+    config.redis.url = Some(url);
+    config.redis.key_prefix = format!("claude_pool:test:account:{}", uuid::Uuid::new_v4());
+    Some(config)
+}
+
+/// For tests that hold `accounts` locked and then expect the refresh to succeed.
+/// The authoritative PG query and caller wait get a long bound, so how long the test takes to
+/// release the lock on a busy runner cannot turn the refresh into a timeout. Tests that assert
+/// the timeout itself keep the production bounds via `test_account_manager`.
+const LOCK_HOLDING_TEST_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn test_account_manager_without_snapshot_timeouts()
+-> Option<(AccountManager, Arc<PostgresStore>)> {
+    let (manager, postgres) = test_account_manager().await?;
+    Some((
+        manager.with_authoritative_pool_snapshot_timeouts(
+            LOCK_HOLDING_TEST_SNAPSHOT_TIMEOUT,
+            LOCK_HOLDING_TEST_SNAPSHOT_TIMEOUT,
+        ),
+        postgres,
+    ))
+}
+
+async fn test_account_manager() -> Option<(AccountManager, Arc<PostgresStore>)> {
+    let Some(postgres_config) = test_postgres_config() else {
+        eprintln!("跳过外部备用池集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+        return None;
+    };
+    let Some(redis_config) = test_redis_config() else {
+        eprintln!("跳过外部备用池集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
+        return None;
+    };
+    let postgres = Arc::new(PostgresStore::connect_test(&postgres_config).await.unwrap());
+    let redis = Arc::new(RedisStore::connect(&redis_config).await.unwrap());
+    Some((AccountManager::new(postgres.clone(), redis), postgres))
+}
+
+enum TestRawHttpBody {
+    DeclaredOnly(usize),
+    Chunked(Vec<u8>),
+    DelayedFixed(Duration, Vec<u8>),
+    StallBeforeHeaders(Duration),
+    StallAfterPrefix,
+    Fixed(Vec<u8>),
+    GzipJson(Vec<u8>),
+}
+
+/// 读取一个 HTTP/1.1 请求的头部和按 Content-Length 声明的 body；读取失败或超时就停止。
+async fn read_full_test_http_request(socket: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let read = match tokio::time::timeout_at(deadline, socket.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(read)) => read,
+        };
+        request.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if request.len() >= header_end + 4 + content_length {
+            return;
+        }
+    }
+}
+
+async fn spawn_test_raw_http_response(
+    status: StatusCode,
+    body: TestRawHttpBody,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // 必须读完整个请求（含 body）再回写响应：请求体超过一次 read 的长度时，带着未读数据
+        // 关闭 socket 会让内核发送 RST，客户端读响应体时就会报 decode error，掩盖真实行为。
+        read_full_test_http_request(&mut socket).await;
+        let reason = status.canonical_reason().unwrap_or("Test");
+        match body {
+            TestRawHttpBody::DeclaredOnly(length) => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    length
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+            }
+            TestRawHttpBody::Chunked(bytes) => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok()
+                    && socket
+                        .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                        .await
+                        .is_ok()
+                    && socket.write_all(&bytes).await.is_ok()
+                {
+                    let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                }
+            }
+            TestRawHttpBody::DelayedFixed(delay, bytes) => {
+                tokio::time::sleep(delay).await;
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&bytes).await;
+                }
+            }
+            TestRawHttpBody::StallBeforeHeaders(delay) => {
+                tokio::time::sleep(delay).await;
+            }
+            TestRawHttpBody::StallAfterPrefix => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx",
+                    status.as_u16(),
+                    reason
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            TestRawHttpBody::Fixed(bytes) => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&bytes).await;
+                }
+            }
+            TestRawHttpBody::GzipJson(bytes) => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&bytes).await;
+                }
+            }
+        }
+    });
+    (format!("http://{address}"), task)
+}
+
+#[derive(Clone, Default)]
+struct AuxiliaryFallbackFakeHits {
+    refresh: Arc<AtomicU64>,
+    profile: Arc<AtomicU64>,
+    local_inference: Arc<AtomicU64>,
+    external_inference: Arc<AtomicU64>,
+}
+
+struct AuxiliaryFallbackFakeServer {
+    base_url: String,
+    hits: AuxiliaryFallbackFakeHits,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AuxiliaryFallbackFakeServer {
+    async fn start() -> Self {
+        async fn refresh(
+            axum::extract::State(hits): axum::extract::State<AuxiliaryFallbackFakeHits>,
+        ) -> impl axum::response::IntoResponse {
+            hits.refresh.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": "server_error"})),
+            )
+        }
+
+        async fn profile(
+            axum::extract::State(hits): axum::extract::State<AuxiliaryFallbackFakeHits>,
+        ) -> impl axum::response::IntoResponse {
+            hits.profile.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"message": "controlled profile failure"})),
+            )
+        }
+
+        async fn local_inference(
+            axum::extract::State(hits): axum::extract::State<AuxiliaryFallbackFakeHits>,
+        ) -> impl axum::response::IntoResponse {
+            hits.local_inference.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"message": "controlled local rejection"})),
+            )
+        }
+
+        async fn external_inference(
+            axum::extract::State(hits): axum::extract::State<AuxiliaryFallbackFakeHits>,
+        ) -> impl axum::response::IntoResponse {
+            hits.external_inference.fetch_add(1, Ordering::Relaxed);
+            axum::Json(serde_json::json!({
+                "id": "msg_external_auxiliary",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "external-ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 7, "output_tokens": 1}
+            }))
+        }
+
+        let hits = AuxiliaryFallbackFakeHits::default();
+        let app = axum::Router::new()
+            .route("/token", axum::routing::post(refresh))
+            .route("/ListAvailableProfiles", axum::routing::post(profile))
+            .route(
+                "/generateAssistantResponse",
+                axum::routing::post(local_inference),
+            )
+            .route("/cc/v1/messages", axum::routing::post(external_inference))
+            .route("/v1/messages", axum::routing::post(external_inference))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auxiliary fallback fake server");
+        let address = listener.local_addr().expect("auxiliary fallback address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve auxiliary fallback fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.hits.refresh.load(Ordering::Acquire),
+            self.hits.profile.load(Ordering::Acquire),
+            self.hits.local_inference.load(Ordering::Acquire),
+            self.hits.external_inference.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl Drop for AuxiliaryFallbackFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+struct ExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: serde_json::Value,
+    request_bodies: Arc<SyncMutex<Vec<Bytes>>>,
+}
+
+struct ExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    request_bodies: Arc<SyncMutex<Vec<Bytes>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExternalMessagesFakeServer {
+    async fn start(status: StatusCode, body: serde_json::Value) -> Self {
+        Self::start_with_headers(status, HeaderMap::new(), body).await
+    }
+
+    async fn start_with_headers(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: serde_json::Value,
+    ) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<ExternalMessagesFakeState>,
+            body: Bytes,
+        ) -> impl axum::response::IntoResponse {
+            state.hits.fetch_add(1, Ordering::Relaxed);
+            state.request_bodies.lock().push(body);
+            (state.status, state.headers.clone(), axum::Json(state.body))
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let request_bodies = Arc::new(SyncMutex::new(Vec::new()));
+        let state = ExternalMessagesFakeState {
+            hits: hits.clone(),
+            status,
+            headers,
+            body,
+            request_bodies: request_bodies.clone(),
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .route("/cc/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind external messages fake server");
+        let address = listener.local_addr().expect("external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            request_bodies,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> u64 {
+        self.hits.load(Ordering::Acquire)
+    }
+
+    fn request_bodies(&self) -> Vec<Bytes> {
+        self.request_bodies.lock().clone()
+    }
+}
+
+impl Drop for ExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+enum ExternalStreamFakeStep {
+    Chunk(Vec<u8>),
+    Delay(Duration),
+    Error(String),
+}
+
+impl ExternalStreamFakeStep {
+    fn chunk(data: impl Into<Vec<u8>>) -> Self {
+        Self::Chunk(data.into())
+    }
+
+    fn delay(duration: Duration) -> Self {
+        Self::Delay(duration)
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self::Error(message.into())
+    }
+}
+
+#[derive(Clone)]
+struct ExternalStreamFakeState {
+    hits: Arc<AtomicU64>,
+    status: StatusCode,
+    steps: Arc<Vec<ExternalStreamFakeStep>>,
+}
+
+struct ExternalStreamFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExternalStreamFakeServer {
+    async fn start(steps: Vec<ExternalStreamFakeStep>) -> Self {
+        Self::start_with_status(StatusCode::OK, steps).await
+    }
+
+    async fn start_with_status(status: StatusCode, steps: Vec<ExternalStreamFakeStep>) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<ExternalStreamFakeState>,
+        ) -> Response {
+            state.hits.fetch_add(1, Ordering::Relaxed);
+            let steps = state.steps.clone();
+            let stream =
+                futures::stream::unfold((steps, 0usize), |(steps, mut index)| async move {
+                    loop {
+                        let step = steps.get(index).cloned()?;
+                        index = index.saturating_add(1);
+                        match step {
+                            ExternalStreamFakeStep::Chunk(bytes) => {
+                                return Some((
+                                    Ok::<Bytes, std::io::Error>(Bytes::from(bytes)),
+                                    (steps, index),
+                                ));
+                            }
+                            ExternalStreamFakeStep::Delay(duration) => {
+                                tokio::time::sleep(duration).await;
+                            }
+                            ExternalStreamFakeStep::Error(message) => {
+                                return Some((Err(std::io::Error::other(message)), (steps, index)));
+                            }
+                        }
+                    }
+                });
+            Response::builder()
+                .status(state.status)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .expect("build external stream fake response")
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let state = ExternalStreamFakeState {
+            hits: hits.clone(),
+            status,
+            steps: Arc::new(steps),
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind external stream fake server");
+        let address = listener.local_addr().expect("external stream address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve external stream fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> u64 {
+        self.hits.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ExternalStreamFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+struct FlakyExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    remaining_failures: Arc<AtomicU64>,
+    failure_status: StatusCode,
+    failure_body: serde_json::Value,
+    success_body: serde_json::Value,
+}
+
+struct FlakyExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FlakyExternalMessagesFakeServer {
+    async fn start_failures_then_success(
+        failure_count: u64,
+        failure_status: StatusCode,
+        failure_body: serde_json::Value,
+        success_body: serde_json::Value,
+    ) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<FlakyExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            state.hits.fetch_add(1, Ordering::Relaxed);
+            let previous = state.remaining_failures.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| (current > 0).then(|| current - 1),
+            );
+            if previous.is_ok() {
+                (state.failure_status, axum::Json(state.failure_body.clone()))
+            } else {
+                (StatusCode::OK, axum::Json(state.success_body.clone()))
+            }
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let state = FlakyExternalMessagesFakeState {
+            hits: hits.clone(),
+            remaining_failures: Arc::new(AtomicU64::new(failure_count)),
+            failure_status,
+            failure_body,
+            success_body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind flaky external messages fake server");
+        let address = listener
+            .local_addr()
+            .expect("flaky external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve flaky external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> u64 {
+        self.hits.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for FlakyExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+struct TurbulentExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    fail_until_hit: u64,
+    fail_percent: u8,
+    seed: u64,
+    statuses: Arc<Vec<(StatusCode, String)>>,
+    success_body: serde_json::Value,
+}
+
+struct TurbulentExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TurbulentExternalMessagesFakeServer {
+    async fn start(
+        fail_until_hit: u64,
+        fail_percent: u8,
+        seed: u64,
+        statuses: Vec<(StatusCode, &str)>,
+        success_body: serde_json::Value,
+    ) -> Self {
+        assert!(!statuses.is_empty(), "turbulent statuses must not be empty");
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<TurbulentExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            let hit = state.hits.fetch_add(1, Ordering::Relaxed) + 1;
+            let should_fail = hit <= state.fail_until_hit
+                && deterministic_failure_percent(hit, state.seed) < state.fail_percent as u64;
+            if should_fail {
+                state.failures.fetch_add(1, Ordering::Relaxed);
+                let index = deterministic_failure_percent(hit, state.seed ^ 0x51d7_34a3) as usize
+                    % state.statuses.len();
+                let (status, message) = &state.statuses[index];
+                return (*status, axum::Json(fake_external_error_body(message)));
+            }
+            (StatusCode::OK, axum::Json(state.success_body.clone()))
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let state = TurbulentExternalMessagesFakeState {
+            hits: hits.clone(),
+            failures: failures.clone(),
+            fail_until_hit,
+            fail_percent: fail_percent.min(100),
+            seed,
+            statuses: Arc::new(
+                statuses
+                    .into_iter()
+                    .map(|(status, message)| (status, message.to_string()))
+                    .collect(),
+            ),
+            success_body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind turbulent external messages fake server");
+        let address = listener
+            .local_addr()
+            .expect("turbulent external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve turbulent external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            failures,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Acquire),
+            self.failures.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl Drop for TurbulentExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+enum PatternExternalMessagesBehavior {
+    AlwaysSuccess,
+    AlwaysFail {
+        status: StatusCode,
+        message: String,
+    },
+    FailFirst {
+        count: u64,
+        status: StatusCode,
+        message: String,
+    },
+    Intermittent {
+        fail_percent: u8,
+        seed: u64,
+        statuses: Arc<Vec<(StatusCode, String)>>,
+    },
+    /// 成功但慢：响应前固定延迟，用于制造"首字慢 / 总耗时长"的质量信号。
+    ///
+    /// 非流式响应下首字与总耗时是同一个时间点，因此一个延迟参数即可覆盖
+    /// D2 的两种慢信号；两者在评分中走不同的归一化项，已由通路 A 单测分别覆盖。
+    SlowSuccess {
+        delay: Duration,
+    },
+}
+
+#[derive(Clone)]
+struct PatternExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    behavior: PatternExternalMessagesBehavior,
+    success_body: serde_json::Value,
+}
+
+struct PatternExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PatternExternalMessagesFakeServer {
+    async fn start(
+        behavior: PatternExternalMessagesBehavior,
+        success_body: serde_json::Value,
+    ) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<PatternExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            let hit = state.hits.fetch_add(1, Ordering::Relaxed) + 1;
+            let failure = match &state.behavior {
+                PatternExternalMessagesBehavior::AlwaysSuccess => None,
+                PatternExternalMessagesBehavior::AlwaysFail { status, message } => {
+                    Some((*status, message.as_str()))
+                }
+                PatternExternalMessagesBehavior::FailFirst {
+                    count,
+                    status,
+                    message,
+                } if hit <= *count => Some((*status, message.as_str())),
+                PatternExternalMessagesBehavior::FailFirst { .. } => None,
+                PatternExternalMessagesBehavior::Intermittent {
+                    fail_percent,
+                    seed,
+                    statuses,
+                } if deterministic_failure_percent(hit, *seed)
+                    < (*fail_percent).min(100) as u64 =>
+                {
+                    let index = deterministic_failure_percent(hit, *seed ^ 0x0ddc_0ffe) as usize
+                        % statuses.len();
+                    let (status, message) = &statuses[index];
+                    Some((*status, message.as_str()))
+                }
+                PatternExternalMessagesBehavior::Intermittent { .. } => None,
+                PatternExternalMessagesBehavior::SlowSuccess { delay } => {
+                    tokio::time::sleep(*delay).await;
+                    None
+                }
+            };
+            if let Some((status, message)) = failure {
+                state.failures.fetch_add(1, Ordering::Relaxed);
+                return (status, axum::Json(fake_external_error_body(message)));
+            }
+            (StatusCode::OK, axum::Json(state.success_body.clone()))
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let state = PatternExternalMessagesFakeState {
+            hits: hits.clone(),
+            failures: failures.clone(),
+            behavior,
+            success_body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pattern external messages fake server");
+        let address = listener
+            .local_addr()
+            .expect("pattern external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve pattern external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            failures,
+            task,
+        }
+    }
+
+    async fn always_success(text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::AlwaysSuccess,
+            fake_external_success_body(text),
+        )
+        .await
+    }
+
+    /// 成功但慢的上游：用于制造首字/耗时劣化的质量信号。
+    async fn slow_success(delay: Duration, text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::SlowSuccess { delay },
+            fake_external_success_body(text),
+        )
+        .await
+    }
+
+    async fn always_fail(status: StatusCode, message: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::AlwaysFail {
+                status,
+                message: message.to_string(),
+            },
+            fake_external_success_body("unused"),
+        )
+        .await
+    }
+
+    async fn fail_first(count: u64, status: StatusCode, message: &str, success_text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::FailFirst {
+                count,
+                status,
+                message: message.to_string(),
+            },
+            fake_external_success_body(success_text),
+        )
+        .await
+    }
+
+    async fn intermittent(
+        fail_percent: u8,
+        seed: u64,
+        statuses: Vec<(StatusCode, &str)>,
+        success_text: &str,
+    ) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::Intermittent {
+                fail_percent,
+                seed,
+                statuses: Arc::new(
+                    statuses
+                        .into_iter()
+                        .map(|(status, message)| (status, message.to_string()))
+                        .collect(),
+                ),
+            },
+            fake_external_success_body(success_text),
+        )
+        .await
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Acquire),
+            self.failures.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl Drop for PatternExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn deterministic_failure_percent(index: u64, seed: u64) -> u64 {
+    let mut mixed = index.wrapping_add(seed).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    mixed ^= mixed >> 33;
+    mixed % 100
+}
+
+fn fake_external_success_body(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "msg_external_retry",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 7, "output_tokens": 1}
+    })
+}
+
+fn fake_external_error_body(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {"type": "api_error", "message": message},
+        "type": "error"
+    })
+}
+
+fn external_sse_event(name: &str, value: serde_json::Value) -> String {
+    format!("event: {name}\ndata: {value}\n\n")
+}
+
+fn external_sse_message_start(id: &str, input_tokens: i32) -> String {
+    external_sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": null,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+            }
+        }),
+    )
+}
+
+fn external_sse_ping() -> String {
+    external_sse_event("ping", serde_json::json!({"type": "ping"}))
+}
+
+fn external_sse_text_start() -> String {
+    external_sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    )
+}
+
+fn external_sse_text_delta(text: &str) -> String {
+    external_sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    )
+}
+
+fn external_sse_text_stop() -> String {
+    external_sse_event(
+        "content_block_stop",
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+    )
+}
+
+fn external_sse_message_delta(input_tokens: i32, output_tokens: i32) -> String {
+    external_sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        }),
+    )
+}
+
+fn external_sse_message_stop() -> String {
+    external_sse_event("message_stop", serde_json::json!({"type": "message_stop"}))
+}
+
+async fn read_response_body_text_allow_error(response: Response) -> (String, Option<String>) {
+    let mut stream = response.into_body().into_data_stream();
+    let mut body = Vec::new();
+    let mut error = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => body.extend_from_slice(&chunk),
+            Err(err) => {
+                error = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    (String::from_utf8_lossy(&body).into_owned(), error)
+}
+
+async fn create_messages_pool(
+    postgres: &PostgresStore,
+    name: &str,
+    priority: i32,
+    base_url: &str,
+) -> Account {
+    let mut request = create_pool_request(name, priority, true);
+    request.base_url = base_url.to_string();
+    request.max_concurrent_requests = 4;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    postgres.create_account(request).await.unwrap()
+}
+
+async fn create_messages_pool_with_concurrency(
+    postgres: &PostgresStore,
+    name: &str,
+    priority: i32,
+    base_url: &str,
+    max_concurrent_requests: u32,
+) -> Account {
+    let mut request = create_pool_request(name, priority, true);
+    request.base_url = base_url.to_string();
+    request.max_concurrent_requests = max_concurrent_requests;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    postgres.create_account(request).await.unwrap()
+}
+
+async fn assert_external_bounded_body_recovery(
+    client: &reqwest::Client,
+    status: StatusCode,
+    max_bytes: usize,
+    round: usize,
+    stage: &str,
+) {
+    let (url, server) =
+        spawn_test_raw_http_response(status, TestRawHttpBody::Fixed(b"ok".to_vec())).await;
+    let response = client.get(url).send().await.unwrap();
+    let body = response_bytes_with_limit_and_body_timeout(response, 2, max_bytes)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"ok", "{stage} recovery round {round}");
+    server.await.unwrap();
+}
+
+async fn run_external_coordinator_perf_round(
+    manager: Arc<AccountManager>,
+    direct_redis: Arc<RedisStore>,
+    config: Arc<AccountsConfig>,
+    route: Arc<AccountRouteRequest>,
+    requests: usize,
+    concurrency: usize,
+) -> Vec<Result<Duration, String>> {
+    let authoritative_pools = match manager.load_authoritative_pool_snapshot().await {
+        Ok(pools) => pools,
+        Err(unavailable) => {
+            return vec![
+                Err(format!(
+                    "PostgreSQL selection unavailable before Redis perf round: {}",
+                    unavailable.kind.as_str()
+                ));
+                requests
+            ];
+        }
+    };
+    futures::stream::iter(0..requests)
+        .map(|_| {
+            let manager = manager.clone();
+            let authoritative_pools = authoritative_pools.clone();
+            let direct_redis = direct_redis.clone();
+            let config = config.clone();
+            let route = route.clone();
+            async move {
+                let started = Instant::now();
+                let selection = manager
+                    .select_pool_for_route_from_snapshot(
+                        &authoritative_pools,
+                        &HashSet::new(),
+                        &config,
+                        &route,
+                    )
+                    .await;
+                let pool = selection.selected_pool.ok_or_else(|| {
+                    format!(
+                        "selection unavailable: coordinator={}, available={}, temporary={}",
+                        selection.availability.coordinator_unavailable,
+                        selection.availability.available_pools,
+                        selection.availability.temporary_unavailable_pools
+                    )
+                })?;
+                let lease = match manager.acquire_pool_for_route(&pool, &config, &route).await {
+                    PoolAcquireResult::Acquired(lease) => lease,
+                    PoolAcquireResult::Unavailable(unavailable) => {
+                        return Err(format!("acquire unavailable: {}", unavailable.detail));
+                    }
+                };
+                let lease_id = lease.lease_id.clone();
+                lease.disarm();
+                let released = direct_redis
+                    .release_account_confirmed_lease(pool.id, &lease_id)
+                    .await
+                    .map_err(|err| format!("direct release failed: {err}"))?;
+                if !released {
+                    return Err("direct release did not find the confirmed lease".to_string());
+                }
+                Ok(started.elapsed())
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await
+}
+
+fn external_perf_percentile_micros(sorted: &[u128], percentile: usize) -> u128 {
+    let index = sorted
+        .len()
+        .saturating_sub(1)
+        .saturating_mul(percentile.min(100))
+        .saturating_add(99)
+        / 100;
+    sorted[index.min(sorted.len().saturating_sub(1))]
+}
+
+fn external_perf_process_rss_kib() -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+fn external_perf_open_fd_count() -> Option<usize> {
+    std::fs::read_dir("/dev/fd")
+        .ok()
+        .map(|entries| entries.count())
+}
+
+fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateAccountRequest {
+    CreateAccountRequest {
+        tags: Vec::new(),
+        proxy_url: None,
+        cost_multiplier: 1.0,
+        overrides: Default::default(),
+        name: name.to_string(),
+        base_url: format!("https://{}.example.test", name),
+        api_key: format!("sk-{}", name),
+        auth_type: AccountAuthType::Bearer,
+        header_profile: AccountHeaderProfile::Generic,
+        append_beta_query: false,
+        header_overrides: HashMap::new(),
+        wire_profile: AccountWireProfile::Default,
+        tls_profile: AccountTlsProfile::Default,
+        enabled,
+        priority,
+        max_concurrent_requests: 1,
+        usage_projection_mode: UsageProjectionMode::PassThrough,
+        stream_response_mode: None,
+
+        auto_disable_policy: AutoDisablePolicy::Inherit,
+        pre_output_stream_retry_mode: StreamRetryMode::Inherit,
+
+        normalize_model_version_dots: false,
+        model_mapping_mode: ModelMappingMode::PassthroughMapping,
+        model_mapping_require_match: false,
+        model_mapping_rules: Vec::new(),
+        supported_models: Vec::new(),
+        route_mode: RouteRuleMode::AllowAll,
+        route_rules: Vec::new(),
+        notes: None,
+    }
+}
+
+async fn lock_account_table(
+    postgres: &PostgresStore,
+) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    let mut connection = postgres.pool().acquire().await.unwrap();
+    sqlx::query("BEGIN")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    connection
+}
+
+async fn unlock_account_table(mut connection: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+}
+
+async fn restore_dispatch_pool_configuration(
+    postgres: &PostgresStore,
+    pool_id: u64,
+    base_url: &str,
+    api_key: &str,
+    supported_model: &str,
+) {
+    sqlx::query(
+        r#"
+        UPDATE accounts
+        SET base_url = $2,
+            api_key = $3,
+            auth_type = 'bearer',
+            max_concurrent_requests = 1,
+            usage_projection_mode = 'pass_through',
+            stream_response_mode = NULL,
+
+
+            auto_disable_policy = 'inherit',
+            model_mapping_mode = 'passthrough_mapping',
+            model_mapping_require_match = false,
+            model_mapping_rules = '[]'::jsonb,
+            supported_models = $4,
+            revision = revision + 1,
+            updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(pool_id as i64)
+    .bind(base_url)
+    .bind(api_key)
+    .bind(json!([supported_model]))
+    .execute(postgres.pool())
+    .await
+    .unwrap();
+}
+
+async fn corrupt_dispatch_pool_configuration(postgres: &PostgresStore, pool_id: u64, case: &str) {
+    let query = match case {
+        "base_url" => {
+            "UPDATE accounts SET base_url = 'ftp://invalid.example', revision = revision + 1 WHERE id = $1"
+        }
+        "base_url_without_host" => {
+            "UPDATE accounts SET base_url = 'http://', revision = revision + 1 WHERE id = $1"
+        }
+        "api_key" => "UPDATE accounts SET api_key = '', revision = revision + 1 WHERE id = $1",
+        "auth_type" => {
+            "UPDATE accounts SET auth_type = 'corrupt', revision = revision + 1 WHERE id = $1"
+        }
+        "max_concurrent_requests" => {
+            "UPDATE accounts SET max_concurrent_requests = 0, revision = revision + 1 WHERE id = $1"
+        }
+        "usage_projection_mode" => {
+            "UPDATE accounts SET usage_projection_mode = 'corrupt', revision = revision + 1 WHERE id = $1"
+        }
+        "stream_response_mode" => {
+            "UPDATE accounts SET stream_response_mode = 'corrupt', revision = revision + 1 WHERE id = $1"
+        }
+        "auto_disable_policy" => {
+            "UPDATE accounts SET auto_disable_policy = 'corrupt', revision = revision + 1 WHERE id = $1"
+        }
+        "model_mapping_mode" => {
+            "UPDATE accounts SET model_mapping_mode = 'corrupt', revision = revision + 1 WHERE id = $1"
+        }
+        "model_mapping_rules" => {
+            "UPDATE accounts SET model_mapping_rules = '{\"invalid\":true}'::jsonb, revision = revision + 1 WHERE id = $1"
+        }
+        "model_mapping_rules_blank" => {
+            "UPDATE accounts SET model_mapping_rules = '[{\"enabled\":true,\"source\":\"\",\"target\":\"\"}]'::jsonb, revision = revision + 1 WHERE id = $1"
+        }
+        "supported_models" => {
+            "UPDATE accounts SET supported_models = '{\"invalid\":true}'::jsonb, revision = revision + 1 WHERE id = $1"
+        }
+        "supported_models_blank" => {
+            "UPDATE accounts SET supported_models = '[\"\"]'::jsonb, revision = revision + 1 WHERE id = $1"
+        }
+        _ => panic!("unknown corrupt dispatch pool case: {case}"),
+    };
+    sqlx::query(query)
+        .bind(pool_id as i64)
+        .execute(postgres.pool())
+        .await
+        .unwrap();
+}
+
+async fn wait_for_static_pool_background_idle(manager: &AccountManager, wait_for: Duration) {
+    timeout(wait_for, async {
+        loop {
+            if manager.static_pool_snapshot_background_in_flight_for_test() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("static pool background refresh must become idle");
+}
+
+async fn wait_for_static_pool_pg_loads(
+    manager: &AccountManager,
+    expected: u64,
+    wait_for: Duration,
+) {
+    timeout(wait_for, async {
+        loop {
+            if manager.static_pool_snapshot_pg_loads_for_test() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("static pool PostgreSQL load counter must reach expected value");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_authoritative_refresh_survives_leader_cancellation_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager_without_snapshot_timeouts().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("authoritative-cancel-safe", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=5 {
+        manager.invalidate_static_pool_snapshot();
+        let blocker = lock_account_table(&postgres).await;
+        let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+        let caller_manager = manager.clone();
+        let caller =
+            tokio::spawn(async move { caller_manager.load_authoritative_pool_snapshot().await });
+        // The manager's own query and wait bounds are raised (see the helper), so the time this
+        // test needs to cancel the caller and release the lock cannot time the refresh out.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.authoritative_pool_snapshot_pg_loads_for_test() > loads_before {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: manager-owned PG refresh did not start"));
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled(), "round {round}");
+        unlock_account_table(blocker).await;
+
+        let snapshot = timeout(
+            Duration::from_secs(5),
+            manager.load_authoritative_pool_snapshot(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: surviving refresh did not publish"))
+        .expect("manager-owned refresh must survive caller cancellation");
+        assert!(snapshot.iter().any(|candidate| candidate.id == pool.id));
+        assert_eq!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: cancellation must not start a replacement PG query"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+fn assert_public_message_hides_internal_routing(message: &str) {
+    let lower = message.to_ascii_lowercase();
+    for forbidden in [
+        "credential",
+        "account",
+        "account",
+        "fallback",
+        "preflight",
+        "备用池",
+        "账号",
+        "凭据",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "public message leaked internal term {forbidden:?}: {message}"
+        );
+    }
+}
+
+pub(crate) fn test_pool(base_url: &str, _legacy_path: bool) -> Account {
+    let now = Utc::now();
+    Account {
+        tags: Vec::new(),
+        proxy_url: None,
+        cost_multiplier: 1.0,
+        overrides: Default::default(),
+        id: 1,
+        revision: 1,
+        name: "test".to_string(),
+        base_url: base_url.to_string(),
+        api_key: Some("sk-test".to_string()),
+        masked_api_key: None,
+        auth_type: AccountAuthType::Bearer,
+        header_profile: AccountHeaderProfile::Generic,
+        append_beta_query: false,
+        header_overrides: HashMap::new(),
+        wire_profile: AccountWireProfile::Default,
+        tls_profile: AccountTlsProfile::Default,
+        enabled: true,
+        priority: 10,
+        max_concurrent_requests: 10,
+        usage_projection_mode: UsageProjectionMode::PassThrough,
+        stream_response_mode: None,
+
+        auto_disable_policy: AutoDisablePolicy::Inherit,
+        pre_output_stream_retry_mode: StreamRetryMode::Inherit,
+        auto_disabled: false,
+        auto_disabled_reason: None,
+        auto_disabled_at: None,
+        auto_disabled_until: None,
+        auto_disabled_last_error: None,
+        normalize_model_version_dots: false,
+        model_mapping_mode: ModelMappingMode::PassthroughMapping,
+        model_mapping_require_match: false,
+        model_mapping_rules: Vec::new(),
+        supported_models: Vec::new(),
+        route_mode: RouteRuleMode::AllowAll,
+        route_rules: Vec::new(),
+        notes: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn model_rule(source: &str, target: &str) -> ModelMappingRule {
+    ModelMappingRule {
+        enabled: true,
+        source: source.to_string(),
+        target: target.to_string(),
+        kind: Default::default(),
+        note: None,
+    }
+}
+
+fn test_pool_with_model_dot_normalization() -> Account {
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.normalize_model_version_dots = true;
+    pool
+}
+
+fn test_account_outbound_body(route: &AccountRouteRequest, pool: &Account) -> Bytes {
+    account_outbound_body(route, pool).expect("build external outbound body")
+}
+
+fn payload_ref(route: &AccountRouteRequest) -> &MessagesRequest {
+    route.payload.as_ref().expect("typed test route payload")
+}
+
+fn payload_mut(route: &mut AccountRouteRequest) -> &mut MessagesRequest {
+    route.payload.as_mut().expect("typed test route payload")
+}
+
+fn refresh_test_route_derived_state(route: &mut AccountRouteRequest) {
+    let request_input_tokens = count_external_route_input_tokens(payload_ref(route));
+    route.request_input_tokens = request_input_tokens;
+    route.effective_raw_body = Bytes::from(serde_json::to_vec(payload_ref(route)).unwrap());
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+    route.reset_preparation_cache();
+}
+
+pub(crate) fn test_route(model: &str) -> AccountRouteRequest {
+    let payload = test_payload(model);
+    let request_input_tokens = count_external_route_input_tokens(&payload);
+    AccountRouteRequest {
+        history_sanitize_enabled: false,
+        effective_raw_body: Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        effective_raw_probe: None,
+        preparation_cache: Arc::new(AccountRouteRequestPreparationCache::default()),
+        raw_body: Bytes::new(),
+        headers: HeaderMap::new(),
+        endpoint: "/cc/v1/messages".to_string(),
+        payload: Some(payload),
+
+        model_hint: None,
+        stream_hint: None,
+        request_input_tokens,
+        upstream_model: Some(model.to_string()),
+        model_resolution_source: Some("exact_upstream".to_string()),
+        model_resolution_note: None,
+        route_subtype: UsageRouteSubtype::Account,
+
+        reported_usage: {
+            let config = Config::default();
+            ReportedUsageConfig {
+                default: config
+                    .cache_policy_for_path("/cc/v1/messages")
+                    .policy
+                    .reported_usage,
+            }
+        },
+        prompt_cache: Arc::new(PromptCacheTracker::default()),
+        prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+        prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
+        prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
+        prompt_cache_route_namespace: None,
+        cache_ttl_mode: crate::model::config::CacheTtlMode::default(),
+        prompt_cache_target_read_ratio: 0.98,
+        prompt_cache_token_scale: 1.6,
+        prompt_cache_max_simulated_input_tokens: 300_000,
+        prompt_cache_cap_jitter_min_tokens: 12_000,
+        prompt_cache_cap_jitter_max_tokens: 24_000,
+        prompt_cache_scale_min_input_tokens: 20_000,
+        prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+        prompt_cache_bounds: PromptCacheBounds::default(),
+        prefix_tool_cache_policy: PrefixToolCachePolicy::default(),
+        prefix_tool_plus_cache_policy: crate::model::config::PrefixToolPlusCachePolicy::default(),
+        stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy::disabled(),
+        model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        request_id: "req_external_billing".to_string(),
+        error_id: "req_error_external_billing".to_string(),
+        recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
+        started_at: Instant::now(),
+        stream_pre_output_hold: None,
+        early_commit: None,
+        first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        latency_trace: Arc::new(ExternalLatencyTraceState::default()),
+        payload_breakdown: None,
+        payload_guard_report: None,
+        payload_guard_external_enabled: true,
+        payload_guard_initial_config: PayloadGuardConfig {
+            enabled: true,
+            max_bytes: 0,
+
+            trim_history: false,
+            shaping: crate::model::config::PayloadShapingConfig::default(),
+        },
+        payload_guard_retry_config: None,
+        inference_attempt_budget: Arc::new(
+            crate::anthropic::inference_attempt_budget::InferenceAttemptBudget::new(4),
+        ),
+        request_api_key_id: None,
+    }
+}
+
+fn raw_test_route(raw_body: &[u8]) -> AccountRouteRequest {
+    let mut route = test_route("raw-placeholder");
+    route.effective_raw_body = Bytes::copy_from_slice(raw_body);
+    route.raw_body = route.effective_raw_body.clone();
+    let raw_probe = Arc::new(probe_raw_messages_body(&route.effective_raw_body));
+    let model_hint = raw_probe.model.clone();
+    let stream_hint = raw_probe.stream;
+    route.effective_raw_probe = Some(raw_probe);
+    route.payload = None;
+
+    route.model_hint = model_hint;
+    route.stream_hint = stream_hint;
+    route.request_input_tokens = 0;
+    route.upstream_model = None;
+    route.model_resolution_source = None;
+    route
+}
+
+fn test_payload(model: &str) -> MessagesRequest {
+    MessagesRequest {
+        model: model.to_string(),
+        max_tokens: 8,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+        }],
+        stream: false,
+        // Marked like Claude Code's system prompt, so non-streaming shaping applies.
+        system: Some(vec![SystemMessage {
+            text: "You are a careful coding assistant. ".repeat(500),
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        output_format: None,
+        metadata: Some(Metadata {
+            user_id: Some("user_test_account__session_external-projection-session".to_string()),
+        }),
+        stop_sequences: None,
+    }
+}
+
+fn projection_context(
+    route: &AccountRouteRequest,
+    pool: &Account,
+    uplift_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    projection_context_with_output_uplift(route, pool, uplift_percent, false, 10, 0, 0)
+}
+
+fn projection_context_with_cost_floor(
+    route: &AccountRouteRequest,
+    pool: &Account,
+    uplift_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    projection_context_with_cost_floor_margin(route, pool, uplift_percent, 10)
+}
+
+fn projection_context_with_cost_floor_margin(
+    route: &AccountRouteRequest,
+    pool: &Account,
+    uplift_percent: u32,
+    cost_floor_margin_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    projection_context_with_output_uplift(
+        route,
+        pool,
+        uplift_percent,
+        true,
+        cost_floor_margin_percent,
+        0,
+        0,
+    )
+}
+
+pub(super) fn projection_context_with_output_uplift(
+    route: &AccountRouteRequest,
+    pool: &Account,
+    uplift_percent: u32,
+    cost_floor_enabled: bool,
+    cost_floor_margin_percent: u32,
+    output_uplift_min_tokens: i32,
+    output_uplift_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    build_external_usage_projection_context(
+        route,
+        pool,
+        uplift_percent,
+        cost_floor_enabled,
+        cost_floor_margin_percent,
+        output_uplift_min_tokens,
+        output_uplift_percent,
+    )
+}
+
+fn configure_usage_projection_test_path(
+    route: &mut AccountRouteRequest,
+    policy: ReportedUsagePathPolicy,
+) {
+    route.endpoint = "/usage-policy/v1/messages".to_string();
+    route.reported_usage.default = policy;
+    route.reset_preparation_cache();
+}
+
+fn disable_path_output_postprocess(route: &mut AccountRouteRequest) {
+    route.reported_usage.default.final_output_guard_enabled = false;
+}
+
+fn event_usage_i64(event: &str, key: &str) -> i64 {
+    event
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("data:"))
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+        .and_then(|value| value.get("usage").and_then(|usage| usage.get(key)).cloned())
+        .and_then(|value| value.as_i64())
+        .expect("usage field")
+}
+
+fn event_data_value(event: &[u8]) -> serde_json::Value {
+    let text = std::str::from_utf8(event).expect("event utf8");
+    text.lines()
+        .find_map(|line| line.trim_start().strip_prefix("data:"))
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+        .expect("event data json")
+}
+
+fn assert_projected_cache_creation_consistent(usage: &serde_json::Value) {
+    let aggregate = usage["cache_creation_input_tokens"]
+        .as_i64()
+        .expect("cache_creation_input_tokens");
+    let five_min = usage["cache_creation"]["ephemeral_5m_input_tokens"]
+        .as_i64()
+        .expect("ephemeral_5m_input_tokens");
+    let one_hour = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+        .as_i64()
+        .expect("ephemeral_1h_input_tokens");
+
+    assert_eq!(aggregate, five_min + one_hour);
+}
+
+fn transcript_sse_event(event: &str, value: serde_json::Value) -> Vec<u8> {
+    format!("event: {event}\ndata: {value}\n\n").into_bytes()
+}
+
+fn transcript_multiline_crlf_sse_event(event: &str, value: serde_json::Value) -> Vec<u8> {
+    let pretty = serde_json::to_string_pretty(&value).unwrap();
+    let mut output = format!("event: {event}\r\n");
+    for line in pretty.lines() {
+        output.push_str("data: ");
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+    output.push_str("\r\n");
+    output.into_bytes()
+}
+
+fn process_external_transcript_events(events: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+    let mut state = ExternalAnthropicTranscriptState::new(["Bash".to_string()]);
+    let mut output = Vec::new();
+    for event in events {
+        output.extend(state.process(&event));
+    }
+    output.extend(state.finish());
+    output
+}
+
+fn process_external_transcript_stream_one_byte_at_a_time(stream: &[u8]) -> Vec<u8> {
+    let mut state = ExternalAnthropicTranscriptState::new(["Bash".to_string()]);
+    let mut buffer = Vec::new();
+    let mut output = Vec::new();
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    for byte in stream {
+        buffer.push(*byte);
+        output.extend(drain_sse_events_with_transcript(
+            &mut buffer,
+            None,
+            None,
+            None,
+            plan,
+            Some(&mut state),
+        ));
+    }
+    assert!(buffer.is_empty());
+    output.extend(state.finish());
+    output
+}
+
+// ---- 账号被动质量采样：错误归因单元测试 ----
+
+fn quality_test_error(
+    status: Option<StatusCode>,
+    message: &str,
+    cooldown_reason: Option<&str>,
+) -> AccountError {
+    AccountError {
+        status,
+        message: message.to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: cooldown_reason.map(|reason| (Duration::from_secs(10), reason.to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    }
+}
+
+/// 构造一个无质量数据的调度候选（等价于冷启动/无样本状态）。
+fn candidate(pool: Account, in_flight: u32, transient_failure_streak: u32) -> AccountCandidate {
+    AccountCandidate {
+        pool,
+        in_flight,
+        transient_failure_streak,
+        quality: None,
+    }
+}
+
+/// 构造一个带质量数据的调度候选。
+fn quality_candidate(
+    pool: Account,
+    in_flight: u32,
+    transient_failure_streak: u32,
+    quality: AccountQualityState,
+) -> AccountCandidate {
+    AccountCandidate {
+        pool,
+        in_flight,
+        transient_failure_streak,
+        quality: Some(quality),
+    }
+}
+
+// ============================================================================
+// P0-b 质量感知选择：单元测试 + 通路 A 高并发分布测试
+// 测试维度设计见 docs/plantree/.../quality-aware-scheduling-test-matrix.md
+// ============================================================================
+
+/// 构造带指定质量信号的池候选。
+fn scored_pool(
+    id: u64,
+    priority: i32,
+    error_rate: f64,
+    ttft_ms: Option<f64>,
+    latency_ms: Option<f64>,
+) -> AccountCandidate {
+    let mut pool = test_pool(&format!("https://pool-{id}.example.test"), true);
+    pool.id = id;
+    pool.priority = priority;
+    pool.max_concurrent_requests = 64;
+    quality_candidate(
+        pool,
+        0,
+        0,
+        AccountQualityState {
+            recent_error_rate: error_rate,
+            ttft_ewma_ms: ttft_ms,
+            latency_ewma_ms: latency_ms,
+            sample_count: 100,
+            ..Default::default()
+        },
+    )
+}
+
+/// 跑 N 次选择，返回每个池的命中份额。
+///
+/// 选择函数用未播种的 `fastrand` 做打散，因此只能做统计断言。
+/// 样本量取 4000 以保证份额断言稳定。
+fn selection_shares(
+    candidates: &[AccountCandidate],
+    config: &AccountsConfig,
+    now_ms: i64,
+    rounds: usize,
+) -> HashMap<u64, f64> {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    for _ in 0..rounds {
+        let selected = select_account_candidate(candidates.to_vec(), config, now_ms)
+            .expect("候选集非空时必须能选出一个池");
+        *counts.entry(selected.id).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(id, count)| (id, count as f64 / rounds as f64))
+        .collect()
+}
+
+const DISTRIBUTION_ROUNDS: usize = 4_000;
+
+fn quality_enabled_config() -> AccountsConfig {
+    AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        ..AccountsConfig::default()
+    }
+}
+
+// ---- L2-14：主开关关闭等价性（防回归总闸门，必须最先通过）----
+
+// ---- 优先级硬分层（P0-b 修正的核心不变量）----
+
+// ---- 失败率优先级高于延迟曲线（用户明确要求）----
+
+// ---- 可用性底线：降级时保证可用 ----
+
+// ---- 冷启动 / 样本不足 ----
+
+// ---- Top-K 边界 ----
+
+// ---- 相对中位数归一化的数学性质 ----
+
+// ============================================================================
+// P1 劣化判定 / 指数退避 / 探测流量 / 恢复爬坡：单元测试
+// 对应测试矩阵 D3（时间与恢复轨迹）
+// ============================================================================
+
+/// 构造一个已累积足够样本的质量状态。
+fn degrade_state(error_rate: f64, probation_level: u32) -> AccountQualityState {
+    AccountQualityState {
+        recent_error_rate: error_rate,
+        sample_count: 100,
+        probation_level,
+        ..Default::default()
+    }
+}
+
+// ---- 探测流量：避让不是真冷却 ----
+
+/// 构造一个处于避让期的池候选。
+fn probationary_pool(id: u64, priority: i32, until_ms: i64) -> AccountCandidate {
+    let mut candidate = scored_pool(id, priority, 0.9, Some(5_000.0), Some(20_000.0));
+    if let Some(quality) = candidate.quality.as_mut() {
+        quality.probation_until_ms = Some(until_ms);
+        quality.probation_level = 1;
+        quality.probation_cleared_at_ms = Some(until_ms);
+    }
+    candidate
+}
+
+// ---- 恢复爬坡 ----
+
+// ---- 可观测性视图 ----
+
+// ============================================================================
+// L2 真实调度测试：mock 账号 + 高并发
+//
+// 与通路 A（纯函数单测）的分工：通路 A 验证评分数学，这里验证**整条调度链路**
+// ——真实 Postgres + Redis、真实 HTTP mock 上游、真实并发下的流量分布。
+// 维度设计见 docs/plantree/.../quality-aware-scheduling-test-matrix.md
+//
+// 三条防 flaky 纪律（矩阵 §2 调研结论）：
+// 1. 质量采样是 fire-and-forget 的 detached task，wave 跑完样本未必已落 Redis
+//    → 一律用 wait_for_quality_samples 轮询收敛，不用固定 sleep。
+// 2. Top-K 加权随机用未播种的 fastrand → 只断言统计份额区间，不断言精确落点。
+// 3. 失败注入用 deterministic_failure_percent，不用 fastrand，保证可复现。
+// ============================================================================
+
+/// L2 测试的并发量级。
+///
+/// 用户明确要求："调度测试不是只搞 1 并发几并发这种，这种测试没有意义"。
+/// 256 足以让 Top-K 加权随机的份额收敛到可断言的区间，
+/// 也足以暴露羊群效应与并发下的状态竞争。
+const L2_WAVE_SIZE: usize = 256;
+
+/// 轮询等待若干池的质量样本落到 Redis。
+///
+/// **不能用固定 sleep**：质量采样是 detached `tokio::spawn`，wave 返回时
+/// 样本可能还在路上。既有测试里的 `sleep(150ms)` 正是 flaky 来源。
+async fn wait_for_quality_samples(
+    manager: &AccountManager,
+    pool_ids: &[u64],
+    min_samples: u64,
+) -> bool {
+    for _ in 0..100 {
+        let mut all_ready = true;
+        for pool_id in pool_ids {
+            let ready = manager
+                .load_pool_runtime_snapshot(*pool_id, &[])
+                .await
+                .ok()
+                .and_then(|runtime| runtime.quality)
+                .is_some_and(|quality| quality.sample_count >= min_samples);
+            if !ready {
+                all_ready = false;
+                break;
+            }
+        }
+        if all_ready {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// 读取一个池当前的质量状态。
+async fn pool_quality(manager: &AccountManager, pool_id: u64) -> Option<AccountQualityState> {
+    manager
+        .load_pool_runtime_snapshot(pool_id, &[])
+        .await
+        .ok()
+        .and_then(|runtime| runtime.quality)
+}
+
+/// 跑一轮并发流量，返回全部结果。
+async fn run_quality_wave(
+    manager: &AccountManager,
+    config: &AccountsConfig,
+    batch: &str,
+    size: usize,
+) -> Vec<AccountForwardOutcome> {
+    let batch = batch.to_string();
+    futures::future::join_all((0..size).map(|index| {
+        let manager = manager.clone();
+        let config = config.clone();
+        let batch = batch.clone();
+        async move {
+            let mut route = test_route("claude-sonnet-4-6");
+            route.request_id = format!("req_{batch}_{index}");
+            route.error_id = format!("err_{batch}_{index}");
+            route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(5));
+            timeout(
+                Duration::from_secs(20),
+                manager.forward_with_failover_result(config, route),
+            )
+            .await
+            .expect("质量调度 wave 请求必须在超时前结束")
+        }
+    }))
+    .await
+}
+
+/// 统计一轮 wave 中成功的请求数。
+fn count_successes(outcomes: &[AccountForwardOutcome]) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| match outcome {
+            AccountForwardOutcome::Response(response) => response.status() == StatusCode::OK,
+            AccountForwardOutcome::FinalError(_) => false,
+        })
+        .count()
+}
+
+/// L2 测试用的基础配置：关闭重试以免掩盖调度分布，保留质量感知。
+fn l2_quality_config() -> AccountsConfig {
+    AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 1024,
+        // 重试会把"选错池"悄悄修正成成功，从而掩盖调度分布问题。
+        // L2 要观测的是**第一次选了谁**，所以关掉重试。
+        retry_max_attempts: 0,
+        same_pool_retry_count: 0,
+        quality_aware_scheduling_enabled: true,
+        quality_min_samples: 3,
+        ..AccountsConfig::default()
+    }
+}
+
+// ---- L2-14：主开关关闭等价性（防回归总闸门，必须最先通过）----
+
+// ---- L2-01：同优先级内按质量分流 ----
+
+// ---- L2-06 / L2-07：可用性底线（"降级时保证可用"）----
+
+// ---- L2-03 / L2-15：优先级硬分层在真实并发下不被质量分打穿 ----
+
+// ---- L2-10 / L2-11：降级 → 探测 → 恢复的完整时间轨迹 ----
+
+/// 恢复轨迹测试里 mock 上游的失败预算。
+///
+/// 取 64（约 L2_WAVE_SIZE 的 1/4）：足以把失败率 EWMA 推过降级阈值，
+/// 又能确保在阶段一之内耗尽，让探测期与恢复期观测到的是真正"已恢复"的上游。
+const FLAKY_FAILURE_BUDGET: u64 = 64;
+
+// ---- L2-20：与既有因子混合（瞬态失败降权 + 质量感知同时生效）----
+
+// ---------------------------------------------------------------------------
+// 提前提交首包（early_commit）模式
+// ---------------------------------------------------------------------------
+
+async fn create_early_commit_pool(
+    postgres: &PostgresStore,
+    name: &str,
+    priority: i32,
+    base_url: &str,
+) -> Account {
+    let mut request = create_pool_request(name, priority, true);
+    request.base_url = base_url.to_string();
+    request.max_concurrent_requests = 4;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    request.pre_output_stream_retry_mode = StreamRetryMode::EarlyCommit;
+    postgres.create_account(request).await.unwrap()
+}
+
+fn downstream_events_named<'a>(
+    events: &'a [(String, serde_json::Value)],
+    name: &str,
+) -> Vec<&'a serde_json::Value> {
+    events
+        .iter()
+        .filter(|(event, _)| event == name)
+        .map(|(_, data)| data)
+        .collect()
+}
+
+fn external_stream_route(
+    request_id: impl Into<String>,
+    error_id: impl Into<String>,
+) -> (
+    AccountRouteRequest,
+    Arc<crate::anthropic::usage::UsageRecorder>,
+) {
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(16));
+    let mut route = test_route("claude-sonnet-4-6");
+    payload_mut(&mut route).stream = true;
+    refresh_test_route_derived_state(&mut route);
+    route.request_id = request_id.into();
+    route.error_id = error_id.into();
+    route.recorder = recorder.clone();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    (route, recorder)
+}
+
+#[test]
+fn all_probationary_pools_still_share_traffic_fairly() {
+    // 全员避让（上游整体故障）：候选集不得被清空，且不得退化成只打一个池。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        probe_share_percent: 10,
+        ..Default::default()
+    };
+
+    let candidates = vec![
+        probationary_pool(1, 1, 10_000),
+        probationary_pool(2, 1, 10_000),
+        probationary_pool(3, 1, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    for id in [1u64, 2, 3] {
+        let share = shares.get(&id).copied().unwrap_or(0.0);
+        assert!(
+            share > 0.15,
+            "全员避让时池 {id} 仍须获得流量，实际 {share:.3}"
+        );
+    }
+}
+
+#[test]
+fn anthropic_body_sanitize_removes_context_management_without_beta() {
+    let body = Bytes::from_static(
+        br#"{"model":"claude","context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},"messages":[]}"#,
+    );
+    let headers = HeaderMap::new();
+
+    let sanitized = sanitize_anthropic_body_for_beta_header(&body, &headers);
+    let value: serde_json::Value = serde_json::from_slice(&sanitized).expect("json");
+    assert!(value.get("context_management").is_none());
+
+    let mut beta_headers = HeaderMap::new();
+    beta_headers.insert(
+        HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_static("context-management-2025-06-27"),
+    );
+    let preserved = sanitize_anthropic_body_for_beta_header(&body, &beta_headers);
+    let value: serde_json::Value = serde_json::from_slice(&preserved).expect("json");
+    assert!(value.get("context_management").is_some());
+}
+
+#[test]
+fn anthropic_passthrough_profile_uses_allowlist_and_beta_query() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("claude-cli/2.1.200"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-runtime"),
+        HeaderValue::from_static("node"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-client-request-id"),
+        HeaderValue::from_static("req-client"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-custom-not-allowed"),
+        HeaderValue::from_static("drop"),
+    );
+    headers.insert(header::COOKIE, HeaderValue::from_static("sid=drop"));
+    let mut pool = test_pool("https://pool.example.com/v1", true);
+    pool.header_profile = AccountHeaderProfile::AnthropicPassthrough;
+    pool.auth_type = AccountAuthType::XApiKey;
+
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
+
+    assert_eq!(
+        forwarded
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+        Some("claude-cli/2.1.200")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-stainless-runtime"))
+            .and_then(|value| value.to_str().ok()),
+        Some("node")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-client-request-id"))
+            .and_then(|value| value.to_str().ok()),
+        Some("req-client")
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-custom-not-allowed"))
+            .is_none()
+    );
+    assert!(forwarded.get(header::COOKIE).is_none());
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-api-key"))
+            .and_then(|value| value.to_str().ok()),
+        Some("sk-test")
+    );
+
+    let config = AccountsConfig::default();
+    let url = account_url(&pool, "/cc/v1/messages", &config).expect("url");
+    assert_eq!(
+        url.as_str(),
+        "https://pool.example.com/v1/messages?beta=true"
+    );
+}
+
+#[test]
+fn bounded_high_cache_external_projection_drops_creation_when_suppressed() {
+    // 第一次写入放行后，紧接着的请求被 creation control 拦下：即使计费补偿想补写入，
+    // 最终写入也必须为 0。
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":2000,"output_tokens":40,"cache_creation_input_tokens":60000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::BoundedHighCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::HighCache;
+    route.prompt_cache_creation_control = PromptCacheCreationControlConfig {
+        enabled: true,
+        min_creation_interval_secs: 3_600,
+        max_creation_tokens_per_event: 30_000,
+        ..PromptCacheCreationControlConfig::default()
+    };
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(500),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_8c3d2e1f-5a6b-4c7d-9e8f-0a1b2c3d4e5f".to_string(),
+        ),
+    });
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let first = projection_context_with_cost_floor(&route, &pool, 0).expect("first projection");
+    let _ = maybe_project_non_stream_usage(body.clone(), Some(&first));
+    first.record_success();
+    let second = projection_context_with_cost_floor(&route, &pool, 0).expect("second projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&second));
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    // 6s 内第二次写入被 min_creation_interval 拦下：计费补偿不能把写入加回来。
+    assert_eq!(reported.cache_creation_input_tokens, 0, "{reported:?}");
+    assert!(reported.input_tokens <= 500, "{reported:?}");
+}
+
+#[test]
+fn bounded_high_cache_external_projection_never_leaves_bounds() {
+    // 上游返回真实 cache_creation、开启计费下限：账号投影最终 usage 仍在上下限内，
+    // 读取不超过原始输入 × maxReadMultiplier，非零读写不低于最小值。
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":2000,"output_tokens":40,"cache_creation_input_tokens":60000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::BoundedHighCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::HighCache;
+    // 放大到原始输入的 3 倍、目标读取 99%：读取会超过 maxReadMultiplier=1 的上限。
+    route.prompt_cache_token_scale = 3.0;
+    route.prompt_cache_scale_min_input_tokens = 0;
+    route.prompt_cache_target_read_ratio = 0.99;
+    route.cache_hit_shaping_policy = crate::model::config::CacheHitShapingPolicy {
+        enabled: true,
+        target_hit_ratio: 0.95,
+        ratio_jitter: 0.04,
+        min_cache_read_tokens: 1_024,
+        min_cache_creation_tokens: 1_024,
+        min_cost_ratio: 1.0,
+        max_read_multiplier: 1.0,
+        min_creation_ratio: 0.0,
+        read_aware_cost_floor: false,
+        cost_floor_top_up_input: true,
+    };
+    route.prompt_cache_creation_control = PromptCacheCreationControlConfig {
+        enabled: true,
+        max_creation_tokens_per_event: 30_000,
+        ..PromptCacheCreationControlConfig::default()
+    };
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy {
+                move_delta_to_cache_read: true,
+                ..ReportedUsageFieldPolicy::sample_input_max(500)
+            },
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_7b2c1d0e-4f5a-4b6c-8d7e-9f0a1b2c3d4e".to_string(),
+        ),
+    });
+    payload_mut(&mut route).system = Some(vec![SystemMessage {
+        text: "stable bounded external prompt ".repeat(700),
+        cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+    }]);
+    refresh_test_route_derived_state(&mut route);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let mut saw_read = false;
+    for round in 0..6 {
+        let projection =
+            projection_context_with_cost_floor(&route, &pool, 30).expect("bounded projection");
+        let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+        let reported = projected.usage_capture.reported.expect("reported usage");
+        let raw_input = projection.raw_input_tokens.max(1);
+        assert!(
+            (1..=500).contains(&reported.input_tokens),
+            "round {round}: {reported:?}"
+        );
+        assert!(
+            reported.cache_creation_input_tokens <= 30_000,
+            "round {round}: {reported:?}"
+        );
+        assert!(
+            reported.cache_read_input_tokens <= raw_input,
+            "round {round}: read {} raw {raw_input}",
+            reported.cache_read_input_tokens
+        );
+        for value in [
+            reported.cache_read_input_tokens,
+            reported.cache_creation_input_tokens,
+        ] {
+            assert!(value == 0 || value >= 1_024, "round {round}: {reported:?}");
+        }
+        if round > 0 {
+            saw_read |= reported.cache_read_input_tokens > 0;
+        }
+        projection.record_success();
+        payload_mut(&mut route).messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!(format!("continue bounded round {round}")),
+            },
+        ]);
+        refresh_test_route_derived_state(&mut route);
+    }
+    assert!(saw_read, "later rounds should hit the local prefix");
+}
+
+#[test]
+fn claude_code_mimic_profile_forces_cli_headers_and_request_id() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.header_profile = AccountHeaderProfile::ClaudeCodeMimic;
+    let headers = HeaderMap::new();
+
+    let forwarded = forward_headers(&headers, &pool, true).expect("headers");
+
+    assert_eq!(
+        forwarded
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+        Some("claude-cli/2.1.161 (external, cli)")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-stainless-runtime-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("v24.3.0")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-stainless-helper-method"))
+            .and_then(|value| value.to_str().ok()),
+        Some("stream")
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-client-request-id"))
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("anthropic-beta"))
+            .and_then(|value| value.to_str().ok()),
+        Some(CLAUDE_CODE_MIMIC_BETA_HEADER)
+    );
+}
+
+#[test]
+fn degrade_backoff_doubles_and_is_capped() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        degrade_probation_secs: 100,
+        max_probation_secs: 700,
+        ..Default::default()
+    };
+
+    let secs_at = |level: u32| -> i64 {
+        match evaluate_account_degrade(&degrade_state(1.0, level), &config, 0) {
+            AccountDegradeDecision::Probation { until_ms, .. } => until_ms / 1_000,
+            other => panic!("期望降级，实际 {other:?}"),
+        }
+    };
+
+    // 第 n 次避让：base * 2^(n-1)，被上限封顶
+    assert_eq!(secs_at(0), 100);
+    assert_eq!(secs_at(1), 200);
+    assert_eq!(secs_at(2), 400);
+    assert_eq!(secs_at(3), 700, "超过上限必须被封顶");
+    assert_eq!(secs_at(20), 700, "高层级不得溢出，必须稳定在上限");
+}
+
+#[test]
+fn degrade_does_not_extend_an_active_probation() {
+    // 避让期内持续失败不得无限续期，否则池永远等不到恢复爬坡窗口。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        ..AccountsConfig::default()
+    };
+    let state = AccountQualityState {
+        recent_error_rate: 1.0,
+        sample_count: 100,
+        probation_until_ms: Some(10_000),
+        probation_level: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_account_degrade(&state, &config, 5_000),
+        AccountDegradeDecision::Keep
+    );
+    // 到期之后才允许再次降级
+    assert!(matches!(
+        evaluate_account_degrade(&state, &config, 10_001),
+        AccountDegradeDecision::Probation { level: 2, .. }
+    ));
+}
+
+#[test]
+fn degrade_ignores_pools_with_insufficient_samples() {
+    // 冷启动：前几个请求全失败也不足以定性一个池。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        ..AccountsConfig::default()
+    };
+    let state = AccountQualityState {
+        recent_error_rate: 1.0,
+        sample_count: config.quality_min_samples - 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_account_degrade(&state, &config, 0),
+        AccountDegradeDecision::Keep
+    );
+}
+
+#[test]
+fn degrade_level_increments_from_existing_level() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        ..AccountsConfig::default()
+    };
+    for existing in [0u32, 1, 5] {
+        match evaluate_account_degrade(&degrade_state(1.0, existing), &config, 0) {
+            AccountDegradeDecision::Probation { level, .. } => {
+                assert_eq!(level, existing + 1, "避让层级必须在既有层级上递增");
+            }
+            other => panic!("期望降级，实际 {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn degrade_level_resets_after_recovery_ramp() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        recovery_ramp_secs: 60,
+        ..Default::default()
+    };
+    let state = AccountQualityState {
+        recent_error_rate: 1.0,
+        sample_count: 100,
+        probation_level: 4,
+        probation_cleared_at_ms: Some(100_000),
+        ..Default::default()
+    };
+
+    // 恢复爬坡完成后再次劣化应从第一层开始，即使质量键尚未因持续流量过期。
+    match evaluate_account_degrade(&state, &config, 160_000) {
+        AccountDegradeDecision::Probation { level, .. } => {
+            assert_eq!(level, 1);
+        }
+        other => panic!("恢复后再次劣化应从第一层开始，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn degrade_never_fires_when_master_switch_is_off() {
+    // 主开关关闭时不得写入任何避让状态，否则关开关也无法回退。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_account_degrade(&degrade_state(1.0, 0), &config, 0),
+        AccountDegradeDecision::Keep
+    );
+}
+
+#[test]
+fn degrade_requires_error_rate_at_or_above_threshold() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        ..AccountsConfig::default()
+    };
+    let threshold = config.degrade_error_rate_threshold;
+
+    // 阈值以下不降级
+    assert_eq!(
+        evaluate_account_degrade(&degrade_state(threshold - 0.01, 0), &config, 0),
+        AccountDegradeDecision::Keep
+    );
+    // 恰好等于阈值即降级（闭区间，避免阈值设 1.0 时永不触发）
+    assert!(matches!(
+        evaluate_account_degrade(&degrade_state(threshold, 0), &config, 0),
+        AccountDegradeDecision::Probation { .. }
+    ));
+}
+
+#[test]
+fn degrade_ttl_covers_probation_window_plus_recovery_ramp() {
+    // TTL 若短于避让窗口，避让状态会随 Redis 键过期被抹掉，降级形同虚设。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        degrade_probation_secs: 300,
+        max_probation_secs: 300,
+        recovery_ramp_secs: 60,
+        quality_sample_ttl_secs: 10,
+        ..Default::default()
+    };
+
+    match evaluate_account_degrade(&degrade_state(1.0, 0), &config, 0) {
+        AccountDegradeDecision::Probation {
+            until_ms, ttl_secs, ..
+        } => {
+            assert_eq!(until_ms, 300_000);
+            assert!(
+                ttl_secs >= 300 + 60,
+                "TTL {ttl_secs} 必须覆盖避让窗口加恢复爬坡"
+            );
+        }
+        other => panic!("期望降级，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn degrade_uses_the_current_window_failure_rate() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        quality_min_samples: 5,
+        degrade_error_rate_threshold: 0.5,
+        ..Default::default()
+    };
+
+    // 历史 EWMA 很高，但当前窗口已经恢复：不能因为旧失败率再次触发避让。
+    let recovered_window = AccountQualityState {
+        recent_error_rate: 0.95,
+        sample_count: 100,
+        degrade_window_sample_count: 10,
+        degrade_window_failure_count: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_account_degrade(&recovered_window, &config, 0),
+        AccountDegradeDecision::Keep
+    );
+
+    // 当前窗口达到阈值时，即使历史 EWMA 较低，也必须触发避让。
+    let failing_window = AccountQualityState {
+        recent_error_rate: 0.05,
+        sample_count: 100,
+        degrade_window_sample_count: 10,
+        degrade_window_failure_count: 8,
+        ..Default::default()
+    };
+    assert!(matches!(
+        evaluate_account_degrade(&failing_window, &config, 0),
+        AccountDegradeDecision::Probation { .. }
+    ));
+}
+
+#[test]
+fn drain_sse_events_respects_processing_plan() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+
+    let mut rewrite_buffer = event.to_vec();
+    let rewritten = drain_sse_events(
+        &mut rewrite_buffer,
+        Some(&projection),
+        None,
+        None,
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+    assert!(rewrite_buffer.is_empty());
+    assert_ne!(rewritten, event);
+    let rewritten_text = std::str::from_utf8(&rewritten).expect("rewritten utf8");
+    assert!(!rewritten_text.contains(r#""input_tokens":100000"#));
+
+    let mut passthrough_buffer = event.to_vec();
+    let rewritten_capture_mode = drain_sse_events(
+        &mut passthrough_buffer,
+        Some(&projection),
+        None,
+        None,
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+    assert!(passthrough_buffer.is_empty());
+    assert_ne!(rewritten_capture_mode, event);
+    let capture_text = std::str::from_utf8(&rewritten_capture_mode).expect("rewritten utf8");
+    assert!(!capture_text.contains(r#""input_tokens":100000"#));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_mode_round_trips_through_postgres() {
+    let Some((_manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let created = create_early_commit_pool(
+        &postgres,
+        "early-commit-round-trip",
+        1,
+        "http://127.0.0.1:9",
+    )
+    .await;
+    assert_eq!(
+        created.pre_output_stream_retry_mode,
+        StreamRetryMode::EarlyCommit
+    );
+    let listed = postgres.list_accounts(false).await.unwrap();
+    let loaded = listed
+        .iter()
+        .find(|pool| pool.id == created.id)
+        .expect("created pool listed");
+    assert_eq!(
+        loaded.pre_output_stream_retry_mode,
+        StreamRetryMode::EarlyCommit
+    );
+    let value = serde_json::to_value(loaded).unwrap();
+    assert_eq!(value["preOutputStreamRetryMode"], "early_commit");
+
+    // 混合模式不能把低优先级普通池误当成提前提交池：否则换池后会重复
+    // message_start，且普通池的首输出超时语义也会被覆盖。
+    let mut normal_request = create_pool_request("early-commit-normal", 10, true);
+    normal_request.base_url = "http://127.0.0.1:9".to_string();
+    normal_request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    normal_request.pre_output_stream_retry_mode = StreamRetryMode::Disabled;
+    postgres.create_account(normal_request).await.unwrap();
+    let (route, _recorder) =
+        external_stream_route("req_early_commit_mixed_mode", "err_early_commit_mixed_mode");
+    let pools = postgres.list_accounts(false).await.unwrap();
+    assert!(!route_prefers_early_commit(
+        &pools,
+        &route,
+        &AccountsConfig::default()
+    ));
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
+    let route = AccountRouteRequest {
+        history_sanitize_enabled: false,
+        effective_raw_body: Bytes::new(),
+        effective_raw_probe: None,
+        preparation_cache: Arc::new(AccountRouteRequestPreparationCache::default()),
+        raw_body: Bytes::new(),
+        headers: HeaderMap::new(),
+        endpoint: "/v1/messages".to_string(),
+        payload: Some(MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 8,
+            messages: Vec::new(),
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            output_format: None,
+            metadata: None,
+            stop_sequences: None,
+        }),
+
+        model_hint: None,
+        stream_hint: None,
+        request_input_tokens: 1,
+        upstream_model: None,
+        model_resolution_source: None,
+        model_resolution_note: None,
+        route_subtype: UsageRouteSubtype::Account,
+
+        reported_usage: ReportedUsageConfig::default(),
+        prompt_cache: Arc::new(PromptCacheTracker::default()),
+        prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+        prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
+        prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
+        prompt_cache_route_namespace: None,
+        cache_ttl_mode: crate::model::config::CacheTtlMode::default(),
+        prompt_cache_target_read_ratio: 0.98,
+        prompt_cache_token_scale: 1.6,
+        prompt_cache_max_simulated_input_tokens: 300_000,
+        prompt_cache_cap_jitter_min_tokens: 12_000,
+        prompt_cache_cap_jitter_max_tokens: 24_000,
+        prompt_cache_scale_min_input_tokens: 20_000,
+        prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+        prompt_cache_bounds: PromptCacheBounds::default(),
+        prefix_tool_cache_policy: PrefixToolCachePolicy::default(),
+        prefix_tool_plus_cache_policy: crate::model::config::PrefixToolPlusCachePolicy::default(),
+        stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy::disabled(),
+        model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        request_id: "req_external_capacity".to_string(),
+        error_id: "req_01capacity".to_string(),
+        recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
+        started_at: Instant::now(),
+        stream_pre_output_hold: None,
+        early_commit: None,
+        first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        latency_trace: Arc::new(ExternalLatencyTraceState::default()),
+        payload_breakdown: None,
+        payload_guard_report: None,
+        payload_guard_external_enabled: true,
+        payload_guard_initial_config: PayloadGuardConfig {
+            enabled: true,
+            max_bytes: 0,
+
+            trim_history: false,
+            shaping: crate::model::config::PayloadShapingConfig::default(),
+        },
+        payload_guard_retry_config: None,
+        inference_attempt_budget: Arc::new(
+            crate::anthropic::inference_attempt_budget::InferenceAttemptBudget::new(4),
+        ),
+        request_api_key_id: None,
+    };
+
+    let (error_type, message) = external_capacity_error(PoolCapacityWaitReason::Full);
+    let err = external_capacity_final_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        error_type,
+        message,
+        &route.error_id,
+    );
+    assert!(err.retryable);
+    assert!(err.is_capacity_like());
+    assert_eq!(err.route_error_type, "account_capacity_full");
+    assert!(should_defer_synthetic_capacity_error_to_last_pool_error(
+        &err
+    ));
+
+    let wait_timeout = external_capacity_final_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "account_wait_timeout",
+        "Request capacity wait timed out after 1 seconds",
+        &route.error_id,
+    );
+    assert!(wait_timeout.retryable);
+    assert!(wait_timeout.is_capacity_like());
+    assert!(should_defer_synthetic_capacity_error_to_last_pool_error(
+        &wait_timeout
+    ));
+
+    let deadline = external_capacity_final_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "account_deadline_exceeded",
+        "Request dispatch deadline exceeded",
+        &route.error_id,
+    );
+    assert!(!deadline.retryable);
+    assert!(!should_defer_synthetic_capacity_error_to_last_pool_error(
+        &deadline
+    ));
+    let response = err.into_response(&route.request_id);
+
+    assert_eq!(response.status().as_u16(), 529);
+    assert_eq!(
+        response.headers().get("request-id").unwrap(),
+        "req_external_capacity"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read scheduler error body");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "overloaded_error");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+    assert!(message.contains("request-id: req_01"));
+    assert!(!message.contains("Request capacity is full"));
+    assert_public_message_hides_internal_routing(message);
+}
+
+#[test]
+fn external_coordinator_failure_is_not_classified_as_capacity_or_queue_full() {
+    let (error_type, message) =
+        external_capacity_error(PoolCapacityWaitReason::CoordinatorUnavailable);
+
+    assert_eq!(error_type, "account_coordinator_unavailable");
+    assert!(!error_type.contains("full"));
+    assert!(message.contains("coordinator"));
+}
+
+#[test]
+fn external_error_classification_keeps_raw_body_only_in_usage_diagnostics() {
+    for round in 0..5 {
+        for (status, body) in [
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    r#"{{"error":{{"message":"prompt is too long PRIVATE_EXTERNAL_{round}_400"}}}}"#
+                ),
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(r#"{{"error":"PRIVATE_EXTERNAL_{round}_429"}}"#),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                format!(r#"{{"error":"PRIVATE_EXTERNAL_{round}_403"}}"#),
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(r#"{{"error":"PRIVATE_EXTERNAL_{round}_500"}}"#),
+            ),
+        ] {
+            let marker = format!("PRIVATE_EXTERNAL_{round}_{}", status.as_u16());
+            let err = classify_external_error(
+                status,
+                Bytes::from(body),
+                HeaderMap::new(),
+                &AccountsConfig::default(),
+            );
+            let (record_message, truncated) = external_error_record_message(&err);
+            let route = test_route("claude-sonnet-4-6");
+            let diagnostics = external_error_diagnostics(
+                &route,
+                &err,
+                anthropic_error_type_for_external_error(&err),
+                truncated,
+            );
+            let final_error = external_final_error_from_error(
+                None,
+                vec![AccountAttempt {
+                    attempt: 1,
+                    pool_id: 7,
+                    pool_name: "pool-a".to_string(),
+                    outbound_model: Some("model-a".to_string()),
+                    status: Some(status.as_u16()),
+                    action: "fail".to_string(),
+                    duration_ms: 1,
+                    error_type: Some(error_type_for_external_error(&err)),
+                    error_message: Some(err.message.clone()),
+                    raw_upstream_error: err.raw_upstream_error.clone(),
+                }],
+                &err,
+                "req_01safe",
+            );
+            assert!(
+                err.raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "classified error must keep upstream raw body for usage detail"
+            );
+            assert!(
+                diagnostics
+                    .raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "usage diagnostics must keep upstream raw body"
+            );
+            assert!(
+                final_error
+                    .attempts
+                    .first()
+                    .and_then(|attempt| attempt.raw_upstream_error.as_ref())
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "attempt diagnostics must keep matching upstream raw body"
+            );
+            let public_error = final_error.public_error();
+            let retained = format!("{record_message} {public_error:?}");
+            assert!(
+                !retained.contains(&marker),
+                "system summary or downstream error retained raw marker: {retained}"
+            );
+        }
+    }
+}
+
+#[test]
+fn external_error_diagnostics_records_status_and_non_duplicate_metadata() {
+    let mut route = test_route("claude-sonnet-4-6");
+    route.error_id = "req_01diagnostic".to_string();
+    let err = classify_external_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        Bytes::from_static(br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+    let response_error_type = anthropic_error_type_for_external_error(&err);
+    let (record_message, message_truncated) = external_error_record_message(&err);
+    let diagnostics =
+        external_error_diagnostics(&route, &err, response_error_type, message_truncated);
+
+    assert_eq!(record_message, err.message);
+    assert_eq!(diagnostics.status_code, Some(429));
+    assert_eq!(diagnostics.source.as_deref(), Some("external_account"));
+    assert_eq!(diagnostics.error_id.as_deref(), Some("req_01diagnostic"));
+    let metadata = diagnostics.metadata.unwrap();
+    assert_eq!(metadata["responseErrorType"], "rate_limit_error");
+    assert_eq!(metadata["retryable"], true);
+    assert_eq!(metadata["softFailureReason"], "rate_limit");
+    assert!(metadata.get("cooldownReason").is_none());
+    for duplicate_key in [
+        "message",
+        "rawMessage",
+        "attempts",
+        "poolId",
+        "poolName",
+        "requestId",
+        "errorId",
+        "statusCode",
+    ] {
+        assert!(
+            metadata.get(duplicate_key).is_none(),
+            "metadata duplicated {duplicate_key}: {metadata}"
+        );
+    }
+}
+
+#[test]
+fn external_failure_standard_usage_keeps_diagnostic_input_and_zeroes_billable_fields() {
+    let huge_usage = AccountUsageSnapshot {
+        total_input_tokens: 2_648_439,
+        input_tokens: 1_100_000,
+        billable_input_tokens: 1_100_000,
+        output_tokens: 77,
+        cache_creation_input_tokens: 1_300_180,
+        cache_read_input_tokens: 1_200_000,
+        cache_creation_5m_input_tokens: 700_000,
+        cache_creation_1h_input_tokens: 600_180,
+    };
+
+    for status in [
+        UsageRecordStatus::Error,
+        UsageRecordStatus::StreamError,
+        UsageRecordStatus::UpstreamTimeout,
+        UsageRecordStatus::ClientDropped,
+    ] {
+        let standard_usage =
+            external_standard_usage_for_status(status, 2_648_439, Some(huge_usage));
+        assert_eq!(
+            standard_usage.total_input_tokens, 2_648_439,
+            "status={status:?}"
+        );
+        assert_eq!(standard_usage.input_tokens, 0, "status={status:?}");
+        assert_eq!(standard_usage.billable_input_tokens, 0, "status={status:?}");
+        assert_eq!(standard_usage.output_tokens, 0, "status={status:?}");
+        assert_eq!(
+            standard_usage.cache_creation_input_tokens, 0,
+            "status={status:?}"
+        );
+        assert_eq!(
+            standard_usage.cache_read_input_tokens, 0,
+            "status={status:?}"
+        );
+    }
+
+    let success_missing_usage =
+        external_standard_usage_for_status(UsageRecordStatus::Success, 2_648_439, None);
+    assert_eq!(success_missing_usage.total_input_tokens, 2_648_439);
+    assert_eq!(success_missing_usage.input_tokens, 2_648_439);
+    assert_eq!(success_missing_usage.billable_input_tokens, 2_648_439);
+    assert_eq!(success_missing_usage.output_tokens, 0);
+
+    let success_reported_usage =
+        external_standard_usage_for_status(UsageRecordStatus::Success, 2_648_439, Some(huge_usage));
+    assert_eq!(success_reported_usage, huge_usage);
+}
+
+#[test]
+fn external_first_output_parser_uses_sse_json_semantics() {
+    let empty_delta = Bytes::from_static(
+        br#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":""}}
+
+"#,
+    );
+    assert!(!external_stream_chunk_has_first_output(&empty_delta));
+
+    let text_then_tool_start = Bytes::from_static(
+            br#"event: content_block_start
+data: {"type":"content_block_start","content_block":{"type":"text"}}
+
+event: content_block_start
+data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}
+
+"#,
+        );
+    assert!(external_stream_chunk_has_first_output(
+        &text_then_tool_start
+    ));
+    assert_eq!(
+        count_external_stream_events_before_first_output(&text_then_tool_start),
+        1
+    );
+
+    let content_in_payload_string = Bytes::from_static(
+        br#"event: message_delta
+data: {"type":"message_delta","note":"content_block_delta"}
+
+"#,
+    );
+    assert!(!external_stream_chunk_has_first_output(
+        &content_in_payload_string
+    ));
+}
+
+#[test]
+fn external_image_size_rejection_maps_to_fixed_image_message_for_five_rounds() {
+    for round in 0..5 {
+        let body = Bytes::from(format!(
+            r#"{{"error":{{"type":"invalid_request_error","message":"messages.{round}.content.1.image.source.base64: image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes","reason":"IMAGE_SIZE_EXCEEDED"}},"type":"error"}}"#
+        ));
+        let err = classify_external_error(
+            StatusCode::BAD_REQUEST,
+            body,
+            HeaderMap::new(),
+            &AccountsConfig::default(),
+        );
+        assert!(!err.retryable, "round {round}");
+        let public_error = external_public_error_from_parts(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            false,
+            &err.message,
+            "req_01image",
+        );
+        assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(public_error.error_type, "invalid_request_error");
+        assert_eq!(
+            public_error.message,
+            envelope::public_message_with_error_id(
+                envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+                "req_01image"
+            )
+        );
+        assert!(!public_error.message.contains("5298668"));
+        assert!(!public_error.message.contains("messages."));
+    }
+}
+
+#[test]
+fn external_latency_trace_records_stream_markers_without_changing_first_output_semantics() {
+    let trace = ExternalLatencyTraceState::default();
+    let started_at = Instant::now() - Duration::from_millis(25);
+
+    trace.mark_upstream_header(started_at);
+    trace.mark_first_upstream_chunk(started_at);
+
+    let text_start = Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\"}}\n\n",
+        );
+    assert!(!external_stream_chunk_has_first_output(&text_start));
+
+    let output = Bytes::from_static(
+            b"event: ping\ndata: {}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+        );
+    assert!(external_stream_chunk_has_first_output(&output));
+    assert_eq!(count_external_stream_events_before_first_output(&output), 1);
+
+    trace.mark_first_output(50, 1, 2);
+    let snapshot = trace.snapshot().expect("latency trace snapshot");
+    assert!(snapshot.upstream_header_ms.is_some());
+    assert!(snapshot.first_upstream_chunk_ms.is_some());
+    assert_eq!(snapshot.first_output_delta_ms, Some(50));
+    assert_eq!(snapshot.chunks_before_first_output, Some(1));
+    assert_eq!(snapshot.events_before_first_output, Some(2));
+    assert!(snapshot.stream_gap_to_first_output_ms.is_some());
+}
+
+#[test]
+fn external_non_stream_clean_response_remains_byte_identical() {
+    for _round in 0..5 {
+        let body = Bytes::from_static(
+            br#"{"type":"message","content":[{"type":"thinking","thinking":"ordinary reasoning","signature":"opaque-signature"},{"type":"text","text":"visible answer"}],"usage":{"input_tokens":12,"output_tokens":7},"future_field":{"preserved":true}}"#,
+        );
+        let projected =
+            maybe_project_non_stream_usage_with_tools(body.clone(), None, ["Bash".to_string()]);
+        assert!(!projected.protocol_contamination);
+        assert_eq!(projected.body, body);
+    }
+}
+
+#[test]
+fn external_non_stream_response_contamination_is_retryable_not_partial_success() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    let cases = [
+        json!({"type":"text","text":polluted}),
+        json!({"type":"thinking","thinking":polluted}),
+        json!({"type":"thinking","thinking":polluted,"signature":"opaque-signature"}),
+        json!({"type":"redacted_thinking","data":polluted}),
+    ];
+    for _round in 0..5 {
+        for content in &cases {
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "type": "message",
+                    "content": [content.clone()],
+                    "usage": {"input_tokens": 12, "output_tokens": 7},
+                    "future_field": {"preserved": true}
+                }))
+                .unwrap(),
+            );
+            let projected =
+                maybe_project_non_stream_usage_with_tools(body, None, ["Bash".to_string()]);
+            assert!(projected.protocol_contamination);
+            let wire = String::from_utf8(projected.body.to_vec()).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            let block_type = content["type"].as_str().unwrap_or_default();
+            if matches!(block_type, "thinking" | "redacted_thinking")
+                && (content.get("signature").is_some() || block_type == "redacted_thinking")
+            {
+                // Authenticated thinking is inspected for contamination but never rewritten:
+                // changing its body while retaining its signature/data would corrupt the block.
+                assert!(wire.contains("user Continue"));
+                assert!(wire.contains("Bash: hidden"));
+                assert_eq!(value["content"][0], content.clone());
+            } else {
+                assert!(!wire.contains("user Continue"));
+                assert!(!wire.contains("Bash: hidden"));
+            }
+            assert_eq!(value["usage"]["input_tokens"], 12);
+            assert_eq!(value["usage"]["output_tokens"], 7);
+            assert_eq!(value["future_field"]["preserved"], true);
+        }
+    }
+
+    let error = external_protocol_contamination_error(&AccountsConfig::default());
+    assert_eq!(error.status, Some(StatusCode::OK));
+    assert_eq!(error.message, RESPONSE_PROTOCOL_CONTAMINATION_DETAIL);
+    assert!(error.retryable);
+    assert!(error.auto_disable_reason.is_none());
+    assert_eq!(
+        error.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
+        Some("protocol_contamination")
+    );
+    assert!(error.protocol_error.is_none());
+}
+
+#[test]
+fn external_payload_guard_retry_route_trims_and_disables_second_retry() {
+    for round in 1..=5 {
+        let mut route = test_route("claude-sonnet-4-6");
+        // Trimming is measured against an 8 KB body: keep the system prompt at its short size.
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].text =
+                "You are a careful coding assistant. ".repeat(180);
+        }
+        let mut messages = Vec::new();
+        for idx in 0..32 {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: serde_json::json!(format!(
+                    "round {round} history {} {}",
+                    idx,
+                    "x".repeat(700)
+                )),
+            });
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{
+                    "type": "text",
+                    "text": format!("round {round} answer {} {}", idx, "y".repeat(500)),
+                }]),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: serde_json::json!(format!("current question round {round}")),
+        });
+        route.payload.as_mut().unwrap().messages = messages;
+        refresh_test_route_derived_state(&mut route);
+        let original_input_tokens = route.request_input_tokens;
+        let body = serde_json::to_string(route.payload.as_ref().unwrap())
+            .expect("serialize route payload");
+        route.raw_body = Bytes::from(body);
+        route.payload_guard_retry_config = Some(PayloadGuardConfig {
+            enabled: true,
+            max_bytes: 8_000,
+
+            trim_history: true,
+            shaping: crate::model::config::PayloadShapingConfig::default(),
+        });
+        let err = classify_external_error(
+            StatusCode::BAD_REQUEST,
+            Bytes::from_static(br#"{"error":{"message":"Context window is full"}}"#),
+            HeaderMap::new(),
+            &AccountsConfig::default(),
+        );
+
+        assert!(should_retry_external_payload_guard(&route, &err));
+        let retry_route = external_payload_guard_retry_route(&route).expect("retry route");
+
+        assert!(
+            retry_route.effective_raw_body.len() <= 8_000,
+            "round {round}"
+        );
+        assert!(
+            retry_route.payload_guard_retry_config.is_none(),
+            "round {round}"
+        );
+        assert!(
+            retry_route
+                .payload_guard_report
+                .as_ref()
+                .is_some_and(|report| report.trimmed_history_entries > 0),
+            "round {round}"
+        );
+        assert_eq!(
+            retry_route
+                .payload
+                .as_ref()
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .content,
+            serde_json::json!(format!("current question round {round}"))
+        );
+
+        let retry_payload = retry_route.payload.as_ref().expect("retry payload");
+        let retry_input_tokens = count_external_route_input_tokens(retry_payload);
+        assert_eq!(
+            retry_route.request_input_tokens, retry_input_tokens,
+            "round {round}: retry route token estimate must match its trimmed payload"
+        );
+        assert!(
+            retry_input_tokens < original_input_tokens,
+            "round {round}: retry tokens {retry_input_tokens} must be below original {original_input_tokens}"
+        );
+        let body_payload: MessagesRequest = serde_json::from_slice(&retry_route.effective_raw_body)
+            .expect("retry body remains a Messages request");
+        assert_eq!(
+            serde_json::to_value(body_payload).unwrap(),
+            serde_json::to_value(retry_payload).unwrap(),
+            "round {round}: retry raw body and typed payload must remain identical"
+        );
+
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&retry_route, &pool, 0)
+            .unwrap_or_else(|| panic!("round {round}: retry usage projection"));
+        assert_eq!(
+            projection.raw_input_tokens, retry_input_tokens,
+            "round {round}: usage projection must use the trimmed request estimate"
+        );
+        assert!(
+            projection.prompt_cache_profile.is_some(),
+            "round {round}: retry payload should build a prompt-cache profile"
+        );
+        let projected = maybe_project_non_stream_usage(
+            Bytes::from_static(
+                br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+            ),
+            Some(&projection),
+        );
+        assert_eq!(
+            projected.usage_capture.request_input_tokens,
+            Some(retry_input_tokens),
+            "round {round}: projected usage must carry the trimmed request estimate"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_atomic_acquire_honors_pool_cooldown_and_fails_closed_on_bad_state() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        model_unavailable_cooldown_mode: ModelUnavailableCooldownMode::Model,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-atomic-cooldown", 1, true))
+        .await
+        .unwrap();
+    let cooldown_key = format!("account:{}:cooldown", pool.id);
+    let route = test_route("claude-sonnet-4-6");
+    let model_cooldown_candidates = route.model_cooldown_candidates();
+
+    for round in 0..5 {
+        manager
+            .mark_pool_cooldown(pool.id, Duration::from_secs(30), "rate_limit".to_string())
+            .await;
+        let blocked = manager.acquire_pool(&pool, &config).await;
+        let PoolAcquireResult::Unavailable(blocked) = blocked else {
+            panic!("round {round}: active pool cooldown must block atomic acquire");
+        };
+        assert_eq!(blocked.reason, PoolCapacityWaitReason::Cooldown);
+        assert_eq!(blocked.detail, "cooldown_during_atomic_acquire");
+        assert!(blocked.wait_for.is_some());
+        let cleared = manager.clear_pool_cooldowns(pool.id).await.unwrap();
+        assert!(
+            cleared >= 1,
+            "round {round}: clearing pool cooldown should delete at least one Redis key"
+        );
+        let cleared_snapshot = manager
+            .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
+            .await
+            .unwrap();
+        assert_eq!(
+            cleared_snapshot.pool_cooldown_remaining_secs, 0,
+            "round {round}: cleared pool cooldown must be absent from the runtime snapshot"
+        );
+        assert!(
+            cleared_snapshot.model_cooldown.is_none(),
+            "round {round}: clearing pool cooldown should also clear model cooldown state"
+        );
+
+        let before_model_race = manager
+            .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
+            .await
+            .unwrap();
+        assert!(
+            before_model_race.model_cooldown.is_none(),
+            "round {round}: selection snapshot should precede the model cooldown write"
+        );
+        manager
+            .mark_pool_model_cooldowns(
+                pool.id,
+                Duration::from_secs(30),
+                "model_unavailable".to_string(),
+                &model_cooldown_candidates,
+            )
+            .await;
+        let model_blocked = manager
+            .acquire_pool_with_model_cooldowns(&pool, &config, &model_cooldown_candidates)
+            .await;
+        let PoolAcquireResult::Unavailable(model_blocked) = model_blocked else {
+            panic!("round {round}: model cooldown race must block atomic acquire");
+        };
+        assert_eq!(
+            model_blocked.reason,
+            PoolCapacityWaitReason::ModelUnavailable
+        );
+        assert_eq!(model_blocked.detail, "model_cooldown_during_atomic_acquire");
+        assert_eq!(
+            manager.pool_runtime_snapshot(pool.id).await.unwrap().0,
+            0,
+            "round {round}: rejected model cooldown race must not occupy a lease"
+        );
+        let cleared = manager.clear_pool_cooldowns(pool.id).await.unwrap();
+        assert!(
+            cleared >= 1,
+            "round {round}: clearing model cooldown should delete at least one Redis key"
+        );
+        let cleared_snapshot = manager
+            .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
+            .await
+            .unwrap();
+        assert_eq!(cleared_snapshot.pool_cooldown_remaining_secs, 0);
+        assert!(
+            cleared_snapshot.model_cooldown.is_none(),
+            "round {round}: cleared model cooldown must be absent from the runtime snapshot"
+        );
+
+        manager
+            .redis
+            .set_json(&cooldown_key, &"not-a-cooldown-state", 30)
+            .await
+            .unwrap();
+        let malformed = manager
+            .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+            .await;
+        assert!(malformed.selected_pool.is_none());
+        assert!(malformed.availability.coordinator_unavailable);
+        assert_eq!(
+            malformed.availability.wait_reason,
+            Some(PoolCapacityWaitReason::CoordinatorUnavailable)
+        );
+        manager.redis.del(&cooldown_key).await.unwrap();
+
+        let lease = match manager.acquire_pool(&pool, &config).await {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => {
+                panic!(
+                    "round {round}: acquire should recover: {}",
+                    unavailable.detail
+                )
+            }
+        };
+        drop(lease);
+        let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+        assert!(drained.drained, "round {round}: release task should drain");
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_authoritative_pg_timeout_c128_is_one_query_and_recovers_for_three_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("authoritative-timeout-wave", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=3 {
+        manager.invalidate_static_pool_snapshot();
+        let blocker = lock_account_table(&postgres).await;
+        let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+        let saturated_before = manager.selection_saturated.load(Ordering::Acquire);
+        let first_wave = timeout(
+            Duration::from_secs(3),
+            futures::future::join_all((0..128).map(|_| manager.load_authoritative_pool_snapshot())),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: first timeout wave exceeded hard deadline"));
+        assert!(first_wave.iter().all(|result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.kind == AccountSelectionFailureKind::PostgresTimeout)
+        }));
+        assert_eq!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: c128 timeout wave must issue one PG list"
+        );
+        assert_eq!(
+            manager.selection_saturated.load(Ordering::Acquire),
+            saturated_before,
+            "round {round}: singleflight must not shed callers at the 32-query admission cap"
+        );
+
+        let negative_wave =
+            futures::future::join_all((0..128).map(|_| manager.load_authoritative_pool_snapshot()))
+                .await;
+        assert!(negative_wave.iter().all(Result::is_err));
+        assert_eq!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: failure cache must suppress immediate retry fanout"
+        );
+        unlock_account_table(blocker).await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let recovered = timeout(
+            Duration::from_secs(1),
+            futures::future::join_all((0..128).map(|_| manager.load_authoritative_pool_snapshot())),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: recovery wave timed out"));
+        assert!(recovered.iter().all(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|pools| pools.iter().any(|candidate| candidate.id == pool.id))
+        }));
+        assert_eq!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test(),
+            loads_before + 2,
+            "round {round}: recovery c128 must issue exactly one new PG list"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+/// Deterministic version of the CI failure of
+/// `account_authoritative_refresh_survives_leader_cancellation_for_five_rounds` ("round 4:
+/// manager-owned PG refresh did not start"). The previous refresh has published and woken its
+/// waiters but its task has not returned yet, which a busy runtime can stretch out. A caller
+/// that arrives after the snapshot was invalidated must still start a new refresh at once. When
+/// the refresh woke waiters before releasing its lock, that caller found the lock taken and
+/// waited for a notification that had already been sent, until its wait timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_authoritative_refresh_starts_while_previous_refresh_task_finishes() {
+    let Some((manager, postgres)) = test_account_manager_without_snapshot_timeouts().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("authoritative-lock-handoff", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=5 {
+        // One completed refresh, held at the end of its task.
+        manager.invalidate_static_pool_snapshot();
+        let gate = TestDispatchAfterPrepareGate::new();
+        manager.set_authoritative_refresh_end_gate(gate.clone());
+        let warm = manager.clone();
+        let warm = tokio::spawn(async move { warm.load_authoritative_pool_snapshot().await });
+        timeout(Duration::from_secs(10), gate.prepared.wait())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: first refresh never reached the gate"));
+        timeout(Duration::from_secs(5), warm)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: first caller was not woken"))
+            .unwrap()
+            .expect("first refresh publishes");
+
+        // The snapshot is invalidated and a new caller arrives while that task is still held.
+        manager.invalidate_static_pool_snapshot();
+        let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+        let caller_manager = manager.clone();
+        let caller =
+            tokio::spawn(async move { caller_manager.load_authoritative_pool_snapshot().await });
+        // Give the caller time to look for the refresh lock before the held task returns. If it
+        // is scheduled later, it finds the lock free either way and the round still passes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        timeout(Duration::from_secs(10), gate.resume.wait())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: gate release timed out"));
+
+        let snapshot = timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}: caller waited for a refresh that never started")
+            })
+            .unwrap()
+            .expect("caller gets the refreshed snapshot");
+        assert!(snapshot.iter().any(|candidate| candidate.id == pool.id));
+        assert_eq!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: the new caller must start exactly one refresh"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_authoritative_selection_pg_lock_is_typed_bounded_and_recovers() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("selection-pg-timeout", 1, true))
+        .await
+        .unwrap();
+    let route = test_route("claude-sonnet-4-6");
+    let blocker = lock_account_table(&postgres).await;
+    manager.redis.reset_account_hot_path_round_trips();
+    let started = Instant::now();
+    let blocked = manager
+        .select_pool_for_route(&HashSet::new(), &config, &route)
+        .await;
+    let elapsed = started.elapsed();
+    assert!(blocked.selected_pool.is_none());
+    assert!(blocked.availability.coordinator_unavailable);
+    assert_eq!(
+        blocked.availability.coordinator_unavailable_kind,
+        Some(PoolCoordinatorUnavailableKind::PostgresTimeout)
+    );
+    assert_eq!(
+        blocked.availability.wait_reason,
+        Some(PoolCapacityWaitReason::CoordinatorUnavailable)
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1_800),
+        "elapsed={elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(3_000),
+        "elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        manager.redis.account_hot_path_round_trips(),
+        0,
+        "PG selection timeout must fail before Redis selection/acquire"
+    );
+
+    unlock_account_table(blocker).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let recovered = manager
+        .select_pool_for_route(&HashSet::new(), &config, &route)
+        .await;
+    let selected = recovered
+        .selected_pool
+        .expect("authoritative selection must recover after the PG lock is released");
+    assert_eq!(selected.id, pool.id);
+    let cold_bootstrap_rtts = manager.redis.account_hot_path_round_trips();
+    assert!(
+        (1..=5).contains(&cold_bootstrap_rtts),
+        "the first successful selection after a coordinator-cold PG timeout may bootstrap Redis coordination, but must stay bounded; rtts={cold_bootstrap_rtts}"
+    );
+
+    manager.redis.reset_account_hot_path_round_trips();
+    *manager.selection_runtime_snapshot.lock() = None;
+    let warm = manager
+        .select_pool_for_route(&HashSet::new(), &config, &route)
+        .await;
+    let warm_selected = warm
+        .selected_pool
+        .expect("warm authoritative selection must keep working after bootstrap");
+    assert_eq!(warm_selected.id, pool.id);
+    assert_eq!(
+        manager.redis.account_hot_path_round_trips(),
+        1,
+        "warm authoritative selection must use one batched Redis runtime snapshot RTT"
+    );
+    let lease = match manager
+        .acquire_pool_for_route(&warm_selected, &config, &route)
+        .await
+    {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!("atomic lease must recover: {}", unavailable.detail)
+        }
+    };
+    assert_eq!(
+        manager.redis.account_hot_path_round_trips(),
+        2,
+        "warm authoritative selection plus atomic acquire must use two Redis RTTs"
+    );
+    drop(lease);
+    let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+    assert!(drained.drained);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_authoritative_snapshot_singleflights_c32_c128_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager_without_snapshot_timeouts().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("authoritative-singleflight", 1, true))
+        .await
+        .unwrap();
+
+    for concurrency in [32usize, 128] {
+        for round in 1..=5 {
+            manager.invalidate_static_pool_snapshot();
+            let blocker = lock_account_table(&postgres).await;
+            let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+            let wave_manager = manager.clone();
+            let wave = tokio::spawn(async move {
+                futures::future::join_all(
+                    (0..concurrency).map(|_| wave_manager.load_authoritative_pool_snapshot()),
+                )
+                .await
+            });
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if manager.authoritative_pool_snapshot_pg_loads_for_test() > loads_before {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}, c{concurrency}: authoritative PG query did not start")
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(
+                manager.authoritative_pool_snapshot_pg_loads_for_test(),
+                loads_before + 1,
+                "round {round}, c{concurrency}: one cold generation must issue one PG query"
+            );
+            unlock_account_table(blocker).await;
+            let results = timeout(Duration::from_secs(10), wave)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}, c{concurrency}: wave timed out"))
+                .unwrap();
+            assert_eq!(results.len(), concurrency);
+            assert!(results.iter().all(|result| {
+                result
+                    .as_ref()
+                    .is_ok_and(|pools| pools.iter().any(|candidate| candidate.id == pool.id))
+            }));
+            assert_eq!(
+                manager.authoritative_pool_snapshot_pg_loads_for_test(),
+                loads_before + 1,
+                "round {round}, c{concurrency}: waiters must reuse the same completed wave"
+            );
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_auto_disable_two_managers_claim_one_revision_transition_per_burst() {
+    let Some((manager_a, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager_b = AccountManager::new(postgres.clone(), manager_a.redis.clone());
+    let config = AccountsConfig {
+        enabled: true,
+        auto_disable_enabled: true,
+        auto_disable_on_auth_error: true,
+        auto_disable_failure_threshold: 3,
+        auto_disable_window_secs: 60,
+        auto_disable_duration_secs: 60,
+        ..AccountsConfig::default()
+    };
+    let mut pool = postgres
+        .create_account(create_pool_request("auto-disable-two-manager", 1, true))
+        .await
+        .unwrap();
+
+    for round in 0..3 {
+        let revision_before = pool.revision;
+        futures::future::join_all((0..128).map(|index| {
+            let manager = if index % 2 == 0 {
+                manager_a.clone()
+            } else {
+                manager_b.clone()
+            };
+            let config = config.clone();
+            let pool = pool.clone();
+            async move {
+                manager
+                    .auto_disable_pool_if_configured(
+                        &pool,
+                        &config,
+                        "auth_error",
+                        "test authentication failure",
+                    )
+                    .await;
+            }
+        }))
+        .await;
+        let disabled = postgres
+            .get_account(pool.id, true)
+            .await
+            .unwrap()
+            .expect("pool remains present");
+        assert!(disabled.auto_disabled, "round {round}");
+        assert_eq!(
+            disabled.revision,
+            revision_before + 1,
+            "round {round}: distributed claim and PG CAS permit one transition"
+        );
+        pool = postgres
+            .clear_account_auto_disabled(pool.id)
+            .await
+            .unwrap()
+            .expect("pool remains present");
+        assert_eq!(pool.revision, disabled.revision + 1);
+    }
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_bad_request_model_unavailable_fails_over_without_same_pool_replay() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_REQUEST,
+        fake_external_error_body("No available channel for model claude-sonnet-4-6"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("400-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "bad-request-model-unavailable-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "bad-request-model-unavailable-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 3,
+        same_pool_retry_status_codes: vec![StatusCode::BAD_REQUEST.as_u16()],
+        same_pool_retry_delay_ms: 1,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_bad_request_model_unavailable".to_string();
+    route.error_id = "err_bad_request_model_unavailable".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("400 model-unavailable failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("400 model-unavailable should fail over to the next pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        1,
+        "model-unavailable must not replay the same pool even when 400 is listed"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_billing_matches_dashed_opus_request_to_dotted_pricing_model() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+    let route = test_route("claude-opus-4-8");
+    route.pricing_catalog.upsert_manual_price(
+        "claude-opus-4.8",
+        crate::anthropic::pricing::ModelPricing {
+            input_cost_per_token: 0.000007,
+            output_cost_per_token: 0.000031,
+            cache_creation_input_token_cost: 0.000008,
+            cache_creation_1h_input_token_cost: 0.0,
+            cache_read_input_token_cost: 0.0000007,
+        },
+    );
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected =
+        process_non_stream_response_usage(body, Some(&route), None, std::iter::empty::<String>());
+    let billing = account_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+
+    assert!(billing.pricing_available);
+    assert_eq!(billing.pricing_model.as_deref(), Some("claude-opus-4.8"));
+    assert!(billing.billable_cost_usd > 0.0);
+    assert!((billing.billable_cost_usd - 0.00101).abs() < f64::EPSILON);
+}
+
+#[test]
+fn account_billing_pass_through_uses_reported_cost_without_floor() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let projected = maybe_project_non_stream_usage(body, None);
+    let route = test_route("claude-sonnet-4-5");
+    let pool = test_pool("http://pool.example.com", false);
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+
+    assert!(billing.pricing_available);
+    assert!(!billing.cost_floor_applied);
+    assert!((billing.raw_cost_usd - billing.shaped_cost_usd).abs() < f64::EPSILON);
+    assert!((billing.raw_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+    assert!(billing.profit_usd.abs() < f64::EPSILON);
+    assert!((billing.raw_cost_usd - billing.reported_cost_usd).abs() < f64::EPSILON);
+    assert!((billing.billable_cost_usd - billing.reported_cost_usd).abs() < f64::EPSILON);
+}
+
+#[test]
+fn account_billing_tracks_raw_shaped_uplifted_costs() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 25);
+    let projected = maybe_project_non_stream_usage(body, projection.as_ref());
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+
+    assert!(billing.pricing_available);
+    assert!(billing.raw_cost_usd > billing.shaped_cost_usd);
+    assert!(billing.uplifted_cost_usd > billing.shaped_cost_usd);
+    assert!((billing.reported_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+    assert!((billing.billable_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+    assert!(
+        (billing.profit_usd - (billing.uplifted_cost_usd - billing.raw_cost_usd)).abs()
+            < 0.000000001
+    );
+}
+
+#[test]
+fn account_billing_uses_output_uplift_as_final_reported_cost() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":1200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    disable_path_output_postprocess(&mut route);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+
+    assert!(billing.pricing_available);
+    assert_eq!(billing.raw_usage.output_tokens, 1200);
+    assert_eq!(billing.shaped_usage.output_tokens, 1200);
+    assert_eq!(
+        billing.reported_usage.output_tokens,
+        uplift_tokens(1200, 50)
+    );
+    assert!(billing.uplifted_cost_usd > billing.shaped_cost_usd);
+    assert!((billing.reported_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+    assert!((billing.billable_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+}
+
+/// Accounts resolve the write TTL from the route mode; "channel first" follows a channel
+/// that reported a 1-hour write and otherwise falls back to the request marker.
+#[test]
+fn account_cache_ttl_modes_follow_route_and_channel() {
+    use crate::model::config::CacheTtlMode;
+    let channel_1h = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1998336,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1998336}}}
+
+"#;
+    let channel_5m = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1998336,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":1998336,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+    let split = |mode: CacheTtlMode, request_ttl: Option<&str>, event: &[u8]| {
+        let mut route = test_route("claude-opus-4-8");
+        payload_mut(&mut route).stream = true;
+        if let Some(ttl) = request_ttl {
+            payload_mut(&mut route).system.as_mut().unwrap()[0].cache_control =
+                Some(serde_json::json!({"type": "ephemeral", "ttl": ttl}));
+        }
+        route.cache_ttl_mode = mode;
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        let projected = rewrite_sse_event_usage(event, Some(&projection), None);
+        let value = event_data_value(&projected);
+        let usage = value["usage"].clone();
+        assert_projected_cache_creation_consistent(&usage);
+        let total = usage["cache_creation_input_tokens"].as_i64().unwrap();
+        assert!(total > 0, "{usage}");
+        let hour = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_i64()
+            .unwrap();
+        if hour == total {
+            "1h"
+        } else {
+            assert_eq!(hour, 0, "{usage}");
+            "5m"
+        }
+    };
+
+    // Channel-first: the channel's 1h wins even over an explicit 5m request.
+    assert_eq!(
+        split(
+            CacheTtlMode::UpstreamThenRequestDefault5m,
+            Some("5m"),
+            channel_1h
+        ),
+        "1h"
+    );
+    // A channel that reported only 5m counts as unmarked: follow the request, else 5m.
+    assert_eq!(
+        split(
+            CacheTtlMode::UpstreamThenRequestDefault5m,
+            Some("1h"),
+            channel_5m
+        ),
+        "1h"
+    );
+    assert_eq!(
+        split(CacheTtlMode::UpstreamThenRequestDefault5m, None, channel_5m),
+        "5m"
+    );
+    // The other modes ignore the channel.
+    assert_eq!(
+        split(CacheTtlMode::FollowRequestDefault5m, None, channel_1h),
+        "5m"
+    );
+    assert_eq!(
+        split(CacheTtlMode::FollowRequestDefault1h, None, channel_5m),
+        "1h"
+    );
+    assert_eq!(split(CacheTtlMode::Force5m, Some("1h"), channel_1h), "5m");
+    assert_eq!(split(CacheTtlMode::Force1h, Some("5m"), channel_5m), "1h");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_cached_immediate_availability_is_no_wait_under_pg_lock_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 0,
+        ..AccountsConfig::default()
+    };
+
+    postgres
+        .create_account(create_pool_request("external-cached-no-wait", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=5 {
+        manager.invalidate_static_pool_snapshot();
+        let blocker = lock_account_table(&postgres).await;
+        let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+        let wave_manager = manager.clone();
+        let wave_config = config.clone();
+        let started = Instant::now();
+        let wave = tokio::spawn(async move {
+            futures::future::join_all((0..128).map(|_| {
+                let manager = wave_manager.clone();
+                let config = wave_config.clone();
+                async move {
+                    manager
+                        .has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4")
+                }
+            }))
+            .await
+        });
+        let results = timeout(Duration::from_millis(250), wave)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}: cached local gate waited for locked Postgres")
+            })
+            .unwrap();
+        assert!(
+            results.iter().all(|available| !*available),
+            "round {round}: cold cached gate must preserve local semantics until a snapshot is ready"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "round {round}: cached local gate must not wait for authoritative refresh"
+        );
+        assert!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test() <= loads_before + 1,
+            "round {round}: c128 cached local gate may start at most one background PG refresh"
+        );
+
+        unlock_account_table(blocker).await;
+        let snapshot = timeout(
+            Duration::from_secs(2),
+            manager.load_authoritative_pool_snapshot(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: background refresh did not recover"))
+        .expect("authoritative snapshot should recover after table unlock");
+        assert!(
+            !snapshot.is_empty(),
+            "round {round}: recovered authoritative snapshot should contain the pool"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_cached_immediate_availability_uses_cached_runtime_capacity() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 0,
+        ..AccountsConfig::default()
+    };
+
+    let pool = postgres
+        .create_account(create_pool_request("external-cached-runtime", 1, true))
+        .await
+        .unwrap();
+
+    assert!(
+        !manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cold cached route gate must not synchronously read Redis/PgSQL"
+    );
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "authoritative availability should populate the runtime cache"
+    );
+    assert!(
+        manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cached route gate should use the warmed authoritative/runtime snapshots"
+    );
+
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!("pool lease should be acquired: {}", unavailable.detail)
+        }
+    };
+    assert!(
+        !manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "authoritative availability should observe the full account"
+    );
+    assert!(
+        !manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cached route gate must not steer local traffic to a full account"
+    );
+
+    drop(lease);
+    let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+    assert!(drained.drained, "external release should drain");
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "authoritative availability should recover after release"
+    );
+    assert!(
+        manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cached route gate should recover after release and runtime cache refresh"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_cancelled_waiter_releases_redis_queue_lease() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = Arc::new(manager);
+    let config = AccountsConfig {
+        enabled: true,
+        capacity_mode: CapacityMode::Wait,
+        max_queued_requests: 1,
+        dispatch_max_wait_secs: 60,
+        ..AccountsConfig::default()
+    };
+
+    let pool = postgres
+        .create_account(create_pool_request("external-cancelled-waiter", 1, true))
+        .await
+        .unwrap();
+    let held_lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => panic!(
+            "account lease should be acquired before queueing: {}",
+            unavailable.detail
+        ),
+    };
+
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_manager
+            .forward_with_failover_result(config, test_route("claude-sonnet-4-5"))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager.redis.account_dispatch_queue_size().await.unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("external waiter should acquire a Redis queue lease");
+
+    waiting.abort();
+    let join_error = match waiting.await {
+        Err(error) => error,
+        Ok(_) => panic!("aborted external queue waiter should not finish normally"),
+    };
+    assert!(join_error.is_cancelled());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager.redis.account_dispatch_queue_size().await.unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled external waiter should release its queue lease before TTL");
+
+    drop(held_lease);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_candidate_selection_handles_multiple_backup_pools() {
+    let config = AccountsConfig::default();
+    let mut primary = test_pool("https://primary.example.test", true);
+    primary.id = 11;
+    primary.priority = 1;
+    primary.max_concurrent_requests = 1;
+    let mut secondary = test_pool("https://secondary.example.test", true);
+    secondary.id = 22;
+    secondary.priority = 2;
+    secondary.max_concurrent_requests = 1;
+    let mut tertiary = test_pool("https://tertiary.example.test", true);
+    tertiary.id = 33;
+    tertiary.priority = 3;
+    tertiary.max_concurrent_requests = 1;
+
+    let selected = select_account_candidate(
+        vec![
+            candidate(secondary.clone(), 0, 0),
+            candidate(tertiary.clone(), 0, 0),
+            candidate(primary.clone(), 0, 0),
+        ],
+        &config,
+        0,
+    )
+    .expect("candidate should be selected");
+    assert_eq!(selected.id, primary.id);
+
+    let selected = select_account_candidate(
+        vec![
+            candidate(secondary.clone(), 0, 0),
+            candidate(tertiary.clone(), 0, 0),
+        ],
+        &config,
+        0,
+    )
+    .expect("fallback candidate should be selected when primary is excluded/full");
+    assert_eq!(selected.id, secondary.id);
+
+    primary.priority = 1;
+    secondary.priority = 1;
+    primary.max_concurrent_requests = 2;
+    secondary.max_concurrent_requests = 4;
+    let selected = select_account_candidate(
+        vec![
+            candidate(primary.clone(), 1, 0),
+            candidate(secondary.clone(), 1, 0),
+        ],
+        &config,
+        0,
+    )
+    .expect("lower same-priority load should be selected");
+    assert_eq!(selected.id, secondary.id);
+}
+
+#[test]
+fn account_candidate_selection_penalizes_transient_failures() {
+    let config = AccountsConfig::default();
+    let mut failing_primary = test_pool("https://failing-primary.example.test", true);
+    failing_primary.id = 41;
+    failing_primary.priority = 1;
+    failing_primary.max_concurrent_requests = 4;
+    let mut healthy_backup = test_pool("https://healthy-backup.example.test", true);
+    healthy_backup.id = 42;
+    healthy_backup.priority = 10;
+    healthy_backup.max_concurrent_requests = 4;
+    let selected = select_account_candidate(
+        vec![
+            candidate(failing_primary.clone(), 0, 1),
+            candidate(healthy_backup.clone(), 0, 0),
+        ],
+        &config,
+        0,
+    )
+    .expect("healthy backup should be selected once the primary accumulated a transient failure");
+    assert_eq!(selected.id, healthy_backup.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_client_decodes_gzip_non_stream_usage_before_projection() {
+    let raw_body = br#"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":20,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, raw_body).expect("write gzip body");
+    let gzipped = encoder.finish().expect("finish gzip body");
+    let (url, server) =
+        spawn_test_raw_http_response(StatusCode::OK, TestRawHttpBody::GzipJson(gzipped)).await;
+
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("build account client");
+    let response = client.get(url).send().await.expect("send request");
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    let body = response_bytes_with_limit_and_body_timeout(
+        response,
+        2,
+        ACCOUNT_NON_STREAM_RESPONSE_MAX_BYTES,
+    )
+    .await
+    .expect("read decoded body");
+    server.await.unwrap();
+
+    assert_eq!(body.as_ref(), raw_body);
+    let projected = maybe_project_non_stream_usage(body, None);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.output_tokens),
+        Some(7)
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .map(|usage| usage.output_tokens),
+        Some(7)
+    );
+    assert!(!projected.usage_capture.usage_estimated);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_confirmed_heartbeat_keeps_lease_alive_past_max_age_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 1,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-heartbeat-max-age", 1, true))
+        .await
+        .unwrap();
+    let max_age = Duration::from_millis(900);
+    let cooldown_keys = vec![format!("account:{}:cooldown", pool.id)];
+
+    for round in 0..5 {
+        let lease = match manager
+            .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+            .await
+        {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => {
+                panic!("round {round}: {}", unavailable.detail)
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(1_350)).await;
+        let snapshot = manager
+            .redis
+            .account_coordinator_snapshot(
+                pool.id,
+                Some(max_age),
+                &cooldown_keys,
+                &lease.coordination_epoch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.capacity,
+            crate::storage::redis_cache::AccountCapacityState {
+                pool_in_flight_requests: 1,
+                global_in_flight_requests: 1,
+            },
+            "round {round}: heartbeat must keep the confirmed lease alive past max_age"
+        );
+        assert!(
+            lease
+                .heartbeat
+                .as_ref()
+                .unwrap()
+                .state
+                .attempts
+                .load(Ordering::Relaxed)
+                >= 2,
+            "round {round}: expected repeated direct heartbeat feedback"
+        );
+        drop(lease);
+        let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+        assert!(drained.drained, "round {round}: release must drain");
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_coordinator_admission_bounds_10k_simultaneous_first_timeout_wave_for_five_rounds()
+{
+    let Ok(toxiproxy_api) = std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 coordinator 首波压力测试：未设置 CLAUDE_POOL_TEST_TOXIPROXY_API");
+        return;
+    };
+    let proxy_name =
+        std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-breaker-first-wave", 1, true))
+        .await
+        .unwrap();
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let pool_ids = vec![pool.id];
+    let excluded = HashSet::new();
+    let client = reqwest::Client::new();
+    let toxic_base = format!(
+        "{}/proxies/{}/toxics",
+        toxiproxy_api.trim_end_matches('/'),
+        proxy_name
+    );
+
+    for round in 0..5 {
+        manager.redis.reset_account_hot_path_round_trips();
+        let saturated_before = manager.selection_saturated.load(Ordering::Acquire);
+        let toxic_name = format!("external-breaker-first-wave-{round}");
+        let install = client
+            .post(&toxic_base)
+            .json(&json!({
+                "name": toxic_name.clone(),
+                "type": "latency",
+                "stream": "downstream",
+                "toxicity": 1.0,
+                "attributes": { "latency": 2200, "jitter": 0 },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(install.status().is_success(), "round {round}: {install:?}");
+
+        let first_wave = futures::future::join_all((0..10_000).map(|_| {
+            manager.scan_pool_availability_uncached(&excluded, &config, true, None, None)
+        }))
+        .await;
+        let remove = client
+            .delete(format!("{toxic_base}/{toxic_name}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(remove.status().is_success(), "round {round}: {remove:?}");
+        assert!(
+            first_wave.iter().all(|selection| {
+                selection.selected_pool.is_none() && selection.availability.coordinator_unavailable
+            }),
+            "round {round}: the injected first timeout wave must fail closed"
+        );
+        let redis_attempts = manager.redis.account_hot_path_round_trips();
+        assert!(redis_attempts > 0, "round {round}");
+        assert!(
+            redis_attempts <= ACCOUNT_COORDINATOR_MAX_IN_FLIGHT as u64,
+            "round {round}: first-wave Redis attempts {redis_attempts} exceeded the hard cap"
+        );
+        assert!(
+            manager
+                .selection_saturated
+                .load(Ordering::Acquire)
+                .saturating_sub(saturated_before)
+                >= (10_000 - ACCOUNT_COORDINATOR_MAX_IN_FLIGHT) as u64,
+            "round {round}: excess requests must be rejected before spawning Redis work"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        let attempts_before_recovery = manager.redis.account_hot_path_round_trips();
+        let recovery_race = futures::future::join_all(
+            (0..128).map(|_| manager.load_pool_runtime_snapshots(&pool_ids, &[])),
+        )
+        .await;
+        assert_eq!(
+            recovery_race.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "round {round}: exactly one recovery probe must succeed"
+        );
+        assert_eq!(
+            manager.redis.account_hot_path_round_trips(),
+            attempts_before_recovery + 1,
+            "round {round}: the recovery race must add exactly one Redis attempt"
+        );
+        for recovery_probe in 0..5 {
+            let recovered = manager
+                .scan_pool_availability_uncached(&excluded, &config, true, None, None)
+                .await;
+            assert_eq!(
+                recovered.selected_pool.map(|pool| pool.id),
+                Some(pool.id),
+                "round {round}, recovery probe {recovery_probe}"
+            );
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_coordinator_breaker_bounds_10k_failures_and_single_recovery_probe_for_five_rounds()
+{
+    let Ok(toxiproxy_api) = std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 coordinator breaker 压力测试：未设置 CLAUDE_POOL_TEST_TOXIPROXY_API");
+        return;
+    };
+    let proxy_name =
+        std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-breaker-burst", 1, true))
+        .await
+        .unwrap();
+    let pool_ids = vec![pool.id];
+    let client = reqwest::Client::new();
+    let toxic_base = format!(
+        "{}/proxies/{}/toxics",
+        toxiproxy_api.trim_end_matches('/'),
+        proxy_name
+    );
+
+    for round in 0..5 {
+        manager.redis.reset_account_hot_path_round_trips();
+        let toxic_name = format!("external-breaker-burst-{round}");
+        let install = client
+            .post(&toxic_base)
+            .json(&json!({
+                "name": toxic_name.clone(),
+                "type": "reset_peer",
+                "stream": "downstream",
+                "toxicity": 1.0,
+                "attributes": { "timeout": 0 },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(install.status().is_success(), "round {round}: {install:?}");
+
+        assert!(
+            manager
+                .load_pool_runtime_snapshots(&pool_ids, &[])
+                .await
+                .is_err(),
+            "round {round}: injected Redis failure must open the breaker"
+        );
+        let remove = client
+            .delete(format!("{toxic_base}/{toxic_name}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(remove.status().is_success(), "round {round}: {remove:?}");
+        assert_eq!(manager.redis.account_hot_path_round_trips(), 1);
+
+        let fail_fast = futures::future::join_all(
+            (0..10_000).map(|_| manager.load_pool_runtime_snapshots(&pool_ids, &[])),
+        )
+        .await;
+        assert!(
+            fail_fast.iter().all(|result| result
+                .as_ref()
+                .is_err_and(|err| err.to_string().contains("coordinator breaker is open"))),
+            "round {round}: every request inside the open window must fail fast"
+        );
+        assert_eq!(
+            manager.redis.account_hot_path_round_trips(),
+            1,
+            "round {round}: 10k fail-fast requests must not amplify Redis operations"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        let recovery_race = futures::future::join_all(
+            (0..128).map(|_| manager.load_pool_runtime_snapshots(&pool_ids, &[])),
+        )
+        .await;
+        assert_eq!(
+            recovery_race.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "round {round}: exactly one recovery probe may reach Redis"
+        );
+        assert_eq!(
+            manager.redis.account_hot_path_round_trips(),
+            2,
+            "round {round}: recovery race must add exactly one Redis RTT"
+        );
+
+        for recovery_probe in 0..5 {
+            let recovered = manager
+                .load_pool_runtime_snapshots(&pool_ids, &[])
+                .await
+                .unwrap();
+            assert_eq!(recovered.len(), 1, "round {round}, {recovery_probe}");
+            assert!(recovered[0].is_ok(), "round {round}, {recovery_probe}");
+        }
+        assert_eq!(
+            manager.redis.account_hot_path_round_trips(),
+            7,
+            "round {round}: five healthy probes must each use one batch RTT"
+        );
+    }
+
+    assert!(
+        manager
+            .coordinator_breaker
+            .stats
+            .fail_fast
+            .load(Ordering::Relaxed)
+            >= 5 * (10_000 + 127)
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_coordinator_breaker_single_probe_and_cancellation_recover_for_five_rounds() {
+    for round in 0..5 {
+        let breaker = Arc::new(AccountCoordinatorBreaker::new(vec![
+            Duration::from_millis(15),
+            Duration::from_millis(30),
+            Duration::from_millis(60),
+        ]));
+        let stale_success = breaker.try_begin().expect("closed breaker must admit");
+        breaker
+            .try_begin()
+            .expect("closed breaker must admit concurrent operation")
+            .failure(AccountCoordinatorFailureKind::Timeout);
+        stale_success.success();
+
+        for _ in 0..64 {
+            assert!(
+                breaker.try_begin().is_err(),
+                "round {round}: stale success must not close a newer failure generation"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let cancelled_probe = breaker
+            .try_begin()
+            .expect("round must admit exactly one recovery probe");
+        for _ in 0..64 {
+            assert!(
+                breaker.try_begin().is_err(),
+                "round {round}: concurrent recovery probes must fail fast"
+            );
+        }
+        drop(cancelled_probe);
+        assert!(
+            breaker.try_begin().is_err(),
+            "round {round}: cancelled probe must re-arm a bounded retry window"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        breaker
+            .try_begin()
+            .expect("cancelled probe must not permanently occupy recovery")
+            .success();
+        for _ in 0..5 {
+            breaker
+                .try_begin()
+                .expect("successful probe must close the breaker")
+                .success();
+        }
+
+        assert_eq!(breaker.stats.failures.load(Ordering::Relaxed), 1);
+        assert_eq!(breaker.stats.recovery_probes.load(Ordering::Relaxed), 2);
+        assert_eq!(breaker.stats.cancelled_probes.load(Ordering::Relaxed), 1);
+        assert_eq!(breaker.stats.recoveries.load(Ordering::Relaxed), 1);
+        assert!(breaker.stats.fail_fast.load(Ordering::Relaxed) >= 129);
+    }
+}
+
+#[test]
+fn account_coordinator_breaker_uses_bounded_exponential_backoff() {
+    let breaker = AccountCoordinatorBreaker::default();
+    let expected = [1, 2, 4, 8, 16, 30, 30, 30];
+    for (failure_count, expected_secs) in expected.into_iter().enumerate() {
+        assert_eq!(
+            breaker.backoff_for_failure(failure_count + 1),
+            Duration::from_secs(expected_secs)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_coordinator_clean_startup_has_no_recovery_barrier_for_five_rounds() {
+    for round in 0..5 {
+        let Some((manager, postgres)) = test_account_manager().await else {
+            return;
+        };
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_config WHERE id = $1")
+            .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+        assert_eq!(existing, 0, "round {round}: test schema must start clean");
+
+        let started = Instant::now();
+        let epoch = manager.account_coordination_epoch().await.unwrap();
+        let first_start_elapsed = started.elapsed();
+        assert!(!epoch.is_empty(), "round {round}");
+        assert!(
+            first_start_elapsed < Duration::from_secs(2),
+            "round {round}: clean startup unexpectedly waited for recovery: {first_start_elapsed:?}"
+        );
+        assert_eq!(
+            manager
+                .redis
+                .account_coordinator_guard_state_for_epoch(&epoch)
+                .await
+                .unwrap(),
+            AccountCoordinatorGuardState::Ready {
+                coordination_epoch: epoch.clone(),
+            },
+            "round {round}: clean startup must not install a recovery barrier"
+        );
+
+        let authority: serde_json::Value =
+            sqlx::query_scalar("SELECT config FROM runtime_config WHERE id = $1")
+                .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            authority
+                .get("coordinationEpoch")
+                .and_then(serde_json::Value::as_str),
+            Some(epoch.as_str()),
+            "round {round}"
+        );
+        assert!(
+            authority
+                .get("redisRunId")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|run_id| !run_id.is_empty()),
+            "round {round}: authority must persist the Redis run id"
+        );
+
+        let peer = AccountManager::new(postgres.clone(), manager.redis.clone());
+        let peer_started = Instant::now();
+        let peer_epoch = peer.account_coordination_epoch().await.unwrap();
+        assert_eq!(
+            peer_epoch, epoch,
+            "round {round}: peer rotated a clean epoch"
+        );
+        assert!(
+            peer_started.elapsed() < Duration::from_secs(2),
+            "round {round}: peer startup unexpectedly waited for recovery"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_config WHERE id = $1")
+            .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "round {round}");
+        postgres.drop_test_schema().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn account_coordinator_failure_fails_closed_in_fail_fast_mode_without_queue_admission() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        capacity_mode: CapacityMode::FailFast,
+        max_queued_requests: 1,
+        dispatch_max_wait_secs: 0,
+        ..AccountsConfig::default()
+    };
+    let route = test_route("claude-sonnet-4-5");
+    let mut queue_guard = None;
+    let mut wait_started_at = None;
+    let mut capacity_waiter = manager.capacity_signal.register();
+
+    let decision = manager
+        .handle_capacity_unavailable(
+            &route,
+            Vec::new(),
+            &config,
+            PoolCapacityWaitContext {
+                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                wait_for: None,
+                cooldown_reason: None,
+                cooldown_scope: None,
+                cooldown_remaining_secs: None,
+                eligible_pools: 0,
+                available_pools: 0,
+                temporary_unavailable_pools: 0,
+                coordinator_unavailable_kind: Some(PoolCoordinatorUnavailableKind::RedisError),
+            },
+            &mut queue_guard,
+            &mut wait_started_at,
+            &mut capacity_waiter,
+            None,
+        )
+        .await;
+
+    let ExternalCapacityDecision::FinalError(error) = decision else {
+        panic!("coordinator failure must fail closed without waiting");
+    };
+    assert_eq!(error.route_error_type, "account_coordinator_unavailable");
+    assert!(queue_guard.is_none());
+    assert_eq!(
+        manager.redis.account_dispatch_queue_size().await.unwrap(),
+        0
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_coordinator_failure_wait_mode_retries_without_queue_admission() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        capacity_mode: CapacityMode::Wait,
+        max_queued_requests: 1,
+        dispatch_max_wait_secs: 1,
+        ..AccountsConfig::default()
+    };
+    let route = test_route("claude-sonnet-4-5");
+    let mut queue_guard = None;
+    let mut wait_started_at = None;
+    let mut capacity_waiter = manager.capacity_signal.register();
+
+    let started = Instant::now();
+    let decision = manager
+        .handle_capacity_unavailable(
+            &route,
+            Vec::new(),
+            &config,
+            PoolCapacityWaitContext {
+                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                wait_for: Some(Duration::from_millis(1)),
+                cooldown_reason: None,
+                cooldown_scope: None,
+                cooldown_remaining_secs: None,
+                eligible_pools: 3,
+                available_pools: 0,
+                temporary_unavailable_pools: 3,
+                coordinator_unavailable_kind: Some(PoolCoordinatorUnavailableKind::RedisError),
+            },
+            &mut queue_guard,
+            &mut wait_started_at,
+            &mut capacity_waiter,
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(decision, ExternalCapacityDecision::Retry),
+        "coordinator failure in wait mode should retry selection"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "coordinator retry backoff should be short and bounded"
+    );
+    assert!(queue_guard.is_none());
+    assert_eq!(
+        manager.redis.account_dispatch_queue_size().await.unwrap(),
+        0
+    );
+
+    let mut expired_wait_started_at = Some(Instant::now() - Duration::from_secs(2));
+    let mut expired_waiter = manager.capacity_signal.register();
+    let expired = manager
+        .handle_capacity_unavailable(
+            &route,
+            Vec::new(),
+            &config,
+            PoolCapacityWaitContext {
+                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                wait_for: None,
+                cooldown_reason: None,
+                cooldown_scope: None,
+                cooldown_remaining_secs: None,
+                eligible_pools: 3,
+                available_pools: 0,
+                temporary_unavailable_pools: 3,
+                coordinator_unavailable_kind: Some(PoolCoordinatorUnavailableKind::RedisError),
+            },
+            &mut queue_guard,
+            &mut expired_wait_started_at,
+            &mut expired_waiter,
+            None,
+        )
+        .await;
+    let ExternalCapacityDecision::FinalError(error) = expired else {
+        panic!("expired coordinator wait must fail closed");
+    };
+    assert_eq!(error.route_error_type, "account_coordinator_unavailable");
+    assert!(error.retryable);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_coordinator_first_failure_wave_has_a_hard_in_flight_cap_for_five_rounds() {
+    for round in 0..5 {
+        let breaker = Arc::new(AccountCoordinatorBreaker::default());
+        let mut admitted = Vec::with_capacity(ACCOUNT_COORDINATOR_MAX_IN_FLIGHT);
+        for _ in 0..ACCOUNT_COORDINATOR_MAX_IN_FLIGHT {
+            admitted.push(
+                breaker
+                    .try_begin()
+                    .expect("operations up to the hard cap must be admitted"),
+            );
+        }
+        for _ in 0..10_000 {
+            assert!(
+                breaker.try_begin().is_err(),
+                "round {round}: operations above the hard cap must not create waiting tasks"
+            );
+        }
+        assert_eq!(
+            breaker.stats.saturated.load(Ordering::Relaxed),
+            10_000,
+            "round {round}"
+        );
+        assert_eq!(breaker.operation_semaphore.available_permits(), 0);
+        for permit in admitted {
+            permit.success();
+        }
+        assert_eq!(
+            breaker.operation_semaphore.available_permits(),
+            ACCOUNT_COORDINATOR_MAX_IN_FLIGHT
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_cross_pool_retry_status_codes_can_stop_failover() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("unused"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "cross-pool-status-filter-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "cross-pool-status-filter-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        retry_status_codes: vec![StatusCode::TOO_MANY_REQUESTS.as_u16()],
+        same_pool_retry_count: 0,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_cross_pool_status_filter".to_string();
+    route.error_id = "err_cross_pool_status_filter".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("cross-pool status filtering should finish");
+    assert!(
+        matches!(outcome, AccountForwardOutcome::FinalError(_)),
+        "a status excluded from cross-pool retry must fail without switching pools"
+    );
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_data_generation_invalidates_peer_without_clearing_on_policy_only_change() {
+    let Some((manager_a, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager_b = AccountManager::new(postgres.clone(), manager_a.redis.clone())
+        .with_static_pool_snapshot_ttl(Duration::from_secs(30));
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let mut request = create_pool_request("cross-instance-generation", 1, true);
+    request.supported_models = vec!["model-before-event".to_string()];
+    let pool = postgres.create_account(request).await.unwrap();
+    assert!(
+        manager_b
+            .has_eligible_pool_for_model(&config, "model-before-event")
+            .await
+    );
+    let cached_generation = manager_b.static_pool_snapshot_generation_for_test();
+    manager_b.invalidate_account_policy_state();
+    assert_eq!(
+        manager_b.static_pool_snapshot_generation_for_test(),
+        cached_generation,
+        "policy-only config changes must not clear static pool data"
+    );
+
+    postgres
+        .set_account_supported_models(pool.id, vec!["model-after-event".to_string()])
+        .await
+        .unwrap();
+    let distributed_generation = manager_a
+        .redis
+        .publish_account_data_changed("test_peer_update", Some(pool.id))
+        .await
+        .unwrap();
+    assert!(
+        manager_b.observe_account_data_event(
+            &json!({ "generation": distributed_generation }).to_string()
+        )
+    );
+    assert!(manager_b.static_pool_snapshot_generation_for_test() > cached_generation);
+    assert!(
+        manager_b
+            .has_eligible_pool_for_model(&config, "model-after-event")
+            .await
+    );
+    assert!(
+        !manager_b
+            .has_eligible_pool_for_model(&config, "model-before-event")
+            .await
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_default_model_mapping_preserves_caller_claude_code_model() {
+    let mut route = test_route("claude-opus-4-8");
+    route.upstream_model = Some("claude-opus-4.8".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+    route.raw_body = Bytes::from_static(
+        br#"{"model":"claude-opus-4-8","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    );
+    route.effective_raw_body = route.raw_body.clone();
+
+    let pool = test_pool("https://example.com/v1", true);
+    assert_eq!(
+        pool.model_mapping_mode,
+        ModelMappingMode::PassthroughMapping
+    );
+
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-opus-4-8");
+    assert_eq!(prepared.outbound_model.as_deref(), Some("claude-opus-4-8"));
+    assert_eq!(route.upstream_model.as_deref(), Some("claude-opus-4.8"));
+}
+
+#[test]
+fn account_default_retry_attempts_cover_eligible_pools_and_payload_guard_retry() {
+    assert_eq!(
+        PoolAvailabilitySnapshot {
+            eligible_pools: 0,
+            ..PoolAvailabilitySnapshot::default()
+        }
+        .default_retry_attempts(false),
+        1
+    );
+    assert_eq!(
+        PoolAvailabilitySnapshot {
+            eligible_pools: 2,
+            ..PoolAvailabilitySnapshot::default()
+        }
+        .default_retry_attempts(false),
+        2
+    );
+    assert_eq!(
+        PoolAvailabilitySnapshot {
+            eligible_pools: 2,
+            ..PoolAvailabilitySnapshot::default()
+        }
+        .default_retry_attempts(true),
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_dispatch_deadline_is_shared_with_capacity_wait() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        capacity_mode: CapacityMode::Wait,
+        max_queued_requests: 1,
+        dispatch_max_wait_secs: 60,
+        request_timeout_secs: 1,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-shared-deadline", 1, true))
+        .await
+        .unwrap();
+    let held_lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "account lease should be held before waiting: {}",
+                unavailable.detail
+            )
+        }
+    };
+
+    let mut route = test_route("claude-sonnet-4-5");
+    route.started_at = Instant::now() - Duration::from_secs(2);
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("expired dispatch deadline should terminate promptly");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "capacity wait must use the request's remaining deadline"
+    );
+    match outcome {
+        AccountForwardOutcome::FinalError(error) => {
+            assert_eq!(error.route_error_type, "account_deadline_exceeded");
+        }
+        AccountForwardOutcome::Response(_) => {
+            panic!("a held pool must not produce a response after the deadline")
+        }
+    }
+
+    drop(held_lease);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_dispatch_fence_coalesces_only_in_flight_c32_c128_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("dispatch-fence-singleflight", 1, true))
+        .await
+        .unwrap();
+
+    for concurrency in [32usize, 128] {
+        for round in 1..=5 {
+            let blocker = lock_account_table(&postgres).await;
+            let loads_before = manager.dispatch_fence_pg_loads_for_test();
+            let wave_manager = manager.clone();
+            let wave_pool = pool.clone();
+            let wave = tokio::spawn(async move {
+                futures::future::join_all(
+                    (0..concurrency).map(|_| wave_manager.validate_pool_dispatch_fence(&wave_pool)),
+                )
+                .await
+            });
+            timeout(Duration::from_millis(250), async {
+                loop {
+                    if manager.dispatch_fence_pg_loads_for_test() > loads_before {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}, c{concurrency}: dispatch fence query did not start")
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(
+                manager.dispatch_fence_pg_loads_for_test(),
+                loads_before + 1,
+                "round {round}, c{concurrency}: concurrent same-revision fences must singleflight"
+            );
+            unlock_account_table(blocker).await;
+            let results = timeout(Duration::from_secs(1), wave)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}, c{concurrency}: fence wave timed out"))
+                .unwrap();
+            assert!(
+                results
+                    .iter()
+                    .all(|result| *result == PoolDispatchFenceResult::Current)
+            );
+
+            let sequential_before = manager.dispatch_fence_pg_loads_for_test();
+            assert_eq!(
+                manager.validate_pool_dispatch_fence(&pool).await,
+                PoolDispatchFenceResult::Current
+            );
+            assert_eq!(
+                manager.validate_pool_dispatch_fence(&pool).await,
+                PoolDispatchFenceResult::Current
+            );
+            assert_eq!(
+                manager.dispatch_fence_pg_loads_for_test(),
+                sequential_before + 2,
+                "round {round}, c{concurrency}: completed results must never become a TTL cache"
+            );
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_dispatch_fence_pg_timeout_c128_is_one_query_and_recovers_for_three_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request("dispatch-fence-timeout-wave", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=3 {
+        let blocker = lock_account_table(&postgres).await;
+        let loads_before = manager.dispatch_fence_pg_loads_for_test();
+        let saturated_before = manager.selection_saturated.load(Ordering::Acquire);
+        let first_wave = timeout(
+            Duration::from_secs(1),
+            futures::future::join_all(
+                (0..128).map(|_| manager.validate_pool_dispatch_fence(&pool)),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: fence timeout wave exceeded deadline"));
+        assert!(first_wave.iter().all(|result| {
+            matches!(
+                result,
+                PoolDispatchFenceResult::CoordinatorUnavailable(unavailable)
+                    if unavailable.kind == AccountSelectionFailureKind::PostgresTimeout
+            )
+        }));
+        assert_eq!(
+            manager.dispatch_fence_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: c128 fence timeout must issue one PG query"
+        );
+        assert_eq!(
+            manager.selection_saturated.load(Ordering::Acquire),
+            saturated_before,
+            "round {round}: same-revision c128 must not hit selection admission"
+        );
+
+        let negative_wave = futures::future::join_all(
+            (0..128).map(|_| manager.validate_pool_dispatch_fence(&pool)),
+        )
+        .await;
+        assert!(negative_wave.iter().all(|result| {
+            matches!(result, PoolDispatchFenceResult::CoordinatorUnavailable(_))
+        }));
+        assert_eq!(
+            manager.dispatch_fence_pg_loads_for_test(),
+            loads_before + 1,
+            "round {round}: open breaker must suppress immediate fence query fanout"
+        );
+        unlock_account_table(blocker).await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let recovered = timeout(
+            Duration::from_secs(1),
+            futures::future::join_all(
+                (0..128).map(|_| manager.validate_pool_dispatch_fence(&pool)),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: fence recovery timed out"));
+        assert!(
+            recovered
+                .iter()
+                .all(|result| *result == PoolDispatchFenceResult::Current)
+        );
+        assert_eq!(
+            manager.dispatch_fence_pg_loads_for_test(),
+            loads_before + 2,
+            "round {round}: recovery c128 must issue one new fence query"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_dispatch_prepares_then_fences_before_attempt_and_http_send_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let fake = AuxiliaryFallbackFakeServer::start().await;
+    let mut request = create_pool_request("prepare-before-fence", 1, true);
+    request.base_url = fake.base_url.clone();
+    request.max_concurrent_requests = 4;
+    let mut pool = postgres.create_account(request).await.unwrap();
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 4,
+        retry_max_attempts: 1,
+        ..AccountsConfig::default()
+    };
+
+    for round in 1..=5 {
+        if round > 1 {
+            pool = postgres
+                .set_account_enabled(pool.id, true)
+                .await
+                .unwrap()
+                .expect("pool remains present");
+            manager.invalidate_static_pool_snapshot();
+        }
+        let gate = TestDispatchAfterPrepareGate::new();
+        manager.set_dispatch_after_prepare_gate(gate.clone());
+        let budget = Arc::new(InferenceAttemptBudget::new(2));
+        let mut route = test_route("claude-sonnet-4-6");
+        route.inference_attempt_budget = budget.clone();
+        route.request_id = format!("req_prepare_fence_{round}");
+        route.error_id = format!("err_prepare_fence_{round}");
+        let hits_before = fake.snapshot().3;
+        let task_manager = manager.clone();
+        let task_config = config.clone();
+        let task = tokio::spawn(async move {
+            task_manager
+                .forward_with_failover_result(task_config, route)
+                .await
+        });
+
+        timeout(Duration::from_secs(1), gate.prepared.wait())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: request preparation gate timed out"));
+        let disabled = postgres
+            .set_account_enabled(pool.id, false)
+            .await
+            .unwrap()
+            .expect("pool remains present");
+        assert!(disabled.revision > pool.revision, "round {round}");
+        gate.resume.wait().await;
+        let outcome = timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: fenced dispatch did not finish"))
+            .unwrap();
+        assert!(
+            matches!(outcome, AccountForwardOutcome::FinalError(_)),
+            "round {round}: changed pool must not send"
+        );
+        assert_eq!(
+            fake.snapshot().3,
+            hits_before,
+            "round {round}: stale URL/key/body snapshot reached the HTTP server"
+        );
+        assert_eq!(
+            budget.snapshot().consumed,
+            0,
+            "round {round}: rejected stale dispatch must not consume inference attempt budget"
+        );
+        assert!(
+            manager
+                .drain_release_intents(Duration::from_secs(5))
+                .await
+                .drained,
+            "round {round}: rejected stale lease must release"
+        );
+        pool = disabled;
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_dispatch_preserves_caller_model_when_upstream_model_is_pool_dot() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let fake =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("model-ok"))
+            .await;
+    let mut pool_request = create_pool_request("external-model-body-preserve", 1, true);
+    pool_request.base_url = fake.base_url.clone();
+    pool_request.supported_models = vec!["claude-opus-4-8".to_string()];
+    postgres.create_account(pool_request).await.unwrap();
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 4,
+        retry_max_attempts: 0,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-opus-4-8");
+    route.upstream_model = Some("claude-opus-4.8".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+
+    let response = match manager.forward_with_failover_result(config, route).await {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("account dispatch should succeed: {}", error.message)
+        }
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = fake.request_bodies();
+    assert_eq!(bodies.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_slice(&bodies[0]).expect("account request body is json");
+    assert_eq!(value["model"], "claude-opus-4-8");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_dispatch_uses_shared_request_deadline_before_pool_timeout() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        capacity_mode: CapacityMode::Wait,
+        max_queued_requests: 1,
+        dispatch_max_wait_secs: 60,
+        request_timeout_secs: 60,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request(
+            "external-shared-request-deadline",
+            1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let held_lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "account lease should be held before waiting: {}",
+                unavailable.detail
+            )
+        }
+    };
+
+    let route = test_route("claude-sonnet-4-5");
+    route
+        .inference_attempt_budget
+        .set_dispatch_deadline_after(Duration::from_millis(50));
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("shared request deadline should terminate capacity wait");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "shared deadline should win over the configured 60 second pool timeout"
+    );
+    match outcome {
+        AccountForwardOutcome::FinalError(error) => {
+            assert_eq!(error.route_error_type, "account_deadline_exceeded");
+        }
+        AccountForwardOutcome::Response(_) => {
+            panic!("a held pool must not produce a response after the shared deadline")
+        }
+    }
+
+    drop(held_lease);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_error_and_non_stream_bodies_are_bounded_and_recover_for_five_rounds() {
+    let client = reqwest::Client::builder().build().unwrap();
+    for (case, status, max_bytes) in [
+        (
+            "error",
+            StatusCode::BAD_GATEWAY,
+            ACCOUNT_ERROR_RESPONSE_MAX_BYTES,
+        ),
+        (
+            "non_stream_success",
+            StatusCode::OK,
+            ACCOUNT_NON_STREAM_RESPONSE_MAX_BYTES,
+        ),
+    ] {
+        for round in 0..5 {
+            let (url, server) = spawn_test_raw_http_response(
+                status,
+                TestRawHttpBody::DeclaredOnly(max_bytes.saturating_add(1)),
+            )
+            .await;
+            let response = client.get(url).send().await.unwrap();
+            let error = response_bytes_with_limit_and_body_timeout(response, 5, max_bytes)
+                .await
+                .expect_err("declared Content-Length above the external limit must be rejected");
+            let error = external_response_body_read_error(error, status, max_bytes, None);
+            assert!(!error.err.retryable, "{case} Content-Length round {round}");
+            assert!(
+                error.err.message.contains("exceeds"),
+                "{case} Content-Length round {round}: {}",
+                error.err.message
+            );
+            server.await.unwrap();
+            assert_external_bounded_body_recovery(
+                &client,
+                status,
+                max_bytes,
+                round,
+                &format!("{case} Content-Length"),
+            )
+            .await;
+
+            let (url, server) = spawn_test_raw_http_response(
+                status,
+                TestRawHttpBody::Chunked(vec![b'x'; max_bytes.saturating_add(1)]),
+            )
+            .await;
+            let response = client.get(url).send().await.unwrap();
+            let error = response_bytes_with_limit_and_body_timeout(response, 5, max_bytes)
+                .await
+                .expect_err("chunked external body above the limit must be rejected");
+            let error = external_response_body_read_error(error, status, max_bytes, None);
+            assert!(!error.err.retryable, "{case} chunked round {round}");
+            assert!(
+                error.err.message.contains("exceeds"),
+                "{case} chunked round {round}: {}",
+                error.err.message
+            );
+            server.await.unwrap();
+            assert_external_bounded_body_recovery(
+                &client,
+                status,
+                max_bytes,
+                round,
+                &format!("{case} chunked"),
+            )
+            .await;
+
+            let (url, server) =
+                spawn_test_raw_http_response(status, TestRawHttpBody::StallAfterPrefix).await;
+            let response = client.get(url).send().await.unwrap();
+            let error = response_bytes_with_limit_and_body_timeout(response, 1, max_bytes)
+                .await
+                .expect_err("stalled external body must hit the total body timeout");
+            let error = external_response_body_read_error(error, status, max_bytes, None);
+            assert!(error.err.retryable, "{case} stalled body round {round}");
+            assert!(
+                error.err.message.contains("timeout"),
+                "{case} stalled body round {round}: {}",
+                error.err.message
+            );
+            server.abort();
+            let _ = server.await;
+            assert_external_bounded_body_recovery(
+                &client,
+                status,
+                max_bytes,
+                round,
+                &format!("{case} stalled body"),
+            )
+            .await;
+        }
+    }
+}
+
+#[test]
+fn account_error_classifies_channel_disabled_for_optional_auto_disable() {
+    let config = AccountsConfig::default();
+    let err = classify_external_error(
+        StatusCode::BAD_GATEWAY,
+        Bytes::from_static(br#"channel affinity has been disabled"#),
+        HeaderMap::new(),
+        &config,
+    );
+
+    assert!(err.retryable);
+    assert_eq!(err.auto_disable_reason.as_deref(), Some("channel_disabled"));
+    assert_eq!(error_type_for_external_error(&err), "channel_disabled");
+    assert!(auto_disable_reason_enabled(&config, "channel_disabled"));
+}
+
+#[test]
+fn account_error_classifies_database_busy_without_auto_disable() {
+    let err = classify_external_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Bytes::from_static(br#"database is locked (SQLITE_BUSY)"#),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "database_busy");
+    assert!(err.auto_disable_reason.is_none());
+}
+
+#[test]
+fn account_error_classifies_model_unavailable_as_retryable() {
+    let err = classify_external_error(
+        StatusCode::BAD_REQUEST,
+        Bytes::from_static(br#"{"error":{"code":"model_not_found"}}"#),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+    assert!(err.auto_disable_reason.is_none());
+    assert_eq!(
+        err.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
+        Some("model_unavailable")
+    );
+}
+
+#[test]
+fn account_error_classifies_model_unavailable_without_cooldown_when_disabled() {
+    let config = AccountsConfig {
+        model_unavailable_cooldown_mode: ModelUnavailableCooldownMode::Disabled,
+        ..AccountsConfig::default()
+    };
+    let err = classify_external_error(
+        StatusCode::BAD_REQUEST,
+        Bytes::from_static(br#"{"error":{"message":"No available channel for model x"}}"#),
+        HeaderMap::new(),
+        &config,
+    );
+
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+    assert!(err.cooldown.is_none());
+}
+
+#[test]
+fn account_error_classifies_nested_rate_limit_body() {
+    let err = classify_external_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Bytes::from_static(br#"{"error":"SERVICE_REQUEST_RATE_EXCEEDED: Too many requests"}"#),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "rate_limit");
+    assert!(err.auto_disable_reason.is_none());
+}
+
+#[test]
+fn account_error_classifies_not_found_invalid_model_as_retryable() {
+    let err = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(
+            br#"{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#,
+        ),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+    assert!(err.auto_disable_reason.is_none());
+    assert_eq!(
+        err.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
+        Some("model_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn account_error_response_masks_raw_error_body_with_trace_id() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        HeaderName::from_static("anthropic-request-id"),
+        HeaderValue::from_static("req_upstream"),
+    );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("999"));
+    let body = Bytes::from_static(
+        br#"{"error":{"type":"invalid_request_error","message":"bad input"},"type":"error"}"#,
+    );
+
+    let err = classify_external_error(
+        StatusCode::BAD_REQUEST,
+        body.clone(),
+        headers,
+        &AccountsConfig::default(),
+    );
+    let response = external_final_error_from_error(None, Vec::new(), &err, "req_01gatewayerror")
+        .into_response("req_gateway");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get(HeaderName::from_static("request-id"))
+            .unwrap(),
+        "req_gateway"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(HeaderName::from_static("request-id"))
+            .unwrap(),
+        "req_gateway"
+    );
+    assert!(
+        response
+            .headers()
+            .get(HeaderName::from_static("x-error-id"))
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|error_id| error_id.starts_with("req_01"))
+    );
+    assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+
+    let actual = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read external error body");
+    let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(envelope::PUBLIC_INVALID_REQUEST_MESSAGE));
+    assert!(message.contains("request-id: req_01"));
+    assert!(!message.contains("bad input"));
+    assert!(!message.contains("invalid_request_error"));
+    assert_public_message_hides_internal_routing(message);
+    assert_eq!(value["request_id"], "req_gateway");
+}
+
+#[tokio::test]
+async fn account_fallback_eligibility_bypasses_stale_empty_cache() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..Default::default()
+    };
+
+    let cached_empty = manager
+        .pool_availability_snapshot(&HashSet::new(), &config)
+        .await;
+    assert_eq!(cached_empty.eligible_pools, 0);
+    assert_eq!(cached_empty.available_pools, 0);
+
+    let mut request = create_pool_request("external-after-empty-cache", 1, true);
+    request.supported_models = vec!["claude-sonnet-4".to_string()];
+    postgres.create_account(request).await.unwrap();
+
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+            .await,
+        "fallback eligibility must observe a newly created model-limited pool without waiting for cache expiry"
+    );
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4")
+            .await,
+        "model-limited pools must not be eligible for a different model"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_heartbeat_redis_faults_fail_closed_before_prune_and_recover_five_of_five() {
+    let Ok(toxiproxy_api) = std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 heartbeat Redis 故障测试：未设置 CLAUDE_POOL_TEST_TOXIPROXY_API");
+        return;
+    };
+    let Ok(direct_redis_url) = std::env::var("CLAUDE_POOL_TEST_REDIS_DIRECT_URL") else {
+        eprintln!("跳过 heartbeat Redis 故障测试：未设置 CLAUDE_POOL_TEST_REDIS_DIRECT_URL");
+        return;
+    };
+    let proxy_name =
+        std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let mut direct_redis_config = Config::default();
+    direct_redis_config.redis.url = Some(direct_redis_url);
+    direct_redis_config.redis.key_prefix = manager.redis.key_prefix_for_test();
+    let direct_redis = RedisStore::connect(&direct_redis_config).await.unwrap();
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 1,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-heartbeat-faults", 1, true))
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let toxic_base = format!(
+        "{}/proxies/{}/toxics",
+        toxiproxy_api.trim_end_matches('/'),
+        proxy_name
+    );
+    let max_age = Duration::from_millis(900);
+    let cooldown_keys = vec![format!("account:{}:cooldown", pool.id)];
+
+    for fault in ["latency", "reset_peer"] {
+        for round in 0..5 {
+            let lease = match manager
+                .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+                .await
+            {
+                PoolAcquireResult::Acquired(lease) => lease,
+                PoolAcquireResult::Unavailable(unavailable) => {
+                    panic!(
+                        "{fault} round {round}: initial acquire: {}",
+                        unavailable.detail
+                    )
+                }
+            };
+            let lease_acquired_at = Instant::now();
+            let toxic_name = format!("external-heartbeat-{fault}-{round}");
+            let toxic = if fault == "latency" {
+                json!({
+                    "name": toxic_name.clone(),
+                    "type": "latency",
+                    "stream": "downstream",
+                    "toxicity": 1.0,
+                    "attributes": { "latency": 500, "jitter": 0 },
+                })
+            } else {
+                json!({
+                    "name": toxic_name.clone(),
+                    "type": "reset_peer",
+                    "stream": "downstream",
+                    "toxicity": 1.0,
+                    "attributes": { "timeout": 0 },
+                })
+            };
+            let install = client.post(&toxic_base).json(&toxic).send().await.unwrap();
+            assert!(
+                install.status().is_success(),
+                "{fault} round {round}: {install:?}"
+            );
+
+            let before_lost = direct_redis
+                .acquire_account_lease(
+                    pool.id,
+                    &format!("pre-loss-probe-{fault}-{round}"),
+                    &lease.coordination_epoch,
+                    1,
+                    1,
+                    Some(max_age),
+                    &cooldown_keys,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    before_lost,
+                    RedisAccountLeaseAcquireResult::PoolCapacityFull { .. }
+                        | RedisAccountLeaseAcquireResult::GlobalCapacityFull { .. }
+                ),
+                "{fault} round {round}: a second manager must not acquire before heartbeat loss: {before_lost:?}"
+            );
+            let lost = tokio::time::timeout(Duration::from_secs(2), lease.wait_until_lost()).await;
+            let lost_elapsed = lease_acquired_at.elapsed();
+            let remove = client
+                .delete(format!("{toxic_base}/{toxic_name}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                remove.status().is_success(),
+                "{fault} round {round}: {remove:?}"
+            );
+            lost.expect("heartbeat must fail closed before the Redis prune deadline");
+            assert!(
+                lost_elapsed < max_age,
+                "{fault} round {round}: heartbeat loss {lost_elapsed:?} must precede max-age {max_age:?}"
+            );
+            let heartbeat = lease.heartbeat.as_ref().unwrap();
+            assert!(heartbeat.state.lost.load(Ordering::Acquire));
+            assert!(
+                heartbeat.state.attempts.load(Ordering::Relaxed) <= 2,
+                "{fault} round {round}: heartbeat retry attempts must remain bounded"
+            );
+
+            drop(lease);
+            let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+            assert!(drained.drained, "{fault} round {round}: release must drain");
+            let recovered = match manager
+                .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+                .await
+            {
+                PoolAcquireResult::Acquired(lease) => lease,
+                PoolAcquireResult::Unavailable(unavailable) => {
+                    panic!("{fault} round {round}: recovery: {}", unavailable.detail)
+                }
+            };
+            drop(recovered);
+            let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+            assert!(
+                drained.drained,
+                "{fault} round {round}: recovery release must drain"
+            );
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_heartbeat_touch_false_marks_lease_lost_and_recovers_five_of_five() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 1,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-heartbeat-lost", 1, true))
+        .await
+        .unwrap();
+    let max_age = Duration::from_millis(900);
+
+    for round in 0..5 {
+        let lease = match manager
+            .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+            .await
+        {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => {
+                panic!("round {round}: {}", unavailable.detail)
+            }
+        };
+        assert!(
+            manager
+                .redis
+                .release_account_confirmed_lease(pool.id, &lease.lease_id)
+                .await
+                .unwrap(),
+            "round {round}: test must remove the active lease"
+        );
+        tokio::time::timeout(Duration::from_secs(2), lease.wait_until_lost())
+            .await
+            .expect("touch=false must be surfaced before the prune deadline");
+        assert!(
+            lease
+                .heartbeat
+                .as_ref()
+                .unwrap()
+                .state
+                .lost
+                .load(Ordering::Acquire),
+            "round {round}: heartbeat loss feedback missing"
+        );
+        drop(lease);
+        let recovered = match manager
+            .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+            .await
+        {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => {
+                panic!("round {round}: recovery failed: {}", unavailable.detail)
+            }
+        };
+        drop(recovered);
+        let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+        assert!(
+            drained.drained,
+            "round {round}: recovery release must drain"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_immediate_availability_requires_current_capacity_and_recovers() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 0,
+        ..AccountsConfig::default()
+    };
+
+    let pool = postgres
+        .create_account(create_pool_request("external-immediate-capacity", 1, true))
+        .await
+        .unwrap();
+
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "a healthy pool with an open lease slot can immediately take local fallback traffic"
+    );
+
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "pool lease should be acquired, got {:?}",
+                unavailable.reason
+            )
+        }
+    };
+    assert!(
+        !manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "a full account must not change local credential dispatch into fail-fast fallback"
+    );
+
+    drop(lease);
+    let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+    assert!(drained.drained, "external release should drain");
+
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "external immediate availability must recover after the external lease is released"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_lease_touch_and_drop_release_are_accepted_and_drained() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 1,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-lease-drain", 1, true))
+        .await
+        .unwrap();
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!("account lease should be acquired: {}", unavailable.detail)
+        }
+    };
+
+    assert!(
+        manager
+            .touch_pool(
+                pool.id,
+                &lease.lease_id,
+                ACCOUNT_LEASE_MAX_AGE_SECS as usize * 2,
+                &lease.coordination_epoch,
+            )
+            .await
+            .unwrap(),
+        "confirmed lease heartbeat must receive direct success feedback"
+    );
+    let (pool_in_flight, global_in_flight, _, _) =
+        manager.pool_runtime_snapshot(pool.id).await.unwrap();
+    assert_eq!(pool_in_flight, 1);
+    assert_eq!(global_in_flight, 1);
+
+    let enqueued_before = manager
+        .release_dispatcher
+        .stats
+        .enqueued
+        .load(Ordering::Acquire);
+    drop(lease);
+    let release_drain = manager.drain_release_intents(Duration::from_secs(5)).await;
+    assert!(release_drain.drained, "accepted release task should drain");
+    assert_eq!(release_drain.pending, 0);
+    assert!(release_drain.enqueued >= enqueued_before.saturating_add(1));
+    assert!(release_drain.completed >= release_drain.enqueued);
+    let (pool_in_flight, global_in_flight, _, _) =
+        manager.pool_runtime_snapshot(pool.id).await.unwrap();
+    assert_eq!(
+        pool_in_flight, 0,
+        "drop release must not wait for lease TTL"
+    );
+    assert_eq!(
+        global_in_flight, 0,
+        "global release must not wait for lease TTL"
+    );
+
+    manager
+        .redis
+        .del("account:inflight:lease_sequence")
+        .await
+        .unwrap();
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_local_mutations_keep_all_pools_when_own_event_is_observed() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+
+    for (index, name) in ["local-one", "local-two", "local-three"].iter().enumerate() {
+        let mut request = create_pool_request(name, (index + 1) as i32, true);
+        request.supported_models = vec!["claude-sonnet-4".to_string()];
+        let pool = postgres.create_account(request).await.unwrap();
+        manager.notify_account_data_changed_with_local_pool("test_local_create", &pool);
+
+        let generation = index as u64 + 1;
+        let own_event = serde_json::json!({
+            "generation": generation,
+            "reason": "test_local_create",
+            "poolId": pool.id,
+            "origin": manager.instance_id,
+        })
+        .to_string();
+        assert!(
+            !manager.observe_account_data_event(&own_event),
+            "an event emitted by this process must not invalidate the just-merged local snapshot"
+        );
+        let snapshot = manager.load_authoritative_pool_snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.len(),
+            index + 1,
+            "local mutation {name} must retain all previously created pools"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_manager_distinguishes_global_capacity_from_no_pool() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 1,
+        ..Default::default()
+    };
+
+    let primary = postgres
+        .create_account(create_pool_request("external-global-a", 1, true))
+        .await
+        .unwrap();
+    let secondary = postgres
+        .create_account(create_pool_request("external-global-b", 2, true))
+        .await
+        .unwrap();
+
+    let lease = match manager.acquire_pool(&primary, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(_) => panic!("primary pool lease should be acquired"),
+    };
+
+    assert!(
+        manager
+            .select_pool(&HashSet::new(), &config)
+            .await
+            .is_none()
+    );
+    assert!(manager.has_eligible_pool(&config).await);
+    let snapshot = manager
+        .pool_availability_snapshot(&HashSet::new(), &config)
+        .await;
+    assert_eq!(snapshot.eligible_pools, 2);
+    assert_eq!(snapshot.available_pools, 0);
+    assert_eq!(snapshot.temporary_unavailable_pools, 2);
+    assert_eq!(snapshot.wait_reason, Some(PoolCapacityWaitReason::Full));
+
+    drop(lease);
+    let mut selected = None;
+    for _ in 0..20 {
+        if let Some(pool) = manager.select_pool(&HashSet::new(), &config).await {
+            selected = Some(pool);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let selected = selected.expect("pool should become selectable after global lease release");
+    assert!(selected.id == primary.id || selected.id == secondary.id);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_manager_respects_disabled_switch_and_disabled_pools() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let mut config = AccountsConfig {
+        enabled: false,
+        ..Default::default()
+    };
+
+    let disabled = postgres
+        .create_account(create_pool_request("external-disabled", 1, false))
+        .await
+        .unwrap();
+    let enabled = postgres
+        .create_account(create_pool_request("external-enabled", 2, true))
+        .await
+        .unwrap();
+
+    assert!(!manager.has_available_pool(&config).await);
+    let disabled_outcome = manager
+        .forward_with_failover_result(config.clone(), test_route("claude-sonnet-4-5"))
+        .await;
+    let AccountForwardOutcome::FinalError(disabled_error) = disabled_outcome else {
+        panic!("the global account switch must reject without forwarding");
+    };
+    assert_eq!(disabled_error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(disabled_error.route_error_type, "account_unavailable");
+    assert!(!disabled_error.retryable);
+    assert!(disabled_error.attempts.is_empty());
+
+    config.enabled = true;
+    let selected = manager
+        .select_pool(&HashSet::new(), &config)
+        .await
+        .expect("enabled account should be selected");
+    assert_eq!(selected.id, enabled.id);
+    assert_ne!(selected.id, disabled.id);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_manager_selects_multiple_pools_by_priority_and_capacity() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 0,
+        ..AccountsConfig::default()
+    };
+
+    let primary = postgres
+        .create_account(create_pool_request("external-primary", 1, true))
+        .await
+        .unwrap();
+    let secondary = postgres
+        .create_account(create_pool_request("external-secondary", 2, true))
+        .await
+        .unwrap();
+    let tertiary = postgres
+        .create_account(create_pool_request("external-tertiary", 3, true))
+        .await
+        .unwrap();
+
+    let first = manager
+        .select_pool(&HashSet::new(), &config)
+        .await
+        .expect("primary pool should be selected first");
+    assert_eq!(first.id, primary.id);
+
+    let first_lease = match manager.acquire_pool(&primary, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(_) => panic!("primary pool lease should be acquired"),
+    };
+    let second = manager
+        .select_pool(&HashSet::new(), &config)
+        .await
+        .expect("secondary pool should be selected when primary is full");
+    assert_eq!(second.id, secondary.id);
+
+    let second_lease = match manager.acquire_pool(&secondary, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(_) => panic!("secondary pool lease should be acquired"),
+    };
+    let third = manager
+        .select_pool(&HashSet::new(), &config)
+        .await
+        .expect("tertiary pool should be selected when higher-priority pools are full");
+    assert_eq!(third.id, tertiary.id);
+
+    drop(first_lease);
+    drop(second_lease);
+    let mut after_release = None;
+    for _ in 0..20 {
+        if let Some(pool) = manager.select_pool(&HashSet::new(), &config).await {
+            if pool.id == primary.id {
+                after_release = Some(pool);
+                break;
+            }
+            after_release = Some(pool);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after_release = after_release.expect("primary should be selected again after release");
+    assert_eq!(after_release.id, primary.id);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_manager_uncached_snapshot_detects_full_pool_after_available_cache() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 0,
+        ..AccountsConfig::default()
+    };
+
+    let pool = postgres
+        .create_account(create_pool_request("external-stale-cache", 1, true))
+        .await
+        .unwrap();
+
+    let cached_available = manager
+        .pool_availability_snapshot(&HashSet::new(), &config)
+        .await;
+    assert_eq!(cached_available.eligible_pools, 1);
+    assert_eq!(cached_available.available_pools, 1);
+
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(_) => panic!("pool lease should be acquired"),
+    };
+    let selection = manager
+        .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+        .await;
+    assert!(selection.selected_pool.is_none());
+    let uncached_full = selection.availability;
+    assert_eq!(uncached_full.eligible_pools, 1);
+    assert_eq!(uncached_full.available_pools, 0);
+    assert_eq!(uncached_full.temporary_unavailable_pools, 1);
+    assert_eq!(
+        uncached_full.wait_reason,
+        Some(PoolCapacityWaitReason::Full)
+    );
+
+    drop(lease);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_mapping_rules_normalize_and_match_on_call_path() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    pool.model_mapping_rules = normalize_account_model_mapping_rules(vec![
+        model_rule("  CLAUDE-SONNET-4.5  ", "  CLAUDE-SONNET-4-5  "),
+        model_rule("", "ignored-target"),
+        model_rule("ignored-source", ""),
+    ]);
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(pool.model_mapping_rules.len(), 1);
+    assert_eq!(pool.model_mapping_rules[0].target, "CLAUDE-SONNET-4-5");
+    assert_eq!(value["model"], "CLAUDE-SONNET-4-5");
+}
+
+#[test]
+fn account_mapping_supports_common_direct_date_to_dot_rule() {
+    let mut route = test_route("claude-opus-4-5-20251101");
+    route.upstream_model = Some("claude-opus-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::DirectMapping;
+    pool.model_mapping_rules = vec![model_rule("claude-opus-4-5-20251101", "claude-opus-4.5")];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-opus-4.5");
+}
+
+#[test]
+fn account_mapping_supports_common_processed_thinking_to_dash_rule() {
+    let mut route = test_route("claude-opus-4-8-thinking");
+    route.upstream_model = Some("claude-opus-4.8-thinking".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-8-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    pool.model_mapping_rules = vec![model_rule(
+        "claude-opus-4.8-thinking",
+        "claude-opus-4-8-thinking",
+    )];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-opus-4-8-thinking");
+}
+
+#[test]
+fn account_max_input_tokens_has_no_dispatch_preflight_stage() {
+    let source = include_str!("mod.rs");
+
+    assert!(
+        !source.contains("external_prompt_too_long_preflight"),
+        "account must not synthesize a prompt-too-long preflight stage"
+    );
+    assert!(
+        !source.contains("account_max_input_tokens_for_route"),
+        "accountMaxInputTokens is a compatibility field, not a dispatch preflight gate"
+    );
+}
+
+#[tokio::test]
+async fn account_model_unavailable_cooldown_is_model_scoped_and_does_not_queue() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        capacity_mode: CapacityMode::Wait,
+        max_queued_requests: 1,
+        model_unavailable_cooldown_mode: ModelUnavailableCooldownMode::Model,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-model-cooldown", 1, true))
+        .await
+        .unwrap();
+    let route_a = test_route("claude-opus-4-8");
+    let route_b = test_route("claude-sonnet-4-6");
+    manager
+        .mark_pool_model_cooldowns(
+            pool.id,
+            Duration::from_secs(30),
+            "model_unavailable".to_string(),
+            &route_a.model_cooldown_candidates(),
+        )
+        .await;
+
+    let unavailable_for_a = manager
+        .select_pool_for_route(&HashSet::new(), &config, &route_a)
+        .await;
+    assert!(unavailable_for_a.selected_pool.is_none());
+    assert_eq!(
+        unavailable_for_a.availability.wait_reason,
+        Some(PoolCapacityWaitReason::ModelUnavailable)
+    );
+    assert_eq!(
+        unavailable_for_a.availability.cooldown_scope,
+        Some(PoolCooldownScope::Model)
+    );
+    assert_eq!(
+        unavailable_for_a.availability.cooldown_reason.as_deref(),
+        Some("model_unavailable")
+    );
+
+    let mut queue_guard = None;
+    let mut wait_started_at = None;
+    let mut capacity_waiter = manager.capacity_signal.register();
+    let decision = manager
+        .handle_capacity_unavailable(
+            &route_a,
+            Vec::new(),
+            &config,
+            unavailable_for_a.availability.capacity_context(),
+            &mut queue_guard,
+            &mut wait_started_at,
+            &mut capacity_waiter,
+            None,
+        )
+        .await;
+    let ExternalCapacityDecision::FinalError(error) = decision else {
+        panic!("model_unavailable cooldown must fail fast instead of queueing");
+    };
+    assert_eq!(error.route_error_type, "model_unavailable");
+    assert!(queue_guard.is_none());
+    assert_eq!(
+        manager.redis.account_dispatch_queue_size().await.unwrap(),
+        0
+    );
+
+    let available_for_b = manager
+        .select_pool_for_route(&HashSet::new(), &config, &route_b)
+        .await;
+    assert!(available_for_b.selected_pool.is_some());
+    assert_eq!(available_for_b.availability.available_pools, 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_models_url_adds_single_v1() {
+    let cases = [
+        (
+            "http://pool.example.com",
+            "http://pool.example.com/v1/models",
+        ),
+        (
+            "http://pool.example.com/",
+            "http://pool.example.com/v1/models",
+        ),
+        (
+            "http://pool.example.com/v1",
+            "http://pool.example.com/v1/models",
+        ),
+        (
+            "http://pool.example.com/v1/",
+            "http://pool.example.com/v1/models",
+        ),
+        (
+            "http://pool.example.com/api",
+            "http://pool.example.com/api/v1/models",
+        ),
+        (
+            "http://pool.example.com/api/v1",
+            "http://pool.example.com/api/v1/models",
+        ),
+    ];
+
+    for (base_url, expected) in cases {
+        let actual = account_models_url(base_url).expect("valid models url");
+        assert_eq!(actual.as_str(), expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_non_stream_response_after_dispatch_deadline_is_not_cut_off() {
+    // 调度截止时间只管排队；已发出的非流式请求要按 requestTimeoutSecs 等完。
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let (url, server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(1_200),
+            br#"{"id":"msg_slow","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"slow-ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#.to_vec(),
+        ),
+    )
+    .await;
+    create_messages_pool(&postgres, "slow-non-stream", 1, &url).await;
+    let config = AccountsConfig {
+        enabled: true,
+        retry_max_attempts: 1,
+        same_pool_retry_count: 0,
+        request_timeout_secs: 10,
+        ..AccountsConfig::default()
+    };
+    let route = test_route("claude-sonnet-4-6");
+    route
+        .inference_attempt_budget
+        .set_dispatch_deadline_after(Duration::from_millis(300));
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("slow non-stream response should finish within the request timeout")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("the dispatch deadline must not cut off a request already sent: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("slow-ok"), "{body}");
+    let _ = server.await;
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_normalized_wire_preserves_omitted_output_effort_for_five_rounds() {
+    let mut route = test_route("claude-opus-4-7-thinking");
+    payload_mut(&mut route).thinking = Some(Thinking {
+        thinking_type: "adaptive".to_string(),
+        budget_tokens: 0,
+        display: None,
+    });
+    payload_mut(&mut route).output_config = Some(OutputConfig::default());
+    route.raw_body = Bytes::from_static(
+        br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive"},"output_config":{}}"#,
+    );
+    route.effective_raw_body = route.raw_body.clone();
+
+    let pool = test_pool("https://example.com/v1", true);
+    for round in 0..5 {
+        let outbound = test_account_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse normalized outbound body");
+
+        assert_eq!(value["thinking"]["type"], "adaptive", "round {round}");
+        assert_eq!(
+            value["output_config"],
+            serde_json::json!({}),
+            "round {round}: normalized forwarding must not invent an effort"
+        );
+        assert!(
+            value.pointer("/output_config/effort").is_none(),
+            "round {round}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_not_found_invalid_model_uses_default_cross_pool_retry_status_codes() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::NOT_FOUND,
+        fake_external_error_body("Invalid model ID. Please select a different model to continue."),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("404-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "not-found-model-default-retry-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "not-found-model-default-retry-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 0,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_not_found_model_default_retry".to_string();
+    route.error_id = "err_not_found_model_default_retry".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("not found invalid-model failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("404 invalid-model should fail over to the next pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_one_malformed_runtime_isolated_from_fifty_nine_healthy_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 120,
+        ..AccountsConfig::default()
+    };
+    let mut pool_ids = Vec::with_capacity(60);
+    for index in 0..60 {
+        let pool = postgres
+            .create_account(create_pool_request(
+                &format!("external-malformed-isolation-{index}"),
+                index,
+                true,
+            ))
+            .await
+            .unwrap();
+        pool_ids.push(pool.id);
+    }
+    let malformed_pool_id = pool_ids[0];
+    let route = test_route("claude-sonnet-4-6");
+    let redis_url = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL").unwrap();
+    let redis_client = redis::Client::open(redis_url).unwrap();
+    let mut raw_redis = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let cooldown_key = manager
+        .redis
+        .key(format!("account:{malformed_pool_id}:cooldown"));
+
+    for malformed_kind in ["invalid_json", "list", "hash", "set"] {
+        let _: i64 = redis::cmd("DEL")
+            .arg(&cooldown_key)
+            .query_async(&mut raw_redis)
+            .await
+            .unwrap();
+        match malformed_kind {
+            "invalid_json" => {
+                let _: () = redis::cmd("SET")
+                    .arg(&cooldown_key)
+                    .arg("not-a-cooldown-state")
+                    .arg("EX")
+                    .arg(60)
+                    .query_async(&mut raw_redis)
+                    .await
+                    .unwrap();
+            }
+            "list" => {
+                let _: i64 = redis::cmd("LPUSH")
+                    .arg(&cooldown_key)
+                    .arg("wrong-type")
+                    .query_async(&mut raw_redis)
+                    .await
+                    .unwrap();
+            }
+            "hash" => {
+                let _: i64 = redis::cmd("HSET")
+                    .arg(&cooldown_key)
+                    .arg("wrong")
+                    .arg("type")
+                    .query_async(&mut raw_redis)
+                    .await
+                    .unwrap();
+            }
+            "set" => {
+                let _: i64 = redis::cmd("SADD")
+                    .arg(&cooldown_key)
+                    .arg("wrong-type")
+                    .query_async(&mut raw_redis)
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        for round in 0..5 {
+            let selection = manager
+                .select_pool_for_route(&HashSet::new(), &config, &route)
+                .await;
+            let selected = selection.selected_pool.unwrap_or_else(|| {
+                panic!("{malformed_kind} round {round}: healthy pools must remain selectable")
+            });
+            assert_ne!(
+                selected.id, malformed_pool_id,
+                "{malformed_kind} round {round}"
+            );
+            assert_eq!(
+                selection.availability.eligible_pools, 60,
+                "{malformed_kind} round {round}"
+            );
+            assert_eq!(
+                selection.availability.available_pools, 59,
+                "{malformed_kind} round {round}"
+            );
+            assert_eq!(
+                selection.availability.invalid_runtime_pools, 1,
+                "{malformed_kind} round {round}"
+            );
+            assert!(
+                !selection.availability.coordinator_unavailable,
+                "{malformed_kind} round {round}: one malformed pool must not fail the batch"
+            );
+
+            let statuses = manager
+                .status(&config)
+                .await
+                .expect("status must not be 500");
+            assert_eq!(statuses.len(), 60, "{malformed_kind} round {round}");
+            let malformed = statuses
+                .iter()
+                .find(|status| status.pool.id == malformed_pool_id)
+                .expect("malformed pool status must be returned");
+            assert!(!malformed.dispatchable, "{malformed_kind} round {round}");
+            assert_eq!(
+                malformed.skipped_reason.as_deref(),
+                Some("coordinator_state_invalid"),
+                "{malformed_kind} round {round}"
+            );
+            assert_eq!(
+                statuses.iter().filter(|status| status.dispatchable).count(),
+                59,
+                "{malformed_kind} round {round}"
+            );
+        }
+    }
+
+    let _: i64 = redis::cmd("DEL")
+        .arg(&cooldown_key)
+        .query_async(&mut raw_redis)
+        .await
+        .unwrap();
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_one_wave_all_pools_transient_502_does_not_blackout_recovery() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool_a_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        1,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-a-recovered"),
+    )
+    .await;
+    let pool_b_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        1,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-b-recovered"),
+    )
+    .await;
+    let pool_c_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        1,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-c-recovered"),
+    )
+    .await;
+    let pool_a = create_messages_pool_with_concurrency(
+        &postgres,
+        "one-wave-primary",
+        1,
+        &pool_a_server.base_url,
+        64,
+    )
+    .await;
+    let pool_b = create_messages_pool_with_concurrency(
+        &postgres,
+        "one-wave-secondary",
+        10,
+        &pool_b_server.base_url,
+        64,
+    )
+    .await;
+    let pool_c = create_messages_pool_with_concurrency(
+        &postgres,
+        "one-wave-tertiary",
+        20,
+        &pool_c_server.base_url,
+        64,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 128,
+        retry_max_attempts: 3,
+        retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_count: 0,
+        server_error_cooldown_secs: 30,
+        transient_failure_priority_penalty: 20,
+        ..AccountsConfig::default()
+    };
+
+    let mut first_route = test_route("claude-sonnet-4-6");
+    first_route.request_id = "req_one_wave_first".to_string();
+    first_route.error_id = "err_one_wave_first".to_string();
+    first_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let first = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config.clone(), first_route),
+    )
+    .await
+    .expect("first wave should finish");
+    assert!(
+        matches!(first, AccountForwardOutcome::FinalError(_)),
+        "when every configured pool fails once, the first request can fail"
+    );
+    assert_eq!(pool_a_server.snapshot(), 1);
+    assert_eq!(pool_b_server.snapshot(), 1);
+    assert_eq!(pool_c_server.snapshot(), 1);
+
+    for pool in [&pool_a, &pool_b, &pool_c] {
+        let runtime = manager
+            .load_pool_runtime_snapshot(pool.id, &[])
+            .await
+            .expect("read runtime after one transient wave");
+        assert_eq!(
+            runtime.pool_cooldown_remaining_secs, 0,
+            "ordinary one-wave 502 must not hard-cool pool {}",
+            pool.name
+        );
+        assert_eq!(
+            runtime.transient_failure_streak, 1,
+            "ordinary one-wave 502 should only soft-penalize pool {}",
+            pool.name
+        );
+    }
+
+    let mut recovered_route = test_route("claude-sonnet-4-6");
+    recovered_route.request_id = "req_one_wave_recovered".to_string();
+    recovered_route.error_id = "err_one_wave_recovered".to_string();
+    recovered_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let recovered = timeout(
+        Duration::from_millis(750),
+        manager.forward_with_failover_result(config, recovered_route),
+    )
+    .await
+    .expect("recovered pools must be callable immediately after the transient wave");
+    match recovered {
+        AccountForwardOutcome::Response(response) => {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("recovered transient pools should not remain blacked out: {error:?}")
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_outbound_body_applies_model_mapping_and_preserves_thinking() {
+    let mut route = test_route("claude-opus-4-5-20251101");
+    route.upstream_model = Some("claude-opus-4.5".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+    payload_mut(&mut route).thinking = Some(Thinking {
+        thinking_type: "adaptive".to_string(),
+        budget_tokens: 20000,
+        display: None,
+    });
+    payload_mut(&mut route).output_config = Some(OutputConfig {
+        effort: Some("xhigh".to_string()),
+        format: None,
+    });
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
+        );
+
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-opus-4-5");
+    assert_eq!(value["thinking"]["type"], "adaptive");
+    assert_eq!(value["thinking"]["budget_tokens"], 20000);
+    assert_eq!(value["output_config"]["effort"], "xhigh");
+}
+
+#[test]
+fn account_outbound_body_applies_resolved_upstream_model() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    let outbound = test_account_outbound_body(&route, &pool);
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-sonnet-4-5");
+    assert_eq!(
+        prepared.outbound_model.as_deref(),
+        Some("claude-sonnet-4-5")
+    );
+    assert_eq!(payload_ref(&route).model, "claude-sonnet-4-5-20250929");
+}
+
+#[test]
+fn account_outbound_body_direct_mapping_uses_original_model() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::DirectMapping;
+    pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "external-sonnet");
+    assert_eq!(prepared.outbound_model.as_deref(), Some("external-sonnet"));
+}
+
+#[test]
+fn account_outbound_body_mapping_miss_falls_back_to_existing_conversion() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::DirectMapping;
+    pool.model_mapping_rules = vec![model_rule("claude-opus-4.8", "external-opus")];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-sonnet-4-5");
+}
+
+#[test]
+fn account_outbound_body_mapping_target_is_final() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "claude-sonnet-4.5")];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-sonnet-4.5");
+}
+
+#[test]
+fn account_outbound_body_normalizes_payload_claude_model_without_mapping() {
+    let route = test_route("claude-haiku-4.5");
+
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-haiku-4-5");
+}
+
+#[test]
+fn account_outbound_body_passthrough_mapping_maps_hit_and_keeps_original_on_miss() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
+    pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+    assert_eq!(value["model"], "external-sonnet");
+
+    pool.model_mapping_rules = vec![model_rule("claude-opus-4-8", "external-opus")];
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+    assert_eq!(value["model"], "claude-sonnet-4-5-20250929");
+}
+
+#[test]
+fn account_outbound_body_passthrough_uses_original_request_model() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::Passthrough;
+    pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "custom-sonnet")];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-sonnet-4-5-20250929");
+    assert_eq!(
+        prepared.outbound_model.as_deref(),
+        Some("claude-sonnet-4-5-20250929")
+    );
+}
+
+#[test]
+fn account_outbound_body_preserves_dot_model_when_pool_normalization_disabled() {
+    let route = test_route("claude-haiku-4.5");
+    let pool = test_pool("https://example.com/v1", true);
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-haiku-4.5");
+}
+
+#[test]
+fn account_outbound_body_preserves_enabled_budget_tokens() {
+    let mut route = test_route("claude-sonnet-4-6-thinking");
+    payload_mut(&mut route).thinking = Some(Thinking {
+        thinking_type: "enabled".to_string(),
+        budget_tokens: 12345,
+        display: None,
+    });
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-6-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"enabled","budget_tokens":12345}}"#,
+        );
+
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+
+    let pool = test_pool("https://example.com/v1", true);
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["thinking"]["type"], "enabled");
+    assert_eq!(value["thinking"]["budget_tokens"], 12345);
+}
+
+#[test]
+fn account_outbound_body_processed_mapping_uses_upstream_model() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "external-sonnet")];
+
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "external-sonnet");
+}
+
+#[test]
+fn account_outbound_body_require_mapping_match_rejects_miss_before_send() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
+    pool.model_mapping_require_match = true;
+    pool.model_mapping_rules = vec![model_rule("claude-opus-4-8", "external-opus")];
+
+    let err = account_outbound_body(&route, &pool).unwrap_err();
+
+    assert!(err.retryable);
+    assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+    assert_eq!(error_type_for_external_error(&err), "model_mapping_miss");
+    assert!(err.message.contains("requires model mapping match"));
+}
+
+#[test]
+fn account_outbound_body_preserves_budget_tokens_for_adaptive_thinking() {
+    let mut route = test_route("claude-opus-4-7-thinking");
+    payload_mut(&mut route).thinking = Some(Thinking {
+        thinking_type: "adaptive".to_string(),
+        budget_tokens: 20000,
+        display: None,
+    });
+    payload_mut(&mut route).output_config = Some(OutputConfig {
+        effort: Some("xhigh".to_string()),
+        format: None,
+    });
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
+        );
+
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+
+    let pool = test_pool("https://example.com/v1", true);
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["thinking"]["type"], "adaptive");
+    assert_eq!(value["thinking"]["budget_tokens"], 20000);
+    assert_eq!(value["output_config"]["effort"], "xhigh");
+}
+
+#[test]
+fn account_outbound_body_preserves_budget_tokens_for_disabled_thinking() {
+    let mut route = test_route("claude-opus-4-7");
+    payload_mut(&mut route).thinking = Some(Thinking {
+        thinking_type: "disabled".to_string(),
+        budget_tokens: 20000,
+        display: None,
+    });
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-7","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"disabled","budget_tokens":20000}}"#,
+        );
+
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+
+    let pool = test_pool("https://example.com/v1", true);
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["thinking"]["type"], "disabled");
+    assert_eq!(value["thinking"]["budget_tokens"], 20000);
+}
+
+#[test]
+fn account_outbound_body_uses_final_bytes_and_ignores_typed_payload() {
+    let mut route = test_route("claude-sonnet-4-5-20250929");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+    payload_mut(&mut route).messages = vec![Message {
+        role: "user".to_string(),
+        content: serde_json::json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": "/9j/normalized"
+            }
+        }]),
+    }];
+    route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"/9j/stale"}}]}],"stream":true}"#,
+        );
+
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
+    let outbound = test_account_outbound_body(&route, &pool);
+    let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-sonnet-4-5");
+    assert_eq!(
+        value["messages"][0]["content"][0]["source"]["media_type"],
+        "image/png"
+    );
+    assert_eq!(
+        value["messages"][0]["content"][0]["source"]["data"],
+        "/9j/stale"
+    );
+}
+
+#[test]
+fn account_outbound_model_normalization_only_changes_claude_numeric_versions() {
+    assert_eq!(
+        normalize_account_outbound_model("claude-opus-4.8"),
+        "claude-opus-4-8"
+    );
+    assert_eq!(
+        normalize_account_outbound_model("claude-opus-4.8-thinking"),
+        "claude-opus-4-8-thinking"
+    );
+    assert_eq!(
+        normalize_account_outbound_model(" claude-sonnet-4.5[1m] "),
+        "claude-sonnet-4-5[1m]"
+    );
+    assert_eq!(
+        normalize_account_outbound_model("deepseek-3.2"),
+        "deepseek-3.2"
+    );
+}
+
+#[test]
+fn account_passthrough_mapping_normalizes_dot_model_on_miss_when_enabled() {
+    let route = test_route("claude-haiku-4.5");
+    let pool = test_pool_with_model_dot_normalization();
+
+    assert_eq!(
+        pool.model_mapping_mode,
+        ModelMappingMode::PassthroughMapping
+    );
+
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-haiku-4-5");
+    assert_eq!(prepared.outbound_model.as_deref(), Some("claude-haiku-4-5"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_post_lease_revision_fence_rejects_disable_and_update_toctou() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let mut pool = postgres
+        .create_account(create_pool_request("dispatch-revision-fence", 1, true))
+        .await
+        .unwrap();
+
+    for round in 0..3 {
+        let lease = match manager.acquire_pool(&pool, &config).await {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => {
+                panic!("round {round}: lease unavailable: {}", unavailable.detail)
+            }
+        };
+        let disabled = postgres
+            .set_account_enabled(pool.id, false)
+            .await
+            .unwrap()
+            .expect("pool remains present");
+        assert_eq!(disabled.revision, pool.revision + 1);
+        assert!(matches!(
+            manager.validate_pool_dispatch_fence(&pool).await,
+            PoolDispatchFenceResult::Changed
+        ));
+        drop(lease);
+        assert!(
+            manager
+                .drain_release_intents(Duration::from_secs(5))
+                .await
+                .drained
+        );
+
+        let enabled = postgres
+            .set_account_enabled(pool.id, true)
+            .await
+            .unwrap()
+            .expect("pool remains present");
+        assert_eq!(enabled.revision, disabled.revision + 1);
+        assert!(matches!(
+            manager.validate_pool_dispatch_fence(&enabled).await,
+            PoolDispatchFenceResult::Current
+        ));
+        pool = postgres
+            .update_account(
+                pool.id,
+                UpdateAccountRequest {
+                    notes: Some(format!("revision-fence-round-{round}")),
+                    ..UpdateAccountRequest::default()
+                },
+            )
+            .await
+            .unwrap()
+            .expect("pool remains present");
+        assert_eq!(pool.revision, enabled.revision + 1);
+    }
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_pre_output_stream_commit_classifier_is_conservative() {
+    let message_start = external_sse_message_start("msg_classifier_start", 10);
+    assert!(
+        !external_sse_event_commits_pre_output_stream(message_start.as_bytes()),
+        "message_start is protocol-only and can be buffered before retry"
+    );
+
+    let ping = external_sse_ping();
+    assert!(
+        !external_sse_event_commits_pre_output_stream(ping.as_bytes()),
+        "ping is protocol-only and can be discarded with a failed attempt"
+    );
+
+    let text_start = external_sse_text_start();
+    assert!(
+        external_sse_event_commits_pre_output_stream(text_start.as_bytes()),
+        "content_block_start commits downstream protocol state even when text is empty"
+    );
+
+    let stop = external_sse_message_stop();
+    assert!(
+        external_sse_event_commits_pre_output_stream(stop.as_bytes()),
+        "legal terminal message_stop is not retried by this pre-output failure feature"
+    );
+}
+
+#[test]
+fn account_pre_output_stream_retry_effective_mode_respects_overrides() {
+    let mut config = AccountsConfig {
+        stream_pre_output_retry_enabled: true,
+        ..AccountsConfig::default()
+    };
+    let mut pool = test_pool("https://example.test/v1", true);
+
+    pool.pre_output_stream_retry_mode = StreamRetryMode::Inherit;
+    assert!(effective_account_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+
+    config.stream_pre_output_retry_enabled = false;
+    assert!(!effective_account_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+
+    pool.pre_output_stream_retry_mode = StreamRetryMode::Enabled;
+    assert!(effective_account_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+
+    config.stream_pre_output_retry_enabled = true;
+    pool.pre_output_stream_retry_mode = StreamRetryMode::Disabled;
+    assert!(!effective_account_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+}
+
+#[test]
+fn account_raw_body_mode_does_not_apply_payload_guard() {
+    let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"keep raw body even when guard config is enabled"}]}"#;
+    let mut route = test_route("client-model");
+    route.effective_raw_body = Bytes::from_static(raw);
+    route.raw_body = Bytes::from_static(raw);
+    route.payload_guard_external_enabled = true;
+    route.payload_guard_initial_config = PayloadGuardConfig {
+        enabled: true,
+        max_bytes: 32,
+
+        trim_history: true,
+        shaping: crate::model::config::PayloadShapingConfig::default(),
+    };
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+
+    assert_eq!(prepared.body, Bytes::from_static(raw));
+}
+
+#[test]
+fn account_raw_passthrough_keeps_body_byte_for_byte() {
+    let raw = br#" { "model":"client-model","stream":false,"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}] } "#;
+    let route = raw_test_route(raw);
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    pool.model_mapping_mode = ModelMappingMode::Passthrough;
+
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+
+    assert_eq!(prepared.body, Bytes::from_static(raw));
+    assert_eq!(
+        prepared.outbound_model.as_deref(),
+        route
+            .effective_raw_probe
+            .as_ref()
+            .and_then(|probe| probe.model.as_deref())
+    );
+}
+
+#[test]
+fn account_raw_passthrough_keeps_image_mime_mismatch_byte_for_byte() {
+    let jpeg = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00],
+    );
+    let raw = Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "client-model",
+            "max_tokens": 8,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": jpeg
+                    }
+                }]
+            }]
+        }))
+        .expect("raw image fixture JSON"),
+    );
+    let route = raw_test_route(raw.as_ref());
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    pool.model_mapping_mode = ModelMappingMode::Passthrough;
+
+    let prepared = account_prepare_request(&route, &pool).expect("raw external request");
+
+    assert_eq!(prepared.body, raw);
+}
+
+#[test]
+fn account_raw_passthrough_keeps_whitespace_text_blocks_byte_for_byte() {
+    let raw = br#" { "model":"client-model","stream":false,"messages":[{"role":"user","content":[{"type":"text","text":" \t\n "}]}] } "#;
+    let route = raw_test_route(raw);
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    pool.model_mapping_mode = ModelMappingMode::Passthrough;
+
+    let prepared = account_prepare_request(&route, &pool).expect("raw request");
+
+    assert_eq!(prepared.body, Bytes::from_static(raw));
+}
+
+#[test]
+fn account_raw_rewrite_changes_only_top_level_model() {
+    let raw = br#"{"messages":[{"role":"user","content":[{"type":"tool_result","content":{"model":"nested-model"}}]}],"model":"client-model","stream":false}"#;
+    let route = raw_test_route(raw);
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
+    pool.model_mapping_rules = vec![model_rule("client-model", "mapped-model")];
+
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+    let text = std::str::from_utf8(&prepared.body).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("rewritten body remains json");
+
+    assert_eq!(value["model"], "mapped-model");
+    assert_eq!(
+        value["messages"][0]["content"][0]["content"]["model"],
+        "nested-model"
+    );
+    assert!(text.contains(r#""model":"nested-model""#));
+    assert_eq!(prepared.outbound_model.as_deref(), Some("mapped-model"));
+}
+
+#[test]
+fn account_raw_rewrite_require_mapping_match_rejects_miss() {
+    let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}]}"#;
+    let route = raw_test_route(raw);
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
+    pool.model_mapping_require_match = true;
+    pool.model_mapping_rules = vec![model_rule("other-model", "mapped-model")];
+
+    let err = match account_prepare_request(&route, &pool) {
+        Ok(_) => panic!("raw rewrite should reject mapping miss"),
+        Err(err) => err,
+    };
+
+    assert!(err.retryable);
+    assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+    assert_eq!(error_type_for_external_error(&err), "model_mapping_miss");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_redis_acquire_timeout_reclaims_commit_unknown_and_recovers() {
+    let Ok(toxiproxy_api) = std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 Redis commit-unknown 集成测试：未设置 CLAUDE_POOL_TEST_TOXIPROXY_API");
+        return;
+    };
+    let proxy_name =
+        std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request(
+            "external-redis-commit-unknown",
+            1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let toxic_base = format!(
+        "{}/proxies/{}/toxics",
+        toxiproxy_api.trim_end_matches('/'),
+        proxy_name
+    );
+
+    for round in 0..5 {
+        let toxic_name = format!("external-commit-unknown-{round}");
+        let install = client
+            .post(&toxic_base)
+            .json(&json!({
+                "name": toxic_name.clone(),
+                "type": "latency",
+                "stream": "downstream",
+                "toxicity": 1.0,
+                "attributes": { "latency": 2200, "jitter": 0 },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(install.status().is_success(), "round {round}: {install:?}");
+
+        let started = Instant::now();
+        let delayed = manager.acquire_pool(&pool, &config).await;
+        let elapsed = started.elapsed();
+        let remove = client
+            .delete(format!("{toxic_base}/{toxic_name}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(remove.status().is_success(), "round {round}: {remove:?}");
+
+        let PoolAcquireResult::Unavailable(unavailable) = delayed else {
+            panic!("round {round}: delayed acquire response must not be treated as committed");
+        };
+        assert_eq!(
+            unavailable.reason,
+            PoolCapacityWaitReason::CoordinatorUnavailable
+        );
+        assert_eq!(unavailable.detail, "lease_acquire_timeout");
+        assert!(
+            elapsed >= ACCOUNT_COORDINATOR_REDIS_OPERATION_TIMEOUT,
+            "round {round}: timeout returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2600),
+            "round {round}: timeout was not bounded: {elapsed:?}"
+        );
+
+        let drained = manager.drain_release_intents(Duration::from_secs(8)).await;
+        assert!(
+            drained.drained,
+            "round {round}: commit-unknown cleanup must drain"
+        );
+
+        let fail_fast = manager.pool_runtime_snapshot(pool.id).await;
+        assert!(
+            fail_fast
+                .as_ref()
+                .is_err_and(|err| err.to_string().contains("coordinator breaker is open")),
+            "round {round}: requests inside the breaker window must fail fast: {fail_fast:?}"
+        );
+        let recovered_snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match manager.pool_runtime_snapshot(pool.id).await {
+                    Ok(snapshot) => break snapshot,
+                    Err(err) if err.to_string().contains("coordinator breaker is open") => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(err) => panic!("round {round}: unexpected recovery error: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("coordinator breaker must admit one successful recovery probe");
+        assert_eq!(
+            (recovered_snapshot.0, recovered_snapshot.1),
+            (0, 0),
+            "round {round}: pending cleanup must remove any commit-unknown lease"
+        );
+
+        for recovery_probe in 0..5 {
+            let snapshot = manager.pool_runtime_snapshot(pool.id).await.unwrap();
+            assert_eq!(
+                (snapshot.0, snapshot.1),
+                (0, 0),
+                "round {round}, recovery probe {recovery_probe}: timed-out lease must not retain capacity"
+            );
+            let lease = match manager.acquire_pool(&pool, &config).await {
+                PoolAcquireResult::Acquired(lease) => lease,
+                PoolAcquireResult::Unavailable(unavailable) => panic!(
+                    "round {round}, recovery probe {recovery_probe}: {}",
+                    unavailable.detail
+                ),
+            };
+            drop(lease);
+            let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+            assert!(
+                drained.drained,
+                "round {round}, recovery probe {recovery_probe}: release must drain"
+            );
+        }
+        eprintln!(
+            "account_commit_unknown round={round} timeout_ms={} recovery=5/5",
+            elapsed.as_millis()
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_redis_data_loss_fences_active_confirmed_lease_before_reacquire() {
+    let Ok(container) = std::env::var("CLAUDE_POOL_TEST_REDIS_RESTART_CONTAINER") else {
+        eprintln!(
+            "跳过 active lease Redis restart 测试：未设置 CLAUDE_POOL_TEST_REDIS_RESTART_CONTAINER"
+        );
+        return;
+    };
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    // Keep the restart setup below the heartbeat's first 5s probe while leaving enough
+    // recovery time for that probe to fence the old epoch before a fresh lease is admitted.
+    let recovery_grace = Duration::from_secs(8);
+    let mut manager = manager.with_coordinator_recovery_grace(recovery_grace);
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 1,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request(
+            "external-redis-active-lease-restart",
+            1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let max_age = Duration::from_secs(15);
+    for round in 0..5 {
+        let old_lease = match manager
+            .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+            .await
+        {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => {
+                panic!(
+                    "round {round}: initial active lease unavailable: {}",
+                    unavailable.detail
+                )
+            }
+        };
+        let old_epoch = old_lease.coordination_epoch.clone();
+
+        let kill_container = container.clone();
+        let killed = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("docker")
+                .args(["kill", "--signal", "KILL", &kill_container])
+                .status()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(killed.success(), "round {round}: docker kill failed");
+        let start_container = container.clone();
+        let started = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("docker")
+                .args(["start", &start_container])
+                .status()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(started.success(), "round {round}: docker start failed");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.redis.del("account:restart-readiness").await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Redis must reconnect before the old heartbeat deadline");
+        for suffix in [
+            format!("account:inflight:{}:last_seen", pool.id),
+            format!("account:inflight:{}:acquired", pool.id),
+            "account:global:inflight:last_seen".to_string(),
+            "account:global:inflight:acquired".to_string(),
+        ] {
+            manager.redis.del(suffix).await.unwrap();
+        }
+
+        let mut fresh_redis_config = Config::default();
+        fresh_redis_config.redis.url =
+            Some(crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL").unwrap());
+        fresh_redis_config.redis.key_prefix = manager.redis.key_prefix_for_test();
+        let fresh_manager = AccountManager::new(
+            postgres.clone(),
+            Arc::new(RedisStore::connect(&fresh_redis_config).await.unwrap()),
+        )
+        .with_coordinator_recovery_grace(recovery_grace);
+        assert!(
+            !old_lease
+                .heartbeat
+                .as_ref()
+                .unwrap()
+                .state
+                .lost
+                .load(Ordering::Acquire),
+            "round {round}: reacquire must be attempted before old heartbeat fencing"
+        );
+
+        for barrier_probe in 0..5 {
+            let reacquire = fresh_manager
+                .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+                .await;
+            let PoolAcquireResult::Unavailable(unavailable) = reacquire else {
+                panic!(
+                    "round {round}, barrier probe {barrier_probe}: second lease admitted before fencing"
+                );
+            };
+            assert_eq!(
+                unavailable.reason,
+                PoolCapacityWaitReason::CoordinatorUnavailable
+            );
+            assert_eq!(unavailable.detail, "coordinator_restart_recovery");
+            assert!(unavailable.wait_for.is_some());
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), old_lease.wait_until_lost())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: old epoch heartbeat was not fenced"));
+        assert_ne!(
+            fresh_manager.coordinator_epoch.lock().as_deref(),
+            Some(old_epoch.as_str()),
+            "round {round}: Redis restart must rotate the shared coordinator epoch"
+        );
+
+        let recovered = tokio::time::timeout(recovery_grace + Duration::from_secs(3), async {
+            loop {
+                match fresh_manager
+                    .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+                    .await
+                {
+                    PoolAcquireResult::Acquired(lease) => break lease,
+                    PoolAcquireResult::Unavailable(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: coordinator did not recover after barrier"));
+        assert!(
+            old_lease
+                .heartbeat
+                .as_ref()
+                .unwrap()
+                .state
+                .lost
+                .load(Ordering::Acquire),
+            "round {round}: new lease must not precede old upstream fencing"
+        );
+        drop(recovered);
+        drop(old_lease);
+        let (old_drained, fresh_drained) = tokio::join!(
+            manager.drain_release_intents(Duration::from_secs(5)),
+            fresh_manager.drain_release_intents(Duration::from_secs(5)),
+        );
+        assert!(old_drained.drained, "round {round}: old release must drain");
+        assert!(
+            fresh_drained.drained,
+            "round {round}: fresh release must drain"
+        );
+        manager = fresh_manager;
+    }
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_redis_disconnect_fails_closed_and_recovers() {
+    let Ok(toxiproxy_api) = std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 Redis 断连集成测试：未设置 CLAUDE_POOL_TEST_TOXIPROXY_API");
+        return;
+    };
+    let proxy_name =
+        std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-redis-disconnect", 1, true))
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let toxic_base = format!(
+        "{}/proxies/{}/toxics",
+        toxiproxy_api.trim_end_matches('/'),
+        proxy_name
+    );
+
+    for round in 0..5 {
+        let healthy = manager
+            .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+            .await;
+        assert_eq!(
+            healthy.selected_pool.as_ref().map(|selected| selected.id),
+            Some(pool.id),
+            "round {round}: coordinator should start healthy"
+        );
+        let epoch_before = manager
+            .coordinator_epoch
+            .lock()
+            .clone()
+            .expect("healthy coordinator must cache an epoch");
+        let run_id_before = manager
+            .coordinator_run_id
+            .lock()
+            .clone()
+            .expect("healthy coordinator must cache a Redis run id");
+        let authority_version_before: i64 =
+            sqlx::query_scalar("SELECT version FROM runtime_config WHERE id = $1")
+                .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap();
+
+        let toxic_name = format!("external-reset-peer-{round}");
+        let install = client
+            .post(&toxic_base)
+            .json(&json!({
+                "name": toxic_name.clone(),
+                "type": "reset_peer",
+                "stream": "downstream",
+                "toxicity": 1.0,
+                "attributes": { "timeout": 0 },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(install.status().is_success(), "round {round}: {install:?}");
+
+        let disrupted = tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None),
+        )
+        .await;
+        let remove = client
+            .delete(format!("{toxic_base}/{toxic_name}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(remove.status().is_success(), "round {round}: {remove:?}");
+
+        let disrupted = disrupted.expect("Redis disconnect must fail closed within 3 seconds");
+        assert!(disrupted.selected_pool.is_none(), "round {round}");
+        assert!(
+            disrupted.availability.coordinator_unavailable,
+            "round {round}"
+        );
+        assert_eq!(
+            disrupted.availability.wait_reason,
+            Some(PoolCapacityWaitReason::CoordinatorUnavailable),
+            "round {round}"
+        );
+
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let selection = manager
+                    .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+                    .await;
+                if selection.selected_pool.is_some() {
+                    break selection;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Redis coordinator should recover after reset_peer is removed");
+        assert_eq!(
+            recovered.selected_pool.map(|selected| selected.id),
+            Some(pool.id),
+            "round {round}"
+        );
+        for recovery_probe in 0..5 {
+            let recovered = manager
+                .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+                .await;
+            assert_eq!(
+                recovered.selected_pool.map(|selected| selected.id),
+                Some(pool.id),
+                "round {round}, recovery probe {recovery_probe}: coordinator must remain healthy"
+            );
+        }
+        assert_eq!(
+            manager.account_coordination_epoch().await.unwrap(),
+            epoch_before,
+            "round {round}: a transport disconnect must not rotate the epoch"
+        );
+        assert_eq!(
+            manager.coordinator_run_id.lock().as_deref(),
+            Some(run_id_before.as_str()),
+            "round {round}: a transport disconnect must not change Redis run_id"
+        );
+        assert_eq!(
+            manager
+                .redis
+                .account_coordinator_guard_state_for_epoch(&epoch_before)
+                .await
+                .unwrap(),
+            AccountCoordinatorGuardState::Ready {
+                coordination_epoch: epoch_before.clone(),
+            },
+            "round {round}: disconnect recovery must not install a grace barrier"
+        );
+        let authority_version_after: i64 =
+            sqlx::query_scalar("SELECT version FROM runtime_config WHERE id = $1")
+                .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            authority_version_after, authority_version_before,
+            "round {round}: disconnect recovery must not rewrite authority"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_redis_hot_path_is_repeatable_across_selection_and_acquire() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_ttl(Duration::from_secs(30));
+    let config = AccountsConfig {
+        enabled: true,
+        model_unavailable_cooldown_mode: ModelUnavailableCooldownMode::Model,
+        ..AccountsConfig::default()
+    };
+    let mut pool_ids = Vec::new();
+    for index in 0..8 {
+        let pool = postgres
+            .create_account(create_pool_request(
+                &format!("external-redis-hot-path-{index}"),
+                1,
+                true,
+            ))
+            .await
+            .unwrap();
+        pool_ids.push(pool.id);
+    }
+    let route = test_route("claude-sonnet-4-6");
+
+    for round in 0..5 {
+        manager.redis.reset_account_hot_path_round_trips();
+        let started = Instant::now();
+        assert!(
+            manager
+                .has_eligible_pool_for_model(&config, &route.requested_model())
+                .await,
+            "round {round}: configured pool should remain eligible"
+        );
+        assert_eq!(
+            manager.redis.account_hot_path_round_trips(),
+            0,
+            "round {round}: healthy local eligibility must not perform an external Redis selection snapshot"
+        );
+        let after_eligibility = Instant::now();
+        let selection = manager
+            .select_pool_for_route(&HashSet::new(), &config, &route)
+            .await;
+        let after_selection = Instant::now();
+        let selected = selection
+            .selected_pool
+            .expect("configured pool should remain selectable");
+        assert!(
+            pool_ids.contains(&selected.id),
+            "round {round}: selected pool must come from the eligible batch"
+        );
+        let lease = match manager
+            .acquire_pool_for_route(&selected, &config, &route)
+            .await
+        {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => {
+                panic!(
+                    "round {round}: lease acquire failed: {}",
+                    unavailable.detail
+                )
+            }
+        };
+        let after_acquire = Instant::now();
+        let redis_round_trips = manager.redis.account_hot_path_round_trips();
+        if round == 0 {
+            assert!(
+                (2..=6).contains(&redis_round_trips),
+                "round {round}: cold coordinator bootstrap may add bounded Redis run_id/epoch probes, got {redis_round_trips}"
+            );
+        } else {
+            assert_eq!(
+                redis_round_trips, 2,
+                "round {round}: hot eligibility must not access Redis, while batched selection and atomic acquire use one round trip each regardless of pool count"
+            );
+        }
+        eprintln!(
+            "account_redis_hot_path round={round} pools={} eligibility_ms={} selection_ms={} acquire_ms={} total_ms={}",
+            pool_ids.len(),
+            after_eligibility.duration_since(started).as_millis(),
+            after_selection
+                .duration_since(after_eligibility)
+                .as_millis(),
+            after_acquire.duration_since(after_selection).as_millis(),
+            after_acquire.duration_since(started).as_millis(),
+        );
+
+        drop(lease);
+        let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+        assert!(drained.drained, "round {round}: release task should drain");
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_redis_restart_fails_closed_and_recovers_five_of_five() {
+    let Ok(container) = std::env::var("CLAUDE_POOL_TEST_REDIS_RESTART_CONTAINER") else {
+        eprintln!("跳过 Redis restart 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_RESTART_CONTAINER");
+        return;
+    };
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_coordinator_recovery_grace(Duration::from_millis(600));
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let pool = postgres
+        .create_account(create_pool_request("external-redis-restart", 1, true))
+        .await
+        .unwrap();
+
+    for round in 0..5 {
+        let healthy = manager
+            .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+            .await;
+        assert_eq!(
+            healthy.selected_pool.map(|selected| selected.id),
+            Some(pool.id),
+            "round {round}: coordinator must be healthy before restart"
+        );
+
+        let stop_container = container.clone();
+        let stop = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("docker")
+                .args(["stop", "--timeout", "1", &stop_container])
+                .status()
+        })
+        .await
+        .unwrap();
+        let disrupted = tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None),
+        )
+        .await;
+        let start_container = container.clone();
+        let start = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("docker")
+                .args(["start", &start_container])
+                .status()
+        })
+        .await
+        .unwrap();
+
+        assert!(stop.unwrap().success(), "round {round}: docker stop failed");
+        assert!(
+            start.unwrap().success(),
+            "round {round}: docker start failed"
+        );
+        let disrupted = disrupted.expect("Redis restart failure must be bounded within 3 seconds");
+        assert!(disrupted.selected_pool.is_none(), "round {round}");
+        assert!(
+            disrupted.availability.coordinator_unavailable,
+            "round {round}: Redis downtime must fail closed"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let recovered = manager
+                    .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+                    .await;
+                if recovered.selected_pool.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Redis coordinator must reconnect after restart");
+
+        for recovery_probe in 0..5 {
+            let recovered = manager
+                .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+                .await;
+            assert_eq!(
+                recovered.selected_pool.map(|selected| selected.id),
+                Some(pool.id),
+                "round {round}, recovery probe {recovery_probe}: coordinator must remain healthy"
+            );
+        }
+        eprintln!("account_redis_restart round={round} recovery=5/5");
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_redis_restart_fences_multiple_active_leases_across_managers_for_five_rounds() {
+    let Ok(container) = std::env::var("CLAUDE_POOL_TEST_REDIS_RESTART_CONTAINER") else {
+        eprintln!("跳过多 active lease Redis restart 测试：未设置 restart container");
+        return;
+    };
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let recovery_grace = Duration::from_secs(8);
+    let mut manager = manager.with_coordinator_recovery_grace(recovery_grace);
+    let mut peer_redis_config = Config::default();
+    peer_redis_config.redis.url =
+        Some(crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL").unwrap());
+    peer_redis_config.redis.key_prefix = manager.redis.key_prefix_for_test();
+    let peer = AccountManager::new(
+        postgres.clone(),
+        Arc::new(RedisStore::connect(&peer_redis_config).await.unwrap()),
+    )
+    .with_coordinator_recovery_grace(recovery_grace);
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 4,
+        ..AccountsConfig::default()
+    };
+    let mut request = create_pool_request("external-redis-multi-active-restart", 1, true);
+    request.max_concurrent_requests = 4;
+    let pool = postgres.create_account(request).await.unwrap();
+    let max_age = Duration::from_secs(15);
+
+    for round in 0..5 {
+        let mut old_leases = Vec::with_capacity(4);
+        for owner in [&manager, &manager, &peer, &peer] {
+            match owner
+                .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+                .await
+            {
+                PoolAcquireResult::Acquired(lease) => old_leases.push(lease),
+                PoolAcquireResult::Unavailable(unavailable) => panic!(
+                    "round {round}: failed to seed four active leases: {}",
+                    unavailable.detail
+                ),
+            }
+        }
+        let old_epoch = old_leases[0].coordination_epoch.clone();
+        assert!(
+            old_leases
+                .iter()
+                .all(|lease| lease.coordination_epoch == old_epoch),
+            "round {round}: managers did not share one epoch"
+        );
+
+        let kill_container = container.clone();
+        let killed = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("docker")
+                .args(["kill", "--signal", "KILL", &kill_container])
+                .status()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(killed.success(), "round {round}: docker kill failed");
+        let start_container = container.clone();
+        let started = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("docker")
+                .args(["start", &start_container])
+                .status()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(started.success(), "round {round}: docker start failed");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager
+                    .redis
+                    .del("account:multi-restart-readiness")
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Redis must reconnect before the old heartbeat probe");
+        for suffix in [
+            format!("account:inflight:{}:last_seen", pool.id),
+            format!("account:inflight:{}:acquired", pool.id),
+            "account:global:inflight:last_seen".to_string(),
+            "account:global:inflight:acquired".to_string(),
+        ] {
+            manager.redis.del(suffix).await.unwrap();
+        }
+
+        let fresh = AccountManager::new(
+            postgres.clone(),
+            Arc::new(RedisStore::connect(&peer_redis_config).await.unwrap()),
+        )
+        .with_coordinator_recovery_grace(recovery_grace);
+        assert!(
+            old_leases.iter().all(|lease| !lease
+                .heartbeat
+                .as_ref()
+                .unwrap()
+                .state
+                .lost
+                .load(Ordering::Acquire)),
+            "round {round}: fresh manager must race before old heartbeat fencing"
+        );
+        for probe in 0..5 {
+            let PoolAcquireResult::Unavailable(unavailable) = fresh
+                .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+                .await
+            else {
+                panic!("round {round}, probe {probe}: lease admitted inside recovery barrier");
+            };
+            assert_eq!(unavailable.detail, "coordinator_restart_recovery");
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            futures::future::join_all(old_leases.iter().map(AccountLease::wait_until_lost)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: all four old heartbeats were not fenced"));
+        assert!(
+            old_leases.iter().all(|lease| lease
+                .heartbeat
+                .as_ref()
+                .unwrap()
+                .state
+                .lost
+                .load(Ordering::Acquire)),
+            "round {round}: at least one old upstream remained active"
+        );
+        assert_ne!(
+            fresh.coordinator_epoch.lock().as_deref(),
+            Some(old_epoch.as_str()),
+            "round {round}: restart must rotate the shared epoch"
+        );
+
+        let recovered = tokio::time::timeout(recovery_grace + Duration::from_secs(3), async {
+            loop {
+                match fresh
+                    .acquire_pool_with_model_cooldowns_and_max_age(&pool, &config, &[], max_age)
+                    .await
+                {
+                    PoolAcquireResult::Acquired(lease) => break lease,
+                    PoolAcquireResult::Unavailable(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: fresh manager did not recover"));
+        drop(recovered);
+        drop(old_leases);
+        let (manager_drain, peer_drain, fresh_drain) = tokio::join!(
+            manager.drain_release_intents(Duration::from_secs(5)),
+            peer.drain_release_intents(Duration::from_secs(5)),
+            fresh.drain_release_intents(Duration::from_secs(5)),
+        );
+        assert!(manager_drain.drained, "round {round}: manager drain");
+        assert!(peer_drain.drained, "round {round}: peer drain");
+        assert!(fresh_drain.drained, "round {round}: fresh drain");
+        manager = fresh;
+    }
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn account_redis_rtt_and_concurrency_matrix_five_outer_rounds() {
+    if !matches!(
+        std::env::var("CLAUDE_POOL_RUN_EXTERNAL_REDIS_RTT_MATRIX"),
+        Ok(value) if value == "1"
+    ) {
+        eprintln!(
+            "跳过 external Redis RTT 矩阵：未设置 CLAUDE_POOL_RUN_EXTERNAL_REDIS_RTT_MATRIX=1"
+        );
+        return;
+    }
+    let Ok(proxy_redis_url) = std::env::var("CLAUDE_POOL_TEST_REDIS_URL") else {
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 CLAUDE_POOL_TEST_REDIS_URL");
+        return;
+    };
+    let Ok(direct_redis_url) = std::env::var("CLAUDE_POOL_TEST_REDIS_DIRECT_URL") else {
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 CLAUDE_POOL_TEST_REDIS_DIRECT_URL");
+        return;
+    };
+    let Ok(toxiproxy_api) = std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 CLAUDE_POOL_TEST_TOXIPROXY_API");
+        return;
+    };
+    let proxy_name =
+        std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let Some(mut postgres_config) = test_postgres_config() else {
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+        return;
+    };
+    postgres_config.postgres.max_connections = 64;
+    let postgres = Arc::new(PostgresStore::connect_test(&postgres_config).await.unwrap());
+
+    for index in 0..60 {
+        let mut request = create_pool_request(&format!("external-rtt-matrix-{index}"), index, true);
+        request.max_concurrent_requests = 1_024;
+        postgres.create_account(request).await.unwrap();
+    }
+    let config = Arc::new(AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 0,
+        ..AccountsConfig::default()
+    });
+    let route = Arc::new(test_route("claude-sonnet-4-6"));
+    let mut managers = Vec::with_capacity(5);
+    let mut direct_stores = Vec::with_capacity(5);
+    let key_prefix = format!("claude_pool:test:external_rtt:{}", uuid::Uuid::new_v4());
+    for _ in 0..5 {
+        let mut proxy_config = Config::default();
+        proxy_config.redis.url = Some(proxy_redis_url.clone());
+        proxy_config.redis.key_prefix = key_prefix.clone();
+        let proxy_store = Arc::new(RedisStore::connect(&proxy_config).await.unwrap());
+        managers.push(Arc::new(AccountManager::new(postgres.clone(), proxy_store)));
+
+        let mut direct_config = Config::default();
+        direct_config.redis.url = Some(direct_redis_url.clone());
+        direct_config.redis.key_prefix = key_prefix.clone();
+        direct_stores.push(Arc::new(RedisStore::connect(&direct_config).await.unwrap()));
+    }
+
+    let client = reqwest::Client::new();
+    let toxic_base = format!(
+        "{}/proxies/{}/toxics",
+        toxiproxy_api.trim_end_matches('/'),
+        proxy_name
+    );
+    let rss_start = external_perf_process_rss_kib();
+    let fd_start = external_perf_open_fd_count();
+    let mut rss_peak = rss_start;
+    let mut fd_peak = fd_start;
+
+    for latency_ms in [0u64, 50, 74, 75, 90, 150, 500] {
+        for concurrency in [64usize, 16, 1] {
+            let toxic_name = format!("external-rtt-{latency_ms}-c{concurrency}");
+            if latency_ms > 0 {
+                let _ = client
+                    .delete(format!("{toxic_base}/{toxic_name}"))
+                    .send()
+                    .await;
+                let install = client
+                    .post(&toxic_base)
+                    .json(&json!({
+                        "name": toxic_name.clone(),
+                        "type": "latency",
+                        "stream": "downstream",
+                        "toxicity": 1.0,
+                        "attributes": { "latency": latency_ms, "jitter": 0 },
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    install.status().is_success(),
+                    "latency={latency_ms}, concurrency={concurrency}: {install:?}"
+                );
+            }
+
+            let warmups = futures::future::join_all((0..5).map(|round| {
+                run_external_coordinator_perf_round(
+                    managers[round].clone(),
+                    direct_stores[round].clone(),
+                    config.clone(),
+                    route.clone(),
+                    40,
+                    concurrency,
+                )
+            }))
+            .await;
+            for manager in &managers {
+                manager.redis.reset_account_hot_path_round_trips();
+            }
+            let saturated_before = managers
+                .iter()
+                .map(|manager| manager.selection_saturated.load(Ordering::Acquire))
+                .collect::<Vec<_>>();
+            let measured_started = Instant::now();
+            let measured = futures::future::join_all((0..5).map(|round| {
+                run_external_coordinator_perf_round(
+                    managers[round].clone(),
+                    direct_stores[round].clone(),
+                    config.clone(),
+                    route.clone(),
+                    200,
+                    concurrency,
+                )
+            }))
+            .await;
+            let measured_wall = measured_started.elapsed();
+
+            if latency_ms > 0 {
+                let remove = client
+                    .delete(format!("{toxic_base}/{toxic_name}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    remove.status().is_success(),
+                    "latency={latency_ms}, concurrency={concurrency}: {remove:?}"
+                );
+            }
+
+            let warmup_failures = warmups
+                .iter()
+                .flat_map(|round| round.iter())
+                .filter(|result| result.is_err())
+                .count();
+            let measured_failures = measured
+                .iter()
+                .flat_map(|round| round.iter())
+                .filter(|result| result.is_err())
+                .count();
+            assert_eq!(
+                warmup_failures, 0,
+                "latency={latency_ms}, concurrency={concurrency}: warmup failures"
+            );
+            assert_eq!(
+                measured_failures, 0,
+                "latency={latency_ms}, concurrency={concurrency}: measured failures"
+            );
+
+            let redis_attempts = managers
+                .iter()
+                .map(|manager| manager.redis.account_hot_path_round_trips())
+                .sum::<u64>();
+            let request_round_trips = 2_000u64;
+            let probe_interval_ms =
+                Duration::from_secs(ACCOUNT_COORDINATOR_RUN_ID_PROBE_INTERVAL_SECS)
+                    .as_millis()
+                    .max(1);
+            let probe_windows = measured_wall
+                .as_millis()
+                .saturating_add(probe_interval_ms - 1)
+                / probe_interval_ms;
+            let max_probe_round_trips = probe_windows
+                .saturating_add(2)
+                .saturating_mul(managers.len() as u128)
+                .min(u64::MAX as u128) as u64;
+            assert!(
+                redis_attempts >= request_round_trips
+                    && redis_attempts <= request_round_trips.saturating_add(max_probe_round_trips),
+                "latency={latency_ms}, concurrency={concurrency}: measured Redis RTTs {redis_attempts} exceeded request RTTs {request_round_trips} plus amortized probe bound {max_probe_round_trips}"
+            );
+            let probe_round_trips = redis_attempts.saturating_sub(request_round_trips);
+            let admission_rejections = managers
+                .iter()
+                .zip(&saturated_before)
+                .map(|(manager, before)| {
+                    manager
+                        .selection_saturated
+                        .load(Ordering::Acquire)
+                        .saturating_sub(*before)
+                })
+                .sum::<u64>();
+            assert_eq!(
+                admission_rejections, 0,
+                "latency={latency_ms}, concurrency={concurrency}: nominal matrix load must not be shed"
+            );
+
+            let mut latency_micros = measured
+                .into_iter()
+                .flatten()
+                .map(|result| result.unwrap().as_micros())
+                .collect::<Vec<_>>();
+            latency_micros.sort_unstable();
+            assert_eq!(latency_micros.len(), 1_000);
+            let recovery = run_external_coordinator_perf_round(
+                managers[0].clone(),
+                direct_stores[0].clone(),
+                config.clone(),
+                route.clone(),
+                5,
+                1,
+            )
+            .await;
+            assert!(
+                recovery.iter().all(Result::is_ok),
+                "latency={latency_ms}, concurrency={concurrency}: recovery must be 5/5"
+            );
+
+            let rss_now = external_perf_process_rss_kib();
+            let fd_now = external_perf_open_fd_count();
+            rss_peak = match (rss_peak, rss_now) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            };
+            fd_peak = match (fd_peak, fd_now) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            };
+            eprintln!(
+                "external_redis_rtt latency_ms={latency_ms} round_count=5 pools=60 per_round_concurrency={concurrency} aggregate_concurrency={} warmup=200 measured=1000 request_round_trips={request_round_trips} probe_round_trips={probe_round_trips} probe_round_trip_bound={max_probe_round_trips} admission_rejections={admission_rejections} success=1000 recovery=5/5 p50_us={} p95_us={} p99_us={} wall_ms={} rss_kib={:?} fd={:?}",
+                concurrency * 5,
+                external_perf_percentile_micros(&latency_micros, 50),
+                external_perf_percentile_micros(&latency_micros, 95),
+                external_perf_percentile_micros(&latency_micros, 99),
+                measured_wall.as_millis(),
+                rss_now,
+                fd_now,
+            );
+        }
+    }
+
+    let rss_end = external_perf_process_rss_kib();
+    let fd_end = external_perf_open_fd_count();
+    eprintln!(
+        "external_redis_rtt_resources rss_start_kib={rss_start:?} rss_peak_kib={rss_peak:?} rss_end_kib={rss_end:?} fd_start={fd_start:?} fd_peak={fd_peak:?} fd_end={fd_end:?}"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_release_dispatcher_drains_10k_real_leases_after_commit_unknown_for_five_rounds() {
+    let Ok(direct_redis_url) = std::env::var("CLAUDE_POOL_TEST_REDIS_DIRECT_URL") else {
+        eprintln!("跳过 10k external release 测试：未设置 CLAUDE_POOL_TEST_REDIS_DIRECT_URL");
+        return;
+    };
+    let Ok(toxiproxy_api) = std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 10k external release 测试：未设置 CLAUDE_POOL_TEST_TOXIPROXY_API");
+        return;
+    };
+    let proxy_name =
+        std::env::var("CLAUDE_POOL_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let mut direct_config = Config::default();
+    direct_config.redis.url = Some(direct_redis_url.clone());
+    direct_config.redis.key_prefix = manager.redis.key_prefix_for_test();
+    let direct_redis = Arc::new(RedisStore::connect(&direct_config).await.unwrap());
+    let raw_client = redis::Client::open(direct_redis_url).unwrap();
+    let mut raw_redis = raw_client.get_multiplexed_async_connection().await.unwrap();
+    let coordination_epoch = manager.account_coordination_epoch().await.unwrap();
+    let client = reqwest::Client::new();
+    let toxic_base = format!(
+        "{}/proxies/{}/toxics",
+        toxiproxy_api.trim_end_matches('/'),
+        proxy_name
+    );
+    let rss_start = external_perf_process_rss_kib();
+    let fd_start = external_perf_open_fd_count();
+    let mut rss_peak = rss_start;
+    let mut fd_peak = fd_start;
+    let worker_starts_before = manager
+        .release_dispatcher
+        .stats
+        .worker_starts
+        .load(Ordering::Acquire);
+
+    for round in 0..5 {
+        let pool_id = 90_000 + round as u64;
+        let cooldown_key = format!("account:{pool_id}:cooldown");
+        let mut leases = Vec::with_capacity(10_000);
+        for index in 0..10_000 {
+            let lease_id = format!("release-storm-{round}-{index}");
+            let acquired = direct_redis
+                .acquire_account_lease(
+                    pool_id,
+                    &lease_id,
+                    &coordination_epoch,
+                    10_000,
+                    10_000,
+                    Some(Duration::from_secs(60)),
+                    std::slice::from_ref(&cooldown_key),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(acquired, RedisAccountLeaseAcquireResult::Acquired { .. }),
+                "round {round}, lease {index}: seed acquire failed: {acquired:?}"
+            );
+            let release_permit = manager
+                .release_dispatcher
+                .try_reserve()
+                .expect("10k leases must fit within the explicit release capacity");
+            leases.push(AccountLease {
+                manager: manager.clone(),
+                pool_id,
+                lease_id,
+                coordination_epoch: coordination_epoch.clone(),
+                state: AccountLeaseState::Confirmed,
+                max_age: Duration::from_secs(60),
+                heartbeat: None,
+                global_permit: None,
+                release_permit: Some(release_permit),
+            });
+        }
+        let seeded = direct_redis
+            .account_coordinator_snapshot(
+                pool_id,
+                Some(Duration::from_secs(60)),
+                std::slice::from_ref(&cooldown_key),
+                &coordination_epoch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seeded.capacity.pool_in_flight_requests, 10_000);
+        assert_eq!(seeded.capacity.global_in_flight_requests, 10_000);
+
+        let toxic_name = format!("external-release-reset-peer-{round}");
+        let _ = client
+            .delete(format!("{toxic_base}/{toxic_name}"))
+            .send()
+            .await;
+        let install = client
+            .post(&toxic_base)
+            .json(&json!({
+                "name": toxic_name.clone(),
+                "type": "reset_peer",
+                "stream": "downstream",
+                "toxicity": 1.0,
+                "attributes": { "timeout": 0 },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(install.status().is_success(), "round {round}: {install:?}");
+
+        let enqueued_before = manager
+            .release_dispatcher
+            .stats
+            .enqueued
+            .load(Ordering::Acquire);
+        let completed_before = manager
+            .release_dispatcher
+            .stats
+            .completed
+            .load(Ordering::Acquire);
+        let deduplicated_before = manager
+            .release_dispatcher
+            .stats
+            .deduplicated
+            .load(Ordering::Acquire);
+        let retries_before = manager
+            .release_dispatcher
+            .stats
+            .retries
+            .load(Ordering::Acquire);
+        let worker_starts_round = manager
+            .release_dispatcher
+            .stats
+            .worker_starts
+            .load(Ordering::Acquire);
+        let drop_started = Instant::now();
+        drop(leases);
+        let drop_elapsed = drop_started.elapsed();
+        assert!(
+            drop_elapsed < Duration::from_secs(2),
+            "round {round}: 10k O(1) release registrations took {drop_elapsed:?}"
+        );
+        assert_eq!(manager.release_dispatcher.pending_len(), 10_000);
+
+        let duplicate_permit = manager
+            .release_dispatcher
+            .try_reserve()
+            .expect("duplicate test intent must reserve temporary capacity");
+        manager.release_dispatcher.enqueue(
+            AccountReleaseIntent {
+                pool_id,
+                lease_id: format!("release-storm-{round}-0"),
+                release_kind: AccountLeaseReleaseKind::Confirmed,
+            },
+            duplicate_permit,
+        );
+        assert_eq!(manager.release_dispatcher.pending_len(), 10_000);
+        assert_eq!(
+            manager
+                .release_dispatcher
+                .stats
+                .deduplicated
+                .load(Ordering::Acquire),
+            deduplicated_before + 1
+        );
+
+        let blocked = manager
+            .drain_release_intents(Duration::from_millis(250))
+            .await;
+        assert!(!blocked.drained, "round {round}: fault must retain intents");
+        assert_eq!(blocked.pending, 10_000, "round {round}");
+
+        let remove = client
+            .delete(format!("{toxic_base}/{toxic_name}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(remove.status().is_success(), "round {round}: {remove:?}");
+        let recovery_started = Instant::now();
+        let drained = manager.drain_release_intents(Duration::from_secs(20)).await;
+        let recovery_elapsed = recovery_started.elapsed();
+        assert!(drained.drained, "round {round}: {drained:?}");
+        assert_eq!(drained.pending, 0, "round {round}");
+        assert_eq!(
+            drained.enqueued.saturating_sub(enqueued_before),
+            10_000,
+            "round {round}: duplicate registration must not add an intent"
+        );
+        assert_eq!(
+            drained.completed.saturating_sub(completed_before),
+            10_000,
+            "round {round}: removed=false retries must still complete every intent"
+        );
+        assert!(drained.retries > retries_before, "round {round}");
+        assert_eq!(
+            drained.worker_starts.saturating_sub(worker_starts_round),
+            1,
+            "round {round}: a 10k burst must use one fixed worker"
+        );
+        assert_eq!(
+            manager.release_dispatcher.capacity.available_permits(),
+            ACCOUNT_RELEASE_CAPACITY,
+            "round {round}: every release reservation must return"
+        );
+
+        let final_snapshot = direct_redis
+            .account_coordinator_snapshot(
+                pool_id,
+                Some(Duration::from_secs(60)),
+                std::slice::from_ref(&cooldown_key),
+                &coordination_epoch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            final_snapshot.capacity,
+            crate::storage::redis_cache::AccountCapacityState::default(),
+            "round {round}: pool/global leases must be zero after recovery"
+        );
+        let tombstones: i64 = redis::cmd("ZCARD")
+            .arg(direct_redis.key(format!("account:inflight:{pool_id}:released")))
+            .query_async(&mut raw_redis)
+            .await
+            .unwrap();
+        assert_eq!(tombstones, 0, "round {round}: confirmed release tombstones");
+
+        rss_peak = rss_peak.max(external_perf_process_rss_kib());
+        fd_peak = fd_peak.max(external_perf_open_fd_count());
+        eprintln!(
+            "external_release_10k round={round} drop_ms={} recovery_ms={} retries={} rss_kib={:?} fd={:?}",
+            drop_elapsed.as_millis(),
+            recovery_elapsed.as_millis(),
+            drained.retries.saturating_sub(retries_before),
+            external_perf_process_rss_kib(),
+            external_perf_open_fd_count(),
+        );
+    }
+
+    assert_eq!(
+        manager
+            .release_dispatcher
+            .stats
+            .worker_starts
+            .load(Ordering::Acquire)
+            .saturating_sub(worker_starts_before),
+        5,
+        "five 10k bursts must start exactly five fixed workers"
+    );
+    let all_reservations = (0..ACCOUNT_RELEASE_CAPACITY)
+        .map(|_| {
+            manager
+                .release_dispatcher
+                .try_reserve()
+                .expect("release capacity must be fully restored")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        manager.release_dispatcher.try_reserve().is_none(),
+        "release capacity must have a hard upper bound"
+    );
+    drop(all_reservations);
+    assert_eq!(
+        manager.release_dispatcher.capacity.available_permits(),
+        ACCOUNT_RELEASE_CAPACITY
+    );
+
+    let rss_end = external_perf_process_rss_kib();
+    let fd_end = external_perf_open_fd_count();
+    if let (Some(start), Some(peak)) = (rss_start, rss_peak) {
+        assert!(
+            peak.saturating_sub(start) <= 128 * 1024,
+            "10k release RSS growth exceeded 128 MiB: start={start}, peak={peak}"
+        );
+    }
+    if let (Some(start), Some(end)) = (fd_start, fd_end) {
+        assert!(
+            end <= start.saturating_add(8),
+            "release recovery leaked file descriptors: start={start}, peak={fd_peak:?}, end={end}"
+        );
+    }
+    eprintln!(
+        "external_release_10k resources rss_start={rss_start:?} rss_peak={rss_peak:?} rss_end={rss_end:?} fd_start={fd_start:?} fd_peak={fd_peak:?} fd_end={fd_end:?}"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_release_fallback_storm_is_bounded_for_five_rounds() {
+    for round in 0..5 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while account_release_fallback_semaphore().available_permits()
+                != ACCOUNT_RELEASE_FALLBACK_MAX_IN_FLIGHT
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("previous fallback tasks must drain");
+
+        let accepted_before = ACCOUNT_RELEASE_FALLBACK_ACCEPTED.load(Ordering::Acquire);
+        let rejected_before = ACCOUNT_RELEASE_FALLBACK_REJECTED.load(Ordering::Acquire);
+        let finished_before = ACCOUNT_RELEASE_FALLBACK_FINISHED.load(Ordering::Acquire);
+        let gate = Arc::new(Semaphore::new(0));
+        let mut accepted = 0usize;
+
+        for _ in 0..10_000 {
+            let gate = gate.clone();
+            accepted += usize::from(spawn_external_release_fallback(
+                "test external release fallback bound",
+                async move {
+                    let _permit = gate.acquire().await.expect("test gate remains open");
+                    Ok(())
+                },
+            ));
+        }
+
+        assert_eq!(
+            accepted, ACCOUNT_RELEASE_FALLBACK_MAX_IN_FLIGHT,
+            "round {round}: fallback must never create waiting tasks beyond the hard cap"
+        );
+        assert_eq!(
+            ACCOUNT_RELEASE_FALLBACK_ACCEPTED
+                .load(Ordering::Acquire)
+                .saturating_sub(accepted_before),
+            ACCOUNT_RELEASE_FALLBACK_MAX_IN_FLIGHT as u64
+        );
+        assert_eq!(
+            ACCOUNT_RELEASE_FALLBACK_REJECTED
+                .load(Ordering::Acquire)
+                .saturating_sub(rejected_before),
+            (10_000 - ACCOUNT_RELEASE_FALLBACK_MAX_IN_FLIGHT) as u64
+        );
+        assert_eq!(account_release_fallback_semaphore().available_permits(), 0);
+
+        gate.add_permits(accepted);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ACCOUNT_RELEASE_FALLBACK_FINISHED
+                .load(Ordering::Acquire)
+                .saturating_sub(finished_before)
+                < accepted as u64
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("accepted fallback tasks must finish");
+        assert_eq!(
+            account_release_fallback_semaphore().available_permits(),
+            ACCOUNT_RELEASE_FALLBACK_MAX_IN_FLIGHT
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_request_scoped_snapshot_is_reused_across_reselection() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    for index in 0..3 {
+        postgres
+            .create_account(create_pool_request(
+                &format!("request-snapshot-{index}"),
+                index + 1,
+                true,
+            ))
+            .await
+            .unwrap();
+    }
+    let route = test_route("claude-sonnet-4-6");
+    let attempts_before = manager
+        .selection_breaker
+        .stats
+        .postgres_attempts
+        .load(Ordering::Acquire);
+    let authoritative_pools = manager
+        .load_authoritative_pool_snapshot()
+        .await
+        .expect("one request-scoped PostgreSQL snapshot");
+    let mut excluded = HashSet::new();
+    for expected_priority in 1..=3 {
+        let selection = manager
+            .select_pool_for_route_from_snapshot(&authoritative_pools, &excluded, &config, &route)
+            .await;
+        let pool = selection
+            .selected_pool
+            .expect("each reselection must use another pool from the same snapshot");
+        assert_eq!(pool.priority, expected_priority);
+        excluded.insert(pool.id);
+    }
+    assert_eq!(
+        manager
+            .selection_breaker
+            .stats
+            .postgres_attempts
+            .load(Ordering::Acquire)
+            .saturating_sub(attempts_before),
+        1,
+        "reselection must not reload PostgreSQL inside one request"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_retry_after_header_classifies_rate_limit_as_soft_failure_hint() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RETRY_AFTER, HeaderValue::from_static("4"));
+    let err = classify_external_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        Bytes::from_static(
+            br#"{"error":{"type":"rate_limit_error","message":"slow down"},"type":"error"}"#,
+        ),
+        headers,
+        &AccountsConfig::default(),
+    );
+
+    assert_eq!(
+        err.cooldown,
+        Some((Duration::from_secs(4), "rate_limit".to_string()))
+    );
+
+    let mut route = test_route("claude-sonnet-4-6");
+    route.error_id = "req_01retryafter".to_string();
+    let diagnostics = external_error_diagnostics(
+        &route,
+        &err,
+        anthropic_error_type_for_external_error(&err),
+        false,
+    );
+    let metadata = diagnostics.metadata.expect("rate-limit metadata");
+    assert_eq!(metadata["softFailureReason"], "rate_limit");
+    assert_eq!(
+        metadata["softFailureWindowSecs"],
+        ACCOUNT_TRANSIENT_FAILURE_WINDOW_SECS as u64
+    );
+    assert!(metadata.get("cooldownReason").is_none());
+    assert!(metadata.get("cooldownMs").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_retry_after_header_records_soft_failure_without_pool_cooldown() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RETRY_AFTER, HeaderValue::from_static("4"));
+    let failing = ExternalMessagesFakeServer::start_with_headers(
+        StatusCode::TOO_MANY_REQUESTS,
+        headers,
+        fake_external_error_body("rate limited"),
+    )
+    .await;
+    let pool =
+        create_messages_pool(&postgres, "retry-after-real-cooldown", 1, &failing.base_url).await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 4,
+        retry_max_attempts: 1,
+        same_pool_retry_count: 0,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_retry_after_real_cooldown".to_string();
+    route.error_id = "err_retry_after_real_cooldown".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+    let model_cooldown_candidates = route.model_cooldown_candidates();
+
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("rate-limit fake upstream request should finish");
+    assert!(
+        matches!(outcome, AccountForwardOutcome::FinalError(_)),
+        "single rate-limited pool should return a final error"
+    );
+    assert_eq!(failing.snapshot(), 1);
+
+    let runtime = manager
+        .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
+        .await
+        .expect("read pool runtime snapshot");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "ordinary 429 must not hard-cool the whole account"
+    );
+    assert_eq!(runtime.pool_cooldown_reason.as_deref(), None);
+    assert_eq!(
+        runtime.transient_failure_streak, 1,
+        "ordinary 429 should only leave a short-lived health penalty"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_retry_after_http_date_is_bounded() {
+    let retry_at = (Utc::now() + chrono::Duration::days(30)).to_rfc2822();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&retry_at).expect("retry-after date header"),
+    );
+    let err = classify_external_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from_static(br#"{"error":{"message":"temporarily unavailable"}}"#),
+        headers,
+        &AccountsConfig::default(),
+    );
+
+    let (cooldown, reason) = err.cooldown.expect("server cooldown");
+    assert_eq!(reason, "server_error");
+    assert_eq!(cooldown, Duration::from_secs(ACCOUNT_RETRY_AFTER_MAX_SECS));
+}
+
+#[test]
+fn account_retry_boundary_cross_pool_separates_route_errors_from_protocol_and_request_errors() {
+    let mut config = AccountsConfig {
+        retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        retry_on_protocol_error: false,
+        retry_on_network_error: false,
+        ..AccountsConfig::default()
+    };
+
+    let mapping_miss = AccountError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "account #1 requires model mapping match, but no rule matched model sonnet"
+            .to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &mapping_miss
+    ));
+
+    let model_unavailable_400 = AccountError {
+        status: Some(StatusCode::BAD_REQUEST),
+        message: "external upstream model is unavailable".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(30), "model_unavailable".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &model_unavailable_400
+    ));
+
+    let model_unavailable_without_cooldown = AccountError {
+        cooldown: None,
+        ..model_unavailable_400.clone()
+    };
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &model_unavailable_without_cooldown
+    ));
+
+    let ordinary_bad_request = AccountError {
+        status: Some(StatusCode::BAD_REQUEST),
+        message: "external upstream rejected the request".to_string(),
+        retryable: false,
+        auto_disable_reason: None,
+        cooldown: None,
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert!(!retry_pipeline::should_retry_cross_pool(
+        &config,
+        &ordinary_bad_request
+    ));
+
+    let protocol_error = AccountError {
+        status: Some(StatusCode::OK),
+        message: "external upstream returned an unexpected response shape".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(1), "protocol_error".to_string())),
+        protocol_error: Some("unexpected_response_shape"),
+        raw_upstream_error: None,
+    };
+    assert!(!retry_pipeline::should_retry_cross_pool(
+        &config,
+        &protocol_error
+    ));
+    config.retry_on_protocol_error = true;
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &protocol_error
+    ));
+}
+
+#[test]
+fn account_retry_boundary_same_pool_limit_caps_to_one_and_rejects_terminal_errors() {
+    let mut config = AccountsConfig {
+        same_pool_retry_count: 3,
+        same_pool_retry_status_codes: vec![401, 403, 429, 500, 502, 503, 504],
+        ..AccountsConfig::default()
+    };
+
+    let retryable_server_error = AccountError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "temporary upstream failure".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(10), "server_error".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    let terminal_auth_error = AccountError {
+        status: Some(StatusCode::FORBIDDEN),
+        message: "security lock".to_string(),
+        retryable: true,
+        auto_disable_reason: Some("security_lock".to_string()),
+        cooldown: Some((Duration::from_secs(10), "security_lock".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    let terminal_quota_error = AccountError {
+        status: Some(StatusCode::PAYMENT_REQUIRED),
+        message: "quota exhausted".to_string(),
+        retryable: true,
+        auto_disable_reason: Some("quota_exhausted".to_string()),
+        cooldown: Some((Duration::from_secs(10), "quota_exhausted".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &retryable_server_error),
+        1,
+        "server errors must be capped to one same-pool retry"
+    );
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &terminal_auth_error),
+        0,
+        "security lock should not retry the same pool"
+    );
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &terminal_quota_error),
+        0,
+        "quota exhaustion should not retry the same pool"
+    );
+
+    config.same_pool_retry_status_codes = vec![StatusCode::TOO_MANY_REQUESTS.as_u16()];
+    let rate_limit_error = AccountError {
+        status: Some(StatusCode::TOO_MANY_REQUESTS),
+        message: "rate limit".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(4), "rate_limit".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &rate_limit_error),
+        1,
+        "rate limit may retry once on the same pool, not more"
+    );
+
+    let model_mapping_miss = AccountError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "account #1 requires model mapping match, but no rule matched model sonnet"
+            .to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &model_mapping_miss),
+        0,
+        "a pool-local mapping miss must not replay the same pool"
+    );
+
+    let model_unavailable = AccountError {
+        status: Some(StatusCode::BAD_REQUEST),
+        message: "external upstream model is unavailable".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(30), "model_unavailable".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &model_unavailable),
+        0,
+        "model-unavailable responses must not replay the same pool"
+    );
+}
+
+#[tokio::test]
+async fn account_retryable_final_error_uses_gateway_error_envelope() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let body = Bytes::from_static(
+        br#"{"error":{"type":"rate_limit_error","message":"slow down"},"type":"error"}"#,
+    );
+
+    let err = classify_external_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        body.clone(),
+        headers,
+        &AccountsConfig::default(),
+    );
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "rate_limit");
+
+    let response = external_final_error_from_error(None, Vec::new(), &err, "req_01gatewayerror")
+        .into_response("req_gateway");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response
+            .headers()
+            .get(HeaderName::from_static("x-error-id"))
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|error_id| error_id.starts_with("req_01"))
+    );
+    let actual = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read external final retryable body");
+    let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
+    assert_eq!(value["error"]["type"], "rate_limit_error");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(envelope::PUBLIC_RATE_LIMIT_MESSAGE));
+    assert!(message.contains("request-id: req_01"));
+    assert!(!message.contains("slow down"));
+    assert!(!message.contains("rate_limit_error"));
+    assert_public_message_hides_internal_routing(message);
+    assert_eq!(value["request_id"], "req_gateway");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_route_mode_is_applied_per_pool_for_selection_and_eligibility() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let model = "claude-sonnet-4-6".to_string();
+
+    let mut cc_request = create_pool_request("route-allow-cc", 1, true);
+    cc_request.supported_models = vec![model.clone()];
+    cc_request.route_mode = RouteRuleMode::AllowList;
+    cc_request.route_rules = vec!["/cc".to_string()];
+    let cc_pool = postgres.create_account(cc_request).await.unwrap();
+
+    let mut v1_request = create_pool_request("route-allow-v1", 2, true);
+    v1_request.supported_models = vec![model.clone()];
+    v1_request.route_mode = RouteRuleMode::AllowList;
+    v1_request.route_rules = vec!["/v1".to_string()];
+    let v1_pool = postgres.create_account(v1_request).await.unwrap();
+
+    let mut ha_request = create_pool_request("route-deny-cc-v1", 3, true);
+    ha_request.supported_models = vec![model.clone()];
+    ha_request.route_mode = RouteRuleMode::DenyList;
+    ha_request.route_rules = vec!["/cc".to_string(), "/v1".to_string()];
+    let ha_pool = postgres.create_account(ha_request).await.unwrap();
+
+    manager.invalidate_static_pool_snapshot();
+
+    let mut cc_route = test_route(&model);
+    cc_route.endpoint = "/cc/v1/messages".to_string();
+    let cc_selection = manager
+        .select_pool_for_route(&HashSet::new(), &config, &cc_route)
+        .await;
+    assert_eq!(
+        cc_selection.selected_pool.as_ref().map(|pool| pool.id),
+        Some(cc_pool.id)
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_route_and_model(&config, &cc_route.endpoint, &model)
+            .await
+    );
+
+    let mut v1_route = test_route(&model);
+    v1_route.endpoint = "/v1/messages".to_string();
+    v1_route.reported_usage = ReportedUsageConfig::default();
+    let v1_selection = manager
+        .select_pool_for_route(&HashSet::new(), &config, &v1_route)
+        .await;
+    assert_eq!(
+        v1_selection.selected_pool.as_ref().map(|pool| pool.id),
+        Some(v1_pool.id)
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_route_and_model(&config, &v1_route.endpoint, &model)
+            .await
+    );
+
+    let mut ha_route = test_route(&model);
+    ha_route.endpoint = "/ha/v1/messages".to_string();
+    let ha_selection = manager
+        .select_pool_for_route(&HashSet::new(), &config, &ha_route)
+        .await;
+    assert_eq!(
+        ha_selection.selected_pool.as_ref().map(|pool| pool.id),
+        Some(ha_pool.id)
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_route_and_model(&config, &ha_route.endpoint, &model)
+            .await
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_route_policy_applies_per_pool_rules() {
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    assert!(account_route_allowed(&pool, Some("/cc/v1/messages")));
+    assert!(account_route_allowed(&pool, None));
+
+    pool.route_mode = crate::model::config::RouteRuleMode::AllowList;
+    pool.route_rules = vec!["/cc".to_string(), "/dfcache/team".to_string()];
+    assert!(account_route_allowed(&pool, Some("/cc/v1/messages")));
+    assert!(account_route_allowed(
+        &pool,
+        Some("/dfcache/team/v1/messages")
+    ));
+    assert!(!account_route_allowed(
+        &pool,
+        Some("/dfcache/team-a/v1/messages")
+    ));
+    assert!(!account_route_allowed(&pool, Some("/v1/messages")));
+
+    pool.route_rules = vec!["*".to_string()];
+    assert!(account_route_allowed(&pool, Some("/v1/messages")));
+    assert!(account_route_allowed(&pool, Some("/ha/v1/messages")));
+
+    pool.route_mode = crate::model::config::RouteRuleMode::DenyList;
+    pool.route_rules = vec!["/cc".to_string()];
+    assert!(!account_route_allowed(&pool, Some("/cc/v1/messages")));
+    assert!(account_route_allowed(&pool, Some("/v1/messages")));
+
+    pool.route_rules = vec!["*".to_string()];
+    assert!(!account_route_allowed(&pool, Some("/v1/messages")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_same_pool_retry_is_capped_to_one_before_cross_pool_failover() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("capped-ok"))
+            .await;
+    create_messages_pool(&postgres, "same-pool-capped-primary", 1, &failing.base_url).await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-capped-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 3,
+        same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_delay_ms: 1,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_retry_capped".to_string();
+    route.error_id = "err_same_pool_retry_capped".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("capped same-pool failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("capped same-pool retry should still fail over: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        2,
+        "same-pool retry must be capped to one even when config allows more"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_same_pool_retry_precedes_cross_pool_failover_for_configured_status() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("retry-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-before-failover-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-before-failover-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 1,
+        same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_delay_ms: 1,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_before_failover".to_string();
+    route.error_id = "err_same_pool_before_failover".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("same-pool retry failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("configured retryable status should reach secondary pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read retry success body");
+    assert!(
+        body.windows(b"retry-ok".len())
+            .any(|window| window == b"retry-ok")
+    );
+    assert_eq!(
+        failing.snapshot(),
+        2,
+        "configured status should retry the selected pool before switching"
+    );
+    assert_eq!(
+        succeeding.snapshot(),
+        1,
+        "secondary pool should be tried after same-pool retry is exhausted"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_same_pool_retry_runs_even_when_pool_attempt_budget_is_one_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    create_messages_pool(&postgres, "same-pool-budget-primary", 1, &failing.base_url).await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 4,
+        retry_max_attempts: 1,
+        same_pool_retry_count: 1,
+        same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_delay_ms: 1,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_retry_budget".to_string();
+    route.error_id = "err_same_pool_retry_budget".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("same-pool retry should finish");
+    assert!(
+        matches!(outcome, AccountForwardOutcome::FinalError(_)),
+        "single permanently failing pool should still end with a final error"
+    );
+    assert_eq!(
+        failing.snapshot(),
+        2,
+        "same-pool retry must not be blocked by the one-pool cross-pool attempt budget"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_same_pool_retry_skips_statuses_not_in_config() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("no-same-pool-retry-ok"),
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-status-filter-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-status-filter-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 3,
+        same_pool_retry_status_codes: vec![StatusCode::TOO_MANY_REQUESTS.as_u16()],
+        same_pool_retry_delay_ms: 1,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_status_filter".to_string();
+    route.error_id = "err_same_pool_status_filter".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("status-filtered failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("unconfigured status should switch pools without same-pool retry: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        1,
+        "status not listed in 同池重试状态码 must not retry the same pool"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_selection_admission_has_a_low_hard_in_flight_cap_for_five_rounds() {
+    for round in 0..5 {
+        let breaker = Arc::new(AccountSelectionBreaker::default());
+        let admitted = (0..ACCOUNT_SELECTION_MAX_IN_FLIGHT)
+            .map(|_| {
+                breaker
+                    .try_begin()
+                    .expect("selection operations up to the low hard cap must be admitted")
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..10_000 {
+            assert!(
+                breaker.try_begin().is_err(),
+                "round {round}: selection work above the hard cap must fail before spawning PG work"
+            );
+        }
+        assert_eq!(
+            breaker.stats.saturated.load(Ordering::Relaxed),
+            10_000,
+            "round {round}"
+        );
+        assert_eq!(breaker.operation_semaphore.available_permits(), 0);
+        for permit in admitted {
+            permit.success();
+        }
+        assert_eq!(
+            breaker.operation_semaphore.available_permits(),
+            ACCOUNT_SELECTION_MAX_IN_FLIGHT
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_selection_breaker_generation_fence_and_single_probe_recover_for_five_rounds() {
+    for round in 0..5 {
+        let breaker = Arc::new(AccountSelectionBreaker::new(
+            4,
+            vec![Duration::from_millis(120), Duration::from_millis(240)],
+            0,
+        ));
+        let stale_success = breaker.try_begin().expect("closed breaker must admit");
+        breaker
+            .try_begin()
+            .expect("closed breaker must admit concurrent PG work")
+            .failure(AccountSelectionFailureKind::PostgresTimeout);
+        stale_success.success();
+
+        for _ in 0..64 {
+            assert!(
+                breaker.try_begin().is_err(),
+                "round {round}: a stale success must not close the failed generation"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let cancelled_probe = breaker
+            .try_begin()
+            .expect("one recovery probe must be admitted");
+        for _ in 0..64 {
+            assert!(
+                breaker.try_begin().is_err(),
+                "round {round}: concurrent recovery probes must fail fast"
+            );
+        }
+        drop(cancelled_probe);
+        assert!(
+            breaker.try_begin().is_err(),
+            "round {round}: a cancelled probe must re-arm backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        breaker
+            .try_begin()
+            .expect("a later recovery probe must be admitted")
+            .success();
+        breaker
+            .try_begin()
+            .expect("successful recovery must close the breaker")
+            .success();
+
+        assert_eq!(breaker.stats.failures.load(Ordering::Relaxed), 1);
+        assert_eq!(breaker.stats.recovery_probes.load(Ordering::Relaxed), 2);
+        assert_eq!(breaker.stats.cancelled_probes.load(Ordering::Relaxed), 1);
+        assert_eq!(breaker.stats.recoveries.load(Ordering::Relaxed), 1);
+        assert!(breaker.stats.fail_fast.load(Ordering::Relaxed) >= 129);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_selection_runtime_snapshot_coalesces_128_waiters_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_account(create_pool_request(
+            "external-selection-singleflight",
+            1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let authoritative = manager.load_authoritative_pool_snapshot().await.unwrap();
+    let excluded = HashSet::new();
+
+    manager.redis.reset_account_hot_path_round_trips();
+    let bootstrap = manager
+        .scan_pool_availability_from_snapshot(
+            &authoritative,
+            &excluded,
+            &config,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        bootstrap.selected_pool.as_ref().map(|pool| pool.id),
+        Some(pool.id),
+        "coordinator bootstrap must observe the available pool before measuring warm coalescing"
+    );
+    let bootstrap_rtts = manager.redis.account_hot_path_round_trips();
+    assert!(
+        (1..=5).contains(&bootstrap_rtts),
+        "coordinator bootstrap must stay bounded before warm coalescing measurement; rtts={bootstrap_rtts}"
+    );
+    *manager.selection_runtime_snapshot.lock() = None;
+
+    for round in 0..5 {
+        if round > 0 {
+            tokio::time::sleep(ACCOUNT_SELECTION_RUNTIME_SNAPSHOT_TTL + Duration::from_millis(20))
+                .await;
+        }
+        manager.redis.reset_account_hot_path_round_trips();
+        let selections = futures::future::join_all((0..128).map(|_| {
+            manager.scan_pool_availability_from_snapshot(
+                &authoritative,
+                &excluded,
+                &config,
+                true,
+                None,
+                None,
+                None,
+            )
+        }))
+        .await;
+        assert!(
+            selections.iter().all(|selection| {
+                selection.selected_pool.as_ref().map(|pool| pool.id) == Some(pool.id)
+            }),
+            "round {round}: every waiter must observe the available pool"
+        );
+        assert_eq!(
+            manager.redis.account_hot_path_round_trips(),
+            1,
+            "round {round}: 128 simultaneous waiters must share one Redis runtime snapshot"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_skip_reason_respects_enabled_switches_and_capacity() {
+    let mut config = AccountsConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let mut pool = test_pool("https://pool.example.test", true);
+
+    assert_eq!(
+        AccountManager::skip_reason(&pool, 0, 0, 0, &config).as_deref(),
+        Some("accounts_disabled")
+    );
+
+    config.enabled = true;
+    pool.enabled = false;
+    assert_eq!(
+        AccountManager::skip_reason(&pool, 0, 0, 0, &config).as_deref(),
+        Some("disabled")
+    );
+
+    pool.enabled = true;
+    assert_eq!(
+        AccountManager::skip_reason(&pool, 0, 0, 3, &config).as_deref(),
+        Some("cooldown")
+    );
+
+    pool.max_concurrent_requests = 2;
+    assert_eq!(
+        AccountManager::skip_reason(&pool, 2, 0, 0, &config).as_deref(),
+        Some("pool_concurrency_full")
+    );
+
+    config.global_max_concurrent_requests = 4;
+    assert_eq!(
+        AccountManager::skip_reason(&pool, 0, 4, 0, &config).as_deref(),
+        Some("global_concurrency_full")
+    );
+
+    assert!(AccountManager::skip_reason(&pool, 0, 3, 0, &config).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_soft_failure_streak_accumulates_and_requires_manual_clear_or_ttl() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool_id = 43;
+
+    manager
+        .record_account_soft_failure(pool_id, "server_error")
+        .await;
+    manager
+        .record_account_soft_failure(pool_id, "server_error")
+        .await;
+    let streak = manager
+        .redis
+        .get_json::<u64>(account_transient_failure_key(pool_id))
+        .await
+        .unwrap()
+        .expect("soft failure streak should exist");
+    assert_eq!(streak, 2);
+    let reason_streak = manager
+        .redis
+        .get_json::<u64>(account_transient_failure_reason_key(
+            pool_id,
+            "server_error",
+        ))
+        .await
+        .unwrap()
+        .expect("reason-scoped soft failure streak should exist");
+    assert_eq!(reason_streak, 2);
+
+    manager.reset_pool_auto_disable_failure_counts(pool_id);
+    timeout(Duration::from_secs(2), async {
+        while manager
+            .success_reset_tasks_in_flight
+            .load(Ordering::Acquire)
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("success reset should finish without clearing soft failure streak");
+
+    let after_reset = manager
+        .redis
+        .get_json::<u64>(account_transient_failure_key(pool_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        after_reset,
+        Some(2),
+        "one later success should not reset accumulated soft failure streak"
+    );
+
+    manager
+        .redis
+        .record_account_quality_sample(pool_id, false, None, None, 0.5, Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    let cleared = manager.clear_pool_cooldowns(pool_id).await.unwrap();
+    assert!(
+        cleared >= 1,
+        "manual clear should remove soft failure streak and quality state"
+    );
+    let after_clear = manager
+        .redis
+        .get_json::<u64>(account_transient_failure_key(pool_id))
+        .await
+        .unwrap();
+    assert!(
+        after_clear.is_none(),
+        "manual clear should reset the soft failure streak"
+    );
+    let after_reason_clear = manager
+        .redis
+        .get_json::<u64>(account_transient_failure_reason_key(
+            pool_id,
+            "server_error",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        after_reason_clear.is_none(),
+        "manual clear should reset reason-scoped soft failure streak"
+    );
+    let after_quality_clear = manager
+        .redis
+        .get_json::<serde_json::Value>(account_quality_key(pool_id))
+        .await
+        .unwrap();
+    assert!(
+        after_quality_clear.is_none(),
+        "manual clear should reset passive quality state"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_static_eligibility_invalidation_observes_every_pool_mutation() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_ttl(Duration::from_secs(30));
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+            .await
+    );
+    let mut request = create_pool_request("static-invalidation", 1, true);
+    request.supported_models = vec!["claude-sonnet-4".to_string()];
+    let pool = postgres.create_account(request).await.unwrap();
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+            .await,
+        "a cached generation must remain stable until explicit invalidation"
+    );
+
+    let mut expected_generation = manager.static_pool_snapshot_generation_for_test();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    expected_generation = manager.static_pool_snapshot_generation_for_test();
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+            .await
+    );
+
+    postgres
+        .set_account_supported_models(pool.id, vec!["claude-opus-4".to_string()])
+        .await
+        .unwrap();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    expected_generation = manager.static_pool_snapshot_generation_for_test();
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+            .await
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4")
+            .await
+    );
+
+    postgres.set_account_enabled(pool.id, false).await.unwrap();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    expected_generation = manager.static_pool_snapshot_generation_for_test();
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4")
+            .await
+    );
+
+    postgres.set_account_enabled(pool.id, true).await.unwrap();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    expected_generation = manager.static_pool_snapshot_generation_for_test();
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4")
+            .await
+    );
+
+    postgres
+        .update_account(
+            pool.id,
+            UpdateAccountRequest {
+                ..UpdateAccountRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    expected_generation = manager.static_pool_snapshot_generation_for_test();
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4",)
+            .await
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4",)
+            .await
+    );
+
+    postgres
+        .auto_disable_account(pool.id, "auth_error", "fixture", 60)
+        .await
+        .unwrap();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    expected_generation = manager.static_pool_snapshot_generation_for_test();
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4")
+            .await
+    );
+
+    postgres.clear_account_auto_disabled(pool.id).await.unwrap();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    expected_generation = manager.static_pool_snapshot_generation_for_test();
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4")
+            .await
+    );
+
+    postgres.soft_delete_account(pool.id).await.unwrap();
+    manager.invalidate_static_pool_snapshot();
+    assert!(manager.static_pool_snapshot_generation_for_test() > expected_generation);
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "claude-opus-4")
+            .await
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_static_eligibility_pg_failure_is_negative_cached_without_rpm_fanout() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_ttl(Duration::from_secs(30));
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    postgres.drop_test_schema().await.unwrap();
+
+    for round in 0..3 {
+        for concurrency in [1usize, 8, 32] {
+            manager.invalidate_static_pool_snapshot();
+            manager.redis.reset_account_hot_path_round_trips();
+            let loads_before = manager.static_pool_snapshot_pg_loads_for_test();
+            let first_wave = futures::future::join_all((0..concurrency).map(|_| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    manager
+                        .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+                        .await
+                }
+            }))
+            .await;
+            assert!(first_wave.iter().all(|eligible| !eligible));
+            assert_eq!(
+                manager.static_pool_snapshot_pg_loads_for_test(),
+                loads_before + 1,
+                "round {round}, concurrency {concurrency}: a failed generation must singleflight one PostgreSQL attempt"
+            );
+
+            let second_wave = futures::future::join_all((0..concurrency).map(|_| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    manager
+                        .has_eligible_pool_for_model(&config, "claude-opus-4")
+                        .await
+                }
+            }))
+            .await;
+            assert!(second_wave.iter().all(|eligible| !eligible));
+            assert_eq!(
+                manager.static_pool_snapshot_pg_loads_for_test(),
+                loads_before + 1,
+                "round {round}, concurrency {concurrency}: a cached load failure must not fan out retries"
+            );
+            assert_eq!(
+                manager.redis.account_hot_path_round_trips(),
+                0,
+                "static eligibility failure must remain independent of Redis"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_static_eligibility_snapshot_singleflights_models_and_body_modes() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_ttl(Duration::from_secs(30));
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+
+    let mut normalized = create_pool_request("static-normalized-sonnet", 1, true);
+    normalized.supported_models = vec!["claude-sonnet-4".to_string()];
+    postgres.create_account(normalized).await.unwrap();
+
+    let mut raw = create_pool_request("static-raw-opus", 2, true);
+
+    raw.supported_models = vec!["claude-opus-4".to_string()];
+    postgres.create_account(raw).await.unwrap();
+
+    postgres
+        .create_account(create_pool_request("static-disabled", 3, false))
+        .await
+        .unwrap();
+
+    for round in 0..3 {
+        for concurrency in [1usize, 8, 32] {
+            manager.invalidate_static_pool_snapshot();
+            manager.redis.reset_account_hot_path_round_trips();
+            let loads_before = manager.static_pool_snapshot_pg_loads_for_test();
+            let checks = futures::future::join_all((0..concurrency).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    match index % 5 {
+                        0 => {
+                            manager
+                                .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+                                .await
+                        }
+                        1 => {
+                            manager
+                                .has_eligible_pool_for_model(&config, "claude-sonnet-4")
+                                .await
+                        }
+                        2 => {
+                            manager
+                                .has_eligible_pool_for_model(&config, "claude-opus-4")
+                                .await
+                        }
+                        3 => {
+                            manager
+                                .has_eligible_pool_for_model(&config, "claude-opus-4")
+                                .await
+                        }
+                        _ => {
+                            !manager
+                                .has_eligible_pool_for_model(&config, "claude-future-9")
+                                .await
+                        }
+                    }
+                }
+            }))
+            .await;
+
+            assert!(
+                checks.iter().all(|passed| *passed),
+                "round {round}, concurrency {concurrency}: mixed eligibility mismatch"
+            );
+            assert_eq!(
+                manager
+                    .static_pool_snapshot_pg_loads_for_test()
+                    .saturating_sub(loads_before),
+                1,
+                "round {round}, concurrency {concurrency}: one generation must issue exactly one PostgreSQL pool-list query"
+            );
+            assert_eq!(
+                manager.static_pool_snapshot_pool_count_for_test(),
+                Some(3),
+                "the cache must contain the complete pool list, not a model-filtered entry"
+            );
+            assert_eq!(
+                manager.redis.account_hot_path_round_trips(),
+                0,
+                "round {round}, concurrency {concurrency}: static eligibility must not read Redis"
+            );
+
+            let second_wave = futures::future::join_all((0..32).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    manager
+                        .has_eligible_pool_for_model(
+                            &config,
+                            if index % 2 == 0 {
+                                "claude-sonnet-4"
+                            } else {
+                                "claude-opus-4"
+                            },
+                        )
+                        .await
+                }
+            }))
+            .await;
+            assert!(second_wave.iter().all(|eligible| *eligible));
+            assert_eq!(
+                manager.static_pool_snapshot_pg_loads_for_test(),
+                loads_before + 1,
+                "different models must share the same complete static snapshot"
+            );
+            assert_eq!(manager.redis.account_hot_path_round_trips(), 0);
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_static_eligibility_ttl_recovers_cross_instance_changes_for_three_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_timing(
+        Duration::from_millis(250),
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    );
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+
+    for round in 0..3 {
+        let model = format!("claude-cross-instance-{round}");
+        manager.invalidate_static_pool_snapshot();
+        assert!(!manager.has_eligible_pool_for_model(&config, &model).await);
+
+        let mut request = create_pool_request(&format!("cross-instance-{round}"), 1, true);
+        request.supported_models = vec![model.clone()];
+        let pool = postgres.create_account(request).await.unwrap();
+        assert!(
+            !manager.has_eligible_pool_for_model(&config, &model).await,
+            "round {round}: a peer mutation remains boundedly stale before TTL"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !manager.has_eligible_pool_for_model(&config, &model).await,
+            "round {round}: the first expired read returns same-generation stale while refreshing"
+        );
+        wait_for_static_pool_background_idle(&manager, Duration::from_millis(750)).await;
+        assert!(
+            manager.has_eligible_pool_for_model(&config, &model).await,
+            "round {round}: background TTL refresh must discover a peer-created pool"
+        );
+
+        postgres.soft_delete_account(pool.id).await.unwrap();
+        assert!(
+            manager.has_eligible_pool_for_model(&config, &model).await,
+            "round {round}: the cached snapshot remains stable inside its TTL"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            manager.has_eligible_pool_for_model(&config, &model).await,
+            "round {round}: the first expired read returns same-generation stale while refreshing"
+        );
+        wait_for_static_pool_background_idle(&manager, Duration::from_millis(750)).await;
+        assert!(
+            !manager.has_eligible_pool_for_model(&config, &model).await,
+            "round {round}: background TTL refresh must drop a peer-deleted pool"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn account_static_snapshot_invalidation_never_serves_old_generation_under_pg_lock() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_timing(
+        Duration::from_millis(20),
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        Duration::from_millis(500),
+    );
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let mut request = create_pool_request("static-invalidation-lock", 1, true);
+    request.supported_models = vec!["model-generation-old".to_string()];
+    let pool = postgres.create_account(request).await.unwrap();
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "model-generation-old")
+            .await
+    );
+
+    postgres
+        .set_account_supported_models(pool.id, vec!["model-generation-new".to_string()])
+        .await
+        .unwrap();
+    manager.invalidate_static_pool_snapshot();
+    let invalidated_generation = manager.static_pool_snapshot_generation_for_test();
+    let blocker = lock_account_table(&postgres).await;
+    manager.redis.reset_account_hot_path_round_trips();
+    let loads_before = manager.static_pool_snapshot_pg_loads_for_test();
+    let refreshes_before = manager.static_pool_snapshot_background_refreshes_for_test();
+    let completed_count = Arc::new(AtomicU64::new(0));
+    let barrier = Arc::new(tokio::sync::Barrier::new(129));
+    let handles = (0..128usize)
+        .map(|index| {
+            let manager = manager.clone();
+            let config = config.clone();
+            let completed_count = completed_count.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let started = Instant::now();
+                let eligible = manager
+                    .has_eligible_pool_for_model(
+                        &config,
+                        if index % 2 == 0 {
+                            "model-generation-old"
+                        } else {
+                            "model-generation-new"
+                        },
+                    )
+                    .await;
+                completed_count.fetch_add(1, Ordering::AcqRel);
+                (eligible, started.elapsed().as_micros())
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        completed_count.load(Ordering::Acquire),
+        0,
+        "generation mismatch must not return stale data while authoritative refresh is blocked"
+    );
+    wait_for_static_pool_pg_loads(&manager, loads_before + 1, Duration::from_millis(100)).await;
+    let completed = timeout(
+        Duration::from_millis(1_500),
+        futures::future::join_all(handles),
+    )
+    .await
+    .expect("cold invalidated generation must fail closed within the 500ms PG timeout");
+    let mut latency_micros = Vec::with_capacity(128);
+    for result in completed {
+        let (eligible, elapsed_micros) = result.unwrap();
+        assert!(
+            !eligible,
+            "negative cache must fail closed for both old and new models"
+        );
+        latency_micros.push(elapsed_micros);
+    }
+    latency_micros.sort_unstable();
+    let p95 = external_perf_percentile_micros(&latency_micros, 95);
+    let p99 = external_perf_percentile_micros(&latency_micros, 99);
+    assert!(
+        p95 >= 350_000,
+        "p95 {p95}us did not observe the held PG lock"
+    );
+    assert!(
+        p99 < 1_200_000,
+        "p99 {p99}us exceeded the bounded refresh window"
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_pg_loads_for_test(),
+        loads_before + 1
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_background_refreshes_for_test(),
+        refreshes_before,
+        "cold/invalidation refresh must remain foreground singleflight"
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_cached_generation_for_test(),
+        Some(invalidated_generation)
+    );
+    assert_eq!(manager.static_pool_snapshot_pool_count_for_test(), Some(0));
+    assert_eq!(manager.redis.account_hot_path_round_trips(), 0);
+
+    unlock_account_table(blocker).await;
+    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    let recovery_loads_before = manager.static_pool_snapshot_pg_loads_for_test();
+    let recovery_refreshes_before = manager.static_pool_snapshot_background_refreshes_for_test();
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "model-generation-new")
+            .await,
+        "the retry-triggering read still returns the fail-closed negative snapshot"
+    );
+    wait_for_static_pool_background_idle(&manager, Duration::from_millis(750)).await;
+    assert_eq!(
+        manager.static_pool_snapshot_pg_loads_for_test(),
+        recovery_loads_before + 1
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_background_refreshes_for_test(),
+        recovery_refreshes_before + 1
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "model-generation-new")
+            .await
+    );
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "model-generation-old")
+            .await
+    );
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let blocker = lock_account_table(&postgres).await;
+    let timeout_loads_before = manager.static_pool_snapshot_pg_loads_for_test();
+    let timeout_refreshes_before = manager.static_pool_snapshot_background_refreshes_for_test();
+    let timeout_started = Instant::now();
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "model-generation-new")
+            .await,
+        "same-generation last-good data must remain immediately available"
+    );
+    wait_for_static_pool_pg_loads(
+        &manager,
+        timeout_loads_before + 1,
+        Duration::from_millis(100),
+    )
+    .await;
+    wait_for_static_pool_background_idle(&manager, Duration::from_millis(750)).await;
+    assert!(
+        timeout_started.elapsed() < Duration::from_millis(750),
+        "the sole background task must terminate after its 500ms PG timeout"
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_background_refreshes_for_test(),
+        timeout_refreshes_before + 1
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_background_in_flight_for_test(),
+        0
+    );
+
+    let second_wave = futures::future::join_all((0..128).map(|_| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            manager
+                .has_eligible_pool_for_model(&config, "model-generation-new")
+                .await
+        }
+    }))
+    .await;
+    assert!(second_wave.iter().all(|eligible| *eligible));
+    assert_eq!(
+        manager.static_pool_snapshot_pg_loads_for_test(),
+        timeout_loads_before + 1,
+        "the one-second failure retry window must suppress PG RPM fanout"
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_background_refreshes_for_test(),
+        timeout_refreshes_before + 1,
+        "the one-second failure retry window must not spawn more tasks"
+    );
+    assert_eq!(manager.redis.account_hot_path_round_trips(), 0);
+    unlock_account_table(blocker).await;
+
+    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "model-generation-new")
+            .await
+    );
+    wait_for_static_pool_background_idle(&manager, Duration::from_millis(750)).await;
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "model-generation-new")
+            .await
+    );
+    assert_eq!(
+        manager.static_pool_snapshot_background_in_flight_for_test(),
+        0
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn account_static_snapshot_swr_avoids_pg_lock_hol_c32_c128_for_three_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_timing(
+        Duration::from_millis(20),
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        Duration::from_millis(500),
+    );
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let mut request = create_pool_request("static-swr-lock", 1, true);
+    request.supported_models = vec!["model-static-swr".to_string()];
+    postgres.create_account(request).await.unwrap();
+    assert!(
+        manager
+            .has_eligible_pool_for_model(&config, "model-static-swr")
+            .await
+    );
+
+    for round in 0..3 {
+        for concurrency in [32usize, 128] {
+            wait_for_static_pool_background_idle(&manager, Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let blocker = lock_account_table(&postgres).await;
+            manager.redis.reset_account_hot_path_round_trips();
+            let loads_before = manager.static_pool_snapshot_pg_loads_for_test();
+            let refreshes_before = manager.static_pool_snapshot_background_refreshes_for_test();
+            let barrier = Arc::new(tokio::sync::Barrier::new(concurrency + 1));
+            let handles = (0..concurrency)
+                .map(|_| {
+                    let manager = manager.clone();
+                    let config = config.clone();
+                    let barrier = barrier.clone();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        let started = Instant::now();
+                        let eligible = manager
+                            .has_eligible_pool_for_model(&config, "model-static-swr")
+                            .await;
+                        (eligible, started.elapsed().as_micros())
+                    })
+                })
+                .collect::<Vec<_>>();
+            barrier.wait().await;
+            let completed = timeout(
+                Duration::from_millis(250),
+                futures::future::join_all(handles),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "round {round}, concurrency {concurrency}: same-generation stale readers blocked behind PostgreSQL refresh"
+                )
+            });
+            let mut latency_micros = Vec::with_capacity(concurrency);
+            for result in completed {
+                let (eligible, elapsed_micros) = result.unwrap();
+                assert!(eligible, "round {round}, concurrency {concurrency}");
+                latency_micros.push(elapsed_micros);
+            }
+            latency_micros.sort_unstable();
+            let p95 = external_perf_percentile_micros(&latency_micros, 95);
+            let p99 = external_perf_percentile_micros(&latency_micros, 99);
+            assert!(
+                p99 < 250_000,
+                "round {round}, concurrency {concurrency}: p99 {p99}us must remain below the held PG lock interval"
+            );
+            wait_for_static_pool_pg_loads(&manager, loads_before + 1, Duration::from_millis(100))
+                .await;
+            assert_eq!(
+                manager.static_pool_snapshot_pg_loads_for_test(),
+                loads_before + 1,
+                "round {round}, concurrency {concurrency}: one stale generation may start one PG refresh"
+            );
+            assert_eq!(
+                manager.static_pool_snapshot_background_refreshes_for_test(),
+                refreshes_before + 1,
+                "round {round}, concurrency {concurrency}: one background task must own the refresh"
+            );
+            assert_eq!(
+                manager.static_pool_snapshot_background_in_flight_for_test(),
+                1,
+                "round {round}, concurrency {concurrency}: the sole refresh remains blocked on the table lock"
+            );
+            assert_eq!(manager.redis.account_hot_path_round_trips(), 0);
+            eprintln!(
+                "static_pool_swr round={round} concurrency={concurrency} p50_us={} p95_us={p95} p99_us={p99} pg_loads=1 background_tasks=1 redis_rtt=0",
+                external_perf_percentile_micros(&latency_micros, 50),
+            );
+
+            unlock_account_table(blocker).await;
+            wait_for_static_pool_background_idle(&manager, Duration::from_millis(750)).await;
+            assert_eq!(
+                manager.static_pool_snapshot_cached_generation_for_test(),
+                Some(manager.static_pool_snapshot_generation_for_test())
+            );
+        }
+    }
+
+    assert_eq!(
+        manager.static_pool_snapshot_background_in_flight_for_test(),
+        0
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_success_reset_coalesces_auto_disable_keys_and_obeys_task_cap() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool_id = 42;
+    for reason in ACCOUNT_AUTO_DISABLE_REASONS {
+        manager
+            .redis
+            .incr_with_ttl(
+                format!("account:{pool_id}:auto_disable_failures:{reason}"),
+                60,
+            )
+            .await
+            .unwrap();
+    }
+    manager
+        .redis
+        .incr_with_ttl(account_transient_failure_key(pool_id), 60)
+        .await
+        .unwrap();
+    let started_before = manager.success_reset_tasks_started.load(Ordering::Acquire);
+    for _ in 0..10_000 {
+        manager.reset_pool_auto_disable_failure_counts(pool_id);
+    }
+    timeout(Duration::from_secs(2), async {
+        while manager
+            .success_reset_tasks_in_flight
+            .load(Ordering::Acquire)
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the one coalesced reset task must finish");
+    assert_eq!(
+        manager
+            .success_reset_tasks_started
+            .load(Ordering::Acquire)
+            .saturating_sub(started_before),
+        1
+    );
+    for reason in ACCOUNT_AUTO_DISABLE_REASONS {
+        let value = manager
+            .redis
+            .get_json::<u64>(format!("account:{pool_id}:auto_disable_failures:{reason}"))
+            .await
+            .unwrap();
+        assert!(value.is_none(), "reason {reason} must be cleared");
+    }
+    let transient = manager
+        .redis
+        .get_json::<u64>(account_transient_failure_key(pool_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        transient,
+        Some(1),
+        "single successes must not erase soft failure health evidence during intermittent turbulence"
+    );
+
+    let held_permits = futures::future::join_all(
+        (0..ACCOUNT_SUCCESS_RESET_MAX_TASKS)
+            .map(|_| manager.success_reset_semaphore.clone().acquire_owned()),
+    )
+    .await
+    .into_iter()
+    .map(|result| result.unwrap())
+    .collect::<Vec<_>>();
+    let capped_before = manager.success_reset_tasks_started.load(Ordering::Acquire);
+    for id in 10_000..10_128 {
+        manager.reset_pool_auto_disable_failure_counts(id);
+    }
+    assert_eq!(
+        manager.success_reset_tasks_started.load(Ordering::Acquire),
+        capped_before,
+        "no task may be spawned after the hard task cap is exhausted"
+    );
+    drop(held_permits);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_terminal_account_error_skips_same_pool_retry_and_fails_over() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::UNAUTHORIZED,
+        fake_external_error_body("invalid token"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("auth-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "terminal-account-error-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "terminal-account-error-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 3,
+        same_pool_retry_status_codes: vec![StatusCode::UNAUTHORIZED.as_u16()],
+        same_pool_retry_delay_ms: 1,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_terminal_account_error".to_string();
+    route.error_id = "err_terminal_account_error".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("terminal account failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("terminal account error should fail over to the next pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        1,
+        "auth errors should cool down and fail over instead of retrying the same account"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_url_adds_single_v1_for_standard_message_path() {
+    let config = AccountsConfig::default();
+    let cases = [
+        (
+            "http://pool.example.com",
+            "http://pool.example.com/v1/messages",
+        ),
+        (
+            "http://pool.example.com/",
+            "http://pool.example.com/v1/messages",
+        ),
+        (
+            "http://pool.example.com/v1",
+            "http://pool.example.com/v1/messages",
+        ),
+        (
+            "http://pool.example.com/v1/",
+            "http://pool.example.com/v1/messages",
+        ),
+        (
+            "http://pool.example.com/api",
+            "http://pool.example.com/api/v1/messages",
+        ),
+        (
+            "http://pool.example.com/api/v1",
+            "http://pool.example.com/api/v1/messages",
+        ),
+    ];
+
+    for (base_url, expected) in cases {
+        let actual = account_url(&test_pool(base_url, false), "/cc/v1/messages", &config)
+            .expect("valid account url");
+        assert_eq!(actual.as_str(), expected);
+    }
+}
+
+#[test]
+fn account_url_uses_pool_messages_path() {
+    let config = AccountsConfig::default();
+    let base_v1 = account_url(
+        &test_pool("http://pool.example.com/v1", true),
+        "/v1/messages",
+        &config,
+    )
+    .expect("valid account url");
+    assert_eq!(base_v1.as_str(), "http://pool.example.com/v1/messages");
+
+    let cc_path = account_url(
+        &test_pool("http://pool.example.com", true),
+        "/cc/v1/messages",
+        &config,
+    )
+    .expect("valid account url");
+    assert_eq!(cc_path.as_str(), "http://pool.example.com/v1/messages");
+}
+
+#[test]
+fn external_public_error_masks_raw_message() {
+    let public_error = external_public_error_from_parts(
+        StatusCode::BAD_GATEWAY,
+        "server_error",
+        true,
+        "provider says buy credits at https://example.invalid",
+        "req_01public",
+    );
+
+    assert_eq!(public_error.status_code, StatusCode::BAD_GATEWAY.as_u16());
+    assert_eq!(public_error.error_type, "api_error");
+    assert!(
+        public_error
+            .message
+            .contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE)
+    );
+    assert!(public_error.message.contains("request-id: req_01public"));
+    assert!(!public_error.message.contains("buy credits"));
+}
+
+#[test]
+fn external_public_error_reports_payload_limit_without_context_window_message() {
+    let public_error = external_public_error_from_parts(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        false,
+        "external upstream rejected the request because the request payload is too large CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        "req_01payload",
+    );
+
+    assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
+    assert_eq!(public_error.error_type, "invalid_request_error");
+    assert!(public_error.message.contains("content length exceeded"));
+    assert!(public_error.message.contains("external upstream threshold"));
+    assert!(public_error.message.contains("request-id: req_01payload"));
+    assert!(!public_error.message.contains("Context window is full"));
+    assert!(!public_error.message.contains("Prompt is too long"));
+}
+
+#[test]
+fn external_public_error_reports_prompt_too_long_without_raw_pool_message() {
+    let public_error = external_public_error_from_parts(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        false,
+        "prompt is too long: > 1000000 maximum; pool banner buy credits",
+        "req_01long",
+    );
+
+    assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
+    assert_eq!(public_error.error_type, "invalid_request_error");
+    assert!(public_error.message.contains("Context window is full"));
+    assert!(public_error.message.contains("request-id: req_01long"));
+    assert!(!public_error.message.contains("1000000 maximum"));
+    assert!(!public_error.message.contains("buy credits"));
+}
+
+#[test]
+fn external_record_usage_source_prefers_request_estimate_for_estimated_billing() {
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let estimated = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"id":"chatcmpl_fake","choices":[{"message":{"role":"assistant","content":"OK"}}]}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    let estimated_billing = account_billing_from_capture(&route, &pool, estimated.usage_capture)
+        .expect("estimated billing");
+    assert!(estimated_billing.usage_estimated);
+    assert_eq!(
+        external_record_usage_source(Some(&estimated_billing), true),
+        UsageSource::RequestEstimate
+    );
+
+    let projected_route = test_route("claude-opus-4-6");
+    let mut projected_pool = test_pool("http://pool.example.com", false);
+    projected_pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&projected_route, &projected_pool, 0).expect("projection");
+    let projected = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        ),
+        Some(&projection),
+    );
+    let projected_billing =
+        account_billing_from_capture(&projected_route, &projected_pool, projected.usage_capture)
+            .expect("projected billing");
+    assert!(projected_billing.usage_projection_applied);
+    assert_eq!(
+        external_record_usage_source(Some(&projected_billing), true),
+        UsageSource::LocalPromptCache
+    );
+
+    let passthrough = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        ),
+        None,
+    );
+    let passthrough_billing =
+        account_billing_from_capture(&route, &pool, passthrough.usage_capture)
+            .expect("passthrough billing");
+    assert_eq!(
+        external_record_usage_source(Some(&passthrough_billing), true),
+        UsageSource::UpstreamMetadata
+    );
+}
+
+#[test]
+fn external_release_ready_queue_bypasses_more_than_one_batch_of_poison_for_five_rounds() {
+    for round in 0..5u64 {
+        let semaphore = Arc::new(Semaphore::new(ACCOUNT_RELEASE_BATCH_SIZE + 2));
+        let mut state = AccountReleaseDispatcherState::default();
+        let now = Instant::now();
+        for index in 0..=ACCOUNT_RELEASE_BATCH_SIZE {
+            let intent = AccountReleaseIntent {
+                pool_id: round + 1,
+                lease_id: format!("poison-{round}-{index}"),
+                release_kind: AccountLeaseReleaseKind::Confirmed,
+            };
+            state.order.push_back(intent.clone());
+            state.pending.insert(
+                intent,
+                AccountPendingRelease {
+                    _permit: semaphore.clone().try_acquire_owned().unwrap(),
+                    failures: 20,
+                    next_attempt_at: now + Duration::from_secs(30),
+                },
+            );
+        }
+        let healthy = AccountReleaseIntent {
+            pool_id: round + 10_000,
+            lease_id: format!("healthy-{round}"),
+            release_kind: AccountLeaseReleaseKind::Confirmed,
+        };
+        state.order.push_back(healthy.clone());
+        state.pending.insert(
+            healthy.clone(),
+            AccountPendingRelease {
+                _permit: semaphore.clone().try_acquire_owned().unwrap(),
+                failures: 0,
+                next_attempt_at: now,
+            },
+        );
+
+        let (batch, next_attempt_at) = state.next_ready_batch(now, ACCOUNT_RELEASE_BATCH_SIZE);
+        assert_eq!(batch, vec![healthy], "round {round}");
+        assert_eq!(next_attempt_at, Some(now + Duration::from_secs(30)));
+    }
+}
+
+#[test]
+fn external_release_transport_backoff_retains_but_does_not_send_new_work() {
+    let semaphore = Arc::new(Semaphore::new(1));
+    let now = Instant::now();
+    let retry_at = now + Duration::from_secs(30);
+    let intent = AccountReleaseIntent {
+        pool_id: 1,
+        lease_id: "queued-during-outage".to_string(),
+        release_kind: AccountLeaseReleaseKind::Confirmed,
+    };
+    let mut state = AccountReleaseDispatcherState {
+        system_failures: 10,
+        system_retry_at: Some(retry_at),
+        ..Default::default()
+    };
+    state.order.push_back(intent.clone());
+    state.pending.insert(
+        intent,
+        AccountPendingRelease {
+            _permit: semaphore.try_acquire_owned().unwrap(),
+            failures: 0,
+            next_attempt_at: now,
+        },
+    );
+    assert_eq!(
+        state.next_ready_batch(now, ACCOUNT_RELEASE_BATCH_SIZE),
+        (Vec::new(), Some(retry_at))
+    );
+}
+
+#[test]
+fn external_route_requested_max_tokens_ignores_invalid_raw_body_values() {
+    for body in [
+        br#"{"model":"claude-sonnet-5","max_tokens":0}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":-1}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":"64"}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":2147483648}"#.as_slice(),
+        b"not-json".as_slice(),
+    ] {
+        let route = raw_test_route(body);
+        assert_eq!(route.requested_max_tokens(), None);
+    }
+}
+
+#[test]
+fn external_route_requested_max_tokens_prefers_payload_and_falls_back_to_raw_body() {
+    let mut route = test_route("claude-sonnet-5");
+    route.effective_raw_body =
+        Bytes::from_static(br#"{"model":"claude-sonnet-5","max_tokens":64}"#);
+    route.raw_body = route.effective_raw_body.clone();
+    assert_eq!(route.requested_max_tokens(), Some(8));
+
+    let route = raw_test_route(br#"{"model":"claude-sonnet-5","max_tokens":64}"#);
+    assert_eq!(route.requested_max_tokens(), Some(64));
+}
+
+#[test]
+fn external_sse_atomic_overflow_records_stream_failure_and_stops_terminal_success() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut state = ExternalAnthropicTranscriptState::new_with_error_context(
+        ["Bash".to_string()],
+        Some("req_test".to_string()),
+        Some("err_test".to_string()),
+    );
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    let events = vec![
+        transcript_sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        ),
+        transcript_sse_event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x".repeat(ACCOUNT_MAX_SSE_EVENT_BUFFER_BYTES + 1)}}),
+        ),
+        transcript_sse_event(
+            "message_delta",
+            json!({"type":"message_delta","usage":{"output_tokens":20,"output_tokens_details":{"thinking_tokens":12}}}),
+        ),
+        transcript_sse_event("message_stop", json!({"type":"message_stop"})),
+    ];
+    let mut output = Vec::new();
+    for event in events {
+        output.extend(process_sse_event_with_plan_and_transcript(
+            &event,
+            None,
+            Some(&capture),
+            None,
+            plan,
+            Some(&mut state),
+        ));
+    }
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains(r#""type":"error""#));
+    assert!(output.contains("req_test"));
+    assert!(output.contains("err_test"));
+    assert!(!output.contains("thinking_tokens"));
+    assert!(!output.contains("message_stop"));
+    assert_eq!(
+        capture.lock().stream_error_message.as_deref(),
+        Some("external thinking block exceeded bounded atomic buffer")
+    );
+}
+
+#[test]
+fn external_sse_atomic_thinking_buffer_is_bounded() {
+    let oversized = "x".repeat(ACCOUNT_MAX_SSE_EVENT_BUFFER_BYTES + 1);
+    let events = vec![
+        transcript_sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        ),
+        transcript_sse_event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":oversized}}),
+        ),
+        transcript_sse_event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        ),
+    ];
+    let output = String::from_utf8(process_external_transcript_events(events)).unwrap();
+    assert!(!output.contains(&"x".repeat(1024)));
+    assert!(output.contains(r#""type":"error""#));
+    assert!(!output.contains("message_stop"));
+}
+
+#[test]
+fn external_sse_eof_contamination_emits_error_and_records_stream_failure() {
+    for _round in 0..5 {
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let mut state = ExternalAnthropicTranscriptState::new_with_error_context(
+            ["Bash".to_string()],
+            Some("req_eof_contamination".to_string()),
+            Some("err_eof_contamination".to_string()),
+        );
+        let start = transcript_sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        );
+        let partial = transcript_sse_event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"user Continue\n\nBa"}}),
+        );
+        let mut output = process_external_transcript_state(&mut state, &start, Some(&capture));
+        output.extend(process_external_transcript_state(
+            &mut state,
+            &partial,
+            Some(&capture),
+        ));
+        output.extend(finish_external_transcript_state(&mut state, Some(&capture)));
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(output.contains("req_eof_contamination"));
+        assert!(output.contains("err_eof_contamination"));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains(RESPONSE_PROTOCOL_CONTAMINATION_DETAIL));
+        assert!(!output.contains("message_stop"));
+        assert_eq!(
+            capture.lock().stream_error_message.as_deref(),
+            Some(RESPONSE_PROTOCOL_CONTAMINATION_DETAIL)
+        );
+    }
+}
+
+#[test]
+fn external_sse_multiline_crlf_json_is_sanitized_across_one_byte_transport_chunks() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let stream = [
+            transcript_multiline_crlf_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            ),
+            transcript_multiline_crlf_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":polluted}}),
+            ),
+            transcript_multiline_crlf_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}),
+            ),
+            transcript_multiline_crlf_sse_event(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+            transcript_multiline_crlf_sse_event(
+                "message_delta",
+                json!({"type":"message_delta","usage":{"output_tokens":20,"output_tokens_details":{"thinking_tokens":12}}}),
+            ),
+        ]
+        .concat();
+        let output = String::from_utf8(process_external_transcript_stream_one_byte_at_a_time(
+            &stream,
+        ))
+        .unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains("Bash: hidden"));
+        assert!(!output.contains("opaque-signature"));
+        assert!(!output.contains(r#""type":"thinking""#));
+        assert!(!output.contains("thinking_tokens"));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_sse_multiline_crlf_unsigned_pollution_fails_closed() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let stream = [
+            transcript_multiline_crlf_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            ),
+            transcript_multiline_crlf_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":polluted}}),
+            ),
+            transcript_multiline_crlf_sse_event(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+        ]
+        .concat();
+        let output = String::from_utf8(process_external_transcript_stream_one_byte_at_a_time(
+            &stream,
+        ))
+        .unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(!output.contains(r#""type":"thinking""#));
+        assert!(!output.contains(r#""type":"thinking_delta""#));
+        assert!(!output.contains("safe prefix"));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains("Bash: hidden"));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_sse_orphan_thinking_and_signature_deltas_fail_closed_on_pollution() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let events = vec![
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":polluted}}),
+            ),
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":polluted}}),
+            ),
+            transcript_sse_event(
+                "message_delta",
+                json!({"type":"message_delta","usage":{"output_tokens":20,"output_tokens_details":{"thinking_tokens":12}}}),
+            ),
+        ];
+        let output = String::from_utf8(process_external_transcript_events(events)).unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(!output.contains("safe prefix"));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains("Bash: hidden"));
+        assert!(!output.contains("signature_delta"));
+        assert!(!output.contains("thinking_tokens"));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_sse_partial_transcript_at_tool_boundary_fails_before_tool_forwarding() {
+    for _round in 0..5 {
+        let events = vec![
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"user Continue\n\nBa"}}),
+            ),
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}),
+            ),
+            transcript_sse_event("message_stop", json!({"type":"message_stop"})),
+        ];
+        let output = String::from_utf8(process_external_transcript_events(events)).unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains("toolu_1"));
+        assert!(!output.contains(r#""type":"tool_use""#));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_sse_redacted_leak_is_suppressed_and_clean_signed_block_is_identical() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let redacted = vec![
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":polluted}}),
+            ),
+            transcript_sse_event(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+        ];
+        let redacted = String::from_utf8(process_external_transcript_events(redacted)).unwrap();
+        assert!(redacted.contains(r#""type":"error""#));
+        assert!(!redacted.contains("redacted_thinking"));
+        assert!(!redacted.contains("user Continue"));
+        assert!(!redacted.contains("safe prefix"));
+        assert!(!redacted.contains("message_stop"));
+
+        let clean = vec![
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            ),
+            transcript_sse_event("ping", json!({"type":"ping"})),
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ordinary reasoning"}}),
+            ),
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}),
+            ),
+            transcript_sse_event(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+        ];
+        let mut expected = clean[1].clone();
+        expected.extend(clean[0].clone());
+        expected.extend(clean[2..].concat());
+        assert_eq!(process_external_transcript_events(clean), expected);
+    }
+}
+
+#[test]
+fn external_sse_signed_thinking_is_atomic_across_character_deltas() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let mut events = vec![transcript_sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        )];
+        events.extend(polluted.chars().map(|ch| {
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":ch.to_string()}}),
+            )
+        }));
+        events.push(transcript_sse_event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}),
+        ));
+        events.push(transcript_sse_event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        ));
+        events.push(transcript_sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+        ));
+        events.push(transcript_sse_event(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"visible"}}),
+        ));
+        events.push(transcript_sse_event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        ));
+        events.push(transcript_sse_event(
+            "message_delta",
+            json!({"type":"message_delta","usage":{"output_tokens":20,"output_tokens_details":{"thinking_tokens":12}}}),
+        ));
+
+        let output = String::from_utf8(process_external_transcript_events(events)).unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains("opaque-signature"));
+        assert!(!output.contains(r#""type":"thinking""#));
+        assert!(!output.contains("thinking_tokens"));
+        assert!(!output.contains("visible"));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_sse_start_embedded_thinking_cannot_bypass_sanitization() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let events = vec![
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":polluted}}),
+            ),
+            transcript_sse_event(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+        ];
+        let output = String::from_utf8(process_external_transcript_events(events)).unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(!output.contains(r#""type":"thinking""#));
+        assert!(!output.contains("safe prefix"));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains("Bash: hidden"));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_sse_text_pollution_fails_closed_before_or_after_visible_output() {
+    let polluted = "user Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let same_event = vec![
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":format!("same-event prefix\n{polluted}")}}),
+            ),
+            transcript_sse_event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            ),
+            transcript_sse_event("message_stop", json!({"type":"message_stop"})),
+        ];
+        let same_event = String::from_utf8(process_external_transcript_events(same_event)).unwrap();
+        assert!(same_event.contains(r#""type":"error""#));
+        assert!(!same_event.contains("same-event prefix"));
+        assert!(!same_event.contains("user Continue"));
+        assert!(!same_event.contains("hidden"));
+        assert!(!same_event.contains("message_stop"));
+        assert!(!same_event.contains("stop_reason"));
+
+        let after_visible = vec![
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"already visible\n"}}),
+            ),
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":polluted}}),
+            ),
+            transcript_sse_event("message_stop", json!({"type":"message_stop"})),
+        ];
+        let after_visible =
+            String::from_utf8(process_external_transcript_events(after_visible)).unwrap();
+        assert!(after_visible.contains("already visible"));
+        assert!(after_visible.contains(r#""type":"error""#));
+        assert!(!after_visible.contains("user Continue"));
+        assert!(!after_visible.contains("hidden"));
+        assert!(!after_visible.contains("message_stop"));
+
+        let embedded_start = vec![
+            transcript_sse_event(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":polluted}}),
+            ),
+            transcript_sse_event("message_stop", json!({"type":"message_stop"})),
+        ];
+        let embedded_start =
+            String::from_utf8(process_external_transcript_events(embedded_start)).unwrap();
+        assert!(embedded_start.contains(r#""type":"error""#));
+        assert!(!embedded_start.contains("user Continue"));
+        assert!(!embedded_start.contains("hidden"));
+        assert!(!embedded_start.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_sse_unsigned_thinking_pollution_fails_closed() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let mut events = vec![transcript_sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        )];
+        events.extend(polluted.chars().map(|ch| {
+            transcript_sse_event(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":ch.to_string()}}),
+            )
+        }));
+        events.push(transcript_sse_event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        ));
+
+        let output = String::from_utf8(process_external_transcript_events(events)).unwrap();
+        assert!(output.contains(r#""type":"error""#));
+        assert!(!output.contains(r#""type":"thinking""#));
+        assert!(!output.contains(r#""type":"thinking_delta""#));
+        assert!(!output.contains("safe prefix"));
+        assert!(!output.contains("user Continue"));
+        assert!(!output.contains("Bash: hidden"));
+        assert!(!output.contains(r#""type":"text_delta""#));
+        assert!(!output.contains("message_stop"));
+    }
+}
+
+#[test]
+fn external_stream_error_event_is_masked_and_only_safe_classification_is_recorded() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mask = ExternalStreamErrorMask {
+        request_id: "req_stream_mask".to_string(),
+        error_id: "req_01streammask".to_string(),
+        pool_id: 7,
+        pool_name: "pool-a".to_string(),
+    };
+    let event = br#"event: error
+data: {"type":"error","error":{"type":"api_error","message":"raw external promo text"}}
+
+"#;
+
+    let masked = process_sse_event_with_plan(
+        event,
+        None,
+        Some(&capture),
+        Some(&mask),
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+    let text = std::str::from_utf8(&masked).expect("masked event utf8");
+
+    assert!(text.contains("event: error"));
+    assert!(text.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+    assert!(text.contains("request-id: req_01streammask"));
+    assert!(text.contains("req_stream_mask"));
+    assert!(!text.contains("raw external promo text"));
+    assert!(!text.contains("pool-a"));
+    assert_public_message_hides_internal_routing(text);
+
+    let recorded = capture
+        .lock()
+        .stream_error_message
+        .clone()
+        .expect("safe stream error classification recorded");
+    assert_eq!(recorded, "external upstream emitted an error event");
+    assert!(!recorded.contains("raw external promo text"));
+    assert!(!recorded.contains("req_01streammask"));
+}
+
+#[test]
+fn external_stream_request_timeout_zero_does_not_inherit_non_stream_timeout() {
+    let config = AccountsConfig {
+        request_timeout_secs: 2,
+        stream_request_timeout_secs: 0,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    payload_mut(&mut route).stream = true;
+    refresh_test_route_derived_state(&mut route);
+    let dispatch_deadline = external_dispatch_deadline(&route, &config);
+
+    assert!(
+        dispatch_deadline.is_some(),
+        "overall stream dispatch capacity wait still has a bounded deadline"
+    );
+    assert_eq!(
+        external_request_send_timeout(&route, &config),
+        None,
+        "stream request_timeout=0 must keep long stream semantics and rely on idle timeout"
+    );
+}
+
+#[test]
+fn external_usage_debug_candidates_collect_raw_usage_from_unusual_paths() {
+    let value = json!({
+        "wrapper": {
+            "nested": {
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        },
+        "choices": [
+            {
+                "message": { "content": "ok" },
+                "provider_usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 4
+                }
+            }
+        ]
+    });
+
+    let candidates = collect_account_usage_debug_candidates(&value);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.wrapper.nested.usage"
+                && candidate.raw_json.contains("\"output_tokens\":5")),
+        "must keep raw Anthropic usage from non-standard wrapper path"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.choices[0].provider_usage"
+                && candidate
+                    .normalized_anthropic_usage
+                    .as_ref()
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(|value| value.as_i64())
+                    == Some(4)),
+        "must normalize OpenAI-style raw usage without losing original raw json"
+    );
+}
+
+#[test]
+fn external_usage_debug_sse_event_keeps_raw_usage_event_sample() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    plan.usage_debug_enabled = true;
+    plan.usage_debug_max_body_bytes = 128;
+    let event = br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}
+
+"#;
+
+    record_external_usage_debug_sse_event(event, Some(&capture), plan);
+
+    let snapshot = capture.lock().debug_stream.clone();
+    assert_eq!(snapshot.events_seen, 1);
+    assert_eq!(snapshot.usage_events_seen, 1);
+    assert_eq!(snapshot.usage_paths.get("$.usage"), Some(&1));
+    let sample = snapshot
+        .raw_usage_event_samples
+        .first()
+        .expect("usage event sample should be present");
+    assert_eq!(sample.event.as_deref(), Some("message_delta"));
+    assert!(sample.raw_event_utf8.contains("\"output_tokens\":4"));
+    assert!(
+        sample
+            .usage_candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.usage"
+                && candidate.raw_json.contains("\"output_tokens\":4")),
+        "raw SSE usage candidate should be kept for single-request analysis"
+    );
+    let preview = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        snapshot.raw_stream_preview_base64.as_bytes(),
+    )
+    .expect("stream preview should be valid base64");
+    assert_eq!(preview, event);
+}
+
+#[test]
+fn external_wire_debug_request_summary_keeps_last_user_marker() {
+    let body = br#"{
+        "model":"claude-opus-4-8",
+        "stream":true,
+        "max_tokens":512,
+        "messages":[
+            {"role":"user","content":[{"type":"text","text":"first task"}]},
+            {"role":"assistant","content":[{"type":"text","text":"first answer"}]},
+            {"role":"user","content":[{"type":"text","text":"FOLLOWUP_MARKER_F2 compute 31+40"}]}
+        ],
+        "tools":[{"name":"noop","input_schema":{"type":"object"}}]
+    }"#;
+
+    let summary = account_wire_debug_request_summary(body);
+
+    assert_eq!(summary["parseOk"], true);
+    assert_eq!(summary["model"], "claude-opus-4-8");
+    assert_eq!(summary["stream"], true);
+    assert_eq!(summary["messageCount"], 3);
+    assert_eq!(summary["userMessageCount"], 2);
+    assert_eq!(summary["toolCount"], 1);
+    assert!(
+        summary["lastUserContent"]
+            .to_string()
+            .contains("FOLLOWUP_MARKER_F2"),
+        "last user content preview must make follow-up marker correlation possible"
+    );
+    assert!(
+        summary["lastUserContent"].to_string().contains("sha256"),
+        "last user content must include stable hashes for long-context correlation"
+    );
+}
+
+#[test]
+fn external_wire_debug_stream_records_raw_and_processed_text_usage_and_stop() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    plan.wire_debug_enabled = true;
+    plan.wire_debug_max_body_bytes = 4096;
+
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}
+
+"#;
+    let usage_event = br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}
+
+"#;
+    let stop_event = br#"event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+    assert_eq!(
+        process_sse_event_with_plan(text_event, None, Some(&capture), None, plan),
+        text_event
+    );
+    assert_eq!(
+        process_sse_event_with_plan(usage_event, None, Some(&capture), None, plan),
+        usage_event
+    );
+    assert_eq!(
+        process_sse_event_with_plan(stop_event, None, Some(&capture), None, plan),
+        stop_event
+    );
+
+    let snapshot = capture.lock().wire_debug.clone();
+    assert_eq!(snapshot.raw_upstream_stream.events_seen, 3);
+    assert_eq!(snapshot.processed_downstream_stream.events_seen, 3);
+    assert_eq!(snapshot.raw_upstream_stream.semantic.text_delta_chars, 2);
+    assert_eq!(
+        snapshot
+            .processed_downstream_stream
+            .semantic
+            .text_delta_chars,
+        2
+    );
+    assert_eq!(snapshot.raw_upstream_stream.usage_events_seen, 1);
+    assert_eq!(snapshot.processed_downstream_stream.usage_events_seen, 1);
+    assert_eq!(snapshot.raw_upstream_stream.semantic.message_stop_events, 1);
+    assert_eq!(
+        snapshot
+            .processed_downstream_stream
+            .semantic
+            .message_stop_events,
+        1
+    );
+    assert_eq!(
+        snapshot
+            .raw_upstream_stream
+            .semantic
+            .last_stop_reason
+            .as_deref(),
+        Some("end_turn")
+    );
+    assert_eq!(
+        snapshot
+            .processed_downstream_stream
+            .semantic
+            .last_stop_reason
+            .as_deref(),
+        Some("end_turn")
+    );
+    assert!(
+        snapshot
+            .processed_downstream_stream
+            .preview_utf8
+            .contains("\"text\":\"OK\"")
+    );
+}
+
+#[test]
+fn finds_sse_event_delimiters_for_lf_and_crlf() {
+    assert_eq!(find_sse_event_delimiter(b"data: {}\n\nrest"), Some((8, 2)));
+    assert_eq!(
+        find_sse_event_delimiter(b"data: {}\r\n\r\nrest"),
+        Some((8, 4))
+    );
+    assert_eq!(find_sse_event_delimiter(b"data: {}"), None);
+}
+
+#[test]
+fn finite_external_queue_lease_covers_wait_without_periodic_renewal() {
+    for round in 1..=5 {
+        let default_wait = AccountsConfig::default().effective_dispatch_max_wait_secs();
+        let default_policy = account_queue_lease_policy(Some(Duration::from_secs(default_wait)));
+        assert_eq!(default_wait, 60, "round {round}");
+        assert_eq!(default_policy.ttl_secs, 120, "round {round}");
+        assert!(!default_policy.renewal_required, "round {round}");
+
+        let long_policy = account_queue_lease_policy(Some(Duration::from_secs(120)));
+        assert_eq!(long_policy.ttl_secs, 180, "round {round}");
+        assert!(!long_policy.renewal_required, "round {round}");
+
+        let fractional_policy = account_queue_lease_policy(Some(Duration::from_millis(1501)));
+        assert_eq!(fractional_policy.ttl_secs, 62, "round {round}");
+        assert!(!fractional_policy.renewal_required, "round {round}");
+
+        let unlimited_policy = account_queue_lease_policy(None);
+        assert_eq!(unlimited_policy.ttl_secs, 60, "round {round}");
+        assert!(unlimited_policy.renewal_required, "round {round}");
+    }
+}
+
+#[test]
+fn forward_headers_adds_default_anthropic_version_for_external_auth_modes() {
+    let headers = HeaderMap::new();
+    let mut bearer_pool = test_pool("https://example.com/v1", true);
+    bearer_pool.auth_type = AccountAuthType::Bearer;
+    bearer_pool.api_key = Some("sk-bearer".to_string());
+
+    let bearer = forward_headers(&headers, &bearer_pool, false).expect("bearer headers");
+    assert_eq!(
+        bearer
+            .get(HeaderName::from_static("anthropic-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    assert_eq!(
+        bearer
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer sk-bearer")
+    );
+    assert!(bearer.get(HeaderName::from_static("x-api-key")).is_none());
+
+    let mut x_api_key_pool = bearer_pool;
+    x_api_key_pool.auth_type = AccountAuthType::XApiKey;
+    x_api_key_pool.api_key = Some("sk-x-api-key".to_string());
+    let x_api_key = forward_headers(&headers, &x_api_key_pool, false).expect("x-api-key headers");
+    assert_eq!(
+        x_api_key
+            .get(HeaderName::from_static("anthropic-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    assert_eq!(
+        x_api_key
+            .get(HeaderName::from_static("x-api-key"))
+            .and_then(|value| value.to_str().ok()),
+        Some("sk-x-api-key")
+    );
+    assert!(x_api_key.get(header::AUTHORIZATION).is_none());
+}
+
+#[test]
+fn forward_headers_preserves_client_anthropic_version() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static("2024-02-29"),
+    );
+    headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+    let pool = test_pool("https://example.com/v1", true);
+
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("anthropic-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("2024-02-29")
+    );
+    assert!(forwarded.get(header::ACCEPT_ENCODING).is_none());
+}
+
+#[test]
+fn forward_headers_strips_auth_cookie_and_google_api_key_residue() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer client"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-api-key"),
+        HeaderValue::from_static("client-key"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-goog-api-key"),
+        HeaderValue::from_static("google-key"),
+    );
+    headers.insert(header::COOKIE, HeaderValue::from_static("sid=client"));
+    headers.insert(
+        HeaderName::from_static("x-custom"),
+        HeaderValue::from_static("kept"),
+    );
+    let pool = test_pool("https://example.com/v1", true);
+
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
+
+    assert_eq!(
+        forwarded
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer sk-test")
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-api-key"))
+            .is_none()
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-goog-api-key"))
+            .is_none()
+    );
+    assert!(forwarded.get(header::COOKIE).is_none());
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-custom"))
+            .and_then(|value| value.to_str().ok()),
+        Some("kept")
+    );
+}
+
+#[test]
+fn forwarded_response_headers_drop_provider_fingerprints() {
+    let mut upstream_headers = HeaderMap::new();
+    for (name, value) in [
+        ("content-type", "application/json"),
+        ("retry-after", "3"),
+        ("anthropic-ratelimit-requests-remaining", "10"),
+        ("server", "cloudflare"),
+        ("cf-ray", "abc123-SJC"),
+        ("x-amzn-requestid", "1f2e3d"),
+        ("x-amzn-errortype", "ThrottlingException"),
+        ("anthropic-organization-id", "org-upstream"),
+        ("x-request-id", "upstream-request-id"),
+        ("request-id", "req_upstream"),
+        ("via", "1.1 upstream-gateway"),
+    ] {
+        upstream_headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+
+    let mut builder = Response::builder().status(StatusCode::OK);
+    apply_forwarded_response_headers(&mut builder, &upstream_headers, "req_01local");
+    let response = builder.body(()).expect("response should build");
+    let headers = response.headers();
+
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(headers["retry-after"], "3");
+    assert_eq!(headers["anthropic-ratelimit-requests-remaining"], "10");
+    assert_eq!(headers["request-id"], "req_01local");
+    for dropped in [
+        "server",
+        "cf-ray",
+        "x-amzn-requestid",
+        "x-amzn-errortype",
+        "anthropic-organization-id",
+        "x-request-id",
+        "via",
+    ] {
+        assert!(
+            !headers.contains_key(dropped),
+            "{dropped} must not be relayed"
+        );
+    }
+}
+
+#[test]
+fn header_overrides_apply_after_auth_but_reject_sensitive_names() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.header_overrides = normalize_account_header_overrides(HashMap::from([(
+        "anthropic-beta".to_string(),
+        "claude-code-20250219".to_string(),
+    )]))
+    .expect("valid override");
+    let headers = HeaderMap::new();
+
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("anthropic-beta"))
+            .and_then(|value| value.to_str().ok()),
+        Some("claude-code-20250219")
+    );
+
+    assert!(
+        normalize_account_header_overrides(HashMap::from([(
+            "authorization".to_string(),
+            "Bearer bad".to_string(),
+        )]))
+        .is_err()
+    );
+    assert!(
+        normalize_account_header_overrides(HashMap::from([(
+            "x-client-request-id".to_string(),
+            "fixed".to_string(),
+        )]))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn http1_title_case_wire_profile_writes_http1_title_case_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw capture server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = vec![0u8; 8192];
+        let mut read = 0usize;
+        loop {
+            let n = socket.read(&mut buf[read..]).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            read += n;
+            if read >= 4 && buf[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if read == buf.len() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await
+            .expect("write response");
+        String::from_utf8_lossy(&buf[..read]).to_string()
+    });
+
+    let client = account_reqwest_client(
+        AccountWireProfile::Http1TitleCase,
+        AccountTlsProfile::Default,
+    );
+    let response = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-stainless-os", "Linux")
+        .header("anthropic-beta", "claude-code-20250219")
+        .body("{}")
+        .send()
+        .await
+        .expect("send raw capture request");
+    assert!(response.status().is_success());
+
+    let raw_request = server.await.expect("server task");
+    assert!(
+        raw_request.starts_with("POST /v1/messages HTTP/1.1\r\n"),
+        "{raw_request}"
+    );
+    assert!(raw_request.contains("\r\nX-Stainless-Os: Linux\r\n"));
+    assert!(raw_request.contains("\r\nAnthropic-Beta: claude-code-20250219\r\n"));
+}
+
+#[test]
+fn inference_attempt_rejection_keeps_attempt_list_empty_and_public_error_masked() {
+    for round in 0..5 {
+        let mut route = test_route("claude-sonnet-4-5");
+        route.error_id = format!("req_01mask{round}");
+        let error = external_attempt_rejection_final_error(&route, Vec::new());
+
+        assert!(error.attempts.is_empty());
+        assert_eq!(error.pool_id, None);
+        assert_eq!(error.pool_name, None);
+        assert_eq!(error.route_error_type, "inference_attempt_policy");
+        let public_message = error.public_message(&route.error_id);
+        assert_public_message_hides_internal_routing(&public_message);
+        assert!(!public_message.contains("attempt"));
+        assert!(!public_message.contains("pool"));
+    }
+}
+
+#[test]
+fn inference_attempt_rejection_never_creates_pool_cooldown_for_five_rounds() {
+    for _ in 0..5 {
+        for rejection in [
+            InferenceAttemptRejection::Exhausted,
+            InferenceAttemptRejection::ReservedForFallback,
+            InferenceAttemptRejection::DownstreamCommitted,
+        ] {
+            let error = ExternalForwardError::dispatch_rejected(
+                AccountError {
+                    status: Some(StatusCode::SERVICE_UNAVAILABLE),
+                    message: "dispatch unavailable".to_string(),
+                    retryable: false,
+                    auto_disable_reason: None,
+                    cooldown: None,
+                    protocol_error: None,
+                    raw_upstream_error: None,
+                },
+                Some("claude-sonnet-4-5".to_string()),
+                rejection,
+            );
+
+            assert_eq!(error.attempt_rejection, Some(rejection));
+            assert!(!error.err.retryable);
+            assert!(error.err.cooldown.is_none());
+            assert!(error.err.auto_disable_reason.is_none());
+        }
+    }
+}
+
+#[test]
+fn prefix_tool_plus_usage_projection_shapes_account_usage() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/plus/v1/messages".to_string();
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::PrefixToolPlus;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    route.reported_usage = ReportedUsageConfig {
+        default: ReportedUsagePathPolicy::disabled(),
+    };
+    let mut plus = crate::model::config::PrefixToolPlusCachePolicy::default();
+    plus.shaping.cache_read.multiplier = 50.0;
+    plus.shaping.cache_read.max_tokens = 1_000;
+    plus.shaping.input.min_tokens = 5_000;
+    plus.shaping.output.multiplier = 3.0;
+    route.prefix_tool_plus_cache_policy = plus;
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_0c6b1c55-1b1e-4c4b-9d6b-3b8f2b8d9e11".to_string(),
+        ),
+    });
+    payload_mut(&mut route).system = Some(vec![SystemMessage {
+        text: "stable external plus strategy prompt ".repeat(700),
+        cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+    }]);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let first_projection = projection_context(&route, &pool, 0).expect("first projection");
+    let first = maybe_project_non_stream_usage(body.clone(), Some(&first_projection));
+    let first_reported = first.usage_capture.reported.expect("first reported usage");
+    assert_eq!(first_reported.cache_read_input_tokens, 0);
+    assert!(first_reported.cache_creation_input_tokens > 0);
+    assert_eq!(first_reported.output_tokens, 30);
+    first_projection.record_success();
+
+    payload_mut(&mut route).messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue external plus strategy session"),
+        },
+    ]);
+    refresh_test_route_derived_state(&mut route);
+    let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+    let second = maybe_project_non_stream_usage(body, Some(&second_projection));
+    let reported = second
+        .usage_capture
+        .reported
+        .expect("second reported usage");
+    assert_eq!(reported.cache_read_input_tokens, 1_000);
+    assert!(reported.input_tokens >= 5_000);
+    assert_eq!(
+        reported.input_tokens
+            + reported.cache_creation_input_tokens
+            + reported.cache_read_input_tokens,
+        reported.total_input_tokens
+    );
+}
+
+#[test]
+fn prefix_tool_usage_projection_applies_path_cache_creation_policy() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}"#,
+        );
+    let mut route = test_route("claude-opus-4-8");
+    route.endpoint = "/cc/v1/messages".to_string();
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::PrefixTool;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        cache_creation: ReportedUsageFieldPolicy::sample_max(4_000),
+        ..ReportedUsagePathPolicy::default()
+    };
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_57f3e60f-2cc6-4e8f-ae7e-e43753320a09".to_string(),
+        ),
+    });
+    payload_mut(&mut route).system = Some(vec![SystemMessage {
+        text: "stable account strategy prompt ".repeat(8_000),
+        cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+    }]);
+    route.request_input_tokens = count_external_route_input_tokens(payload_ref(&route));
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    assert_projected_cache_creation_consistent(usage);
+    let reported_creation = usage["cache_creation_input_tokens"]
+        .as_i64()
+        .expect("reported cache creation");
+    assert!(
+        (1..=4_000).contains(&reported_creation),
+        "reported cache creation should follow path policy, got {reported_creation}"
+    );
+    assert!(
+        !std::str::from_utf8(&projected.body)
+            .unwrap()
+            .contains("1300180")
+    );
+
+    let raw = projected.usage_capture.raw.expect("raw usage");
+    assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    assert!((1..=4_000).contains(&reported.cache_creation_input_tokens));
+    assert!(projected.usage_capture.projected);
+}
+
+#[test]
+fn prefix_tool_usage_projection_commits_account_cache_only_after_success() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/pool/v1/messages".to_string();
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::PrefixTool;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    route.reported_usage = ReportedUsageConfig {
+        default: ReportedUsagePathPolicy::disabled(),
+    };
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string(),
+        ),
+    });
+    payload_mut(&mut route).system = Some(vec![SystemMessage {
+        text: "stable account strategy prompt ".repeat(700),
+        cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+    }]);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let failed_projection = projection_context(&route, &pool, 0).expect("failed projection");
+    let failed = maybe_project_non_stream_usage(body.clone(), Some(&failed_projection));
+    let failed_value: serde_json::Value =
+        serde_json::from_slice(&failed.body).expect("failed projected json");
+    assert_eq!(
+        failed_value["usage"]["cache_read_input_tokens"]
+            .as_i64()
+            .unwrap_or_default(),
+        0
+    );
+    assert!(
+        failed_value["usage"]["cache_creation_input_tokens"]
+            .as_i64()
+            .unwrap_or_default()
+            > 0
+    );
+
+    let retry_projection = projection_context(&route, &pool, 0).expect("retry projection");
+    let retry = maybe_project_non_stream_usage(body.clone(), Some(&retry_projection));
+    let retry_value: serde_json::Value =
+        serde_json::from_slice(&retry.body).expect("retry projected json");
+    assert_eq!(
+        retry_value["usage"]["cache_read_input_tokens"]
+            .as_i64()
+            .unwrap_or_default(),
+        0
+    );
+    assert!(
+        retry_value["usage"]["cache_creation_input_tokens"]
+            .as_i64()
+            .unwrap_or_default()
+            > 0
+    );
+    retry_projection.record_success();
+
+    payload_mut(&mut route).messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue account strategy session"),
+        },
+    ]);
+    refresh_test_route_derived_state(&mut route);
+    let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+    let second = maybe_project_non_stream_usage(body, Some(&second_projection));
+    let second_value: serde_json::Value =
+        serde_json::from_slice(&second.body).expect("second projected json");
+    assert!(
+        second_value["usage"]["cache_read_input_tokens"]
+            .as_i64()
+            .unwrap_or_default()
+            > 0
+    );
+    let raw = second.usage_capture.raw.expect("raw usage");
+    let reported = second.usage_capture.reported.expect("reported usage");
+    assert_eq!(raw.input_tokens, 100000);
+    assert_eq!(raw.cache_read_input_tokens, 0);
+    assert!(reported.cache_read_input_tokens > 0);
+    assert!(
+        (32..=4_096).contains(&reported.input_tokens),
+        "前缀追踪 reported input range must remain authoritative, got {}",
+        reported.input_tokens
+    );
+    assert_eq!(
+        reported.input_tokens
+            + reported.cache_creation_input_tokens
+            + reported.cache_read_input_tokens,
+        reported.total_input_tokens
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
+async fn l2_all_pools_degraded_still_serves_traffic_without_emptying_candidates() {
+    // 用户要求的核心保证之一：账号整体不稳定时，尽可能保证可用。
+    // 全体一起慢的场景下，相对中位数归一化必须让所有池都不被额外降权。
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let slow_a =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(120), "slow-a").await;
+    let slow_b =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(130), "slow-b").await;
+    let slow_c =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(125), "slow-c").await;
+
+    let pool_a =
+        create_messages_pool_with_concurrency(&postgres, "l2-allslow-a", 5, &slow_a.base_url, 512)
+            .await;
+    let pool_b =
+        create_messages_pool_with_concurrency(&postgres, "l2-allslow-b", 5, &slow_b.base_url, 512)
+            .await;
+    let pool_c =
+        create_messages_pool_with_concurrency(&postgres, "l2-allslow-c", 5, &slow_c.base_url, 512)
+            .await;
+
+    let config = l2_quality_config();
+
+    let warmup = run_quality_wave(&manager, &config, "l2_allslow_warm", L2_WAVE_SIZE).await;
+    assert_eq!(count_successes(&warmup), L2_WAVE_SIZE);
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[pool_a.id, pool_b.id, pool_c.id],
+            config.quality_min_samples
+        )
+        .await,
+        "质量样本必须落盘"
+    );
+
+    let before = [
+        slow_a.snapshot().0,
+        slow_b.snapshot().0,
+        slow_c.snapshot().0,
+    ];
+    let outcomes = run_quality_wave(&manager, &config, "l2_allslow_hot", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "全体劣化时必须仍然全部可用——这是'降级时保证可用'的底线"
+    );
+
+    let after = [
+        slow_a.snapshot().0,
+        slow_b.snapshot().0,
+        slow_c.snapshot().0,
+    ];
+    for (index, (before, after)) in before.iter().zip(after.iter()).enumerate() {
+        assert!(
+            after > before,
+            "全体一起慢时第 {index} 个池仍应分到流量，不得被中位数归一化误判为差池"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
+async fn l2_failing_pool_is_probationed_then_recovers_and_regains_traffic() {
+    // D3 全轨迹：一个池先持续失败被降级，随后上游恢复，
+    // 它必须靠探测流量拿回样本、走完恢复爬坡、重新承担流量。
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    // fail_first：前 N 次失败，之后恢复正常——模拟"一段时间后恢复"。
+    //
+    // 预算必须小于阶段一实际打到这个池的请求数（约 L2_WAVE_SIZE/2），
+    // 否则失败会渗进探测期与恢复期，池被反复重新降级——
+    // 那测的就不是"恢复"，而是"上游还在坏"。
+    let flaky = PatternExternalMessagesFakeServer::fail_first(
+        FLAKY_FAILURE_BUDGET,
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+        "flaky-recovered",
+    )
+    .await;
+    let healthy = PatternExternalMessagesFakeServer::always_success("healthy-peer").await;
+
+    let flaky_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-flaky", 5, &flaky.base_url, 512).await;
+    let healthy_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-healthy", 5, &healthy.base_url, 512)
+            .await;
+
+    // 压缩时间参数：Redis TTL 不随 tokio::time::pause 前进（矩阵 §2 调研结论），
+    // 因此必须把避让窗口压到秒级并配合真实 sleep。
+    let mut config = l2_quality_config();
+    config.degrade_probation_secs = 2;
+    config.max_probation_secs = 2;
+    config.recovery_ramp_secs = 1;
+    config.probe_share_percent = 20;
+    config.degrade_error_rate_threshold = 0.5;
+
+    // 阶段一：制造持续失败，触发降级
+    //
+    // 降级只在选池时按已落盘的质量样本判定，样本写入是 detached task。
+    // 直接打 256 并发时，所有请求可能在任何失败样本落盘前就完成选池，
+    // 这一轮就判定不到降级（测试因此偶发失败）。先用一小波预热，
+    // 等两个池都有足够样本，主波次开始选池时失败率落差就已可见。
+    let mut warmed_up = false;
+    for round in 0..5 {
+        let _ =
+            run_quality_wave(&manager, &config, &format!("l2_recover_warmup_{round}"), 16).await;
+        if wait_for_quality_samples(
+            &manager,
+            &[flaky_pool.id, healthy_pool.id],
+            config.quality_min_samples,
+        )
+        .await
+        {
+            warmed_up = true;
+            break;
+        }
+    }
+    assert!(warmed_up, "预热后两个池都必须有足够的质量样本");
+    let _ = run_quality_wave(&manager, &config, "l2_recover_fail", L2_WAVE_SIZE).await;
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[flaky_pool.id, healthy_pool.id],
+            config.quality_min_samples
+        )
+        .await,
+        "质量样本必须落盘"
+    );
+
+    // 轮询等待降级状态写入（同样是 detached task）
+    let mut probationed = false;
+    for _ in 0..100 {
+        if pool_quality(&manager, flaky_pool.id)
+            .await
+            .is_some_and(|quality| quality.probation_until_ms.is_some())
+        {
+            probationed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        probationed,
+        "持续失败的池必须被标记为临时降级；这是'长时间质量差就降低调度优先级'的落地"
+    );
+
+    // 阶段二：降级期内，健康池应承担绝大部分流量，
+    // 但失败池仍必须收到少量探测流量（否则无法自证恢复）。
+    let flaky_before = flaky.snapshot().0;
+    let _ = run_quality_wave(&manager, &config, "l2_recover_probe", L2_WAVE_SIZE).await;
+    let flaky_probe_delta = flaky.snapshot().0 - flaky_before;
+    let diagnostic = manager
+        .load_pool_runtime_snapshot(flaky_pool.id, &[])
+        .await
+        .map(|runtime| {
+            format!(
+                "cooldown_secs={} reason={:?} streak={} quality={:?}",
+                runtime.pool_cooldown_remaining_secs,
+                runtime.pool_cooldown_reason,
+                runtime.transient_failure_streak,
+                runtime.quality,
+            )
+        })
+        .unwrap_or_else(|err| format!("runtime snapshot failed: {err}"));
+    assert!(
+        flaky_probe_delta > 0,
+        "被降级的池必须保留探测流量，否则临时降级会变成永久放逐；运行态：{diagnostic}"
+    );
+    assert!(
+        flaky_probe_delta < L2_WAVE_SIZE as u64,
+        "被降级的池不应再承担主要流量，实际 {flaky_probe_delta}/{L2_WAVE_SIZE}"
+    );
+
+    // 阶段三：等到池真正重新具备承接主流量的资格。
+    //
+    // 这里必须等**两个独立的窗口**都过去，不能只等避让窗口：
+    // - 新增的避让窗口（本测试压到 2 秒）；
+    // - 既有的瞬态失败连击窗口 `ACCOUNT_TRANSIENT_FAILURE_WINDOW_SECS`（30 秒，
+    //   硬编码常量，不可配置）。连击只要还在，有效优先级就被抬高，
+    //   池会停留在最优层之外，只能靠探测流量存活。
+    //
+    // Redis TTL 不随 tokio::time::pause 前进（矩阵 §2 调研结论），
+    // 因此只能真实 sleep。轮询到连击清零即可提前结束，不必固定睡满 30 秒。
+    let mut streak_cleared = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let runtime = manager
+            .load_pool_runtime_snapshot(flaky_pool.id, &[])
+            .await
+            .expect("读取恢复期运行态");
+        let probation_over = runtime
+            .quality
+            .as_ref()
+            .is_none_or(|quality| !quality.is_in_probation(account_now_ms()));
+        if runtime.transient_failure_streak == 0 && probation_over {
+            streak_cleared = true;
+            break;
+        }
+    }
+    assert!(
+        streak_cleared,
+        "瞬态失败连击与避让窗口都应在轮询窗口内自然过期"
+    );
+
+    let mut recovery_deltas = Vec::new();
+    for wave in 0..3 {
+        let before = flaky.snapshot().0;
+        let outcomes = run_quality_wave(
+            &manager,
+            &config,
+            &format!("l2_recover_back_{wave}"),
+            L2_WAVE_SIZE,
+        )
+        .await;
+        assert_eq!(
+            count_successes(&outcomes),
+            L2_WAVE_SIZE,
+            "上游恢复后全部请求应成功"
+        );
+        recovery_deltas.push(flaky.snapshot().0 - before);
+    }
+
+    // 断言的是"**回到与健康池平起平坐**"，不是"逐轮持续上升"。
+    //
+    // 实测三轮份额形如 [137, 123, 130]/256——池在第一轮就已恢复到 ~50% 并在
+    // 平价附近抖动。单调上升断言在这里必然 flaky：没有上升空间了。
+    // 之所以恢复得这么快，是因为上面等待连击过期的 30 秒里，
+    // 探测流量已经在持续用成功样本压低失败率 EWMA。
+    //
+    // 同理刻意**不**拿"探测期份额"当基准：探测期是 probe_share_percent 的
+    // 固定配额（20% × 256 ≈ 51），与恢复中挣到的份额量级相撞，
+    // 实测会在 47/51 这种边界上随机翻面。
+    let last = recovery_deltas[recovery_deltas.len() - 1];
+    let healthy_last_wave = L2_WAVE_SIZE as u64 - last;
+    assert!(
+        last > 0 && healthy_last_wave > 0,
+        "恢复末轮两个池都应在承接流量：恢复池 {last} 次，健康池 {healthy_last_wave} 次"
+    );
+    // 平价区间放宽到 [25%, 75%]：Top-K 加权随机用未播种 fastrand，
+    // 只能断言统计区间，不能断言精确份额（矩阵 §2 防 flaky 纪律第 2 条）。
+    let last_share = last as f64 / L2_WAVE_SIZE as f64;
+    assert!(
+        (0.25..=0.75).contains(&last_share),
+        "恢复完成后应与健康池大致平分流量，实际份额 {last_share:.3}（全部轮次 {recovery_deltas:?}）"
+    );
+    // 先确认 mock 的失败预算确实已经用尽——否则"仍在避让"是上游真的还在失败，
+    // 那是测试夹具没造好，不是调度逻辑的问题。
+    let (_, total_failures) = flaky.snapshot();
+    assert_eq!(
+        total_failures, FLAKY_FAILURE_BUDGET,
+        "恢复阶段开始前 mock 的失败预算应已耗尽，否则上游仍在真实失败"
+    );
+    let recovered_quality = pool_quality(&manager, flaky_pool.id)
+        .await
+        .expect("恢复后必须仍有质量状态");
+    assert!(
+        !recovered_quality.is_in_probation(account_now_ms()),
+        "恢复后不应仍处于避让期"
+    );
+    assert!(
+        recovered_quality.recent_error_rate < 0.9,
+        "持续成功应把失败率 EWMA 压下来，实际 {}",
+        recovered_quality.recent_error_rate
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
+async fn l2_quality_composes_with_existing_transient_failure_penalty() {
+    // 既有的"瞬态失败临时降权"（硬分层内的有效优先级惩罚）
+    // 必须与新的质量评分同时生效且不互相破坏。
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = PatternExternalMessagesFakeServer::always_fail(
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+    )
+    .await;
+    let healthy = PatternExternalMessagesFakeServer::always_success("mixed-healthy").await;
+
+    // 失败池优先级更高：只有既有的瞬态降权 + 新的质量降级共同作用，
+    // 流量才会转移到优先级更低的健康池。
+    let failing_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-mixed-failing",
+        1,
+        &failing.base_url,
+        512,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-mixed-healthy",
+        10,
+        &healthy.base_url,
+        512,
+    )
+    .await;
+
+    let mut config = l2_quality_config();
+    // 保留既有因子：瞬态失败降权 20 级，足以跨越 1 → 10 的优先级差。
+    config.transient_failure_priority_penalty = 20;
+    config.retry_max_attempts = 2;
+
+    let first = run_quality_wave(&manager, &config, "l2_mixed_first", L2_WAVE_SIZE).await;
+    assert!(
+        count_successes(&first) > 0,
+        "有健康备池时，重试应能把请求救回来"
+    );
+    assert!(
+        wait_for_quality_samples(&manager, &[failing_pool.id], config.quality_min_samples).await,
+        "失败池的质量样本必须落盘"
+    );
+
+    let healthy_before = healthy.snapshot().0;
+    let outcomes = run_quality_wave(&manager, &config, "l2_mixed_second", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "既有瞬态降权与质量降级共同作用后，流量应稳定落在健康池上"
+    );
+    let healthy_delta = healthy.snapshot().0 - healthy_before;
+    assert!(
+        healthy_delta >= L2_WAVE_SIZE as u64,
+        "健康池应承担全部流量，实际 {healthy_delta} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
+async fn l2_quality_disabled_keeps_legacy_priority_routing_under_load() {
+    // 矩阵 §4 规定这是**最先必须通过**的用例：
+    // 新功能不生效只是没收益，旧逻辑被破坏是事故。
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    // 主池慢且优先级高，备池快但优先级低。
+    // 关闭质量感知后，必须严格按优先级走——慢不构成让位的理由。
+    let slow_primary =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(120), "slow-primary")
+            .await;
+    let fast_backup = PatternExternalMessagesFakeServer::always_success("fast-backup").await;
+
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-off-primary",
+        1,
+        &slow_primary.base_url,
+        512,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-off-backup",
+        10,
+        &fast_backup.base_url,
+        512,
+    )
+    .await;
+
+    let mut config = l2_quality_config();
+    config.quality_aware_scheduling_enabled = false;
+
+    let outcomes = run_quality_wave(&manager, &config, "l2_off", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "关闭质量感知时全部请求仍应成功"
+    );
+
+    let (primary_hits, _) = slow_primary.snapshot();
+    let backup_hits = fast_backup.snapshot().0;
+    assert_eq!(
+        primary_hits as usize, L2_WAVE_SIZE,
+        "主开关关闭时必须严格按优先级路由到主池，实际主池 {primary_hits} 次"
+    );
+    assert_eq!(
+        backup_hits, 0,
+        "主开关关闭时低优先级备池不得分流，实际 {backup_hits} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
+async fn l2_quality_never_promotes_a_lower_priority_tier_under_load() {
+    // 这是 P0-b 那个被既有测试捕获的缺陷的 L2 版本：
+    // 主池又慢又差，备池又快又好，但只要主池还能用，就不该让位。
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let slow_primary = PatternExternalMessagesFakeServer::slow_success(
+        Duration::from_millis(150),
+        "slow-but-primary",
+    )
+    .await;
+    let fast_backup = PatternExternalMessagesFakeServer::always_success("fast-backup").await;
+
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-tier-primary",
+        1,
+        &slow_primary.base_url,
+        512,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-tier-backup",
+        10,
+        &fast_backup.base_url,
+        512,
+    )
+    .await;
+
+    let config = l2_quality_config();
+
+    let warmup = run_quality_wave(&manager, &config, "l2_prio_warm", L2_WAVE_SIZE).await;
+    assert_eq!(count_successes(&warmup), L2_WAVE_SIZE);
+    assert!(
+        wait_for_quality_samples(&manager, &[primary_pool.id], config.quality_min_samples).await,
+        "主池质量样本必须落盘"
+    );
+
+    let backup_before = fast_backup.snapshot().0;
+    let outcomes = run_quality_wave(&manager, &config, "l2_prio_hot", L2_WAVE_SIZE).await;
+    assert_eq!(count_successes(&outcomes), L2_WAVE_SIZE);
+
+    let backup_delta = fast_backup.snapshot().0 - backup_before;
+    assert_eq!(
+        backup_delta, 0,
+        "主池只是慢、并未失败时，质量分不得把低优先级备池提上来，实际备池收到 {backup_delta} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
+async fn l2_quality_shifts_traffic_to_the_faster_pool_within_one_priority_tier() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let slow = PatternExternalMessagesFakeServer::slow_success(
+        Duration::from_millis(150),
+        "l2-slow-but-ok",
+    )
+    .await;
+    let fast = PatternExternalMessagesFakeServer::always_success("l2-fast-ok").await;
+
+    // 关键：两个池**同优先级**，质量是唯一的区分因素。
+    let slow_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-tier-slow", 5, &slow.base_url, 512)
+            .await;
+    let fast_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-tier-fast", 5, &fast.base_url, 512)
+            .await;
+
+    let config = l2_quality_config();
+
+    // 第一轮：质量数据为空，两池应大致均分（此时没有任何倾向性依据）。
+    let warmup = run_quality_wave(&manager, &config, "l2_tier_warm", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&warmup),
+        L2_WAVE_SIZE,
+        "两个池都健康时全部请求应成功"
+    );
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[slow_pool.id, fast_pool.id],
+            config.quality_min_samples
+        )
+        .await,
+        "质量样本必须在轮询窗口内落到 Redis"
+    );
+
+    let (slow_before, _) = slow.snapshot();
+    let (fast_before, _) = fast.snapshot();
+
+    // 第二轮：质量数据已形成，流量应显著偏向快池。
+    let outcomes = run_quality_wave(&manager, &config, "l2_tier_hot", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "质量调度不得让健康池上的请求失败"
+    );
+
+    let slow_delta = slow.snapshot().0 - slow_before;
+    let fast_delta = fast.snapshot().0 - fast_before;
+    assert!(
+        fast_delta > slow_delta,
+        "同优先级下流量应偏向更快的池：快池 {fast_delta} 次 vs 慢池 {slow_delta} 次"
+    );
+    // 只断言"显著偏向"而非精确比例：Top-K 加权随机用未播种 fastrand。
+    assert!(
+        slow_delta > 0,
+        "慢池不应被完全饿死（它只是慢，不是坏），实际 {slow_delta} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
+async fn l2_single_remaining_pool_is_never_starved_even_when_failing() {
+    // 极端场景：只剩一个池且它一直在失败。候选集必须不清空——
+    // 即使它很差，它也是唯一的希望。
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let only =
+        PatternExternalMessagesFakeServer::always_fail(StatusCode::BAD_GATEWAY, "upstream is down")
+            .await;
+    let pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-only-bad", 1, &only.base_url, 512)
+            .await;
+
+    let config = l2_quality_config();
+
+    // 先打一轮把失败率拉满并触发降级
+    let first = run_quality_wave(&manager, &config, "l2_only_first", 64).await;
+    assert_eq!(count_successes(&first), 0, "上游全失败时不应有成功");
+    assert!(
+        wait_for_quality_samples(&manager, &[pool.id], config.quality_min_samples).await,
+        "失败样本也必须落盘"
+    );
+
+    let hits_before = only.snapshot().0;
+    // 第二轮：即使已被降级，唯一的池仍必须继续收到请求。
+    let _ = run_quality_wave(&manager, &config, "l2_only_second", 64).await;
+    let hits_after = only.snapshot().0;
+    assert!(
+        hits_after > hits_before,
+        "唯一可用的池即使被降级也必须继续收到流量，否则服务直接不可用；\
+         降级前 {hits_before} 次，降级后 {hits_after} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_zero_external_wait_reaches_a_bounded_final_error() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        capacity_mode: CapacityMode::Wait,
+        max_queued_requests: 1,
+        dispatch_max_wait_secs: 0,
+        ..AccountsConfig::default()
+    };
+    assert_eq!(config.effective_dispatch_max_wait_secs(), 5);
+
+    let route = test_route("claude-sonnet-4-5");
+    let mut queue_guard = None;
+    let mut wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+    let mut capacity_waiter = manager.capacity_signal.register();
+    let decision = manager
+        .handle_capacity_unavailable(
+            &route,
+            Vec::new(),
+            &config,
+            PoolCapacityWaitContext {
+                reason: PoolCapacityWaitReason::Full,
+                wait_for: None,
+                cooldown_reason: None,
+                cooldown_scope: None,
+                cooldown_remaining_secs: None,
+                eligible_pools: 1,
+                available_pools: 0,
+                temporary_unavailable_pools: 1,
+                coordinator_unavailable_kind: None,
+            },
+            &mut queue_guard,
+            &mut wait_started_at,
+            &mut capacity_waiter,
+            None,
+        )
+        .await;
+
+    let ExternalCapacityDecision::FinalError(error) = decision else {
+        panic!("legacy zero wait must terminate at the safe default deadline");
+    };
+    assert_eq!(error.route_error_type, "account_wait_timeout");
+    // 容量等待超时属于可重试容量错误，与容量已满保持一致。
+    assert!(error.retryable);
+    assert!(queue_guard.is_none());
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_account_rows_are_isolated_and_fail_closed_for_five_rounds() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let mut healthy_request = create_pool_request("malformed-row-healthy", 1, true);
+    healthy_request.supported_models = vec!["model-healthy-only".to_string()];
+    let healthy = postgres.create_account(healthy_request).await.unwrap();
+    let mut candidate_request = create_pool_request("malformed-row-candidate", 2, true);
+    candidate_request.supported_models = vec!["model-corrupt-only".to_string()];
+    let candidate_base_url = candidate_request.base_url.clone();
+    let candidate_api_key = candidate_request.api_key.clone();
+    let candidate = postgres.create_account(candidate_request).await.unwrap();
+    let config = AccountsConfig {
+        enabled: true,
+        ..AccountsConfig::default()
+    };
+    let corrupt_cases = [
+        "base_url",
+        "base_url_without_host",
+        "api_key",
+        "auth_type",
+        "max_concurrent_requests",
+        "usage_projection_mode",
+        "stream_response_mode",
+        "auto_disable_policy",
+        "model_mapping_mode",
+        "model_mapping_rules",
+        "model_mapping_rules_blank",
+        "supported_models",
+        "supported_models_blank",
+    ];
+
+    for round in 1..=5 {
+        for case in corrupt_cases {
+            restore_dispatch_pool_configuration(
+                &postgres,
+                candidate.id,
+                &candidate_base_url,
+                &candidate_api_key,
+                "model-corrupt-only",
+            )
+            .await;
+            corrupt_dispatch_pool_configuration(&postgres, candidate.id, case).await;
+            manager.invalidate_static_pool_snapshot();
+
+            assert!(
+                !manager
+                    .has_eligible_pool_for_model(&config, "model-corrupt-only")
+                    .await,
+                "round {round}, case {case}: malformed row must not authorize static fallback"
+            );
+            assert!(
+                manager
+                    .has_eligible_pool_for_model(&config, "model-healthy-only")
+                    .await,
+                "round {round}, case {case}: healthy row must remain eligible"
+            );
+            let authoritative = manager
+                .load_authoritative_pool_snapshot()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "round {round}, case {case}: healthy rows must survive malformed peer: {}",
+                        error.kind.as_str()
+                    )
+                });
+            assert!(authoritative.iter().any(|pool| pool.id == healthy.id));
+            assert!(
+                authoritative.iter().all(|pool| pool.id != candidate.id),
+                "round {round}, case {case}: malformed row entered authoritative dispatch snapshot"
+            );
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn never_recovering_pool_keeps_being_re_probationed() {
+    // D3 "永不恢复"：每次避让到期后失败率仍超标，层级必须持续递增、
+    // 避让时长持续拉长，直至上限。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        degrade_probation_secs: 100,
+        max_probation_secs: 400,
+        ..Default::default()
+    };
+
+    let mut level = 0u32;
+    let mut now_ms = 0i64;
+    let mut observed = Vec::new();
+    for _ in 0..5 {
+        match evaluate_account_degrade(&degrade_state(1.0, level), &config, now_ms) {
+            AccountDegradeDecision::Probation {
+                until_ms,
+                level: next_level,
+                ..
+            } => {
+                observed.push((until_ms - now_ms) / 1_000);
+                level = next_level;
+                now_ms = until_ms + 1;
+            }
+            other => panic!("持续失败必须持续降级，实际 {other:?}"),
+        }
+    }
+    assert_eq!(observed, vec![100, 200, 400, 400, 400]);
+}
+
+#[test]
+fn non_stream_missing_usage_injects_estimated_billing_body() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected =
+        process_non_stream_response_usage(body, Some(&route), None, std::iter::empty::<String>());
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("estimated usage");
+
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("missing_upstream_usage")
+    );
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0);
+    assert!(usage["output_tokens"].as_i64().unwrap() >= 0);
+
+    let billing = account_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("missing_upstream_usage")
+    );
+    assert_eq!(billing.usage_candidate_path, None);
+    assert!(billing.reported_usage.input_tokens > 0);
+}
+
+#[test]
+fn non_stream_stop_reason_is_captured_for_account_usage_records() {
+    let route = test_route("claude-opus-4-6");
+
+    let anthropic = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"type":"message","content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens","usage":{"input_tokens":10,"output_tokens":20}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        anthropic.usage_capture.downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+
+    let openai = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        openai.usage_capture.downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+}
+
+#[test]
+fn non_stream_unknown_json_without_usage_injects_estimated_usage_and_billing() {
+    let body = Bytes::from_static(
+        br#"{"id":"chatcmpl_fake","choices":[{"message":{"role":"assistant","content":"OK"}}],"model":"claude-opus-4-6"}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected =
+        process_non_stream_response_usage(body, Some(&route), None, std::iter::empty::<String>());
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("estimated usage");
+
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0);
+    assert!(usage["output_tokens"].as_i64().unwrap() > 0);
+
+    let billing = account_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert_eq!(billing.usage_candidate_path, None);
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert!(billing.reported_usage.output_tokens > 0);
+}
+
+#[test]
+fn non_stream_unknown_text_without_usage_records_estimated_billing_without_rewriting_body() {
+    let body = Bytes::from_static(b"OK");
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = process_non_stream_response_usage(
+        body.clone(),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+
+    assert_eq!(projected.body, body);
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+
+    let billing = account_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert_eq!(billing.reported_usage.output_tokens, 0);
+}
+
+#[test]
+fn openai_stream_usage_keeps_local_shaping_separate_from_raw_billing() {
+    let route = test_route("claude-opus-4-6");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"prompt_tokens":1234,"completion_tokens":56,"total_tokens":1290}}
+
+"#;
+
+    let rewritten = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let value = event_data_value(&rewritten);
+    assert_eq!(value["usage"]["output_tokens"], 56);
+
+    let billing = account_billing_from_capture_ref(&route, &pool, &capture)
+        .expect("stream usage should produce billing");
+    assert_eq!(billing.raw_usage.input_tokens, 1234);
+    assert_eq!(billing.raw_usage.output_tokens, 56);
+    assert_eq!(billing.shaped_usage.output_tokens, 56);
+    assert_eq!(
+        value["usage"]["input_tokens"].as_i64(),
+        Some(billing.reported_usage.input_tokens as i64)
+    );
+    assert!(billing.usage_projection_applied);
+    assert!(!billing.usage_estimated);
+}
+
+#[test]
+fn openai_usage_is_captured_for_stream_account_billing() {
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+
+    capture_sse_event_usage(
+        br#"event: message_delta
+data: {"type":"message_delta","usage":{"prompt_tokens":1234,"completion_tokens":56,"total_tokens":1290}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+
+    let billing = account_billing_from_capture_ref(&route, &pool, &capture)
+        .expect("stream usage should produce billing");
+    assert_eq!(billing.raw_usage.input_tokens, 1234);
+    assert_eq!(billing.raw_usage.output_tokens, 56);
+    assert_eq!(billing.reported_usage.input_tokens, 1234);
+    assert_eq!(billing.reported_usage.output_tokens, 56);
+    assert!(!billing.usage_estimated);
+    assert_eq!(
+        billing.usage_candidate_path, None,
+        "stream captures do not assign a non-stream candidate path"
+    );
+}
+
+#[test]
+fn openai_usage_is_normalized_for_non_stream_account_body() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = maybe_project_non_stream_usage(body, None);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(usage["input_tokens"], 11);
+    assert_eq!(usage["output_tokens"], 3);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.input_tokens),
+        Some(11)
+    );
+    assert_eq!(
+        projected.usage_capture.usage_candidate_path.as_deref(),
+        Some("$.usage")
+    );
+
+    let billing = account_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert_eq!(billing.raw_usage.input_tokens, 11);
+    assert_eq!(billing.reported_usage.output_tokens, 3);
+    assert_eq!(billing.usage_candidate_path.as_deref(), Some("$.usage"));
+    assert!(!billing.usage_estimated);
+}
+
+#[test]
+fn persisted_account_enum_parsers_reject_unknown_values_for_five_rounds() {
+    for round in 1..=5 {
+        assert_eq!(
+            AccountAuthType::parse_known("bearer"),
+            Some(AccountAuthType::Bearer),
+            "round {round}"
+        );
+        assert!(AccountAuthType::parse_known("corrupt").is_none());
+        assert_eq!(
+            UsageProjectionMode::parse_known("pass_through"),
+            Some(UsageProjectionMode::PassThrough)
+        );
+        assert!(UsageProjectionMode::parse_known("corrupt").is_none());
+        assert_eq!(
+            AutoDisablePolicy::parse_known("inherit"),
+            Some(AutoDisablePolicy::Inherit)
+        );
+        assert!(AutoDisablePolicy::parse_known("corrupt").is_none());
+        assert_eq!(
+            ModelMappingMode::parse_known("processed_mapping"),
+            Some(ModelMappingMode::ProcessedMapping)
+        );
+        assert!(ModelMappingMode::parse_known("corrupt").is_none());
+        assert_eq!(
+            StreamResponseMode::parse_known("event_passthrough"),
+            Some(StreamResponseMode::EventPassthrough)
+        );
+        assert!(StreamResponseMode::parse_known("corrupt").is_none());
+        assert_eq!(
+            StreamRetryMode::parse_known("inherit"),
+            Some(StreamRetryMode::Inherit)
+        );
+        assert_eq!(
+            StreamRetryMode::parse_known("enabled"),
+            Some(StreamRetryMode::Enabled)
+        );
+        assert_eq!(
+            StreamRetryMode::parse_known("disabled"),
+            Some(StreamRetryMode::Disabled)
+        );
+        assert!(StreamRetryMode::parse_known("corrupt").is_none());
+    }
+}
+
+#[test]
+fn pool_auto_disable_policy_can_override_global_switch() {
+    let mut config = AccountsConfig {
+        auto_disable_enabled: false,
+        ..Default::default()
+    };
+
+    assert!(!pool_auto_disable_policy_enabled(
+        AutoDisablePolicy::Inherit,
+        &config
+    ));
+    assert!(pool_auto_disable_policy_enabled(
+        AutoDisablePolicy::Enabled,
+        &config
+    ));
+    assert!(!pool_auto_disable_policy_enabled(
+        AutoDisablePolicy::Disabled,
+        &config
+    ));
+
+    config.auto_disable_enabled = true;
+    assert!(pool_auto_disable_policy_enabled(
+        AutoDisablePolicy::Inherit,
+        &config
+    ));
+}
+
+#[test]
+fn probationary_pool_still_receives_probe_traffic_outside_top_k() {
+    // 核心回归：Top-K = 3 且有 3 个健康池时，被避让的池会排在第 4 位，
+    // 纯罚分方案会让它拿到**零**流量，从而永远无法自证恢复。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        quality_top_k: 3,
+        probe_share_percent: 10,
+        ..Default::default()
+    };
+
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(210.0), Some(1_050.0)),
+        scored_pool(3, 1, 0.0, Some(220.0), Some(1_100.0)),
+        probationary_pool(4, 1, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let probe_share = shares.get(&4).copied().unwrap_or(0.0);
+    assert!(
+        probe_share > 0.05 && probe_share < 0.16,
+        "避让池必须保留约 10% 探测流量，实际 {probe_share:.3}"
+    );
+}
+
+#[test]
+fn probe_share_zero_gives_probationary_pool_no_traffic() {
+    // 探测比例设为 0 时退化为"硬避让"，必须尊重该配置。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        quality_top_k: 3,
+        probe_share_percent: 0,
+        ..Default::default()
+    };
+
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(210.0), Some(1_050.0)),
+        scored_pool(3, 1, 0.0, Some(220.0), Some(1_100.0)),
+        probationary_pool(4, 1, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(shares.get(&4).copied().unwrap_or(0.0), 0.0);
+}
+
+#[test]
+fn probe_traffic_never_crosses_priority_tiers() {
+    // 探测流量只在最优优先级层内发生：一个低优先级的避让池
+    // 不得借探测通道抢到高优先级层的流量。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        probe_share_percent: 50,
+        ..Default::default()
+    };
+
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        probationary_pool(2, 5, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&2).copied().unwrap_or(0.0),
+        0.0,
+        "低优先级层的避让池不得通过探测通道越层抢流量"
+    );
+}
+
+#[test]
+fn probe_traffic_reaches_a_pool_demoted_by_its_failure_streak() {
+    // L2 捕获的缺陷：被降级的池通常同时背着既有的瞬态失败连击，
+    // 连击会抬高有效优先级把它挤出最优层，于是层内探测永远抽不到它。
+    //
+    // 这与"用户配置的低优先级"必须区别对待：
+    // 这个池的**基础优先级与主池相同**，只是被系统的失败惩罚降了下去。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        probe_share_percent: 20,
+        transient_failure_priority_penalty: 20,
+        ..Default::default()
+    };
+
+    let healthy = scored_pool(1, 5, 0.0, Some(200.0), Some(1_000.0));
+    let mut demoted = probationary_pool(2, 5, 10_000);
+    // 同样的基础优先级 5，但背着 3 连击 → 有效优先级 5 + 60 = 65
+    demoted.transient_failure_streak = 3;
+
+    let shares = selection_shares(&[healthy, demoted], &config, 0, DISTRIBUTION_ROUNDS);
+    let probe_share = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        probe_share > 0.1 && probe_share < 0.3,
+        "被连击挤出最优层的避让池仍须获得探测流量，否则它永远拿不到样本自证恢复，实际 {probe_share:.3}"
+    );
+}
+
+#[test]
+fn probe_traffic_still_respects_user_configured_priority_for_demoted_pools() {
+    // 边界：一个池既是用户配置的低优先级、又背着连击、还在避让期。
+    // 用户意图优先——它不该拿到探测流量。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        probe_share_percent: 50,
+        transient_failure_priority_penalty: 20,
+        ..Default::default()
+    };
+
+    let healthy = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
+    let mut demoted_backup = probationary_pool(2, 9, 10_000);
+    demoted_backup.transient_failure_streak = 3;
+
+    let shares = selection_shares(&[healthy, demoted_backup], &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&2).copied().unwrap_or(0.0),
+        0.0,
+        "用户配置为低优先级的备用池不得因为处于避让期就获得探测流量"
+    );
+}
+
+#[test]
+fn quality_baseline_ignores_lower_priority_pools() {
+    let config = quality_enabled_config();
+    let candidates = vec![
+        // 最优层：质量差异必须仍然影响排序。
+        scored_pool(1, 1, 0.0, Some(100.0), Some(100.0)),
+        scored_pool(2, 1, 0.0, Some(1_000.0), Some(1_000.0)),
+        // 备用层的极慢账号不应扭曲主层中位数。
+        scored_pool(3, 5, 0.0, Some(100_000.0), Some(100_000.0)),
+        scored_pool(4, 5, 0.0, Some(100_000.0), Some(100_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let fast = shares.get(&1).copied().unwrap_or(0.0);
+    let slow = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        fast > slow,
+        "低优先级池的延迟不得稀释最优层质量排序：fast={fast:.3} slow={slow:.3}"
+    );
+    assert!(
+        !shares.contains_key(&3) && !shares.contains_key(&4),
+        "低优先级池仍不得越过硬分层"
+    );
+}
+
+#[test]
+fn quality_config_serializes_with_the_camel_case_keys_the_ui_sends() {
+    // 锁定前后端配置键契约：前端 ui/src/types/api.ts 按这些 camelCase 键提交，
+    // 任一侧改名都会让设置被 serde 默认值静默吞掉——用户会以为保存成功了。
+    let config = AccountsConfig::default();
+    let value = serde_json::to_value(&config).expect("配置必须可序列化");
+    let object = value.as_object().expect("配置必须是 JSON 对象");
+
+    for key in [
+        "qualityAwareSchedulingEnabled",
+        "qualityEwmaAlpha",
+        "qualitySampleTtlSecs",
+        "qualityMinSamples",
+        "qualityPriorityWeight",
+        "qualityLoadWeight",
+        "qualityErrorWeight",
+        "qualityLatencyWeight",
+        "qualityProbationWeight",
+        "qualityTopK",
+        "degradeWindowSecs",
+        "degradeErrorRateThreshold",
+        "degradeProbationSecs",
+        "maxProbationSecs",
+        "probeSharePercent",
+        "recoveryRampSecs",
+    ] {
+        assert!(object.contains_key(key), "缺少前端依赖的配置键 {key}");
+    }
+
+    // 主开关默认关闭，避免升级后未经显式同意改变账号调度行为。
+    assert_eq!(
+        object["qualityAwareSchedulingEnabled"],
+        serde_json::Value::Bool(false)
+    );
+}
+
+#[test]
+fn quality_median_handles_even_odd_and_empty_inputs() {
+    assert_eq!(median_of([].into_iter()), None);
+    assert_eq!(median_of([5.0].into_iter()), Some(5.0));
+    assert_eq!(median_of([1.0, 3.0].into_iter()), Some(2.0));
+    assert_eq!(median_of([3.0, 1.0, 2.0].into_iter()), Some(2.0));
+    // 非有限值必须被剔除而不是污染中位数
+    assert_eq!(median_of([f64::NAN, 2.0].into_iter()), Some(2.0));
+}
+
+#[test]
+fn quality_relative_penalty_only_punishes_worse_than_median() {
+    // 只惩罚"比同伴差"，不奖励"比同伴好"——
+    // 否则全体一起变慢时会有人被无端降权。
+    assert_eq!(
+        relative_penalty(Some(100.0), Some(200.0)),
+        0.0,
+        "优于中位数不罚分"
+    );
+    assert_eq!(
+        relative_penalty(Some(200.0), Some(200.0)),
+        0.0,
+        "等于中位数不罚分"
+    );
+    assert!((relative_penalty(Some(400.0), Some(200.0)) - 1.0).abs() < 1e-9);
+
+    // 缺失数据、非法中位数一律不罚分
+    assert_eq!(relative_penalty(None, Some(200.0)), 0.0);
+    assert_eq!(relative_penalty(Some(200.0), None), 0.0);
+    assert_eq!(relative_penalty(Some(200.0), Some(0.0)), 0.0);
+    assert_eq!(relative_penalty(Some(f64::NAN), Some(200.0)), 0.0);
+    assert_eq!(relative_penalty(Some(f64::INFINITY), Some(200.0)), 0.0);
+}
+
+#[test]
+fn quality_sampling_counts_genuine_upstream_400s() {
+    // 同样是 400，但不是超长请求——这类仍然是上游行为异常，必须计入。
+    assert!(external_error_affects_pool_quality(&quality_test_error(
+        Some(StatusCode::BAD_REQUEST),
+        "upstream rejected the request unexpectedly",
+        None
+    )));
+}
+
+#[test]
+fn quality_sampling_counts_upstream_faults() {
+    // 真正的上游故障必须全部计入，否则质量曲线只会向好、永远不降级。
+    let cases = [
+        (
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            "rate limit",
+            Some("rate_limited"),
+        ),
+        (
+            Some(StatusCode::INTERNAL_SERVER_ERROR),
+            "server error",
+            Some("server_error"),
+        ),
+        (
+            Some(StatusCode::BAD_GATEWAY),
+            "bad gateway",
+            Some("server_error"),
+        ),
+        (Some(StatusCode::SERVICE_UNAVAILABLE), "unavailable", None),
+        (Some(StatusCode::GATEWAY_TIMEOUT), "timeout", None),
+        (
+            Some(StatusCode::UNAUTHORIZED),
+            "auth failed",
+            Some("auth_failed"),
+        ),
+        // 无 status = 网络层错误（连接失败/超时），是最典型的账号不可用信号。
+        (None, "connection reset by peer", None),
+    ];
+    for (status, message, reason) in cases {
+        assert!(
+            external_error_affects_pool_quality(&quality_test_error(status, message, reason)),
+            "上游故障必须计入健康度: {status:?} {message}"
+        );
+    }
+}
+
+#[test]
+fn quality_sampling_ignores_downstream_caused_payload_errors() {
+    // 下游自己发了超长请求体导致的 400，责任不在上游账号。
+    // 计入健康度会让"用户发了一次长上下文"变成"这个账号不好"，
+    // 进而错误降级一个完全健康的账号。
+    for message in [
+        "input is too long",
+        "Prompt is too long for this model",
+        "context window is full",
+        "content_length_exceeds_threshold",
+        "request payload is too large",
+    ] {
+        assert!(
+            !external_error_affects_pool_quality(&quality_test_error(
+                Some(StatusCode::BAD_REQUEST),
+                message,
+                None
+            )),
+            "下游超长请求不得计入账号健康度: {message}"
+        );
+    }
+}
+
+#[test]
+fn quality_sampling_ignores_model_routing_misses() {
+    // 模型不匹配是路由/配置问题，不是账号质量问题：
+    // 与既有的 should_record_account_soft_failure 判定保持一致，
+    // 否则同一个事件会在两套健康度里得出相反结论。
+    for reason in ["model_mapping_miss", "model_unavailable"] {
+        assert!(
+            !external_error_affects_pool_quality(&quality_test_error(
+                Some(StatusCode::NOT_FOUND),
+                "model not available",
+                Some(reason)
+            )),
+            "{reason} 不得计入账号健康度"
+        );
+        assert!(
+            !should_record_account_soft_failure(reason),
+            "质量归因必须与既有软失败判定一致"
+        );
+    }
+    // 模型级 cooldown 关闭时没有 reason，仍必须依据错误正文保持中性。
+    for (status, message) in [
+        (
+            Some(StatusCode::NOT_FOUND),
+            "external upstream model is unavailable",
+        ),
+        (Some(StatusCode::NOT_FOUND), "invalid model id"),
+        (
+            Some(StatusCode::BAD_REQUEST),
+            "requested model is not available",
+        ),
+    ] {
+        assert!(
+            !external_error_affects_pool_quality(&quality_test_error(status, message, None)),
+            "无 cooldown reason 的模型路由错误不得计入账号健康度: {status:?} {message}"
+        );
+    }
+}
+
+#[test]
+fn quality_scheduling_disabled_matches_legacy_selection_exactly() {
+    // 主开关关闭时必须走 legacy 路径，与变更前行为完全一致：
+    // 只选最优先级 + 最低负载层，且质量数据**完全不影响**结果。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: false,
+        ..Default::default()
+    };
+
+    // 给低优先级池配极好的质量、高优先级池配极差的质量。
+    // 开关关闭时，质量必须被完全忽略，高优先级池仍然全取。
+    let candidates = vec![
+        scored_pool(1, 1, 0.9, Some(9_000.0), Some(60_000.0)),
+        scored_pool(2, 5, 0.0, Some(50.0), Some(200.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&1).copied().unwrap_or(0.0),
+        1.0,
+        "开关关闭时必须严格按优先级选择，质量数据不得有任何影响"
+    );
+    assert!(!shares.contains_key(&2), "低优先级池不得被选中");
+}
+
+#[test]
+fn quality_scheduling_disabled_preserves_legacy_load_balancing() {
+    // legacy 的同优先级负载均衡语义必须保持：负载低的胜出。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: false,
+        ..Default::default()
+    };
+
+    let mut light = test_pool("https://light.example.test", true);
+    light.id = 1;
+    light.priority = 1;
+    light.max_concurrent_requests = 10;
+    let mut heavy = test_pool("https://heavy.example.test", true);
+    heavy.id = 2;
+    heavy.priority = 1;
+    heavy.max_concurrent_requests = 10;
+
+    let selected = select_account_candidate(
+        vec![candidate(light, 1, 0), candidate(heavy, 8, 0)],
+        &config,
+        0,
+    )
+    .expect("必须选出一个池");
+    assert_eq!(selected.id, 1, "同优先级下负载低的池必须胜出");
+}
+
+#[test]
+fn quality_scheduling_empty_candidates_returns_none() {
+    let config = AccountsConfig::default();
+    assert!(select_account_candidate(Vec::new(), &config, 0).is_none());
+}
+
+#[test]
+fn quality_scheduling_handles_pools_without_any_quality_data() {
+    // 完全无质量记录（Redis 里没有键）时必须退化为中性，不得 panic。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        ..AccountsConfig::default()
+    };
+    let mut a = test_pool("https://a.example.test", true);
+    a.id = 1;
+    a.priority = 1;
+    let mut b = test_pool("https://b.example.test", true);
+    b.id = 2;
+    b.priority = 1;
+
+    let shares = selection_shares(
+        &[candidate(a, 0, 0), candidate(b, 0, 0)],
+        &config,
+        0,
+        DISTRIBUTION_ROUNDS,
+    );
+    for id in [1u64, 2] {
+        assert!(
+            shares.get(&id).copied().unwrap_or(0.0) > 0.3,
+            "无质量数据时两池应大致均分"
+        );
+    }
+}
+
+#[test]
+fn quality_scheduling_keeps_all_pools_available_when_everyone_is_degraded() {
+    // 全体劣化时，相对中位数比较让所有人罚分归零，
+    // 候选集**绝不能**被清空——这是"降级时保证可用"的核心。
+    let config = quality_enabled_config();
+    let candidates = vec![
+        scored_pool(1, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(2, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(3, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    for id in [1u64, 2, 3] {
+        let share = shares.get(&id).copied().unwrap_or(0.0);
+        assert!(
+            share > 0.15,
+            "全体劣化时不得饿死任何池，池 {id} 份额仅 {share:.3}"
+        );
+    }
+}
+
+#[test]
+fn quality_scheduling_never_promotes_lower_priority_tier() {
+    // 这是 P0-b 修正的核心：无论质量分差多大，
+    // 低优先级层都不得被提拔到高优先级层之上。
+    let config = quality_enabled_config();
+    let candidates = vec![
+        // 高优先级但质量极差
+        scored_pool(1, 1, 0.95, Some(30_000.0), Some(120_000.0)),
+        // 低优先级但质量完美
+        scored_pool(2, 2, 0.0, Some(10.0), Some(50.0)),
+        scored_pool(3, 3, 0.0, Some(10.0), Some(50.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&1).copied().unwrap_or(0.0),
+        1.0,
+        "优先级是硬分层，质量分不得跨层提拔"
+    );
+}
+
+#[test]
+fn quality_scheduling_never_starves_a_probationary_pool() {
+    // 避让中的池只是罚分靠后，**不得**被移出候选集，
+    // 否则它永远拿不到探测流量、永远无法自证恢复。
+    let config = quality_enabled_config();
+    let now_ms = 1_000_000;
+
+    let mut healthy = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
+    let mut probation = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+    if let Some(quality) = probation.quality.as_mut() {
+        quality.probation_until_ms = Some(now_ms + 60_000);
+    }
+    let _ = &mut healthy;
+
+    let shares = selection_shares(&[healthy, probation], &config, now_ms, DISTRIBUTION_ROUNDS);
+    let probation_share = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        probation_share > 0.0,
+        "避让池必须仍能收到探测流量，实际份额为 0"
+    );
+    assert!(
+        probation_share < 0.15,
+        "避让池份额必须显著低于健康池，实际 {probation_share:.3}"
+    );
+}
+
+#[test]
+fn quality_scheduling_ranks_error_rate_above_latency_signals() {
+    // 用户明确要求：报错/重试多的判断优先级要**高于**首字等质量曲线。
+    // 构造：A 报错但很快，B 不报错但很慢。B 必须胜出。
+    let config = quality_enabled_config();
+    let candidates = vec![
+        // 快但报错
+        scored_pool(1, 1, 0.5, Some(50.0), Some(200.0)),
+        // 慢但不报错
+        scored_pool(2, 1, 0.0, Some(8_000.0), Some(40_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let fast_but_erroring = shares.get(&1).copied().unwrap_or(0.0);
+    let slow_but_reliable = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        slow_but_reliable > fast_but_erroring,
+        "失败率必须压过延迟：slow_reliable={slow_but_reliable:.3} fast_erroring={fast_but_erroring:.3}"
+    );
+}
+
+#[test]
+fn quality_scheduling_reorders_within_the_same_priority_tier() {
+    // 同一优先级层内，质量好的必须显著占优。
+    let config = quality_enabled_config();
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.8, Some(200.0), Some(1_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let healthy = shares.get(&1).copied().unwrap_or(0.0);
+    let erroring = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        healthy > erroring,
+        "同层内健康池份额必须高于报错池：healthy={healthy:.3} erroring={erroring:.3}"
+    );
+    assert!(
+        healthy > 0.75,
+        "失败率权重(100)应让健康池占据绝大多数份额，实际 {healthy:.3}"
+    );
+}
+
+#[test]
+fn quality_scheduling_separates_ttft_and_total_latency_signals() {
+    // 首字高 与 总耗时长 是两个独立因子，必须能分别生效。
+    let config = quality_enabled_config();
+
+    // 仅首字劣化
+    let ttft_only = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(6_000.0), Some(1_000.0)),
+    ];
+    let ttft_shares = selection_shares(&ttft_only, &config, 0, DISTRIBUTION_ROUNDS);
+    assert!(
+        ttft_shares.get(&1).copied().unwrap_or(0.0) > ttft_shares.get(&2).copied().unwrap_or(0.0),
+        "首字劣化必须降低份额"
+    );
+
+    // 仅总耗时劣化
+    let latency_only = vec![
+        scored_pool(3, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(4, 1, 0.0, Some(200.0), Some(30_000.0)),
+    ];
+    let latency_shares = selection_shares(&latency_only, &config, 0, DISTRIBUTION_ROUNDS);
+    assert!(
+        latency_shares.get(&3).copied().unwrap_or(0.0)
+            > latency_shares.get(&4).copied().unwrap_or(0.0),
+        "总耗时劣化必须降低份额（且与首字独立）"
+    );
+}
+
+#[test]
+fn quality_scheduling_still_selects_the_only_pool_even_when_degraded() {
+    // 唯一账号即使质量极差也必须继续被选中，否则服务直接不可用。
+    let config = quality_enabled_config();
+    let candidates = vec![scored_pool(1, 1, 1.0, Some(60_000.0), Some(300_000.0))];
+
+    let selected = select_account_candidate(candidates, &config, 0);
+    assert_eq!(
+        selected.map(|pool| pool.id),
+        Some(1),
+        "唯一账号劣化也必须被选中"
+    );
+}
+
+#[test]
+fn quality_scheduling_top_k_larger_than_candidate_count_is_safe() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        quality_top_k: 99,
+        ..Default::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.1, Some(300.0), Some(1_200.0)),
+    ];
+    let shares = selection_shares(&candidates, &config, 0, 500);
+    assert_eq!(shares.values().sum::<f64>().round(), 1.0);
+}
+
+#[test]
+fn quality_scheduling_top_k_one_always_picks_the_best_scoring_pool() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        quality_top_k: 1,
+        ..Default::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.9, Some(9_000.0), Some(50_000.0)),
+    ];
+    let shares = selection_shares(&candidates, &config, 0, 500);
+    assert_eq!(
+        shares.get(&1).copied().unwrap_or(0.0),
+        1.0,
+        "top_k=1 时必须确定性地选最优池"
+    );
+}
+
+#[test]
+fn quality_scheduling_treats_insufficient_samples_as_neutral() {
+    // 样本不足的池按中性值处理：既不因"没数据"被判差，也不被优待。
+    // 否则新加入的账号永远起不来。
+    let config = quality_enabled_config();
+
+    let mut cold = test_pool("https://cold.example.test", true);
+    cold.id = 1;
+    cold.priority = 1;
+    cold.max_concurrent_requests = 64;
+    // 样本数低于 min_samples(5)，但数据看起来极差
+    let cold = quality_candidate(
+        cold,
+        0,
+        0,
+        AccountQualityState {
+            recent_error_rate: 1.0,
+            ttft_ewma_ms: Some(60_000.0),
+            latency_ewma_ms: Some(300_000.0),
+            sample_count: 2,
+            ..Default::default()
+        },
+    );
+
+    let warm = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+
+    let shares = selection_shares(&[cold, warm], &config, 0, DISTRIBUTION_ROUNDS);
+    let cold_share = shares.get(&1).copied().unwrap_or(0.0);
+    assert!(
+        cold_share > 0.2,
+        "样本不足的池不得因数据难看被降权，实际份额 {cold_share:.3}"
+    );
+}
+
+#[test]
+fn quality_scheduling_without_samples_preserves_legacy_load_selection() {
+    // 开关显式打开但被动采样尚未产生任何合格样本时，必须保持旧的
+    // "有效优先级 -> 最低负载" 语义，不能因 Top-K 加权随机改变冷启动流量。
+    let config = quality_enabled_config();
+    let mut light = test_pool("https://cold-light.example.test", true);
+    light.id = 1;
+    light.priority = 1;
+    light.max_concurrent_requests = 10;
+    let mut heavy = test_pool("https://cold-heavy.example.test", true);
+    heavy.id = 2;
+    heavy.priority = 1;
+    heavy.max_concurrent_requests = 10;
+
+    for _ in 0..100 {
+        let selected = select_account_candidate(
+            vec![
+                candidate(light.clone(), 1, 0),
+                candidate(heavy.clone(), 8, 0),
+            ],
+            &config,
+            0,
+        )
+        .expect("无样本的非空候选集必须能选出池");
+        assert_eq!(
+            selected.id, 1,
+            "冷启动无样本时必须保持 legacy 的最低负载选择"
+        );
+    }
+}
+
+#[test]
+fn quality_view_marks_cold_start_pools_as_not_scoring() {
+    // 样本不足时必须显式告诉运维"这个池的数据还没参与调度"，
+    // 否则会误以为调度器在依据一份难看的冷启动数据决策。
+    let config = AccountsConfig {
+        quality_min_samples: 10,
+        ..Default::default()
+    };
+
+    let state = AccountQualityState {
+        recent_error_rate: 1.0,
+        sample_count: 3,
+        ..Default::default()
+    };
+    let view = AccountQualityView::from_state(&state, &config, 0);
+    assert!(!view.scoring_active);
+    assert_eq!(view.sample_count, 3);
+    assert!(!view.in_probation);
+    assert_eq!(view.recovery_progress, 1.0);
+}
+
+#[test]
+fn quality_view_reports_probation_countdown_and_recovery_progress() {
+    let config = AccountsConfig {
+        quality_min_samples: 5,
+        recovery_ramp_secs: 60,
+        ..Default::default()
+    };
+
+    let state = AccountQualityState {
+        recent_error_rate: 0.75,
+        ttft_ewma_ms: Some(1_800.0),
+        latency_ewma_ms: Some(9_000.0),
+        sample_count: 42,
+        probation_until_ms: Some(120_000),
+        probation_level: 2,
+        probation_cleared_at_ms: Some(120_000),
+        ..Default::default()
+    };
+
+    // 避让期内：剩余秒数向下取整，恢复进度为满（尚未开始爬坡）
+    let during = AccountQualityView::from_state(&state, &config, 90_500);
+    assert!(during.in_probation);
+    assert_eq!(during.probation_remaining_secs, 29);
+    assert_eq!(during.probation_level, 2);
+    assert!(during.scoring_active);
+    assert_eq!(during.recent_error_rate, 0.75);
+
+    // 避让到期后爬坡中段：进度约 50%
+    let ramping = AccountQualityView::from_state(&state, &config, 150_000);
+    assert!(!ramping.in_probation);
+    assert_eq!(ramping.probation_remaining_secs, 0);
+    assert!(
+        (ramping.recovery_progress - 0.5).abs() < 0.01,
+        "爬坡中段进度应约为 0.5，实际 {}",
+        ramping.recovery_progress
+    );
+
+    // 完全恢复
+    let recovered = AccountQualityView::from_state(&state, &config, 200_000);
+    assert_eq!(recovered.recovery_progress, 1.0);
+}
+
+#[test]
+fn raw_failover_shares_tool_and_usage_projection_parsing_across_pools() {
+    // Long enough, with a cache breakpoint, for non-streaming usage projection to apply.
+    let raw = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 128,
+        "system": [{
+            "type": "text",
+            "text": "You are a careful coding assistant. ".repeat(200),
+            "cache_control": {"type": "ephemeral"}
+        }],
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]}
+        ],
+        "tools": [{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}],
+        "stream": false,
+        "metadata": {"user_id": "raw-cache-session"}
+    })
+    .to_string();
+    let route = raw_test_route(raw.as_bytes());
+
+    for pool_id in 1..=8 {
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.id = pool_id;
+
+        pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+        let names = external_route_known_tool_names(&route);
+        assert!(names.iter().any(|name| name == "Bash"));
+        let projection = projection_context(&route, &pool, 0).expect("usage projection");
+        let expected_credential_key = format!("account:{pool_id}");
+        assert_eq!(
+            projection.credential_key.as_deref(),
+            Some(expected_credential_key.as_str())
+        );
+    }
+
+    let counts = route.preparation_operation_counts();
+    assert_eq!(counts.raw_payload_parses, 1);
+    assert_eq!(counts.known_tool_name_builds, 1);
+    assert_eq!(counts.usage_projection_builds, 1);
+    assert_eq!(counts.normalized_base_builds, 0);
+    assert_eq!(counts.normalized_original_value_parses, 0);
+    assert_eq!(counts.normalized_json_serializations, 0);
+}
+
+#[test]
+fn raw_messages_body_hints_ignore_nested_model_without_top_level_model() {
+    let raw = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":[{"type":"text","model":"nested-model","text":"hello"}]}],"stream":true}"#,
+        );
+
+    let (model, stream) = raw_messages_body_hints(&raw);
+
+    assert_eq!(model, None);
+    assert_eq!(stream, Some(true));
+}
+
+#[test]
+fn raw_passthrough_failure_keeps_estimated_total_input_but_zeroes_billable_usage() {
+    let route = raw_test_route(
+        br#"{"model":"claude-sonnet-5","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hello from raw passthrough"}],"system":"You are concise."}"#,
+    );
+    let estimated = estimated_external_request_input_tokens(&route, None);
+    assert!(estimated > 0);
+
+    let standard_usage =
+        external_standard_usage_for_status(UsageRecordStatus::Error, estimated, None);
+    assert_eq!(standard_usage.total_input_tokens, estimated);
+    assert_eq!(standard_usage.input_tokens, 0);
+    assert_eq!(standard_usage.billable_input_tokens, 0);
+    assert_eq!(standard_usage.output_tokens, 0);
+    assert_eq!(standard_usage.cache_creation_input_tokens, 0);
+    assert_eq!(standard_usage.cache_read_input_tokens, 0);
+}
+
+#[test]
+fn raw_passthrough_keeps_body_but_still_applies_usage_projection() {
+    // Top-level cache_control (automatic caching) over a prefix above the minimum.
+    let raw = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hello"}],
+        "system": [{"type": "text", "text": "You are a careful coding assistant. ".repeat(200)}],
+        "cache_control": {"type": "ephemeral"},
+        "stream": false,
+        "metadata": {"user_id": "raw-projection-session"}
+    })
+    .to_string();
+    let raw = raw.as_bytes();
+    let route = raw_test_route(raw);
+    assert!(route.payload.is_none());
+    assert_eq!(route.request_input_tokens, 0);
+
+    let mut pool = test_pool("http://pool.example.com", false);
+
+    pool.model_mapping_mode = ModelMappingMode::Passthrough;
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let prepared = account_prepare_request(&route, &pool).unwrap();
+    assert_eq!(prepared.body, Bytes::copy_from_slice(raw));
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":5,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let projection = projection_context(&route, &pool, 0).expect("raw usage projection");
+    assert!(projection.raw_input_tokens > 0);
+
+    let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(projected.usage_capture.projected);
+    assert_eq!(
+        projected.usage_capture.request_input_tokens,
+        Some(projection.raw_input_tokens)
+    );
+    assert_ne!(projected.body, body);
+    assert!(
+        usage
+            .get("input_tokens")
+            .and_then(|value| value.as_i64())
+            .is_some_and(|tokens| (1..=96).contains(&tokens))
+    );
+}
+
+#[test]
+fn raw_rewrite_only_changes_effective_top_level_model_for_five_rounds() {
+    let effective = Bytes::from_static(
+        br#" {"messages":[{"role":"user","content":{"model":"nested-model","future":true}}],"model":"client-model","max_tokens":20480,"future_top":"keep"} "#,
+    );
+    let expected =
+        rewrite_raw_top_level_model(&effective, "mapped-model").expect("expected rewrite");
+    let expected_sha = hex::encode(Sha256::digest(&expected));
+
+    for round in 1..=5 {
+        let mut route = raw_test_route(effective.as_ref());
+        route.raw_body =
+            Bytes::from_static(br#"{"model":"working-model","max_tokens":1,"messages":[]}"#);
+        route.route_subtype = UsageRouteSubtype::Account;
+        route.payload = Some(test_payload("working-model"));
+
+        for failover_attempt in 1..=2 {
+            let mut pool = test_pool("https://example.com/v1", true);
+            pool.id = failover_attempt;
+
+            pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
+            pool.model_mapping_rules = vec![model_rule("client-model", "mapped-model")];
+
+            let prepared = account_prepare_request(&route, &pool).expect("raw rewrite");
+            assert_eq!(hex::encode(Sha256::digest(&prepared.body)), expected_sha);
+            assert_eq!(
+                prepared.body, expected,
+                "round {round} attempt {failover_attempt}"
+            );
+            let value: serde_json::Value = serde_json::from_slice(&prepared.body).expect("JSON");
+            assert_eq!(value["model"], "mapped-model");
+            assert_eq!(value["messages"][0]["content"]["model"], "nested-model");
+            assert_eq!(value["future_top"], "keep");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_redis_external_poison_does_not_block_or_emit_false_capacity_for_five_rounds() {
+    let Some(url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL") else {
+        eprintln!("跳过 Redis external release poison 测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
+        return;
+    };
+
+    for round in 0..5u64 {
+        let mut config = Config::default();
+        config.redis.url = Some(url.clone());
+        config.redis.key_prefix = format!("claude_pool:test:{}", uuid::Uuid::new_v4());
+        let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
+        let poison_pool = 20_000 + round;
+        redis
+            .set_external_release_wrongtype_for_test(poison_pool, true)
+            .await
+            .unwrap();
+        let capacity_signal = Arc::new(CapacitySignal::default());
+        let selection_runtime_snapshot = Arc::new(SyncMutex::new(None));
+        let dispatcher = AccountReleaseDispatcher::new(
+            redis.clone(),
+            capacity_signal.clone(),
+            selection_runtime_snapshot,
+        );
+        let poison_permit = dispatcher.try_reserve().unwrap();
+        dispatcher.enqueue(
+            AccountReleaseIntent {
+                pool_id: poison_pool,
+                lease_id: "poison".to_string(),
+                release_kind: AccountLeaseReleaseKind::Confirmed,
+            },
+            poison_permit,
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatcher.stats.retries.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: poison intent did not enter retry"));
+
+        let completed_before = dispatcher.stats.completed.load(Ordering::Acquire);
+        let mut capacity_waiter = capacity_signal.register();
+        let healthy_permit = dispatcher.try_reserve().unwrap();
+        dispatcher.enqueue(
+            AccountReleaseIntent {
+                pool_id: poison_pool + 100,
+                lease_id: "already-absent".to_string(),
+                release_kind: AccountLeaseReleaseKind::Confirmed,
+            },
+            healthy_permit,
+        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while dispatcher.stats.completed.load(Ordering::Acquire) == completed_before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: healthy release was blocked by poison"));
+        assert_eq!(dispatcher.pending_len(), 1, "round {round}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), capacity_waiter.wait_for_change())
+                .await
+                .is_err(),
+            "round {round}: removed=false must not create a capacity wake"
+        );
+
+        redis
+            .set_external_release_wrongtype_for_test(poison_pool, false)
+            .await
+            .unwrap();
+        assert!(
+            dispatcher.drain(Duration::from_secs(2)).await.drained,
+            "round {round}"
+        );
+    }
+}
+
+#[test]
+fn recovery_ramp_gradually_restores_traffic_after_probation_expires() {
+    // 避让到期不得瞬间全量回流，份额必须随时间单调回升。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        recovery_ramp_secs: 60,
+        probe_share_percent: 0,
+        ..Default::default()
+    };
+
+    let recovered = |elapsed_ms: i64| -> f64 {
+        let until_ms = 10_000;
+        let mut healed = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+        if let Some(quality) = healed.quality.as_mut() {
+            quality.probation_until_ms = Some(until_ms);
+            quality.probation_cleared_at_ms = Some(until_ms);
+            quality.probation_level = 1;
+        }
+        let candidates = vec![scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)), healed];
+        let shares = selection_shares(
+            &candidates,
+            &config,
+            until_ms + elapsed_ms,
+            DISTRIBUTION_ROUNDS,
+        );
+        shares.get(&2).copied().unwrap_or(0.0)
+    };
+
+    let just_cleared = recovered(1);
+    let half_way = recovered(30_000);
+    let fully_ramped = recovered(60_001);
+
+    assert!(
+        just_cleared < half_way,
+        "刚出避让份额 {just_cleared:.3} 应低于爬坡中段 {half_way:.3}"
+    );
+    assert!(
+        half_way < fully_ramped,
+        "爬坡中段份额 {half_way:.3} 应低于完全恢复 {fully_ramped:.3}"
+    );
+    assert!(
+        fully_ramped > 0.4,
+        "完全恢复后应回到与健康池相当的份额，实际 {fully_ramped:.3}"
+    );
+}
+
+#[test]
+fn relative_degradation_does_not_probation_all_pools_when_the_pool_is_globally_bad() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        degrade_error_rate_threshold: 0.5,
+        ..AccountsConfig::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(2, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(3, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+    ];
+    let baseline = AccountQualityBaseline::from_candidates(&candidates, config.quality_min_samples);
+
+    for candidate in &candidates {
+        assert_eq!(
+            evaluate_account_degrade_relative(candidate, &baseline, &config, 0),
+            None,
+            "全体一起变差时不应按绝对红线把池全部打入 probation"
+        );
+    }
+}
+
+#[test]
+fn relative_degradation_probation_only_targets_an_outlier_in_the_eligible_pool() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        degrade_error_rate_threshold: 0.5,
+        ..AccountsConfig::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 1.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(3, 1, 0.0, Some(200.0), Some(1_000.0)),
+    ];
+    let baseline = AccountQualityBaseline::from_candidates(&candidates, config.quality_min_samples);
+
+    assert!(matches!(
+        evaluate_account_degrade_relative(&candidates[0], &baseline, &config, 0),
+        Some(AccountDegradeDecision::Probation { .. })
+    ));
+    assert_eq!(
+        evaluate_account_degrade_relative(&candidates[1], &baseline, &config, 0),
+        None
+    );
+    assert_eq!(
+        evaluate_account_degrade_relative(&candidates[2], &baseline, &config, 0),
+        None
+    );
+}
+
+#[test]
+fn relative_degradation_uses_a_window_error_rate_baseline() {
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        quality_min_samples: 5,
+        degrade_error_rate_threshold: 0.5,
+        ..AccountsConfig::default()
+    };
+    let mut recent_bad = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
+    recent_bad
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_sample_count = 10;
+    recent_bad
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_failure_count = 8;
+    let mut recent_good = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+    recent_good
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_sample_count = 10;
+    recent_good
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_failure_count = 0;
+    let candidates = vec![recent_bad, recent_good];
+    let baseline = AccountQualityBaseline::from_candidates(&candidates, config.quality_min_samples);
+
+    assert_eq!(
+        baseline.median_error_rate, 0.0,
+        "评分仍使用累计 EWMA 失败率基线"
+    );
+    assert_eq!(
+        baseline.median_window_error_rate, 0.4,
+        "probation 使用窗口失败率基线"
+    );
+    assert!(
+        evaluate_account_degrade_relative(&candidates[0], &baseline, &config, 0).is_none(),
+        "窗口失败率与同 cohort 中位数一致时不得 probation"
+    );
+}
+
+#[test]
+fn relative_degradation_uses_the_full_path_model_eligible_cohort() {
+    // probation 的基线不能只看最优先级层：同一路径/模型下的整个可派发
+    // 账号池共同变差时，任何单个账号都不应因固定绝对红线被摘除。
+    let config = AccountsConfig {
+        quality_aware_scheduling_enabled: true,
+        degrade_error_rate_threshold: 0.5,
+        ..AccountsConfig::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 1.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(3, 5, 0.9, Some(20_000.0), Some(90_000.0)),
+    ];
+    let baseline = AccountQualityBaseline::from_candidates(&candidates, config.quality_min_samples);
+
+    assert_eq!(
+        baseline.median_error_rate, 0.9,
+        "质量基线必须覆盖同一路径/模型的整个准入候选池"
+    );
+    assert_eq!(
+        evaluate_account_degrade_relative(&candidates[0], &baseline, &config, 0),
+        None,
+        "全 cohort 已整体劣化时不能仅因最优层账号达到绝对红线而 probation"
+    );
+}
+
+#[test]
+fn sse_event_passthrough_keeps_nested_usage_when_projection_disabled() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+
+    let passthrough = process_sse_event_with_plan(
+        event,
+        None,
+        Some(&capture),
+        None,
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+
+    assert_eq!(passthrough, event);
+    let capture = capture.lock().clone();
+    assert!(!capture.projected);
+    let raw = capture.raw.expect("raw usage");
+    assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+    assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
+}
+
+#[test]
+fn sse_event_passthrough_keeps_usage_body_when_projection_disabled() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+
+    let passthrough = process_sse_event_with_plan(
+        event,
+        None,
+        Some(&capture),
+        None,
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+
+    assert_eq!(passthrough, event);
+    let capture = capture.lock().clone();
+    assert!(!capture.projected);
+    assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+    assert_eq!(capture.reported.expect("reported").input_tokens, 100000);
+}
+
+#[test]
+fn sse_event_passthrough_rewrites_message_start_usage_when_projection_enabled() {
+    let event = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role":"assistant","content":[],"model":"fake-sonnet","stop_reason":null,"usage":{"input_tokens":100000,"output_tokens":0,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+
+    let passthrough = process_sse_event_with_plan(
+        event,
+        Some(&projection),
+        Some(&capture),
+        None,
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+
+    assert_ne!(passthrough, event);
+    let text = std::str::from_utf8(&passthrough).expect("rewritten utf8");
+    assert!(!text.contains(r#""input_tokens":100000"#));
+    let capture = capture.lock().clone();
+    assert!(capture.projected);
+    assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+    let reported = capture.reported.expect("reported usage");
+    assert!((1..=96).contains(&reported.input_tokens));
+    assert_eq!(reported.output_tokens, 0);
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn sse_event_passthrough_rewrites_usage_when_projection_enabled() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+
+    let passthrough = process_sse_event_with_plan(
+        event,
+        Some(&projection),
+        Some(&capture),
+        None,
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+
+    assert_ne!(passthrough, event);
+    let text = std::str::from_utf8(&passthrough).expect("rewritten utf8");
+    assert!(!text.contains(r#""input_tokens":100000"#));
+    let capture = capture.lock().clone();
+    assert!(capture.projected);
+    assert_eq!(
+        capture.stream_response_mode,
+        Some(StreamResponseMode::EventPassthrough)
+    );
+    assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+    let reported = capture.reported.expect("reported usage");
+    assert!((1..=96).contains(&reported.input_tokens));
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert!(reported.cache_creation_input_tokens > 0);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn sse_message_start_usage_is_rewritten_without_committing_cache_state() {
+    let event = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role":"assistant","content":[],"model":"fake-sonnet","stop_reason":null,"usage":{"input_tokens":100000,"output_tokens":0,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}}
+
+"#;
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let projected = rewrite_sse_event_usage(event, Some(&projection), None);
+    let text = std::str::from_utf8(&projected).expect("projected utf8");
+
+    assert!(text.contains(r#""type":"message_start""#));
+    assert!(!text.contains(r#""input_tokens":100000"#));
+    assert!(text.contains(r#""cache_read_input_tokens":0"#));
+    assert!(text.contains(r#""output_tokens":0"#));
+
+    let mut second_route = route.clone();
+    payload_mut(&mut second_route).messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue after start event only"),
+        },
+    ]);
+    let second_projection = projection_context(&second_route, &pool, 0).expect("second projection");
+    let mut final_usage = serde_json::json!({
+        "input_tokens": 100000,
+        "output_tokens": 1,
+        "cache_creation_input_tokens": 50000,
+        "cache_read_input_tokens": 0
+    });
+    let final_projected =
+        project_usage_value(&mut final_usage, Some(&second_projection), true, None)
+            .expect("final projected usage");
+    assert_eq!(final_projected.reported.cache_read_input_tokens, 0);
+}
+
+#[test]
+fn sse_usage_projection_applies_output_uplift_to_reported_usage() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1200,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    disable_path_output_postprocess(&mut route);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    assert!(text.contains(r#""output_tokens":1800"#));
+
+    let capture = capture.lock().clone();
+    let shaped = capture.shaped.expect("shaped usage");
+    let reported = capture.reported.expect("reported usage");
+    assert_eq!(shaped.output_tokens, 1200);
+    assert_eq!(reported.output_tokens, uplift_tokens(1200, 50));
+}
+
+#[test]
+fn sse_usage_projection_captures_raw_and_reported_usage() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let _projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let capture = capture.lock().clone();
+    let raw = capture.raw.expect("raw usage");
+    let reported = capture.reported.expect("reported usage");
+
+    assert_eq!(raw.input_tokens, 100000);
+    assert!((1..=96).contains(&reported.input_tokens));
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert!(reported.cache_creation_input_tokens > 0);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn sse_usage_projection_cost_floor_repairs_final_stream_usage() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        account_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert!(billing.pricing_available);
+    assert!(billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd * 1.10);
+    assert_eq!(
+        event_usage_i64(text, "input_tokens"),
+        i64::from(billing.reported_usage.input_tokens)
+    );
+    assert!(
+        billing.reported_usage.input_tokens <= input_cap,
+        "final stream input should still respect the configured path input policy"
+    );
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(billing.reported_usage.cache_read_input_tokens)
+            .saturating_add(billing.reported_usage.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn sse_usage_projection_cost_floor_repairs_zero_output_after_stream_text() {
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world from stream"}}
+
+"#;
+    let usage_event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+
+    let text_out =
+        process_sse_event_with_plan(text_event, Some(&projection), Some(&capture), None, plan);
+    assert_eq!(text_out, text_event);
+
+    let projected =
+        process_sse_event_with_plan(usage_event, Some(&projection), Some(&capture), None, plan);
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        account_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert!(
+        billing.reported_usage.total_input_tokens > billing.raw_usage.total_input_tokens,
+        "tiny stream usage should still be repaired even when input sampling keeps input small"
+    );
+    assert!(
+        billing.reported_usage.input_tokens <= input_cap,
+        "tiny stream repair should still respect the configured path input policy"
+    );
+    assert!(billing.reported_usage.output_tokens > 0);
+    assert!(billing.reported_cost_usd > billing.raw_cost_usd);
+    assert!(event_usage_i64(text, "output_tokens") > 0);
+}
+
+#[test]
+fn sse_usage_projection_handles_nested_only_cache_creation_split() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":0,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let route = test_route("claude-opus-4-8");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected utf8");
+    assert!(!text.contains("1300180"));
+    assert_ne!(projected, event);
+
+    let value = event_data_value(&projected);
+    assert_projected_cache_creation_consistent(&value["usage"]);
+
+    let capture = capture.lock().clone();
+    let raw = capture.raw.expect("raw usage");
+    assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+    assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
+}
+
+#[test]
+fn sse_usage_projection_preserves_delimiters_and_done_events() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+data: [DONE]
+
+"#;
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0);
+    let projected = rewrite_sse_event_usage(event, projection.as_ref(), None);
+    let text = String::from_utf8(projected).expect("utf8");
+
+    assert!(text.contains("data: [DONE]"));
+    assert!(text.contains("\n\n"));
+    assert!(!text.contains(r#""input_tokens":100000"#));
+}
+
+#[test]
+fn sse_usage_projection_repairs_raw_output_from_stream_text_estimate_without_cost_floor() {
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world from stream"}}
+
+"#;
+    let usage_event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+
+    let text_out =
+        process_sse_event_with_plan(text_event, Some(&projection), Some(&capture), None, plan);
+    assert_eq!(text_out, text_event);
+
+    let projected =
+        process_sse_event_with_plan(usage_event, Some(&projection), Some(&capture), None, plan);
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        account_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert!(capture.lock().estimated_output_tokens > 0);
+    assert_eq!(
+        billing.reported_usage.output_tokens,
+        capture.lock().estimated_output_tokens
+    );
+    assert_eq!(
+        event_usage_i64(text, "output_tokens"),
+        i64::from(billing.reported_usage.output_tokens)
+    );
+}
+
+#[test]
+fn sse_usage_projection_rewrites_nested_1h_cache_creation_split() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1998336,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1998336}}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-opus-4-8");
+    payload_mut(&mut route).stream = true;
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected utf8");
+    assert!(!text.contains("1998336"));
+
+    let value = event_data_value(&projected);
+    let usage = &value["usage"];
+    assert_projected_cache_creation_consistent(usage);
+    assert!(
+        usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("projected aggregate")
+            < 1_998_336
+    );
+    assert_eq!(
+        usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_i64()
+            .expect("projected 1h cache creation"),
+        0,
+        "external upstream 1h must not leak when the request did not ask for ttl=1h"
+    );
+    assert_eq!(
+        usage["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_i64()
+            .expect("projected 5m cache creation"),
+        usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("projected aggregate"),
+        "default projected cache creation should stay in the 5m bucket"
+    );
+
+    let capture = capture.lock().clone();
+    let raw = capture.raw.expect("raw usage");
+    assert_eq!(raw.cache_creation_input_tokens, 1_998_336);
+    assert_eq!(raw.cache_creation_5m_input_tokens, 0);
+    assert_eq!(raw.cache_creation_1h_input_tokens, 1_998_336);
+}
+
+#[test]
+fn sse_usage_projection_rewrites_nested_5m_cache_creation_split() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let route = test_route("claude-opus-4-8");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected utf8");
+    assert!(!text.contains("1300180"));
+
+    let value = event_data_value(&projected);
+    let usage = &value["usage"];
+    assert_projected_cache_creation_consistent(usage);
+    assert!(
+        usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("projected aggregate")
+            < 1_300_180
+    );
+
+    let capture = capture.lock().clone();
+    let raw = capture.raw.expect("raw usage");
+    assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+    assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
+    assert_eq!(raw.cache_creation_1h_input_tokens, 0);
+    let reported = capture.reported.expect("reported usage");
+    assert_eq!(
+        reported.cache_creation_input_tokens,
+        usage["cache_creation_input_tokens"].as_i64().unwrap() as i32
+    );
+}
+
+#[test]
+fn sse_usage_projection_shapes_uncached_stream_usage_by_path_policy() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+"#;
+    let mut route = test_route("claude-opus-4-6");
+    payload_mut(&mut route).stream = true;
+    route.request_input_tokens = 4165;
+    route.prompt_cache_target_read_ratio = 0.5;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+
+    assert_ne!(projected, event);
+    let value = event_data_value(&projected);
+    let usage = &value["usage"];
+    assert_eq!(usage["input_tokens"].as_i64().expect("projected input"), 1);
+    assert_eq!(
+        usage["output_tokens"].as_i64().expect("projected output"),
+        2
+    );
+    assert_eq!(
+        usage["cache_read_input_tokens"]
+            .as_i64()
+            .expect("projected cache read"),
+        0
+    );
+    assert_eq!(
+        usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("projected cache creation"),
+        4164
+    );
+    assert_projected_cache_creation_consistent(usage);
+    let capture = capture.lock().clone();
+    assert!(capture.projected);
+    assert_eq!(capture.raw.map(|usage| usage.input_tokens), Some(4165));
+    let reported = capture.reported.expect("reported usage");
+    assert_eq!(reported.input_tokens, 1);
+    assert_eq!(reported.cache_creation_input_tokens, 4164);
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn sse_usage_projection_uses_request_ttl_for_1h_cache_creation_split() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-opus-4-8");
+    payload_mut(&mut route).stream = true;
+    payload_mut(&mut route).system = Some(vec![SystemMessage {
+        text: "stable external ttl one hour prompt ".repeat(8_000),
+        cache_control: Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"})),
+    }]);
+    route.request_input_tokens = count_external_route_input_tokens(payload_ref(&route));
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected utf8");
+    assert!(!text.contains("1300180"));
+
+    let value = event_data_value(&projected);
+    let usage = &value["usage"];
+    assert_projected_cache_creation_consistent(usage);
+    let aggregate = usage["cache_creation_input_tokens"]
+        .as_i64()
+        .expect("projected aggregate");
+    assert!(aggregate > 0);
+    assert!(
+        aggregate < 1_300_180,
+        "projected cache creation should follow the local path policy"
+    );
+    assert_eq!(
+        usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_i64()
+            .expect("projected 1h cache creation"),
+        aggregate,
+        "explicit request ttl=1h should put projected creation in the 1h bucket"
+    );
+    assert_eq!(
+        usage["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_i64()
+            .expect("projected 5m cache creation"),
+        0
+    );
+
+    let capture = capture.lock().clone();
+    let raw = capture.raw.expect("raw usage");
+    assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+    assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
+    assert_eq!(raw.cache_creation_1h_input_tokens, 0);
+    let reported = capture.reported.expect("reported usage");
+    assert_eq!(reported.cache_creation_input_tokens as i64, aggregate);
+    assert_eq!(reported.cache_creation_1h_input_tokens as i64, aggregate);
+    assert_eq!(reported.cache_creation_5m_input_tokens, 0);
+    assert!(capture.projected);
+}
+
+#[test]
+fn stream_missing_usage_builds_estimated_billable_account_billing() {
+    let route = test_route("claude-opus-4-6");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    pool.stream_response_mode = Some(StreamResponseMode::EventPassthrough);
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        request_input_tokens: Some(route.request_input_tokens),
+        stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+    let chunk = Bytes::from_static(
+        br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world"}}
+
+"#,
+    );
+    let output_tokens = estimate_external_stream_output_tokens(&chunk);
+
+    let billing = account_billing_from_stream_estimate(
+        &route,
+        &pool,
+        &capture,
+        Some(&projection),
+        output_tokens,
+    )
+    .expect("estimated stream billing");
+
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("missing_stream_usage")
+    );
+    assert_eq!(
+        billing.usage_candidate_path.as_deref(),
+        Some("$stream.estimated")
+    );
+    assert_eq!(
+        billing.stream_response_mode.as_deref(),
+        Some(StreamResponseMode::EventPassthrough.as_str())
+    );
+    assert!(billing.pricing_available);
+    assert!(billing.billable_cost_usd > 0.0);
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert!(billing.reported_usage.output_tokens > 0);
+}
+
+#[test]
+fn stream_output_token_estimator_counts_text_thinking_and_tool_events() {
+    let chunk = Bytes::from_static(
+        br#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello world"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"reasoning text"}}
+
+"#,
+    );
+
+    assert!(estimate_external_stream_output_tokens(&chunk) >= 3);
+}
+
+#[test]
+fn stream_passthrough_does_not_rewrite_usage_when_projection_is_disabled() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let out = process_sse_event_with_plan(
+        event,
+        None,
+        Some(&capture),
+        None,
+        ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough),
+    );
+
+    assert_eq!(out, event);
+    let capture = capture.lock().clone();
+    assert!(!capture.projected);
+    assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+    assert_eq!(capture.reported.expect("reported").input_tokens, 100000);
+}
+
+#[test]
+fn stream_processing_plan_inherits_global_and_allows_pool_override() {
+    let config = AccountsConfig {
+        stream_response_mode: StreamResponseMode::EventPassthrough,
+        ..AccountsConfig::default()
+    };
+
+    let inherited = test_pool("http://pool.example.com", false);
+    assert_eq!(
+        ExternalStreamProcessingPlan::for_pool(&inherited, &config).response_mode,
+        StreamResponseMode::EventPassthrough
+    );
+
+    let mut overridden = inherited.clone();
+    overridden.stream_response_mode = Some(StreamResponseMode::EventPassthrough);
+    let plan = ExternalStreamProcessingPlan::for_pool(&overridden, &config);
+    assert_eq!(plan.response_mode, StreamResponseMode::EventPassthrough);
+    assert!(plan.capture_usage);
+}
+
+#[test]
+fn stream_response_headers_disable_proxy_buffering() {
+    let mut upstream_headers = HeaderMap::new();
+    upstream_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    upstream_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+    let mut builder = Response::builder().status(StatusCode::OK);
+    apply_forwarded_response_headers(&mut builder, &upstream_headers, "req_01abc");
+    disable_proxy_buffering_for_stream_response(&mut builder);
+    let response = builder.body(()).expect("response should build");
+
+    assert_eq!(response.headers()["x-accel-buffering"], "no");
+    assert_eq!(response.headers()["request-id"], "req_01abc");
+}
+
+#[test]
+fn stream_stop_reason_is_captured_for_account_usage_records() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+
+    capture_sse_event_usage(
+        br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+    assert_eq!(
+        capture.lock().downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    capture_sse_event_usage(
+        br#"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+    assert_eq!(
+        capture.lock().downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+}
+
+#[test]
+fn successful_external_error_body_is_treated_as_protocol_error() {
+    let body = Bytes::from_static(
+        br#"{"type":"error","error":{"type":"api_error","message":"raw pool failure"}}"#,
+    );
+
+    assert!(success_response_looks_like_error_body(&body));
+    let err = success_error_body_protocol_error(&body, &AccountsConfig::default());
+
+    assert!(err.retryable);
+    assert_eq!(err.status, Some(StatusCode::OK));
+    assert_eq!(err.protocol_error, Some("success_error_envelope"));
+    assert!(!format!("{err:?}").contains("raw pool failure"));
+    assert!(err.message.contains("success status"));
+}
+
+#[test]
+fn successful_external_html_response_is_protocol_error() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+    let body = Bytes::from_static(br#"<!doctype html><html><body>admin</body></html>"#);
+
+    assert!(success_response_looks_like_html(&headers, &body));
+    let err = success_protocol_error(
+        &headers,
+        Some(&body),
+        &AccountsConfig::default(),
+        "model endpoint returned an HTML response",
+    );
+
+    assert!(err.retryable);
+    assert_eq!(err.status, Some(StatusCode::OK));
+    assert_eq!(
+        err.auto_disable_reason.as_deref(),
+        Some("misconfigured_endpoint")
+    );
+    assert_eq!(
+        error_type_for_external_error(&err),
+        "misconfigured_endpoint"
+    );
+}
+
+#[test]
+fn supported_model_filter_allows_empty_and_matches_route_candidates() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("claude-sonnet-4.5");
+
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_bridges_claude_code_aliases_to_pool_models() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("haiku");
+
+    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["haiku".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_bridges_dotted_dashed_and_dated_claude_forms() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("claude-sonnet-4-5-20250929");
+
+    pool.supported_models = vec!["sonnet-4.5".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["sonnet-4-5".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.6".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_does_not_family_match_custom_names() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("tenant-haiku-model");
+
+    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["tenant-haiku-model".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    let route = test_route("claude-custom-haiku-model");
+    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_empty_list_allows_future_model_without_fallback() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let mut route = test_route("claude-sonnet-5");
+    route.upstream_model = Some("claude-sonnet-4.6".to_string());
+
+    pool.supported_models = vec!["claude-sonnet-4.6".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = Vec::new();
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_keeps_custom_names_exact_unless_resolution_is_explicit() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let mut route = test_route("client-alias");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["client-alias".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    route.model_resolution_source = Some("alias".to_string());
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_prefers_caller_model_but_keeps_dotted_compatibility() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let mut route = test_route("claude-opus-4-8");
+    route.upstream_model = Some("claude-opus-4.8".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+
+    pool.supported_models = vec!["claude-opus-4-8".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-opus-4.8".to_string()];
+    assert!(
+        account_matches_supported_models(&pool, Some(&route.model_candidates_for_support())),
+        "dotted allowlists remain compatibility-only filters"
+    );
+
+    pool.supported_models = vec!["claude-haiku-4-5".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_preserves_thinking_and_one_m_suffixes() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("sonnet-thinking[1m]");
+
+    pool.supported_models = vec!["claude-sonnet-4.6-thinking[1m]".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.6-thinking".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.6[1m]".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_requires_a_candidate_when_list_is_restricted() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+
+    assert!(!account_matches_supported_models(&pool, None));
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&[None, None, None, None])
+    ));
+}
+
+#[test]
+fn supported_model_filter_uses_original_payload_and_raw_model_candidates() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let mut route = test_route("client-alias");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["client-alias".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    let raw_route = raw_test_route(
+            br#"{"model":"raw-client-model","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        );
+    pool.supported_models = vec!["raw-client-model".to_string()];
+    assert!(account_matches_supported_models(
+        &pool,
+        Some(&raw_route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["other-model".to_string()];
+    assert!(!account_matches_supported_models(
+        &pool,
+        Some(&raw_route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn sync_claude_code_session_header_uses_metadata_user_id_session() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-claude-code-session-id"),
+        HeaderValue::from_static("00000000-0000-4000-8000-000000000000"),
+    );
+    let body = br#"{"metadata":{"user_id":"{\"device_id\":\"dev\",\"account_uuid\":\"acc\",\"session_id\":\"8bb5523b-ec7c-4540-a9ca-beb6d79f1552\"}"}}"#;
+
+    sync_claude_code_session_header(&mut headers, body);
+
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("x-claude-code-session-id"))
+            .and_then(|value| value.to_str().ok()),
+        Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552")
+    );
+}
+
+#[test]
+fn usage_projection_applies_current_path_policy_to_json_body() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    assert!(
+        usage
+            .get("input_tokens")
+            .and_then(|value| value.as_i64())
+            .is_some_and(|tokens| (1..=96).contains(&tokens))
+    );
+    assert!(
+        usage
+            .get("cache_read_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default()
+            == 0
+    );
+    assert!(
+        usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default()
+            > 0
+    );
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    assert!((1..=96).contains(&reported.input_tokens));
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_applies_account_uplift_after_path_policy() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let no_uplift_projection = projection_context(&route, &pool, 0).expect("projection");
+    let no_uplift = maybe_project_non_stream_usage(body.clone(), Some(&no_uplift_projection));
+    let with_uplift_projection = projection_context(&route, &pool, 25).expect("projection");
+    let with_uplift = maybe_project_non_stream_usage(body, Some(&with_uplift_projection));
+
+    let no_uplift_usage = no_uplift.usage_capture.reported.expect("no uplift usage");
+    let with_uplift_shaped = with_uplift
+        .usage_capture
+        .shaped
+        .expect("with uplift shaped usage");
+    let with_uplift_usage = with_uplift.usage_capture.reported.expect("uplift usage");
+    assert_eq!(
+        with_uplift_shaped.total_input_tokens,
+        no_uplift_usage.total_input_tokens
+    );
+    assert_eq!(
+        with_uplift_shaped.input_tokens,
+        no_uplift_usage.input_tokens
+    );
+    assert_eq!(
+        with_uplift_shaped.output_tokens,
+        no_uplift_usage.output_tokens
+    );
+    assert_eq!(
+        with_uplift_shaped.cache_creation_input_tokens,
+        no_uplift_usage.cache_creation_input_tokens
+    );
+    assert_eq!(
+        with_uplift_shaped.cache_read_input_tokens,
+        no_uplift_usage.cache_read_input_tokens
+    );
+    assert_eq!(with_uplift_usage.input_tokens, no_uplift_usage.input_tokens);
+    assert_eq!(
+        with_uplift_usage.cache_creation_input_tokens,
+        uplift_tokens(no_uplift_usage.cache_creation_input_tokens, 25)
+    );
+    assert_eq!(
+        with_uplift_usage.cache_read_input_tokens,
+        uplift_tokens(no_uplift_usage.cache_read_input_tokens, 25)
+    );
+}
+
+#[test]
+fn usage_projection_carries_cache_read_evidence_across_split_sse_events() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let start = br#"event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":100000,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":120000}}}
+
+"#;
+    let delta = br#"event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":2}}
+
+"#;
+
+    let _ = rewrite_sse_event_usage(start, Some(&projection), Some(&capture));
+    let final_event = rewrite_sse_event_usage(delta, Some(&projection), Some(&capture));
+    let final_value = event_data_value(&final_event);
+    let final_usage = &final_value["usage"];
+    let reported = capture.lock().reported.expect("reported usage");
+
+    assert!((1..=96).contains(&reported.input_tokens));
+    assert_eq!(reported.input_tokens as i64, final_usage["input_tokens"]);
+    assert_eq!(reported.output_tokens, 2);
+    assert!(reported.cache_read_input_tokens > 0);
+    assert_ne!(reported.cache_read_input_tokens, 120_000);
+    assert_eq!(
+        reported.cache_read_input_tokens as i64,
+        final_usage["cache_read_input_tokens"]
+    );
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_keeps_no_cache_route_cache_free() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(64),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000,"cache_creation":{"ephemeral_5m_input_tokens":50000,"ephemeral_1h_input_tokens":0}}}"#,
+        );
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(
+        billing.reported_cost_usd < billing.raw_cost_usd,
+        "no-cache routes must not turn upstream cache cost into local cache or input hard-top"
+    );
+    assert_eq!(usage["cache_creation_input_tokens"].as_i64(), Some(0));
+    assert_eq!(usage["cache_read_input_tokens"].as_i64(), Some(0));
+    assert!(usage.get("cache_creation").is_none());
+    assert_eq!(billing.reported_usage.cache_creation_input_tokens, 0);
+    assert_eq!(billing.reported_usage.cache_read_input_tokens, 0);
+    assert_eq!(
+        billing.reported_usage.input_tokens,
+        count_external_route_input_tokens(payload_ref(&route))
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_keeps_path_shaped_usage_when_cost_already_covers_raw() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::raw(),
+            output: ReportedUsageFieldPolicy::raw(),
+            cache_read: ReportedUsageFieldPolicy::preserve(),
+            cache_creation: ReportedUsageFieldPolicy::preserve(),
+            output_uplift_min_tokens: 1,
+            output_uplift_percent: 50,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let baseline_projection =
+        projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1, 50)
+            .expect("baseline");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, true, 10, 1, 50)
+        .expect("projection");
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":40,"output_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let baseline = maybe_project_non_stream_usage(body.clone(), Some(&baseline_projection));
+    let baseline_billing = account_billing_from_capture(&route, &pool, baseline.usage_capture)
+        .expect("baseline billing");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+
+    assert!(baseline_billing.reported_cost_usd >= baseline_billing.raw_cost_usd * 1.10);
+    assert_eq!(billing.reported_usage, baseline_billing.reported_usage);
+    assert!((billing.reported_cost_usd - baseline_billing.reported_cost_usd).abs() < 0.000000001);
+    assert_eq!(projected.body, baseline.body);
+}
+
+#[test]
+fn usage_projection_cost_floor_margin_percent_sets_target_cost() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":50000,"ephemeral_1h_input_tokens":0}}}"#,
+    );
+    let mut route = test_route("claude-sonnet-4-5");
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(96),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            final_cache_creation_max_tokens: 200_000,
+            final_cache_creation_jitter_min_tokens: 0,
+            final_cache_creation_jitter_max_tokens: 0,
+            final_cache_read_max_tokens: 200_000,
+            final_cache_read_jitter_min_tokens: 0,
+            final_cache_read_jitter_max_tokens: 0,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection =
+        projection_context_with_cost_floor_margin(&route, &pool, 0, 25).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+
+    assert!(billing.pricing_available);
+    assert!(
+        billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd * 1.25,
+        "reported cost {} should cover raw cost {} with configured margin",
+        billing.reported_cost_usd,
+        billing.raw_cost_usd
+    );
+    assert!(
+        billing.reported_usage.cache_creation_input_tokens
+            > billing.shaped_usage.cache_creation_input_tokens
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_repairs_cache_write_before_cache_read_and_respects_caps() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":1000000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":750000,"ephemeral_1h_input_tokens":250000}}}"#,
+    );
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    let cache_creation_cap = 1_000;
+    let cache_read_cap = 2_000;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(10, 1.0),
+            final_cache_creation_max_tokens: cache_creation_cap,
+            final_cache_creation_jitter_min_tokens: 0,
+            final_cache_creation_jitter_max_tokens: 0,
+            final_cache_read_max_tokens: cache_read_cap,
+            final_cache_read_jitter_min_tokens: 0,
+            final_cache_read_jitter_max_tokens: 0,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(billing.reported_cost_usd < billing.raw_cost_usd);
+    assert!(billing.reported_usage.input_tokens <= input_cap);
+    assert_eq!(
+        billing.reported_usage.cache_creation_input_tokens,
+        cache_creation_cap
+    );
+    assert_eq!(
+        billing.reported_usage.cache_read_input_tokens,
+        cache_read_cap
+    );
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(cache_creation_cap)
+            .saturating_add(cache_read_cap)
+    );
+    assert_eq!(
+        usage["cache_creation_input_tokens"].as_i64(),
+        Some(i64::from(cache_creation_cap))
+    );
+    assert_eq!(
+        usage["cache_read_input_tokens"].as_i64(),
+        Some(i64::from(cache_read_cap))
+    );
+    assert_projected_cache_creation_consistent(usage);
+}
+
+#[test]
+fn usage_projection_cost_floor_repairs_reported_usage_before_billing() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(billing.shaped_cost_usd < billing.raw_cost_usd);
+    assert!(
+        billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd * 1.10,
+        "reported cost {} should cover raw cost {} plus margin",
+        billing.reported_cost_usd,
+        billing.raw_cost_usd
+    );
+    assert!(
+        billing.reported_usage.cache_creation_input_tokens
+            > billing.shaped_usage.cache_creation_input_tokens,
+        "cache write evidence should be repaired through cache_creation first"
+    );
+    assert_eq!(
+        usage["input_tokens"].as_i64().expect("final input"),
+        i64::from(billing.reported_usage.input_tokens)
+    );
+    assert!(
+        billing.reported_usage.input_tokens <= input_cap,
+        "cost floor should not bypass the configured path input policy"
+    );
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(billing.reported_usage.cache_read_input_tokens)
+            .saturating_add(billing.reported_usage.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","content":[{"type":"text","text":"hello world from response"}],"usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let route = test_route("claude-sonnet-4-5");
+    assert!(route.request_input_tokens >= 512);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    // 可疑的 1 token 上游 usage 按请求估算修复：修复后的总输入（input + 缓存）与计费都
+    // 远大于原始值。下发的 input 字段本身仍按 reportedUsage.input 采样，可能恰好为 1，
+    // 所以这里断言总量而不是单个 input 字段。
+    assert!(
+        billing.reported_usage.total_input_tokens > 1,
+        "{:?}",
+        billing.reported_usage
+    );
+    assert!(billing.reported_usage.output_tokens > 0);
+    let downstream_total = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .map(|key| usage[*key].as_i64().unwrap_or_default())
+    .sum::<i64>();
+    assert!(downstream_total > 1, "{usage}");
+    assert!(usage["output_tokens"].as_i64().expect("output") > 0);
+    assert!(billing.reported_cost_usd > billing.raw_cost_usd);
+}
+
+#[test]
+fn usage_projection_disabled_reported_usage_blocks_non_stream_projection() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        enabled: false,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0);
+    assert!(projection.is_none());
+}
+
+#[test]
+fn usage_projection_disabled_reported_usage_blocks_stream_projection() {
+    let mut route = test_route("claude-sonnet-4-5");
+    payload_mut(&mut route).stream = true;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        enabled: false,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0);
+    assert!(projection.is_none());
+}
+
+#[test]
+fn usage_projection_does_not_force_cache_for_small_current_path_request() {
+    let mut route = test_route("claude-opus-4-7");
+    route.request_input_tokens = 1;
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::CurrentHighCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::HighCache;
+    route.prompt_cache_scale_min_input_tokens = 20_000;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(600),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(150_000, 1.5),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":4,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(billing.raw_usage.input_tokens, 4);
+    assert_eq!(billing.raw_usage.cache_read_input_tokens, 0);
+    assert_eq!(billing.raw_usage.cache_creation_input_tokens, 0);
+    assert_eq!(billing.reported_usage.cache_read_input_tokens, 0);
+    assert_eq!(billing.reported_usage.cache_creation_input_tokens, 0);
+    assert_eq!(usage["cache_read_input_tokens"].as_i64(), Some(0));
+    assert_eq!(usage["cache_creation_input_tokens"].as_i64(), Some(0));
+}
+
+#[test]
+fn usage_projection_does_not_leak_uncommitted_read_evidence_to_next_request() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let first_projection = projection_context(&route, &pool, 0).expect("first projection");
+    let first = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":120000}}"#,
+        ),
+        Some(&first_projection),
+    );
+    assert!(
+        first
+            .usage_capture
+            .reported
+            .expect("first reported usage")
+            .cache_read_input_tokens
+            > 0
+    );
+
+    let next_projection = projection_context(&route, &pool, 0).expect("next projection");
+    let next = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        ),
+        Some(&next_projection),
+    );
+    let next_reported = next.usage_capture.reported.expect("next reported usage");
+
+    assert!((1..=96).contains(&next_reported.input_tokens));
+    assert_eq!(next_reported.cache_read_input_tokens, 0);
+    assert_eq!(
+        next_reported.total_input_tokens,
+        next_reported
+            .input_tokens
+            .saturating_add(next_reported.cache_read_input_tokens)
+            .saturating_add(next_reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_final_cache_creation_guard_runs_after_account_uplift() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.request_input_tokens = 200_000;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        final_cache_creation_max_tokens: 100,
+        final_cache_creation_jitter_min_tokens: 0,
+        final_cache_creation_jitter_max_tokens: 0,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 200).expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    let reported = projected.usage_capture.reported.expect("reported usage");
+
+    assert_eq!(reported.input_tokens, 1);
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert_eq!(reported.cache_creation_input_tokens, 100);
+    assert_eq!(
+        usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        100
+    );
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_final_cache_read_guard_runs_after_account_uplift() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        final_cache_read_max_tokens: 100,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let warmup_projection = projection_context(&route, &pool, 0).expect("warmup projection");
+    let _warmup = maybe_project_non_stream_usage(body.clone(), Some(&warmup_projection));
+    warmup_projection.record_success();
+
+    payload_mut(&mut route).messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue external projection session"),
+        },
+    ]);
+    refresh_test_route_derived_state(&mut route);
+    let projection = projection_context(&route, &pool, 200).expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let reported = projected.usage_capture.reported.expect("reported usage");
+
+    assert_eq!(reported.cache_read_input_tokens, 100);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_final_input_guard_leaves_compliant_input_unchanged() {
+    let policy = ReportedCacheUsagePolicy::from_path_policy(
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(96),
+            ..ReportedUsagePathPolicy::default()
+        },
+        42,
+    )
+    .expect("policy");
+    let usage = CacheUsage {
+        total_input_tokens: 50_000,
+        input_tokens: 42,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 49_958,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    };
+
+    let guarded = policy.apply_final_input_guard(usage);
+
+    assert_eq!(guarded.input_tokens, 42);
+    assert_eq!(guarded.cache_read_input_tokens, 49_958);
+    assert_eq!(guarded.total_input_tokens, 50_000);
+}
+
+#[test]
+fn usage_projection_final_input_guard_samples_input_without_cache_read_after_uplift() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 200).expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let reported = projected.usage_capture.reported.expect("reported usage");
+
+    assert!((1..=96).contains(&reported.input_tokens));
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert!(reported.cache_creation_input_tokens > 0);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":4165,"output_tokens":80,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-opus-4-6");
+    route.request_input_tokens = 4165;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        final_output_max_tokens: 80,
+        final_output_jitter_min_tokens: 10,
+        final_output_jitter_max_tokens: 10,
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1, 100)
+        .expect("projection");
+    let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+
+    assert_ne!(projected.body, body);
+    assert!(projected.usage_capture.projected);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    assert_eq!(usage["output_tokens"].as_i64().unwrap(), 70);
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    assert_eq!(reported.output_tokens, 70);
+}
+
+#[test]
+fn usage_projection_ignores_external_cache_when_local_policy_has_no_cache() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":7,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-6");
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 25).expect("projection");
+    let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    assert_eq!(
+        usage
+            .get("input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        count_external_route_input_tokens(payload_ref(&route)) as i64
+    );
+    assert_eq!(
+        usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        0
+    );
+    assert_eq!(
+        usage
+            .get("cache_read_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        0
+    );
+    assert!(projected.usage_capture.projected);
+    assert_eq!(
+        projected
+            .usage_capture
+            .raw
+            .expect("raw")
+            .cache_creation_input_tokens,
+        50_000
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .expect("reported")
+            .input_tokens,
+        count_external_route_input_tokens(payload_ref(&route))
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .expect("reported")
+            .cache_creation_input_tokens,
+        0
+    );
+}
+
+#[test]
+fn usage_projection_ignores_external_raw_cache_when_local_policy_reads() {
+    let raw_creation_body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":80000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let first_projection = projection_context(&route, &pool, 0).expect("first projection");
+    let first = maybe_project_non_stream_usage(raw_creation_body.clone(), Some(&first_projection));
+    let first_value: serde_json::Value =
+        serde_json::from_slice(&first.body).expect("first projected json");
+    let first_usage = first_value.get("usage").expect("first usage");
+    assert!(
+        first_usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default()
+            > 0
+    );
+    first_projection.record_success();
+
+    payload_mut(&mut route).messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue external projection session"),
+        },
+    ]);
+    refresh_test_route_derived_state(&mut route);
+    let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+    let second = maybe_project_non_stream_usage(raw_creation_body, Some(&second_projection));
+    let second_value: serde_json::Value =
+        serde_json::from_slice(&second.body).expect("second projected json");
+    let second_usage = second_value.get("usage").expect("second usage");
+    let second_creation = second_usage
+        .get("cache_creation_input_tokens")
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default();
+    let second_read = second_usage
+        .get("cache_read_input_tokens")
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default();
+
+    assert_eq!(second_creation, 0);
+    assert!(second_read > 0);
+    assert_ne!(second_creation, 80_000);
+}
+
+#[test]
+fn usage_projection_no_cache_route_removes_external_cache_usage() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(64),
+        output: ReportedUsageFieldPolicy::sample_max(5),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0);
+    assert!(projection.is_some());
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":9,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000,"cache_creation":{"ephemeral_5m_input_tokens":50000,"ephemeral_1h_input_tokens":0}}}"#,
+        );
+    let projected = maybe_project_non_stream_usage(body, projection.as_ref());
+    assert!(projected.usage_capture.projected);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    assert_eq!(
+        usage
+            .get("input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        count_external_route_input_tokens(payload_ref(&route)) as i64
+    );
+    assert_eq!(
+        usage
+            .get("output_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        9
+    );
+    assert_eq!(
+        usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        0
+    );
+    assert_eq!(
+        usage
+            .get("cache_read_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        0
+    );
+    assert!(usage.get("cache_creation").is_none());
+    assert_eq!(
+        projected
+            .usage_capture
+            .raw
+            .expect("raw")
+            .cache_creation_input_tokens,
+        50_000
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .expect("reported")
+            .cache_creation_input_tokens,
+        0
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .expect("reported")
+            .cache_read_input_tokens,
+        0
+    );
+}
+
+#[test]
+fn usage_projection_output_uplift_changes_only_final_reported_usage() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1200,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    disable_path_output_postprocess(&mut route);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    let shaped = projected.usage_capture.shaped.expect("shaped usage");
+    let reported = projected.usage_capture.reported.expect("reported usage");
+
+    assert_eq!(shaped.output_tokens, 1200);
+    assert_eq!(reported.output_tokens, uplift_tokens(1200, 50));
+    assert_eq!(
+        usage
+            .get("output_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        uplift_tokens(1200, 50) as i64
+    );
+    assert_eq!(reported.input_tokens, shaped.input_tokens);
+    assert_eq!(
+        reported.cache_read_input_tokens,
+        shaped.cache_read_input_tokens
+    );
+    assert_eq!(
+        reported.cache_creation_input_tokens,
+        shaped.cache_creation_input_tokens
+    );
+}
+
+#[test]
+fn usage_projection_output_uplift_only_applies_above_threshold() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":800,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let shaped = projected.usage_capture.shaped.expect("shaped usage");
+    let reported = projected.usage_capture.reported.expect("reported usage");
+
+    assert_eq!(shaped.output_tokens, 800);
+    assert_eq!(reported.output_tokens, 800);
+}
+
+#[test]
+fn usage_projection_pass_through_keeps_body_unchanged() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let projected = maybe_project_non_stream_usage(body.clone(), None);
+
+    assert_eq!(projected.body, body);
+    assert_eq!(
+        projected.usage_capture.raw,
+        projected.usage_capture.reported
+    );
+    assert!(!projected.protocol_contamination);
+}
+
+#[test]
+fn usage_projection_path_skip_non_stream_blocks_external_projection() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        skip_non_stream_usage_projection: true,
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0);
+    assert!(projection.is_none());
+}
+
+#[test]
+fn usage_projection_path_skip_non_stream_keeps_external_usage_raw() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-opus-4-6");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        skip_non_stream_usage_projection: true,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0);
+    assert!(projection.is_none());
+    let projected = maybe_project_non_stream_usage(body.clone(), projection.as_ref());
+
+    assert_eq!(projected.body, body);
+    assert!(!projected.usage_capture.projected);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.input_tokens),
+        Some(4165)
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .map(|usage| usage.input_tokens),
+        Some(4165)
+    );
+
+    let billing = account_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(!billing.usage_projection_applied);
+    assert_eq!(billing.raw_usage.input_tokens, 4165);
+    assert_eq!(billing.shaped_usage.input_tokens, 4165);
+    assert_eq!(billing.reported_usage.input_tokens, 4165);
+    assert_eq!(billing.reported_usage.output_tokens, 2);
+}
+
+#[test]
+fn usage_projection_path_skip_non_stream_keeps_stream_projection_enabled() {
+    let mut route = test_route("claude-sonnet-4-5");
+    payload_mut(&mut route).stream = true;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        skip_non_stream_usage_projection: true,
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0);
+    assert!(projection.is_some());
+}
+
+#[test]
+fn usage_projection_repairs_raw_output_from_non_stream_answer_estimate_without_cost_floor() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"hello world from response"}],"usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let estimated_output_tokens = projected.usage_capture.estimated_output_tokens;
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(estimated_output_tokens > 0);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert_eq!(
+        billing.reported_usage.output_tokens,
+        estimated_output_tokens
+    );
+    assert_eq!(
+        usage["output_tokens"].as_i64(),
+        Some(i64::from(estimated_output_tokens))
+    );
+}
+
+#[test]
+fn usage_projection_repairs_tiny_raw_input_from_request_estimate_without_cost_floor() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    let request_input_tokens = route.request_input_tokens;
+    assert!(request_input_tokens >= 512);
+
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.cache_read_input_tokens, 0);
+    assert_eq!(billing.raw_usage.cache_creation_input_tokens, 0);
+    assert_eq!(billing.reported_usage.input_tokens, request_input_tokens);
+    assert_eq!(
+        usage["input_tokens"].as_i64(),
+        Some(i64::from(request_input_tokens))
+    );
+}
+
+#[test]
+fn usage_projection_sample_rows_stay_within_path_usage_policy_after_cost_floor() {
+    struct Sample {
+        name: &'static str,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_input_tokens: i32,
+        cache_creation_input_tokens: i32,
+        cache_read_cap: i32,
+        cache_creation_cap: i32,
+        output_cap: i32,
+        expect_output_repair: bool,
+    }
+
+    let samples = [
+        Sample {
+            name: "tiny-uncached-user-example",
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_cap: 128,
+            cache_creation_cap: 4_096,
+            output_cap: 256,
+            expect_output_repair: true,
+        },
+        Sample {
+            name: "tiny-cache-read-upstream-row",
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_input_tokens: 16,
+            cache_creation_input_tokens: 0,
+            cache_read_cap: 128,
+            cache_creation_cap: 4_096,
+            output_cap: 256,
+            expect_output_repair: false,
+        },
+        Sample {
+            name: "large-cache-upstream-row",
+            input_tokens: 44,
+            output_tokens: 665,
+            cache_read_input_tokens: 47_778,
+            cache_creation_input_tokens: 48_629,
+            cache_read_cap: 90_000,
+            cache_creation_cap: 40_000,
+            output_cap: 900,
+            expect_output_repair: false,
+        },
+        Sample {
+            name: "huge-cache-and-output-row",
+            input_tokens: 301_153,
+            output_tokens: 7_476,
+            cache_read_input_tokens: 764_772,
+            cache_creation_input_tokens: 764_107,
+            cache_read_cap: 700_000,
+            cache_creation_cap: 400_000,
+            output_cap: 4_096,
+            expect_output_repair: false,
+        },
+    ];
+
+    for sample in samples {
+        let mut route = test_route("claude-sonnet-4-5");
+        let input_cap = 96;
+        configure_usage_projection_test_path(
+            &mut route,
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+                output: ReportedUsageFieldPolicy::raw(),
+                cache_read: ReportedUsageFieldPolicy::preserve(),
+                cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+                final_cache_read_max_tokens: sample.cache_read_cap,
+                final_cache_read_jitter_min_tokens: 0,
+                final_cache_read_jitter_max_tokens: 0,
+                final_cache_creation_max_tokens: sample.cache_creation_cap,
+                final_cache_creation_jitter_min_tokens: 0,
+                final_cache_creation_jitter_max_tokens: 0,
+                final_output_guard_enabled: true,
+                output_uplift_min_tokens: 0,
+                output_uplift_percent: 0,
+                final_output_max_tokens: sample.output_cap,
+                final_output_jitter_min_tokens: 0,
+                final_output_jitter_max_tokens: 0,
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context_with_cost_floor(&route, &pool, 0)
+            .unwrap_or_else(|| panic!("projection for {}", sample.name));
+
+        let nested_cache_creation = if sample.cache_creation_input_tokens > 0 {
+            format!(
+                r#","cache_creation":{{"ephemeral_5m_input_tokens":{},"ephemeral_1h_input_tokens":0}}"#,
+                sample.cache_creation_input_tokens
+            )
+        } else {
+            String::new()
+        };
+        let body = Bytes::from(format!(
+            r#"{{"type":"message","content":[{{"type":"text","text":"sample response body for usage policy regression"}}],"usage":{{"input_tokens":{},"output_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{}{}}}}}"#,
+            sample.input_tokens,
+            sample.output_tokens,
+            sample.cache_creation_input_tokens,
+            sample.cache_read_input_tokens,
+            nested_cache_creation,
+        ));
+
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let billing = account_billing_from_capture(&route, &pool, projected.usage_capture)
+            .unwrap_or_else(|| panic!("billing for {}", sample.name));
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+
+        assert_eq!(
+            billing.raw_usage.input_tokens, sample.input_tokens,
+            "{} raw input",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.output_tokens, sample.output_tokens,
+            "{} raw output",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.cache_read_input_tokens, sample.cache_read_input_tokens,
+            "{} raw cache read",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.cache_creation_input_tokens, sample.cache_creation_input_tokens,
+            "{} raw cache creation",
+            sample.name
+        );
+
+        assert!(
+            billing.reported_usage.input_tokens <= input_cap,
+            "{} final input {} should respect path input sample max",
+            sample.name,
+            billing.reported_usage.input_tokens
+        );
+        assert!(
+            billing.reported_usage.cache_read_input_tokens <= sample.cache_read_cap,
+            "{} final cache read {} should respect path final cache read cap {}",
+            sample.name,
+            billing.reported_usage.cache_read_input_tokens,
+            sample.cache_read_cap
+        );
+        assert!(
+            billing.reported_usage.cache_creation_input_tokens <= sample.cache_creation_cap,
+            "{} final cache creation {} should respect path final cache creation cap {}",
+            sample.name,
+            billing.reported_usage.cache_creation_input_tokens,
+            sample.cache_creation_cap
+        );
+        assert!(
+            billing.reported_usage.output_tokens <= sample.output_cap,
+            "{} final output {} should respect path final output cap {}",
+            sample.name,
+            billing.reported_usage.output_tokens,
+            sample.output_cap
+        );
+        if sample.expect_output_repair {
+            assert!(
+                billing.reported_usage.output_tokens > sample.output_tokens,
+                "{} should use response body output estimate",
+                sample.name
+            );
+        }
+        assert_eq!(
+            billing.reported_usage.total_input_tokens,
+            billing
+                .reported_usage
+                .input_tokens
+                .saturating_add(billing.reported_usage.cache_read_input_tokens)
+                .saturating_add(billing.reported_usage.cache_creation_input_tokens),
+            "{} total input should match final standard fields",
+            sample.name
+        );
+        assert_eq!(
+            usage["input_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.input_tokens)),
+            "{} returned input",
+            sample.name
+        );
+        assert_eq!(
+            usage["output_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.output_tokens)),
+            "{} returned output",
+            sample.name
+        );
+        assert_eq!(
+            usage["cache_read_input_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.cache_read_input_tokens)),
+            "{} returned cache read",
+            sample.name
+        );
+        assert_eq!(
+            usage["cache_creation_input_tokens"].as_i64(),
+            Some(i64::from(
+                billing.reported_usage.cache_creation_input_tokens
+            )),
+            "{} returned cache creation",
+            sample.name
+        );
+    }
+}
+
+#[test]
+fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-opus-4-6");
+    route.request_input_tokens = 4165;
+    route.prompt_cache_target_read_ratio = 0.5;
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+
+    assert_ne!(projected.body, body);
+    assert!(projected.usage_capture.projected);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    assert_eq!(usage["input_tokens"].as_i64().unwrap(), 1);
+    assert_eq!(usage["output_tokens"].as_i64().unwrap(), 2);
+    assert_eq!(usage["cache_read_input_tokens"].as_i64().unwrap(), 0);
+    assert_eq!(usage["cache_creation_input_tokens"].as_i64().unwrap(), 4164);
+    assert_projected_cache_creation_consistent(usage);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.input_tokens),
+        Some(4165)
+    );
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    assert_eq!(reported.input_tokens, 1);
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert_eq!(reported.cache_creation_input_tokens, 4164);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_stream_capture_uses_latest_projected_reported_usage() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        reported: Some(CacheUsage {
+            total_input_tokens: 120_000,
+            input_tokens: 10_000,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 110_000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        }),
+        ..ExternalUsageCapture::default()
+    }));
+
+    let event =
+            br#"data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":120000}}
+
+"#;
+
+    let out = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&out).expect("event text");
+    let event_input = event_usage_i64(text, "input_tokens");
+    let reported = capture.lock().reported.expect("reported usage");
+
+    assert!((1..=96).contains(&event_input));
+    assert_eq!(reported.input_tokens as i64, event_input);
+    assert!(reported.input_tokens < 10_000);
+    assert!(reported.cache_read_input_tokens > 0);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+/// A non-streaming request without any cache breakpoint, or whose marked prefix is below the
+/// model minimum, keeps the external upstream usage exactly as `skipNonStreamUsageProjection`
+/// would; streaming requests are still shaped.
+/// Accounts follow the same switches as local requests: by default a request long enough as
+/// a whole is shaped by the path strategy whether or not it is marked; with the strict check on for
+/// a request kind, a request the Anthropic API would not cache (no breakpoint, or a prefix below
+/// the model minimum) keeps upstream usage.
+#[test]
+fn usage_projection_strict_cache_eligibility_is_switchable_per_stream_kind() {
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let strict = |route: &mut AccountRouteRequest, stream: bool, non_stream: bool| {
+        route.reported_usage.default.strict_cache_eligibility_stream = stream;
+        route
+            .reported_usage
+            .default
+            .strict_cache_eligibility_non_stream = non_stream;
+        for policy in std::iter::once(&mut route.reported_usage.default) {
+            policy.strict_cache_eligibility_stream = stream;
+            policy.strict_cache_eligibility_non_stream = non_stream;
+        }
+        route.reset_preparation_cache();
+    };
+    let unmarked = |stream: bool| {
+        let mut route = test_route("claude-sonnet-4-5");
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].cache_control = None;
+            payload.stream = stream;
+        }
+        route.reset_preparation_cache();
+        route
+    };
+    // The 42-token haiku shape seen in production: marked, but far below Haiku 4.5's minimum.
+    let short = |stream: bool| {
+        let mut route = test_route("claude-haiku-4-5-20251001");
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].text = "Reply with one word.".to_string();
+            payload.stream = stream;
+        }
+        route.request_input_tokens = 42;
+        route.reset_preparation_cache();
+        route
+    };
+
+    // Default: no strict check, unmarked requests are shaped too; a request shorter than the
+    // model minimum as a whole (the 42-token probe) still keeps upstream usage.
+    for stream in [true, false] {
+        assert!(
+            projection_context(&unmarked(stream), &pool, 0).is_some(),
+            "stream={stream}"
+        );
+        assert!(
+            projection_context(&short(stream), &pool, 0).is_none(),
+            "stream={stream}"
+        );
+    }
+
+    for stream in [true, false] {
+        for (strict_stream, strict_non_stream) in [(true, false), (false, true), (true, true)] {
+            let checked = if stream {
+                strict_stream
+            } else {
+                strict_non_stream
+            };
+            let label = format!("stream={stream} strict=({strict_stream},{strict_non_stream})");
+            let mut route = unmarked(stream);
+            strict(&mut route, strict_stream, strict_non_stream);
+            assert_eq!(
+                projection_context(&route, &pool, 0).is_none(),
+                checked,
+                "unmarked {label}"
+            );
+            let mut route = short(stream);
+            strict(&mut route, strict_stream, strict_non_stream);
+            assert!(
+                projection_context(&route, &pool, 0).is_none(),
+                "short {label}"
+            );
+            let mut marked = test_route("claude-sonnet-4-5");
+            if let Some(payload) = marked.payload.as_mut() {
+                payload.stream = stream;
+            }
+            strict(&mut marked, strict_stream, strict_non_stream);
+            assert!(
+                projection_context(&marked, &pool, 0).is_some(),
+                "marked {label}"
+            );
+        }
+    }
+
+    // A raw body that only sets top-level cache_control (automatic caching) passes the check.
+    let raw = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 8,
+        "system": [{"type": "text", "text": "You are a careful coding assistant. ".repeat(200)}],
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": false
+    });
+    let mut unmarked_raw = raw_test_route(raw.to_string().as_bytes());
+    assert!(projection_context(&unmarked_raw, &pool, 0).is_some());
+    strict(&mut unmarked_raw, false, true);
+    assert!(projection_context(&unmarked_raw, &pool, 0).is_none());
+    let mut automatic = raw.clone();
+    automatic["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    let mut automatic_raw = raw_test_route(automatic.to_string().as_bytes());
+    strict(&mut automatic_raw, false, true);
+    assert!(projection_context(&automatic_raw, &pool, 0).is_some());
+}
+
+#[test]
+fn usage_projection_treats_upstream_cache_read_as_evidence_not_value() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    assert!(projection.raw_input_tokens > 96);
+
+    let small_read = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":1}}"#,
+        ),
+        Some(&projection),
+    );
+    let sentinel_read = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":120000}}"#,
+        ),
+        Some(&projection),
+    );
+
+    assert_eq!(small_read.body, sentinel_read.body);
+    assert_eq!(
+        small_read.usage_capture.reported,
+        sentinel_read.usage_capture.reported
+    );
+    assert_eq!(
+        small_read
+            .usage_capture
+            .raw
+            .expect("small raw usage")
+            .cache_read_input_tokens,
+        1
+    );
+    assert_eq!(
+        sentinel_read
+            .usage_capture
+            .raw
+            .expect("sentinel raw usage")
+            .cache_read_input_tokens,
+        120_000
+    );
+    let reported = sentinel_read
+        .usage_capture
+        .reported
+        .expect("reported usage");
+    assert!((1..=96).contains(&reported.input_tokens));
+    assert!(reported.cache_read_input_tokens > 0);
+    assert_ne!(reported.cache_read_input_tokens, 120_000);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_updates_account_cache_after_success() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let first_projection = projection_context(&route, &pool, 0).expect("first projection");
+    let first = maybe_project_non_stream_usage(body.clone(), Some(&first_projection));
+    let first_value: serde_json::Value =
+        serde_json::from_slice(&first.body).expect("first projected json");
+    let first_usage = first_value.get("usage").expect("first usage");
+    assert_eq!(
+        first_usage
+            .get("cache_read_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        0
+    );
+    assert!(
+        first_usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default()
+            > 0
+    );
+    first_projection.record_success();
+
+    payload_mut(&mut route).messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue external projection session"),
+        },
+    ]);
+    refresh_test_route_derived_state(&mut route);
+    let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+    let second = maybe_project_non_stream_usage(body, Some(&second_projection));
+    let second_value: serde_json::Value =
+        serde_json::from_slice(&second.body).expect("second projected json");
+    let second_usage = second_value.get("usage").expect("second usage");
+    assert!(
+        second_usage
+            .get("cache_read_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default()
+            > 0
+    );
+}
+
+#[test]
+fn usage_projection_uses_resolved_model_without_mutating_payload_model() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("sonnet");
+    route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
+    route.upstream_model = Some("claude-sonnet-4-5".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+
+    assert_eq!(payload_ref(&route).model, "sonnet");
+    assert_eq!(billing.pricing_model.as_deref(), Some("claude-sonnet-4-5"));
+    assert!(billing.pricing_available);
+}
+
+/// 只断言“事件前缀”：首个事件必须是 message_start，且它的 usage 全部为 0。
+fn assert_single_zeroed_message_start(events: &[(String, serde_json::Value)], expected_id: &str) {
+    let starts = downstream_events_named(events, "message_start");
+    assert_eq!(
+        starts.len(),
+        1,
+        "downstream must see exactly one message_start: {events:?}"
+    );
+    assert_eq!(
+        events[0].0, "message_start",
+        "message_start must come first"
+    );
+    let message = &starts[0]["message"];
+    assert_eq!(message["id"], expected_id);
+    let usage = message["usage"].as_object().expect("message_start usage");
+    for (key, value) in usage {
+        match value {
+            serde_json::Value::Number(number) => {
+                assert_eq!(number.as_i64(), Some(0), "usage.{key} must be zeroed");
+            }
+            serde_json::Value::Object(inner) => {
+                for (inner_key, inner_value) in inner {
+                    if let Some(number) = inner_value.as_i64() {
+                        assert_eq!(number, 0, "usage.{key}.{inner_key} must be zeroed");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_backfills_input_usage_missing_from_message_delta() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_backfill",
+            1_234,
+            50_000,
+            700,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("hello")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta_output_only(42)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-backfill", 1, &upstream.base_url).await;
+
+    let request_id = "req_early_commit_backfill";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_backfill");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_backfill");
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    assert_eq!(delta["usage"]["output_tokens"], 42);
+    assert_eq!(delta["usage"]["input_tokens"], 1_234);
+    assert_eq!(delta["usage"]["cache_read_input_tokens"], 50_000);
+    assert_eq!(delta["usage"]["cache_creation_input_tokens"], 700);
+    assert_eq!(
+        delta["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+        700
+    );
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_client_disconnect_stops_failover_and_records_client_dropped() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let stalled = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_stalled", 10)),
+        ExternalStreamFakeStep::delay(Duration::from_secs(30)),
+    ])
+    .await;
+    let backup = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_should_not_run",
+        "should-not-run",
+        1,
+        1,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-stalled", 1, &stalled.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-unused", 10, &backup.base_url).await;
+
+    let request_id = "req_early_commit_client_gone";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_client_gone");
+    let mut config = early_commit_config_for_test();
+    config.stream_idle_timeout_secs = 30;
+    let response = forward_early_commit(&manager, config, route).await;
+    let mut stream = response.into_body().into_data_stream();
+    let first = timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("message_start")
+        .expect("chunk")
+        .expect("chunk ok");
+    assert!(String::from_utf8_lossy(&first).contains("msg_stalled"));
+    drop(stream);
+
+    let record = timeout(
+        Duration::from_secs(5),
+        wait_for_usage_record(&recorder, request_id),
+    )
+    .await
+    .expect("client drop must end the background attempt promptly");
+    assert_eq!(record.status, UsageRecordStatus::ClientDropped);
+    assert_eq!(record.error_type.as_deref(), Some("client_dropped"));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "client_dropped");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(backup.snapshot(), 0, "no failover after the client is gone");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_commit_concurrent_requests_keep_their_streams_separate() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let mut steps = vec![ExternalStreamFakeStep::chunk(external_sse_message_start(
+        "msg_shared",
+        50,
+    ))];
+    steps.push(ExternalStreamFakeStep::delay(Duration::from_millis(200)));
+    steps.extend(
+        external_stream_success_steps("msg_unused", "shared-ok", 50, 3)
+            .into_iter()
+            .skip(1),
+    );
+    let upstream = ExternalStreamFakeServer::start(steps).await;
+    let mut request = create_pool_request("early-commit-concurrent", 1, true);
+    request.base_url = upstream.base_url.clone();
+    request.max_concurrent_requests = 16;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    request.pre_output_stream_retry_mode = StreamRetryMode::EarlyCommit;
+    postgres.create_account(request).await.unwrap();
+
+    let mut tasks = Vec::new();
+    let mut recorders = Vec::new();
+    for index in 0..8 {
+        let request_id = format!("req_early_commit_concurrent_{index}");
+        let (route, recorder) =
+            external_stream_route(request_id.clone(), format!("err_concurrent_{index}"));
+        recorders.push((request_id, recorder));
+        let manager = manager.clone();
+        tasks.push(tokio::spawn(async move {
+            let response =
+                forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+            read_response_body_text_allow_error(response).await
+        }));
+    }
+    for task in tasks {
+        let (body, stream_error) = task.await.unwrap();
+        assert_eq!(stream_error, None);
+        let events = parse_downstream_sse(&body);
+        assert_single_zeroed_message_start(&events, "msg_shared");
+        assert!(body.contains("shared-ok"), "{body}");
+        assert_eq!(downstream_events_named(&events, "message_stop").len(), 1);
+    }
+    for (request_id, recorder) in recorders {
+        let record = wait_for_usage_record(&recorder, &request_id).await;
+        assert_eq!(record.status, UsageRecordStatus::Success);
+    }
+    assert_eq!(upstream.snapshot(), 8);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+fn early_commit_config_for_test() -> AccountsConfig {
+    AccountsConfig {
+        stream_idle_timeout_secs: 3,
+        // 提前提交模式下这个超时不应该生效；设得很短以证明不会被切断。
+        stream_first_output_timeout_secs: 1,
+        ..external_stream_config_for_test()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_does_not_change_non_stream_requests() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start_with_status(
+        StatusCode::BAD_GATEWAY,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"bad gateway"}}"#,
+        )],
+    )
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-non-stream", 1, &failing.base_url).await;
+
+    let request_id = "req_early_commit_non_stream";
+    let (mut route, _recorder) = external_stream_route(request_id, "err_early_commit_non_stream");
+    payload_mut(&mut route).stream = false;
+    refresh_test_route_derived_state(&mut route);
+    let outcome = timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(early_commit_config_for_test(), route),
+    )
+    .await
+    .expect("non-stream dispatch must finish");
+    assert!(
+        matches!(outcome, AccountForwardOutcome::FinalError(_)),
+        "a non-stream request must still return the upstream error status"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_does_not_replay_after_content_was_forwarded() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let partial = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_partial", 10)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("partial-content")),
+        ExternalStreamFakeStep::chunk(external_sse_error("mid-stream failure")),
+    ])
+    .await;
+    let backup = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_should_not_replay",
+        "should-not-replay",
+        1,
+        1,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-partial", 1, &partial.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-no-replay", 10, &backup.base_url).await;
+    let request_id = "req_early_commit_mid_stream";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_mid_stream");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, _stream_error) = read_response_body_text_allow_error(response).await;
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_partial");
+    assert!(body.contains("partial-content"), "{body}");
+    assert!(!body.contains("should-not-replay"), "{body}");
+    assert!(!body.contains("mid-stream failure"));
+    // 提交内容后出错仍按原有语义以 error 事件结束，不计费。
+    assert_eq!(events.last().unwrap().0, "error", "{body}");
+    assert_eq!(backup.snapshot(), 0);
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_ne!(record.status, UsageRecordStatus::Success);
+    assert!(record.account_billing.is_none());
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_ends_with_error_event_and_no_billable_usage_when_all_pools_fail() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing_a = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_fail_a",
+            9_999,
+            88_888,
+            777,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw failure a")),
+    ])
+    .await;
+    let failing_b = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_fail_b",
+            9_999,
+            88_888,
+            777,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw failure b")),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-fail-a", 1, &failing_a.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-fail-b", 1, &failing_b.base_url).await;
+
+    let request_id = "req_early_commit_all_fail";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_all_fail");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(
+        stream_error, None,
+        "the stream must end cleanly with an error event"
+    );
+    let events = parse_downstream_sse(&body);
+    let start_id = downstream_events_named(&events, "message_start")[0]["message"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_single_zeroed_message_start(&events, &start_id);
+    // 下游看不到任何非零的用量：不能被按 message_start 的输入 token 计费。
+    assert!(!body.contains("9999"), "{body}");
+    assert!(!body.contains("88888"), "{body}");
+    assert!(downstream_events_named(&events, "message_delta").is_empty());
+    assert!(downstream_events_named(&events, "message_stop").is_empty());
+    let errors = downstream_events_named(&events, "error");
+    assert_eq!(errors.len(), 1, "{body}");
+    assert_eq!(
+        events.last().unwrap().0,
+        "error",
+        "error must be the last event"
+    );
+    assert_eq!(errors[0]["error"]["type"], "api_error");
+    assert!(
+        errors[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("err_early_commit_all_fail")
+    );
+    assert!(!body.contains("raw failure"));
+    assert_eq!(failing_a.snapshot() + failing_b.snapshot(), 2);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.output_tokens, 0);
+    assert_eq!(record.cache_read_input_tokens, 0);
+    assert_eq!(record.estimated_cost_usd, 0.0);
+    assert!(record.account_billing.is_none());
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_error_in_the_same_chunk_as_message_start_still_fails_over() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    // message_start 与 error 落在同一次读取里：这次尝试可能连 message_start 都没发出去。
+    let same_chunk = ExternalStreamFakeServer::start(vec![ExternalStreamFakeStep::chunk(format!(
+        "{}{}",
+        external_sse_message_start("msg_same_chunk", 10),
+        external_sse_error("same chunk failure")
+    ))])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_same_chunk",
+        "served-after-same-chunk",
+        12,
+        2,
+    ))
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-same-chunk",
+        1,
+        &same_chunk.base_url,
+    )
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-same-ok", 10, &healthy.base_url).await;
+    let request_id = "req_early_commit_same_chunk";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_same_chunk");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    // message_start 先于 error 处理，所以下游拿到的是第一次尝试的 message_start。
+    assert_single_zeroed_message_start(&events, "msg_same_chunk");
+    assert!(!body.contains("msg_after_same_chunk"), "{body}");
+    assert!(body.contains("served-after-same-chunk"), "{body}");
+    assert!(!body.contains("same chunk failure"));
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_fails_over_after_message_start_and_downstream_sees_one_message() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_first",
+            111,
+            5_000,
+            300,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw first attempt secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_second",
+            222,
+            6_000,
+            400,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("ok-after-failover")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(222, 7)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    let pool_a = create_early_commit_pool(&postgres, "early-commit-a", 1, &failing.base_url).await;
+    let pool_b =
+        create_early_commit_pool(&postgres, "early-commit-b", 10, &succeeding.base_url).await;
+
+    let request_id = "req_early_commit_failover";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_failover");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    // 失败池优先级更高，先被选中：下游看到的是第一次尝试的 message_start（usage 清零），
+    // 第二次尝试的 message_start 被丢弃。
+    assert_single_zeroed_message_start(&events, "msg_first");
+    assert!(!body.contains("msg_second"), "{body}");
+    assert!(body.contains("ok-after-failover"), "{body}");
+    assert!(!body.contains("raw first attempt secret"));
+    assert!(
+        downstream_events_named(&events, "error").is_empty(),
+        "{body}"
+    );
+    assert_eq!(downstream_events_named(&events, "message_stop").len(), 1);
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    // message_delta 带上了第二次尝试的真实输入侧用量（第一次的 cache 值不能混进来）。
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    assert_eq!(delta["usage"]["input_tokens"], 222);
+    assert_eq!(delta["usage"]["output_tokens"], 7);
+    assert_eq!(delta["usage"]["cache_read_input_tokens"], 6_000);
+    assert_eq!(delta["usage"]["cache_creation_input_tokens"], 400);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].action, "retry_next");
+    assert_eq!(
+        record.external_attempts[0].error_type.as_deref(),
+        Some("protocol_error")
+    );
+    assert_eq!(record.external_attempts[1].action, "success");
+    assert_eq!(record.external_attempts[0].pool_id, pool_a.id);
+    assert_eq!(record.account_id, Some(pool_b.id));
+    let billing = record.account_billing.as_ref().expect("billing");
+    assert_eq!(billing.raw_usage.input_tokens, 222);
+    assert_eq!(billing.raw_usage.output_tokens, 7);
+    let trace = record.latency_trace.as_ref().expect("latency trace");
+    let first_byte = trace
+        .downstream_first_byte_ms
+        .expect("downstream first byte");
+    let first_output = trace.first_output_delta_ms.expect("first output");
+    assert!(
+        first_byte <= first_output,
+        "message_start must reach downstream before the first content ({first_byte} > {first_output})"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_fails_over_on_read_error_eof_and_idle_before_first_content() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let read_error = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_read_error", 10)),
+        ExternalStreamFakeStep::error("connection reset"),
+    ])
+    .await;
+    let eof = ExternalStreamFakeServer::start(vec![ExternalStreamFakeStep::chunk(
+        external_sse_message_start("msg_eof", 10),
+    )])
+    .await;
+    let idle = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_idle", 10)),
+        ExternalStreamFakeStep::delay(Duration::from_secs(30)),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_healthy",
+        "served-by-healthy",
+        55,
+        6,
+    ))
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-read-error",
+        1,
+        &read_error.base_url,
+    )
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-eof", 2, &eof.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-idle", 3, &idle.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-healthy", 4, &healthy.base_url).await;
+
+    let request_id = "req_early_commit_transport_failures";
+    let (mut route, recorder) = external_stream_route(request_id, "err_early_commit_transport");
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+    let mut config = early_commit_config_for_test();
+    config.retry_max_attempts = 5;
+    config.stream_idle_timeout_secs = 1;
+    let response = forward_early_commit(&manager, config, route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    // 哪次失败尝试的 message_start 先到下游取决于读取时序（错误可能和 message_start 落在同一次
+    // 读取里，那次尝试在发出 message_start 前就失败）；不变的是：只有一个、已清零、来自失败的尝试。
+    let start_id = downstream_events_named(&events, "message_start")[0]["message"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        ["msg_read_error", "msg_eof", "msg_idle"].contains(&start_id.as_str()),
+        "{start_id}"
+    );
+    assert_single_zeroed_message_start(&events, &start_id);
+    assert!(body.contains("served-by-healthy"), "{body}");
+    for other in ["msg_read_error", "msg_eof", "msg_idle"] {
+        if other != start_id {
+            assert!(
+                !body.contains(other),
+                "only one message_start may reach downstream: {body}"
+            );
+        }
+    }
+    assert!(
+        !body.contains("msg_healthy"),
+        "retry message_start must be dropped"
+    );
+    assert_eq!(read_error.snapshot(), 1);
+    assert_eq!(eof.snapshot(), 1);
+    assert_eq!(idle.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 4);
+    assert!(
+        record.external_attempts[..3]
+            .iter()
+            .all(|attempt| attempt.action == "retry_next"),
+        "{:?}",
+        record.external_attempts
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_is_not_used_when_the_top_priority_pools_are_mixed() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let early = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_mixed_early", 10)),
+        ExternalStreamFakeStep::chunk(external_sse_error("mixed early failure")),
+    ])
+    .await;
+    let normal = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_mixed_normal", 10)),
+        ExternalStreamFakeStep::chunk(external_sse_error("mixed normal failure")),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "mixed-early", 1, &early.base_url).await;
+    create_messages_pool(&postgres, "mixed-normal", 1, &normal.base_url).await;
+
+    let request_id = "req_early_commit_mixed";
+    let (route, _recorder) = external_stream_route(request_id, "err_early_commit_mixed");
+    let outcome = timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(early_commit_config_for_test(), route),
+    )
+    .await
+    .expect("mixed dispatch must finish");
+    // 普通语义：首个内容前全部失败时返回最终错误（502），而不是已提交的 200 流。
+    match outcome {
+        AccountForwardOutcome::FinalError(error) => {
+            assert_eq!(error.route_error_type, "protocol_error");
+        }
+        AccountForwardOutcome::Response(response) => {
+            panic!(
+                "mixed priority pools must keep the buffered semantics, got {}",
+                response.status()
+            );
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_keeps_http_error_when_every_pool_fails_before_headers() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let bad_gateway_a = ExternalStreamFakeServer::start_with_status(
+        StatusCode::BAD_GATEWAY,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"bad gateway a"}}"#,
+        )],
+    )
+    .await;
+    let bad_gateway_b = ExternalStreamFakeServer::start_with_status(
+        StatusCode::SERVICE_UNAVAILABLE,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"bad gateway b"}}"#,
+        )],
+    )
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-http-fail-a",
+        1,
+        &bad_gateway_a.base_url,
+    )
+    .await;
+    create_early_commit_pool(
+        &postgres,
+        "early-commit-http-fail-b",
+        2,
+        &bad_gateway_b.base_url,
+    )
+    .await;
+
+    let request_id = "req_early_commit_http_fail";
+    let (route, _recorder) = external_stream_route(request_id, "err_early_commit_http_fail");
+    let outcome = timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(early_commit_config_for_test(), route),
+    )
+    .await
+    .expect("early-commit HTTP failure must finish");
+    let AccountForwardOutcome::FinalError(error) = outcome else {
+        panic!("all pre-header failures must remain an HTTP error");
+    };
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.attempts.len(), 2);
+    assert_eq!(bad_gateway_a.snapshot() + bad_gateway_b.snapshot(), 2);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_keeps_waiting_past_first_output_timeout_with_pings() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    // 首个内容在 2.5 秒后才出现，超过配置的 1 秒首个输出超时；上游期间只发 ping。
+    let slow = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_slow", 321)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_200)),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_300)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("slow-but-healthy")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(321, 3)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    let backup = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_backup",
+        "should-not-run",
+        1,
+        1,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-slow", 1, &slow.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-backup", 10, &backup.base_url).await;
+
+    let request_id = "req_early_commit_slow_first_output";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_slow");
+    let started = Instant::now();
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let mut stream = response.into_body().into_data_stream();
+    let first_chunk = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("message_start must reach downstream quickly")
+        .expect("first chunk")
+        .expect("first chunk ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "message_start must not wait for the first content"
+    );
+    assert!(String::from_utf8_lossy(&first_chunk).contains("msg_slow"));
+    let mut body = String::from_utf8_lossy(&first_chunk).into_owned();
+    while let Some(chunk) = stream.next().await {
+        body.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+    }
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_slow");
+    assert!(body.contains("slow-but-healthy"), "{body}");
+    assert!(
+        !downstream_events_named(&events, "ping").is_empty(),
+        "downstream must receive keepalive pings during the silent gap"
+    );
+    assert!(
+        downstream_events_named(&events, "error").is_empty(),
+        "{body}"
+    );
+    assert_eq!(slow.snapshot(), 1);
+    assert_eq!(
+        backup.snapshot(),
+        0,
+        "a slow but healthy attempt must not be abandoned"
+    );
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 1);
+    // message_delta 自带完整输入侧字段时原样保留。
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    assert_eq!(delta["usage"]["input_tokens"], 321);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_streams_thinking_and_tool_use_after_message_start() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let thinking = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_thinking", 30)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(300)),
+        ExternalStreamFakeStep::chunk(external_sse_thinking_start()),
+        ExternalStreamFakeStep::chunk(external_sse_thinking_delta("let me think")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(30, 5)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-thinking", 1, &thinking.base_url).await;
+    let request_id = "req_early_commit_thinking";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_thinking");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_thinking");
+    assert!(body.contains("let me think"), "{body}");
+    assert_eq!(events[1].0, "content_block_start", "{body}");
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    postgres.drop_test_schema().await.unwrap();
+
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let tool = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_tool", 40)),
+        ExternalStreamFakeStep::chunk(external_sse_tool_use_start("toolu_1", "Read")),
+        ExternalStreamFakeStep::chunk(external_sse_input_json_delta("{\"file_path\":\"/a\"}")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_event(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+                "usage": {"input_tokens": 40, "output_tokens": 9}
+            }),
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-tool", 1, &tool.base_url).await;
+    let request_id = "req_early_commit_tool";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_tool");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_tool");
+    assert!(body.contains("toolu_1"), "{body}");
+    assert!(body.contains("file_path"), "{body}");
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.downstream_stop_reason.as_deref(), Some("tool_use"));
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_upstream_status_error_before_headers_still_fails_over() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let bad_gateway = ExternalStreamFakeServer::start_with_status(
+        StatusCode::BAD_GATEWAY,
+        vec![ExternalStreamFakeStep::chunk(
+            r#"{"type":"error","error":{"type":"upstream_error","message":"Upstream service temporarily unavailable"}}"#,
+        )],
+    )
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_502",
+        "served-after-502",
+        77,
+        4,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "early-commit-502", 1, &bad_gateway.base_url).await;
+    create_early_commit_pool(&postgres, "early-commit-ok", 10, &healthy.base_url).await;
+
+    let request_id = "req_early_commit_502";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_502");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_after_502");
+    assert!(body.contains("served-after-502"), "{body}");
+    assert!(
+        downstream_events_named(&events, "error").is_empty(),
+        "{body}"
+    );
+    assert_eq!(bad_gateway.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].status, Some(502));
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_with_current_path_usage_projection_still_zeroes_message_start() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start_with_cache(
+            "msg_projected",
+            2_000,
+            30_000,
+            500,
+        )),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("projected-ok")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta_output_only(15)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    let mut request = create_pool_request("early-commit-projected", 1, true);
+    request.base_url = upstream.base_url.clone();
+    request.max_concurrent_requests = 4;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    request.pre_output_stream_retry_mode = StreamRetryMode::EarlyCommit;
+    request.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    postgres.create_account(request).await.unwrap();
+
+    let request_id = "req_early_commit_projected";
+    let (route, recorder) = external_stream_route(request_id, "err_early_commit_projected");
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let events = parse_downstream_sse(&body);
+    assert_single_zeroed_message_start(&events, "msg_projected");
+    assert!(body.contains("projected-ok"), "{body}");
+    // 投影后的 message_delta 必须带非零输入：下游按它计费。
+    let delta = downstream_events_named(&events, "message_delta")[0];
+    let delta_input = delta["usage"]["input_tokens"].as_i64().unwrap_or(0)
+        + delta["usage"]["cache_read_input_tokens"]
+            .as_i64()
+            .unwrap_or(0)
+        + delta["usage"]["cache_creation_input_tokens"]
+            .as_i64()
+            .unwrap_or(0);
+    assert!(
+        delta_input > 0,
+        "message_delta must carry the billable input: {delta}"
+    );
+    assert!(
+        delta["usage"]["output_tokens"].as_i64().unwrap_or(0) >= 15,
+        "{delta}"
+    );
+    let record = wait_for_usage_record(&recorder, request_id).await;
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_all_pools_sustained_502_recovers_without_long_blackout() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let pool_a_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        20,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-a-recovered"),
+    )
+    .await;
+    let pool_b_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        20,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-b-recovered"),
+    )
+    .await;
+    let pool_c_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        20,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-c-recovered"),
+    )
+    .await;
+    let pool_a = create_messages_pool_with_concurrency(
+        &postgres,
+        "sustained-all-primary",
+        1,
+        &pool_a_server.base_url,
+        64,
+    )
+    .await;
+    let pool_b = create_messages_pool_with_concurrency(
+        &postgres,
+        "sustained-all-secondary",
+        10,
+        &pool_b_server.base_url,
+        64,
+    )
+    .await;
+    let pool_c = create_messages_pool_with_concurrency(
+        &postgres,
+        "sustained-all-tertiary",
+        20,
+        &pool_c_server.base_url,
+        64,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 192,
+        retry_max_attempts: 3,
+        retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_count: 0,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    };
+
+    for index in 0..20 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_sustained_all_fail_{index}");
+        route.error_id = format!("err_sustained_all_fail_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("sustained all-pool failure request should finish");
+        assert!(
+            matches!(outcome, AccountForwardOutcome::FinalError(_)),
+            "all pools still failing should produce bounded final errors"
+        );
+    }
+    assert_eq!(pool_a_server.snapshot(), 20);
+    assert_eq!(pool_b_server.snapshot(), 20);
+    assert_eq!(pool_c_server.snapshot(), 20);
+
+    for pool in [&pool_a, &pool_b, &pool_c] {
+        let runtime = manager
+            .load_pool_runtime_snapshot(pool.id, &[])
+            .await
+            .expect("read runtime after sustained all-pool failure");
+        assert_eq!(
+            runtime.pool_cooldown_remaining_secs, 0,
+            "sustained ordinary failures must not create long pool cooldown for {}",
+            pool.name
+        );
+        assert!(
+            runtime.transient_failure_streak >= 20,
+            "sustained ordinary failures should accumulate soft evidence for {}",
+            pool.name
+        );
+    }
+
+    let mut recovered_route = test_route("claude-sonnet-4-6");
+    recovered_route.request_id = "req_sustained_all_recovered".to_string();
+    recovered_route.error_id = "err_sustained_all_recovered".to_string();
+    recovered_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let recovered = timeout(
+        Duration::from_millis(750),
+        manager.forward_with_failover_result(config, recovered_route),
+    )
+    .await
+    .expect("recovered pools should be callable without waiting for long cooldown");
+    match recovered {
+        AccountForwardOutcome::Response(response) => {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("recovered sustained-failure pools should not remain blacked out: {error:?}")
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_auto_disable_window_has_own_default() {
+    let config = AccountsConfig::default();
+
+    assert_eq!(config.auto_disable_window_secs, 60);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_first_output_timeout_fails_over_a_pool_that_stalls_after_message_start() {
+    // Production 2026-10-21: an account sent message_start and then nothing for minutes;
+    // the hold window committed it and the request could no longer fail over.
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let stalling = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_stall", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::delay(Duration::from_secs(6)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_stall",
+        "from-healthy-pool",
+        222,
+        6,
+    ))
+    .await;
+    create_messages_pool(&postgres, "first-output-stalling", 1, &stalling.base_url).await;
+    create_messages_pool(&postgres, "first-output-healthy", 10, &healthy.base_url).await;
+
+    let request_id = "req_first_output_timeout";
+    let (mut route, recorder) = external_stream_route(request_id, "err_first_output_timeout");
+    route.stream_pre_output_hold = Some(Duration::from_millis(300));
+    let mut config = external_stream_config_for_test();
+    config.stream_idle_timeout_secs = 30;
+    config.stream_first_output_timeout_secs = 2;
+    let response = match timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("first-output timeout must end the stalled attempt")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("a pool with no first output must fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("from-healthy-pool"), "{body}");
+    assert!(
+        !body.contains("msg_stall"),
+        "the stalled pool's message_start must not be committed or leak"
+    );
+    assert_eq!(stalling.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn account_high_concurrency_network_turbulence_transfers_to_healthy_pools() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let primary_base_url = unused_loopback_base_url().await;
+    let secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-network-ok"),
+    )
+    .await;
+    let tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-network-ok"),
+    )
+    .await;
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "network-turbulence-primary",
+        1,
+        &primary_base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "network-turbulence-secondary",
+        10,
+        &secondary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "network-turbulence-tertiary",
+        20,
+        &tertiary.base_url,
+        128,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 384,
+        retry_max_attempts: 3,
+        retry_on_network_error: true,
+        same_pool_retry_count: 0,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    };
+
+    let run_batch = |batch: &'static str| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..64).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_{batch}_{index}");
+                    route.error_id = format!("err_{batch}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("network turbulence request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_batch("network_turbulence_wave1").await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb network failures: {error:?}")
+            }
+        }
+    }
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read primary runtime after network wave");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "connection-level turbulence must not hard-cool the primary pool"
+    );
+    assert!(
+        runtime.transient_failure_streak > 0,
+        "network failures should leave soft health evidence"
+    );
+    let first_streak = runtime.transient_failure_streak;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_batch("network_turbulence_wave2").await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("subsequent traffic should stay on healthy pools: {error:?}")
+            }
+        }
+    }
+    let after_second = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read primary runtime after second network wave");
+    assert!(
+        after_second.transient_failure_streak <= first_streak.saturating_add(2),
+        "soft penalty should stop repeated high-concurrency traffic from pounding the bad network pool"
+    );
+    assert!(
+        secondary.snapshot().saturating_add(tertiary.snapshot()) >= 120,
+        "healthy backup pools should carry sustained network turbulence traffic"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn account_high_concurrency_random_mixed_status_turbulence_transfers_to_healthy_pools() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let primary = TurbulentExternalMessagesFakeServer::start(
+        10_000,
+        85,
+        0x5eed_2026,
+        vec![
+            (StatusCode::UNAUTHORIZED, "invalid token"),
+            (StatusCode::PAYMENT_REQUIRED, "no credit available"),
+            (StatusCode::FORBIDDEN, "security precaution"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate limit"),
+            (StatusCode::BAD_GATEWAY, "temporary upstream failure"),
+            (
+                StatusCode::from_u16(523).expect("523 is a valid HTTP status"),
+                "origin unreachable",
+            ),
+        ],
+        fake_external_success_body("primary-rare-ok"),
+    )
+    .await;
+    let secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-ok"),
+    )
+    .await;
+    let tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-ok"),
+    )
+    .await;
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "random-mixed-primary",
+        1,
+        &primary.base_url,
+        256,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "random-mixed-secondary",
+        10,
+        &secondary.base_url,
+        256,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "random-mixed-tertiary",
+        20,
+        &tertiary.base_url,
+        256,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 512,
+        retry_max_attempts: 4,
+        same_pool_retry_count: 0,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    };
+
+    let run_batch = |batch: &'static str, size: usize| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..size).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_{batch}_{index}");
+                    route.error_id = format!("err_{batch}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(5));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("random mixed turbulence request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_batch("random_mixed_wave1", 128).await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("healthy accounts should absorb mixed temporary failures: {error:?}")
+            }
+        }
+    }
+    let (primary_wave1_hits, primary_wave1_failures) = primary.snapshot();
+    // 主池拿到多少请求取决于调度速度：第一次失败写入 Redis 后，软惩罚（streak × penalty）
+    // 就把它排到备用池之后，所以快机器上第一波可打满 128 次，CI 上见过只有 13 次。这里只断言
+    // 与调度无关的部分：起初它优先级最高、确定性序列第 1 次必失败，所以至少有 1 次失败；
+    // 命中足够多时再检查"持续失败"（前 9 次全失败）和"夹着成功"（第 10 次成功）。
+    assert!(
+        primary_wave1_failures >= 1,
+        "the turbulent primary must be exercised in the first wave, got {primary_wave1_hits} hits / {primary_wave1_failures} failures"
+    );
+    if primary_wave1_hits >= 9 {
+        assert!(
+            primary_wave1_failures >= 9,
+            "the first nine deterministic hits all fail, got {primary_wave1_hits} hits / {primary_wave1_failures} failures"
+        );
+    }
+    if primary_wave1_hits >= 10 {
+        assert!(
+            primary_wave1_failures < primary_wave1_hits,
+            "the deterministic sequence succeeds on hit 10, got {primary_wave1_hits} hits / {primary_wave1_failures} failures"
+        );
+    }
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read primary runtime after random mixed wave");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "mixed 401/402/403/429/5xx turbulence must not hard-cool the primary pool"
+    );
+    assert!(
+        runtime.transient_failure_streak >= primary_wave1_failures as u32,
+        "mixed turbulence should accumulate soft evidence instead of being erased by rare successes"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_batch("random_mixed_wave2", 128).await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!(
+                    "next traffic wave should stay on healthy pools while the primary is turbulent: {error:?}"
+                )
+            }
+        }
+    }
+    let (primary_total_hits, _) = primary.snapshot();
+    let primary_wave2_hits = primary_total_hits.saturating_sub(primary_wave1_hits);
+    assert!(
+        primary_wave2_hits <= 4,
+        "soft health penalty should prevent a turbulent priority-1 pool from reclaiming sustained traffic; got {primary_wave2_hits} extra hits"
+    );
+    assert!(
+        secondary.snapshot().saturating_add(tertiary.snapshot()) >= 220,
+        "healthy backup pools should carry most successful traffic under sustained mixed turbulence"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn account_high_concurrency_sustained_primary_502_transfers_to_backup_without_cooldown() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing_primary = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let healthy_secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-ok"),
+    )
+    .await;
+    let healthy_tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-ok"),
+    )
+    .await;
+    let primary = create_messages_pool_with_concurrency(
+        &postgres,
+        "concurrent-sustained-primary",
+        1,
+        &failing_primary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "concurrent-sustained-secondary",
+        10,
+        &healthy_secondary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "concurrent-sustained-tertiary",
+        20,
+        &healthy_tertiary.base_url,
+        128,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 384,
+        retry_max_attempts: 3,
+        retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_count: 0,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    };
+
+    let run_batch = |batch: &'static str| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..64).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_{batch}_{index}");
+                    route.error_id = format!("err_{batch}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("concurrent request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_batch("concurrent_sustained_wave1").await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("healthy backup should absorb concurrent primary failures: {error:?}")
+            }
+        }
+    }
+    let primary_after_first_wave = failing_primary.snapshot();
+    assert!(
+        primary_after_first_wave > 0,
+        "first wave must actually hit the failing priority-1 pool"
+    );
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary.id, &[])
+        .await
+        .expect("read primary runtime after high-concurrency wave");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "high-concurrency 502 wave must not hard-cool the primary pool"
+    );
+    assert!(
+        runtime.transient_failure_streak > 0,
+        "high-concurrency 502 wave should leave a soft health penalty"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_batch("concurrent_sustained_wave2").await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("healthy backup should keep absorbing traffic after soft penalty: {error:?}")
+            }
+        }
+    }
+    let primary_second_wave_hits = failing_primary
+        .snapshot()
+        .saturating_sub(primary_after_first_wave);
+    assert!(
+        primary_second_wave_hits <= 2,
+        "soft penalty should prevent the failing priority-1 pool from monopolizing the next high-concurrency wave; got {primary_second_wave_hits} extra hits"
+    );
+    assert_eq!(
+        healthy_secondary
+            .snapshot()
+            .saturating_add(healthy_tertiary.snapshot()),
+        128,
+        "healthy backup pools should receive every successful request"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn account_mock_error_matrix_limits_repeated_failures_and_preserves_recovery() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let sustained_bad = PatternExternalMessagesFakeServer::always_fail(
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+    )
+    .await;
+    let intermittent = PatternExternalMessagesFakeServer::intermittent(
+        35,
+        0x9bad_f00d,
+        vec![
+            (StatusCode::TOO_MANY_REQUESTS, "rate limit"),
+            (StatusCode::FORBIDDEN, "security precaution"),
+            (
+                StatusCode::from_u16(523).expect("523 is a valid HTTP status"),
+                "origin unreachable",
+            ),
+        ],
+        "intermittent-ok",
+    )
+    .await;
+    let healthy_secondary =
+        PatternExternalMessagesFakeServer::always_success("healthy-secondary-ok").await;
+    let healthy_tertiary =
+        PatternExternalMessagesFakeServer::always_success("healthy-tertiary-ok").await;
+
+    let sustained_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-sustained-502-primary",
+        1,
+        &sustained_bad.base_url,
+        128,
+    )
+    .await;
+    let intermittent_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-intermittent-mixed-secondary",
+        10,
+        &intermittent.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-healthy-tertiary",
+        20,
+        &healthy_secondary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-healthy-quaternary",
+        40,
+        &healthy_tertiary.base_url,
+        128,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 512,
+        retry_max_attempts: 4,
+        retry_status_codes: vec![403, 408, 425, 429, 500, 502, 503, 504, 523],
+        same_pool_retry_count: 3,
+        same_pool_retry_status_codes: vec![429, 500, 502, 503, 504, 523],
+        same_pool_retry_delay_ms: 1,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    };
+
+    let run_wave = |wave: &'static str, size: usize| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..size).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_mock_matrix_{wave}_{index}");
+                    route.error_id = format!("err_mock_matrix_{wave}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("mock matrix request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_wave("warmup", 32).await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb warmup failures: {error:?}")
+            }
+        }
+    }
+    let (sustained_wave1_hits, sustained_wave1_failures) = sustained_bad.snapshot();
+    let (intermittent_wave1_hits, intermittent_wave1_failures) = intermittent.snapshot();
+    assert!(
+        sustained_wave1_hits > 0 && sustained_wave1_failures == sustained_wave1_hits,
+        "sustained failing pool must be exercised in first wave"
+    );
+    assert!(
+        intermittent_wave1_hits > 0,
+        "intermittent pool must be exercised in first wave"
+    );
+
+    let sustained_runtime = manager
+        .load_pool_runtime_snapshot(sustained_pool.id, &[])
+        .await
+        .expect("read sustained pool runtime");
+    assert_eq!(sustained_runtime.pool_cooldown_remaining_secs, 0);
+    assert!(
+        sustained_runtime.transient_failure_streak >= sustained_wave1_failures as u32,
+        "sustained failures should leave soft scheduling evidence"
+    );
+
+    let intermittent_runtime = manager
+        .load_pool_runtime_snapshot(intermittent_pool.id, &[])
+        .await
+        .expect("read intermittent pool runtime");
+    assert_eq!(intermittent_runtime.pool_cooldown_remaining_secs, 0);
+    assert!(
+        intermittent_runtime.transient_failure_streak >= intermittent_wave1_failures as u32,
+        "intermittent failures should leave soft scheduling evidence without hard blackout"
+    );
+    let healthy_wave1_hits = healthy_secondary
+        .snapshot()
+        .0
+        .saturating_add(healthy_tertiary.snapshot().0);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_wave("sustained", 128).await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb sustained mixed failures: {error:?}")
+            }
+        }
+    }
+    let (sustained_total_hits, _) = sustained_bad.snapshot();
+    let (intermittent_total_hits, _) = intermittent.snapshot();
+    let healthy_total_hits = healthy_secondary
+        .snapshot()
+        .0
+        .saturating_add(healthy_tertiary.snapshot().0);
+    let sustained_wave2_hits = sustained_total_hits.saturating_sub(sustained_wave1_hits);
+    let intermittent_wave2_hits = intermittent_total_hits.saturating_sub(intermittent_wave1_hits);
+    let healthy_wave2_hits = healthy_total_hits.saturating_sub(healthy_wave1_hits);
+    let bad_wave2_hits = sustained_wave2_hits.saturating_add(intermittent_wave2_hits);
+    assert!(
+        sustained_wave2_hits <= 4,
+        "soft penalty plus one same-pool cap should stop repeated hits on sustained bad pool; got {sustained_wave2_hits}"
+    );
+    assert!(
+        intermittent_wave2_hits <= 32,
+        "intermittent error pool should lose most of the next high-concurrency wave; got {intermittent_wave2_hits}"
+    );
+    assert!(
+        healthy_secondary
+            .snapshot()
+            .0
+            .saturating_add(healthy_tertiary.snapshot().0)
+            > bad_wave2_hits,
+        "healthy pools should receive more traffic than failing pools after failures are observed; healthy_wave2_hits={healthy_wave2_hits}, bad_wave2_hits={bad_wave2_hits}"
+    );
+
+    for outcome in run_wave("recovery", 16).await {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!(
+                    "normal low-concurrency traffic should keep succeeding after burst: {error:?}"
+                )
+            }
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_mock_sporadic_failures_recover_without_long_blackout() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let sporadic_primary = PatternExternalMessagesFakeServer::fail_first(
+        2,
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+        "sporadic-primary-recovered",
+    )
+    .await;
+    let healthy_backup =
+        PatternExternalMessagesFakeServer::always_success("sporadic-backup-ok").await;
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "sporadic-primary",
+        1,
+        &sporadic_primary.base_url,
+        32,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "sporadic-backup",
+        10,
+        &healthy_backup.base_url,
+        32,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 64,
+        retry_max_attempts: 2,
+        retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_count: 3,
+        same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_delay_ms: 1,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    };
+
+    for index in 0..4 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_mock_sporadic_{index}");
+        route.error_id = format!("err_mock_sporadic_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("sporadic request should finish");
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("backup should absorb sporadic failures: {error:?}")
+            }
+        }
+    }
+
+    let (primary_hits, primary_failures) = sporadic_primary.snapshot();
+    assert_eq!(
+        primary_failures, 2,
+        "mock primary should fail only the configured sporadic attempts"
+    );
+    assert!(
+        primary_hits >= 2,
+        "primary should be exercised before being temporarily deprioritized"
+    );
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read sporadic primary runtime");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "sporadic 502 must not hard-blackout the recovered pool"
+    );
+    assert!(
+        healthy_backup.snapshot().0 >= 1,
+        "backup should absorb at least one failed primary request"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_no_response_headers_becomes_client_timeout_without_raw_body() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let (url, server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::StallBeforeHeaders(Duration::from_secs(5)),
+    )
+    .await;
+    let pool = create_messages_pool(&postgres, "no-response-headers", 1, &url).await;
+    let config = AccountsConfig {
+        enabled: true,
+        retry_max_attempts: 1,
+        request_timeout_secs: 1,
+        network_error_cooldown_secs: 1,
+
+        ..AccountsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_no_response_headers_timeout".to_string();
+    route.error_id = "err_no_response_headers_timeout".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("client request timeout should finish before fake server wakes up");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(2500),
+        "client timeout should be governed by request timeout, got {elapsed:?}"
+    );
+    let AccountForwardOutcome::FinalError(error) = outcome else {
+        panic!("single stalled pool must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 1, "final error: {error:?}");
+    let attempt = &error.attempts[0];
+    assert_eq!(attempt.pool_id, pool.id);
+    assert_eq!(attempt.status, None);
+    assert_eq!(attempt.error_type.as_deref(), Some("network_error"));
+    assert!(
+        attempt
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("request send failed: timeout")),
+        "timeout attempt should keep system send-timeout error, got {:?}",
+        attempt.error_message
+    );
+    assert!(
+        attempt.raw_upstream_error.is_none(),
+        "no response headers means there is no upstream response body to record"
+    );
+
+    let record = usage_record_for_request(&recorder, "req_no_response_headers_timeout");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.account_id, Some(pool.id));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].status, None);
+    assert!(record.external_attempts[0].raw_upstream_error.is_none());
+    assert!(record.raw_upstream_error.is_none());
+    assert!(
+        record
+            .error_detail
+            .as_deref()
+            .or(record.error_message.as_deref())
+            .is_some_and(|message| message.contains("request send failed: timeout"))
+    );
+
+    server.abort();
+    let _ = server.await;
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_one_wave_account_capacity_and_quota_errors_soft_recover() {
+    for (case, status, message) in [
+        ("auth_401", StatusCode::UNAUTHORIZED, "invalid token"),
+        (
+            "security_403",
+            StatusCode::FORBIDDEN,
+            "account locked temporarily",
+        ),
+        (
+            "quota_402",
+            StatusCode::PAYMENT_REQUIRED,
+            "no credit available",
+        ),
+        ("rate_429", StatusCode::TOO_MANY_REQUESTS, "rate limit"),
+    ] {
+        let Some((manager, postgres)) = test_account_manager().await else {
+            return;
+        };
+        let first_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+            1,
+            status,
+            fake_external_error_body(message),
+            fake_external_success_body(&format!("{case}-first-recovered")),
+        )
+        .await;
+        let second_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+            1,
+            status,
+            fake_external_error_body(message),
+            fake_external_success_body(&format!("{case}-second-recovered")),
+        )
+        .await;
+        let first_pool = create_messages_pool_with_concurrency(
+            &postgres,
+            &format!("{case}-primary"),
+            1,
+            &first_server.base_url,
+            32,
+        )
+        .await;
+        let second_pool = create_messages_pool_with_concurrency(
+            &postgres,
+            &format!("{case}-secondary"),
+            10,
+            &second_server.base_url,
+            32,
+        )
+        .await;
+
+        let config = AccountsConfig {
+            enabled: true,
+            global_max_concurrent_requests: 64,
+            retry_max_attempts: 2,
+            retry_status_codes: vec![status.as_u16()],
+            same_pool_retry_count: 0,
+            rate_limit_cooldown_secs: 30,
+            protocol_error_cooldown_secs: 30,
+            transient_failure_priority_penalty: 20,
+
+            ..AccountsConfig::default()
+        };
+
+        let mut first_route = test_route("claude-sonnet-4-6");
+        first_route.request_id = format!("req_one_wave_{case}_first");
+        first_route.error_id = format!("err_one_wave_{case}_first");
+        first_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let first = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), first_route),
+        )
+        .await
+        .expect("first account/capacity/quota wave should finish");
+        assert!(
+            matches!(first, AccountForwardOutcome::FinalError(_)),
+            "{case}: first request can fail when all pools fail once"
+        );
+
+        for pool in [&first_pool, &second_pool] {
+            let runtime = manager
+                .load_pool_runtime_snapshot(pool.id, &[])
+                .await
+                .expect("read runtime after one account/capacity/quota wave");
+            assert_eq!(
+                runtime.pool_cooldown_remaining_secs, 0,
+                "{case}: one temporary status must not hard-cool pool {}",
+                pool.name
+            );
+            assert_eq!(
+                runtime.transient_failure_streak, 1,
+                "{case}: one temporary status should only soft-penalize pool {}",
+                pool.name
+            );
+        }
+
+        let mut recovered_route = test_route("claude-sonnet-4-6");
+        recovered_route.request_id = format!("req_one_wave_{case}_recovered");
+        recovered_route.error_id = format!("err_one_wave_{case}_recovered");
+        recovered_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let recovered = timeout(
+            Duration::from_millis(750),
+            manager.forward_with_failover_result(config, recovered_route),
+        )
+        .await
+        .expect("recovered account/capacity/quota pools must be callable immediately");
+        match recovered {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK, "{case}");
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("{case}: recovered temporary pools should not remain blacked out: {error:?}")
+            }
+        }
+
+        postgres.drop_test_schema().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_pre_output_failure_fails_over_past_the_shared_dispatch_deadline() {
+    // The shared dispatch deadline (~15s) bounds queueing; a pool that errors after a long
+    // silent wait must still fail over instead of ending the request with that error.
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let slow_failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+        ExternalStreamFakeStep::chunk(external_sse_error("late upstream failure")),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_deadline",
+        "after-deadline",
+        222,
+        6,
+    ))
+    .await;
+    create_messages_pool(&postgres, "deadline-failing", 1, &slow_failing.base_url).await;
+    create_messages_pool(&postgres, "deadline-healthy", 10, &healthy.base_url).await;
+
+    let request_id = "req_pre_output_past_deadline";
+    let (route, recorder) = external_stream_route(request_id, "err_pre_output_past_deadline");
+    route
+        .inference_attempt_budget
+        .set_dispatch_deadline_after(Duration::from_millis(500));
+    let mut config = external_stream_config_for_test();
+    config.stream_idle_timeout_secs = 30;
+    let response = match timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!(
+                "a pre-output failure after the dispatch deadline must still fail over: {error:?}"
+            )
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("after-deadline"), "{body}");
+    assert_eq!(slow_failing.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+    assert_eq!(
+        usage_record_for_request(&recorder, request_id).status,
+        UsageRecordStatus::Success
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_repeated_soft_failures_never_create_pool_cooldown() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let pool =
+        create_messages_pool(&postgres, "repeated-soft-cooldown", 1, &failing.base_url).await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 4,
+        retry_max_attempts: 1,
+        retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_count: 0,
+        server_error_cooldown_secs: 1,
+        ..AccountsConfig::default()
+    };
+
+    for index in 0..3 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_repeated_soft_cooldown_{index}");
+        route.error_id = format!("err_repeated_soft_cooldown_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("repeated failing request should finish");
+        assert!(
+            matches!(outcome, AccountForwardOutcome::FinalError(_)),
+            "single failing pool should return bounded final errors"
+        );
+    }
+    assert_eq!(failing.snapshot(), 3);
+
+    let runtime = manager
+        .load_pool_runtime_snapshot(pool.id, &[])
+        .await
+        .expect("read runtime after repeated soft failures");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "普通瞬态失败不能升级成池级硬冷却"
+    );
+    assert_eq!(runtime.pool_cooldown_reason.as_deref(), None);
+    assert_eq!(runtime.transient_failure_streak, 3);
+
+    let mut blocked_route = test_route("claude-sonnet-4-6");
+    blocked_route.request_id = "req_repeated_soft_cooldown_blocked".to_string();
+    blocked_route.error_id = "err_repeated_soft_cooldown_blocked".to_string();
+    blocked_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+    let attempted_again = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, blocked_route),
+    )
+    .await
+    .expect("request after repeated soft failures should finish");
+    assert!(
+        matches!(attempted_again, AccountForwardOutcome::FinalError(_)),
+        "the fake upstream still fails, but must be attempted instead of blocked by cooldown"
+    );
+    assert_eq!(
+        failing.snapshot(),
+        4,
+        "ordinary transient failure must not prevent the next request from reaching the pool"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_retry_send_timeout_uses_remaining_dispatch_deadline() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let (slow_502_url, slow_502_server) = spawn_test_raw_http_response(
+        StatusCode::BAD_GATEWAY,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(1200),
+            br#"{"error":{"message":"upstream returned 502 after edge wait"}}"#.to_vec(),
+        ),
+    )
+    .await;
+    let (stalled_url, stalled_server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::StallBeforeHeaders(Duration::from_secs(5)),
+    )
+    .await;
+    let pool_a = create_messages_pool(&postgres, "deadline-slow-502", 1, &slow_502_url).await;
+    let pool_b = create_messages_pool(&postgres, "deadline-stalled-next", 10, &stalled_url).await;
+    let config = AccountsConfig {
+        enabled: true,
+        retry_max_attempts: 2,
+        // 只验证跨池重试共享 dispatch deadline，不覆盖默认启用的同池重试。
+        same_pool_retry_count: 0,
+        request_timeout_secs: 2,
+        server_error_cooldown_secs: 1,
+        network_error_cooldown_secs: 1,
+
+        ..AccountsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_retry_uses_remaining_deadline".to_string();
+    route.error_id = "err_retry_uses_remaining_deadline".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(4),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("remaining dispatch deadline should cap the second send");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2800),
+        "second attempt must not consume a full extra request timeout; got {elapsed:?}"
+    );
+    let AccountForwardOutcome::FinalError(error) = outcome else {
+        panic!("both failing pools must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 2);
+    assert_eq!(error.attempts[0].pool_id, pool_a.id);
+    assert_eq!(error.attempts[0].status, Some(502));
+    assert_eq!(
+        error.attempts[0].error_type.as_deref(),
+        Some("server_error")
+    );
+    assert_eq!(error.attempts[1].pool_id, pool_b.id);
+    assert_eq!(error.attempts[1].status, None);
+    assert_eq!(
+        error.attempts[1].error_type.as_deref(),
+        Some("network_error")
+    );
+    assert!(
+        error.attempts[1].duration_ms < 1500,
+        "second send should use the remaining request deadline, got {}ms",
+        error.attempts[1].duration_ms
+    );
+
+    let record = usage_record_for_request(&recorder, "req_retry_uses_remaining_deadline");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].status, Some(502));
+    assert_eq!(record.external_attempts[1].status, None);
+    assert!(record.external_attempts[0].raw_upstream_error.is_some());
+    assert!(record.external_attempts[1].raw_upstream_error.is_none());
+
+    slow_502_server
+        .await
+        .expect("delayed 502 server should exit");
+    stalled_server.abort();
+    let _ = stalled_server.await;
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_slow_upstream_status_keeps_status_and_error_body_fragment() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let upstream_status = StatusCode::from_u16(524).expect("test status");
+    let (url, server) = spawn_test_raw_http_response(
+        upstream_status,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(200),
+            br#"{"error":{"message":"cf edge timeout marker"}}"#.to_vec(),
+        ),
+    )
+    .await;
+    let pool = create_messages_pool(&postgres, "slow-upstream-status", 1, &url).await;
+    let config = AccountsConfig {
+        enabled: true,
+        retry_max_attempts: 1,
+        // 这里只验证单次 524 的诊断，不覆盖默认启用的同池重试。
+        same_pool_retry_count: 0,
+        request_timeout_secs: 2,
+        server_error_cooldown_secs: 1,
+
+        ..AccountsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_slow_upstream_status".to_string();
+    route.error_id = "err_slow_upstream_status".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("delayed upstream status should finish");
+    assert!(
+        started.elapsed() >= Duration::from_millis(150),
+        "the fake upstream must really delay before returning the status"
+    );
+    let AccountForwardOutcome::FinalError(error) = outcome else {
+        panic!("single 524 pool must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 1);
+    let attempt = &error.attempts[0];
+    assert_eq!(attempt.pool_id, pool.id);
+    assert_eq!(attempt.status, Some(524));
+    assert_eq!(attempt.error_type.as_deref(), Some("server_error"));
+    assert!(
+        attempt.duration_ms >= 150 && attempt.duration_ms < 1500,
+        "status attempt duration should reflect upstream delay, got {}ms",
+        attempt.duration_ms
+    );
+    let raw = attempt.raw_upstream_error.as_ref().unwrap_or_else(|| {
+        panic!("HTTP status error should keep bounded upstream error fragment: {attempt:?}")
+    });
+    assert_eq!(raw.status_code, Some(524));
+    assert!(raw.body.contains("cf edge timeout marker"));
+
+    let record = usage_record_for_request(&recorder, "req_slow_upstream_status");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.account_id, Some(pool.id));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].status, Some(524));
+    assert!(record.external_attempts[0].raw_upstream_error.is_some());
+    assert!(record.raw_upstream_error.is_some());
+
+    server.await.expect("delayed status server should exit");
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_error_after_content_start_does_not_replay_request() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_post_commit_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw post-commit secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_post_commit_b",
+        "should-not-replay",
+        222,
+        9,
+    ))
+    .await;
+    create_messages_pool(&postgres, "stream-post-commit-a", 1, &failing.base_url).await;
+    create_messages_pool(&postgres, "stream-post-commit-b", 10, &succeeding.base_url).await;
+
+    let request_id = "req_stream_post_commit_error_no_replay";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_post_commit_error");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("post-commit stream should return original response")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("post-commit stream error must not become pre-response failover: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("msg_post_commit_a"));
+    assert!(body.contains("content_block_start"));
+    assert!(body.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+    assert!(!body.contains("raw post-commit secret"));
+    assert!(!body.contains("should-not-replay"));
+    assert!(!body.contains("msg_post_commit_b"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::StreamError);
+    assert_eq!(record.error_type.as_deref(), Some("stream_error"));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+    assert_eq!(
+        record.external_attempts[0].pool_name,
+        "stream-post-commit-a"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_error_inside_pre_output_hold_still_fails_over_without_leaking_prefix() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_hold_failed", 111)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(100)),
+        ExternalStreamFakeStep::chunk(external_sse_error("hold window upstream failure")),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_hold_ok", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("from-second-pool")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_messages_pool(&postgres, "hold-failing", 1, &failing.base_url).await;
+    create_messages_pool(&postgres, "hold-healthy", 10, &healthy.base_url).await;
+
+    let request_id = "req_stream_hold_failover";
+    let (mut route, _recorder) = external_stream_route(request_id, "err_stream_hold_failover");
+    // 错误发生在保留窗口内：还没向客户端写任何字节，必须照常换池。
+    route.stream_pre_output_hold = Some(Duration::from_secs(5));
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("failover stream should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("an error inside the hold window must fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("from-second-pool"));
+    assert!(
+        !body.contains("msg_hold_failed"),
+        "the failed attempt's buffered message_start must not leak"
+    );
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_keepalive_emits_ping_during_silent_gap_after_output() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_keepalive_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("before-gap")),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("after-gap")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_messages_pool(&postgres, "stream-keepalive-ping", 1, &upstream.base_url).await;
+
+    let request_id = "req_stream_keepalive_ping";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_keepalive_ping");
+    let mut config = external_stream_config_for_test();
+    // 预输出阶段缓冲语义事件以支持重试；输出提交后再验证 keepalive。
+    config.stream_idle_timeout_secs = 3;
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("keepalive stream should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("keepalive stream should not fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("msg_keepalive_a"));
+    assert!(body.contains("after-gap"));
+    assert!(body.contains("event: ping"));
+    let message_start_pos = body
+        .find("msg_keepalive_a")
+        .expect("message_start should be present");
+    let ping_pos = body
+        .find("event: ping")
+        .expect("keepalive ping should be present");
+    let text_start_pos = body
+        .find("content_block_start")
+        .expect("delayed content_block_start should be present");
+    assert!(
+        message_start_pos < ping_pos,
+        "ping must come after initial stream output"
+    );
+    assert!(
+        text_start_pos < ping_pos,
+        "semantic output must be committed before the keepalive interval"
+    );
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.downstream_stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(record.output_tokens, 4);
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+    assert_eq!(upstream.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_pre_output_eof_read_error_and_idle_fail_over_to_next_pool() {
+    for (case, steps) in [
+        (
+            "eof",
+            vec![ExternalStreamFakeStep::chunk(external_sse_message_start(
+                "msg_eof_a",
+                111,
+            ))],
+        ),
+        (
+            "read_error",
+            vec![
+                ExternalStreamFakeStep::chunk(external_sse_message_start("msg_read_a", 111)),
+                ExternalStreamFakeStep::error("controlled fake upstream body error"),
+            ],
+        ),
+        (
+            "idle",
+            vec![
+                ExternalStreamFakeStep::chunk(external_sse_message_start("msg_idle_a", 111)),
+                ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+                ExternalStreamFakeStep::chunk(external_sse_error("late idle failure")),
+            ],
+        ),
+    ] {
+        let Some((manager, postgres)) = test_account_manager().await else {
+            return;
+        };
+        let failing = ExternalStreamFakeServer::start(steps).await;
+        let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+            &format!("msg_{case}_b"),
+            &format!("ok-{case}-from-b"),
+            222,
+            7,
+        ))
+        .await;
+        create_messages_pool(
+            &postgres,
+            &format!("stream-pre-output-{case}-a"),
+            1,
+            &failing.base_url,
+        )
+        .await;
+        create_messages_pool(
+            &postgres,
+            &format!("stream-pre-output-{case}-b"),
+            10,
+            &succeeding.base_url,
+        )
+        .await;
+
+        let request_id = format!("req_stream_pre_output_{case}_failover");
+        let (route, recorder) =
+            external_stream_route(request_id.clone(), format!("err_stream_pre_output_{case}"));
+        let response = match timeout(
+            Duration::from_secs(6),
+            manager.forward_with_failover_result(external_stream_config_for_test(), route),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: failover should finish"))
+        {
+            AccountForwardOutcome::Response(response) => response,
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("{case}: pre-output stream failure should fail over: {error:?}")
+            }
+        };
+        let (body, stream_error) = read_response_body_text_allow_error(response).await;
+        assert_eq!(stream_error, None, "{case}");
+        assert!(body.contains(&format!("ok-{case}-from-b")), "{case}");
+        assert!(!body.contains("msg_eof_a"), "{case}");
+        assert!(!body.contains("msg_read_a"), "{case}");
+        assert!(!body.contains("msg_idle_a"), "{case}");
+        assert!(
+            !body.contains("controlled fake upstream body error"),
+            "{case}"
+        );
+        assert_eq!(failing.snapshot(), 1, "{case}");
+        assert_eq!(succeeding.snapshot(), 1, "{case}");
+
+        let record = usage_record_for_request(&recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success, "{case}");
+        assert_eq!(record.external_attempts.len(), 2, "{case}");
+        assert_eq!(record.external_attempts[0].action, "retry_next", "{case}");
+        assert_eq!(record.external_attempts[1].action, "success", "{case}");
+        assert_eq!(record.output_tokens, 7, "{case}");
+
+        postgres.drop_test_schema().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_pre_output_hold_commits_message_start_and_pings_before_first_output() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    // 上游先发 message_start，然后在首个语义输出前长时间静默（模拟长 thinking）。
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_hold_a", 111)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(2_500)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("after-hold")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_messages_pool(&postgres, "stream-pre-output-hold", 1, &upstream.base_url).await;
+
+    let request_id = "req_stream_pre_output_hold";
+    let (mut route, recorder) = external_stream_route(request_id, "err_stream_pre_output_hold");
+    route.stream_pre_output_hold = Some(Duration::from_millis(500));
+    let mut config = external_stream_config_for_test();
+    // 空闲超时长于静默间隔，保留窗口到期后由 1 秒间隔的 ping 保活。
+    config.stream_idle_timeout_secs = 3;
+    // The hold-window commit only applies when the first-output timeout is disabled.
+    config.stream_first_output_timeout_secs = 0;
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("held stream should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("held stream should not fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let message_start_pos = body
+        .find("msg_hold_a")
+        .expect("message_start should be present");
+    let ping_pos = body
+        .find("event: ping")
+        .expect("ping must be sent while the upstream is silent");
+    let text_start_pos = body
+        .find("content_block_start")
+        .expect("delayed content_block_start should be present");
+    assert!(
+        message_start_pos < ping_pos,
+        "message_start is committed before keepalive"
+    );
+    assert!(
+        ping_pos < text_start_pos,
+        "keepalive must cover the silent gap before the first semantic output"
+    );
+    assert!(body.contains("after-hold"));
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(upstream.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_pre_output_retry_disabled_returns_original_stream_error_without_failover() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_disabled_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw disabled retry secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_disabled_b",
+        "should-not-run",
+        222,
+        8,
+    ))
+    .await;
+    let mut disabled_pool_request = create_pool_request("stream-pre-output-disabled-a", 1, true);
+    disabled_pool_request.base_url = failing.base_url.clone();
+    disabled_pool_request.max_concurrent_requests = 4;
+    disabled_pool_request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    disabled_pool_request.pre_output_stream_retry_mode = StreamRetryMode::Disabled;
+    postgres
+        .create_account(disabled_pool_request)
+        .await
+        .unwrap();
+    create_messages_pool(
+        &postgres,
+        "stream-pre-output-disabled-b",
+        10,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let request_id = "req_stream_pre_output_retry_disabled";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_pre_output_disabled");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("disabled retry stream should return response")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!(
+                "disabled retry keeps current stream behavior, not final dispatch error: {error:?}"
+            )
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("msg_disabled_a"));
+    assert!(body.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+    assert!(!body.contains("raw disabled retry secret"));
+    assert!(!body.contains("should-not-run"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::StreamError);
+    assert_eq!(record.error_type.as_deref(), Some("stream_error"));
+    assert_eq!(
+        record.error_message.as_deref(),
+        Some("external upstream emitted an error event")
+    );
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_protocol_only_then_error_event_fails_over_without_leaking_prefix() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_protocol_only_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw protocol-only failure")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_protocol_only_b",
+        "ok-after-ping",
+        222,
+        6,
+    ))
+    .await;
+    create_messages_pool(
+        &postgres,
+        "stream-protocol-only-error-a",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "stream-protocol-only-error-b",
+        10,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let request_id = "req_stream_protocol_only_error_failover";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_protocol_only_error");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("protocol-only pre-output error failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("protocol-only pre-output error should fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("ok-after-ping"));
+    assert!(body.contains("msg_protocol_only_b"));
+    assert!(!body.contains("msg_protocol_only_a"));
+    assert!(!body.contains("raw protocol-only failure"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].action, "retry_next");
+    assert_eq!(record.external_attempts[1].action, "success");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_transient_failure_penalty_moves_sustained_traffic_to_healthy_backup() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing_primary = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let healthy_secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-ok"),
+    )
+    .await;
+    let healthy_tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-ok"),
+    )
+    .await;
+    let primary = create_messages_pool_with_concurrency(
+        &postgres,
+        "transient-priority-primary",
+        1,
+        &failing_primary.base_url,
+        64,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "transient-priority-secondary",
+        10,
+        &healthy_secondary.base_url,
+        64,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "transient-priority-tertiary",
+        20,
+        &healthy_tertiary.base_url,
+        64,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 128,
+        retry_max_attempts: 3,
+        retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        same_pool_retry_count: 0,
+        server_error_cooldown_secs: 1,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    };
+
+    let mut first_route = test_route("claude-sonnet-4-6");
+    first_route.request_id = "req_transient_priority_first".to_string();
+    first_route.error_id = "err_transient_priority_first".to_string();
+    first_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config.clone(), first_route),
+    )
+    .await
+    .expect("first failover request should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("primary 502 should fail over to a healthy backup: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(failing_primary.snapshot(), 1);
+    assert_eq!(healthy_secondary.snapshot(), 1);
+    assert_eq!(healthy_tertiary.snapshot(), 0);
+
+    let runtime_after_failure = manager
+        .load_pool_runtime_snapshot(primary.id, &[])
+        .await
+        .expect("read primary runtime after failure");
+    assert_eq!(runtime_after_failure.transient_failure_streak, 1);
+    assert!(
+        runtime_after_failure.transient_failure_ttl.is_some(),
+        "primary transient failure window should remain after the failed send"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+
+    let statuses = manager.status(&config).await.expect("read account status");
+    let primary_status = statuses
+        .iter()
+        .find(|status| status.pool.id == primary.id)
+        .expect("primary status");
+    assert_eq!(primary_status.transient_failure_streak, 1);
+    assert!(
+        primary_status.transient_failure_ttl_secs > 0,
+        "status should expose the remaining transient failure window"
+    );
+
+    for index in 0..5 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_transient_priority_seq_{index}");
+        route.error_id = format!("err_transient_priority_seq_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let response = match timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("sequential backup request should finish")
+        {
+            AccountForwardOutcome::Response(response) => response,
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("sequential traffic should stay on a healthy backup: {error:?}")
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        failing_primary.snapshot(),
+        1,
+        "primary must not be retried immediately after its short cooldown expires"
+    );
+    assert_eq!(healthy_secondary.snapshot(), 6);
+
+    let concurrent = futures::future::join_all((0..24).map(|index| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            let mut route = test_route("claude-sonnet-4-6");
+            route.request_id = format!("req_transient_priority_concurrent_{index}");
+            route.error_id = format!("err_transient_priority_concurrent_{index}");
+            route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+            timeout(
+                Duration::from_secs(3),
+                manager.forward_with_failover_result(config, route),
+            )
+            .await
+            .expect("concurrent backup request should finish")
+        }
+    }))
+    .await;
+    for outcome in concurrent {
+        match outcome {
+            AccountForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            AccountForwardOutcome::FinalError(error) => {
+                panic!("concurrent traffic should stay on healthy backup pools: {error:?}")
+            }
+        }
+    }
+    assert_eq!(
+        failing_primary.snapshot(),
+        1,
+        "concurrent traffic must not be trapped by the failed priority-1 pool"
+    );
+    assert_eq!(
+        healthy_secondary.snapshot(),
+        30,
+        "healthy priority-10 backup should carry the redirected traffic"
+    );
+    assert_eq!(healthy_tertiary.snapshot(), 0);
+
+    let cleared = manager
+        .clear_pool_cooldowns(primary.id)
+        .await
+        .expect("clear primary cooldowns and transient failure window");
+    assert!(
+        cleared >= 1,
+        "clear cooldown should also remove the transient failure window"
+    );
+    let selected_after_clear = manager
+        .select_pool_for_route(&HashSet::new(), &config, &test_route("claude-sonnet-4-6"))
+        .await
+        .selected_pool
+        .expect("primary should be eligible again after manual clear");
+    assert_eq!(selected_after_clear.id, primary.id);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+fn external_sse_error(message: &str) -> String {
+    external_sse_event(
+        "error",
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message}
+        }),
+    )
+}
+
+fn external_sse_input_json_delta(partial_json: &str) -> String {
+    external_sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json}
+        }),
+    )
+}
+
+/// message_delta 只带 output_tokens（部分上游如此），用于验证输入侧补全。
+fn external_sse_message_delta_output_only(output_tokens: i32) -> String {
+    external_sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": output_tokens}
+        }),
+    )
+}
+
+fn external_sse_message_start_with_cache(
+    id: &str,
+    input_tokens: i32,
+    cache_read: i32,
+    cache_creation: i32,
+) -> String {
+    external_sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": null,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": cache_creation,
+                        "ephemeral_1h_input_tokens": 0
+                    }
+                }
+            }
+        }),
+    )
+}
+
+fn external_sse_thinking_delta(text: &str) -> String {
+    external_sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": text}
+        }),
+    )
+}
+
+fn external_sse_thinking_start() -> String {
+    external_sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+        }),
+    )
+}
+
+fn external_sse_tool_use_start(id: &str, name: &str) -> String {
+    external_sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+        }),
+    )
+}
+
+fn external_stream_config_for_test() -> AccountsConfig {
+    AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 0,
+        stream_idle_timeout_secs: 1,
+        protocol_error_cooldown_secs: 1,
+        network_error_cooldown_secs: 1,
+        transient_failure_priority_penalty: 20,
+
+        ..AccountsConfig::default()
+    }
+}
+
+fn external_stream_success_steps(
+    message_id: &str,
+    text: &str,
+    input_tokens: i32,
+    output_tokens: i32,
+) -> Vec<ExternalStreamFakeStep> {
+    vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start(message_id, input_tokens)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta(text)),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(input_tokens, output_tokens)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ]
+}
+
+async fn forward_early_commit(
+    manager: &AccountManager,
+    config: AccountsConfig,
+    route: AccountRouteRequest,
+) -> Response {
+    match timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("early-commit dispatch must return immediately")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("early-commit mode must always answer with a committed SSE stream: {error:?}")
+        }
+    }
+}
+
+/// 按 SSE 事件拆分下游响应，返回 (事件名, data JSON)。
+fn parse_downstream_sse(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| {
+            let mut name = String::new();
+            let mut data = serde_json::Value::Null;
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event:") {
+                    name = value.trim().to_string();
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data = serde_json::from_str(value.trim()).unwrap_or(serde_json::Value::Null);
+                }
+            }
+            (name, data)
+        })
+        .collect()
+}
+
+async fn unused_loopback_base_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused loopback port");
+    let address = listener.local_addr().expect("unused loopback address");
+    drop(listener);
+    format!("http://{address}")
+}
+
+fn usage_record_for_request(
+    recorder: &crate::anthropic::usage::UsageRecorder,
+    request_id: &str,
+) -> UsageRecord {
+    let result = recorder.query(UsageRecordQuery {
+        request_id: Some(request_id.to_string()),
+        ..UsageRecordQuery::default()
+    });
+    assert_eq!(result.records.len(), 1, "usage record for {request_id}");
+    result.records[0].clone()
+}
+
+async fn wait_for_usage_record(
+    recorder: &crate::anthropic::usage::UsageRecorder,
+    request_id: &str,
+) -> UsageRecord {
+    for _ in 0..100 {
+        let result = recorder.query(UsageRecordQuery {
+            request_id: Some(request_id.to_string()),
+            ..UsageRecordQuery::default()
+        });
+        if let Some(record) = result.records.into_iter().next() {
+            return record;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("usage record for {request_id} was not written");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_pre_output_error_event_fails_over_and_keeps_success_usage_clean() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw upstream failure secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_b",
+        "ok-from-b",
+        222,
+        5,
+    ))
+    .await;
+    let pool_a =
+        create_messages_pool(&postgres, "stream-pre-output-error-a", 1, &failing.base_url).await;
+    let pool_b = create_messages_pool(
+        &postgres,
+        "stream-pre-output-error-b",
+        10,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let request_id = "req_stream_pre_output_error_failover";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_pre_output_error");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("pre-output error event failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("pre-output error should fail over to healthy pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("ok-from-b"));
+    assert!(body.contains("msg_b"));
+    assert!(!body.contains("msg_a"));
+    assert!(!body.contains("raw upstream failure secret"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.account_id, Some(pool_b.id));
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].pool_id, pool_a.id);
+    assert_eq!(record.external_attempts[0].action, "retry_next");
+    assert_eq!(
+        record.external_attempts[0].error_type.as_deref(),
+        Some("protocol_error")
+    );
+    assert_eq!(record.external_attempts[1].pool_id, pool_b.id);
+    assert_eq!(record.external_attempts[1].action, "success");
+    let billing = record
+        .account_billing
+        .as_ref()
+        .expect("successful stream billing");
+    assert_eq!(billing.raw_usage.input_tokens, 222);
+    assert_eq!(billing.raw_usage.output_tokens, 5);
+    assert_eq!(billing.reported_usage.input_tokens, 222);
+    assert_eq!(billing.reported_usage.output_tokens, 5);
+    assert_ne!(billing.raw_usage.input_tokens, 111);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn passthrough_response_history_sanitizer_is_route_optional() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: secret tail";
+    let raw = Bytes::from(
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "id":"msg_passthrough", "type":"message", "role":"assistant",
+            "content":[{"type":"text","text":polluted}],"unknown":{"stable":true}
+        }))
+        .unwrap(),
+    );
+    let mut route = test_route("claude-sonnet-4-6");
+    route.history_sanitize_enabled = false;
+    let off =
+        process_non_stream_response_usage(raw.clone(), Some(&route), None, ["Bash".to_string()]);
+    let mut off_value: serde_json::Value = serde_json::from_slice(&off.body).unwrap();
+    off_value.as_object_mut().unwrap().shift_remove("usage");
+    assert_eq!(
+        off_value,
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap()
+    );
+    route.history_sanitize_enabled = true;
+    let on =
+        process_non_stream_response_usage(raw.clone(), Some(&route), None, ["Bash".to_string()]);
+    assert!(on.protocol_contamination);
+    let value: serde_json::Value = serde_json::from_slice(&on.body).unwrap();
+    assert_eq!(value["content"][0]["text"], "safe prefix\n");
+    assert_eq!(value["unknown"]["stable"], true);
+
+    let events = [
+        external_sse_message_start("msg_passthrough", 0),
+        external_sse_text_start(),
+        external_sse_text_delta(polluted),
+        external_sse_text_stop(),
+        external_sse_message_stop(),
+    ];
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    let mut state = ExternalAnthropicTranscriptState::new(["Bash".to_string()]);
+    let mut cleaned = Vec::new();
+    for event in events {
+        let off = process_sse_event_with_plan_and_transcript(
+            event.as_bytes(),
+            None,
+            None,
+            None,
+            plan,
+            None,
+        );
+        assert_eq!(off, event.as_bytes());
+        cleaned.extend(process_sse_event_with_plan_and_transcript(
+            event.as_bytes(),
+            None,
+            None,
+            None,
+            plan,
+            Some(&mut state),
+        ));
+    }
+    cleaned.extend(state.finish());
+    assert!(!String::from_utf8_lossy(&cleaned).contains("secret tail"));
+}
+
+#[test]
+fn route_models_are_the_intersection_of_listing_route_and_account_rules() {
+    use crate::model::routes::{RouteRule, RoutesConfig};
+    let catalog = ModelCapabilitiesCatalog::new();
+    let mut status = ModelCapabilitiesCatalog::seed_status();
+    status
+        .models
+        .push(crate::anthropic::model_capabilities::ModelCapabilityItem {
+            model: "custom-hidden-model".into(),
+            display_name: "Hidden".into(),
+            listed: false,
+            description: None,
+            max_input_tokens: Some(200_000),
+            max_output_tokens: Some(64_000),
+            supports_prompt_caching: Some(true),
+            supported_input_types: vec!["TEXT".into()],
+            source: Some("manual".into()),
+        });
+    catalog.load_persisted_status(status);
+    let mut pool = test_pool("http://example.invalid", true);
+    pool.supported_models = vec![
+        "claude-sonnet-4-5".into(),
+        "claude-opus-4-6".into(),
+        "custom-hidden-model".into(),
+    ];
+    let pools = vec![account_eligibility_from_pool(&pool)];
+    let mut routes = RoutesConfig::default();
+    routes.route_mut("/cc").model_rule = RouteRule {
+        mode: RouteRuleMode::AllowList,
+        rules: vec!["claude-sonnet-*".into()],
+    };
+    routes.route_mut("/ha").model_rule = RouteRule {
+        mode: RouteRuleMode::AllowList,
+        rules: vec!["claude-opus-*".into()],
+    };
+    for (prefix, expected) in [
+        (
+            "/cc",
+            vec!["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
+        ),
+        ("/ha", vec!["claude-opus-4-6"]),
+    ] {
+        let route = routes.route_mut(prefix);
+        let models = filter_models_for_route(
+            route,
+            &format!("{prefix}/v1/models"),
+            catalog.standard_anthropic_models(),
+            &pools,
+        );
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        route.account_rule = RouteRule {
+            mode: RouteRuleMode::DenyList,
+            rules: vec![pool.id.to_string()],
+        };
+        assert!(
+            filter_models_for_route(
+                route,
+                &format!("{prefix}/v1/models"),
+                catalog.standard_anthropic_models(),
+                &pools
+            )
+            .is_empty()
+        );
+    }
+    pool.supported_models.clear();
+    pool.route_mode = RouteRuleMode::AllowList;
+    pool.route_rules = vec!["/cc".into()];
+    let pools = vec![account_eligibility_from_pool(&pool)];
+    let mut route = crate::model::routes::RouteConfig::new("/ha");
+    assert!(
+        filter_models_for_route(
+            &route,
+            "/ha/v1/models",
+            catalog.standard_anthropic_models(),
+            &pools
+        )
+        .is_empty()
+    );
+    route.prefix = "/cc".into();
+    assert!(
+        !filter_models_for_route(
+            &route,
+            "/cc/v1/models",
+            catalog.standard_anthropic_models(),
+            &pools
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn account_proxy_cost_and_override_validation() {
+    for url in [
+        "http://user:pass@127.0.0.1:8080",
+        "https://proxy.example.invalid",
+        "socks5://127.0.0.1:1080",
+        "socks5h://user:pass@proxy.example.invalid:1080",
+    ] {
+        validate_account_fields(Some(url), 1.0, &AccountOverrides::default()).unwrap();
+    }
+    for url in [
+        "file:///tmp/proxy",
+        "ftp://proxy.example.invalid",
+        "invalid",
+    ] {
+        assert!(validate_account_fields(Some(url), 1.0, &AccountOverrides::default()).is_err());
+    }
+    for multiplier in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+        assert!(validate_account_fields(None, multiplier, &AccountOverrides::default()).is_err());
+    }
+    let overrides = AccountOverrides {
+        request_timeout_secs: Some(86_401),
+        ..Default::default()
+    };
+    assert!(validate_account_fields(None, 1.0, &overrides).is_err());
+    let inherited: UpdateAccountRequest = serde_json::from_value(json!({})).unwrap();
+    let cleared: UpdateAccountRequest = serde_json::from_value(json!({"proxyUrl":null})).unwrap();
+    assert!(inherited.proxy_url.is_none());
+    assert_eq!(cleared.proxy_url, Some(None));
+}

@@ -6,8 +6,8 @@
 set -e
 
 # 配置
-API_URL="${KIRO_API_URL:-http://localhost:3000}"
-API_KEY="${KIRO_API_KEY:-test-key}"
+API_URL="${CLAUDE_POOL_API_URL:-http://localhost:3000}"
+API_KEY="${CLAUDE_POOL_API_KEY:-test-key}"
 TIMEOUT_SECONDS=180
 
 # 颜色输出
@@ -16,7 +16,7 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}=== Kiro 流式保活测试 ===${NC}"
+echo -e "${GREEN}=== Anthropic 流式保活测试 ===${NC}"
 echo "API URL: $API_URL"
 echo "超时设置: ${TIMEOUT_SECONDS}s"
 echo ""

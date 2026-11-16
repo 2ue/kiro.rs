@@ -5,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::config::{
-    CachePolicyConfig, CacheRoutePolicy, CacheRoutePolicyPatch, Config, ExternalPoolRouteMode,
-    PromptCacheStrategyType, ReportedUsageConfig, ReportedUsageFieldPolicy,
-    ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, resolve_cache_policy_for_route,
-    route_policy_allows,
+    CachePolicyConfig, CacheRoutePolicy, CacheRoutePolicyPatch, Config, PromptCacheStrategyType,
+    ReportedUsageConfig, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
+    ResolvedCacheRoutePolicy, RouteRuleMode, resolve_cache_policy_for_route, route_policy_allows,
 };
 use super::prompt_injection::{
     InjectionId, ItemOverride, ResolvedInjections, RouteFeatureOverride, RouteFeatureSet,
@@ -22,7 +21,7 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct RouteRule {
     #[serde(default)]
-    pub mode: ExternalPoolRouteMode,
+    pub mode: RouteRuleMode,
     #[serde(default)]
     pub rules: Vec<String>,
 }
@@ -36,13 +35,13 @@ impl RouteRule {
     }
     pub fn allows_match(&self, matched: bool) -> bool {
         match self.mode {
-            ExternalPoolRouteMode::AllowAll => true,
-            ExternalPoolRouteMode::AllowList => matched,
-            ExternalPoolRouteMode::DenyList => !matched,
+            RouteRuleMode::AllowAll => true,
+            RouteRuleMode::AllowList => matched,
+            RouteRuleMode::DenyList => !matched,
         }
     }
     pub fn allows_model(&self, model: &str) -> bool {
-        crate::external_pool::route_model_rule_allows(self, model)
+        crate::account::route_model_rule_allows(self, model)
     }
 }
 
@@ -303,12 +302,8 @@ pub fn migrate_path_overrides_to_routes(value: &mut Value) -> bool {
                 .and_then(|v| v.get("pathOverrides"))
                 .is_some()
         })
-        || value
-            .pointer("/externalPools/externalPoolRouteMode")
-            .is_some()
-        || value
-            .pointer("/externalPools/externalPoolRouteRules")
-            .is_some();
+        || value.pointer("/accounts/accountRouteMode").is_some()
+        || value.pointer("/accounts/accountRouteRules").is_some();
     if !legacy {
         return false;
     }
@@ -457,16 +452,14 @@ pub fn migrate_path_overrides_to_routes(value: &mut Value) -> bool {
             }
         }
     }
-    let external = value
-        .get_mut("externalPools")
-        .and_then(Value::as_object_mut);
+    let external = value.get_mut("accounts").and_then(Value::as_object_mut);
     if let Some(external) = external {
         let mode = external
-            .remove("externalPoolRouteMode")
-            .and_then(|v| serde_json::from_value::<ExternalPoolRouteMode>(v).ok())
+            .remove("accountRouteMode")
+            .and_then(|v| serde_json::from_value::<RouteRuleMode>(v).ok())
             .unwrap_or_default();
         let rules = external
-            .remove("externalPoolRouteRules")
+            .remove("accountRouteRules")
             .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
             .unwrap_or_default();
         for (prefix, route) in &mut routes {
@@ -488,9 +481,9 @@ pub fn migrate_path_overrides_to_routes(value: &mut Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::{ExternalPoolCapacityMode, ExternalPoolsConfig};
+    use super::super::config::{AccountsConfig, CapacityMode};
     use super::*;
-    use crate::external_pool::AccountOverrides;
+    use crate::account::AccountOverrides;
 
     #[test]
     fn prefixes_and_longest_match() {
@@ -550,15 +543,15 @@ mod tests {
     #[test]
     fn bidirectional_rules_table() {
         let cases = [
-            (ExternalPoolRouteMode::AllowAll, Vec::<String>::new(), true),
-            (ExternalPoolRouteMode::AllowList, vec![], false),
-            (ExternalPoolRouteMode::AllowList, vec!["*".into()], true),
-            (ExternalPoolRouteMode::AllowList, vec!["7".into()], true),
-            (ExternalPoolRouteMode::AllowList, vec!["8".into()], false),
-            (ExternalPoolRouteMode::DenyList, vec![], true),
-            (ExternalPoolRouteMode::DenyList, vec!["*".into()], false),
-            (ExternalPoolRouteMode::DenyList, vec!["7".into()], false),
-            (ExternalPoolRouteMode::DenyList, vec!["8".into()], true),
+            (RouteRuleMode::AllowAll, Vec::<String>::new(), true),
+            (RouteRuleMode::AllowList, vec![], false),
+            (RouteRuleMode::AllowList, vec!["*".into()], true),
+            (RouteRuleMode::AllowList, vec!["7".into()], true),
+            (RouteRuleMode::AllowList, vec!["8".into()], false),
+            (RouteRuleMode::DenyList, vec![], true),
+            (RouteRuleMode::DenyList, vec!["*".into()], false),
+            (RouteRuleMode::DenyList, vec!["7".into()], false),
+            (RouteRuleMode::DenyList, vec!["8".into()], true),
         ];
         for (mode, rules, expected) in &cases {
             for (account_mode, account_rules, account_expected) in &cases {
@@ -604,9 +597,9 @@ mod tests {
             ("*", "arbitrary-model", true),
         ] {
             for mode in [
-                ExternalPoolRouteMode::AllowAll,
-                ExternalPoolRouteMode::AllowList,
-                ExternalPoolRouteMode::DenyList,
+                RouteRuleMode::AllowAll,
+                RouteRuleMode::AllowList,
+                RouteRuleMode::DenyList,
             ] {
                 let rule = RouteRule {
                     mode,
@@ -615,9 +608,9 @@ mod tests {
                 assert_eq!(
                     rule.allows_model(model),
                     match mode {
-                        ExternalPoolRouteMode::AllowAll => true,
-                        ExternalPoolRouteMode::AllowList => matches,
-                        ExternalPoolRouteMode::DenyList => !matches,
+                        RouteRuleMode::AllowAll => true,
+                        RouteRuleMode::AllowList => matches,
+                        RouteRuleMode::DenyList => !matches,
                     },
                     "{mode:?} {pattern} {model}"
                 );
@@ -627,54 +620,46 @@ mod tests {
 
     #[test]
     fn account_overrides_inherit_and_override_every_field() {
-        let global = ExternalPoolsConfig::default();
+        let global = AccountsConfig::default();
         let inherited = AccountOverrides::default().merge(&global);
         let global_json = serde_json::to_value(&global).unwrap();
         assert_eq!(serde_json::to_value(inherited).unwrap(), global_json);
         for (account_field, global_field, value) in [
-            (
-                "requestTimeoutSecs",
-                "externalPoolRequestTimeoutSecs",
-                json!(123),
-            ),
+            ("requestTimeoutSecs", "requestTimeoutSecs", json!(123)),
             (
                 "streamRequestTimeoutSecs",
-                "externalPoolStreamRequestTimeoutSecs",
+                "streamRequestTimeoutSecs",
                 json!(234),
             ),
-            (
-                "streamIdleTimeoutSecs",
-                "externalPoolStreamIdleTimeoutSecs",
-                json!(45),
-            ),
+            ("streamIdleTimeoutSecs", "streamIdleTimeoutSecs", json!(45)),
             (
                 "streamFirstOutputTimeoutSecs",
-                "externalPoolStreamFirstOutputTimeoutSecs",
+                "streamFirstOutputTimeoutSecs",
                 json!(67),
             ),
             (
                 "usageProjectionUpliftPercent",
-                "externalPoolUsageProjectionUpliftPercent",
+                "usageProjectionUpliftPercent",
                 json!(17),
             ),
             (
                 "usageProjectionCostFloorEnabled",
-                "externalPoolUsageProjectionCostFloorEnabled",
-                json!(!global.external_pool_usage_projection_cost_floor_enabled),
+                "usageProjectionCostFloorEnabled",
+                json!(!global.usage_projection_cost_floor_enabled),
             ),
             (
                 "usageProjectionCostFloorMarginPercent",
-                "externalPoolUsageProjectionCostFloorMarginPercent",
+                "usageProjectionCostFloorMarginPercent",
                 json!(19),
             ),
             (
                 "usageProjectionOutputUpliftMinTokens",
-                "externalPoolUsageProjectionOutputUpliftMinTokens",
+                "usageProjectionOutputUpliftMinTokens",
                 json!(345),
             ),
             (
                 "usageProjectionOutputUpliftPercent",
-                "externalPoolUsageProjectionOutputUpliftPercent",
+                "usageProjectionOutputUpliftPercent",
                 json!(23),
             ),
         ] {
@@ -689,19 +674,16 @@ mod tests {
 
     #[test]
     fn scheduler_defaults_table() {
-        let defaults = serde_json::to_value(ExternalPoolsConfig::default()).unwrap();
+        let defaults = serde_json::to_value(AccountsConfig::default()).unwrap();
         for (field, expected) in [
-            ("externalPoolDispatchMaxWaitSecs", json!(60)),
-            ("externalPoolMaxQueuedRequests", json!(64)),
-            ("externalPoolCapacityMode", json!("wait")),
-            ("externalPoolsEnabled", json!(true)),
+            ("dispatchMaxWaitSecs", json!(60)),
+            ("maxQueuedRequests", json!(64)),
+            ("capacityMode", json!("wait")),
+            ("enabled", json!(true)),
         ] {
             assert_eq!(defaults[field], expected, "{field}");
         }
-        assert_eq!(
-            ExternalPoolsConfig::default().external_pool_capacity_mode,
-            ExternalPoolCapacityMode::Wait
-        );
+        assert_eq!(AccountsConfig::default().capacity_mode, CapacityMode::Wait);
     }
 
     #[test]
@@ -713,7 +695,7 @@ mod tests {
             "promptInjection": {"pathOverrides": {"/cc": {"taskQuality":{"enabled":true}}, "/inject": {"custom":{"enabled":false}}}},
             "routeFeatures": {"pathOverrides": {"/cc": {"thinkingModelName":true}, "/feature": {"historySanitize":true}}},
             "definedCacheRoutes": ["foo", "/dfcache/bar/"],
-            "externalPools": {"externalPoolRouteMode":"allow_list", "externalPoolRouteRules":["/cc", "/dfcache/foo"]}
+            "accounts": {"accountRouteMode":"allow_list", "accountRouteRules":["/cc", "/dfcache/foo"]}
         });
         assert!(migrate_path_overrides_to_routes(&mut value));
         let config: Config = serde_json::from_value(value.clone()).unwrap();
@@ -851,13 +833,13 @@ mod legacy_fixture_tests {
             "cachePolicy":{"currentHighCache":{"simulation":{"targetReadRatio":0.98,"tokenScale":1.6}},"pathOverrides":{
                 "/v1":{"cacheType":"current_high_cache","routeNamespace":false},
                 "/cc":{"cacheType":"current_high_cache","routeNamespace":false},
-                "/dfcache/team-a":{"cacheType":"kiro_rs_tool","routeNamespace":true}
+                "/dfcache/team-a":{"cacheType":"prefix_tool","routeNamespace":true}
             }},
             "reportedUsage":{"pathOverrides":{"/ha":{"input":{"mode":"sample-max","maxTokens":96}}}},
             "promptInjection":{"defaults":{"custom":{"enabled":false}},"texts":{"custom":"redacted deployment prompt"},"pathOverrides":{"/dfcache":{"custom":{"enabled":true}}}},
             "routeFeatures":{"pathOverrides":{"/dfcache":{"reasoningCompat":null,"historySanitize":true},"/dfcache/team-a":{"thinkingModelName":true}}},
             "definedCacheRoutes":["/dfcache/team-a","/dfcache/team-b"],
-            "externalPools":{"externalPoolsEnabled":true,"externalPoolRouteMode":"deny_list","externalPoolRouteRules":["/na"],"externalPoolDispatchMaxWaitSecs":60,"externalPoolMaxQueuedRequests":64,"externalPoolCapacityMode":"wait"}
+            "accounts":{"enabled":true,"accountRouteMode":"deny_list","accountRouteRules":["/na"],"dispatchMaxWaitSecs":60,"maxQueuedRequests":64,"capacityMode":"wait"}
         });
         assert!(migrate_path_overrides_to_routes(&mut value));
         let config = Config::from_json_value(value.clone()).unwrap();
@@ -868,7 +850,7 @@ mod legacy_fixture_tests {
             .unwrap();
         assert_eq!(
             team.cache_policy.policy.cache_type,
-            PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::PrefixTool
         );
         assert!(team.features.history_sanitize);
         assert!(team.features.thinking_model_name);

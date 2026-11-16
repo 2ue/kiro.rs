@@ -297,10 +297,10 @@ mod tests {
         ] {
             let lower = message.to_ascii_lowercase();
             for forbidden in [
-                "kiro",
+                "pool",
                 "credential",
-                "external pool",
-                "external_pool",
+                "account",
+                "account",
                 "fallback",
                 "backup",
                 "scheduler",
@@ -309,7 +309,7 @@ mod tests {
                 "service unavailable",
                 "upstream",
                 "备用",
-                "外部池",
+                "账号",
                 "凭据",
                 "凭证",
             ] {

@@ -8,7 +8,7 @@ import type {
 } from '@/types/api'
 
 /** Marker of a route policy file, so unrelated JSON is rejected with a clear message. */
-export const ROUTE_POLICY_FORMAT = 'kiro-rs-route-policy'
+export const ROUTE_POLICY_FORMAT = 'claude-pool-route-policy'
 export const ROUTE_POLICY_VERSION = 2
 /** Route policy files are a few KB; anything far larger is not a route policy. */
 export const ROUTE_POLICY_MAX_BYTES = 1024 * 1024
@@ -41,9 +41,9 @@ export type RoutePolicyImport =
 const CACHE_TYPES: PromptCacheStrategyType[] = [
   'no_cache',
   'current_high_cache',
-  'kiro_rs_tool',
+  'prefix_tool',
   'stable_segment_cache',
-  'kiro_rs_tool_plus',
+  'prefix_tool_plus',
   'bounded_high_cache',
 ]
 
@@ -54,8 +54,8 @@ const CACHE_OBJECT_KEYS: Array<keyof CacheRoutePolicyPatch> = [
   'reportedUsage',
   'cachePoint',
   'bounds',
-  'kiroRsTool',
-  'kiroRsToolPlus',
+  'prefixTool',
+  'prefixToolPlus',
   'stableSegment',
   'hitShaping',
   'coldRequestGuard',
@@ -88,7 +88,7 @@ const LEGACY_IDENTITY_KEYS = [
   'turnReminderEnabled',
   'outputGuardEnabled',
   'outputGuardStreamEnabled',
-  'applyToExternalPool',
+  'applyToAccount',
 ] as const
 
 function convertLegacyIdentity(
@@ -109,10 +109,10 @@ function convertLegacyIdentity(
   const promptInjection: RouteInjectionOverrides = {}
   const features: RouteFeatureOverride = {}
   const prompt = combine(values.promptEnabled)
-  if (prompt !== undefined || values.applyToExternalPool !== undefined) {
+  if (prompt !== undefined || values.applyToAccount !== undefined) {
     promptInjection.identityPrompt = {
       ...(prompt === undefined ? {} : { enabled: prompt }),
-      ...(values.applyToExternalPool === undefined ? {} : { externalPool: values.applyToExternalPool }),
+      ...(values.applyToAccount === undefined ? {} : { account: values.applyToAccount }),
     }
   }
   const reminder = combine(values.turnReminderEnabled)
@@ -154,12 +154,12 @@ function parseInjection(input: unknown): RouteInjectionOverrides | string {
     if (!isPlainObject(item)) return `promptInjection.${id} 必须是对象`
     const parsed: InjectionItemOverride = {}
     for (const [key, value] of Object.entries(item)) {
-      if (key !== 'enabled' && key !== 'externalPool') return `promptInjection.${id} 中有未知字段：${key}`
+      if (key !== 'enabled' && key !== 'account') return `promptInjection.${id} 中有未知字段：${key}`
       if (value === null || value === undefined) continue
       if (typeof value !== 'boolean') return `promptInjection.${id}.${key} 必须是 true 或 false`
       parsed[key] = value
     }
-    if (parsed.enabled !== undefined || parsed.externalPool !== undefined) result[id as InjectionId] = parsed
+    if (parsed.enabled !== undefined || parsed.account !== undefined) result[id as InjectionId] = parsed
   }
   return result
 }

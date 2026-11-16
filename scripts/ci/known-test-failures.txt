@@ -1,3 +1,3 @@
 # This list only shrinks: delete an entry when its test is fixed. Explain any new entry in its PR.
 # One fully qualified test name per line, for example:
-# external_pool::tests::some_test_name
+# account::tests::some_test_name

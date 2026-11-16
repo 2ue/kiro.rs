@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn expands_kiro_claude_models_to_common_official_request_forms() {
+    fn expands_pool_claude_models_to_common_official_request_forms() {
         assert_eq!(
             expand_claude_supported_model_variants(vec![
                 "claude-sonnet-4.5".to_string(),

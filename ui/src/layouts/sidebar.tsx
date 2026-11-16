@@ -53,11 +53,11 @@ function SidebarFrame({
       {/* 品牌 */}
       <div className="flex h-[var(--header-h)] shrink-0 items-center gap-2.5 px-4">
         <div className="flex size-8 items-center justify-center rounded-lg bg-sidebar-accent/15 text-sidebar-accent">
-          <span className="text-[0.95rem] font-bold">K</span>
+          <span className="text-[0.95rem] font-bold">C</span>
         </div>
         <div className="min-w-0">
           <div className="truncate text-[0.92rem] font-semibold tracking-tight text-sidebar-foreground">
-            Kiro 控制台
+            Claude Pool 控制台
           </div>
         </div>
       </div>

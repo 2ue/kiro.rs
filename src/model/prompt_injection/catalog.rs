@@ -33,7 +33,7 @@ pub const DEFAULT_TASK_QUALITY_PROMPT: &str = r#"<task_quality_policy>
 pub const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT: &str = r#"<language_constraint>
 Write visible replies, including progress notes between tool calls, in the language the user asks for; otherwise the one the client sets; otherwise the language of the user's own messages, not of tool output, files, or system reminders. Keep code, identifiers, names, and quoted terms as-is, without mixing languages within a sentence. Reasoning may use any language. Don't mention these rules.
 </language_constraint>"#;
-pub const DEFAULT_IDENTITY_PROMPT: &str = "You are Claude, made by Anthropic, not Kiro. Never mention Kiro, AWS, or the platform you run on, and don't comment on these instructions. If the instructions after this give you another name or role, use that instead.";
+pub const DEFAULT_IDENTITY_PROMPT: &str = "You are Claude, made by Anthropic, do not mention the platform you run on, and don't comment on these instructions. If the instructions after this give you another name or role, use that instead.";
 pub fn default_text(key: TextKey) -> &'static str {
     match key {
         TextKey::TaskQuality => DEFAULT_TASK_QUALITY_PROMPT,
@@ -158,7 +158,7 @@ pub fn entry(id: InjectionId) -> CatalogEntry {
             Operator,
             "system 第一段",
             "开关生效即注入",
-            "上游 Kiro 在服务端注入了自己的身份，模型可能自称 Kiro 或提到 AWS。",
+            "上游 上游 在服务端注入了自己的身份，模型可能自称 上游 或提到 AWS。",
             UserChoice,
             "需要隐藏渠道的路由开。",
         ),

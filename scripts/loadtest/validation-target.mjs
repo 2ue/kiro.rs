@@ -5,9 +5,9 @@ function explicitBoolean(value) {
 }
 
 export function resolveLoadTarget(args, env = process.env) {
-  const configuredBaseUrl = args.baseUrl || env.KIRO_BASE_URL
+  const configuredBaseUrl = args.baseUrl || env.CLAUDE_POOL_BASE_URL
   if (!configuredBaseUrl) {
-    throw new Error('an explicit --base-url or KIRO_BASE_URL is required')
+    throw new Error('an explicit --base-url or CLAUDE_POOL_BASE_URL is required')
   }
 
   let baseUrl
@@ -28,14 +28,14 @@ export function resolveLoadTarget(args, env = process.env) {
   if (loopback && effectivePort === 9022) {
     throw new Error('port 9022 is protected and cannot be used by validation load runners')
   }
-  const allowRemote = explicitBoolean(args.allowRemote ?? env.KIRO_LOAD_ALLOW_REMOTE)
+  const allowRemote = explicitBoolean(args.allowRemote ?? env.CLAUDE_POOL_LOAD_ALLOW_REMOTE)
   if (!loopback && !allowRemote) {
     throw new Error('non-loopback load targets require explicit --allow-remote true')
   }
 
-  const apiKey = args.apiKey || env.KIRO_API_KEY
+  const apiKey = args.apiKey || env.CLAUDE_POOL_API_KEY
   if (!apiKey || !apiKey.trim()) {
-    throw new Error('an explicit --api-key or KIRO_API_KEY is required')
+    throw new Error('an explicit --api-key or CLAUDE_POOL_API_KEY is required')
   }
   return { baseUrl, apiKey }
 }

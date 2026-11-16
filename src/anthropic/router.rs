@@ -11,10 +11,10 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::account::AccountManager;
 use crate::common::auth::RequestApiKeyStore;
-use crate::external_pool::ExternalPoolManager;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
+    AccountsConfig, CachePolicyConfig, CompatProfile, Config, ImageProcessingConfig,
     MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
     PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
     PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
@@ -47,7 +47,7 @@ pub struct AnthropicRouterDependencies {
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
+    pub account_manager: Option<Arc<AccountManager>>,
 }
 
 pub struct AnthropicRouterConfig {
@@ -76,7 +76,7 @@ pub struct AnthropicRouterConfig {
     image_processing: ImageProcessingConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
-    external_pools: ExternalPoolsConfig,
+    accounts: AccountsConfig,
 }
 
 impl AnthropicRouterConfig {
@@ -156,7 +156,7 @@ impl AnthropicRouterConfig {
                 .defaults
                 .payload_shaping
                 .unwrap_or_default(),
-            external_pools: config.external_pools.clone(),
+            accounts: config.accounts.clone(),
         }
     }
 }
@@ -191,7 +191,7 @@ pub fn create_router(
         prompt_cache_creation_controller,
         pricing_catalog,
         model_capabilities,
-        external_pool_manager,
+        account_manager,
     } = dependencies;
     let AnthropicRouterConfig {
         prompt_cache_target_read_ratio,
@@ -219,7 +219,7 @@ pub fn create_router(
         image_processing,
         missing_max_tokens,
         payload_shaping,
-        external_pools,
+        accounts,
     } = config;
     let request_admission_state =
         RequestAdmissionMiddlewareState::new(request_admission, usage_recorder.clone());
@@ -259,7 +259,7 @@ pub fn create_router(
         payload_shaping,
     )
     .with_missing_max_tokens(missing_max_tokens)
-    .with_external_pools(external_pools)
+    .with_accounts(accounts)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
 
@@ -267,8 +267,8 @@ pub fn create_router(
         .runtime
         .install_local(|config| config.route_features = configured_features);
 
-    if let Some(manager) = external_pool_manager {
-        base_state = base_state.with_external_pool_manager(manager);
+    if let Some(manager) = account_manager {
+        base_state = base_state.with_account_manager(manager);
     }
 
     let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) = route_prompt_cache_states(base_state);
@@ -617,7 +617,7 @@ mod tests {
                     ),
                     pricing_catalog: Arc::new(PricingCatalog::new()),
                     model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                    external_pool_manager: None,
+                    account_manager: None,
                 },
                 AnthropicRouterConfig::from_runtime_config(&config),
             );
@@ -676,7 +676,7 @@ mod tests {
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
                 pricing_catalog: Arc::new(PricingCatalog::new()),
                 model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                external_pool_manager: None,
+                account_manager: None,
             },
             AnthropicRouterConfig::from_runtime_config(&config),
         );
@@ -744,7 +744,7 @@ mod tests {
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
                 pricing_catalog: Arc::new(PricingCatalog::new()),
                 model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                external_pool_manager: None,
+                account_manager: None,
             },
             AnthropicRouterConfig::from_runtime_config(&config),
         )

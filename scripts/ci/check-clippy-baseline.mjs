@@ -128,7 +128,7 @@ function recordWarning(line, counts) {
   } catch {
     return;
   }
-  if (event.reason !== "compiler-message" || !event.package_id?.includes("#kiro-rs@")) {
+  if (event.reason !== "compiler-message" || !event.package_id?.includes("#claude-pool@")) {
     return;
   }
   if (event.message?.level !== "warning") {

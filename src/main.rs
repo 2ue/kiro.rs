@@ -1,8 +1,8 @@
+mod account;
 mod admin;
 mod anthropic;
 mod common;
 mod diagnostics;
-mod external_pool;
 mod http_client;
 mod model;
 mod storage;
@@ -25,13 +25,13 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use account::AccountManager;
 use anyhow::Context as _;
 use axum::serve::ListenerExt as _;
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use chrono::Utc;
 use clap::Parser;
 use common::auth::RequestApiKeyStore;
-use external_pool::ExternalPoolManager;
 use futures::StreamExt;
 use model::arg::{Args, Command, MaintenanceCommand};
 use model::config::Config;
@@ -46,12 +46,12 @@ const STARTUP_DEPENDENCY_MAX_WAIT: StdDuration = StdDuration::from_secs(60);
 // for HTTP connections to drain (queued requests answer at once, see `begin_shutdown`), then at
 // most 4 s for background work, with the usage writers drained first. Streams still running
 // when the drain ends are cut, so deployments with a longer grace period raise the drain with
-// `KIRO_RS_HTTP_DRAIN_SECS` (grace period minus about 10 s).
+// `CLAUDE_POOL_HTTP_DRAIN_SECS` (grace period minus about 10 s).
 const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const SERVER_GRACEFUL_SHUTDOWN_MAX: StdDuration = StdDuration::from_secs(600);
 
 fn server_graceful_shutdown_timeout() -> StdDuration {
-    std::env::var("KIRO_RS_HTTP_DRAIN_SECS")
+    std::env::var("CLAUDE_POOL_HTTP_DRAIN_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(StdDuration::from_secs)
@@ -357,7 +357,7 @@ async fn async_main() {
                 model_capabilities.load_persisted_status(status.clone());
                 if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
                     tracing::warn!(
-                        "刷新 Kiro 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
+                        "刷新 上游 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
                         err
                     );
                 }
@@ -371,7 +371,7 @@ async fn async_main() {
             model_capabilities.load_persisted_status(status.clone());
             if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
                 tracing::warn!(
-                    "保存 Kiro 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
+                    "保存 上游 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
                     err
                 );
             } else {
@@ -392,15 +392,15 @@ async fn async_main() {
         model::runtime::RuntimeConfigStore::new(config.clone(), Some(postgres_store.clone()));
 
     common::runtime_lag::spawn_probe();
-    let external_pool_manager = Arc::new(ExternalPoolManager::new(
+    let account_manager = Arc::new(AccountManager::new(
         postgres_store.clone(),
         redis_store.clone(),
     ));
-    let weak_external_pool_manager = Arc::downgrade(&external_pool_manager);
+    let weak_account_manager = Arc::downgrade(&account_manager);
     runtime.subscribe(Arc::new(move |previous, current, _reason| {
-        if previous.external_pools != current.external_pools {
-            if let Some(manager) = weak_external_pool_manager.upgrade() {
-                manager.invalidate_external_pool_policy_state();
+        if previous.accounts != current.accounts {
+            if let Some(manager) = weak_account_manager.upgrade() {
+                manager.invalidate_account_policy_state();
             }
         }
     }));
@@ -410,7 +410,7 @@ async fn async_main() {
     let runtime_event_listener = spawn_redis_runtime_event_listener(
         runtime.clone(),
         redis_store.clone(),
-        external_pool_manager.clone(),
+        account_manager.clone(),
         admin_api_key_store.clone(),
         request_api_key_store.clone(),
         request_admission.clone(),
@@ -461,7 +461,7 @@ async fn async_main() {
     });
 
     // 初始化 LLM 明文采集（默认空闲，仅在 Admin API 显式启动后写盘）
-    let capture_dir = std::env::var("KIRO_CAPTURE_DIR")
+    let capture_dir = std::env::var("CLAUDE_POOL_CAPTURE_DIR")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| diagnostics::capture::DEFAULT_CAPTURE_DIR.to_string());
@@ -478,7 +478,7 @@ async fn async_main() {
             prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
             pricing_catalog: pricing_catalog.clone(),
             model_capabilities: model_capabilities.clone(),
-            external_pool_manager: Some(external_pool_manager.clone()),
+            account_manager: Some(account_manager.clone()),
         },
         anthropic::AnthropicRouterConfig::from_runtime_config(&config),
     );
@@ -502,7 +502,7 @@ async fn async_main() {
                 observability_redis_store: observability_redis_store.clone(),
                 request_api_key_store: request_api_key_store.clone(),
                 request_admission: request_admission.clone(),
-                external_pool_manager: external_pool_manager.clone(),
+                account_manager: account_manager.clone(),
             });
             let admin_state =
                 admin::AdminState::with_key_store(admin_api_key_store.clone(), admin_service);
@@ -569,7 +569,7 @@ async fn async_main() {
     let (usage_drain, storage_drain, external_release_drain) = tokio::join!(
         usage_recorder.drain(drain_timeout),
         common::storage_task::drain_best_effort_storage_tasks(drain_timeout),
-        external_pool_manager.drain_release_intents(drain_timeout),
+        account_manager.drain_release_intents(drain_timeout),
     );
     tracing::info!(
         timed_out = usage_drain.timed_out,
@@ -597,7 +597,7 @@ async fn async_main() {
         retries = external_release_drain.retries,
         worker_starts = external_release_drain.worker_starts,
         spawn_failures = external_release_drain.spawn_failures,
-        "外部池 Redis release intent 排空阶段已结束"
+        "账号 Redis release intent 排空阶段已结束"
     );
     let usage_shutdown_timeout =
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
@@ -848,14 +848,14 @@ fn startup_retry_delay(attempt: u32) -> StdDuration {
 }
 
 fn apply_service_bind_env_overrides(config: &mut Config) {
-    if let Ok(host) = std::env::var("KIRO_RS_HOST") {
+    if let Ok(host) = std::env::var("CLAUDE_POOL_HOST") {
         let host = host.trim();
         if !host.is_empty() {
             config.host = host.to_string();
         }
     }
 
-    if let Ok(port) = std::env::var("KIRO_RS_PORT") {
+    if let Ok(port) = std::env::var("CLAUDE_POOL_PORT") {
         let port = port.trim();
         if port.is_empty() {
             return;
@@ -865,7 +865,7 @@ fn apply_service_bind_env_overrides(config: &mut Config) {
             Err(err) => tracing::warn!(
                 value = port,
                 error = %err,
-                "忽略无效的 KIRO_RS_PORT 环境变量"
+                "忽略无效的 CLAUDE_POOL_PORT 环境变量"
             ),
         }
     }
@@ -1041,7 +1041,7 @@ fn spawn_redis_runtime_event_listener(
     runtime: Arc<model::runtime::RuntimeConfigStore>,
     redis_store: Arc<RedisStore>,
 
-    external_pool_manager: Arc<ExternalPoolManager>,
+    account_manager: Arc<AccountManager>,
     admin_api_key_store: admin::AdminApiKeyStore,
     request_api_key_store: Arc<RequestApiKeyStore>,
     request_admission: Arc<anthropic::request_admission::RequestAdmissionController>,
@@ -1050,7 +1050,7 @@ fn spawn_redis_runtime_event_listener(
     tokio::spawn(async move {
         loop {
             let config_channel = redis_store.runtime_config_changed_channel();
-            let external_pool_data_channel = redis_store.external_pool_data_changed_channel();
+            let account_data_channel = redis_store.account_data_changed_channel();
             let mut pubsub = match redis_store.subscribe_runtime_events().await {
                 Ok(pubsub) => pubsub,
                 Err(err) => {
@@ -1093,11 +1093,11 @@ fn spawn_redis_runtime_event_listener(
                                 Ok(false) => tracing::debug!(payload, "收到运行配置通知，但未执行热加载"),
                                 Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
                             }
-                        } else if channel == external_pool_data_channel {
-                            if external_pool_manager.observe_external_pool_data_event(&payload) {
-                                tracing::debug!(payload, "已失效跨实例外部池数据快照");
+                        } else if channel == account_data_channel {
+                            if account_manager.observe_account_data_event(&payload) {
+                                tracing::debug!(payload, "已失效跨实例账号数据快照");
                             } else {
-                                tracing::debug!(payload, "忽略已观察或无效的外部池数据通知");
+                                tracing::debug!(payload, "忽略已观察或无效的账号数据通知");
                             }
                         }
                     }

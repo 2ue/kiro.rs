@@ -99,7 +99,7 @@ impl TextKey {
         self != Self::Custom
     }
 }
-/// 一项的全局默认。`externalPool` 只对支持外部池的项有意义。
+/// 一项的全局默认。`account` 只对支持账号的项有意义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ItemSetting {
@@ -158,7 +158,7 @@ impl Default for PromptInjectionConfig {
 }
 
 impl PromptInjectionConfig {
-    /// 补齐缺失的默认项，去掉不支持外部池的项上的外部池设置，规范化路由前缀，删除空设置和
+    /// 补齐缺失的默认项，去掉不支持账号的项上的账号设置，规范化路由前缀，删除空设置和
     /// 与内置文本相同的文本。
     pub fn normalized(mut self) -> Self {
         for id in InjectionId::ALL {
@@ -226,7 +226,7 @@ impl PromptInjectionConfig {
             .unwrap_or_else(|| catalog::default_text(key))
     }
 
-    /// 这一项在 `endpoint` 上的开关和外部池开关，以及决定开关的来源。
+    /// 这一项在 `endpoint` 上的开关和账号开关，以及决定开关的来源。
     pub fn item_setting_for_route(&self, _endpoint: &str, id: InjectionId) -> RouteItemSetting {
         let default = self.defaults.get(&id).copied().unwrap_or(ItemSetting {
             enabled: id.default_enabled(),
@@ -254,12 +254,6 @@ pub struct RouteItemSetting {
     pub enabled: bool,
     /// 决定 `enabled` 的路由前缀；`None` 表示来自全局默认。
     pub source: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum UpstreamKind {
-    ExternalPool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -292,12 +286,7 @@ pub struct ResolvedInjections {
 }
 
 impl ResolvedInjections {
-    pub fn resolve(
-        endpoint: &str,
-        _upstream: UpstreamKind,
-        profile: CompatProfile,
-        config: &PromptInjectionConfig,
-    ) -> Self {
+    pub fn resolve(endpoint: &str, profile: CompatProfile, config: &PromptInjectionConfig) -> Self {
         Self::resolve_route(profile, config, endpoint, &BTreeMap::new())
     }
     pub fn resolve_route(
@@ -379,7 +368,7 @@ impl ResolvedInjections {
                 .defaults
                 .insert(*id, ItemSetting { enabled: *enabled });
         }
-        Self::resolve("/v1/messages", UpstreamKind::ExternalPool, profile, &config)
+        Self::resolve("/v1/messages", profile, &config)
     }
 
     /// 测试用：在 `with_items` 的基础上改一段文本。
@@ -408,7 +397,6 @@ impl Default for ResolvedInjections {
     fn default() -> Self {
         Self::resolve(
             "/v1/messages",
-            UpstreamKind::ExternalPool,
             CompatProfile::default(),
             &PromptInjectionConfig::default(),
         )

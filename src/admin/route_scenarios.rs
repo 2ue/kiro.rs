@@ -11,8 +11,8 @@ use serde_json::json;
 
 use super::error::AdminServiceError;
 use super::service::{AdminService, block_on_admin_store_public};
-use crate::external_pool::UpdateExternalPoolRequest;
-use crate::model::config::{ExternalPoolRouteMode, normalize_route_rules};
+use crate::account::UpdateAccountRequest;
+use crate::model::config::{RouteRuleMode, normalize_route_rules};
 
 const MAX_SCENARIO_NAME_CHARS: usize = 64;
 const MAX_SCENARIO_DESCRIPTION_CHARS: usize = 500;
@@ -25,14 +25,14 @@ const MAX_RULE_CHARS: usize = 256;
 #[serde(rename_all = "camelCase")]
 pub struct RoutePolicy {
     #[serde(default)]
-    pub route_mode: ExternalPoolRouteMode,
+    pub route_mode: RouteRuleMode,
     #[serde(default)]
     pub route_rules: Vec<String>,
 }
 
 impl RoutePolicy {
     fn normalized(&self) -> Self {
-        let route_rules = if self.route_mode == ExternalPoolRouteMode::AllowAll {
+        let route_rules = if self.route_mode == RouteRuleMode::AllowAll {
             Vec::new()
         } else {
             normalize_route_rules(&self.route_rules)
@@ -49,9 +49,9 @@ impl RoutePolicy {
 
     fn summary(&self) -> String {
         match self.route_mode {
-            ExternalPoolRouteMode::AllowAll => "不限制".to_string(),
-            ExternalPoolRouteMode::AllowList => format!("仅允许 {}", self.route_rules.join(", ")),
-            ExternalPoolRouteMode::DenyList => format!("禁止 {}", self.route_rules.join(", ")),
+            RouteRuleMode::AllowAll => "不限制".to_string(),
+            RouteRuleMode::AllowList => format!("仅允许 {}", self.route_rules.join(", ")),
+            RouteRuleMode::DenyList => format!("禁止 {}", self.route_rules.join(", ")),
         }
     }
 }
@@ -145,7 +145,7 @@ pub struct RouteScenarioAccountOption {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteScenarioItemKind {
-    ExternalPool,
+    Account,
     ExternalAccount,
 }
 
@@ -320,7 +320,7 @@ fn plan_items(
 ) -> (Vec<PlannedItem>, Vec<RouteScenarioItemKey>) {
     let mut items = vec![PlannedItem {
         key: RouteScenarioItemKey {
-            kind: RouteScenarioItemKind::ExternalPool,
+            kind: RouteScenarioItemKind::Account,
             id: 0,
         },
         label: "路由定义".to_string(),
@@ -363,7 +363,7 @@ fn plan_items(
 impl AdminService {
     fn route_state(&self) -> Result<RouteState, AdminServiceError> {
         let config = self.route_scenario_runtime_config();
-        let pools = self.list_external_pools()?;
+        let pools = self.list_accounts()?;
         let external_accounts = pools
             .into_iter()
             .map(|pool| {
@@ -500,7 +500,7 @@ impl AdminService {
         let restricted = |accounts: &BTreeMap<u64, (String, RoutePolicy)>| {
             accounts
                 .iter()
-                .filter(|(_, (_, policy))| policy.route_mode != ExternalPoolRouteMode::AllowAll)
+                .filter(|(_, (_, policy))| policy.route_mode != RouteRuleMode::AllowAll)
                 .map(|(id, (_, policy))| AccountRoutePolicy {
                     id: *id,
                     policy: policy.clone(),
@@ -610,18 +610,18 @@ impl AdminService {
                 continue;
             }
             match item.key.kind {
-                RouteScenarioItemKind::ExternalPool => {
+                RouteScenarioItemKind::Account => {
                     pool_update = item.route_after.clone();
                     pool_items.push(item);
                 }
                 RouteScenarioItemKind::ExternalAccount => {
                     let result = self
-                        .update_external_pool(
+                        .update_account(
                             item.key.id,
-                            UpdateExternalPoolRequest {
+                            UpdateAccountRequest {
                                 route_mode: Some(item.after.route_mode),
                                 route_rules: Some(item.after.route_rules.clone()),
-                                ..UpdateExternalPoolRequest::default()
+                                ..UpdateAccountRequest::default()
                             },
                         )
                         .map(|_| ());

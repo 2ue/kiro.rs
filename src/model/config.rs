@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 
 pub use super::routes::{CompiledRoutes, RouteConfig, RoutesConfig};
 
-pub use super::kiro_rs_tool_plus::{
-    KiroRsToolPlusCachePolicy, SelectedUsageShaping, SuppressedCreationTarget, UsageFieldShaping,
+pub use super::prefix_tool_plus_policy::{
+    PrefixToolPlusCachePolicy, SelectedUsageShaping, SuppressedCreationTarget, UsageFieldShaping,
     UsageShapingProfile,
 };
 pub use super::prompt_injection::{
     InjectionId, PromptInjectionConfig, ResolvedInjections, RouteFeatureSet, RouteFeaturesConfig,
-    UpstreamKind,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -44,7 +43,7 @@ impl Default for PromptCacheSimulationMode {
     }
 }
 
-/// Kiro payload shaping 配置。
+/// 上游 payload shaping 配置。
 ///
 /// 该配置只处理旧历史和可安全压缩的冗余内容；默认不截断当前用户消息、
 /// 当前合法 tool_result、当前 document/PDF 或当前图片。
@@ -81,7 +80,7 @@ pub struct ImageProcessingConfig {
 
     /// 是否在发给上游前压缩过大的图片（默认关闭）。打开后，长边超过 `resize_max_long_side` 或
     /// base64 长度超过 `resize_max_bytes` 的 PNG/JPEG/WebP 图片会等比缩小并重新编码为 JPEG；
-    /// GIF 不处理，失败时保留原图。只在本地多模态预处理阶段执行：直接转发给外部池的请求
+    /// GIF 不处理，失败时保留原图。只在本地多模态预处理阶段执行：直接转发给账号的请求
     /// （原样转发路径）不经过这一步，保持原图。
     #[serde(default)]
     pub resize_enabled: bool,
@@ -164,7 +163,7 @@ pub const DEFAULT_TOOL_SCHEMA_KEY_VALIDATION_REGEX: &str = "^[a-zA-Z0-9_.-]{1,64
 /// 关掉就交给严格校验（多数情况下返回 400）。已有的兼容行为默认开启，零配置时与之前完全
 /// 一致；新增的兼容默认也开启，因为它们只把原本会被拒绝或计费的请求改成可用。
 ///
-/// 改写发生在请求入口、选路之前，本地账号和外部池都会收到改写后的请求体；外部池的
+/// 改写发生在请求入口、选路之前，本地账号和账号都会收到改写后的请求体；账号的
 /// 参数透传方式不受这里影响。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
@@ -595,7 +594,7 @@ pub struct ReportedUsagePathPolicy {
     ///
     /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求不进入
     /// 本系统 usage 整形、input 采样和补偿，也不会读取或写入本地 prompt-cache 状态；
-    /// 外部池非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
+    /// 账号非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
     /// 关闭时按路径策略整形；是否额外要求官方缓存条件见 `strict_cache_eligibility_non_stream`。
     /// 流式请求不受影响。
     /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
@@ -1471,7 +1470,7 @@ pub enum CacheTtlMode {
     /// 忽略请求标记，一律 1 小时。
     #[serde(rename = "force_1h")]
     Force1h,
-    /// 仅外部池：渠道返回了 1 小时写入就按 1 小时；渠道只有 5 分钟写入或没有拆分时视为未标记，
+    /// 仅账号：渠道返回了 1 小时写入就按 1 小时；渠道只有 5 分钟写入或没有拆分时视为未标记，
     /// 改为跟随请求标记，请求也未指定按 5 分钟。
     #[serde(rename = "upstream_then_request_default_5m")]
     UpstreamThenRequestDefault5m,
@@ -1479,12 +1478,12 @@ pub enum CacheTtlMode {
 
 impl CacheTtlMode {}
 
-/// 路由缓存策略的写入时长设置：本地账号和外部池分开配置。
+/// 路由缓存策略的写入时长设置：本地账号和账号分开配置。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheTtlPolicy {
     #[serde(default)]
-    pub external_pool: CacheTtlMode,
+    pub account: CacheTtlMode,
 }
 
 impl CacheTtlPolicy {
@@ -1498,19 +1497,19 @@ impl CacheTtlPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct CacheTtlPolicyPatch {
     #[serde(default)]
-    pub external_pool: Option<CacheTtlMode>,
+    pub account: Option<CacheTtlMode>,
 }
 
 impl CacheTtlPolicyPatch {
     fn apply_to(self, mut policy: CacheTtlPolicy) -> CacheTtlPolicy {
-        if let Some(value) = self.external_pool {
-            policy.external_pool = value;
+        if let Some(value) = self.account {
+            policy.account = value;
         }
         policy
     }
 
     fn is_empty(&self) -> bool {
-        self.external_pool.is_none()
+        self.account.is_none()
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {
@@ -1677,8 +1676,8 @@ impl CacheHitShapingPolicyPatch {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroRsToolCachePolicy {
-    #[serde(default = "default_kiro_rs_tool_coverage_ratio")]
+pub struct PrefixToolCachePolicy {
+    #[serde(default = "default_prefix_tool_coverage_ratio")]
     pub coverage_ratio: f64,
     #[serde(default)]
     pub max_coverage_tokens: i32,
@@ -1690,31 +1689,31 @@ pub struct KiroRsToolCachePolicy {
     pub cache_current_user_stable_prefix: bool,
     #[serde(default)]
     pub current_user_stable_prefix_max_tokens: i32,
-    #[serde(default = "default_kiro_rs_tool_reported_input_min_tokens")]
+    #[serde(default = "default_prefix_tool_reported_input_min_tokens")]
     pub reported_input_min_tokens: i32,
-    #[serde(default = "default_kiro_rs_tool_reported_input_max_tokens")]
+    #[serde(default = "default_prefix_tool_reported_input_max_tokens")]
     pub reported_input_max_tokens: i32,
 }
 
-impl Default for KiroRsToolCachePolicy {
+impl Default for PrefixToolCachePolicy {
     fn default() -> Self {
         Self {
-            coverage_ratio: default_kiro_rs_tool_coverage_ratio(),
+            coverage_ratio: default_prefix_tool_coverage_ratio(),
             max_coverage_tokens: 0,
             incremental_create_enabled: true,
             max_new_creation_tokens_per_request: 0,
             cache_current_user_stable_prefix: false,
             current_user_stable_prefix_max_tokens: 0,
-            reported_input_min_tokens: default_kiro_rs_tool_reported_input_min_tokens(),
-            reported_input_max_tokens: default_kiro_rs_tool_reported_input_max_tokens(),
+            reported_input_min_tokens: default_prefix_tool_reported_input_min_tokens(),
+            reported_input_max_tokens: default_prefix_tool_reported_input_max_tokens(),
         }
     }
 }
 
-impl KiroRsToolCachePolicy {
+impl PrefixToolCachePolicy {
     pub fn normalized(mut self) -> Self {
         if !self.coverage_ratio.is_finite() {
-            self.coverage_ratio = default_kiro_rs_tool_coverage_ratio();
+            self.coverage_ratio = default_prefix_tool_coverage_ratio();
         }
         self.coverage_ratio = self.coverage_ratio.clamp(0.0, 1.0);
         self.max_coverage_tokens = self.max_coverage_tokens.max(0);
@@ -1768,7 +1767,7 @@ impl KiroRsToolCachePolicy {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroRsToolCachePolicyPatch {
+pub struct PrefixToolCachePolicyPatch {
     #[serde(default)]
     pub coverage_ratio: Option<f64>,
     #[serde(default)]
@@ -1787,8 +1786,8 @@ pub struct KiroRsToolCachePolicyPatch {
     pub reported_input_max_tokens: Option<i32>,
 }
 
-impl KiroRsToolCachePolicyPatch {
-    fn apply_to(self, mut policy: KiroRsToolCachePolicy) -> KiroRsToolCachePolicy {
+impl PrefixToolCachePolicyPatch {
+    fn apply_to(self, mut policy: PrefixToolCachePolicy) -> PrefixToolCachePolicy {
         if let Some(value) = self.coverage_ratio {
             policy.coverage_ratio = value;
         }
@@ -2614,10 +2613,10 @@ pub struct CacheRoutePolicyPatch {
     #[serde(default)]
     pub bounds: Option<CacheBoundsPolicyPatch>,
     #[serde(default)]
-    pub kiro_rs_tool: Option<KiroRsToolCachePolicyPatch>,
-    /// Kiro-RS Tool Plus 策略参数；整体替换，缺失字段取默认值。
+    pub prefix_tool: Option<PrefixToolCachePolicyPatch>,
+    /// 前缀追踪 Plus 策略参数；整体替换，缺失字段取默认值。
     #[serde(default)]
-    pub kiro_rs_tool_plus: Option<KiroRsToolPlusCachePolicy>,
+    pub prefix_tool_plus: Option<PrefixToolPlusCachePolicy>,
     /// Boxed: the patch has ~25 optional fields and `CachePolicyConfig` embeds this struct
     /// several times, which otherwise bloats every `Config` copy on debug-build stacks.
     #[serde(default)]
@@ -2654,8 +2653,8 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
-        if let Some(patch) = self.kiro_rs_tool {
-            policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
+        if let Some(patch) = self.prefix_tool {
+            policy.prefix_tool = patch.apply_to(policy.prefix_tool);
         }
         if let Some(patch) = self.stable_segment.as_deref() {
             policy.stable_segment = patch.apply_to(policy.stable_segment);
@@ -2690,11 +2689,11 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = &self.bounds {
             patch.validate_raw(&format!("{label}.bounds"))?;
         }
-        if let Some(patch) = &self.kiro_rs_tool {
-            patch.validate_raw(&format!("{label}.kiroRsTool"))?;
+        if let Some(patch) = &self.prefix_tool {
+            patch.validate_raw(&format!("{label}.prefixTool"))?;
         }
-        if let Some(policy) = &self.kiro_rs_tool_plus {
-            policy.validate(&format!("{label}.kiroRsToolPlus"))?;
+        if let Some(policy) = &self.prefix_tool_plus {
+            policy.validate(&format!("{label}.prefixToolPlus"))?;
         }
         if let Some(patch) = &self.stable_segment {
             patch.validate_raw(&format!("{label}.stableSegment"))?;
@@ -2714,9 +2713,9 @@ impl CacheRoutePolicyPatch {
             PromptCacheStrategyType::NoCache => self.apply_no_cache_fields_to(policy),
             PromptCacheStrategyType::CurrentHighCache
             | PromptCacheStrategyType::BoundedHighCache => self.apply_fields_to(policy),
-            PromptCacheStrategyType::KiroRsTool => self.apply_kiro_rs_tool_fields_to(policy),
-            PromptCacheStrategyType::KiroRsToolPlus => {
-                self.apply_kiro_rs_tool_plus_fields_to(policy)
+            PromptCacheStrategyType::PrefixTool => self.apply_prefix_tool_fields_to(policy),
+            PromptCacheStrategyType::PrefixToolPlus => {
+                self.apply_prefix_tool_plus_fields_to(policy)
             }
             PromptCacheStrategyType::StableSegmentCache => {
                 self.apply_stable_segment_fields_to(policy)
@@ -2729,7 +2728,7 @@ impl CacheRoutePolicyPatch {
         policy.normalized()
     }
 
-    fn apply_kiro_rs_tool_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+    fn apply_prefix_tool_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
         if let Some(cache_type) = self.cache_type {
             policy.cache_type = cache_type;
         }
@@ -2740,8 +2739,8 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
-        if let Some(patch) = self.kiro_rs_tool {
-            policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
+        if let Some(patch) = self.prefix_tool {
+            policy.prefix_tool = patch.apply_to(policy.prefix_tool);
         }
         if let Some(patch) = self.hit_shaping {
             policy.hit_shaping = patch.apply_to(policy.hit_shaping);
@@ -2756,7 +2755,7 @@ impl CacheRoutePolicyPatch {
     }
 
     /// Plus 策略自带整形与写入频次控制，不叠加 hitShaping / coldRequestGuard / reportedUsage。
-    fn apply_kiro_rs_tool_plus_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+    fn apply_prefix_tool_plus_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
         if let Some(cache_type) = self.cache_type {
             policy.cache_type = cache_type;
         }
@@ -2764,8 +2763,8 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
-        if let Some(plus) = self.kiro_rs_tool_plus {
-            policy.kiro_rs_tool_plus = plus.normalized();
+        if let Some(plus) = self.prefix_tool_plus {
+            policy.prefix_tool_plus = plus.normalized();
         }
         if let Some(patch) = self.cache_ttl {
             policy.cache_ttl = patch.apply_to(policy.cache_ttl);
@@ -2806,8 +2805,8 @@ impl CacheRoutePolicyPatch {
             || self.simulation.is_some()
             || self.creation_control.is_some()
             || self.bounds.is_some()
-            || self.kiro_rs_tool.is_some()
-            || self.kiro_rs_tool_plus.is_some()
+            || self.prefix_tool.is_some()
+            || self.prefix_tool_plus.is_some()
             || self.stable_segment.is_some()
     }
 
@@ -2825,10 +2824,10 @@ impl CacheRoutePolicyPatch {
                 .as_ref()
                 .is_none_or(CacheBoundsPolicyPatch::is_empty)
             && self
-                .kiro_rs_tool
+                .prefix_tool
                 .as_ref()
-                .is_none_or(KiroRsToolCachePolicyPatch::is_empty)
-            && self.kiro_rs_tool_plus.is_none()
+                .is_none_or(PrefixToolCachePolicyPatch::is_empty)
+            && self.prefix_tool_plus.is_none()
             && self
                 .stable_segment
                 .as_deref()
@@ -2854,9 +2853,9 @@ pub enum PromptCacheStrategyType {
     NoCache,
     #[default]
     CurrentHighCache,
-    KiroRsTool,
+    PrefixTool,
     StableSegmentCache,
-    KiroRsToolPlus,
+    PrefixToolPlus,
     /// 上下限优先的本地模拟缓存：模拟、前缀追踪、reportedUsage、creationControl、hitShaping
     /// 与 `current_high_cache` 相同，但各字段上下限是最终约束，计费只在范围内补，
     /// 补不上的差额跨请求记账。
@@ -2878,11 +2877,11 @@ pub struct CachePolicyConfig {
     #[serde(default)]
     pub current_high_cache: CacheRoutePolicyPatch,
     #[serde(default)]
-    pub kiro_rs_tool: CacheRoutePolicyPatch,
+    pub prefix_tool: CacheRoutePolicyPatch,
     #[serde(default)]
     pub stable_segment_cache: CacheRoutePolicyPatch,
     #[serde(default)]
-    pub kiro_rs_tool_plus: CacheRoutePolicyPatch,
+    pub prefix_tool_plus: CacheRoutePolicyPatch,
     /// 上下限优先的本地模拟缓存策略模板（`bounded_high_cache`），不继承 `default`。
     #[serde(default)]
     pub bounded_high_cache: CacheRoutePolicyPatch,
@@ -2898,12 +2897,12 @@ impl CachePolicyConfig {
             .validate("当前本地模拟策略兼容参数", base.clone())?;
         self.current_high_cache
             .validate("当前本地模拟策略模板", base.clone())?;
-        self.kiro_rs_tool
-            .validate("Kiro-RS-Tool 缓存策略模板", base.clone())?;
+        self.prefix_tool
+            .validate("前缀追踪 缓存策略模板", base.clone())?;
         self.stable_segment_cache
             .validate("Stable Segment 缓存策略模板", base.clone())?;
-        self.kiro_rs_tool_plus
-            .validate("Kiro-RS-Tool Plus 缓存策略模板", base.clone())?;
+        self.prefix_tool_plus
+            .validate("前缀追踪 Plus 缓存策略模板", base.clone())?;
         self.bounded_high_cache
             .validate("上下限优先缓存策略模板", base.clone())?;
         Ok(())
@@ -2920,9 +2919,9 @@ impl CachePolicyConfig {
         policy.normalized()
     }
 
-    fn kiro_rs_tool_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+    fn prefix_tool_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
         let neutral = CacheRoutePolicy {
-            cache_type: PromptCacheStrategyType::KiroRsTool,
+            cache_type: PromptCacheStrategyType::PrefixTool,
             simulation: CacheSimulationPolicy {
                 enabled: false,
                 target_read_ratio: default_prompt_cache_target_read_ratio(),
@@ -2941,14 +2940,14 @@ impl CachePolicyConfig {
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
 
             bounds: base.bounds,
-            kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            prefix_tool: PrefixToolCachePolicy::default(),
             stable_segment: base.stable_segment,
             hit_shaping: base.hit_shaping,
             cold_request_guard: base.cold_request_guard,
-            kiro_rs_tool_plus: base.kiro_rs_tool_plus,
+            prefix_tool_plus: base.prefix_tool_plus,
             cache_ttl: base.cache_ttl,
         };
-        self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
+        self.prefix_tool.apply_prefix_tool_fields_to(neutral)
     }
 
     fn stable_segment_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
@@ -2972,20 +2971,20 @@ impl CachePolicyConfig {
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
 
             bounds: base.bounds,
-            kiro_rs_tool: base.kiro_rs_tool,
+            prefix_tool: base.prefix_tool,
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: base.hit_shaping,
             cold_request_guard: base.cold_request_guard,
-            kiro_rs_tool_plus: base.kiro_rs_tool_plus,
+            prefix_tool_plus: base.prefix_tool_plus,
             cache_ttl: base.cache_ttl,
         };
         self.stable_segment_cache
             .apply_stable_segment_fields_to(neutral)
     }
 
-    fn kiro_rs_tool_plus_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+    fn prefix_tool_plus_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
         let neutral = CacheRoutePolicy {
-            cache_type: PromptCacheStrategyType::KiroRsToolPlus,
+            cache_type: PromptCacheStrategyType::PrefixToolPlus,
             simulation: CacheSimulationPolicy {
                 enabled: false,
                 target_read_ratio: default_prompt_cache_target_read_ratio(),
@@ -3004,15 +3003,15 @@ impl CachePolicyConfig {
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
 
             bounds: base.bounds,
-            kiro_rs_tool: base.kiro_rs_tool,
+            prefix_tool: base.prefix_tool,
             stable_segment: base.stable_segment,
             hit_shaping: CacheHitShapingPolicy::disabled(),
             cold_request_guard: ColdRequestGuardPolicy::disabled(),
-            kiro_rs_tool_plus: KiroRsToolPlusCachePolicy::default(),
+            prefix_tool_plus: PrefixToolPlusCachePolicy::default(),
             cache_ttl: base.cache_ttl,
         };
-        self.kiro_rs_tool_plus
-            .apply_kiro_rs_tool_plus_fields_to(neutral)
+        self.prefix_tool_plus
+            .apply_prefix_tool_plus_fields_to(neutral)
     }
 
     fn no_cache_policy(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
@@ -3031,11 +3030,11 @@ impl CachePolicyConfig {
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
 
             bounds: base.bounds,
-            kiro_rs_tool: base.kiro_rs_tool,
+            prefix_tool: base.prefix_tool,
             stable_segment: base.stable_segment,
             hit_shaping: CacheHitShapingPolicy::disabled(),
             cold_request_guard: ColdRequestGuardPolicy::disabled(),
-            kiro_rs_tool_plus: base.kiro_rs_tool_plus,
+            prefix_tool_plus: base.prefix_tool_plus,
             cache_ttl: base.cache_ttl,
         }
         .normalized()
@@ -3053,9 +3052,9 @@ impl CachePolicyConfig {
                 policy.cache_type = PromptCacheStrategyType::CurrentHighCache;
                 policy.normalized()
             }
-            PromptCacheStrategyType::KiroRsTool => {
-                let mut policy = self.kiro_rs_tool_template(base);
-                policy.cache_type = PromptCacheStrategyType::KiroRsTool;
+            PromptCacheStrategyType::PrefixTool => {
+                let mut policy = self.prefix_tool_template(base);
+                policy.cache_type = PromptCacheStrategyType::PrefixTool;
                 policy.normalized()
             }
             PromptCacheStrategyType::StableSegmentCache => {
@@ -3063,9 +3062,9 @@ impl CachePolicyConfig {
                 policy.cache_type = PromptCacheStrategyType::StableSegmentCache;
                 policy.normalized()
             }
-            PromptCacheStrategyType::KiroRsToolPlus => {
-                let mut policy = self.kiro_rs_tool_plus_template(base);
-                policy.cache_type = PromptCacheStrategyType::KiroRsToolPlus;
+            PromptCacheStrategyType::PrefixToolPlus => {
+                let mut policy = self.prefix_tool_plus_template(base);
+                policy.cache_type = PromptCacheStrategyType::PrefixToolPlus;
                 policy.normalized()
             }
             PromptCacheStrategyType::BoundedHighCache => self.bounded_high_cache_template(base),
@@ -3081,12 +3080,12 @@ pub struct CacheRoutePolicy {
     pub reported_usage: ReportedUsagePathPolicy,
 
     pub bounds: CacheBoundsPolicy,
-    pub kiro_rs_tool: KiroRsToolCachePolicy,
+    pub prefix_tool: PrefixToolCachePolicy,
     pub stable_segment: StableSegmentCachePolicy,
     pub hit_shaping: CacheHitShapingPolicy,
     pub cold_request_guard: ColdRequestGuardPolicy,
-    pub kiro_rs_tool_plus: KiroRsToolPlusCachePolicy,
-    /// 缓存写入时长（5 分钟 / 1 小时），本地账号与外部池分开设置；所有缓存策略共用。
+    pub prefix_tool_plus: PrefixToolPlusCachePolicy,
+    /// 缓存写入时长（5 分钟 / 1 小时），本地账号与账号分开设置；所有缓存策略共用。
     pub cache_ttl: CacheTtlPolicy,
 }
 
@@ -3095,10 +3094,10 @@ impl CacheRoutePolicy {
         self.simulation = self.simulation.normalized();
         self.creation_control = self.creation_control.normalized();
         self.reported_usage = self.reported_usage.normalized();
-        self.kiro_rs_tool = self.kiro_rs_tool.normalized();
+        self.prefix_tool = self.prefix_tool.normalized();
         self.stable_segment = self.stable_segment.normalized();
         self.hit_shaping = self.hit_shaping.normalized();
-        self.kiro_rs_tool_plus = self.kiro_rs_tool_plus.normalized();
+        self.prefix_tool_plus = self.prefix_tool_plus.normalized();
         self
     }
 
@@ -3111,11 +3110,11 @@ impl CacheRoutePolicy {
         self.reported_usage
             .validate(&format!("{label}.reportedUsage"))?;
         self.bounds.validate(&format!("{label}.bounds"))?;
-        self.kiro_rs_tool.validate(&format!("{label}.kiroRsTool"))?;
+        self.prefix_tool.validate(&format!("{label}.prefixTool"))?;
         self.stable_segment
             .validate(&format!("{label}.stableSegment"))?;
-        self.kiro_rs_tool_plus
-            .validate(&format!("{label}.kiroRsToolPlus"))?;
+        self.prefix_tool_plus
+            .validate(&format!("{label}.prefixToolPlus"))?;
         self.cache_ttl.validate(&format!("{label}.cacheTtl"))?;
         Ok(())
     }
@@ -3150,7 +3149,7 @@ pub fn resolve_cache_policy_for_route(
     let policy = override_policy.apply_fields_for_strategy(policy);
     let namespace = match cache_type {
         PromptCacheStrategyType::NoCache => None,
-        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::KiroRsToolPlus => {
+        PromptCacheStrategyType::PrefixTool | PromptCacheStrategyType::PrefixToolPlus => {
             Some(prefix.clone())
         }
         PromptCacheStrategyType::StableSegmentCache => override_policy
@@ -3203,7 +3202,7 @@ impl Default for PayloadShapingConfig {
 /// Anthropic compatibility profile.
 ///
 /// `claude-code` keeps the pragmatic rewrites needed by Claude Code CLI and
-/// the Kiro upstream. `anthropic-strict` minimizes synthetic protocol and
+/// the 上游 upstream. `anthropic-strict` minimizes synthetic protocol and
 /// prompt rewrites for detector-style checks. `debug` follows `claude-code`
 /// behavior but exposes proxy warning headers by default.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3257,7 +3256,7 @@ impl Default for ThinkingTriggerMode {
 ///
 /// `compatible` 保持当前 Claude Code 兼容行为：允许 `sonnet`、`opus`、
 /// `default` 等短别名，也允许把同 family 的旧版/未来模型名映射到当前
-/// Kiro 上游可用模型。`alias_only` 只允许精确模型和显式别名，不做
+/// 上游 上游可用模型。`alias_only` 只允许精确模型和显式别名，不做
 /// 宽松 family 归一化。`exact_only` 只允许模型能力目录里的精确模型 ID。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -3384,9 +3383,9 @@ impl ModelMappingConfig {
     }
 }
 
-/// Kiro payload guard 的大小裁剪触发模式。
+/// 上游 payload guard 的大小裁剪触发模式。
 ///
-/// `preemptive` 在 Kiro local path 按 `payloadGuardKiroMaxWeight`、
+/// `preemptive` 在 上游 local path 按 `payloadGuardMaxWeight`、
 /// 在外部/Anthropic byte path 按 `payloadGuardMaxBytes`，发送上游前执行配置的
 /// 内容整形和裁剪。`on_too_long` 首次请求只做协议修复；只有上游返回输入过长类
 /// 错误后，才按对应口径裁剪并重试一次。
@@ -3418,35 +3417,35 @@ pub enum PayloadTooLongHandling {
 
 /// 外部备用号池并发满时的处理模式。
 ///
-/// `fail_fast` 保持历史行为：当前没有外部池并发槽时立即返回调度不可用。
-/// `wait` 会进入外部池独立等待队列，直到拿到外部池槽位或超过配置等待时间。
+/// `fail_fast` 保持历史行为：当前没有账号并发槽时立即返回调度不可用。
+/// `wait` 会进入账号独立等待队列，直到拿到账号槽位或超过配置等待时间。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ExternalPoolCapacityMode {
+pub enum CapacityMode {
     FailFast,
     Wait,
 }
 
-impl Default for ExternalPoolCapacityMode {
+impl Default for CapacityMode {
     fn default() -> Self {
         Self::Wait
     }
 }
 
-/// 外部池入口路由控制模式。
+/// 账号入口路由控制模式。
 ///
-/// 默认 `allow_all` 保持历史行为。`allow_list` 只允许命中规则的入口进入外部池；
-/// `deny_list` 则禁止命中规则的入口进入外部池，其它入口保持可用。
+/// 默认 `allow_all` 保持历史行为。`allow_list` 只允许命中规则的入口进入账号；
+/// `deny_list` 则禁止命中规则的入口进入账号，其它入口保持可用。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ExternalPoolRouteMode {
+pub enum RouteRuleMode {
     #[default]
     AllowAll,
     AllowList,
     DenyList,
 }
 
-impl ExternalPoolRouteMode {
+impl RouteRuleMode {
     pub fn parse(value: &str) -> Self {
         Self::parse_known(value).unwrap_or_default()
     }
@@ -3469,27 +3468,27 @@ impl ExternalPoolRouteMode {
     }
 }
 
-/// 外部池返回模型不可用时的冷却范围。
+/// 账号返回模型不可用时的冷却范围。
 ///
-/// `model` 是默认值：只短暂避开当前外部池的当前模型，避免一个不支持模型把
-/// 整个外部池冷却并把后续请求推入全局排队队列。
+/// `model` 是默认值：只短暂避开当前账号的当前模型，避免一个不支持模型把
+/// 整个账号冷却并把后续请求推入全局排队队列。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ExternalPoolModelUnavailableCooldownMode {
+pub enum ModelUnavailableCooldownMode {
     Disabled,
     #[default]
     Model,
     Pool,
 }
 
-/// 外部池流式响应处理模式。
+/// 账号流式响应处理模式。
 ///
 /// `event_passthrough` 保持 SSE event 级透传，并会屏蔽上游流式错误事件中的
-/// 内部细节。是否改写下游可见 usage 不由这里决定，而由单个外部池的
+/// 内部细节。是否改写下游可见 usage 不由这里决定，而由单个账号的
 /// `usageProjectionMode` 决定：`pass_through` 原样返回上游 usage，
 /// `current_path_policy` 按入口路径缓存策略整理 usage。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ExternalPoolStreamResponseMode {
+pub enum StreamResponseMode {
     #[serde(
         rename = "event_passthrough",
         alias = "event_passthrough_usage_rewrite",
@@ -3498,13 +3497,13 @@ pub enum ExternalPoolStreamResponseMode {
     EventPassthrough,
 }
 
-impl Default for ExternalPoolStreamResponseMode {
+impl Default for StreamResponseMode {
     fn default() -> Self {
         Self::EventPassthrough
     }
 }
 
-impl ExternalPoolStreamResponseMode {
+impl StreamResponseMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::EventPassthrough => "event_passthrough",
@@ -3528,10 +3527,10 @@ impl ExternalPoolStreamResponseMode {
 /// 外部备用号池全局策略配置。
 ///
 /// 注意：因质量评分权重为 `f64`，本结构体只实现 `PartialEq` 不实现 `Eq`。
-/// 既有的配置变更检测（`external_pool_policy_changed`）只依赖 `PartialEq`。
+/// 既有的配置变更检测（`account_policy_changed`）只依赖 `PartialEq`。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalPoolsConfig {
+pub struct AccountsConfig {
     #[serde(skip)]
     pub transport_proxy_url: Option<String>,
     #[serde(skip)]
@@ -3541,44 +3540,44 @@ pub struct ExternalPoolsConfig {
     #[serde(skip)]
     pub routes: RoutesConfig,
     #[serde(default = "default_true")]
-    pub external_pools_enabled: bool,
-    #[serde(default = "default_external_pool_global_max_concurrent_requests")]
-    pub external_pool_global_max_concurrent_requests: u32,
-    #[serde(default = "default_external_pool_max_queued_requests")]
-    pub external_pool_max_queued_requests: u32,
+    pub enabled: bool,
+    #[serde(default = "default_account_global_max_concurrent_requests")]
+    pub global_max_concurrent_requests: u32,
+    #[serde(default = "default_account_max_queued_requests")]
+    pub max_queued_requests: u32,
     #[serde(default)]
-    pub external_pool_capacity_mode: ExternalPoolCapacityMode,
-    #[serde(default = "default_external_pool_dispatch_max_wait_secs")]
-    pub external_pool_dispatch_max_wait_secs: u64,
-    #[serde(default = "default_external_pool_retry_max_attempts")]
-    pub external_pool_retry_max_attempts: u32,
-    /// 外部池之间故障转移时允许重试的 HTTP 状态码。
+    pub capacity_mode: CapacityMode,
+    #[serde(default = "default_account_dispatch_max_wait_secs")]
+    pub dispatch_max_wait_secs: u64,
+    #[serde(default = "default_account_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+    /// 账号之间故障转移时允许重试的 HTTP 状态码。
     ///
     /// 认证、配额、渠道禁用等错误默认也按临时抖动信号处理；该列表控制
     /// 普通 HTTP 错误是否继续消耗跨池重试预算。默认列表中的 500 作为
     /// 5xx 族兜底，覆盖 523/524/599 等未逐个枚举的上游临时错误；如果
     /// 运营侧显式只配置 502 等具体状态码，则按配置收窄。
-    #[serde(default = "default_external_pool_retry_status_codes")]
-    pub external_pool_retry_status_codes: Vec<u16>,
+    #[serde(default = "default_account_retry_status_codes")]
+    pub retry_status_codes: Vec<u16>,
     /// 连接、DNS、超时等没有 HTTP 状态码的网络错误是否允许跨池重试。
     #[serde(default = "default_true")]
-    pub external_pool_retry_on_network_error: bool,
+    pub retry_on_network_error: bool,
     /// 成功状态码下返回错误信封、SSE 协议污染等协议错误是否允许跨池重试。
     #[serde(default = "default_true")]
-    pub external_pool_retry_on_protocol_error: bool,
-    #[serde(default = "default_external_pool_same_pool_retry_count")]
-    pub external_pool_same_pool_retry_count: u32,
-    #[serde(default = "default_external_pool_same_pool_retry_status_codes")]
-    pub external_pool_same_pool_retry_status_codes: Vec<u16>,
-    #[serde(default = "default_external_pool_same_pool_retry_delay_ms")]
-    pub external_pool_same_pool_retry_delay_ms: u64,
-    /// 外部池瞬态失败调度罚分。
+    pub retry_on_protocol_error: bool,
+    #[serde(default = "default_account_same_pool_retry_count")]
+    pub same_pool_retry_count: u32,
+    #[serde(default = "default_account_same_pool_retry_status_codes")]
+    pub same_pool_retry_status_codes: Vec<u16>,
+    #[serde(default = "default_account_same_pool_retry_delay_ms")]
+    pub same_pool_retry_delay_ms: u64,
+    /// 账号瞬态失败调度罚分。
     ///
     /// 每一个仍在 Redis 瞬态失败窗口内的失败 streak，都会临时增加池的
     /// 有效优先级。默认 20 可让优先级 1 的故障池在一次可重试失败后让位给
     /// 优先级 10/20 的健康池；填 0 会退回只按配置优先级和负载排序。
-    #[serde(default = "default_external_pool_transient_failure_priority_penalty")]
-    pub external_pool_transient_failure_priority_penalty: u32,
+    #[serde(default = "default_account_transient_failure_priority_penalty")]
+    pub transient_failure_priority_penalty: u32,
 
     // ==================== 质量感知调度（被动采样） ====================
     //
@@ -3591,259 +3590,239 @@ pub struct ExternalPoolsConfig {
     /// 关闭后完全退回"有效优先级 → 负载"的字典序排序；质量状态仍可随既有
     /// 运行态快照读取，但不参与选择、不展示，也不会写入新的质量样本，
     /// 行为与引入本特性之前的选择结果完全一致，可作为线上快速回退手段。
-    #[serde(default = "default_external_pool_quality_aware_scheduling_enabled")]
-    pub external_pool_quality_aware_scheduling_enabled: bool,
+    #[serde(default = "default_account_quality_aware_scheduling_enabled")]
+    pub quality_aware_scheduling_enabled: bool,
     /// 质量 EWMA 平滑系数，有效窗口约为最近 `1/alpha` 个请求。
-    #[serde(default = "default_external_pool_quality_ewma_alpha")]
-    pub external_pool_quality_ewma_alpha: f64,
+    #[serde(default = "default_account_quality_ewma_alpha")]
+    pub quality_ewma_alpha: f64,
     /// 质量样本有效期；超过该时长无请求则质量数据过期并回到中性值。
-    #[serde(default = "default_external_pool_quality_sample_ttl_secs")]
-    pub external_pool_quality_sample_ttl_secs: u64,
+    #[serde(default = "default_account_quality_sample_ttl_secs")]
+    pub quality_sample_ttl_secs: u64,
     /// 参与质量评分所需的最少样本数；不足时按中性值处理，避免冷启动误判。
-    #[serde(default = "default_external_pool_quality_min_samples")]
-    pub external_pool_quality_min_samples: u64,
+    #[serde(default = "default_account_quality_min_samples")]
+    pub quality_min_samples: u64,
     /// 优先级权重（分数越低越优先）。
-    #[serde(default = "default_external_pool_quality_priority_weight")]
-    pub external_pool_quality_priority_weight: f64,
+    #[serde(default = "default_account_quality_priority_weight")]
+    pub quality_priority_weight: f64,
     /// 负载率权重。
-    #[serde(default = "default_external_pool_quality_load_weight")]
-    pub external_pool_quality_load_weight: f64,
+    #[serde(default = "default_account_quality_load_weight")]
+    pub quality_load_weight: f64,
     /// 失败率权重。
     ///
     /// 量级刻意显著高于延迟权重：报错是比"慢"严重得多的问题，
     /// 必须能压过首字延迟的倾向，但仍保持在同一个连续可比空间内。
-    #[serde(default = "default_external_pool_quality_error_weight")]
-    pub external_pool_quality_error_weight: f64,
+    #[serde(default = "default_account_quality_error_weight")]
+    pub quality_error_weight: f64,
     /// 相对首字延迟权重（以候选集中位数为 1.0 的相对值）。
-    #[serde(default = "default_external_pool_quality_latency_weight")]
-    pub external_pool_quality_latency_weight: f64,
+    #[serde(default = "default_account_quality_latency_weight")]
+    pub quality_latency_weight: f64,
     /// 临时避让权重。
-    #[serde(default = "default_external_pool_quality_probation_weight")]
-    pub external_pool_quality_probation_weight: f64,
+    #[serde(default = "default_account_quality_probation_weight")]
+    pub quality_probation_weight: f64,
     /// 候选池大小 K：在分数最优的 K 个候选里加权随机，避免惊群。
-    #[serde(default = "default_external_pool_quality_top_k")]
-    pub external_pool_quality_top_k: u32,
+    #[serde(default = "default_account_quality_top_k")]
+    pub quality_top_k: u32,
     /// 持续劣化判定窗口。
-    #[serde(default = "default_external_pool_degrade_window_secs")]
-    pub external_pool_degrade_window_secs: u64,
+    #[serde(default = "default_account_degrade_window_secs")]
+    pub degrade_window_secs: u64,
     /// 触发临时降级的失败率阈值。
-    #[serde(default = "default_external_pool_degrade_error_rate_threshold")]
-    pub external_pool_degrade_error_rate_threshold: f64,
+    #[serde(default = "default_account_degrade_error_rate_threshold")]
+    pub degrade_error_rate_threshold: f64,
     /// 临时降级时长。
-    #[serde(default = "default_external_pool_degrade_probation_secs")]
-    pub external_pool_degrade_probation_secs: u64,
+    #[serde(default = "default_account_degrade_probation_secs")]
+    pub degrade_probation_secs: u64,
     /// 连续劣化指数退避后的最长降级时长。
-    #[serde(default = "default_external_pool_max_probation_secs")]
-    pub external_pool_max_probation_secs: u64,
+    #[serde(default = "default_account_max_probation_secs")]
+    pub max_probation_secs: u64,
     /// 降级期保留的探测流量比例（百分比）。
     ///
     /// 这是"不是真冷却"的落地：被降级的账号仍保留少量真实流量，
     /// 否则它永远不会产生新样本来证明自己已经恢复。
-    #[serde(default = "default_external_pool_probe_share_percent")]
-    pub external_pool_probe_share_percent: u32,
+    #[serde(default = "default_account_probe_share_percent")]
+    pub probe_share_percent: u32,
     /// 恢复爬坡时长；降级到期后流量线性回升，避免瞬间重新打满。
-    #[serde(default = "default_external_pool_recovery_ramp_secs")]
-    pub external_pool_recovery_ramp_secs: u64,
+    #[serde(default = "default_account_recovery_ramp_secs")]
+    pub recovery_ramp_secs: u64,
     #[serde(default)]
-    pub external_pool_auto_disable_enabled: bool,
+    pub auto_disable_enabled: bool,
     #[serde(default = "default_true")]
-    pub external_pool_auto_disable_on_auth_error: bool,
+    pub auto_disable_on_auth_error: bool,
     #[serde(default = "default_true")]
-    pub external_pool_auto_disable_on_security_lock: bool,
+    pub auto_disable_on_security_lock: bool,
     #[serde(default)]
-    pub external_pool_auto_disable_on_quota_exhausted: bool,
+    pub auto_disable_on_quota_exhausted: bool,
     #[serde(default)]
-    pub external_pool_auto_disable_on_misconfigured_endpoint: bool,
-    #[serde(default = "default_external_pool_auto_disable_failure_threshold")]
-    pub external_pool_auto_disable_failure_threshold: u32,
-    #[serde(default = "default_external_pool_auto_disable_window_secs")]
-    pub external_pool_auto_disable_window_secs: u64,
+    pub auto_disable_on_misconfigured_endpoint: bool,
+    #[serde(default = "default_account_auto_disable_failure_threshold")]
+    pub auto_disable_failure_threshold: u32,
+    #[serde(default = "default_account_auto_disable_window_secs")]
+    pub auto_disable_window_secs: u64,
     #[serde(default)]
-    pub external_pool_auto_disable_duration_secs: u64,
-    /// 外部池限流类错误的历史兼容冷却秒数。
+    pub auto_disable_duration_secs: u64,
+    /// 账号限流类错误的历史兼容冷却秒数。
     ///
     /// 当前普通上游错误默认只写短期健康降权，不写池级冷却；该值只在
     /// 严格临时不可调度或兼容诊断路径中作为时间提示。
-    #[serde(default = "default_external_pool_rate_limit_cooldown_secs")]
-    pub external_pool_rate_limit_cooldown_secs: u64,
-    /// 外部池服务器错误的历史兼容冷却秒数。
-    #[serde(default = "default_external_pool_server_error_cooldown_secs")]
-    pub external_pool_server_error_cooldown_secs: u64,
-    /// 外部池网络错误的历史兼容冷却秒数。
-    #[serde(default = "default_external_pool_network_error_cooldown_secs")]
-    pub external_pool_network_error_cooldown_secs: u64,
-    /// 外部池协议错误的历史兼容冷却秒数。
-    #[serde(default = "default_external_pool_protocol_error_cooldown_secs")]
-    pub external_pool_protocol_error_cooldown_secs: u64,
+    #[serde(default = "default_account_rate_limit_cooldown_secs")]
+    pub rate_limit_cooldown_secs: u64,
+    /// 账号服务器错误的历史兼容冷却秒数。
+    #[serde(default = "default_account_server_error_cooldown_secs")]
+    pub server_error_cooldown_secs: u64,
+    /// 账号网络错误的历史兼容冷却秒数。
+    #[serde(default = "default_account_network_error_cooldown_secs")]
+    pub network_error_cooldown_secs: u64,
+    /// 账号协议错误的历史兼容冷却秒数。
+    #[serde(default = "default_account_protocol_error_cooldown_secs")]
+    pub protocol_error_cooldown_secs: u64,
     #[serde(default)]
-    pub external_pool_model_unavailable_cooldown_mode: ExternalPoolModelUnavailableCooldownMode,
-    #[serde(default = "default_external_pool_model_unavailable_cooldown_secs")]
-    pub external_pool_model_unavailable_cooldown_secs: u64,
-    #[serde(default = "default_external_pool_request_timeout_secs")]
-    pub external_pool_request_timeout_secs: u64,
+    pub model_unavailable_cooldown_mode: ModelUnavailableCooldownMode,
+    #[serde(default = "default_account_model_unavailable_cooldown_secs")]
+    pub model_unavailable_cooldown_secs: u64,
+    #[serde(default = "default_account_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     #[serde(default)]
-    pub external_pool_stream_request_timeout_secs: u64,
-    #[serde(default = "default_external_pool_stream_idle_timeout_secs")]
-    pub external_pool_stream_idle_timeout_secs: u64,
-    /// 外部池流式响应首个语义输出（文本、tool_use、结束）的最长等待秒数，从发出请求算起。
+    pub stream_request_timeout_secs: u64,
+    #[serde(default = "default_account_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    /// 账号流式响应首个语义输出（文本、tool_use、结束）的最长等待秒数，从发出请求算起。
     ///
     /// 超时且尚未向下游提交任何内容时，按首输出前失败处理并换池或回落本地；0 表示不限制。
-    /// 现网 2026-10-21：同一外部池成功请求的总耗时 p95 为 107 秒，而失败请求在无输出状态下
+    /// 现网 2026-10-21：同一账号成功请求的总耗时 p95 为 107 秒，而失败请求在无输出状态下
     /// 中位等待 144–261 秒，客户端先放弃。默认 120 秒，覆盖正常长首字，同时远早于上述失败形态。
-    #[serde(default = "default_external_pool_stream_first_output_timeout_secs")]
-    pub external_pool_stream_first_output_timeout_secs: u64,
-    /// 外部池流式响应在有效语义输出前出现 error/断流/idle 时是否允许换池恢复。
+    #[serde(default = "default_account_stream_first_output_timeout_secs")]
+    pub stream_first_output_timeout_secs: u64,
+    /// 账号流式响应在有效语义输出前出现 error/断流/idle 时是否允许换池恢复。
     ///
-    /// 该开关只覆盖“尚未向下游提交有效内容”的安全窗口。单个外部池可以通过
+    /// 该开关只覆盖“尚未向下游提交有效内容”的安全窗口。单个账号可以通过
     /// `preOutputStreamRetryMode` 覆盖为启用或禁用；默认继承全局值。
-    #[serde(default = "default_external_pool_stream_pre_output_retry_enabled")]
-    pub external_pool_stream_pre_output_retry_enabled: bool,
+    #[serde(default = "default_account_stream_pre_output_retry_enabled")]
+    pub stream_pre_output_retry_enabled: bool,
     #[serde(default = "default_true")]
-    pub external_pool_auto_disable_on_channel_disabled: bool,
-    #[serde(default = "default_external_pool_usage_projection_uplift_percent")]
-    pub external_pool_usage_projection_uplift_percent: u32,
+    pub auto_disable_on_channel_disabled: bool,
+    #[serde(default = "default_account_usage_projection_uplift_percent")]
+    pub usage_projection_uplift_percent: u32,
     #[serde(default = "default_true")]
-    pub external_pool_usage_projection_cost_floor_enabled: bool,
-    #[serde(default = "default_external_pool_usage_projection_cost_floor_margin_percent")]
-    pub external_pool_usage_projection_cost_floor_margin_percent: u32,
+    pub usage_projection_cost_floor_enabled: bool,
+    #[serde(default = "default_account_usage_projection_cost_floor_margin_percent")]
+    pub usage_projection_cost_floor_margin_percent: u32,
     #[serde(default)]
-    pub external_pool_usage_projection_output_uplift_min_tokens: i32,
+    pub usage_projection_output_uplift_min_tokens: i32,
     #[serde(default)]
-    pub external_pool_usage_projection_output_uplift_percent: u32,
+    pub usage_projection_output_uplift_percent: u32,
     #[serde(default)]
-    pub external_pool_stream_response_mode: ExternalPoolStreamResponseMode,
-    /// 外部池 usage 诊断文件记录。默认关闭，只用于生产临时排查上游原始
+    pub stream_response_mode: StreamResponseMode,
+    /// 账号 usage 诊断文件记录。默认关闭，只用于生产临时排查上游原始
     /// usage/响应形状与本系统解析结果不一致的问题。
     #[serde(default)]
-    pub external_pool_usage_debug_enabled: bool,
-    #[serde(default = "default_external_pool_usage_debug_dir")]
-    pub external_pool_usage_debug_dir: String,
-    #[serde(default = "default_external_pool_usage_debug_max_body_bytes")]
-    pub external_pool_usage_debug_max_body_bytes: u32,
-    #[serde(default = "default_external_pool_usage_debug_max_files")]
-    pub external_pool_usage_debug_max_files: u32,
-    /// 外部池 wire/交互诊断文件记录。默认关闭，用于临时排查 Claude Code CLI
+    pub usage_debug_enabled: bool,
+    #[serde(default = "default_account_usage_debug_dir")]
+    pub usage_debug_dir: String,
+    #[serde(default = "default_account_usage_debug_max_body_bytes")]
+    pub usage_debug_max_body_bytes: u32,
+    #[serde(default = "default_account_usage_debug_max_files")]
+    pub usage_debug_max_files: u32,
+    /// 账号 wire/交互诊断文件记录。默认关闭，用于临时排查 Claude Code CLI
     /// 空回、流式终止、追问未进入上游请求、以及 downstream SSE 形状问题。
     #[serde(default)]
-    pub external_pool_wire_debug_enabled: bool,
-    #[serde(default = "default_external_pool_wire_debug_dir")]
-    pub external_pool_wire_debug_dir: String,
-    #[serde(default = "default_external_pool_wire_debug_max_body_bytes")]
-    pub external_pool_wire_debug_max_body_bytes: u32,
-    #[serde(default = "default_external_pool_wire_debug_max_files")]
-    pub external_pool_wire_debug_max_files: u32,
+    pub wire_debug_enabled: bool,
+    #[serde(default = "default_account_wire_debug_dir")]
+    pub wire_debug_dir: String,
+    #[serde(default = "default_account_wire_debug_max_body_bytes")]
+    pub wire_debug_max_body_bytes: u32,
+    #[serde(default = "default_account_wire_debug_max_files")]
+    pub wire_debug_max_files: u32,
 }
 
-impl Default for ExternalPoolsConfig {
+impl Default for AccountsConfig {
     fn default() -> Self {
         Self {
             routes: RoutesConfig::default(),
             transport_proxy_url: None,
             transport_proxy_username: None,
             transport_proxy_password: None,
-            external_pools_enabled: true,
-            external_pool_global_max_concurrent_requests:
-                default_external_pool_global_max_concurrent_requests(),
-            external_pool_max_queued_requests: default_external_pool_max_queued_requests(),
-            external_pool_capacity_mode: ExternalPoolCapacityMode::default(),
-            external_pool_dispatch_max_wait_secs: default_external_pool_dispatch_max_wait_secs(),
-            external_pool_retry_max_attempts: default_external_pool_retry_max_attempts(),
-            external_pool_retry_status_codes: default_external_pool_retry_status_codes(),
-            external_pool_retry_on_network_error: true,
-            external_pool_retry_on_protocol_error: true,
-            external_pool_same_pool_retry_count: default_external_pool_same_pool_retry_count(),
-            external_pool_same_pool_retry_status_codes:
-                default_external_pool_same_pool_retry_status_codes(),
-            external_pool_same_pool_retry_delay_ms: default_external_pool_same_pool_retry_delay_ms(
+            enabled: true,
+            global_max_concurrent_requests: default_account_global_max_concurrent_requests(),
+            max_queued_requests: default_account_max_queued_requests(),
+            capacity_mode: CapacityMode::default(),
+            dispatch_max_wait_secs: default_account_dispatch_max_wait_secs(),
+            retry_max_attempts: default_account_retry_max_attempts(),
+            retry_status_codes: default_account_retry_status_codes(),
+            retry_on_network_error: true,
+            retry_on_protocol_error: true,
+            same_pool_retry_count: default_account_same_pool_retry_count(),
+            same_pool_retry_status_codes: default_account_same_pool_retry_status_codes(),
+            same_pool_retry_delay_ms: default_account_same_pool_retry_delay_ms(),
+            transient_failure_priority_penalty: default_account_transient_failure_priority_penalty(
             ),
-            external_pool_transient_failure_priority_penalty:
-                default_external_pool_transient_failure_priority_penalty(),
-            external_pool_quality_aware_scheduling_enabled:
-                default_external_pool_quality_aware_scheduling_enabled(),
-            external_pool_quality_ewma_alpha: default_external_pool_quality_ewma_alpha(),
-            external_pool_quality_sample_ttl_secs: default_external_pool_quality_sample_ttl_secs(),
-            external_pool_quality_min_samples: default_external_pool_quality_min_samples(),
-            external_pool_quality_priority_weight: default_external_pool_quality_priority_weight(),
-            external_pool_quality_load_weight: default_external_pool_quality_load_weight(),
-            external_pool_quality_error_weight: default_external_pool_quality_error_weight(),
-            external_pool_quality_latency_weight: default_external_pool_quality_latency_weight(),
-            external_pool_quality_probation_weight: default_external_pool_quality_probation_weight(
-            ),
-            external_pool_quality_top_k: default_external_pool_quality_top_k(),
-            external_pool_degrade_window_secs: default_external_pool_degrade_window_secs(),
-            external_pool_degrade_error_rate_threshold:
-                default_external_pool_degrade_error_rate_threshold(),
-            external_pool_degrade_probation_secs: default_external_pool_degrade_probation_secs(),
-            external_pool_max_probation_secs: default_external_pool_max_probation_secs(),
-            external_pool_probe_share_percent: default_external_pool_probe_share_percent(),
-            external_pool_recovery_ramp_secs: default_external_pool_recovery_ramp_secs(),
-            external_pool_auto_disable_enabled: false,
-            external_pool_auto_disable_on_auth_error: true,
-            external_pool_auto_disable_on_security_lock: true,
-            external_pool_auto_disable_on_quota_exhausted: false,
-            external_pool_auto_disable_on_misconfigured_endpoint: false,
-            external_pool_auto_disable_failure_threshold:
-                default_external_pool_auto_disable_failure_threshold(),
-            external_pool_auto_disable_window_secs: default_external_pool_auto_disable_window_secs(
-            ),
-            external_pool_auto_disable_duration_secs: 0,
-            external_pool_rate_limit_cooldown_secs: default_external_pool_rate_limit_cooldown_secs(
-            ),
-            external_pool_server_error_cooldown_secs:
-                default_external_pool_server_error_cooldown_secs(),
-            external_pool_network_error_cooldown_secs:
-                default_external_pool_network_error_cooldown_secs(),
-            external_pool_protocol_error_cooldown_secs:
-                default_external_pool_protocol_error_cooldown_secs(),
-            external_pool_model_unavailable_cooldown_mode:
-                ExternalPoolModelUnavailableCooldownMode::default(),
-            external_pool_model_unavailable_cooldown_secs:
-                default_external_pool_model_unavailable_cooldown_secs(),
-            external_pool_request_timeout_secs: default_external_pool_request_timeout_secs(),
-            external_pool_stream_request_timeout_secs: 0,
-            external_pool_stream_idle_timeout_secs: default_external_pool_stream_idle_timeout_secs(
-            ),
-            external_pool_stream_first_output_timeout_secs:
-                default_external_pool_stream_first_output_timeout_secs(),
-            external_pool_stream_pre_output_retry_enabled:
-                default_external_pool_stream_pre_output_retry_enabled(),
-            external_pool_auto_disable_on_channel_disabled: true,
-            external_pool_usage_projection_uplift_percent:
-                default_external_pool_usage_projection_uplift_percent(),
-            external_pool_usage_projection_cost_floor_enabled: true,
-            external_pool_usage_projection_cost_floor_margin_percent:
-                default_external_pool_usage_projection_cost_floor_margin_percent(),
-            external_pool_usage_projection_output_uplift_min_tokens: 0,
-            external_pool_usage_projection_output_uplift_percent: 0,
-            external_pool_stream_response_mode: ExternalPoolStreamResponseMode::default(),
-            external_pool_usage_debug_enabled: false,
-            external_pool_usage_debug_dir: default_external_pool_usage_debug_dir(),
-            external_pool_usage_debug_max_body_bytes:
-                default_external_pool_usage_debug_max_body_bytes(),
-            external_pool_usage_debug_max_files: default_external_pool_usage_debug_max_files(),
-            external_pool_wire_debug_enabled: false,
-            external_pool_wire_debug_dir: default_external_pool_wire_debug_dir(),
-            external_pool_wire_debug_max_body_bytes:
-                default_external_pool_wire_debug_max_body_bytes(),
-            external_pool_wire_debug_max_files: default_external_pool_wire_debug_max_files(),
+            quality_aware_scheduling_enabled: default_account_quality_aware_scheduling_enabled(),
+            quality_ewma_alpha: default_account_quality_ewma_alpha(),
+            quality_sample_ttl_secs: default_account_quality_sample_ttl_secs(),
+            quality_min_samples: default_account_quality_min_samples(),
+            quality_priority_weight: default_account_quality_priority_weight(),
+            quality_load_weight: default_account_quality_load_weight(),
+            quality_error_weight: default_account_quality_error_weight(),
+            quality_latency_weight: default_account_quality_latency_weight(),
+            quality_probation_weight: default_account_quality_probation_weight(),
+            quality_top_k: default_account_quality_top_k(),
+            degrade_window_secs: default_account_degrade_window_secs(),
+            degrade_error_rate_threshold: default_account_degrade_error_rate_threshold(),
+            degrade_probation_secs: default_account_degrade_probation_secs(),
+            max_probation_secs: default_account_max_probation_secs(),
+            probe_share_percent: default_account_probe_share_percent(),
+            recovery_ramp_secs: default_account_recovery_ramp_secs(),
+            auto_disable_enabled: false,
+            auto_disable_on_auth_error: true,
+            auto_disable_on_security_lock: true,
+            auto_disable_on_quota_exhausted: false,
+            auto_disable_on_misconfigured_endpoint: false,
+            auto_disable_failure_threshold: default_account_auto_disable_failure_threshold(),
+            auto_disable_window_secs: default_account_auto_disable_window_secs(),
+            auto_disable_duration_secs: 0,
+            rate_limit_cooldown_secs: default_account_rate_limit_cooldown_secs(),
+            server_error_cooldown_secs: default_account_server_error_cooldown_secs(),
+            network_error_cooldown_secs: default_account_network_error_cooldown_secs(),
+            protocol_error_cooldown_secs: default_account_protocol_error_cooldown_secs(),
+            model_unavailable_cooldown_mode: ModelUnavailableCooldownMode::default(),
+            model_unavailable_cooldown_secs: default_account_model_unavailable_cooldown_secs(),
+            request_timeout_secs: default_account_request_timeout_secs(),
+            stream_request_timeout_secs: 0,
+            stream_idle_timeout_secs: default_account_stream_idle_timeout_secs(),
+            stream_first_output_timeout_secs: default_account_stream_first_output_timeout_secs(),
+            stream_pre_output_retry_enabled: default_account_stream_pre_output_retry_enabled(),
+            auto_disable_on_channel_disabled: true,
+            usage_projection_uplift_percent: default_account_usage_projection_uplift_percent(),
+            usage_projection_cost_floor_enabled: true,
+            usage_projection_cost_floor_margin_percent:
+                default_account_usage_projection_cost_floor_margin_percent(),
+            usage_projection_output_uplift_min_tokens: 0,
+            usage_projection_output_uplift_percent: 0,
+            stream_response_mode: StreamResponseMode::default(),
+            usage_debug_enabled: false,
+            usage_debug_dir: default_account_usage_debug_dir(),
+            usage_debug_max_body_bytes: default_account_usage_debug_max_body_bytes(),
+            usage_debug_max_files: default_account_usage_debug_max_files(),
+            wire_debug_enabled: false,
+            wire_debug_dir: default_account_wire_debug_dir(),
+            wire_debug_max_body_bytes: default_account_wire_debug_max_body_bytes(),
+            wire_debug_max_files: default_account_wire_debug_max_files(),
         }
     }
 }
 
-impl ExternalPoolsConfig {
+impl AccountsConfig {
     /// Return a finite external capacity wait even when a legacy or API client
     /// submits zero. Keeping this bound at runtime prevents a stale config from
     /// turning a local scheduler outage into an indefinitely queued request.
     pub fn effective_dispatch_max_wait_secs(&self) -> u64 {
-        if self.external_pool_dispatch_max_wait_secs == 0 {
-            default_external_pool_dispatch_max_wait_secs()
+        if self.dispatch_max_wait_secs == 0 {
+            default_account_dispatch_max_wait_secs()
         } else {
-            self.external_pool_dispatch_max_wait_secs
+            self.dispatch_max_wait_secs
         }
     }
 
     pub fn same_pool_retry_status_codes(&self) -> BTreeSet<u16> {
-        self.external_pool_same_pool_retry_status_codes
+        self.same_pool_retry_status_codes
             .iter()
             .copied()
             .filter(|code| (100..=599).contains(code))
@@ -3851,7 +3830,7 @@ impl ExternalPoolsConfig {
     }
 
     pub fn retry_status_codes(&self) -> BTreeSet<u16> {
-        self.external_pool_retry_status_codes
+        self.retry_status_codes
             .iter()
             .copied()
             .filter(|code| (100..=599).contains(code))
@@ -3859,19 +3838,11 @@ impl ExternalPoolsConfig {
     }
 }
 
-pub(crate) fn route_policy_allows(
-    mode: ExternalPoolRouteMode,
-    rules: &[String],
-    endpoint: &str,
-) -> bool {
+pub(crate) fn route_policy_allows(mode: RouteRuleMode, rules: &[String], endpoint: &str) -> bool {
     match mode {
-        ExternalPoolRouteMode::AllowAll => true,
-        ExternalPoolRouteMode::AllowList => {
-            rules.iter().any(|rule| route_rule_matches(rule, endpoint))
-        }
-        ExternalPoolRouteMode::DenyList => {
-            !rules.iter().any(|rule| route_rule_matches(rule, endpoint))
-        }
+        RouteRuleMode::AllowAll => true,
+        RouteRuleMode::AllowList => rules.iter().any(|rule| route_rule_matches(rule, endpoint)),
+        RouteRuleMode::DenyList => !rules.iter().any(|rule| route_rule_matches(rule, endpoint)),
     }
 }
 
@@ -4234,8 +4205,8 @@ pub struct Config {
 
     /// 单个下游 Messages 请求允许发出的推理上游 HTTP 请求硬上限。
     ///
-    /// 首输出前流重试、payload 重试和外部池 failover 共享这一预算。
-    /// 该值与外部池数量无关。
+    /// 首输出前流重试、payload 重试和账号 failover 共享这一预算。
+    /// 该值与账号数量无关。
     #[serde(default = "default_inference_upstream_max_attempts")]
     pub inference_upstream_max_attempts: u32,
 
@@ -4363,7 +4334,7 @@ pub struct Config {
 
     /// 外部备用号池和直连/预检 fallback 策略。
     #[serde(default)]
-    pub external_pools: ExternalPoolsConfig,
+    pub accounts: AccountsConfig,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -4511,15 +4482,15 @@ fn default_cache_hit_min_cost_ratio() -> f64 {
     1.0
 }
 
-fn default_kiro_rs_tool_coverage_ratio() -> f64 {
+fn default_prefix_tool_coverage_ratio() -> f64 {
     1.0
 }
 
-fn default_kiro_rs_tool_reported_input_min_tokens() -> i32 {
+fn default_prefix_tool_reported_input_min_tokens() -> i32 {
     32
 }
 
-fn default_kiro_rs_tool_reported_input_max_tokens() -> i32 {
+fn default_prefix_tool_reported_input_max_tokens() -> i32 {
     4_096
 }
 
@@ -4646,190 +4617,190 @@ fn default_audit_log_retention_days() -> u32 {
     15
 }
 
-fn default_external_pool_auto_disable_failure_threshold() -> u32 {
+fn default_account_auto_disable_failure_threshold() -> u32 {
     1
 }
 
-fn default_external_pool_auto_disable_window_secs() -> u64 {
+fn default_account_auto_disable_window_secs() -> u64 {
     60
 }
 
-fn default_external_pool_global_max_concurrent_requests() -> u32 {
+fn default_account_global_max_concurrent_requests() -> u32 {
     512
 }
 
-fn default_external_pool_max_queued_requests() -> u32 {
+fn default_account_max_queued_requests() -> u32 {
     64
 }
 
-fn default_external_pool_dispatch_max_wait_secs() -> u64 {
+fn default_account_dispatch_max_wait_secs() -> u64 {
     60
 }
 
-fn default_external_pool_retry_max_attempts() -> u32 {
+fn default_account_retry_max_attempts() -> u32 {
     3
 }
 
-fn default_external_pool_retry_status_codes() -> Vec<u16> {
+fn default_account_retry_status_codes() -> Vec<u16> {
     // 500 is treated as the default 5xx family retry guard by retry_pipeline.
     // 404 is included because some upstreams surface model-unavailable and
     // invalid-model failures as exact Not Found responses.
     vec![404, 408, 425, 429, 500, 502, 503, 504, 529]
 }
 
-fn default_external_pool_same_pool_retry_count() -> u32 {
+fn default_account_same_pool_retry_count() -> u32 {
     1
 }
 
-fn default_external_pool_same_pool_retry_status_codes() -> Vec<u16> {
+fn default_account_same_pool_retry_status_codes() -> Vec<u16> {
     // 500 is treated as the default 5xx family retry guard by retry_pipeline.
     vec![408, 425, 429, 500, 502, 503, 504, 529]
 }
 
-fn default_external_pool_same_pool_retry_delay_ms() -> u64 {
+fn default_account_same_pool_retry_delay_ms() -> u64 {
     500
 }
 
-fn default_external_pool_quality_aware_scheduling_enabled() -> bool {
+fn default_account_quality_aware_scheduling_enabled() -> bool {
     // This feature changes scheduling decisions and performs background Redis
     // sampling. Keep upgrades backwards-compatible unless an operator opts in.
     false
 }
 
-fn default_external_pool_quality_ewma_alpha() -> f64 {
+fn default_account_quality_ewma_alpha() -> f64 {
     // 有效窗口约为最近 10 个请求：足够快地跟上真实劣化，
     // 又不会被单次抖动带偏。
     0.2
 }
 
-fn default_external_pool_quality_sample_ttl_secs() -> u64 {
+fn default_account_quality_sample_ttl_secs() -> u64 {
     600
 }
 
-fn default_external_pool_quality_min_samples() -> u64 {
+fn default_account_quality_min_samples() -> u64 {
     5
 }
 
-fn default_external_pool_quality_priority_weight() -> f64 {
+fn default_account_quality_priority_weight() -> f64 {
     1.0
 }
 
-fn default_external_pool_quality_load_weight() -> f64 {
+fn default_account_quality_load_weight() -> f64 {
     100.0
 }
 
-fn default_external_pool_quality_error_weight() -> f64 {
+fn default_account_quality_error_weight() -> f64 {
     // 失败率 0→30% 贡献 30 分，约等于 30 级优先级差或 3 倍中位数首字延迟，
     // 保证"报错多"的判断优先级天然高于"首字慢"。
     100.0
 }
 
-fn default_external_pool_quality_latency_weight() -> f64 {
+fn default_account_quality_latency_weight() -> f64 {
     // 相对值制：候选集中位数为 1.0。慢一倍（2.0）贡献 10 分。
     10.0
 }
 
-fn default_external_pool_quality_probation_weight() -> f64 {
+fn default_account_quality_probation_weight() -> f64 {
     50.0
 }
 
-fn default_external_pool_quality_top_k() -> u32 {
+fn default_account_quality_top_k() -> u32 {
     3
 }
 
-fn default_external_pool_degrade_window_secs() -> u64 {
+fn default_account_degrade_window_secs() -> u64 {
     120
 }
 
-fn default_external_pool_degrade_error_rate_threshold() -> f64 {
+fn default_account_degrade_error_rate_threshold() -> f64 {
     0.5
 }
 
-fn default_external_pool_degrade_probation_secs() -> u64 {
+fn default_account_degrade_probation_secs() -> u64 {
     180
 }
 
-fn default_external_pool_max_probation_secs() -> u64 {
+fn default_account_max_probation_secs() -> u64 {
     900
 }
 
-fn default_external_pool_probe_share_percent() -> u32 {
+fn default_account_probe_share_percent() -> u32 {
     5
 }
 
-fn default_external_pool_recovery_ramp_secs() -> u64 {
+fn default_account_recovery_ramp_secs() -> u64 {
     60
 }
 
-fn default_external_pool_transient_failure_priority_penalty() -> u32 {
+fn default_account_transient_failure_priority_penalty() -> u32 {
     20
 }
 
-fn default_external_pool_rate_limit_cooldown_secs() -> u64 {
+fn default_account_rate_limit_cooldown_secs() -> u64 {
     30
 }
 
-fn default_external_pool_server_error_cooldown_secs() -> u64 {
+fn default_account_server_error_cooldown_secs() -> u64 {
     10
 }
 
-fn default_external_pool_network_error_cooldown_secs() -> u64 {
+fn default_account_network_error_cooldown_secs() -> u64 {
     10
 }
 
-fn default_external_pool_protocol_error_cooldown_secs() -> u64 {
+fn default_account_protocol_error_cooldown_secs() -> u64 {
     10
 }
 
-fn default_external_pool_model_unavailable_cooldown_secs() -> u64 {
+fn default_account_model_unavailable_cooldown_secs() -> u64 {
     10
 }
 
-fn default_external_pool_request_timeout_secs() -> u64 {
+fn default_account_request_timeout_secs() -> u64 {
     180
 }
 
-fn default_external_pool_stream_idle_timeout_secs() -> u64 {
+fn default_account_stream_idle_timeout_secs() -> u64 {
     180
 }
 
-fn default_external_pool_stream_first_output_timeout_secs() -> u64 {
+fn default_account_stream_first_output_timeout_secs() -> u64 {
     120
 }
 
-fn default_external_pool_stream_pre_output_retry_enabled() -> bool {
+fn default_account_stream_pre_output_retry_enabled() -> bool {
     true
 }
 
-fn default_external_pool_usage_projection_uplift_percent() -> u32 {
+fn default_account_usage_projection_uplift_percent() -> u32 {
     25
 }
 
-fn default_external_pool_usage_projection_cost_floor_margin_percent() -> u32 {
+fn default_account_usage_projection_cost_floor_margin_percent() -> u32 {
     10
 }
 
-fn default_external_pool_usage_debug_dir() -> String {
-    "/tmp/kiro-rs/external-pool-usage-debug".to_string()
+fn default_account_usage_debug_dir() -> String {
+    "/tmp/claude-pool/account-usage-debug".to_string()
 }
 
-fn default_external_pool_usage_debug_max_body_bytes() -> u32 {
+fn default_account_usage_debug_max_body_bytes() -> u32 {
     8 * 1024
 }
 
-fn default_external_pool_usage_debug_max_files() -> u32 {
+fn default_account_usage_debug_max_files() -> u32 {
     1_000
 }
 
-fn default_external_pool_wire_debug_dir() -> String {
-    "/tmp/kiro-rs/external-pool-wire-debug".to_string()
+fn default_account_wire_debug_dir() -> String {
+    "/tmp/claude-pool/account-wire-debug".to_string()
 }
 
-fn default_external_pool_wire_debug_max_body_bytes() -> u32 {
+fn default_account_wire_debug_max_body_bytes() -> u32 {
     8 * 1024
 }
 
-fn default_external_pool_wire_debug_max_files() -> u32 {
+fn default_account_wire_debug_max_files() -> u32 {
     1_000
 }
 
@@ -4842,11 +4813,11 @@ fn default_postgres_usage_max_connections() -> u32 {
 }
 
 fn default_redis_key_prefix() -> String {
-    "kiro_rs:local".to_string()
+    "claude_pool:local".to_string()
 }
 
 fn default_observability_redis_key_prefix() -> String {
-    "kiro_rs:observability".to_string()
+    "claude_pool:observability".to_string()
 }
 
 fn default_reported_usage_normal_max_multiplier() -> f64 {
@@ -5063,7 +5034,7 @@ impl Default for Config {
             high_cache_threshold: default_high_cache_threshold(),
             audit_log_retention_enabled: false,
             audit_log_retention_days: default_audit_log_retention_days(),
-            external_pools: ExternalPoolsConfig::default(),
+            accounts: AccountsConfig::default(),
             config_path: None,
         }
     }
@@ -5097,11 +5068,11 @@ impl Config {
                 entry_ttl_secs: self.prompt_cache_entry_ttl_secs,
                 estimated_bytes_limit: self.prompt_cache_estimated_bytes_limit,
             },
-            kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            prefix_tool: PrefixToolCachePolicy::default(),
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: CacheHitShapingPolicy::default(),
             cold_request_guard: ColdRequestGuardPolicy::default(),
-            kiro_rs_tool_plus: KiroRsToolPlusCachePolicy::default(),
+            prefix_tool_plus: PrefixToolPlusCachePolicy::default(),
             cache_ttl: CacheTtlPolicy::default(),
         }
         .normalized()
@@ -5294,44 +5265,44 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(url) = std::env::var("KIRO_RS_POSTGRES_URL") {
+        if let Ok(url) = std::env::var("CLAUDE_POOL_POSTGRES_URL") {
             if !url.trim().is_empty() {
                 self.postgres.url = Some(url);
             }
         }
-        if let Some(parsed) = std::env::var("KIRO_RS_POSTGRES_MAX_CONNECTIONS")
+        if let Some(parsed) = std::env::var("CLAUDE_POOL_POSTGRES_MAX_CONNECTIONS")
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
         {
             self.postgres.max_connections = parsed.max(1);
         }
-        if let Some(parsed) = std::env::var("KIRO_RS_POSTGRES_USAGE_MAX_CONNECTIONS")
+        if let Some(parsed) = std::env::var("CLAUDE_POOL_POSTGRES_USAGE_MAX_CONNECTIONS")
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
         {
             self.postgres.usage_max_connections = parsed.max(1);
         }
-        if let Ok(value) = std::env::var("KIRO_RS_POSTGRES_MIGRATE_ON_START") {
+        if let Ok(value) = std::env::var("CLAUDE_POOL_POSTGRES_MIGRATE_ON_START") {
             if let Some(parsed) = parse_env_bool(&value) {
                 self.postgres.migrate_on_start = parsed;
             }
         }
-        if let Ok(value) = std::env::var("KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START") {
+        if let Ok(value) = std::env::var("CLAUDE_POOL_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START") {
             if let Some(parsed) = parse_env_bool(&value) {
                 self.postgres.compress_usage_rollups_on_start = parsed;
             }
         }
-        if let Ok(url) = std::env::var("KIRO_RS_REDIS_URL") {
+        if let Ok(url) = std::env::var("CLAUDE_POOL_REDIS_URL") {
             if !url.trim().is_empty() {
                 self.redis.url = Some(url);
             }
         }
-        if let Ok(url) = std::env::var("KIRO_RS_OBSERVABILITY_REDIS_URL") {
+        if let Ok(url) = std::env::var("CLAUDE_POOL_OBSERVABILITY_REDIS_URL") {
             if !url.trim().is_empty() {
                 self.observability_redis.url = Some(url);
             }
         }
-        if let Ok(prefix) = std::env::var("KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX") {
+        if let Ok(prefix) = std::env::var("CLAUDE_POOL_OBSERVABILITY_REDIS_KEY_PREFIX") {
             if !prefix.trim().is_empty() {
                 self.observability_redis.key_prefix = prefix;
             }
@@ -5356,7 +5327,7 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 mod tests {
     #[derive(Default)]
     struct TestEndpointRule {
-        mode: super::ExternalPoolRouteMode,
+        mode: super::RouteRuleMode,
         rules: Vec<String>,
     }
     impl TestEndpointRule {
@@ -5373,7 +5344,7 @@ mod tests {
         assert!(config.observability_redis.url.is_none());
         assert_eq!(
             config.observability_redis.key_prefix,
-            "kiro_rs:observability"
+            "claude_pool:observability"
         );
         assert!(config.validate_redis_fault_domains().is_ok());
     }
@@ -5460,7 +5431,7 @@ mod tests {
                     "cacheType": "current_high_cache",
                     "hitShaping": { "targetHitRatio": 0.85, "minCacheCreationTokens": 2048 }
                 },
-                "/dfcache/kiro": { "cacheType": "kiro_rs_tool" },
+                "/dfcache/pool": { "cacheType": "prefix_tool" },
                 "/na": { "cacheType": "no_cache" }
             }
         }"#;
@@ -5482,11 +5453,11 @@ mod tests {
 
         // 默认关闭，没有单独配置的策略继承默认值。
         assert!(!CacheHitShapingPolicy::default().enabled);
-        let kiro = config
-            .cache_policy_for_path("/dfcache/kiro/v1/messages")
+        let pool = config
+            .cache_policy_for_path("/dfcache/pool/v1/messages")
             .policy
             .hit_shaping;
-        assert_eq!(kiro, CacheHitShapingPolicy::default());
+        assert_eq!(pool, CacheHitShapingPolicy::default());
         let v1 = config
             .cache_policy_for_path("/v1/messages")
             .policy
@@ -5904,21 +5875,21 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_capacity_wait_is_always_bounded() {
-        let mut config = ExternalPoolsConfig::default();
+    fn account_capacity_wait_is_always_bounded() {
+        let mut config = AccountsConfig::default();
         assert_eq!(config.effective_dispatch_max_wait_secs(), 60);
 
-        config.external_pool_dispatch_max_wait_secs = 0;
+        config.dispatch_max_wait_secs = 0;
         assert_eq!(config.effective_dispatch_max_wait_secs(), 60);
 
-        config.external_pool_dispatch_max_wait_secs = 7;
+        config.dispatch_max_wait_secs = 7;
         assert_eq!(config.effective_dispatch_max_wait_secs(), 7);
     }
 
     #[test]
-    fn external_pool_route_policy_denies_matching_routes_only() {
+    fn account_route_policy_denies_matching_routes_only() {
         let mut config = TestEndpointRule {
-            mode: ExternalPoolRouteMode::DenyList,
+            mode: RouteRuleMode::DenyList,
             rules: vec!["/cc".to_string(), "/dfcache/team-a".to_string()],
             ..TestEndpointRule::default()
         };
@@ -5933,9 +5904,9 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_route_policy_allow_list_requires_a_match() {
+    fn account_route_policy_allow_list_requires_a_match() {
         let config = TestEndpointRule {
-            mode: ExternalPoolRouteMode::AllowList,
+            mode: RouteRuleMode::AllowList,
             rules: vec!["/ha".to_string(), "/dfcache/team-b".to_string()],
             ..TestEndpointRule::default()
         };
@@ -5947,9 +5918,9 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_route_policy_matches_case_insensitively() {
+    fn account_route_policy_matches_case_insensitively() {
         let config = TestEndpointRule {
-            mode: ExternalPoolRouteMode::AllowList,
+            mode: RouteRuleMode::AllowList,
             rules: vec!["/CC/V1".to_string()],
             ..TestEndpointRule::default()
         };
@@ -5959,9 +5930,9 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_route_policy_does_not_match_mid_path_segments() {
+    fn account_route_policy_does_not_match_mid_path_segments() {
         let config = TestEndpointRule {
-            mode: ExternalPoolRouteMode::AllowList,
+            mode: RouteRuleMode::AllowList,
             rules: vec!["/v1".to_string()],
             ..TestEndpointRule::default()
         };
@@ -5972,20 +5943,20 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_stream_response_mode_accepts_legacy_capture_value() {
+    fn account_stream_response_mode_accepts_legacy_capture_value() {
         let config: Config = Config::from_json_str(
             r#"{
                 "apiKey": "sk-test",
-                "externalPools": {
-                    "externalPoolStreamResponseMode": "event_passthrough_capture"
+                "accounts": {
+                    "streamResponseMode": "event_passthrough_capture"
                 }
             }"#,
         )
         .unwrap();
 
         assert_eq!(
-            config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthrough
+            config.accounts.stream_response_mode,
+            StreamResponseMode::EventPassthrough
         );
     }
 
@@ -6290,7 +6261,7 @@ mod tests {
     fn cache_policy_preserves_cache_type_only_override() {
         let mut config = Config::default();
         config.routes.route_mut(&"/tool".to_string()).cache_policy = CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+            cache_type: Some(PromptCacheStrategyType::PrefixTool),
             ..CacheRoutePolicyPatch::default()
         };
 
@@ -6306,7 +6277,7 @@ mod tests {
         assert_eq!(resolved.namespace.as_deref(), Some("/tool"));
         assert_eq!(
             resolved.policy.cache_type,
-            PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::PrefixTool
         );
         assert!(!resolved.policy.reported_usage.enabled);
         assert!(
@@ -6325,8 +6296,8 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_cache_policy_defaults_match_current_behavior() {
-        let policy = KiroRsToolCachePolicy::default();
+    fn prefix_tool_cache_policy_defaults_match_current_behavior() {
+        let policy = PrefixToolCachePolicy::default();
 
         assert_eq!(policy.coverage_ratio, 1.0);
         assert_eq!(policy.max_coverage_tokens, 0);
@@ -6513,21 +6484,21 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_plus_policy_resolves_template_and_path_override() {
+    fn prefix_tool_plus_policy_resolves_template_and_path_override() {
         let mut config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
-                "kiroRsToolPlus": {
+                "prefixToolPlus": {
                     "hitShaping": { "enabled": true },
-                    "kiroRsToolPlus": {
+                    "prefixToolPlus": {
                         "coverageRatio": 0.8,
                         "shaping": { "cacheRead": { "multiplier": 2.5 } }
                     }
                 },
                 "pathOverrides": {
-                    "/plus": { "cacheType": "kiro_rs_tool_plus" },
+                    "/plus": { "cacheType": "prefix_tool_plus" },
                     "/plus-custom": {
-                        "cacheType": "kiro_rs_tool_plus",
-                        "kiroRsToolPlus": {
+                        "cacheType": "prefix_tool_plus",
+                        "prefixToolPlus": {
                             "creationFrequency": { "enabled": true, "minSuccessfulRequestsBetweenCreation": 5 },
                             "suppressedCreationTarget": "cache_read",
                             "shaping": { "cacheCreation": { "multiplier": 3, "maxTokens": 50000 } },
@@ -6549,13 +6520,13 @@ mod tests {
         assert_eq!(template.namespace.as_deref(), Some("/plus"));
         assert_eq!(
             template.policy.cache_type,
-            PromptCacheStrategyType::KiroRsToolPlus
+            PromptCacheStrategyType::PrefixToolPlus
         );
-        assert_eq!(template.policy.kiro_rs_tool_plus.coverage_ratio, 0.8);
+        assert_eq!(template.policy.prefix_tool_plus.coverage_ratio, 0.8);
         assert_eq!(
             template
                 .policy
-                .kiro_rs_tool_plus
+                .prefix_tool_plus
                 .shaping
                 .cache_read
                 .multiplier,
@@ -6566,7 +6537,7 @@ mod tests {
         assert!(!template.policy.reported_usage.enabled);
 
         let custom = config.cache_policy_for_path("/plus-custom/v1/messages");
-        let plus = custom.policy.kiro_rs_tool_plus;
+        let plus = custom.policy.prefix_tool_plus;
         assert!(plus.creation_frequency.enabled);
         assert_eq!(
             plus.creation_frequency
@@ -6583,7 +6554,7 @@ mod tests {
         assert_eq!(plus.shaping.cache_read.multiplier, 1.0);
         assert_eq!(
             plus.non_stream.mode,
-            crate::model::kiro_rs_tool_plus::UsageShapingProfileMode::Raw
+            crate::model::prefix_tool_plus_policy::UsageShapingProfileMode::Raw
         );
         assert!(plus.small_request.enabled && plus.small_request.disable_cache);
         assert_eq!(plus.small_request.max_input_tokens, 2_048);
@@ -6651,13 +6622,13 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_plus_policy_rejects_invalid_path_override() {
+    fn prefix_tool_plus_policy_rejects_invalid_path_override() {
         let config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "pathOverrides": {
                     "/plus": {
-                        "cacheType": "kiro_rs_tool_plus",
-                        "kiroRsToolPlus": {
+                        "cacheType": "prefix_tool_plus",
+                        "prefixToolPlus": {
                             "shaping": { "output": { "minTokens": 10, "maxTokens": 5 } }
                         }
                     }
@@ -6669,18 +6640,18 @@ mod tests {
             .routes
             .validate_with_config(&config)
             .expect_err("min > max should fail");
-        assert!(err.contains("kiroRsToolPlus.shaping.output"), "{err}");
+        assert!(err.contains("prefixToolPlus.shaping.output"), "{err}");
     }
 
     #[test]
-    fn kiro_rs_tool_cache_policy_deserializes_template_and_path_patch() {
+    fn prefix_tool_cache_policy_deserializes_template_and_path_patch() {
         let mut config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
-                "kiroRsTool": {
+                "prefixTool": {
                     "reportedUsage": {
                         "skipNonStreamUsageProjection": true
                     },
-                    "kiroRsTool": {
+                    "prefixTool": {
                         "coverageRatio": 0.75,
                         "maxCoverageTokens": 12000,
                         "incrementalCreateEnabled": true,
@@ -6692,9 +6663,9 @@ mod tests {
                     }
                 },
                 "pathOverrides": {
-                    "/dfcache/kiro-param": {
-                        "cacheType": "kiro_rs_tool",
-                        "kiroRsTool": {
+                    "/dfcache/pool-param": {
+                        "cacheType": "prefix_tool",
+                        "prefixTool": {
                             "coverageRatio": 0.5,
                             "maxNewCreationTokensPerRequest": 1000,
                             "reportedInputMinTokens": 128
@@ -6712,11 +6683,11 @@ mod tests {
             PromptCacheStrategyType::CurrentHighCache
         );
 
-        let resolved = config.cache_policy_for_path("/dfcache/kiro-param/v1/messages");
-        assert_eq!(resolved.namespace.as_deref(), Some("/dfcache/kiro-param"));
+        let resolved = config.cache_policy_for_path("/dfcache/pool-param/v1/messages");
+        assert_eq!(resolved.namespace.as_deref(), Some("/dfcache/pool-param"));
         assert_eq!(
             resolved.policy.cache_type,
-            PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::PrefixTool
         );
         assert!(
             resolved
@@ -6724,43 +6695,35 @@ mod tests {
                 .reported_usage
                 .skip_non_stream_usage_projection
         );
-        assert_eq!(resolved.policy.kiro_rs_tool.coverage_ratio, 0.5);
-        assert_eq!(resolved.policy.kiro_rs_tool.max_coverage_tokens, 12_000);
+        assert_eq!(resolved.policy.prefix_tool.coverage_ratio, 0.5);
+        assert_eq!(resolved.policy.prefix_tool.max_coverage_tokens, 12_000);
         assert_eq!(
             resolved
                 .policy
-                .kiro_rs_tool
+                .prefix_tool
                 .max_new_creation_tokens_per_request,
             1_000
         );
-        assert!(
-            resolved
-                .policy
-                .kiro_rs_tool
-                .cache_current_user_stable_prefix
-        );
+        assert!(resolved.policy.prefix_tool.cache_current_user_stable_prefix);
         assert_eq!(
             resolved
                 .policy
-                .kiro_rs_tool
+                .prefix_tool
                 .current_user_stable_prefix_max_tokens,
             1_500
         );
-        assert_eq!(resolved.policy.kiro_rs_tool.reported_input_min_tokens, 128);
-        assert_eq!(
-            resolved.policy.kiro_rs_tool.reported_input_max_tokens,
-            2_048
-        );
+        assert_eq!(resolved.policy.prefix_tool.reported_input_min_tokens, 128);
+        assert_eq!(resolved.policy.prefix_tool.reported_input_max_tokens, 2_048);
     }
 
     #[test]
-    fn kiro_rs_tool_cache_policy_rejects_invalid_values() {
+    fn prefix_tool_cache_policy_rejects_invalid_values() {
         let config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "pathOverrides": {
                     "/dfcache/bad": {
-                        "cacheType": "kiro_rs_tool",
-                        "kiroRsTool": {
+                        "cacheType": "prefix_tool",
+                        "prefixTool": {
                             "coverageRatio": 1.5
                         }
                     }
@@ -6779,8 +6742,8 @@ mod tests {
             "cachePolicy": {
                 "pathOverrides": {
                     "/dfcache/bad-range": {
-                        "cacheType": "kiro_rs_tool",
-                        "kiroRsTool": {
+                        "cacheType": "prefix_tool",
+                        "prefixTool": {
                             "reportedInputMinTokens": 4096,
                             "reportedInputMaxTokens": 32
                         }
@@ -6944,7 +6907,7 @@ mod tests {
     #[test]
     fn cache_policy_builtin_defaults_do_not_overwrite_existing_path() {
         let mut routes = RoutesConfig::default();
-        routes.route_mut("/cc").cache_policy.cache_type = Some(PromptCacheStrategyType::KiroRsTool);
+        routes.route_mut("/cc").cache_policy.cache_type = Some(PromptCacheStrategyType::PrefixTool);
         routes.route_mut("/na").cache_policy = CacheRoutePolicyPatch {
             cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
             simulation: Some(CacheSimulationPolicyPatch {
@@ -6959,7 +6922,7 @@ mod tests {
         }
         assert_eq!(
             routes.route_mut("/cc").cache_policy.cache_type,
-            Some(PromptCacheStrategyType::KiroRsTool)
+            Some(PromptCacheStrategyType::PrefixTool)
         );
         assert_eq!(
             routes.route_mut("/na").cache_policy.cache_type,

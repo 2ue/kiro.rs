@@ -128,9 +128,9 @@ const TEMPLATE_META: Array<{
     tone: 'primary',
   },
   {
-    type: 'kiro_rs_tool',
-    title: 'Kiro-RS Tool',
-    shortTitle: 'Kiro-RS Tool',
+    type: 'prefix_tool',
+    title: '前缀追踪',
+    shortTitle: '前缀追踪',
     description: '按会话和请求路径追踪稳定前缀，再生成缓存用量。',
     tone: 'success',
   },
@@ -142,9 +142,9 @@ const TEMPLATE_META: Array<{
     tone: 'warning',
   },
   {
-    type: 'kiro_rs_tool_plus',
-    title: 'Kiro-RS Tool Plus',
-    shortTitle: 'Kiro-RS Tool Plus',
+    type: 'prefix_tool_plus',
+    title: '前缀追踪 Plus',
+    shortTitle: '前缀追踪 Plus',
     description: '独立控制四类 usage 的 shaping、非流式策略、小请求和写入频次。',
     tone: 'info',
   },
@@ -231,12 +231,12 @@ function strategyLabel(type?: CacheStrategyType): string {
   switch (type) {
     case 'current_high_cache':
       return '本地模拟缓存'
-    case 'kiro_rs_tool':
-      return 'Kiro-RS Tool'
+    case 'prefix_tool':
+      return '前缀追踪'
     case 'stable_segment_cache':
       return '稳定片段缓存'
-    case 'kiro_rs_tool_plus':
-      return 'Kiro-RS Tool Plus'
+    case 'prefix_tool_plus':
+      return '前缀追踪 Plus'
     case 'bounded_high_cache':
       return '上下限优先缓存'
     default:
@@ -252,10 +252,10 @@ function templatePolicy(config: RuntimeConfig, type: TemplateKey): CacheRoutePol
       type,
     )
   }
-  if (type === 'kiro_rs_tool') return cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, type)
+  if (type === 'prefix_tool') return cachePolicyForStrategyTemplate(cachePolicy.prefixTool ?? {}, type)
   if (type === 'stable_segment_cache') return cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, type)
   if (type === 'bounded_high_cache') return cachePolicyForStrategyTemplate(cachePolicy.boundedHighCache ?? {}, type)
-  return cachePolicyForStrategyTemplate(cachePolicy.kiroRsToolPlus ?? {}, type)
+  return cachePolicyForStrategyTemplate(cachePolicy.prefixToolPlus ?? {}, type)
 }
 
 function routeOrder(a: string, b: string): number {
@@ -283,8 +283,8 @@ function defaultPathPolicy(prefix: string, cachePolicy: CachePolicyConfig, repor
   if (existing) {
     if (
       existing.cacheType === 'no_cache' ||
-      existing.cacheType === 'kiro_rs_tool' ||
-      existing.cacheType === 'kiro_rs_tool_plus' ||
+      existing.cacheType === 'prefix_tool' ||
+      existing.cacheType === 'prefix_tool_plus' ||
       existing.cacheType === 'stable_segment_cache' ||
       existing.cacheType === 'bounded_high_cache'
     ) {
@@ -326,11 +326,11 @@ function templateHighlights(type: TemplateKey, policy: CacheRoutePolicyPatch): s
       `写入间隔 ${policy.creationControl?.minCreationIntervalSecs ?? 0}s`,
     ]
   }
-  if (type === 'kiro_rs_tool') {
+  if (type === 'prefix_tool') {
     return [
-      `覆盖率 ${formatRatio(policy.kiroRsTool?.coverageRatio)}`,
-      `增量写入 ${policy.kiroRsTool?.incrementalCreateEnabled === false ? '关闭' : '开启'}`,
-      `稳定前缀 ${policy.kiroRsTool?.cacheCurrentUserStablePrefix ? '开启' : '关闭'}`,
+      `覆盖率 ${formatRatio(policy.prefixTool?.coverageRatio)}`,
+      `增量写入 ${policy.prefixTool?.incrementalCreateEnabled === false ? '关闭' : '开启'}`,
+      `稳定前缀 ${policy.prefixTool?.cacheCurrentUserStablePrefix ? '开启' : '关闭'}`,
     ]
   }
   if (type === 'stable_segment_cache') {
@@ -344,7 +344,7 @@ function templateHighlights(type: TemplateKey, policy: CacheRoutePolicyPatch): s
       ].filter(Boolean).length}/3`,
     ]
   }
-  const plus = policy.kiroRsToolPlus
+  const plus = policy.prefixToolPlus
   return [
     `覆盖率 ${formatRatio(plus?.coverageRatio)}`,
     `输入 ${plus?.shaping?.input?.multiplier ?? 1}× · 输出 ${plus?.shaping?.output?.multiplier ?? 1}×`,
@@ -366,10 +366,10 @@ function pathSummary(policy: CacheRoutePolicyPatch): string[] {
       `路径空间 ${policy.routeNamespace ? '独立' : '共享'}`,
     ]
   }
-  if (policy.cacheType === 'kiro_rs_tool') {
+  if (policy.cacheType === 'prefix_tool') {
     return [
-      `覆盖率 ${formatRatio(policy.kiroRsTool?.coverageRatio)}`,
-      `增量写入 ${policy.kiroRsTool?.incrementalCreateEnabled === false ? '关闭' : '开启'}`,
+      `覆盖率 ${formatRatio(policy.prefixTool?.coverageRatio)}`,
+      `增量写入 ${policy.prefixTool?.incrementalCreateEnabled === false ? '关闭' : '开启'}`,
     ]
   }
   if (policy.cacheType === 'stable_segment_cache') {
@@ -379,8 +379,8 @@ function pathSummary(policy: CacheRoutePolicyPatch): string[] {
     ]
   }
   return [
-    `覆盖率 ${formatRatio(policy.kiroRsToolPlus?.coverageRatio)}`,
-    `输入 ${policy.kiroRsToolPlus?.shaping?.input?.multiplier ?? 1}×`,
+    `覆盖率 ${formatRatio(policy.prefixToolPlus?.coverageRatio)}`,
+    `输入 ${policy.prefixToolPlus?.shaping?.input?.multiplier ?? 1}×`,
   ]
 }
 
@@ -590,14 +590,14 @@ export function CachePoliciesPage() {
     if (templateEditor.type === 'current_high_cache') {
       nextCachePolicy.currentHighCache = templateEditor.policy
       nextCachePolicy.default = { ...nextCachePolicy.default, ...templateEditor.policy }
-    } else if (templateEditor.type === 'kiro_rs_tool') {
-      nextCachePolicy.kiroRsTool = templateEditor.policy
+    } else if (templateEditor.type === 'prefix_tool') {
+      nextCachePolicy.prefixTool = templateEditor.policy
     } else if (templateEditor.type === 'stable_segment_cache') {
       nextCachePolicy.stableSegmentCache = templateEditor.policy
     } else if (templateEditor.type === 'bounded_high_cache') {
       nextCachePolicy.boundedHighCache = templateEditor.policy
     } else {
-      nextCachePolicy.kiroRsToolPlus = templateEditor.policy
+      nextCachePolicy.prefixToolPlus = templateEditor.policy
     }
     const saved = await persist({ ...workingConfig, cachePolicy: normalizeCachePolicy(nextCachePolicy) })
     if (saved) setTemplateEditor(null)

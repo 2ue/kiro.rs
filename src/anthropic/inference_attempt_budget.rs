@@ -10,7 +10,7 @@ pub(crate) const MAX_INFERENCE_UPSTREAM_MAX_ATTEMPTS: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InferenceAttemptKind {
-    ExternalPool,
+    Account,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +157,7 @@ impl InferenceAttemptBudget {
             })?;
 
         match kind {
-            InferenceAttemptKind::ExternalPool => {
+            InferenceAttemptKind::Account => {
                 self.external_attempts.fetch_add(1, Ordering::Relaxed);
             }
         }

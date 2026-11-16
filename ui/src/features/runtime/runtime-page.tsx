@@ -10,7 +10,6 @@ import {
   Shield,
   Sparkles,
   Wand2,
-  GitBranch,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -34,7 +33,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import {
   defaultImageProcessing,
   defaultBodyConversion,
-  defaultExternalPoolsConfig,
+  defaultAccountsConfig,
   defaultMissingMaxTokens,
   defaultLocalRequestCompat,
   defaultRequestCapture,
@@ -67,8 +66,7 @@ import {
   useUpdateRuntimeConfig,
 } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
-import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
-import { VersionEndpointSection } from './version-endpoint-section'
+import type { LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
 import {
   normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
@@ -80,7 +78,7 @@ import {
 type RuntimeSectionKey =
   | 'loadBalancing'
   | 'capacity'
-  | 'externalPools'
+  | 'accounts'
   | 'cooldown'
   | 'scheduler'
   | 'warmup'
@@ -89,7 +87,6 @@ type RuntimeSectionKey =
   | 'startupProxy'
   | 'compat'
   | 'requestCompat'
-  | 'versionEndpoint'
 
 const runtimeSections: Array<{
   key: RuntimeSectionKey
@@ -99,19 +96,17 @@ const runtimeSections: Array<{
 }> = [
   { key: 'loadBalancing', title: '负载均衡模式', desc: '请求分配给账号的策略', icon: <Gauge className="h-4 w-4" /> },
   { key: 'capacity', title: '请求容量', desc: '并发、排队、重试、超时', icon: <Gauge className="h-4 w-4" /> },
-  { key: 'externalPools', title: '路由策略', desc: '控制哪些入口进入本地账号或外部池', icon: <Router className="h-4 w-4" /> },
+  { key: 'accounts', title: '路由策略', desc: '控制哪些入口进入本地账号或账号', icon: <Router className="h-4 w-4" /> },
   { key: 'cooldown', title: '错误恢复 / 冷却', desc: '不同错误类型的暂停策略与退避', icon: <Shield className="h-4 w-4" /> },
   { key: 'scheduler', title: '账号选择权重', desc: '优先使用哪些账号的调度参数', icon: <Gauge className="h-4 w-4" /> },
   { key: 'warmup', title: '新账号预热', desc: '新账号逐步参与请求，稳定后恢复正常', icon: <Sparkles className="h-4 w-4" /> },
   { key: 'payload', title: '请求体处理', desc: '协议转换、大小保护、历史清理和当前请求兜底', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
   { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
-  { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
+  { key: 'compat', title: '接口兼容', desc: '兼容模式、上游 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
   { key: 'requestCompat', title: '参数兼容', desc: '客户端参数写法不规范时改写还是拒绝', icon: <Wand2 className="h-4 w-4" /> },
-  { key: 'versionEndpoint', title: '版本与端点', desc: '客户端版本生命周期和同账号端点故障转移', icon: <GitBranch className="h-4 w-4" /> },
 ]
 
-const SUPPORTED_OAUTH_ENDPOINT_FALLBACKS = new Set(['codewhisperer', 'amazonq', 'runtime'])
 
 // ─── 原子组件 ──────────────────────────────────────────────────────────────────
 
@@ -126,7 +121,7 @@ function routePolicySummary(mode: string, rules: string[] = []): string {
   return '不限制'
 }
 
-function normalizeExternalPoolRouteMode(value?: string): RuntimeConfig['externalPools']['externalPoolRouteMode'] {
+function normalizeRouteRuleMode(value?: string): RuntimeConfig['accounts']['accountRouteMode'] {
   if (value === 'allow_list' || value === 'deny_list') return value
   return 'allow_all'
 }
@@ -302,10 +297,6 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     },
     credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
     credentialInfoRefreshConcurrency: toWhole(draft.credentialInfoRefreshConcurrency, 1, 16),
-    // 0 或空值表示未配置；后端同样把 0 视为清空。
-    kiroCreditUnitPriceUsd: draft.kiroCreditUnitPriceUsd && draft.kiroCreditUnitPriceUsd > 0
-      ? Math.min(draft.kiroCreditUnitPriceUsd, 100)
-      : null,
     credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
     credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
     credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
@@ -328,8 +319,6 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     emptyTurnRetryBaseDelayMs: Math.min(10000, Math.max(0, Math.round(Number(draft.emptyTurnRetryBaseDelayMs) || 0))),
     emptyTurnRetryMaxDelayMs: Math.min(30000, Math.max(0, Math.round(Number(draft.emptyTurnRetryMaxDelayMs) || 0))),
     emptyTurnRetryJitterPercent: Math.min(100, Math.max(0, Math.round(Number(draft.emptyTurnRetryJitterPercent) || 0))),
-    kiroVersionAutoSyncEnabled: Boolean(draft.kiroVersionAutoSyncEnabled),
-    kiroRuntimeDomainEnabled: Boolean(draft.kiroRuntimeDomainEnabled),
     credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
     credentialAuthErrorCooldownSecs: toWhole(draft.credentialAuthErrorCooldownSecs, 1),
     credentialCooldownBackoffMultiplier: Math.max(1, Number(draft.credentialCooldownBackoffMultiplier.toFixed(2))),
@@ -338,15 +327,9 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
     credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
     credentialSessionMaxConcurrentRequests: toWhole(draft.credentialSessionMaxConcurrentRequests),
-    kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
-    kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
-    kiroUpstreamStreamMaxDurationSecs: toWhole(draft.kiroUpstreamStreamMaxDurationSecs, 0, 86400),
     streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
     streamPreOutputHoldSecs: toWhole(draft.streamPreOutputHoldSecs, 0, 60),
     streamFirstOutputTimeoutSecs: toWhole(draft.streamFirstOutputTimeoutSecs, 0, 3600),
-    kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
-    kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
-    kiroUpstreamUsageOnlyRetryMaxAttempts: toWhole(draft.kiroUpstreamUsageOnlyRetryMaxAttempts, 1, 100),
     inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
     auxiliaryUpstreamMaxAttempts: toWhole(draft.auxiliaryUpstreamMaxAttempts, 1, 10),
     auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
@@ -355,18 +338,9 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     tokenRefreshBackgroundEnabled: Boolean(draft.tokenRefreshBackgroundEnabled),
     tokenRefreshBackgroundIntervalSecs: toWhole(draft.tokenRefreshBackgroundIntervalSecs, 10, 3600),
     tokenRefreshBackgroundLeadSecs: toWhole(draft.tokenRefreshBackgroundLeadSecs, 60, 3600),
-    kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
-    kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
-    kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
     credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
     credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
     credentialPromptLogicRetryMaxAttempts: toWhole(draft.credentialPromptLogicRetryMaxAttempts),
-    kiroUpstreamRegionRotationEnabled: Boolean(draft.kiroUpstreamRegionRotationEnabled),
-    kiroRegionProfileArnMismatchAllowed: Boolean(draft.kiroRegionProfileArnMismatchAllowed),
-    kiroEndpointFallbackEnabled: Boolean(draft.kiroEndpointFallbackEnabled),
-    kiroEndpointFallbackOrder: [...new Set(draft.kiroEndpointFallbackOrder.map((name) => name.trim().toLowerCase()))]
-      .filter((name) => SUPPORTED_OAUTH_ENDPOINT_FALLBACKS.has(name))
-      .slice(0, 8),
     localBerserkModeEnabled: Boolean(draft.localBerserkModeEnabled),
     localBerserkMaxRounds: toWhole(draft.localBerserkMaxRounds, 1, 10),
     localBerserkRoundDelayMs: toWhole(draft.localBerserkRoundDelayMs, 0, 60_000),
@@ -389,7 +363,6 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
     payloadShaping: normalizePayloadShaping(draft.payloadShaping),
     payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
-    payloadGuardKiroMaxWeight: toWhole(draft.payloadGuardKiroMaxWeight),
     payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
     promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
     promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -414,91 +387,83 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
     modelMapping: normalizeModelMapping(draft.modelMapping),
-    externalPools: {
-      ...defaultExternalPoolsConfig(),
-      ...draft.externalPools,
-      externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
-      externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
-      externalPoolMaxInputTokens: toWhole(draft.externalPools.externalPoolMaxInputTokens),
-      externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs, 1),
-      externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
-      externalPoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.externalPools.externalPoolRetryStatusCodes)),
-      externalPoolRetryOnNetworkError: Boolean(draft.externalPools.externalPoolRetryOnNetworkError),
-      externalPoolRetryOnProtocolError: Boolean(draft.externalPools.externalPoolRetryOnProtocolError),
-      externalPoolSamePoolRetryCount: toWhole(draft.externalPools.externalPoolSamePoolRetryCount),
-      externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.externalPools.externalPoolSamePoolRetryStatusCodes)),
-      externalPoolSamePoolRetryDelayMs: toWhole(draft.externalPools.externalPoolSamePoolRetryDelayMs),
-      externalPoolTransientFailurePriorityPenalty: toWhole(draft.externalPools.externalPoolTransientFailurePriorityPenalty),
-      externalPoolTransientFailureCooldownThreshold: toWhole(draft.externalPools.externalPoolTransientFailureCooldownThreshold),
-      externalPoolQualityAwareSchedulingEnabled: Boolean(draft.externalPools.externalPoolQualityAwareSchedulingEnabled),
-      externalPoolQualityEwmaAlpha: clampFloat(draft.externalPools.externalPoolQualityEwmaAlpha, 0.01, 1),
-      externalPoolQualitySampleTtlSecs: toWhole(draft.externalPools.externalPoolQualitySampleTtlSecs, 1, 86_400),
-      externalPoolQualityMinSamples: toWhole(draft.externalPools.externalPoolQualityMinSamples, 1, 10_000),
-      externalPoolQualityPriorityWeight: clampFloat(draft.externalPools.externalPoolQualityPriorityWeight, 0, 1_000_000),
-      externalPoolQualityLoadWeight: clampFloat(draft.externalPools.externalPoolQualityLoadWeight, 0, 1_000_000),
-      externalPoolQualityErrorWeight: clampFloat(draft.externalPools.externalPoolQualityErrorWeight, 0, 1_000_000),
-      externalPoolQualityLatencyWeight: clampFloat(draft.externalPools.externalPoolQualityLatencyWeight, 0, 1_000_000),
-      externalPoolQualityProbationWeight: clampFloat(draft.externalPools.externalPoolQualityProbationWeight, 0, 1_000_000),
-      externalPoolQualityTopK: toWhole(draft.externalPools.externalPoolQualityTopK, 1, 100),
-      externalPoolDegradeWindowSecs: toWhole(draft.externalPools.externalPoolDegradeWindowSecs, 1, 86_400),
-      externalPoolDegradeErrorRateThreshold: clampFloat(draft.externalPools.externalPoolDegradeErrorRateThreshold, 0, 1),
-      externalPoolDegradeProbationSecs: toWhole(draft.externalPools.externalPoolDegradeProbationSecs, 1, 86_400),
-      // 避让上限不得低于单次避让时长，与后端 validate_external_pools_config 的跨字段校验保持一致，
+    accounts: {
+      ...defaultAccountsConfig(),
+      ...draft.accounts,
+      globalMaxConcurrentRequests: toWhole(draft.accounts.globalMaxConcurrentRequests),
+      maxQueuedRequests: toWhole(draft.accounts.maxQueuedRequests),
+      accountMaxInputTokens: toWhole(draft.accounts.accountMaxInputTokens),
+      dispatchMaxWaitSecs: toWhole(draft.accounts.dispatchMaxWaitSecs, 1),
+      retryMaxAttempts: toWhole(draft.accounts.retryMaxAttempts),
+      retryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.accounts.retryStatusCodes)),
+      retryOnNetworkError: Boolean(draft.accounts.retryOnNetworkError),
+      retryOnProtocolError: Boolean(draft.accounts.retryOnProtocolError),
+      samePoolRetryCount: toWhole(draft.accounts.samePoolRetryCount),
+      samePoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.accounts.samePoolRetryStatusCodes)),
+      samePoolRetryDelayMs: toWhole(draft.accounts.samePoolRetryDelayMs),
+      transientFailurePriorityPenalty: toWhole(draft.accounts.transientFailurePriorityPenalty),
+      accountTransientFailureCooldownThreshold: toWhole(draft.accounts.accountTransientFailureCooldownThreshold),
+      qualityAwareSchedulingEnabled: Boolean(draft.accounts.qualityAwareSchedulingEnabled),
+      qualityEwmaAlpha: clampFloat(draft.accounts.qualityEwmaAlpha, 0.01, 1),
+      qualitySampleTtlSecs: toWhole(draft.accounts.qualitySampleTtlSecs, 1, 86_400),
+      qualityMinSamples: toWhole(draft.accounts.qualityMinSamples, 1, 10_000),
+      qualityPriorityWeight: clampFloat(draft.accounts.qualityPriorityWeight, 0, 1_000_000),
+      qualityLoadWeight: clampFloat(draft.accounts.qualityLoadWeight, 0, 1_000_000),
+      qualityErrorWeight: clampFloat(draft.accounts.qualityErrorWeight, 0, 1_000_000),
+      qualityLatencyWeight: clampFloat(draft.accounts.qualityLatencyWeight, 0, 1_000_000),
+      qualityProbationWeight: clampFloat(draft.accounts.qualityProbationWeight, 0, 1_000_000),
+      qualityTopK: toWhole(draft.accounts.qualityTopK, 1, 100),
+      degradeWindowSecs: toWhole(draft.accounts.degradeWindowSecs, 1, 86_400),
+      degradeErrorRateThreshold: clampFloat(draft.accounts.degradeErrorRateThreshold, 0, 1),
+      degradeProbationSecs: toWhole(draft.accounts.degradeProbationSecs, 1, 86_400),
+      // 避让上限不得低于单次避让时长，与后端 validate_accounts_config 的跨字段校验保持一致，
       // 避免用户在前端就提交一个必然被后端拒绝的组合。
-      externalPoolMaxProbationSecs: Math.max(
-        toWhole(draft.externalPools.externalPoolMaxProbationSecs, 1, 86_400),
-        toWhole(draft.externalPools.externalPoolDegradeProbationSecs, 1, 86_400),
+      maxProbationSecs: Math.max(
+        toWhole(draft.accounts.maxProbationSecs, 1, 86_400),
+        toWhole(draft.accounts.degradeProbationSecs, 1, 86_400),
       ),
-      externalPoolProbeSharePercent: toWhole(draft.externalPools.externalPoolProbeSharePercent, 0, 100),
-      externalPoolRecoveryRampSecs: toWhole(draft.externalPools.externalPoolRecoveryRampSecs, 0, 86_400),
-      externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
-      localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
-      localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
-      localPoolCircuitRequireDistinctCredentials: toWhole(draft.externalPools.localPoolCircuitRequireDistinctCredentials),
-      localPoolCircuitMinRatioPercent: toWhole(draft.externalPools.localPoolCircuitMinRatioPercent),
-      localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
-      localPoolCircuitHalfOpenProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenProbes, 1),
-      externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
-      externalPoolAutoDisableWindowSecs: toWhole(draft.externalPools.externalPoolAutoDisableWindowSecs, 1),
-      externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
-      externalPoolRateLimitCooldownSecs: toWhole(draft.externalPools.externalPoolRateLimitCooldownSecs, 1),
-      externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
-      externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
-      externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
-      externalPoolModelUnavailableCooldownMode: draft.externalPools.externalPoolModelUnavailableCooldownMode,
-      externalPoolModelUnavailableCooldownSecs: toWhole(draft.externalPools.externalPoolModelUnavailableCooldownSecs, 1),
-      externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
-      externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
-      externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
-      externalPoolStreamFirstOutputTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamFirstOutputTimeoutSecs),
-      externalPoolRouteMode: normalizeExternalPoolRouteMode(draft.externalPools.externalPoolRouteMode),
-      externalPoolRouteRules: normalizeRuleList(draft.externalPools.externalPoolRouteRules),
-      localPoolRouteMode: normalizeExternalPoolRouteMode(draft.externalPools.localPoolRouteMode),
-      localPoolRouteRules: normalizeRuleList(draft.externalPools.localPoolRouteRules),
-      externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
-      externalPoolUsageProjectionCostFloorEnabled: Boolean(draft.externalPools.externalPoolUsageProjectionCostFloorEnabled),
-      externalPoolUsageProjectionCostFloorMarginPercent: toWhole(draft.externalPools.externalPoolUsageProjectionCostFloorMarginPercent),
-      externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
-      externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
-      externalPoolUsageDebugEnabled: Boolean(draft.externalPools.externalPoolUsageDebugEnabled),
-      externalPoolUsageDebugDir: String(draft.externalPools.externalPoolUsageDebugDir || '').trim(),
-      externalPoolUsageDebugMaxBodyBytes: toWhole(draft.externalPools.externalPoolUsageDebugMaxBodyBytes),
-      externalPoolUsageDebugMaxFiles: toWhole(draft.externalPools.externalPoolUsageDebugMaxFiles),
+      probeSharePercent: toWhole(draft.accounts.probeSharePercent, 0, 100),
+      recoveryRampSecs: toWhole(draft.accounts.recoveryRampSecs, 0, 86_400),
+      accountLocalRescueMaxWaitSecs: toWhole(draft.accounts.accountLocalRescueMaxWaitSecs),
+      localPoolCircuitWindowSecs: toWhole(draft.accounts.localPoolCircuitWindowSecs, 1),
+      localPoolCircuitOpenAfterFailures: toWhole(draft.accounts.localPoolCircuitOpenAfterFailures, 1),
+      localPoolCircuitRequireDistinctCredentials: toWhole(draft.accounts.localPoolCircuitRequireDistinctCredentials),
+      localPoolCircuitMinRatioPercent: toWhole(draft.accounts.localPoolCircuitMinRatioPercent),
+      localPoolCircuitOpenSecs: toWhole(draft.accounts.localPoolCircuitOpenSecs, 1),
+      localPoolCircuitHalfOpenProbes: toWhole(draft.accounts.localPoolCircuitHalfOpenProbes, 1),
+      autoDisableFailureThreshold: toWhole(draft.accounts.autoDisableFailureThreshold, 1),
+      autoDisableWindowSecs: toWhole(draft.accounts.autoDisableWindowSecs, 1),
+      autoDisableDurationSecs: toWhole(draft.accounts.autoDisableDurationSecs),
+      rateLimitCooldownSecs: toWhole(draft.accounts.rateLimitCooldownSecs, 1),
+      serverErrorCooldownSecs: toWhole(draft.accounts.serverErrorCooldownSecs, 1),
+      networkErrorCooldownSecs: toWhole(draft.accounts.networkErrorCooldownSecs, 1),
+      protocolErrorCooldownSecs: toWhole(draft.accounts.protocolErrorCooldownSecs, 1),
+      modelUnavailableCooldownMode: draft.accounts.modelUnavailableCooldownMode,
+      modelUnavailableCooldownSecs: toWhole(draft.accounts.modelUnavailableCooldownSecs, 1),
+      requestTimeoutSecs: toWhole(draft.accounts.requestTimeoutSecs),
+      streamRequestTimeoutSecs: toWhole(draft.accounts.streamRequestTimeoutSecs),
+      streamIdleTimeoutSecs: toWhole(draft.accounts.streamIdleTimeoutSecs),
+      streamFirstOutputTimeoutSecs: toWhole(draft.accounts.streamFirstOutputTimeoutSecs),
+      accountRouteMode: normalizeRouteRuleMode(draft.accounts.accountRouteMode),
+      accountRouteRules: normalizeRuleList(draft.accounts.accountRouteRules),
+      localPoolRouteMode: normalizeRouteRuleMode(draft.accounts.localPoolRouteMode),
+      localPoolRouteRules: normalizeRuleList(draft.accounts.localPoolRouteRules),
+      usageProjectionUpliftPercent: toWhole(draft.accounts.usageProjectionUpliftPercent),
+      usageProjectionCostFloorEnabled: Boolean(draft.accounts.usageProjectionCostFloorEnabled),
+      usageProjectionCostFloorMarginPercent: toWhole(draft.accounts.usageProjectionCostFloorMarginPercent),
+      usageProjectionOutputUpliftMinTokens: toWhole(draft.accounts.usageProjectionOutputUpliftMinTokens),
+      usageProjectionOutputUpliftPercent: toWhole(draft.accounts.usageProjectionOutputUpliftPercent),
+      usageDebugEnabled: Boolean(draft.accounts.usageDebugEnabled),
+      usageDebugDir: String(draft.accounts.usageDebugDir || '').trim(),
+      usageDebugMaxBodyBytes: toWhole(draft.accounts.usageDebugMaxBodyBytes),
+      usageDebugMaxFiles: toWhole(draft.accounts.usageDebugMaxFiles),
     },
   }
   return next
 }
 
 function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
-  const {
-    proxyUrl: _proxyUrl,
-    proxyUsername: _proxyUsername,
-    proxyPassword: _proxyPassword,
-    kiroVersionLatest: _kiroVersionLatest,
-    kiroVersionLifecycle: _kiroVersionLifecycle,
-    ...editable
-  } = config
-  return editable as RuntimeConfig
+  return config
 }
 
 function runtimeConfigDraftFingerprint(config: RuntimeConfig): string {
@@ -535,11 +500,6 @@ export function RuntimePage() {
           ...emptyRuntimeConfig.tokenRefreshAdmissionRuntime,
           ...config.data.tokenRefreshAdmissionRuntime,
         },
-        kiroVersionLifecycle: {
-          ...emptyRuntimeConfig.kiroVersionLifecycle,
-          ...config.data.kiroVersionLifecycle,
-        },
-        kiroEndpointFallbackOrder: (config.data.kiroEndpointFallbackOrder ?? []).filter((name) => SUPPORTED_OAUTH_ENDPOINT_FALLBACKS.has(name)),
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
         bodyConversion,
         promptInjection: normalizePromptInjection(config.data.promptInjection),
@@ -548,13 +508,13 @@ export function RuntimePage() {
         localRequestCompat: normalizeLocalRequestCompat(config.data.localRequestCompat),
         requestCapture: normalizeRequestCapture(config.data.requestCapture),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
-        externalPools: {
-          ...defaultExternalPoolsConfig(),
-          ...config.data.externalPools,
-          externalPoolRouteMode: normalizeExternalPoolRouteMode(config.data.externalPools?.externalPoolRouteMode),
-          externalPoolRouteRules: normalizeRuleList(config.data.externalPools?.externalPoolRouteRules),
-          localPoolRouteMode: normalizeExternalPoolRouteMode(config.data.externalPools?.localPoolRouteMode),
-          localPoolRouteRules: normalizeRuleList(config.data.externalPools?.localPoolRouteRules),
+        accounts: {
+          ...defaultAccountsConfig(),
+          ...config.data.accounts,
+          accountRouteMode: normalizeRouteRuleMode(config.data.accounts?.accountRouteMode),
+          accountRouteRules: normalizeRuleList(config.data.accounts?.accountRouteRules),
+          localPoolRouteMode: normalizeRouteRuleMode(config.data.accounts?.localPoolRouteMode),
+          localPoolRouteRules: normalizeRuleList(config.data.accounts?.localPoolRouteRules),
         },
         payloadShaping: normalizePayloadShaping(config.data.payloadShaping),
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
@@ -571,8 +531,6 @@ export function RuntimePage() {
   const set = <K extends keyof RuntimeConfig>(k: K) => (v: RuntimeConfig[K]) =>
     setDraft((prev) => ({ ...prev, [k]: v }))
 
-  const setVersionLifecycle = (kiroVersionLifecycle: RuntimeConfig['kiroVersionLifecycle']) =>
-    setDraft((prev) => ({ ...prev, kiroVersionLifecycle }))
 
   const setRequestAdmission = <K extends keyof RuntimeConfig['requestAdmission']>(k: K) => (v: RuntimeConfig['requestAdmission'][K]) =>
     setDraft((prev) => ({
@@ -590,12 +548,12 @@ export function RuntimePage() {
       },
     }))
 
-  const setExternalPools = <K extends keyof RuntimeConfig['externalPools']>(k: K) => (v: RuntimeConfig['externalPools'][K]) =>
+  const setAccounts = <K extends keyof RuntimeConfig['accounts']>(k: K) => (v: RuntimeConfig['accounts'][K]) =>
     setDraft((prev) => ({
       ...prev,
-      externalPools: {
-        ...defaultExternalPoolsConfig(),
-        ...prev.externalPools,
+      accounts: {
+        ...defaultAccountsConfig(),
+        ...prev.accounts,
         [k]: v,
       },
     }))
@@ -785,8 +743,8 @@ export function RuntimePage() {
                 <NumField label="每实例 · 每 Key 等待" desc="每个实例内同一 Key 等待并发名额的最长时间；0 表示不排队并立即返回 429。" value={draft.requestAdmission.queueTimeoutMs} min={0} max={300_000} suffix="毫秒" onChange={setRequestAdmission('queueTimeoutMs')} />
                 <NumField label="单账号每分钟请求上限" desc="每个账号一分钟最多接多少个请求；0 表示不做本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={set('credentialRpm')} />
                 <NumField label="单账号最大并发" desc="每个账号同一时间最多处理多少个请求；0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={set('credentialMaxConcurrentRequests')} />
-                <NumField label="积分查询上游并发" desc="管理端强制查询积分时，同时向 Kiro 请求账号额度的数量；与推理并发独立。建议保持 1 到 3，避免批量查询触发上游限流。" value={draft.credentialInfoRefreshConcurrency} min={1} max={16} suffix="并发" onChange={set('credentialInfoRefreshConcurrency')} />
-                <NumField label="Kiro 积分单价" desc="每个积分的真实成本，按套餐价折算填写。只用于总览把本地积分换算成成本、计算全局毛利，不影响调度和计费。0 表示未配置。" value={draft.kiroCreditUnitPriceUsd ?? 0} min={0} max={100} step={0.0001} suffix="美元/积分" onChange={set('kiroCreditUnitPriceUsd')} />
+                <NumField label="积分查询上游并发" desc="管理端强制查询积分时，同时向 上游 请求账号额度的数量；与推理并发独立。建议保持 1 到 3，避免批量查询触发上游限流。" value={draft.credentialInfoRefreshConcurrency} min={1} max={16} suffix="并发" onChange={set('credentialInfoRefreshConcurrency')} />
+
                 <NumField label="全局最大并发" desc="整个服务同一时间最多处理多少个请求；0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={set('dispatchGlobalMaxConcurrentRequests')} />
                 <NumField label="最大排队请求数" desc="账号忙不过来时最多让多少个请求排队；0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={set('dispatchMaxQueuedRequests')} />
                 <TogField
@@ -877,17 +835,17 @@ export function RuntimePage() {
                 </div>
                 <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。建议 30 到 60 秒，过载时快速返回，避免请求一直挂起。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
                 <NumField label="单会话单账号最大并发" desc="同一会话在绑定账号上最多同时跑几个请求，超出的临时借用其他账号，不改绑；没有其他空闲账号时仍用绑定账号。0 表示等于账号自身的并发上限。" value={draft.credentialSessionMaxConcurrentRequests} min={0} max={1000} suffix="个" onChange={set('credentialSessionMaxConcurrentRequests')} />
-                <TogField label="对话改走 Kiro 新域名" desc="默认关闭。打开后 IDE 端点的对话和联网搜索改发到 runtime.{区域}.kiro.dev，请求头不变；模型列表、额度查询、令牌刷新不受影响。注意：实测 FREE 账号打开后对话全部被新域名限流（429），打开前请先用自己的账号小范围验证。" checked={draft.kiroRuntimeDomainEnabled} onChange={set('kiroRuntimeDomainEnabled')} />
-                <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
-                <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
-                <NumField label="单次响应总时长上限" desc="一次上游响应最多持续多久；上游持续慢慢输出、一直不结束时，到点结束本次响应并释放账号并发。0 表示不限制；默认 3600 秒。" value={draft.kiroUpstreamStreamMaxDurationSecs} min={0} max={86400} suffix="秒" onChange={set('kiroUpstreamStreamMaxDurationSecs')} />
+
+
+
+
                 <NumField label="流式保活间隔" desc="上游暂时没有新内容时，每隔多久向客户端发一次保活心跳，防止客户端或中间代理因空闲断开；默认 5 秒。" value={draft.streamKeepaliveIntervalSecs} min={1} max={300} suffix="秒" onChange={set('streamKeepaliveIntervalSecs')} />
                 <NumField label="首输出前静默保留" desc="上游还没有输出时，最多多少秒内不向客户端写入，以便失败时无感换号；超过后开始下发并保活，不再换号。0 表示一直保留到首个输出；默认 15 秒。" value={draft.streamPreOutputHoldSecs} min={0} max={60} suffix="秒" onChange={set('streamPreOutputHoldSecs')} />
                 <NumField label="首输出等待上限" desc="上游返回响应头后最多等待多少秒出现首个内容；超时断开上游并释放账号，未写入时换号重试，已写入时返回过载错误让客户端重试。0 表示关闭（默认）。开启时应大于慢模型的首输出耗时，建议不低于 300 秒。" value={draft.streamFirstOutputTimeoutSecs} min={0} max={3600} suffix="秒" onChange={set('streamFirstOutputTimeoutSecs')} />
-                <TogField label="首输出前流式换号" desc="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试。" checked={draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryEnabled')} />
-                <NumField label="首输出前普通错误最多尝试" desc="包含第一次调用；默认 6。流式和非流式共用，覆盖首输出前的流读取错误、静默或首输出超时、2xx 错误事件和 EventStream 不完整。实际次数还受下方推理发送硬上限约束。" value={draft.kiroUpstreamStreamRetryMaxAttempts} min={1} max={100} suffix="次" disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryMaxAttempts')} />
-                <NumField label="usage-only 最多尝试" desc="只有 usage/metadata、没有 assistant、reasoning 或 tool 输出时的独立上限，包含第一次调用；默认 2。设置为 1 可关闭空回换号，实际次数仍受推理发送硬上限约束。" value={draft.kiroUpstreamUsageOnlyRetryMaxAttempts} min={1} max={100} suffix="次" disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamUsageOnlyRetryMaxAttempts')} />
-                <NumField label="单请求推理发送硬上限" desc="本地换号、首输出前重试、请求体重试、外部池故障转移和本地救援共享；默认 4，与账号数量无关。" value={draft.inferenceUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('inferenceUpstreamMaxAttempts')} />
+
+
+
+                <NumField label="单请求推理发送硬上限" desc="本地换号、首输出前重试、请求体重试、账号故障转移和本地救援共享；默认 4，与账号数量无关。" value={draft.inferenceUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('inferenceUpstreamMaxAttempts')} />
                 <NumField label="单请求辅助发送硬上限" desc="Token 刷新与企业 Profile 探测共享；默认 2，与账号数量无关，不计入推理发送次数。" value={draft.auxiliaryUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('auxiliaryUpstreamMaxAttempts')} />
                 <NumField label="单实例辅助并发上限" desc="限制同时进行的 Token 刷新、Profile 探测和模型目录请求；饱和时立即拒绝，不进入无界等待队列。" value={draft.auxiliaryUpstreamMaxConcurrentRequests} min={1} max={256} suffix="路" onChange={set('auxiliaryUpstreamMaxConcurrentRequests')} />
                 <NumField label="Token 刷新 RPM 上限" desc="Redis 可用时为跨实例共享上限；未配置 Redis 时为单进程上限。" value={draft.tokenRefreshMaxRpm} min={1} max={6000} suffix="RPM" onChange={set('tokenRefreshMaxRpm')} />
@@ -899,14 +857,14 @@ export function RuntimePage() {
                   当前辅助通道：进行中 {draft.auxiliaryUpstreamRuntime.inFlight}，历史峰值 {draft.auxiliaryUpstreamRuntime.peakInFlight}，饱和拒绝 {draft.auxiliaryUpstreamRuntime.rejected}。Refresh client 缓存 {draft.auxiliaryUpstreamRuntime.refreshClientCacheEntries}/{draft.auxiliaryUpstreamRuntime.refreshClientCacheMaxEntries}，构建 {draft.auxiliaryUpstreamRuntime.refreshClientBuilds}，命中 {draft.auxiliaryUpstreamRuntime.refreshClientHits}，未命中 {draft.auxiliaryUpstreamRuntime.refreshClientMisses}，容量拒绝 {draft.auxiliaryUpstreamRuntime.refreshClientCacheSaturated}。
                   <br />Token refresh authority {draft.tokenRefreshAdmissionRuntime.authority}，准入 {draft.tokenRefreshAdmissionRuntime.admitted}，RPM 拒绝 {draft.tokenRefreshAdmissionRuntime.rateLimited}，协调拒绝 {draft.tokenRefreshAdmissionRuntime.coordinationRejected}，Redis 错误 {draft.tokenRefreshAdmissionRuntime.redisErrors}，剩余 {draft.tokenRefreshAdmissionRuntime.remainingMilliTokens / 1000} tokens。
                 </div>
-                <TogField label="静默超时可换号" desc="上游流在首输出前长时间无内容时允许换号。" checked={draft.kiroUpstreamStreamRetryOnIdleTimeout} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnIdleTimeout')} />
-                <TogField label="读取错误可换号" desc="首输出前连接中断、流读取失败时允许换号。" checked={draft.kiroUpstreamStreamRetryOnReadError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnReadError')} />
-                <TogField label="状态错误可换号" desc="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。" checked={draft.kiroUpstreamStreamRetryOnStatusError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnStatusError')} />
+
+
+
                 <NumField label="本地 provider 尝试上限" desc="单次本地调用最多尝试多少个凭据；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
                 <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />
-                <TogField label="跨 Region 轮换（既有策略）" desc="同一协议端点按账号 Region 顺序在 us-east-1 / eu-central-1 间尝试；此开关与下方协议端点 fallback 分开生效。" checked={draft.kiroUpstreamRegionRotationEnabled} onChange={set('kiroUpstreamRegionRotationEnabled')} />
-                <TogField label="允许 Profile ARN 跨 Region" desc="默认关闭。仅当上方跨 Region 轮换也开启时才生效；打开后允许使用与 Profile ARN 所在 Region 不同的候选，可能导致上游拒绝。" checked={draft.kiroRegionProfileArnMismatchAllowed} disabled={!draft.kiroUpstreamRegionRotationEnabled} onChange={set('kiroRegionProfileArnMismatchAllowed')} />
+
+
                 <TogField label="狂暴模式（429 暴力轮换）" desc="仅作用于本地账号。开启后遇到普通 429 会优先换号重试，把所有账号轮一遍后再换端点，直到成功或轮次耗尽。会显著放大上游请求量，默认关闭。风控型 429 与带 Retry-After 的 429 不受影响。" checked={draft.localBerserkModeEnabled} onChange={set('localBerserkModeEnabled')} />
                 <NumField label="狂暴模式最多轮换几轮" desc="仅在狂暴模式开启时生效。一轮 = 所有账号 × 所有端点各试一遍。" value={draft.localBerserkMaxRounds} min={1} max={10} suffix="轮" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkMaxRounds')} />
                 <NumField label="狂暴模式轮次间隔" desc="仅在狂暴模式开启时生效。同一轮内换号不等待；只有进入下一轮时才退避这么久。0 表示完全不等待。" value={draft.localBerserkRoundDelayMs} min={0} max={60000} suffix="毫秒" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkRoundDelayMs')} />
@@ -914,50 +872,50 @@ export function RuntimePage() {
               </TwoCol>
             )}
 
-            {activeSection === 'externalPools' && (
+            {activeSection === 'accounts' && (
               <div className="space-y-4">
                 <TwoCol>
                   <TogField
-                    label="启用外部池"
-                    desc="允许请求在本地凭据不可调度或策略命中时进入外部池；下方路由规则会继续限制入口。"
-                    checked={draft.externalPools.externalPoolsEnabled}
-                    onChange={setExternalPools('externalPoolsEnabled')}
+                    label="启用账号"
+                    desc="允许请求在本地凭据不可调度或策略命中时进入账号；下方路由规则会继续限制入口。"
+                    checked={draft.accounts.enabled}
+                    onChange={setAccounts('enabled')}
                   />
                   <TogField
                     label="外部直连策略"
-                    desc="开启后命中直连模型或路径规则的请求直接走外部池；关闭时外部池只作为本地不可用后的兜底。"
-                    checked={draft.externalPools.externalDirectPolicyEnabled}
-                    onChange={setExternalPools('externalDirectPolicyEnabled')}
+                    desc="开启后命中直连模型或路径规则的请求直接走账号；关闭时账号只作为本地不可用后的兜底。"
+                    checked={draft.accounts.externalDirectPolicyEnabled}
+                    onChange={setAccounts('externalDirectPolicyEnabled')}
                   />
                   <TogField
-                    label="本地不可调度时预检外部池"
-                    desc="本地账号容量不足、无可用账号或调度 Redis 退化时，允许请求在解析后优先尝试外部池。"
-                    checked={draft.externalPools.localPoolPreflightEnabled}
-                    onChange={setExternalPools('localPoolPreflightEnabled')}
+                    label="本地不可调度时预检账号"
+                    desc="本地账号容量不足、无可用账号或调度 Redis 退化时，允许请求在解析后优先尝试账号。"
+                    checked={draft.accounts.localPoolPreflightEnabled}
+                    onChange={setAccounts('localPoolPreflightEnabled')}
                   />
                   <TogField
-                    label="外部池失败后本地救援"
-                    desc="外部池作为兜底路径失败后，允许最后再尝试一次本地凭据；外部直连策略命中时不会启用该救援。"
-                    checked={draft.externalPools.externalPoolLocalRescueEnabled}
-                    onChange={setExternalPools('externalPoolLocalRescueEnabled')}
+                    label="账号失败后本地救援"
+                    desc="账号作为兜底路径失败后，允许最后再尝试一次本地凭据；外部直连策略命中时不会启用该救援。"
+                    checked={draft.accounts.accountLocalRescueEnabled}
+                    onChange={setAccounts('accountLocalRescueEnabled')}
                   />
                 </TwoCol>
 
                 <div className="rounded-lg border border-warning/30 bg-warning/5 p-4">
                   <div className="grid gap-4 md:grid-cols-2">
                     <TogField
-                      label="外部池 usage 原始数据诊断"
-                      desc="临时记录外部池上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；默认关闭。"
-                      checked={draft.externalPools.externalPoolUsageDebugEnabled}
-                      onChange={setExternalPools('externalPoolUsageDebugEnabled')}
+                      label="账号 usage 原始数据诊断"
+                      desc="临时记录账号上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；默认关闭。"
+                      checked={draft.accounts.usageDebugEnabled}
+                      onChange={setAccounts('usageDebugEnabled')}
                     />
                     <label className="space-y-1.5 text-sm">
                       <span className="text-muted-foreground">诊断目录</span>
                       <Input
                         className="font-mono text-xs"
-                        value={draft.externalPools.externalPoolUsageDebugDir}
-                        placeholder="/tmp/kiro-rs/external-pool-usage-debug"
-                        onChange={(event) => setExternalPools('externalPoolUsageDebugDir')(event.target.value)}
+                        value={draft.accounts.usageDebugDir}
+                        placeholder="/tmp/claude-pool/account-usage-debug"
+                        onChange={(event) => setAccounts('usageDebugDir')(event.target.value)}
                       />
                       <span className="block text-xs leading-4 text-muted-foreground">
                         写入容器内路径；记录失败只写服务日志，不影响请求。
@@ -966,22 +924,22 @@ export function RuntimePage() {
                     <NumField
                       label="单条原始片段上限"
                       desc="限制原始请求/响应 body 与 SSE 前缀保存大小。"
-                      value={draft.externalPools.externalPoolUsageDebugMaxBodyBytes}
+                      value={draft.accounts.usageDebugMaxBodyBytes}
                       min={0}
                       max={1024 * 1024}
                       suffix="Bytes"
-                      disabled={!draft.externalPools.externalPoolUsageDebugEnabled}
-                      onChange={setExternalPools('externalPoolUsageDebugMaxBodyBytes')}
+                      disabled={!draft.accounts.usageDebugEnabled}
+                      onChange={setAccounts('usageDebugMaxBodyBytes')}
                     />
                     <NumField
                       label="最多诊断文件"
                       desc="进程启动后最多写入的诊断 JSON 文件数；超出后跳过写入。"
-                      value={draft.externalPools.externalPoolUsageDebugMaxFiles}
+                      value={draft.accounts.usageDebugMaxFiles}
                       min={0}
                       max={100_000}
                       suffix="个"
-                      disabled={!draft.externalPools.externalPoolUsageDebugEnabled}
-                      onChange={setExternalPools('externalPoolUsageDebugMaxFiles')}
+                      disabled={!draft.accounts.usageDebugEnabled}
+                      onChange={setAccounts('usageDebugMaxFiles')}
                     />
                   </div>
                 </div>
@@ -990,141 +948,141 @@ export function RuntimePage() {
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="text-sm font-semibold">路由限制</div>
                     <div className="flex flex-wrap gap-2">
-                      <Button asChild variant="outline" size="sm"><Link to="/external-pools">在外部池页修改</Link></Button>
+                      <Button asChild variant="outline" size="sm"><Link to="/accounts">在账号页修改</Link></Button>
                       <Button asChild variant="outline" size="sm"><Link to="/route-scenarios">路由场景</Link></Button>
                     </div>
                   </div>
                   <div className="grid gap-2 text-sm md:grid-cols-2">
-                    <div><span className="text-muted-foreground">本地账号：</span>{routePolicySummary(draft.externalPools.localPoolRouteMode, draft.externalPools.localPoolRouteRules)}</div>
-                    <div><span className="text-muted-foreground">外部账号：</span>{routePolicySummary(draft.externalPools.externalPoolRouteMode, draft.externalPools.externalPoolRouteRules)}</div>
+                    <div><span className="text-muted-foreground">本地账号：</span>{routePolicySummary(draft.accounts.localPoolRouteMode, draft.accounts.localPoolRouteRules)}</div>
+                    <div><span className="text-muted-foreground">外部账号：</span>{routePolicySummary(draft.accounts.accountRouteMode, draft.accounts.accountRouteRules)}</div>
                   </div>
                   <p className="text-xs leading-5 text-muted-foreground">
-                    本地和外部的整体路由限制统一在外部池页的“路由策略”里修改；要整套切换本地、外部和各账号的路由规则，用路由场景。
+                    本地和外部的整体路由限制统一在账号页的“路由策略”里修改；要整套切换本地、外部和各账号的路由规则，用路由场景。
                   </p>
                 </div>
 
                 <TwoCol>
                   <NumField
-                    label="外部池全局最大并发"
-                    desc="所有外部池合计同时处理的请求上限；0 表示不限制。"
-                    value={draft.externalPools.externalPoolGlobalMaxConcurrentRequests}
+                    label="账号全局最大并发"
+                    desc="所有账号合计同时处理的请求上限；0 表示不限制。"
+                    value={draft.accounts.globalMaxConcurrentRequests}
                     min={0}
                     max={100_000}
                     suffix="并发"
-                    onChange={setExternalPools('externalPoolGlobalMaxConcurrentRequests')}
+                    onChange={setAccounts('globalMaxConcurrentRequests')}
                   />
                   <NumField
-                    label="外部池最大排队请求数"
-                    desc="外部池并发占满时最多允许排队的请求数；0 表示不排队。"
-                    value={draft.externalPools.externalPoolMaxQueuedRequests}
+                    label="账号最大排队请求数"
+                    desc="账号并发占满时最多允许排队的请求数；0 表示不排队。"
+                    value={draft.accounts.maxQueuedRequests}
                     min={0}
                     max={100_000}
                     suffix="请求"
-                    onChange={setExternalPools('externalPoolMaxQueuedRequests')}
+                    onChange={setAccounts('maxQueuedRequests')}
                   />
                   <NumField
-                    label="外部池最长排队等待"
-                    desc="外部池等待并发名额的最长时间；0 会按后端安全默认值处理。"
-                    value={draft.externalPools.externalPoolDispatchMaxWaitSecs}
+                    label="账号最长排队等待"
+                    desc="账号等待并发名额的最长时间；0 会按后端安全默认值处理。"
+                    value={draft.accounts.dispatchMaxWaitSecs}
                     min={0}
                     max={86_400}
                     suffix="秒"
-                    onChange={setExternalPools('externalPoolDispatchMaxWaitSecs')}
+                    onChange={setAccounts('dispatchMaxWaitSecs')}
                   />
                   <NumField
-                    label="外部池最多故障转移"
-                    desc="同一请求在多个外部池之间最多尝试多少次；0 表示不重试其它外部池。"
-                    value={draft.externalPools.externalPoolRetryMaxAttempts}
+                    label="账号最多故障转移"
+                    desc="同一请求在多个账号之间最多尝试多少次；0 表示不重试其它账号。"
+                    value={draft.accounts.retryMaxAttempts}
                     min={0}
                     max={10_000}
                     suffix="次"
-                    onChange={setExternalPools('externalPoolRetryMaxAttempts')}
+                    onChange={setAccounts('retryMaxAttempts')}
                   />
                   <TogField
                     label="网络错误跨池重试"
-                    desc="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他外部池。"
-                    checked={draft.externalPools.externalPoolRetryOnNetworkError}
-                    onChange={setExternalPools('externalPoolRetryOnNetworkError')}
+                    desc="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他账号。"
+                    checked={draft.accounts.retryOnNetworkError}
+                    onChange={setAccounts('retryOnNetworkError')}
                   />
                   <TogField
                     label="协议错误跨池重试"
-                    desc="上游返回成功状态码但内容是错误信封或协议污染时，是否允许切换其他外部池。"
-                    checked={draft.externalPools.externalPoolRetryOnProtocolError}
-                    onChange={setExternalPools('externalPoolRetryOnProtocolError')}
+                    desc="上游返回成功状态码但内容是错误信封或协议污染时，是否允许切换其他账号。"
+                    checked={draft.accounts.retryOnProtocolError}
+                    onChange={setAccounts('retryOnProtocolError')}
                   />
                   <label className="space-y-1.5 text-sm md:col-span-2">
                     <span className="text-muted-foreground">跨池重试状态码</span>
                     <Input
                       className="font-mono text-xs"
-                      value={joinStatusCodeList(draft.externalPools.externalPoolRetryStatusCodes)}
-                      onChange={(event) => setExternalPools('externalPoolRetryStatusCodes')(parseStatusCodeList(event.target.value))}
+                      value={joinStatusCodeList(draft.accounts.retryStatusCodes)}
+                      onChange={(event) => setAccounts('retryStatusCodes')(parseStatusCodeList(event.target.value))}
                     />
                     <span className="block text-xs leading-4 text-muted-foreground">
-                      控制普通 HTTP 错误是否继续尝试其他外部池；认证、配额、渠道禁用等已分类错误仍按错误分类切换。
+                      控制普通 HTTP 错误是否继续尝试其他账号；认证、配额、渠道禁用等已分类错误仍按错误分类切换。
                     </span>
                   </label>
                   <NumField
                     label="同池重试次数"
-                    desc="命中下面状态码时，先在同一个外部池上重试；重试耗尽后才冷却并尝试其他外部池。"
-                    value={draft.externalPools.externalPoolSamePoolRetryCount}
+                    desc="命中下面状态码时，先在同一个账号上重试；重试耗尽后才冷却并尝试其他账号。"
+                    value={draft.accounts.samePoolRetryCount}
                     min={0}
                     max={10}
                     suffix="次"
-                    onChange={setExternalPools('externalPoolSamePoolRetryCount')}
+                    onChange={setAccounts('samePoolRetryCount')}
                   />
                   <NumField
                     label="同池重试间隔"
-                    desc="同一个外部池重试之间的等待时间。"
-                    value={draft.externalPools.externalPoolSamePoolRetryDelayMs}
+                    desc="同一个账号重试之间的等待时间。"
+                    value={draft.accounts.samePoolRetryDelayMs}
                     min={0}
                     max={60_000}
                     suffix="毫秒"
-                    onChange={setExternalPools('externalPoolSamePoolRetryDelayMs')}
+                    onChange={setAccounts('samePoolRetryDelayMs')}
                   />
                   <NumField
                     label="失败池临时降权"
-                    desc="外部池出现可重试瞬态失败后，在失败窗口内临时增加有效优先级；默认 20 可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。"
-                    value={draft.externalPools.externalPoolTransientFailurePriorityPenalty}
+                    desc="账号出现可重试瞬态失败后，在失败窗口内临时增加有效优先级；默认 20 可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。"
+                    value={draft.accounts.transientFailurePriorityPenalty}
                     min={0}
                     max={10_000}
                     suffix="优先级"
-                    onChange={setExternalPools('externalPoolTransientFailurePriorityPenalty')}
+                    onChange={setAccounts('transientFailurePriorityPenalty')}
                   />
                   <NumField
                       label="连续失败计数（兼容）"
                       desc="保留旧配置字段；普通瞬态失败只降低调度优先级，不会触发池级冷却。池级冷却仅用于模型不可用、端点错误或自动禁用等极端状态。"
-                    value={draft.externalPools.externalPoolTransientFailureCooldownThreshold}
+                    value={draft.accounts.accountTransientFailureCooldownThreshold}
                     min={0}
                     max={1000}
                     suffix="次"
-                    onChange={setExternalPools('externalPoolTransientFailureCooldownThreshold')}
+                    onChange={setAccounts('accountTransientFailureCooldownThreshold')}
                   />
                   <label className="space-y-1.5 text-sm md:col-span-2">
                     <span className="text-muted-foreground">同池重试状态码</span>
                     <Input
                       className="font-mono text-xs"
-                      value={joinStatusCodeList(draft.externalPools.externalPoolSamePoolRetryStatusCodes)}
-                      onChange={(event) => setExternalPools('externalPoolSamePoolRetryStatusCodes')(parseStatusCodeList(event.target.value))}
+                      value={joinStatusCodeList(draft.accounts.samePoolRetryStatusCodes)}
+                      onChange={(event) => setAccounts('samePoolRetryStatusCodes')(parseStatusCodeList(event.target.value))}
                     />
                     <span className="block text-xs leading-4 text-muted-foreground">支持用逗号、空格或换行分隔；默认值用于 401、403、429、500、502、503、504。</span>
                   </label>
                   <NumField
-                    label="外部池失败后本地等待"
+                    label="账号失败后本地等待"
                     desc="触发本地救援时，最多等待本地账号空闲多久。"
-                    value={draft.externalPools.externalPoolLocalRescueMaxWaitSecs}
+                    value={draft.accounts.accountLocalRescueMaxWaitSecs}
                     min={0}
                     max={300}
                     suffix="秒"
-                    disabled={!draft.externalPools.externalPoolLocalRescueEnabled}
-                    onChange={setExternalPools('externalPoolLocalRescueMaxWaitSecs')}
+                    disabled={!draft.accounts.accountLocalRescueEnabled}
+                    onChange={setAccounts('accountLocalRescueMaxWaitSecs')}
                   />
                   <NumField
-                    label="外部池估算输入上限（兼容）"
+                    label="账号估算输入上限（兼容）"
                     desc="保留历史配置；当前不再用它做本地发送前拒绝，真实上下文超限以上游响应和请求大小保护为准。"
-                    value={draft.externalPools.externalPoolMaxInputTokens}
+                    value={draft.accounts.accountMaxInputTokens}
                     min={0}
                     suffix="tokens"
-                    onChange={setExternalPools('externalPoolMaxInputTokens')}
+                    onChange={setAccounts('accountMaxInputTokens')}
                   />
                 </TwoCol>
 
@@ -1140,49 +1098,49 @@ export function RuntimePage() {
                     <TogField
                       label="启用质量感知调度"
                       desc="关闭后完全退回“优先级 → 负载”的旧排序；质量状态仍随运行态快照读取，但不参与选择、不展示，也不会写入新的质量样本，可作为线上快速回退手段。"
-                      checked={draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityAwareSchedulingEnabled')}
+                      checked={draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityAwareSchedulingEnabled')}
                     />
                     <NumField
                       label="候选池大小 K"
                       desc="在评分最优的 K 个账号里加权随机挑选，避免多实例同时扑向同一个账号。1 表示总是选最优。"
-                      value={draft.externalPools.externalPoolQualityTopK}
+                      value={draft.accounts.qualityTopK}
                       min={1}
                       max={100}
                       suffix="个"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityTopK')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityTopK')}
                     />
                     <NumField
                       label="质量平滑系数"
                       desc="EWMA 系数，有效窗口约为最近 1/系数 个请求。越大越灵敏，越小越稳定。"
-                      value={draft.externalPools.externalPoolQualityEwmaAlpha}
+                      value={draft.accounts.qualityEwmaAlpha}
                       min={0.01}
                       max={1}
                       step={0.01}
                       suffix="系数"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityEwmaAlpha')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityEwmaAlpha')}
                     />
                     <NumField
                       label="最少样本数"
                       desc="累计样本不足时按中性处理，不加分也不减分；避免新账号因冷启动数据难看而永远起不来。"
-                      value={draft.externalPools.externalPoolQualityMinSamples}
+                      value={draft.accounts.qualityMinSamples}
                       min={1}
                       max={10_000}
                       suffix="次"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityMinSamples')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityMinSamples')}
                     />
                     <NumField
                       label="质量数据有效期"
                       desc="超过该时长没有新请求，质量数据过期并回到中性值。"
-                      value={draft.externalPools.externalPoolQualitySampleTtlSecs}
+                      value={draft.accounts.qualitySampleTtlSecs}
                       min={1}
                       max={86_400}
                       suffix="秒"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualitySampleTtlSecs')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualitySampleTtlSecs')}
                     />
                   </TwoCol>
                 </div>
@@ -1199,57 +1157,57 @@ export function RuntimePage() {
                     <NumField
                       label="失败率权重"
                       desc="量级刻意远高于延迟权重：报错比“慢”严重得多，必须能压过首字延迟的倾向。默认 100。"
-                      value={draft.externalPools.externalPoolQualityErrorWeight}
+                      value={draft.accounts.qualityErrorWeight}
                       min={0}
                       max={1_000_000}
                       step={1}
                       suffix="权重"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityErrorWeight')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityErrorWeight')}
                     />
                     <NumField
                       label="延迟权重"
                       desc="首字延迟与总耗时各自相对中位数归一化后共用该权重；慢一倍贡献 1 个权重单位。"
-                      value={draft.externalPools.externalPoolQualityLatencyWeight}
+                      value={draft.accounts.qualityLatencyWeight}
                       min={0}
                       max={1_000_000}
                       step={1}
                       suffix="权重"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityLatencyWeight')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityLatencyWeight')}
                     />
                     <NumField
                       label="负载权重"
                       desc="账号当前并发占用率的权重，用于在质量相近时摊平负载。"
-                      value={draft.externalPools.externalPoolQualityLoadWeight}
+                      value={draft.accounts.qualityLoadWeight}
                       min={0}
                       max={1_000_000}
                       step={1}
                       suffix="权重"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityLoadWeight')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityLoadWeight')}
                     />
                     <NumField
                       label="临时降级权重"
                       desc="被临时降级的账号额外增加的分数，使其排到末尾但不移出候选集。"
-                      value={draft.externalPools.externalPoolQualityProbationWeight}
+                      value={draft.accounts.qualityProbationWeight}
                       min={0}
                       max={1_000_000}
                       step={1}
                       suffix="权重"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityProbationWeight')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityProbationWeight')}
                     />
                     <NumField
                       label="优先级权重"
                       desc="仅用于管理端展示分数构成；优先级是硬分层，同层内该项为常数，不影响实际比较。"
-                      value={draft.externalPools.externalPoolQualityPriorityWeight}
+                      value={draft.accounts.qualityPriorityWeight}
                       min={0}
                       max={1_000_000}
                       step={1}
                       suffix="权重"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolQualityPriorityWeight')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('qualityPriorityWeight')}
                     />
                   </TwoCol>
                 </div>
@@ -1266,63 +1224,63 @@ export function RuntimePage() {
                     <NumField
                       label="降级失败率阈值"
                       desc="失败率达到该比例即临时降级。设为 1 表示只在全部失败时才降级。"
-                      value={draft.externalPools.externalPoolDegradeErrorRateThreshold}
+                      value={draft.accounts.degradeErrorRateThreshold}
                       min={0}
                       max={1}
                       step={0.05}
                       suffix="比例"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolDegradeErrorRateThreshold')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('degradeErrorRateThreshold')}
                     />
                     <NumField
                       label="劣化判定窗口"
                       desc="失败率的观察窗口长度。"
-                      value={draft.externalPools.externalPoolDegradeWindowSecs}
+                      value={draft.accounts.degradeWindowSecs}
                       min={1}
                       max={86_400}
                       suffix="秒"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolDegradeWindowSecs')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('degradeWindowSecs')}
                     />
                     <NumField
                       label="单次降级时长"
                       desc="首次触发降级持续多久；连续再次触发会按 2 倍逐次延长。"
-                      value={draft.externalPools.externalPoolDegradeProbationSecs}
+                      value={draft.accounts.degradeProbationSecs}
                       min={1}
                       max={86_400}
                       suffix="秒"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolDegradeProbationSecs')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('degradeProbationSecs')}
                     />
                     <NumField
                       label="最长降级时长"
                       desc="连续降级指数退避的上限，不得低于单次降级时长。"
-                      value={draft.externalPools.externalPoolMaxProbationSecs}
-                      min={draft.externalPools.externalPoolDegradeProbationSecs}
+                      value={draft.accounts.maxProbationSecs}
+                      min={draft.accounts.degradeProbationSecs}
                       max={86_400}
                       suffix="秒"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolMaxProbationSecs')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('maxProbationSecs')}
                     />
                     <NumField
                       label="降级期探测流量"
                       desc="被降级账号仍保留的流量比例。设为 0 会让降级变成硬避让，账号将无法自证恢复，除非它重新进入候选前列。"
-                      value={draft.externalPools.externalPoolProbeSharePercent}
+                      value={draft.accounts.probeSharePercent}
                       min={0}
                       max={100}
                       suffix="%"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolProbeSharePercent')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('probeSharePercent')}
                     />
                     <NumField
                       label="恢复爬坡时长"
                       desc="降级到期后流量线性回升的时长，避免账号刚恢复就被瞬间打满。0 表示立即全量恢复。"
-                      value={draft.externalPools.externalPoolRecoveryRampSecs}
+                      value={draft.accounts.recoveryRampSecs}
                       min={0}
                       max={86_400}
                       suffix="秒"
-                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
-                      onChange={setExternalPools('externalPoolRecoveryRampSecs')}
+                      disabled={!draft.accounts.qualityAwareSchedulingEnabled}
+                      onChange={setAccounts('recoveryRampSecs')}
                     />
                   </TwoCol>
                 </div>
@@ -1443,7 +1401,7 @@ export function RuntimePage() {
                   </div>
                   <TwoCol>
                     <NumField label="请求大小阈值" desc="超过此大小才触发处理（如 1048576 = 1 MB）；0 表示不按大小处理" value={draft.payloadGuardMaxBytes} min={0} suffix="字节" onChange={set('payloadGuardMaxBytes')} />
-                    <NumField label="Kiro 加权阈值" desc="Kiro 本地账号按字符集加权计算：ASCII=1，非 ASCII=8；默认 1300000" value={draft.payloadGuardKiroMaxWeight} min={1} suffix="weight" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardKiroMaxWeight')} />
+
                     <NumField label="安全余量" desc="处理目标比阈值小出的缓冲（如 65536 = 64 KB），避免裁剪后仍超限" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="字节" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardSafetyMarginBytes')} />
                   </TwoCol>
                 </div>
@@ -1475,7 +1433,7 @@ export function RuntimePage() {
                     </div>
                     <TogField
                       label="展开本地文件 source"
-                      desc="把已上传文件引用展开为可发送给 Kiro 的 inline 内容。"
+                      desc="把已上传文件引用展开为可发送给 上游 的 inline 内容。"
                       checked={Boolean(draft.imageProcessing?.safeMaterializeFileSources)}
                       disabled={imageProcessingMode !== 'safe'}
                       onChange={setImageProcessing('safeMaterializeFileSources')}
@@ -1496,7 +1454,7 @@ export function RuntimePage() {
                     />
                     <TogField
                       label="压缩过大的图片"
-                      desc="默认关闭。打开后，长边或体积超限的 PNG/JPEG/WebP 会等比缩小并重新编码为 JPEG 再发给上游，可减少请求体积和输入 token；GIF 不处理，失败时保留原图。只作用于经过本地处理的请求（含本地处理后转外部池兜底的请求）；直接转发给外部池的请求保持原样。"
+                      desc="默认关闭。打开后，长边或体积超限的 PNG/JPEG/WebP 会等比缩小并重新编码为 JPEG 再发给上游，可减少请求体积和输入 token；GIF 不处理，失败时保留原图。只作用于经过本地处理的请求（含本地处理后转账号兜底的请求）；直接转发给账号的请求保持原样。"
                       checked={Boolean(draft.imageProcessing?.resizeEnabled)}
                       onChange={setImageProcessing('resizeEnabled')}
                     />
@@ -1521,12 +1479,12 @@ export function RuntimePage() {
                   <div>
                     <div className="text-sm font-semibold">本地协议转换</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      这些开关会改变本地凭据路径最终发往 Kiro 的请求体；外部池 raw body 透传不会进入这些阶段。
+                      这些开关会改变本地凭据路径最终发往 上游 的请求体；账号 raw body 透传不会进入这些阶段。
                     </div>
                   </div>
                   <TwoCol>
                     <TogField label="工具 schema 规范化" desc="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
-                    <TogField label="工具名映射" desc="清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
+                    <TogField label="工具名映射" desc="清洗或缩短不符合 上游 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
                     <div className="rounded-md border bg-background p-4">
                       <div className="mb-3">
                         <div className="text-sm font-medium">schema key 映射</div>
@@ -1552,8 +1510,8 @@ export function RuntimePage() {
                         onChange={(event) => setBodyConversion('toolSchemaKeyValidationRegex')(event.target.value)}
                       />
                     </div>
-                    <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
-                    <TogField label="Thinking 兼容签名" desc="Kiro 没有原生签名时，为 Claude Code 输出确定性的兼容签名；历史回放到 Kiro 前会自动剥离。" checked={draft.bodyConversion.syntheticThinkingSignatures} onChange={setBodyConversion('syntheticThinkingSignatures')} />
+                    <TogField label="原生 reasoning 字段" desc="对支持的 上游 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
+                    <TogField label="Thinking 兼容签名" desc="上游 没有原生签名时，为 Claude Code 输出确定性的兼容签名；历史回放到 上游 前会自动剥离。" checked={draft.bodyConversion.syntheticThinkingSignatures} onChange={setBodyConversion('syntheticThinkingSignatures')} />
                     <TogField label="结构化 tool_choice" desc="按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用（含 disable_parallel_tool_use）。对应的提示词在提示词注入页单独控制。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
                     <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
@@ -1684,9 +1642,7 @@ export function RuntimePage() {
               </div>
             )}
 
-            {activeSection === 'versionEndpoint' && (
-              <VersionEndpointSection draft={draft} setConfig={set} onLifecycle={setVersionLifecycle} />
-            )}
+
 
             {activeSection === 'compat' && (
               <div className="space-y-4">
@@ -1709,24 +1665,7 @@ export function RuntimePage() {
                           : '保留更多排查信息，适合本地调试，不建议用于正式流量。'}
                     </p>
                   </div>
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">Kiro 工作模式</div>
-                    <Select value={draft.kiroAgentModeStrategy} onValueChange={(v) => set('kiroAgentModeStrategy')(v as KiroAgentModeStrategy)}>
-                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="vibe">Vibe</SelectItem>
-                        <SelectItem value="spec">Spec</SelectItem>
-                        <SelectItem value="auto">自动</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      {draft.kiroAgentModeStrategy === 'auto'
-                        ? '根据请求内容自动选择工作方式。'
-                        : draft.kiroAgentModeStrategy === 'spec'
-                          ? '偏向规格化流程，适合明确需求和分步骤实现。'
-                          : '偏向自由对话流程，适合快速探索和直接执行。'}
-                    </p>
-                  </div>
+
                   <div className="space-y-1.5">
                     <div className="text-sm font-semibold">思考触发（默认值）</div>
                     <Select
@@ -1786,12 +1725,12 @@ export function RuntimePage() {
                     onChange={setMissingMaxTokens('defaultValue')}
                   />
                   <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">外部池默认流式 SSE 转发</div>
+                    <div className="text-sm font-semibold">账号默认流式 SSE 转发</div>
                     <Select
-                      value={draft.externalPools.externalPoolStreamResponseMode}
+                      value={draft.accounts.streamResponseMode}
                       onValueChange={(v) =>
-                        setExternalPools('externalPoolStreamResponseMode')(
-                          v as RuntimeConfig['externalPools']['externalPoolStreamResponseMode'],
+                        setAccounts('streamResponseMode')(
+                          v as RuntimeConfig['accounts']['streamResponseMode'],
                         )
                       }
                     >
@@ -1801,7 +1740,7 @@ export function RuntimePage() {
                       </SelectContent>
                     </Select>
                     <p className="text-xs leading-5 text-muted-foreground">
-                      作为外部池默认值；单个外部账号可以覆盖。只决定 stream=true 的 SSE 事件转发方式；usage 是透传上游还是按入口路径整理，由外部账号的“下游 usage 口径”决定。
+                      作为账号默认值；单个外部账号可以覆盖。只决定 stream=true 的 SSE 事件转发方式；usage 是透传上游还是按入口路径整理，由外部账号的“下游 usage 口径”决定。
                     </p>
                   </div>
                 </div>
@@ -1819,7 +1758,7 @@ export function RuntimePage() {
                   <TwoCol>
                     <TogField
                       label="抓取空回请求"
-                      desc="首输出前重试用完仍只返回用量统计的本地请求：保存客户端请求体和发给 Kiro 的请求体。"
+                      desc="首输出前重试用完仍只返回用量统计的本地请求：保存客户端请求体和发给 上游 的请求体。"
                       checked={draft.requestCapture.usageOnly}
                       disabled={!draft.requestCapture.enabled}
                       onChange={setRequestCapture('usageOnly')}

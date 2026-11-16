@@ -7,7 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Tool};
-use crate::model::config::{KiroRsToolCachePolicy, StableSegmentCachePolicy};
+use crate::model::config::{PrefixToolCachePolicy, StableSegmentCachePolicy};
 use crate::token;
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -81,13 +81,13 @@ impl PromptCacheProfile {
 }
 
 #[derive(Debug, Clone)]
-pub struct KiroRsToolPromptCachePlan {
+pub struct PrefixToolPromptCachePlan {
     profile: Option<PromptCacheProfile>,
     usage: PromptCacheUsage,
     committed_cache_tokens: i32,
 }
 
-impl KiroRsToolPromptCachePlan {
+impl PrefixToolPromptCachePlan {
     pub fn usage(&self) -> PromptCacheUsage {
         self.usage
     }
@@ -318,21 +318,21 @@ impl PromptCacheTracker {
         self.build_profile_with_policy(req, total_input_tokens, true, cache_model)
     }
 
-    pub fn compute_kiro_rs_tool_with_bounds(
+    pub fn compute_prefix_tool_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
         req: &MessagesRequest,
         total_input_tokens: i32,
         cache_model: &str,
         bounds: PromptCacheBounds,
-        policy: KiroRsToolCachePolicy,
-    ) -> KiroRsToolPromptCachePlan {
+        policy: PrefixToolCachePolicy,
+    ) -> PrefixToolPromptCachePlan {
         let policy = policy.normalized();
         let profile =
-            self.build_kiro_rs_tool_profile_for_model(req, total_input_tokens, cache_model, policy);
+            self.build_prefix_tool_profile_for_model(req, total_input_tokens, cache_model, policy);
         let usage =
-            self.compute_kiro_rs_tool_profile_with_bounds(scope, profile.as_ref(), bounds, policy);
-        KiroRsToolPromptCachePlan {
+            self.compute_prefix_tool_profile_with_bounds(scope, profile.as_ref(), bounds, policy);
+        PrefixToolPromptCachePlan {
             profile,
             usage,
             committed_cache_tokens: usage
@@ -342,13 +342,13 @@ impl PromptCacheTracker {
         }
     }
 
-    pub fn commit_kiro_rs_tool_success_with_bounds(
+    pub fn commit_prefix_tool_success_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
-        plan: &KiroRsToolPromptCachePlan,
+        plan: &PrefixToolPromptCachePlan,
         bounds: PromptCacheBounds,
     ) {
-        self.update_kiro_rs_tool_profile_with_bounds(
+        self.update_prefix_tool_profile_with_bounds(
             scope,
             plan.profile.as_ref(),
             bounds,
@@ -433,15 +433,15 @@ impl PromptCacheTracker {
         );
     }
 
-    fn build_kiro_rs_tool_profile_for_model(
+    fn build_prefix_tool_profile_for_model(
         &self,
         req: &MessagesRequest,
         total_input_tokens: i32,
         cache_model: &str,
-        policy: KiroRsToolCachePolicy,
+        policy: PrefixToolCachePolicy,
     ) -> Option<PromptCacheProfile> {
         self.build_profile_with_blocks(
-            kiro_rs_tool_cache_blocks(req, policy),
+            prefix_tool_cache_blocks(req, policy),
             total_input_tokens,
             cache_model,
             false,
@@ -701,12 +701,12 @@ impl PromptCacheTracker {
         state.enforce_bounds(&scope, bounds, now);
     }
 
-    fn compute_kiro_rs_tool_profile_with_bounds(
+    fn compute_prefix_tool_profile_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
         bounds: PromptCacheBounds,
-        policy: KiroRsToolCachePolicy,
+        policy: PrefixToolCachePolicy,
     ) -> PromptCacheUsage {
         let policy = policy.normalized();
         let Some(scope) = scope else {
@@ -725,7 +725,7 @@ impl PromptCacheTracker {
         if covered_tokens <= 0 {
             return PromptCacheUsage::default();
         }
-        let covered_tokens = apply_kiro_rs_tool_coverage_policy(covered_tokens, policy);
+        let covered_tokens = apply_prefix_tool_coverage_policy(covered_tokens, policy);
         if covered_tokens <= 0 {
             return PromptCacheUsage::default();
         }
@@ -906,7 +906,7 @@ impl PromptCacheTracker {
         state.enforce_bounds(&scope, bounds, now);
     }
 
-    fn update_kiro_rs_tool_profile_with_bounds(
+    fn update_prefix_tool_profile_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
@@ -1074,9 +1074,9 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheBlock> {
     blocks
 }
 
-fn kiro_rs_tool_cache_blocks(
+fn prefix_tool_cache_blocks(
     req: &MessagesRequest,
-    policy: KiroRsToolCachePolicy,
+    policy: PrefixToolCachePolicy,
 ) -> Vec<CacheBlock> {
     let mut blocks = Vec::new();
     let policy = policy.normalized();
@@ -1110,10 +1110,10 @@ fn kiro_rs_tool_cache_blocks(
             && msg.role == "user"
             && !message_has_explicit_cache_control(msg)
         {
-            append_kiro_rs_tool_current_user_stable_prefix_block(&mut blocks, msg, policy);
+            append_prefix_tool_current_user_stable_prefix_block(&mut blocks, msg, policy);
             continue;
         }
-        append_kiro_rs_tool_message_blocks(&mut blocks, msg, idx != last_message_idx);
+        append_prefix_tool_message_blocks(&mut blocks, msg, idx != last_message_idx);
     }
 
     blocks
@@ -1410,7 +1410,7 @@ fn append_stable_segment_message_blocks(
     }
 }
 
-fn append_kiro_rs_tool_message_blocks(
+fn append_prefix_tool_message_blocks(
     blocks: &mut Vec<CacheBlock>,
     msg: &Message,
     auto_breakpoint_at_message_end: bool,
@@ -1471,10 +1471,10 @@ fn message_has_explicit_cache_control(msg: &Message) -> bool {
     }
 }
 
-fn append_kiro_rs_tool_current_user_stable_prefix_block(
+fn append_prefix_tool_current_user_stable_prefix_block(
     blocks: &mut Vec<CacheBlock>,
     msg: &Message,
-    policy: KiroRsToolCachePolicy,
+    policy: PrefixToolCachePolicy,
 ) {
     let max_tokens = policy.current_user_stable_prefix_max_tokens.max(0);
     append_current_user_stable_prefix_block(blocks, msg, max_tokens, DEFAULT_PROMPT_CACHE_TTL);
@@ -1826,7 +1826,7 @@ fn is_valid_uuid(value: &str) -> bool {
     true
 }
 
-fn apply_kiro_rs_tool_coverage_policy(covered_tokens: i32, policy: KiroRsToolCachePolicy) -> i32 {
+fn apply_prefix_tool_coverage_policy(covered_tokens: i32, policy: PrefixToolCachePolicy) -> i32 {
     let policy = policy.normalized();
     apply_coverage_limits(
         covered_tokens,
@@ -2537,9 +2537,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_first_miss_then_success_commit_hits() {
+    fn prefix_tool_first_miss_then_success_commit_hits() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-session");
+        let scope = test_scope("pool-session");
         let mut first_req = request("stable system prompt ".repeat(300));
         first_req.messages = vec![
             Message {
@@ -2556,30 +2556,30 @@ mod tests {
             },
         ];
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &first_req,
             12_000,
             &first_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
         assert!(first.usage().cache_creation_input_tokens > 0);
         assert_eq!(first.usage().cache_read_input_tokens, 0);
 
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_prefix_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &first_req,
             12_000,
             &first_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
         assert!(second.usage().cache_read_input_tokens > 0);
         assert_eq!(second.usage().cache_creation_input_tokens, 0);
@@ -2694,9 +2694,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_failed_request_does_not_commit_segments() {
+    fn prefix_tool_failed_request_does_not_commit_segments() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-failed-session");
+        let scope = test_scope("pool-failed-session");
         let mut req = request("stable system prompt ".repeat(300));
         req.messages = vec![
             Message {
@@ -2713,33 +2713,33 @@ mod tests {
             },
         ];
 
-        let failed = tracker.compute_kiro_rs_tool_with_bounds(
+        let failed = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &req,
             12_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
         assert!(failed.usage().cache_creation_input_tokens > 0);
         assert_eq!(failed.usage().cache_read_input_tokens, 0);
 
-        let retry = tracker.compute_kiro_rs_tool_with_bounds(
+        let retry = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &req,
             12_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
         assert_eq!(retry.usage().cache_read_input_tokens, 0);
         assert!(retry.usage().cache_creation_input_tokens > 0);
     }
 
     #[test]
-    fn kiro_rs_tool_skips_dynamic_system_before_first_cache_control() {
+    fn prefix_tool_skips_dynamic_system_before_first_cache_control() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-dynamic-system");
+        let scope = test_scope("pool-dynamic-system");
         let make_req = |dynamic: &str| MessagesRequest {
             model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
@@ -2778,37 +2778,37 @@ mod tests {
         };
 
         let first_req = make_req("time=1000");
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &first_req,
             12_000,
             &first_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_prefix_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
         let second_req = make_req("time=2000");
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &second_req,
             12_000,
             &second_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
         assert!(
             second.usage().cache_read_input_tokens > 0,
-            "dynamic system text before the first cache_control must not poison Kiro-RS-Tool cache hits"
+            "dynamic system text before the first cache_control must not poison 前缀追踪 cache hits"
         );
     }
 
     #[test]
-    fn kiro_rs_tool_single_current_message_without_prefix_is_uncached() {
+    fn prefix_tool_single_current_message_without_prefix_is_uncached() {
         let tracker = PromptCacheTracker::default();
         let req = MessagesRequest {
             model: "claude-sonnet-4-5".to_string(),
@@ -2828,13 +2828,13 @@ mod tests {
             stop_sequences: None,
         };
 
-        let plan = tracker.compute_kiro_rs_tool_with_bounds(
-            Some(test_scope("kiro-single-message")),
+        let plan = tracker.compute_prefix_tool_with_bounds(
+            Some(test_scope("pool-single-message")),
             &req,
             1_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
 
         assert_eq!(plan.usage().cache_read_input_tokens, 0);
@@ -2842,11 +2842,11 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_cache_respects_global_entry_bounds() {
+    fn prefix_tool_cache_respects_global_entry_bounds() {
         let tracker = PromptCacheTracker::default();
         let bounds = PromptCacheBounds::from_config(10, 2, 3600, 0);
         for idx in 0..5 {
-            let scope = test_scope(&format!("kiro-bounds-{idx}"));
+            let scope = test_scope(&format!("pool-bounds-{idx}"));
             let mut req = request(format!("stable system prompt {idx} ").repeat(300));
             req.messages = vec![
                 Message {
@@ -2862,24 +2862,24 @@ mod tests {
                     content: json!("current question"),
                 },
             ];
-            let plan = tracker.compute_kiro_rs_tool_with_bounds(
+            let plan = tracker.compute_prefix_tool_with_bounds(
                 Some(scope.clone()),
                 &req,
                 12_000,
                 &req.model,
                 bounds,
-                KiroRsToolCachePolicy::default(),
+                PrefixToolCachePolicy::default(),
             );
-            tracker.commit_kiro_rs_tool_success_with_bounds(Some(scope), &plan, bounds);
+            tracker.commit_prefix_tool_success_with_bounds(Some(scope), &plan, bounds);
         }
 
         assert!(tracker.entry_count() <= 2);
     }
 
     #[test]
-    fn kiro_rs_tool_coverage_ratio_caps_committed_reads() {
+    fn prefix_tool_coverage_ratio_caps_committed_reads() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-coverage-ratio");
+        let scope = test_scope("pool-coverage-ratio");
         let mut req = request("stable system prompt ".repeat(300));
         req.messages = vec![
             Message {
@@ -2895,12 +2895,12 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let policy = KiroRsToolCachePolicy {
+        let policy = PrefixToolCachePolicy {
             coverage_ratio: 0.5,
-            ..KiroRsToolCachePolicy::default()
+            ..PrefixToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &req,
             12_000,
@@ -2911,13 +2911,13 @@ mod tests {
         let first_create = first.usage().cache_creation_input_tokens;
         assert!(first_create > 0);
         assert_eq!(first.usage().cache_read_input_tokens, 0);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_prefix_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &req,
             12_000,
@@ -2930,9 +2930,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_creation_cap_commits_only_created_tokens() {
+    fn prefix_tool_creation_cap_commits_only_created_tokens() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-creation-cap");
+        let scope = test_scope("pool-creation-cap");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
         req.messages = vec![
             Message {
@@ -2948,12 +2948,12 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let policy = KiroRsToolCachePolicy {
+        let policy = PrefixToolCachePolicy {
             max_new_creation_tokens_per_request: 2_048,
-            ..KiroRsToolCachePolicy::default()
+            ..PrefixToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &req,
             20_000,
@@ -2963,13 +2963,13 @@ mod tests {
         );
         assert_eq!(first.usage().cache_creation_input_tokens, 2_048);
         assert_eq!(first.usage().cache_read_input_tokens, 0);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_prefix_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &req,
             20_000,
@@ -2982,9 +2982,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_can_disable_incremental_creation_after_read() {
+    fn prefix_tool_can_disable_incremental_creation_after_read() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-no-incremental-create");
+        let scope = test_scope("pool-no-incremental-create");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
         req.messages = vec![
             Message {
@@ -3000,16 +3000,16 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let first_policy = KiroRsToolCachePolicy {
+        let first_policy = PrefixToolCachePolicy {
             max_new_creation_tokens_per_request: 2_048,
-            ..KiroRsToolCachePolicy::default()
+            ..PrefixToolCachePolicy::default()
         };
-        let second_policy = KiroRsToolCachePolicy {
+        let second_policy = PrefixToolCachePolicy {
             incremental_create_enabled: false,
-            ..KiroRsToolCachePolicy::default()
+            ..PrefixToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &req,
             20_000,
@@ -3017,13 +3017,13 @@ mod tests {
             PromptCacheBounds::default(),
             first_policy,
         );
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_prefix_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &req,
             20_000,
@@ -3036,9 +3036,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_max_coverage_tokens_caps_default_creation() {
+    fn prefix_tool_max_coverage_tokens_caps_default_creation() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-max-coverage");
+        let scope = test_scope("pool-max-coverage");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
         req.messages = vec![
             Message {
@@ -3054,12 +3054,12 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let policy = KiroRsToolCachePolicy {
+        let policy = PrefixToolCachePolicy {
             max_coverage_tokens: 3_000,
-            ..KiroRsToolCachePolicy::default()
+            ..PrefixToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &req,
             20_000,
@@ -3068,13 +3068,13 @@ mod tests {
             policy,
         );
         assert_eq!(first.usage().cache_creation_input_tokens, 3_000);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_prefix_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &req,
             20_000,
@@ -3087,7 +3087,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_current_user_prefix_is_opt_in() {
+    fn prefix_tool_current_user_prefix_is_opt_in() {
         let tracker = PromptCacheTracker::default();
         let req = MessagesRequest {
             model: "claude-sonnet-4-5".to_string(),
@@ -3107,24 +3107,24 @@ mod tests {
             stop_sequences: None,
         };
 
-        let default_plan = tracker.compute_kiro_rs_tool_with_bounds(
-            Some(test_scope("kiro-current-user-default")),
+        let default_plan = tracker.compute_prefix_tool_with_bounds(
+            Some(test_scope("pool-current-user-default")),
             &req,
             10_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            PrefixToolCachePolicy::default(),
         );
         assert_eq!(default_plan.usage().cache_creation_input_tokens, 0);
         assert_eq!(default_plan.usage().cache_read_input_tokens, 0);
 
-        let policy = KiroRsToolCachePolicy {
+        let policy = PrefixToolCachePolicy {
             cache_current_user_stable_prefix: true,
             current_user_stable_prefix_max_tokens: 1_500,
-            ..KiroRsToolCachePolicy::default()
+            ..PrefixToolCachePolicy::default()
         };
-        let scope = test_scope("kiro-current-user-opt-in");
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let scope = test_scope("pool-current-user-opt-in");
+        let first = tracker.compute_prefix_tool_with_bounds(
             Some(scope.clone()),
             &req,
             10_000,
@@ -3134,13 +3134,13 @@ mod tests {
         );
         assert!(first.usage().cache_creation_input_tokens > 0);
         assert!(first.usage().cache_creation_input_tokens <= 1_500);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_prefix_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_prefix_tool_with_bounds(
             Some(scope),
             &req,
             10_000,

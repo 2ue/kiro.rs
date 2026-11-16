@@ -241,12 +241,8 @@ mod tests {
     #[test]
     fn raw_upstream_error_is_utf8_safe_and_bounded() {
         let body = "错".repeat(RAW_UPSTREAM_ERROR_BODY_MAX_BYTES);
-        let error = RawUpstreamError::from_text(
-            "external_pool",
-            Some(400),
-            Some("application/json"),
-            &body,
-        );
+        let error =
+            RawUpstreamError::from_text("account", Some(400), Some("application/json"), &body);
 
         assert!(error.truncated);
         assert!(error.body.len() <= RAW_UPSTREAM_ERROR_BODY_MAX_BYTES + 32);
@@ -266,12 +262,8 @@ mod tests {
             "unrelated": { "body": "should not be copied" }
         })
         .to_string();
-        let error = RawUpstreamError::from_text(
-            "external_pool",
-            Some(400),
-            Some("application/json"),
-            &body,
-        );
+        let error =
+            RawUpstreamError::from_text("account", Some(400), Some("application/json"), &body);
 
         assert!(error.body.contains("$.error.type: invalid_request_error"));
         assert!(error.body.contains("$.error.message: request is invalid"));

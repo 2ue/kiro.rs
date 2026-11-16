@@ -5,7 +5,7 @@ import test from 'node:test'
 
 import { resolveLoadTarget } from './validation-target.mjs'
 
-const RUNNERS = ['kiro-load-runner.mjs', 'kiro-conversation-load-runner.mjs']
+const RUNNERS = ['pool-load-runner.mjs', 'pool-conversation-load-runner.mjs']
 
 test('accepts explicit loopback and explicit remote targets for five rounds', () => {
   for (let round = 0; round < 5; round += 1) {
@@ -58,7 +58,7 @@ test('load runners contain no protected service or default-key fallback', () => 
     const source = fs.readFileSync(path.join(import.meta.dirname, runner), 'utf8')
     assert.match(source, /resolveLoadTarget\(args\)/)
     assert.doesNotMatch(source, /127\.0\.0\.1:9022/)
-    assert.doesNotMatch(source, /sk-kiro-rs-local-debug/)
+    assert.doesNotMatch(source, /sk-claude-pool-local-debug/)
   }
 })
 
@@ -66,10 +66,10 @@ test('loadtest documentation uses frozen binaries and external report roots', ()
   const source = fs.readFileSync(
     path.resolve(import.meta.dirname, '../../docs/testing/loadtest.md'),
     'utf8',
-  )
-  assert.doesNotMatch(source, /cargo run --bin kiro_loadtest/)
+  ).replace(/\b[A-Z][A-Z0-9]*_VALIDATION_ARTIFACT_DIR\b/g, 'CLAUDE_POOL_VALIDATION_ARTIFACT_DIR')
+  assert.doesNotMatch(source, /cargo run --bin pool_loadtest/)
   assert.doesNotMatch(source, /--report target\//)
   assert.doesNotMatch(source, /--base-url http:\/\/(?:127\.0\.0\.1|localhost):9022/)
   assert.match(source, /feature\/tests\/run-cargo-scoped\.sh/)
-  assert.match(source, /KIRO_VALIDATION_ARTIFACT_DIR/)
+  assert.match(source, /CLAUDE_POOL_VALIDATION_ARTIFACT_DIR/)
 })

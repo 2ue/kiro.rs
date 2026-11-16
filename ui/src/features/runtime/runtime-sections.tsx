@@ -124,12 +124,12 @@ function EditorSection({
 // ─── 缓存策略与路径绑定(cachePolicy + legacy defaults) ───────────────────────
 
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
-type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
-type KiroRsToolPlusPatch = NonNullable<CacheRoutePolicyPatch['kiroRsToolPlus']>
-type UsageShapingProfilePatch = NonNullable<KiroRsToolPlusPatch['shaping']>
+type PrefixToolPatch = NonNullable<CacheRoutePolicyPatch['prefixTool']>
+type PrefixToolPlusPatch = NonNullable<CacheRoutePolicyPatch['prefixToolPlus']>
+type UsageShapingProfilePatch = NonNullable<PrefixToolPlusPatch['shaping']>
 type UsageFieldShapingPatch = NonNullable<UsageShapingProfilePatch['input']>
-type UsageShapingMode = NonNullable<NonNullable<KiroRsToolPlusPatch['nonStream']>['mode']>
-type SuppressedCreationTarget = NonNullable<KiroRsToolPlusPatch['suppressedCreationTarget']>
+type UsageShapingMode = NonNullable<NonNullable<PrefixToolPlusPatch['nonStream']>['mode']>
+type SuppressedCreationTarget = NonNullable<PrefixToolPlusPatch['suppressedCreationTarget']>
 type StableSegmentPatch = NonNullable<CacheRoutePolicyPatch['stableSegment']>
 type CacheHitShapingPatch = NonNullable<CacheRoutePolicyPatch['hitShaping']>
 type ColdRequestGuardPatch = NonNullable<CacheRoutePolicyPatch['coldRequestGuard']>
@@ -169,7 +169,7 @@ function defaultSimulationPatch(): CacheSimulationPatch {
   }
 }
 
-function defaultKiroRsToolPatch(): KiroRsToolPatch {
+function defaultPrefixToolPatch(): PrefixToolPatch {
   return {
     coverageRatio: 1,
     maxCoverageTokens: 0,
@@ -180,7 +180,7 @@ function defaultKiroRsToolPatch(): KiroRsToolPatch {
   }
 }
 
-// 与后端 KiroRsToolPlusCachePolicy::default() 保持一致
+// 与后端 PrefixToolPlusCachePolicy::default() 保持一致
 type FullFieldShaping = Required<UsageFieldShapingPatch>
 type FullShapingProfile = {
   input: FullFieldShaping
@@ -212,11 +212,11 @@ function mergeUsageShapingProfile(value?: UsageShapingProfilePatch): FullShaping
   }
 }
 
-function defaultKiroRsToolPlusPatch(): KiroRsToolPlusPatch {
-  return mergeKiroRsToolPlusPatch()
+function defaultPrefixToolPlusPatch(): PrefixToolPlusPatch {
+  return mergePrefixToolPlusPatch()
 }
 
-function mergeKiroRsToolPlusPatch(value?: KiroRsToolPlusPatch) {
+function mergePrefixToolPlusPatch(value?: PrefixToolPlusPatch) {
   return {
     coverageRatio: value?.coverageRatio ?? 1,
     maxCoverageTokens: value?.maxCoverageTokens ?? 0,
@@ -241,7 +241,7 @@ function mergeKiroRsToolPlusPatch(value?: KiroRsToolPlusPatch) {
       mode: value?.smallRequest?.mode ?? 'inherit',
       profile: mergeUsageShapingProfile(value?.smallRequest?.profile),
     },
-  } satisfies KiroRsToolPlusPatch
+  } satisfies PrefixToolPlusPatch
 }
 
 // 与后端 StableSegmentCachePolicy::default() 保持一致
@@ -306,11 +306,11 @@ export function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyTy
   if (cacheType === 'no_cache') {
     return { cacheType: 'no_cache' }
   }
-  if (cacheType === 'kiro_rs_tool') {
+  if (cacheType === 'prefix_tool') {
     return {
-      cacheType: 'kiro_rs_tool',
+      cacheType: 'prefix_tool',
       reportedUsage: defaultUsagePatch(prefix),
-      kiroRsTool: defaultKiroRsToolPatch(),
+      prefixTool: defaultPrefixToolPatch(),
     }
   }
   if (cacheType === 'stable_segment_cache') {
@@ -321,9 +321,9 @@ export function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyTy
       stableSegment: defaultStableSegmentPatch(),
     }
   }
-  if (cacheType === 'kiro_rs_tool_plus') {
+  if (cacheType === 'prefix_tool_plus') {
     // 不写入参数：路径沿用 Plus 模板，编辑后才保存路径自己的整套参数。
-    return { cacheType: 'kiro_rs_tool_plus' }
+    return { cacheType: 'prefix_tool_plus' }
   }
   return {
     cacheType: cacheType === 'bounded_high_cache' ? 'bounded_high_cache' : 'current_high_cache',
@@ -363,11 +363,11 @@ export function sanitizeCacheRoutePolicy(policy: CacheRoutePolicyPatch): CacheRo
       ...pickDefinedRoutePolicyFields(policy, ['routeNamespace', 'simulation', 'creationControl', 'reportedUsage', 'hitShaping', 'coldRequestGuard']),
     }
   }
-  if (cacheType === 'kiro_rs_tool') {
+  if (cacheType === 'prefix_tool') {
     return {
       cacheType,
       ...shared,
-      ...pickDefinedRoutePolicyFields(policy, ['reportedUsage', 'kiroRsTool', 'hitShaping', 'coldRequestGuard']),
+      ...pickDefinedRoutePolicyFields(policy, ['reportedUsage', 'prefixTool', 'hitShaping', 'coldRequestGuard']),
     }
   }
   if (cacheType === 'stable_segment_cache') {
@@ -380,7 +380,7 @@ export function sanitizeCacheRoutePolicy(policy: CacheRoutePolicyPatch): CacheRo
   return {
     cacheType,
     ...shared,
-    ...pickDefinedRoutePolicyFields(policy, ['kiroRsToolPlus']),
+    ...pickDefinedRoutePolicyFields(policy, ['prefixToolPlus']),
   }
 }
 
@@ -391,9 +391,9 @@ const CACHE_STRATEGY_OPTIONS: Array<{
 }> = [
   { value: 'no_cache', title: '无缓存', desc: '直接使用原始用量，不进入缓存计算。' },
   { value: 'current_high_cache', title: '本地模拟缓存', desc: '本地模拟命中和创建，适合保持现有展示逻辑。' },
-  { value: 'kiro_rs_tool', title: 'Kiro-RS Tool', desc: '按会话和路径追踪稳定前缀，逐步补建缓存。' },
+  { value: 'prefix_tool', title: '前缀追踪', desc: '按会话和路径追踪稳定前缀，逐步补建缓存。' },
   { value: 'stable_segment_cache', title: '稳定片段缓存', desc: '从 tools、system 和历史消息提取稳定缓存片段。' },
-  { value: 'kiro_rs_tool_plus', title: 'Kiro-RS Tool Plus', desc: '分别控制四类 usage、写入频次、非流式和小请求。' },
+  { value: 'prefix_tool_plus', title: '前缀追踪 Plus', desc: '分别控制四类 usage、写入频次、非流式和小请求。' },
   { value: 'bounded_high_cache', title: '上下限优先缓存', desc: '参数同本地模拟缓存；各字段上下限是最终约束，计费只在范围内补。' },
 ]
 
@@ -682,17 +682,17 @@ function CacheTtlPolicyForm({
       <FieldGrid>
         <CacheTtlModeSelect
           label="本地账号"
-          desc="本地 Kiro 账号返回的缓存写入时长。"
+          desc="本地 上游 账号返回的缓存写入时长。"
           value={value?.local}
           external={false}
           onChange={(local) => onChange({ ...value, local })}
         />
         <CacheTtlModeSelect
-          label="外部池账号"
-          desc="外部池按本路径策略整形 usage 时的缓存写入时长；外部账号透传 usage 时不改。"
-          value={value?.externalPool}
+          label="账号账号"
+          desc="账号按本路径策略整形 usage 时的缓存写入时长；外部账号透传 usage 时不改。"
+          value={value?.account}
           external
-          onChange={(externalPool) => onChange({ ...value, externalPool })}
+          onChange={(account) => onChange({ ...value, account })}
         />
       </FieldGrid>
     </ParameterGroup>
@@ -929,15 +929,15 @@ function CreationControlOverrideForm({
   )
 }
 
-function KiroRsToolPolicyForm({
+function PrefixToolPolicyForm({
   value,
   onChange,
 }: {
-  value: KiroRsToolPatch
-  onChange: (next: KiroRsToolPatch) => void
+  value: PrefixToolPatch
+  onChange: (next: PrefixToolPatch) => void
 }) {
-  const merged = { ...defaultKiroRsToolPatch(), ...value }
-  const set = <K extends keyof KiroRsToolPatch>(key: K) => (nextValue: KiroRsToolPatch[K]) =>
+  const merged = { ...defaultPrefixToolPatch(), ...value }
+  const set = <K extends keyof PrefixToolPatch>(key: K) => (nextValue: PrefixToolPatch[K]) =>
     onChange({ ...merged, [key]: nextValue })
 
   return (
@@ -945,7 +945,7 @@ function KiroRsToolPolicyForm({
       <FieldGrid>
         <NumField
           label="缓存覆盖比例"
-          desc="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。"
+          desc="本轮最多把多少稳定内容纳入 前缀追踪 缓存。1 表示保持当前表现；0 表示不创建也不读取。"
           value={merged.coverageRatio ?? 1}
           min={0}
           max={1}
@@ -955,7 +955,7 @@ function KiroRsToolPolicyForm({
         />
         <NumField
           label="覆盖上限"
-          desc="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。"
+          desc="单次最多纳入多少 Token。0 表示不限制，保持当前 前缀追踪 表现。"
           value={merged.maxCoverageTokens ?? 0}
           min={0}
           suffix="Token"
@@ -987,7 +987,7 @@ function KiroRsToolPolicyForm({
       />
       <TogField
         label="缓存当前用户稳定前缀"
-        desc="默认关闭，和当前 Kiro-RS Tool 表现一致。开启后只取当前用户文本前段，适合确实有稳定长前缀的请求。"
+        desc="默认关闭，和当前 前缀追踪 表现一致。开启后只取当前用户文本前段，适合确实有稳定长前缀的请求。"
         checked={merged.cacheCurrentUserStablePrefix ?? false}
         onChange={set('cacheCurrentUserStablePrefix')}
       />
@@ -1143,15 +1143,15 @@ function PlusPanel({
   )
 }
 
-function KiroRsToolPlusPolicyForm({
+function PrefixToolPlusPolicyForm({
   value,
   onChange,
 }: {
-  value: KiroRsToolPlusPatch
-  onChange: (next: KiroRsToolPlusPatch) => void
+  value: PrefixToolPlusPatch
+  onChange: (next: PrefixToolPlusPatch) => void
 }) {
-  const merged = mergeKiroRsToolPlusPatch(value)
-  const set = <K extends keyof KiroRsToolPlusPatch>(key: K) => (nextValue: KiroRsToolPlusPatch[K]) =>
+  const merged = mergePrefixToolPlusPatch(value)
+  const set = <K extends keyof PrefixToolPlusPatch>(key: K) => (nextValue: PrefixToolPlusPatch[K]) =>
     onChange({ ...merged, [key]: nextValue })
 
   return (
@@ -1645,7 +1645,7 @@ const NON_STREAM_CACHE_OPTIONS: Array<{ value: NonStreamCacheMode; label: string
   {
     value: 'force_off',
     label: '强制不缓存',
-    desc: '所有非流式请求都不整理 usage、不推进本地缓存：外部池保持上游 usage 原样，本地账号用上游原始 metadata。',
+    desc: '所有非流式请求都不整理 usage、不推进本地缓存：账号保持上游 usage 原样，本地账号用上游原始 metadata。',
   },
 ]
 
@@ -1735,20 +1735,20 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
   // 只透传已配置的值，不补默认：未配置的模板保持关闭且不新增字段。
   const coldRequestGuard = policy.coldRequestGuard ? { coldRequestGuard: policy.coldRequestGuard } : {}
   const cacheTtl = policy.cacheTtl ? { cacheTtl: policy.cacheTtl } : {}
-  if (cacheType === 'kiro_rs_tool') {
+  if (cacheType === 'prefix_tool') {
     return {
-      cacheType: 'kiro_rs_tool',
+      cacheType: 'prefix_tool',
       reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
-      kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
+      prefixTool: policy.prefixTool ?? defaultPrefixToolPatch(),
       hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
       ...coldRequestGuard,
       ...cacheTtl,
     }
   }
-  if (cacheType === 'kiro_rs_tool_plus') {
+  if (cacheType === 'prefix_tool_plus') {
     return {
-      cacheType: 'kiro_rs_tool_plus',
-      kiroRsToolPlus: policy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch(),
+      cacheType: 'prefix_tool_plus',
+      prefixToolPlus: policy.prefixToolPlus ?? defaultPrefixToolPlusPatch(),
       ...cacheTtl,
     }
   }
@@ -1803,7 +1803,7 @@ export function StrategyTemplateEditor({
   const setSimulation = (simulation: CacheSimulationPatch) => onChange({ ...template, simulation })
   const setCreationControl = (creationControl: PromptCacheCreationControlConfig) => onChange({ ...template, creationControl })
   const setReportedUsage = (reportedUsage: ReportedUsagePathPolicy) => onChange({ ...template, reportedUsage })
-  const setKiroRsTool = (kiroRsTool: KiroRsToolPatch) => onChange({ ...template, kiroRsTool })
+  const setPrefixTool = (prefixTool: PrefixToolPatch) => onChange({ ...template, prefixTool })
   const setStableSegment = (stableSegment: StableSegmentPatch) => onChange({ ...template, stableSegment })
   const setHitShaping = (hitShaping: CacheHitShapingPatch) => onChange({ ...template, hitShaping })
 
@@ -1836,10 +1836,10 @@ export function StrategyTemplateEditor({
             />
           </ParameterGroup>
         </>
-      ) : cacheType === 'kiro_rs_tool_plus' ? (
-        <KiroRsToolPlusPolicyForm
-          value={template.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch()}
-          onChange={(kiroRsToolPlus) => onChange({ ...template, kiroRsToolPlus })}
+      ) : cacheType === 'prefix_tool_plus' ? (
+        <PrefixToolPlusPolicyForm
+          value={template.prefixToolPlus ?? defaultPrefixToolPlusPatch()}
+          onChange={(prefixToolPlus) => onChange({ ...template, prefixToolPlus })}
         />
       ) : cacheType === 'stable_segment_cache' ? (
         <>
@@ -1871,9 +1871,9 @@ export function StrategyTemplateEditor({
               onChange={setReportedUsage}
             />
           </ParameterGroup>
-          <KiroRsToolPolicyForm
-            value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
-            onChange={setKiroRsTool}
+          <PrefixToolPolicyForm
+            value={template.prefixTool ?? defaultPrefixToolPatch()}
+            onChange={setPrefixTool}
           />
           <ParameterGroup title="命中率与小值整形">
             <CacheHitShapingForm value={template.hitShaping ?? defaultCacheHitShaping()} onChange={setHitShaping} />
@@ -1901,16 +1901,16 @@ export function pathPolicyWithStrategyDefaults(
 ): CacheRoutePolicyPatch {
   const cacheType = policy.cacheType ?? 'no_cache'
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
-  if (cacheType === 'kiro_rs_tool_plus') {
-    const plusTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsToolPlus ?? {}, 'kiro_rs_tool_plus')
+  if (cacheType === 'prefix_tool_plus') {
+    const plusTemplate = cachePolicyForStrategyTemplate(cachePolicy.prefixToolPlus ?? {}, 'prefix_tool_plus')
     return {
       ...policy,
       cacheType,
-      kiroRsToolPlus: policy.kiroRsToolPlus ?? plusTemplate.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch(),
+      prefixToolPlus: policy.prefixToolPlus ?? plusTemplate.prefixToolPlus ?? defaultPrefixToolPlusPatch(),
     }
   }
-  const template = cacheType === 'kiro_rs_tool'
-    ? cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
+  const template = cacheType === 'prefix_tool'
+    ? cachePolicyForStrategyTemplate(cachePolicy.prefixTool ?? {}, 'prefix_tool')
     : cacheType === 'bounded_high_cache'
       ? cachePolicyForStrategyTemplate(cachePolicy.boundedHighCache ?? {}, 'bounded_high_cache')
     : cacheType === 'stable_segment_cache'
@@ -1942,7 +1942,7 @@ export function pathPolicyWithStrategyDefaults(
           }
         : {
             reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
-            kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
+            prefixTool: policy.prefixTool ?? template.prefixTool ?? defaultPrefixToolPatch(),
           }),
   }
 }
@@ -2150,10 +2150,10 @@ export function PathStrategyBindingCard({
                 />
               </ParameterGroup>
             </div>
-          ) : effectiveCacheType === 'kiro_rs_tool_plus' ? (
-            <KiroRsToolPlusPolicyForm
-              value={effectivePolicy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch()}
-              onChange={(kiroRsToolPlus) => patch({ kiroRsToolPlus })}
+          ) : effectiveCacheType === 'prefix_tool_plus' ? (
+            <PrefixToolPlusPolicyForm
+              value={effectivePolicy.prefixToolPlus ?? defaultPrefixToolPlusPatch()}
+              onChange={(prefixToolPlus) => patch({ prefixToolPlus })}
             />
           ) : effectiveCacheType === 'stable_segment_cache' ? (
             <div className="space-y-7">
@@ -2196,10 +2196,10 @@ export function PathStrategyBindingCard({
                   onChange={(reportedUsage) => patch({ reportedUsage })}
                 />
               </ParameterGroup>
-              <ParameterGroup title="稳定前缀规则" desc="控制 Kiro-RS Tool 本轮最多追踪和创建多少稳定内容。">
-                <KiroRsToolPolicyForm
-                  value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
-                  onChange={(kiroRsTool) => patch({ kiroRsTool })}
+              <ParameterGroup title="稳定前缀规则" desc="控制 前缀追踪 本轮最多追踪和创建多少稳定内容。">
+                <PrefixToolPolicyForm
+                  value={effectivePolicy.prefixTool ?? defaultPrefixToolPatch()}
+                  onChange={(prefixTool) => patch({ prefixTool })}
                 />
               </ParameterGroup>
               <ParameterGroup title="命中率与小值整形" desc="最后处理命中率、小值和冷请求边界。">
@@ -2238,6 +2238,14 @@ export function CachePolicySettingsSection({
   const [newPath, setNewPath] = useState('')
   const [error, setError] = useState<string | null>(null)
   const cachePolicy = config.cachePolicy
+  const setPrefixToolPlusTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({ ...cachePolicy, prefixToolPlus: next })
+  }
+  const prefixToolTemplate = cachePolicyForStrategyTemplate(cachePolicy.prefixTool ?? {}, 'prefix_tool')
+  const prefixToolPlusTemplate = cachePolicyForStrategyTemplate(cachePolicy.prefixToolPlus ?? {}, 'prefix_tool_plus')
+  const setPrefixToolTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({ ...cachePolicy, prefixTool: next })
+  }
   const paths = Array.from(new Set([
     ...BUILT_IN_CACHE_PREFIXES,
     ...Object.keys(cachePolicy.pathOverrides ?? {}).map(canonicalCachePolicyPath),
@@ -2263,7 +2271,7 @@ export function CachePolicySettingsSection({
     const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
     const legacyReportedUsage = reportedUsageForPrefix(config.reportedUsage.pathOverrides, normalizedPrefix)
     if (existing) {
-      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool' || existing.cacheType === 'kiro_rs_tool_plus' || existing.cacheType === 'stable_segment_cache' || existing.cacheType === 'bounded_high_cache') {
+      if (existing.cacheType === 'no_cache' || existing.cacheType === 'prefix_tool' || existing.cacheType === 'prefix_tool_plus' || existing.cacheType === 'stable_segment_cache' || existing.cacheType === 'bounded_high_cache') {
         return existing
       }
       return legacyReportedUsage ? { ...existing, reportedUsage: existing.reportedUsage ?? legacyReportedUsage } : existing
@@ -2367,22 +2375,12 @@ export function CachePolicySettingsSection({
     })
   }
 
-  const setKiroTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({ ...cachePolicy, kiroRsTool: next })
-  }
-
   const currentTemplate = cachePolicyForStrategyTemplate(
     { ...(cachePolicy.default ?? {}), ...(cachePolicy.currentHighCache ?? {}) },
     'current_high_cache'
   )
   const setStableSegmentTemplate = (next: CacheRoutePolicyPatch) => {
     updateCachePolicy({ ...cachePolicy, stableSegmentCache: next })
-  }
-
-  const kiroTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
-  const kiroPlusTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsToolPlus ?? {}, 'kiro_rs_tool_plus')
-  const setKiroPlusTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({ ...cachePolicy, kiroRsToolPlus: next })
   }
   const stableSegmentTemplate = cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, 'stable_segment_cache')
   const boundedTemplate = cachePolicyForStrategyTemplate(cachePolicy.boundedHighCache ?? {}, 'bounded_high_cache')
@@ -2401,11 +2399,11 @@ export function CachePolicySettingsSection({
           onChange={setCurrentTemplate}
         />
         <StrategyTemplateEditor
-          title="Kiro-RS Tool 缓存策略默认参数"
-          desc="使用本策略的路径只读取这里属于 Kiro-RS Tool 的参数，不读取本地模拟策略参数。"
-          cacheType="kiro_rs_tool"
-          policy={kiroTemplate}
-          onChange={setKiroTemplate}
+          title="前缀追踪 缓存策略默认参数"
+          desc="使用本策略的路径只读取这里属于 前缀追踪 的参数，不读取本地模拟策略参数。"
+          cacheType="prefix_tool"
+          policy={prefixToolTemplate}
+          onChange={setPrefixToolTemplate}
         />
         <StrategyTemplateEditor
           title="稳定片段缓存策略默认参数"
@@ -2415,11 +2413,11 @@ export function CachePolicySettingsSection({
           onChange={setStableSegmentTemplate}
         />
         <StrategyTemplateEditor
-          title="Kiro-RS Tool Plus 缓存策略默认参数"
+          title="前缀追踪 Plus 缓存策略默认参数"
           desc="使用本策略且没有单独配置参数的路径读取这里的参数。可分别控制输入、输出、缓存读取、缓存写入的放大倍数和上下限，并限制写入频次。"
-          cacheType="kiro_rs_tool_plus"
-          policy={kiroPlusTemplate}
-          onChange={setKiroPlusTemplate}
+          cacheType="prefix_tool_plus"
+          policy={prefixToolPlusTemplate}
+          onChange={setPrefixToolPlusTemplate}
         />
         <StrategyTemplateEditor
           title="上下限优先缓存策略默认参数"
@@ -2434,7 +2432,7 @@ export function CachePolicySettingsSection({
         <div>
           <div className="text-sm font-semibold">路径绑定</div>
           <div className="mt-1 text-xs leading-5 text-muted-foreground">
-            每个路径都显式选择无缓存、本地模拟缓存策略、上下限优先缓存策略、Kiro-RS Tool 缓存策略、Kiro-RS Tool Plus 缓存策略或稳定片段缓存策略。
+            每个路径都显式选择无缓存、本地模拟缓存策略、上下限优先缓存策略、前缀追踪 缓存策略、前缀追踪 Plus 缓存策略或稳定片段缓存策略。
           </div>
         </div>
         <div className="flex flex-col gap-2 md:flex-row md:items-end">
@@ -3029,7 +3027,7 @@ function PathPolicyEditor({
 function versionEquivalentSource(model: string): string | null {
   const match = model.match(/^claude-(opus|sonnet|haiku)-(\d+)([.-])(\d{1,3})(-\d{6,})?(-thinking)?$/)
   if (!match) return null
-  const [, family, major, separator, minor, , thinking = ''] = match
+  const [, family, major, separator, minor, thinking = ''] = match
   return separator === '.'
     ? `claude-${family}-${major}-${minor}${thinking}`
     : `claude-${family}-${major}.${minor}${thinking}`

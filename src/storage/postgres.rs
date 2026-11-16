@@ -9,6 +9,12 @@ use sqlx::{
     postgres::{PgConnection, PgPoolOptions, PgRow},
 };
 
+use crate::account::{
+    Account, AccountAuthType, AccountEligibility, AccountHeaderProfile, AccountTlsProfile,
+    AccountWireProfile, AutoDisablePolicy, CreateAccountRequest, ModelMappingMode, StreamRetryMode,
+    UpdateAccountRequest, UsageProjectionMode, mask_account_key,
+    normalize_account_header_overrides, normalize_account_model_mapping_rules,
+};
 use crate::anthropic::model_capabilities::{
     MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
 };
@@ -16,36 +22,28 @@ use crate::anthropic::pricing::{
     MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
 };
 use crate::anthropic::usage::{
-    REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem, UsageDashboardResponse,
-    UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow,
-    UsageDashboardWindowSpec, UsageExternalPoolBillingByPool, UsageExternalPoolBillingSummary,
-    UsageExternalPoolRiskBucket, UsageExternalPoolRiskCacheStats, UsageExternalPoolRiskCostConfig,
-    UsageExternalPoolRiskCostStats, UsageExternalPoolRiskFilters, UsageExternalPoolRiskGroup,
-    UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageExternalPoolRiskSample,
-    UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals, UsageExternalPoolRiskWindow,
-    UsageOverviewAccountRow, UsageOverviewExternal, UsageOverviewMetrics, UsageOverviewPoolRow,
-    UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewSeriesBreakdown,
-    UsageOverviewSeriesGroup, UsageOverviewSeriesGroups, UsageOverviewSeriesMetrics,
-    UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals, UsageRealtimeStats,
-    UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
-    UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
-    usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
-    usage_dashboard_window_spec_for_key, usage_dashboard_windows,
-};
-use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
-    ExternalPoolEligibility, ExternalPoolHeaderProfile, ExternalPoolModelMappingMode,
-    ExternalPoolStreamRetryMode, ExternalPoolTlsProfile, ExternalPoolUsageProjectionMode,
-    ExternalPoolWireProfile, UpdateExternalPoolRequest, mask_external_pool_key,
-    normalize_external_pool_header_overrides, normalize_external_pool_model_mapping_rules,
+    REALTIME_USAGE_WINDOW_SECS, UsageAccountBillingByPool, UsageAccountBillingSummary,
+    UsageAccountRiskBucket, UsageAccountRiskCacheStats, UsageAccountRiskCostConfig,
+    UsageAccountRiskCostStats, UsageAccountRiskFilters, UsageAccountRiskGroup,
+    UsageAccountRiskQuery, UsageAccountRiskResponse, UsageAccountRiskSample,
+    UsageAccountRiskThresholds, UsageAccountRiskTotals, UsageAccountRiskWindow, UsageAggregate,
+    UsageBreakdownItem, UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary,
+    UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec, UsageOverviewAccountRow,
+    UsageOverviewExternal, UsageOverviewMetrics, UsageOverviewPoolRow, UsageOverviewRankRow,
+    UsageOverviewResponse, UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup,
+    UsageOverviewSeriesGroups, UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint,
+    UsageOverviewSpec, UsageOverviewTotals, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
+    UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult, UsageRouteKind,
+    UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
+    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
+    usage_dashboard_windows,
 };
 use crate::model::config::{
-    Config, ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ModelMappingRule,
-    normalize_route_rules,
+    Config, ModelMappingRule, RouteRuleMode, StreamResponseMode, normalize_route_rules,
 };
 use crate::model::model_support::normalize_supported_models;
 
-const EXTERNAL_POOL_SELECT_SQL: &str = r#"
+const ACCOUNT_SELECT_SQL: &str = r#"
 SELECT id, name, base_url, api_key, auth_type, enabled, priority,
        max_concurrent_requests, usage_projection_mode, stream_response_mode,
        auto_disable_policy, pre_output_stream_retry_mode,
@@ -57,7 +55,7 @@ SELECT id, name, base_url, api_key, auth_type, enabled, priority,
        model_mapping_require_match, model_mapping_rules, supported_models,
        route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
        revision, created_at, updated_at
-FROM external_upstream_pools
+FROM accounts
 WHERE deleted_at IS NULL
 ORDER BY priority ASC, id ASC
 "#;
@@ -84,19 +82,19 @@ struct RequiredPostgresColumn {
 
 const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "tags",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "proxy_url",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "cost_multiplier",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "overrides",
     },
     RequiredPostgresColumn {
@@ -116,39 +114,39 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
         column_name: "total_compat_input_tokens",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "revision",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "pre_output_stream_retry_mode",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "route_mode",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "route_rules",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "header_profile",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "append_beta_query",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "header_overrides",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "wire_profile",
     },
     RequiredPostgresColumn {
-        table_name: "external_upstream_pools",
+        table_name: "accounts",
         column_name: "tls_profile",
     },
     RequiredPostgresColumn {
@@ -197,27 +195,27 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "external_pool_raw_cost_usd",
+        column_name: "account_raw_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "external_pool_shaped_cost_usd",
+        column_name: "account_shaped_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "external_pool_uplifted_cost_usd",
+        column_name: "account_uplifted_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "external_pool_reported_cost_usd",
+        column_name: "account_reported_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "external_pool_billable_cost_usd",
+        column_name: "account_billable_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "external_pool_cost_floor_delta_usd",
+        column_name: "account_cost_floor_delta_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
@@ -241,27 +239,27 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "external_pool_raw_cost_usd",
+        column_name: "account_raw_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "external_pool_shaped_cost_usd",
+        column_name: "account_shaped_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "external_pool_uplifted_cost_usd",
+        column_name: "account_uplifted_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "external_pool_reported_cost_usd",
+        column_name: "account_reported_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "external_pool_billable_cost_usd",
+        column_name: "account_billable_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "external_pool_cost_floor_delta_usd",
+        column_name: "account_cost_floor_delta_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
@@ -318,8 +316,8 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
     },
     UsageIndexDefinition {
         table: "usage_records",
-        name: "idx_usage_records_credential_created",
-        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_credential_created ON usage_records (credential_id, created_at DESC) WHERE deleted_at IS NULL",
+        name: "idx_usage_records_account_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_account_created ON usage_records (account_id, created_at DESC) WHERE deleted_at IS NULL",
     },
     UsageIndexDefinition {
         table: "usage_records",
@@ -338,8 +336,8 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
     },
     UsageIndexDefinition {
         table: "usage_records",
-        name: "idx_usage_records_external_pool_created",
-        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_external_pool_created ON usage_records ((data->>'externalPoolId'), created_at DESC) WHERE deleted_at IS NULL",
+        name: "idx_usage_records_account_json_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_account_json_created ON usage_records ((data->>'accountId'), created_at DESC) WHERE deleted_at IS NULL",
     },
     UsageIndexDefinition {
         table: "usage_records",
@@ -564,7 +562,7 @@ impl PostgresStore {
             .url
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
-        let schema = format!("kiro_rs_test_{}", uuid::Uuid::new_v4().simple());
+        let schema = format!("claude_pool_test_{}", uuid::Uuid::new_v4().simple());
         let bootstrap_pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
         sqlx::query(&format!(r#"CREATE SCHEMA "{}""#, schema))
             .execute(&bootstrap_pool)
@@ -746,7 +744,7 @@ impl PostgresStore {
             "startup migration is disabled"
         };
         anyhow::bail!(
-            "PostgreSQL schema is not compatible with this kiro.rs binary; missing required tables/columns: {}. {}. Set KIRO_RS_POSTGRES_MIGRATE_ON_START=true or postgres.migrateOnStart=true, restart once to migrate the database, and do not run the service with an old or partial schema.",
+            "PostgreSQL schema is not compatible with this claude-pool binary; missing required tables/columns: {}. {}. Set CLAUDE_POOL_POSTGRES_MIGRATE_ON_START=true or postgres.migrateOnStart=true, restart once to migrate the database, and do not run the service with an old or partial schema.",
             missing.join(", "),
             migration_state
         );
@@ -854,8 +852,8 @@ impl PostgresStore {
                 .await?;
                 run_versioned_migration_in_tx(
                     &mut tx,
-                    "external-pool-default-model-mapping-passthrough-v1",
-                    EXTERNAL_POOL_DEFAULT_MODEL_MAPPING_PASSTHROUGH_SQL,
+                    "account-default-model-mapping-passthrough-v1",
+                    ACCOUNT_DEFAULT_MODEL_MAPPING_PASSTHROUGH_SQL,
                 )
                 .await?;
 
@@ -1068,22 +1066,19 @@ impl PostgresStore {
         Ok(())
     }
 
-    pub async fn list_external_pools(
-        &self,
-        mask_secrets: bool,
-    ) -> anyhow::Result<Vec<ExternalPool>> {
-        let rows = sqlx::query(EXTERNAL_POOL_SELECT_SQL)
+    pub async fn list_accounts(&self, mask_secrets: bool) -> anyhow::Result<Vec<Account>> {
+        let rows = sqlx::query(ACCOUNT_SELECT_SQL)
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()
-            .map(|row| external_pool_from_row(row, mask_secrets))
+            .map(|row| account_from_row(row, mask_secrets))
             .collect()
     }
 
     /// Loads only rows that can be decoded without compatibility defaults.
     /// A malformed pool is isolated from healthy pools and cannot authorize dispatch.
-    pub async fn list_dispatchable_external_pools(&self) -> anyhow::Result<Vec<ExternalPool>> {
-        let rows = sqlx::query(EXTERNAL_POOL_SELECT_SQL)
+    pub async fn list_dispatchable_accounts(&self) -> anyhow::Result<Vec<Account>> {
+        let rows = sqlx::query(ACCOUNT_SELECT_SQL)
             .fetch_all(&self.pool)
             .await?;
         let mut pools = Vec::with_capacity(rows.len());
@@ -1091,7 +1086,7 @@ impl PostgresStore {
         let mut invalid_rows = 0usize;
         for row in rows {
             let pool_id = row.try_get::<i64, _>("id").ok();
-            match external_pool_from_row_with_policy(row, false, true) {
+            match account_from_row_with_policy(row, false, true) {
                 Ok(pool) => pools.push(pool),
                 Err(_) => {
                     invalid_rows = invalid_rows.saturating_add(1);
@@ -1105,15 +1100,13 @@ impl PostgresStore {
             tracing::debug!(
                 invalid_rows,
                 invalid_pool_ids = ?invalid_pool_ids,
-                "外部池持久化配置无法安全解析，调度资格按池 fail closed"
+                "账号持久化配置无法安全解析，调度资格按池 fail closed"
             );
         }
         Ok(pools)
     }
 
-    pub async fn list_external_pool_eligibility(
-        &self,
-    ) -> anyhow::Result<Vec<ExternalPoolEligibility>> {
+    pub async fn list_account_eligibility(&self) -> anyhow::Result<Vec<AccountEligibility>> {
         let rows = sqlx::query(
             r#"
             SELECT id, revision, enabled, base_url,
@@ -1126,7 +1119,7 @@ impl PostgresStore {
                    model_mapping_require_match, model_mapping_rules,
                    auto_disabled, auto_disabled_until, supported_models,
                    route_mode, route_rules
-            FROM external_upstream_pools
+            FROM accounts
             WHERE deleted_at IS NULL
             ORDER BY priority ASC, id ASC
             "#,
@@ -1139,7 +1132,7 @@ impl PostgresStore {
         let mut invalid_rows = 0usize;
         for row in rows {
             let pool_id = row.try_get::<i64, _>("id").ok();
-            match external_pool_eligibility_from_row(&row) {
+            match account_eligibility_from_row(&row) {
                 Ok(pool) => eligibility.push(pool),
                 Err(err) => {
                     invalid_rows = invalid_rows.saturating_add(1);
@@ -1157,17 +1150,17 @@ impl PostgresStore {
                 invalid_rows,
                 invalid_pool_ids = ?invalid_pool_ids,
                 invalid_reasons = ?invalid_reasons,
-                "外部池静态资格配置无法安全解析，按池 fail closed"
+                "账号静态资格配置无法安全解析，按池 fail closed"
             );
         }
         Ok(eligibility)
     }
 
-    pub async fn get_external_pool(
+    pub async fn get_account(
         &self,
         id: u64,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<Account>> {
         let row = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
@@ -1181,21 +1174,21 @@ impl PostgresStore {
                    model_mapping_require_match, model_mapping_rules, supported_models,
                    route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
                    revision, created_at, updated_at
-            FROM external_upstream_pools
+            FROM accounts
             WHERE id = $1 AND deleted_at IS NULL
             "#,
         )
         .bind(id as i64)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| external_pool_from_row(row, mask_secrets))
+        row.map(|row| account_from_row(row, mask_secrets))
             .transpose()
     }
 
     /// Defines the request's dispatch linearization point after request preparation and before
     /// attempt reservation/HTTP send. A mutation committed after this query does not revoke an
     /// already-started dispatch; callers must not hold a PostgreSQL lock across upstream I/O.
-    pub async fn external_pool_dispatch_revision_matches(
+    pub async fn account_dispatch_revision_matches(
         &self,
         id: u64,
         expected_revision: u64,
@@ -1204,7 +1197,7 @@ impl PostgresStore {
             r#"
             SELECT EXISTS (
                 SELECT 1
-                FROM external_upstream_pools
+                FROM accounts
                 WHERE id = $1
                   AND revision = $2
                   AND deleted_at IS NULL
@@ -1219,7 +1212,7 @@ impl PostgresStore {
         .bind(id as i64)
         .bind(
             i64::try_from(expected_revision)
-                .map_err(|_| anyhow::anyhow!("外部池 revision 超出 PgSQL BIGINT 范围"))?,
+                .map_err(|_| anyhow::anyhow!("账号 revision 超出 PgSQL BIGINT 范围"))?,
         )
         .fetch_one(&self.pool)
         .await?;
@@ -1227,50 +1220,45 @@ impl PostgresStore {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn create_external_pool(
-        &self,
-        request: CreateExternalPoolRequest,
-    ) -> anyhow::Result<ExternalPool> {
-        self.create_external_pool_with_secret_policy(request, true)
-            .await
+    pub async fn create_account(&self, request: CreateAccountRequest) -> anyhow::Result<Account> {
+        self.create_account_with_secret_policy(request, true).await
     }
 
-    pub(crate) async fn create_external_pool_unmasked(
+    pub(crate) async fn create_account_unmasked(
         &self,
-        request: CreateExternalPoolRequest,
-    ) -> anyhow::Result<ExternalPool> {
-        self.create_external_pool_with_secret_policy(request, false)
-            .await
+        request: CreateAccountRequest,
+    ) -> anyhow::Result<Account> {
+        self.create_account_with_secret_policy(request, false).await
     }
 
-    async fn create_external_pool_with_secret_policy(
+    async fn create_account_with_secret_policy(
         &self,
-        request: CreateExternalPoolRequest,
+        request: CreateAccountRequest,
         mask_secrets: bool,
-    ) -> anyhow::Result<ExternalPool> {
-        validate_external_pool_input(
+    ) -> anyhow::Result<Account> {
+        validate_account_input(
             &request.name,
             &request.base_url,
             request.max_concurrent_requests,
         )?;
-        crate::external_pool::validate_account_fields(
+        crate::account::validate_account_fields(
             request.proxy_url.as_deref(),
             request.cost_multiplier,
             &request.overrides,
         )?;
         let model_mapping_rules =
-            normalize_external_pool_model_mapping_rules(request.model_mapping_rules);
+            normalize_account_model_mapping_rules(request.model_mapping_rules);
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let supported_models = normalize_supported_models(request.supported_models);
         let supported_models_value = serde_json::to_value(&supported_models)?;
         validate_account_route_rules(&request.route_rules)?;
         let route_rules = normalize_route_rules(&request.route_rules);
         let route_rules_value = serde_json::to_value(&route_rules)?;
-        let header_overrides = normalize_external_pool_header_overrides(request.header_overrides)?;
+        let header_overrides = normalize_account_header_overrides(request.header_overrides)?;
         let header_overrides_value = serde_json::to_value(&header_overrides)?;
         let row = sqlx::query(
             r#"
-            INSERT INTO external_upstream_pools (
+            INSERT INTO accounts (
                 name, base_url, api_key, auth_type, enabled, priority,
                 max_concurrent_requests, usage_projection_mode, stream_response_mode,
                 auto_disable_policy, pre_output_stream_retry_mode,
@@ -1324,35 +1312,35 @@ impl PostgresStore {
         .bind(serde_json::to_value(&request.overrides)?)
         .fetch_one(&self.pool)
         .await?;
-        external_pool_from_row(row, mask_secrets)
+        account_from_row(row, mask_secrets)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn update_external_pool(
+    pub async fn update_account(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.update_external_pool_with_secret_policy(id, request, true)
+        request: UpdateAccountRequest,
+    ) -> anyhow::Result<Option<Account>> {
+        self.update_account_with_secret_policy(id, request, true)
             .await
     }
 
-    pub(crate) async fn update_external_pool_unmasked(
+    pub(crate) async fn update_account_unmasked(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.update_external_pool_with_secret_policy(id, request, false)
+        request: UpdateAccountRequest,
+    ) -> anyhow::Result<Option<Account>> {
+        self.update_account_with_secret_policy(id, request, false)
             .await
     }
 
-    async fn update_external_pool_with_secret_policy(
+    async fn update_account_with_secret_policy(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
+        request: UpdateAccountRequest,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        let Some(current) = self.get_external_pool(id, false).await? else {
+    ) -> anyhow::Result<Option<Account>> {
+        let Some(current) = self.get_account(id, false).await? else {
             return Ok(None);
         };
         let name = request.name.unwrap_or(current.name).trim().to_string();
@@ -1391,7 +1379,7 @@ impl PostgresStore {
             .unwrap_or(current.append_beta_query);
         let header_overrides = request
             .header_overrides
-            .map(normalize_external_pool_header_overrides)
+            .map(normalize_account_header_overrides)
             .transpose()?
             .unwrap_or(current.header_overrides);
         let header_overrides_value = serde_json::to_value(&header_overrides)?;
@@ -1408,7 +1396,7 @@ impl PostgresStore {
             .unwrap_or(current.model_mapping_require_match);
         let model_mapping_rules = request
             .model_mapping_rules
-            .map(normalize_external_pool_model_mapping_rules)
+            .map(normalize_account_model_mapping_rules)
             .unwrap_or(current.model_mapping_rules);
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let supported_models = request
@@ -1434,15 +1422,11 @@ impl PostgresStore {
             .filter(|url| !url.trim().is_empty());
         let cost_multiplier = request.cost_multiplier.unwrap_or(current.cost_multiplier);
         let overrides = request.overrides.unwrap_or(current.overrides);
-        crate::external_pool::validate_account_fields(
-            proxy_url.as_deref(),
-            cost_multiplier,
-            &overrides,
-        )?;
-        validate_external_pool_input(&name, &base_url, max_concurrent_requests)?;
+        crate::account::validate_account_fields(proxy_url.as_deref(), cost_multiplier, &overrides)?;
+        validate_account_input(&name, &base_url, max_concurrent_requests)?;
         let row = sqlx::query(
             r#"
-            UPDATE external_upstream_pools
+            UPDATE accounts
             SET name = $2,
                 base_url = $3,
                 api_key = $4,
@@ -1515,37 +1499,37 @@ impl PostgresStore {
         .bind(serde_json::to_value(&overrides)?)
         .fetch_one(&self.pool)
         .await?;
-        Ok(Some(external_pool_from_row(row, mask_secrets)?))
+        Ok(Some(account_from_row(row, mask_secrets)?))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn set_external_pool_enabled(
+    pub async fn set_account_enabled(
         &self,
         id: u64,
         enabled: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.set_external_pool_enabled_with_secret_policy(id, enabled, true)
+    ) -> anyhow::Result<Option<Account>> {
+        self.set_account_enabled_with_secret_policy(id, enabled, true)
             .await
     }
 
-    pub(crate) async fn set_external_pool_enabled_unmasked(
+    pub(crate) async fn set_account_enabled_unmasked(
         &self,
         id: u64,
         enabled: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.set_external_pool_enabled_with_secret_policy(id, enabled, false)
+    ) -> anyhow::Result<Option<Account>> {
+        self.set_account_enabled_with_secret_policy(id, enabled, false)
             .await
     }
 
-    async fn set_external_pool_enabled_with_secret_policy(
+    async fn set_account_enabled_with_secret_policy(
         &self,
         id: u64,
         enabled: bool,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<Account>> {
         let row = sqlx::query(
             r#"
-            UPDATE external_upstream_pools
+            UPDATE accounts
             SET enabled = $2,
                 revision = revision + 1,
                 updated_at = now()
@@ -1567,40 +1551,40 @@ impl PostgresStore {
         .bind(enabled)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| external_pool_from_row(row, mask_secrets))
+        row.map(|row| account_from_row(row, mask_secrets))
             .transpose()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn set_external_pool_supported_models(
+    pub async fn set_account_supported_models(
         &self,
         id: u64,
         supported_models: Vec<String>,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.set_external_pool_supported_models_with_secret_policy(id, supported_models, true)
+    ) -> anyhow::Result<Option<Account>> {
+        self.set_account_supported_models_with_secret_policy(id, supported_models, true)
             .await
     }
 
-    pub(crate) async fn set_external_pool_supported_models_unmasked(
+    pub(crate) async fn set_account_supported_models_unmasked(
         &self,
         id: u64,
         supported_models: Vec<String>,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.set_external_pool_supported_models_with_secret_policy(id, supported_models, false)
+    ) -> anyhow::Result<Option<Account>> {
+        self.set_account_supported_models_with_secret_policy(id, supported_models, false)
             .await
     }
 
-    async fn set_external_pool_supported_models_with_secret_policy(
+    async fn set_account_supported_models_with_secret_policy(
         &self,
         id: u64,
         supported_models: Vec<String>,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<Account>> {
         let supported_models = normalize_supported_models(supported_models);
         let supported_models_value = serde_json::to_value(&supported_models)?;
         let row = sqlx::query(
             r#"
-            UPDATE external_upstream_pools
+            UPDATE accounts
             SET supported_models = $2,
                 revision = revision + 1,
                 updated_at = now()
@@ -1622,13 +1606,13 @@ impl PostgresStore {
         .bind(supported_models_value)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| external_pool_from_row(row, mask_secrets))
+        row.map(|row| account_from_row(row, mask_secrets))
             .transpose()
     }
 
-    pub async fn soft_delete_external_pool(&self, id: u64) -> anyhow::Result<bool> {
+    pub async fn soft_delete_account(&self, id: u64) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE external_upstream_pools SET deleted_at = now(), revision = revision + 1, updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
+            "UPDATE accounts SET deleted_at = now(), revision = revision + 1, updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id as i64)
         .execute(&self.pool)
@@ -1637,30 +1621,27 @@ impl PostgresStore {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn clear_external_pool_auto_disabled(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.clear_external_pool_auto_disabled_with_secret_policy(id, true)
+    pub async fn clear_account_auto_disabled(&self, id: u64) -> anyhow::Result<Option<Account>> {
+        self.clear_account_auto_disabled_with_secret_policy(id, true)
             .await
     }
 
-    pub(crate) async fn clear_external_pool_auto_disabled_unmasked(
+    pub(crate) async fn clear_account_auto_disabled_unmasked(
         &self,
         id: u64,
-    ) -> anyhow::Result<Option<ExternalPool>> {
-        self.clear_external_pool_auto_disabled_with_secret_policy(id, false)
+    ) -> anyhow::Result<Option<Account>> {
+        self.clear_account_auto_disabled_with_secret_policy(id, false)
             .await
     }
 
-    async fn clear_external_pool_auto_disabled_with_secret_policy(
+    async fn clear_account_auto_disabled_with_secret_policy(
         &self,
         id: u64,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<Account>> {
         let row = sqlx::query(
             r#"
-            UPDATE external_upstream_pools
+            UPDATE accounts
             SET auto_disabled = false,
                 auto_disabled_reason = NULL,
                 auto_disabled_at = NULL,
@@ -1683,34 +1664,28 @@ impl PostgresStore {
         .bind(id as i64)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| external_pool_from_row(row, mask_secrets))
+        row.map(|row| account_from_row(row, mask_secrets))
             .transpose()
     }
 
     #[cfg(test)]
-    pub async fn auto_disable_external_pool(
+    pub async fn auto_disable_account(
         &self,
         id: u64,
         reason: &str,
         last_error: &str,
         duration_secs: u64,
     ) -> anyhow::Result<()> {
-        let Some(pool) = self.get_external_pool(id, true).await? else {
+        let Some(pool) = self.get_account(id, true).await? else {
             return Ok(());
         };
         let _ = self
-            .auto_disable_external_pool_if_unchanged(
-                id,
-                pool.revision,
-                reason,
-                last_error,
-                duration_secs,
-            )
+            .auto_disable_account_if_unchanged(id, pool.revision, reason, last_error, duration_secs)
             .await?;
         Ok(())
     }
 
-    pub async fn auto_disable_external_pool_if_unchanged(
+    pub async fn auto_disable_account_if_unchanged(
         &self,
         id: u64,
         expected_revision: u64,
@@ -1725,7 +1700,7 @@ impl PostgresStore {
         };
         let result = sqlx::query(
             r#"
-            UPDATE external_upstream_pools
+            UPDATE accounts
             SET auto_disabled = true,
                 auto_disabled_reason = $2,
                 auto_disabled_at = now(),
@@ -1748,7 +1723,7 @@ impl PostgresStore {
         .bind(last_error)
         .bind(
             i64::try_from(expected_revision)
-                .map_err(|_| anyhow::anyhow!("外部池 revision 超出 PgSQL BIGINT 范围"))?,
+                .map_err(|_| anyhow::anyhow!("账号 revision 超出 PgSQL BIGINT 范围"))?,
         )
         .execute(&self.pool)
         .await?;
@@ -2172,7 +2147,7 @@ impl PostgresStore {
         let mut tx = self.pool.begin().await?;
         let mut promoted = Vec::new();
         for model in models {
-            let Some(model) = crate::external_pool::normalize_catalog_model(model) else {
+            let Some(model) = crate::account::normalize_catalog_model(model) else {
                 continue;
             };
             let inserted = sqlx::query("INSERT INTO model_capabilities (model, display_name, max_input_tokens, max_output_tokens, supports_prompt_caching, supported_input_types, source, listed) VALUES ($1, $1, 200000, 64000, true, ARRAY['TEXT'], 'account_discovery', false) ON CONFLICT (model) DO NOTHING RETURNING model").bind(&model).fetch_optional(&mut *tx).await?;
@@ -2670,7 +2645,7 @@ pub struct AdminAuditLogFilter {
     pub account_event: Option<String>,
     /// `local` or `external`.
     pub account_source: Option<String>,
-    /// `credential` / `external_pool` / ...
+    /// `credential` / `account` / ...
     pub object_type: Option<String>,
     /// Exact object id.
     pub object_id: Option<String>,
@@ -3233,7 +3208,7 @@ impl PostgresUsageStore {
     /// Rollup-first overview split for the redesigned admin dashboard.
     ///
     /// The query intentionally reads only complete UTC hour buckets. Local usage
-    /// is derived as global minus external-pool rows so the response can expose
+    /// is derived as global minus account rows so the response can expose
     /// an auditable all = local + external reconciliation without scanning the
     /// request-level table.
     pub async fn dashboard_overview(
@@ -3242,7 +3217,7 @@ impl PostgresUsageStore {
     ) -> anyhow::Result<UsageOverviewResponse> {
         let dimensions = vec![
             "global".to_string(),
-            "external_pool".to_string(),
+            "account".to_string(),
             "credential".to_string(),
             "model".to_string(),
             "endpoint".to_string(),
@@ -3277,14 +3252,14 @@ impl PostgresUsageStore {
                 unpriced_requests,
                 duration_ms_sum,
                 duration_ms_count,
-                external_pool_cost_floor_applied_requests,
-                external_pool_raw_cost_usd,
-                external_pool_shaped_cost_usd,
-                external_pool_uplifted_cost_usd,
-                external_pool_reported_cost_usd,
-                external_pool_billable_cost_usd,
-                external_pool_profit_usd,
-                external_pool_cost_floor_delta_usd
+                account_cost_floor_applied_requests,
+                account_raw_cost_usd,
+                account_shaped_cost_usd,
+                account_uplifted_cost_usd,
+                account_reported_cost_usd,
+                account_billable_cost_usd,
+                account_profit_usd,
+                account_cost_floor_delta_usd
             FROM usage_rollup_time_buckets
             WHERE dimension = ANY($1::text[])
               AND bucket_start >= $2
@@ -3329,17 +3304,17 @@ impl PostgresUsageStore {
                         .all
                         .add(metrics, OverviewExternalCosts::from_row(&row)?);
                 }
-                "external_pool" => {
+                "account" => {
                     external.add(metrics);
                     let costs = OverviewExternalCosts::from_row(&row)?;
                     let bucket = series.entry(series_key.clone()).or_default();
                     bucket.external.add(metrics, costs);
                     bucket
-                        .external_pools
+                        .accounts
                         .entry(dimension_key.clone())
                         .or_default()
                         .add(metrics, costs);
-                    series_groups.external_pools.add(
+                    series_groups.accounts.add(
                         &dimension_key,
                         dimension_label.as_deref(),
                         costs.raw_cost_usd,
@@ -3347,21 +3322,17 @@ impl PostgresUsageStore {
                     );
                     let pool = pools.entry(dimension_key.clone()).or_default();
                     pool.metrics.add(metrics);
-                    pool.raw_cost_usd += row.try_get::<f64, _>("external_pool_raw_cost_usd")?;
-                    pool.shaped_cost_usd +=
-                        row.try_get::<f64, _>("external_pool_shaped_cost_usd")?;
-                    pool.uplifted_cost_usd +=
-                        row.try_get::<f64, _>("external_pool_uplifted_cost_usd")?;
-                    pool.reported_cost_usd +=
-                        row.try_get::<f64, _>("external_pool_reported_cost_usd")?;
-                    pool.billable_cost_usd +=
-                        row.try_get::<f64, _>("external_pool_billable_cost_usd")?;
-                    pool.profit_usd += row.try_get::<f64, _>("external_pool_profit_usd")?;
+                    pool.raw_cost_usd += row.try_get::<f64, _>("account_raw_cost_usd")?;
+                    pool.shaped_cost_usd += row.try_get::<f64, _>("account_shaped_cost_usd")?;
+                    pool.uplifted_cost_usd += row.try_get::<f64, _>("account_uplifted_cost_usd")?;
+                    pool.reported_cost_usd += row.try_get::<f64, _>("account_reported_cost_usd")?;
+                    pool.billable_cost_usd += row.try_get::<f64, _>("account_billable_cost_usd")?;
+                    pool.profit_usd += row.try_get::<f64, _>("account_profit_usd")?;
                     pool.cost_floor_delta_usd +=
-                        row.try_get::<f64, _>("external_pool_cost_floor_delta_usd")?;
+                        row.try_get::<f64, _>("account_cost_floor_delta_usd")?;
                     pool.cost_floor_applied_requests =
                         pool.cost_floor_applied_requests.saturating_add(
-                            row.try_get::<i64, _>("external_pool_cost_floor_applied_requests")?
+                            row.try_get::<i64, _>("account_cost_floor_applied_requests")?
                                 .max(0) as usize,
                         );
                     if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
@@ -4101,32 +4072,32 @@ impl PostgresUsageStore {
                 COALESCE(t.local_prompt_cache_creation_input_tokens, 0)::bigint AS local_prompt_cache_creation_input_tokens,
                 COALESCE(t.simulated_requests, 0)::bigint AS simulated_requests,
                 COALESCE(t.upstream_metadata_requests, 0)::bigint AS upstream_metadata_requests,
-                COALESCE(t.external_pool_requests, 0)::bigint AS external_pool_requests,
-                COALESCE(t.external_pool_priced_requests, 0)::bigint AS external_pool_priced_requests,
-                COALESCE(t.external_pool_unpriced_requests, 0)::bigint AS external_pool_unpriced_requests,
-                COALESCE(t.external_pool_cost_floor_applied_requests, 0)::bigint AS external_pool_cost_floor_applied_requests,
-                COALESCE(t.external_pool_raw_cost_usd, 0)::double precision AS external_pool_raw_cost_usd,
+                COALESCE(t.account_requests, 0)::bigint AS account_requests,
+                COALESCE(t.account_priced_requests, 0)::bigint AS account_priced_requests,
+                COALESCE(t.account_unpriced_requests, 0)::bigint AS account_unpriced_requests,
+                COALESCE(t.account_cost_floor_applied_requests, 0)::bigint AS account_cost_floor_applied_requests,
+                COALESCE(t.account_raw_cost_usd, 0)::double precision AS account_raw_cost_usd,
                 CASE
-                    WHEN COALESCE(t.external_pool_shaped_cost_usd, 0) <> 0
-                    THEN t.external_pool_shaped_cost_usd
-                    ELSE COALESCE(t.external_pool_reported_cost_usd, 0)
-                END::double precision AS external_pool_shaped_cost_usd,
+                    WHEN COALESCE(t.account_shaped_cost_usd, 0) <> 0
+                    THEN t.account_shaped_cost_usd
+                    ELSE COALESCE(t.account_reported_cost_usd, 0)
+                END::double precision AS account_shaped_cost_usd,
                 CASE
-                    WHEN COALESCE(t.external_pool_uplifted_cost_usd, 0) <> 0
-                    THEN t.external_pool_uplifted_cost_usd
-                    ELSE COALESCE(t.external_pool_reported_cost_usd, 0)
-                END::double precision AS external_pool_uplifted_cost_usd,
+                    WHEN COALESCE(t.account_uplifted_cost_usd, 0) <> 0
+                    THEN t.account_uplifted_cost_usd
+                    ELSE COALESCE(t.account_reported_cost_usd, 0)
+                END::double precision AS account_uplifted_cost_usd,
                 CASE
-                    WHEN COALESCE(t.external_pool_profit_usd, 0) <> 0
-                    THEN t.external_pool_profit_usd
-                    WHEN COALESCE(t.external_pool_reported_cost_usd, 0) <> 0
-                      OR COALESCE(t.external_pool_raw_cost_usd, 0) <> 0
-                    THEN COALESCE(t.external_pool_reported_cost_usd, 0) - COALESCE(t.external_pool_raw_cost_usd, 0)
+                    WHEN COALESCE(t.account_profit_usd, 0) <> 0
+                    THEN t.account_profit_usd
+                    WHEN COALESCE(t.account_reported_cost_usd, 0) <> 0
+                      OR COALESCE(t.account_raw_cost_usd, 0) <> 0
+                    THEN COALESCE(t.account_reported_cost_usd, 0) - COALESCE(t.account_raw_cost_usd, 0)
                     ELSE 0
-                END::double precision AS external_pool_profit_usd,
-                COALESCE(t.external_pool_reported_cost_usd, 0)::double precision AS external_pool_reported_cost_usd,
-                COALESCE(t.external_pool_billable_cost_usd, 0)::double precision AS external_pool_billable_cost_usd,
-                COALESCE(t.external_pool_cost_floor_delta_usd, 0)::double precision AS external_pool_cost_floor_delta_usd,
+                END::double precision AS account_profit_usd,
+                COALESCE(t.account_reported_cost_usd, 0)::double precision AS account_reported_cost_usd,
+                COALESCE(t.account_billable_cost_usd, 0)::double precision AS account_billable_cost_usd,
+                COALESCE(t.account_cost_floor_delta_usd, 0)::double precision AS account_cost_floor_delta_usd,
                 COUNT(r.id) FILTER (WHERE r.created_at >= now() - interval '60 seconds')::bigint AS realtime_requests,
                 COUNT(r.id) FILTER (WHERE r.created_at >= now() - interval '60 seconds' AND r.status = 'success')::bigint AS realtime_success_requests,
                 COUNT(r.id) FILTER (WHERE r.created_at >= now() - interval '60 seconds' AND r.status <> 'success')::bigint AS realtime_error_requests,
@@ -4149,13 +4120,13 @@ impl PostgresUsageStore {
                      t.local_prompt_cache_read_input_tokens,
                      t.local_prompt_cache_creation_input_tokens,
                      t.simulated_requests, t.upstream_metadata_requests,
-                     t.external_pool_requests, t.external_pool_priced_requests,
-                     t.external_pool_unpriced_requests,
-                     t.external_pool_cost_floor_applied_requests,
-                     t.external_pool_raw_cost_usd, t.external_pool_shaped_cost_usd,
-                     t.external_pool_uplifted_cost_usd, t.external_pool_profit_usd,
-                     t.external_pool_reported_cost_usd, t.external_pool_billable_cost_usd,
-                     t.external_pool_cost_floor_delta_usd
+                     t.account_requests, t.account_priced_requests,
+                     t.account_unpriced_requests,
+                     t.account_cost_floor_applied_requests,
+                     t.account_raw_cost_usd, t.account_shaped_cost_usd,
+                     t.account_uplifted_cost_usd, t.account_profit_usd,
+                     t.account_reported_cost_usd, t.account_billable_cost_usd,
+                     t.account_cost_floor_delta_usd
             "#,
         )
         .bind(high_cache_threshold)
@@ -4184,21 +4155,21 @@ impl PostgresUsageStore {
                 .try_get("local_prompt_cache_creation_input_tokens")?,
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
-            external_pool_billing: UsageExternalPoolBillingSummary {
-                requests: row_i64_to_usize(&row, "external_pool_requests")?,
-                priced_requests: row_i64_to_usize(&row, "external_pool_priced_requests")?,
-                unpriced_requests: row_i64_to_usize(&row, "external_pool_unpriced_requests")?,
+            account_billing: UsageAccountBillingSummary {
+                requests: row_i64_to_usize(&row, "account_requests")?,
+                priced_requests: row_i64_to_usize(&row, "account_priced_requests")?,
+                unpriced_requests: row_i64_to_usize(&row, "account_unpriced_requests")?,
                 cost_floor_applied_requests: row_i64_to_usize(
                     &row,
-                    "external_pool_cost_floor_applied_requests",
+                    "account_cost_floor_applied_requests",
                 )?,
-                raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
-                shaped_cost_usd: row.try_get("external_pool_shaped_cost_usd")?,
-                uplifted_cost_usd: row.try_get("external_pool_uplifted_cost_usd")?,
-                profit_usd: row.try_get("external_pool_profit_usd")?,
-                reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
-                billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
-                cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
+                raw_cost_usd: row.try_get("account_raw_cost_usd")?,
+                shaped_cost_usd: row.try_get("account_shaped_cost_usd")?,
+                uplifted_cost_usd: row.try_get("account_uplifted_cost_usd")?,
+                profit_usd: row.try_get("account_profit_usd")?,
+                reported_cost_usd: row.try_get("account_reported_cost_usd")?,
+                billable_cost_usd: row.try_get("account_billable_cost_usd")?,
+                cost_floor_delta_usd: row.try_get("account_cost_floor_delta_usd")?,
             },
             realtime: UsageRealtimeStats::from_totals_with_status(
                 REALTIME_USAGE_WINDOW_SECS,
@@ -4399,16 +4370,16 @@ impl PostgresUsageStore {
         ))
     }
 
-    pub async fn dashboard_external_pool_billing_only(
+    pub async fn dashboard_account_billing_only(
         &self,
         timezone: Option<&str>,
         window_key: &str,
-    ) -> anyhow::Result<(String, String, String, Vec<UsageExternalPoolBillingByPool>)> {
+    ) -> anyhow::Result<(String, String, String, Vec<UsageAccountBillingByPool>)> {
         let now = Utc::now();
         let (timezone, offset) = usage_dashboard_timezone(timezone);
         let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
         let specs = [window_spec.clone()];
-        let mut billing = self.dashboard_external_pool_billing_by_pool(&specs).await?;
+        let mut billing = self.dashboard_account_billing_by_pool(&specs).await?;
         Ok((
             now.to_rfc3339(),
             timezone,
@@ -4417,13 +4388,13 @@ impl PostgresUsageStore {
         ))
     }
 
-    pub async fn external_pool_usage_risk(
+    pub async fn account_usage_risk(
         &self,
-        query: UsageExternalPoolRiskQuery,
-        cost_config: UsageExternalPoolRiskCostConfig,
-    ) -> anyhow::Result<UsageExternalPoolRiskResponse> {
+        query: UsageAccountRiskQuery,
+        cost_config: UsageAccountRiskCostConfig,
+    ) -> anyhow::Result<UsageAccountRiskResponse> {
         if query.from >= query.to {
-            anyhow::bail!("外部池 usage 风控查询时间范围无效");
+            anyhow::bail!("账号 usage 风控查询时间范围无效");
         }
 
         let cost_target_multiplier = if cost_config.cost_floor_enabled {
@@ -4436,26 +4407,25 @@ impl PostgresUsageStore {
         let mut tx = self.store.pool().begin().await?;
         configure_usage_dashboard_read_transaction(&mut tx).await?;
 
-        let summary_row = external_pool_usage_risk_summary_query(&query, cost_target_multiplier)
+        let summary_row = account_usage_risk_summary_query(&query, cost_target_multiplier)
             .build()
             .fetch_one(&mut *tx)
             .await?;
-        let totals = external_pool_usage_risk_totals_from_row(&summary_row)?;
-        let raw_cache = external_pool_usage_risk_cache_stats_from_row(&summary_row, "raw")?;
-        let reported_cache =
-            external_pool_usage_risk_cache_stats_from_row(&summary_row, "reported")?;
-        let cost = external_pool_usage_risk_cost_stats_from_row(&summary_row)?;
+        let totals = account_usage_risk_totals_from_row(&summary_row)?;
+        let raw_cache = account_usage_risk_cache_stats_from_row(&summary_row, "raw")?;
+        let reported_cache = account_usage_risk_cache_stats_from_row(&summary_row, "reported")?;
+        let cost = account_usage_risk_cost_stats_from_row(&summary_row)?;
 
-        let bucket_rows = external_pool_usage_risk_bucket_query(&query, cost_target_multiplier)
+        let bucket_rows = account_usage_risk_bucket_query(&query, cost_target_multiplier)
             .build()
             .fetch_all(&mut *tx)
             .await?;
         let buckets = bucket_rows
             .into_iter()
-            .map(external_pool_usage_risk_bucket_from_row)
+            .map(account_usage_risk_bucket_from_row)
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let group_rows = external_pool_usage_risk_group_query(&query, cost_target_multiplier)
+        let group_rows = account_usage_risk_group_query(&query, cost_target_multiplier)
             .build()
             .fetch_all(&mut *tx)
             .await?;
@@ -4464,7 +4434,7 @@ impl PostgresUsageStore {
         let mut by_model = Vec::new();
         for row in group_rows {
             let group_kind: String = row.try_get("group_kind")?;
-            let group = external_pool_usage_risk_group_from_row(&row)?;
+            let group = account_usage_risk_group_from_row(&row)?;
             match group_kind.as_str() {
                 "pool" => by_pool.push(group),
                 "path" => by_path.push(group),
@@ -4473,34 +4443,34 @@ impl PostgresUsageStore {
             }
         }
 
-        let sample_rows = external_pool_usage_risk_sample_query(&query, cost_target_multiplier)
+        let sample_rows = account_usage_risk_sample_query(&query, cost_target_multiplier)
             .build()
             .fetch_all(&mut *tx)
             .await?;
         let samples = sample_rows
             .into_iter()
-            .map(external_pool_usage_risk_sample_from_row)
+            .map(account_usage_risk_sample_from_row)
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         tx.commit().await?;
 
-        Ok(UsageExternalPoolRiskResponse {
+        Ok(UsageAccountRiskResponse {
             generated_at: Utc::now().to_rfc3339(),
             timezone: query.timezone.clone(),
-            window: UsageExternalPoolRiskWindow {
+            window: UsageAccountRiskWindow {
                 key: query.window_key.clone(),
                 label: query.window_label.clone(),
                 from: query.from.to_rfc3339(),
                 to: query.to.to_rfc3339(),
             },
-            thresholds: UsageExternalPoolRiskThresholds {
+            thresholds: UsageAccountRiskThresholds {
                 warning_tokens: query.warning_threshold_tokens,
                 critical_tokens: query.critical_threshold_tokens,
                 cost_floor_enabled: cost_config.cost_floor_enabled,
                 cost_floor_margin_percent: cost_config.cost_floor_margin_percent,
                 cost_target_multiplier,
             },
-            filters: UsageExternalPoolRiskFilters {
+            filters: UsageAccountRiskFilters {
                 pool_id: query.pool_id,
                 endpoint: query.endpoint.clone(),
                 model: query.model.clone(),
@@ -4568,38 +4538,38 @@ impl PostgresUsageStore {
 
                 COALESCE(SUM(s.simulated_requests), 0)::bigint AS simulated_requests,
                 COALESCE(SUM(s.upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
-                COALESCE(SUM(s.external_pool_requests), 0)::bigint AS external_pool_requests,
-                COALESCE(SUM(s.external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
-                COALESCE(SUM(s.external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
-                COALESCE(SUM(s.external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
-                COALESCE(SUM(s.external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
+                COALESCE(SUM(s.account_requests), 0)::bigint AS account_requests,
+                COALESCE(SUM(s.account_priced_requests), 0)::bigint AS account_priced_requests,
+                COALESCE(SUM(s.account_unpriced_requests), 0)::bigint AS account_unpriced_requests,
+                COALESCE(SUM(s.account_cost_floor_applied_requests), 0)::bigint AS account_cost_floor_applied_requests,
+                COALESCE(SUM(s.account_raw_cost_usd), 0)::double precision AS account_raw_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(s.external_pool_shaped_cost_usd, 0) <> 0
-                        THEN s.external_pool_shaped_cost_usd
-                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.account_shaped_cost_usd, 0) <> 0
+                        THEN s.account_shaped_cost_usd
+                        ELSE COALESCE(s.account_reported_cost_usd, 0)
                     END
-                ), 0)::double precision AS external_pool_shaped_cost_usd,
+                ), 0)::double precision AS account_shaped_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(s.external_pool_uplifted_cost_usd, 0) <> 0
-                        THEN s.external_pool_uplifted_cost_usd
-                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.account_uplifted_cost_usd, 0) <> 0
+                        THEN s.account_uplifted_cost_usd
+                        ELSE COALESCE(s.account_reported_cost_usd, 0)
                     END
-                ), 0)::double precision AS external_pool_uplifted_cost_usd,
+                ), 0)::double precision AS account_uplifted_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(s.external_pool_profit_usd, 0) <> 0
-                        THEN s.external_pool_profit_usd
-                        WHEN COALESCE(s.external_pool_reported_cost_usd, 0) <> 0
-                          OR COALESCE(s.external_pool_raw_cost_usd, 0) <> 0
-                        THEN COALESCE(s.external_pool_reported_cost_usd, 0) - COALESCE(s.external_pool_raw_cost_usd, 0)
+                        WHEN COALESCE(s.account_profit_usd, 0) <> 0
+                        THEN s.account_profit_usd
+                        WHEN COALESCE(s.account_reported_cost_usd, 0) <> 0
+                          OR COALESCE(s.account_raw_cost_usd, 0) <> 0
+                        THEN COALESCE(s.account_reported_cost_usd, 0) - COALESCE(s.account_raw_cost_usd, 0)
                         ELSE 0
                     END
-                ), 0)::double precision AS external_pool_profit_usd,
-                COALESCE(SUM(s.external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
-                COALESCE(SUM(s.external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
-                COALESCE(SUM(s.external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd
+                ), 0)::double precision AS account_profit_usd,
+                COALESCE(SUM(s.account_reported_cost_usd), 0)::double precision AS account_reported_cost_usd,
+                COALESCE(SUM(s.account_billable_cost_usd), 0)::double precision AS account_billable_cost_usd,
+                COALESCE(SUM(s.account_cost_floor_delta_usd), 0)::double precision AS account_cost_floor_delta_usd
             FROM window_bounds w
             LEFT JOIN dashboard_global_segments s ON s.window_key = w.key
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
@@ -4706,17 +4676,17 @@ impl PostgresUsageStore {
 
                 r.simulated_requests,
                 r.upstream_metadata_requests,
-                r.external_pool_requests,
-                r.external_pool_priced_requests,
-                r.external_pool_unpriced_requests,
-                r.external_pool_cost_floor_applied_requests,
-                r.external_pool_raw_cost_usd,
-                r.external_pool_shaped_cost_usd,
-                r.external_pool_uplifted_cost_usd,
-                r.external_pool_profit_usd,
-                r.external_pool_reported_cost_usd,
-                r.external_pool_billable_cost_usd,
-                r.external_pool_cost_floor_delta_usd
+                r.account_requests,
+                r.account_priced_requests,
+                r.account_unpriced_requests,
+                r.account_cost_floor_applied_requests,
+                r.account_raw_cost_usd,
+                r.account_shaped_cost_usd,
+                r.account_uplifted_cost_usd,
+                r.account_profit_usd,
+                r.account_reported_cost_usd,
+                r.account_billable_cost_usd,
+                r.account_cost_floor_delta_usd
             FROM rollup r
             LEFT JOIN high_cache h ON h.key = r.key
             LEFT JOIN duration_p95 p ON p.key = r.key
@@ -4777,7 +4747,7 @@ impl PostgresUsageStore {
         let mut usage_source_breakdown = self
             .dashboard_breakdown(specs, DashboardBreakdownColumn::UsageSource)
             .await?;
-        let mut external_pool_billing = self.dashboard_external_pool_billing_by_pool(specs).await?;
+        let mut account_billing = self.dashboard_account_billing_by_pool(specs).await?;
 
         for window in windows {
             window.summary.status_breakdown =
@@ -4785,9 +4755,8 @@ impl PostgresUsageStore {
             window.summary.usage_source_breakdown = usage_source_breakdown
                 .remove(&window.key)
                 .unwrap_or_default();
-            window.summary.external_pool_billing_by_pool = external_pool_billing
-                .remove(&window.key)
-                .unwrap_or_default();
+            window.summary.account_billing_by_pool =
+                account_billing.remove(&window.key).unwrap_or_default();
         }
         Ok(())
     }
@@ -4931,59 +4900,59 @@ impl PostgresUsageStore {
             .collect::<anyhow::Result<Vec<_>>>()
     }
 
-    async fn dashboard_external_pool_billing_by_pool(
+    async fn dashboard_account_billing_by_pool(
         &self,
         specs: &[UsageDashboardWindowSpec],
-    ) -> anyhow::Result<HashMap<String, Vec<UsageExternalPoolBillingByPool>>> {
+    ) -> anyhow::Result<HashMap<String, Vec<UsageAccountBillingByPool>>> {
         if specs.is_empty() {
             return Ok(HashMap::new());
         }
 
         let mut builder = QueryBuilder::<Postgres>::new("");
         push_dashboard_windows_cte(&mut builder, specs);
-        push_dashboard_external_pool_segments_cte(&mut builder);
+        push_dashboard_account_segments_cte(&mut builder);
         builder.push(
             r#"
             SELECT
                 w.key AS window_key,
                 s.pool_id,
                 NULLIF(MAX(s.pool_name), '') AS pool_name,
-                COALESCE(SUM(s.external_pool_requests), 0)::bigint AS requests,
-                COALESCE(SUM(s.external_pool_priced_requests), 0)::bigint AS priced_requests,
-                COALESCE(SUM(s.external_pool_unpriced_requests), 0)::bigint AS unpriced_requests,
-                COALESCE(SUM(s.external_pool_cost_floor_applied_requests), 0)::bigint AS cost_floor_applied_requests,
-                COALESCE(SUM(s.external_pool_raw_cost_usd), 0)::double precision AS raw_cost_usd,
+                COALESCE(SUM(s.account_requests), 0)::bigint AS requests,
+                COALESCE(SUM(s.account_priced_requests), 0)::bigint AS priced_requests,
+                COALESCE(SUM(s.account_unpriced_requests), 0)::bigint AS unpriced_requests,
+                COALESCE(SUM(s.account_cost_floor_applied_requests), 0)::bigint AS cost_floor_applied_requests,
+                COALESCE(SUM(s.account_raw_cost_usd), 0)::double precision AS raw_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(s.external_pool_shaped_cost_usd, 0) <> 0
-                        THEN s.external_pool_shaped_cost_usd
-                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.account_shaped_cost_usd, 0) <> 0
+                        THEN s.account_shaped_cost_usd
+                        ELSE COALESCE(s.account_reported_cost_usd, 0)
                     END
                 ), 0)::double precision AS shaped_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(s.external_pool_uplifted_cost_usd, 0) <> 0
-                        THEN s.external_pool_uplifted_cost_usd
-                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.account_uplifted_cost_usd, 0) <> 0
+                        THEN s.account_uplifted_cost_usd
+                        ELSE COALESCE(s.account_reported_cost_usd, 0)
                     END
                 ), 0)::double precision AS uplifted_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(s.external_pool_profit_usd, 0) <> 0
-                        THEN s.external_pool_profit_usd
-                        WHEN COALESCE(s.external_pool_reported_cost_usd, 0) <> 0
-                          OR COALESCE(s.external_pool_raw_cost_usd, 0) <> 0
-                        THEN COALESCE(s.external_pool_reported_cost_usd, 0) - COALESCE(s.external_pool_raw_cost_usd, 0)
+                        WHEN COALESCE(s.account_profit_usd, 0) <> 0
+                        THEN s.account_profit_usd
+                        WHEN COALESCE(s.account_reported_cost_usd, 0) <> 0
+                          OR COALESCE(s.account_raw_cost_usd, 0) <> 0
+                        THEN COALESCE(s.account_reported_cost_usd, 0) - COALESCE(s.account_raw_cost_usd, 0)
                         ELSE 0
                     END
                 ), 0)::double precision AS profit_usd,
-                COALESCE(SUM(s.external_pool_reported_cost_usd), 0)::double precision AS reported_cost_usd,
-                COALESCE(SUM(s.external_pool_billable_cost_usd), 0)::double precision AS billable_cost_usd,
-                COALESCE(SUM(s.external_pool_cost_floor_delta_usd), 0)::double precision AS cost_floor_delta_usd
+                COALESCE(SUM(s.account_reported_cost_usd), 0)::double precision AS reported_cost_usd,
+                COALESCE(SUM(s.account_billable_cost_usd), 0)::double precision AS billable_cost_usd,
+                COALESCE(SUM(s.account_cost_floor_delta_usd), 0)::double precision AS cost_floor_delta_usd
             FROM window_bounds w
-            JOIN dashboard_external_pool_segments s ON s.window_key = w.key
+            JOIN dashboard_account_segments s ON s.window_key = w.key
             GROUP BY w.key, w.ord, s.pool_id
-            HAVING COALESCE(SUM(s.external_pool_requests), 0) > 0
+            HAVING COALESCE(SUM(s.account_requests), 0) > 0
             ORDER BY w.ord, uplifted_cost_usd DESC, requests DESC, pool_id
             "#,
         );
@@ -4992,7 +4961,7 @@ impl PostgresUsageStore {
         configure_usage_dashboard_read_transaction(&mut tx).await?;
         let rows = builder.build().fetch_all(&mut *tx).await?;
         tx.commit().await?;
-        let mut grouped: HashMap<String, Vec<UsageExternalPoolBillingByPool>> = HashMap::new();
+        let mut grouped: HashMap<String, Vec<UsageAccountBillingByPool>> = HashMap::new();
         for row in rows {
             let window_key: String = row.try_get("window_key")?;
             let pool_key: String = row.try_get("pool_id")?;
@@ -5003,7 +4972,7 @@ impl PostgresUsageStore {
             grouped
                 .entry(window_key)
                 .or_default()
-                .push(UsageExternalPoolBillingByPool {
+                .push(UsageAccountBillingByPool {
                     pool_id: pool_key.parse::<u64>().unwrap_or(0),
                     pool_name,
                     requests: row_i64_to_usize(&row, "requests")?,
@@ -5287,12 +5256,12 @@ impl PostgresUsageStore {
     }
 }
 
-fn external_pool_usage_risk_summary_query<'a>(
-    query: &'a UsageExternalPoolRiskQuery,
+fn account_usage_risk_summary_query<'a>(
+    query: &'a UsageAccountRiskQuery,
     cost_target_multiplier: f64,
 ) -> QueryBuilder<'a, Postgres> {
     let mut builder = QueryBuilder::<Postgres>::new("");
-    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    push_account_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
     builder.push(
         r#"
         SELECT
@@ -5305,8 +5274,8 @@ fn external_pool_usage_risk_summary_query<'a>(
             COUNT(*) FILTER (WHERE NOT pricing_available)::bigint AS unpriced_records,
             COUNT(*) FILTER (WHERE raw_usage_present)::bigint AS raw_usage_records,
             COUNT(*) FILTER (WHERE reported_usage_present)::bigint AS reported_usage_records,
-            COUNT(*) FILTER (WHERE NOT external_pool_billing_present)::bigint
-                AS missing_external_pool_billing_records,
+            COUNT(*) FILTER (WHERE NOT account_billing_present)::bigint
+                AS missing_account_billing_records,
             COUNT(*) FILTER (WHERE reported_output_tokens = 0)::bigint AS output_zero_records,
 
             COALESCE(MIN(raw_cache_read_input_tokens), 0)::bigint AS raw_min_read_tokens,
@@ -5396,12 +5365,12 @@ fn external_pool_usage_risk_summary_query<'a>(
     builder
 }
 
-fn external_pool_usage_risk_bucket_query<'a>(
-    query: &'a UsageExternalPoolRiskQuery,
+fn account_usage_risk_bucket_query<'a>(
+    query: &'a UsageAccountRiskQuery,
     cost_target_multiplier: f64,
 ) -> QueryBuilder<'a, Postgres> {
     let mut builder = QueryBuilder::<Postgres>::new("");
-    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    push_account_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
     builder.push(
         r#"
         , buckets(key, label, min_tokens, max_tokens, ord) AS (
@@ -5453,23 +5422,23 @@ fn external_pool_usage_risk_bucket_query<'a>(
     builder
 }
 
-fn external_pool_usage_risk_group_query<'a>(
-    query: &'a UsageExternalPoolRiskQuery,
+fn account_usage_risk_group_query<'a>(
+    query: &'a UsageAccountRiskQuery,
     cost_target_multiplier: f64,
 ) -> QueryBuilder<'a, Postgres> {
     let mut builder = QueryBuilder::<Postgres>::new("");
-    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    push_account_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
     builder.push(
         r#"
         , group_rows AS (
             SELECT
                 'pool' AS group_kind,
-                COALESCE(external_pool_id_text, 'unknown') AS group_key,
+                COALESCE(account_id_text, 'unknown') AS group_key,
                 COALESCE(
-                    external_pool_name,
+                    account_name,
                     CASE
-                        WHEN external_pool_id_text IS NOT NULL THEN '#' || external_pool_id_text
-                        ELSE '未知外部池'
+                        WHEN account_id_text IS NOT NULL THEN '#' || account_id_text
+                        ELSE '未知账号'
                     END
                 ) AS group_label,
                 status,
@@ -5578,12 +5547,12 @@ fn external_pool_usage_risk_group_query<'a>(
     builder
 }
 
-fn external_pool_usage_risk_sample_query<'a>(
-    query: &'a UsageExternalPoolRiskQuery,
+fn account_usage_risk_sample_query<'a>(
+    query: &'a UsageAccountRiskQuery,
     cost_target_multiplier: f64,
 ) -> QueryBuilder<'a, Postgres> {
     let mut builder = QueryBuilder::<Postgres>::new("");
-    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    push_account_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
     builder.push(
         r#"
         SELECT
@@ -5593,11 +5562,11 @@ fn external_pool_usage_risk_sample_query<'a>(
             stream,
             model,
             status,
-            external_pool_id_text,
-            external_pool_name,
+            account_id_text,
+            account_name,
             pricing_model,
             usage_projection_mode,
-            external_pool_billing_present,
+            account_billing_present,
             cost_floor_applied,
             raw_input_tokens,
             raw_output_tokens,
@@ -5614,7 +5583,7 @@ fn external_pool_usage_risk_sample_query<'a>(
             target_gap_usd,
             cost_ratio,
             array_remove(ARRAY[
-                CASE WHEN NOT external_pool_billing_present THEN 'missing_external_pool_billing' END,
+                CASE WHEN NOT account_billing_present THEN 'missing_account_billing' END,
                 CASE WHEN reported_output_tokens = 0 THEN 'output_zero' END,
                 CASE
                     WHEN raw_cache_read_input_tokens >= critical_threshold
@@ -5662,9 +5631,9 @@ fn external_pool_usage_risk_sample_query<'a>(
     builder
 }
 
-fn push_external_pool_usage_risk_scored_cte<'a>(
+fn push_account_usage_risk_scored_cte<'a>(
     builder: &mut QueryBuilder<'a, Postgres>,
-    query: &'a UsageExternalPoolRiskQuery,
+    query: &'a UsageAccountRiskQuery,
     cost_target_multiplier: f64,
 ) {
     builder.push(
@@ -5678,33 +5647,33 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                 records.model,
                 records.status,
                 records.pricing_available,
-                NULLIF(records.data->>'externalPoolId', '') AS external_pool_id_text,
-                NULLIF(BTRIM(records.data->>'externalPoolName'), '') AS external_pool_name,
+                NULLIF(records.data->>'accountId', '') AS account_id_text,
+                NULLIF(BTRIM(records.data->>'accountName'), '') AS account_name,
                 COALESCE(
-                    NULLIF(BTRIM(records.data #>> '{externalPoolBilling,pricingModel}'), ''),
+                    NULLIF(BTRIM(records.data #>> '{accountBilling,pricingModel}'), ''),
                     NULLIF(BTRIM(records.pricing_model), '')
                 ) AS pricing_model,
-                NULLIF(BTRIM(records.data #>> '{externalPoolBilling,usageProjectionMode}'), '')
+                NULLIF(BTRIM(records.data #>> '{accountBilling,usageProjectionMode}'), '')
                     AS usage_projection_mode,
-                COALESCE(jsonb_typeof(records.data->'externalPoolBilling') = 'object', false)
-                    AS external_pool_billing_present,
+                COALESCE(jsonb_typeof(records.data->'accountBilling') = 'object', false)
+                    AS account_billing_present,
                 COALESCE(
-                    jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage}') = 'object',
+                    jsonb_typeof(records.data #> '{accountBilling,rawUsage}') = 'object',
                     false
                 )
                     AS raw_usage_present,
                 COALESCE(
-                    jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage}') = 'object',
+                    jsonb_typeof(records.data #> '{accountBilling,reportedUsage}') = 'object',
                     false
                 )
                     AS reported_usage_present,
-                COALESCE(records.data #> '{externalPoolBilling,costFloorApplied}' = 'true'::jsonb, false)
+                COALESCE(records.data #> '{accountBilling,costFloorApplied}' = 'true'::jsonb, false)
                     AS cost_floor_applied,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,inputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,rawUsage,inputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,rawUsage,inputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,rawUsage,inputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5712,10 +5681,10 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE 0::bigint
                 END AS raw_input_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,outputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,rawUsage,outputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,rawUsage,outputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,rawUsage,outputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5723,10 +5692,10 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE 0::bigint
                 END AS raw_output_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,cacheReadInputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,rawUsage,cacheReadInputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,rawUsage,cacheReadInputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,rawUsage,cacheReadInputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5734,10 +5703,10 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE 0::bigint
                 END AS raw_cache_read_input_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,cacheCreationInputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,rawUsage,cacheCreationInputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,rawUsage,cacheCreationInputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,rawUsage,cacheCreationInputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5745,10 +5714,10 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE 0::bigint
                 END AS raw_cache_creation_input_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,inputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,reportedUsage,inputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,reportedUsage,inputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,reportedUsage,inputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5756,10 +5725,10 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE GREATEST(records.compat_input_tokens, 0)::bigint
                 END AS reported_input_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,outputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,reportedUsage,outputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,reportedUsage,outputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,reportedUsage,outputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5767,10 +5736,10 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE GREATEST(records.output_tokens, 0)::bigint
                 END AS reported_output_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,cacheReadInputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,reportedUsage,cacheReadInputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,reportedUsage,cacheReadInputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,reportedUsage,cacheReadInputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5778,10 +5747,10 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE GREATEST(records.cache_read_input_tokens, 0)::bigint
                 END AS reported_cache_read_input_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,cacheCreationInputTokens}') = 'number'
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,reportedUsage,cacheCreationInputTokens}') = 'number'
                     THEN GREATEST(
                         LEAST(
-                            (records.data #>> '{externalPoolBilling,reportedUsage,cacheCreationInputTokens}')::numeric,
+                            (records.data #>> '{accountBilling,reportedUsage,cacheCreationInputTokens}')::numeric,
                             9223372036854775807::numeric
                         ),
                         0::numeric
@@ -5789,15 +5758,15 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                     ELSE GREATEST(records.cache_creation_input_tokens, 0)::bigint
                 END AS reported_cache_creation_input_tokens,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawCostUsd}') = 'number'
-                    THEN (records.data #>> '{externalPoolBilling,rawCostUsd}')::double precision
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,rawCostUsd}') = 'number'
+                    THEN (records.data #>> '{accountBilling,rawCostUsd}')::double precision
                     WHEN COALESCE(records.original_cost_usd, 0) <> 0
                     THEN records.original_cost_usd
                     ELSE 0::double precision
                 END AS raw_cost_usd,
                 CASE
-                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedCostUsd}') = 'number'
-                    THEN (records.data #>> '{externalPoolBilling,reportedCostUsd}')::double precision
+                    WHEN jsonb_typeof(records.data #> '{accountBilling,reportedCostUsd}') = 'number'
+                    THEN (records.data #>> '{accountBilling,reportedCostUsd}')::double precision
                     WHEN COALESCE(records.estimated_cost_usd, 0) <> 0
                     THEN records.estimated_cost_usd
                     ELSE 0::double precision
@@ -5813,14 +5782,14 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
     builder.push(
         r#"
               AND (
-                  records.data->>'routeKind' = 'external_pool'
-                  OR jsonb_typeof(records.data->'externalPoolBilling') = 'object'
+                  records.data->>'routeKind' = 'account'
+                  OR jsonb_typeof(records.data->'accountBilling') = 'object'
               )
         "#,
     );
 
     if let Some(pool_id) = query.pool_id {
-        builder.push(" AND records.data->>'externalPoolId' = ");
+        builder.push(" AND records.data->>'accountId' = ");
         builder.push_bind(pool_id.to_string());
     }
     if let Some(endpoint) = query.endpoint.as_deref() {
@@ -5836,7 +5805,7 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
         builder.push_bind(model);
         builder.push(" OR records.data->>'externalOutboundModel' = ");
         builder.push_bind(model);
-        builder.push(" OR records.data #>> '{externalPoolBilling,pricingModel}' = ");
+        builder.push(" OR records.data #>> '{accountBilling,pricingModel}' = ");
         builder.push_bind(model);
         builder.push(")");
     }
@@ -5897,7 +5866,7 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
     builder.push(
         r#"::double precision) > reported_cost_usd
                     OR reported_output_tokens = 0
-                    OR NOT external_pool_billing_present
+                    OR NOT account_billing_present
                 ) AS has_warning_risk,
                 (
                     raw_cache_read_input_tokens >= "#,
@@ -5918,10 +5887,8 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
     );
 }
 
-fn external_pool_usage_risk_totals_from_row(
-    row: &PgRow,
-) -> anyhow::Result<UsageExternalPoolRiskTotals> {
-    Ok(UsageExternalPoolRiskTotals {
+fn account_usage_risk_totals_from_row(row: &PgRow) -> anyhow::Result<UsageAccountRiskTotals> {
+    Ok(UsageAccountRiskTotals {
         records: row_i64_to_usize(row, "records")?,
         success_records: row_i64_to_usize(row, "success_records")?,
         error_records: row_i64_to_usize(row, "error_records")?,
@@ -5931,19 +5898,16 @@ fn external_pool_usage_risk_totals_from_row(
         unpriced_records: row_i64_to_usize(row, "unpriced_records")?,
         raw_usage_records: row_i64_to_usize(row, "raw_usage_records")?,
         reported_usage_records: row_i64_to_usize(row, "reported_usage_records")?,
-        missing_external_pool_billing_records: row_i64_to_usize(
-            row,
-            "missing_external_pool_billing_records",
-        )?,
+        missing_account_billing_records: row_i64_to_usize(row, "missing_account_billing_records")?,
         output_zero_records: row_i64_to_usize(row, "output_zero_records")?,
     })
 }
 
-fn external_pool_usage_risk_cache_stats_from_row(
+fn account_usage_risk_cache_stats_from_row(
     row: &PgRow,
     prefix: &str,
-) -> anyhow::Result<UsageExternalPoolRiskCacheStats> {
-    Ok(UsageExternalPoolRiskCacheStats {
+) -> anyhow::Result<UsageAccountRiskCacheStats> {
+    Ok(UsageAccountRiskCacheStats {
         min_read_tokens: row.try_get(format!("{}_min_read_tokens", prefix).as_str())?,
         max_read_tokens: row.try_get(format!("{}_max_read_tokens", prefix).as_str())?,
         avg_read_tokens: row.try_get(format!("{}_avg_read_tokens", prefix).as_str())?,
@@ -5961,10 +5925,10 @@ fn external_pool_usage_risk_cache_stats_from_row(
     })
 }
 
-fn external_pool_usage_risk_cost_stats_from_row(
+fn account_usage_risk_cost_stats_from_row(
     row: &PgRow,
-) -> anyhow::Result<UsageExternalPoolRiskCostStats> {
-    Ok(UsageExternalPoolRiskCostStats {
+) -> anyhow::Result<UsageAccountRiskCostStats> {
+    Ok(UsageAccountRiskCostStats {
         raw_cost_usd: row.try_get("raw_cost_usd")?,
         reported_cost_usd: row.try_get("reported_cost_usd")?,
         target_cost_usd: row.try_get("target_cost_usd")?,
@@ -5984,10 +5948,8 @@ fn external_pool_usage_risk_cost_stats_from_row(
     })
 }
 
-fn external_pool_usage_risk_bucket_from_row(
-    row: PgRow,
-) -> anyhow::Result<UsageExternalPoolRiskBucket> {
-    Ok(UsageExternalPoolRiskBucket {
+fn account_usage_risk_bucket_from_row(row: PgRow) -> anyhow::Result<UsageAccountRiskBucket> {
+    Ok(UsageAccountRiskBucket {
         key: row.try_get("key")?,
         label: row.try_get("label")?,
         min_tokens: row.try_get("min_tokens")?,
@@ -5999,10 +5961,8 @@ fn external_pool_usage_risk_bucket_from_row(
     })
 }
 
-fn external_pool_usage_risk_group_from_row(
-    row: &PgRow,
-) -> anyhow::Result<UsageExternalPoolRiskGroup> {
-    Ok(UsageExternalPoolRiskGroup {
+fn account_usage_risk_group_from_row(row: &PgRow) -> anyhow::Result<UsageAccountRiskGroup> {
+    Ok(UsageAccountRiskGroup {
         key: row.try_get("group_key")?,
         label: row.try_get("group_label")?,
         records: row_i64_to_usize(row, "records")?,
@@ -6025,24 +5985,22 @@ fn external_pool_usage_risk_group_from_row(
     })
 }
 
-fn external_pool_usage_risk_sample_from_row(
-    row: PgRow,
-) -> anyhow::Result<UsageExternalPoolRiskSample> {
+fn account_usage_risk_sample_from_row(row: PgRow) -> anyhow::Result<UsageAccountRiskSample> {
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
-    Ok(UsageExternalPoolRiskSample {
+    Ok(UsageAccountRiskSample {
         id: row.try_get("id")?,
         created_at: created_at.to_rfc3339(),
         endpoint: row.try_get("endpoint")?,
         stream: row.try_get("stream")?,
         model: row.try_get("model")?,
         status: row.try_get("status")?,
-        external_pool_id: row
-            .try_get::<Option<String>, _>("external_pool_id_text")?
+        account_id: row
+            .try_get::<Option<String>, _>("account_id_text")?
             .and_then(|value| value.parse::<u64>().ok()),
-        external_pool_name: row.try_get("external_pool_name")?,
+        account_name: row.try_get("account_name")?,
         pricing_model: row.try_get("pricing_model")?,
         usage_projection_mode: row.try_get("usage_projection_mode")?,
-        external_pool_billing_present: row.try_get("external_pool_billing_present")?,
+        account_billing_present: row.try_get("account_billing_present")?,
         cost_floor_applied: row.try_get("cost_floor_applied")?,
         raw_input_tokens: row.try_get("raw_input_tokens")?,
         raw_output_tokens: row.try_get("raw_output_tokens")?,
@@ -6068,12 +6026,12 @@ fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
         return;
     }
 
-    if let Some(external_pool_billing) = record
-        .external_pool_billing
+    if let Some(account_billing) = record
+        .account_billing
         .as_ref()
         .filter(|billing| billing.raw_cost_usd != 0.0)
     {
-        record.original_cost_usd = external_pool_billing.raw_cost_usd;
+        record.original_cost_usd = account_billing.raw_cost_usd;
         return;
     }
 
@@ -6093,8 +6051,8 @@ async fn upsert_usage_record_in_tx(
     let applied = sqlx::query(
         r#"
         INSERT INTO usage_records (
-            id, created_at, endpoint, stream, model, conversation_id, credential_id,
-            credential_label, status, usage_source, total_input_tokens, compat_input_tokens,
+            id, created_at, endpoint, stream, model, conversation_id, account_id,
+            account_label, status, usage_source, total_input_tokens, compat_input_tokens,
             billable_input_tokens, output_tokens, cache_read_input_tokens,
             cache_creation_input_tokens, cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens, estimated_cost_usd, original_cost_usd,
@@ -6119,8 +6077,8 @@ async fn upsert_usage_record_in_tx(
             stream = EXCLUDED.stream,
             model = EXCLUDED.model,
             conversation_id = EXCLUDED.conversation_id,
-            credential_id = EXCLUDED.credential_id,
-            credential_label = EXCLUDED.credential_label,
+            account_id = EXCLUDED.account_id,
+            account_label = EXCLUDED.account_label,
             status = EXCLUDED.status,
             usage_source = EXCLUDED.usage_source,
             total_input_tokens = EXCLUDED.total_input_tokens,
@@ -6468,17 +6426,17 @@ struct UsageRollupMetrics {
     total_estimated_cost_usd: f64,
     total_original_cost_usd: f64,
 
-    external_pool_requests: i64,
-    external_pool_priced_requests: i64,
-    external_pool_unpriced_requests: i64,
-    external_pool_cost_floor_applied_requests: i64,
-    external_pool_raw_cost_usd: f64,
-    external_pool_shaped_cost_usd: f64,
-    external_pool_uplifted_cost_usd: f64,
-    external_pool_profit_usd: f64,
-    external_pool_reported_cost_usd: f64,
-    external_pool_billable_cost_usd: f64,
-    external_pool_cost_floor_delta_usd: f64,
+    account_requests: i64,
+    account_priced_requests: i64,
+    account_unpriced_requests: i64,
+    account_cost_floor_applied_requests: i64,
+    account_raw_cost_usd: f64,
+    account_shaped_cost_usd: f64,
+    account_uplifted_cost_usd: f64,
+    account_profit_usd: f64,
+    account_reported_cost_usd: f64,
+    account_billable_cost_usd: f64,
+    account_cost_floor_delta_usd: f64,
     duration_ms_sum: i64,
     duration_ms_count: i64,
     duration_ms_max: i64,
@@ -6490,10 +6448,10 @@ impl UsageRollupMetrics {
         let success = record.status == UsageRecordStatus::Success;
         let local_prompt_cache = record.usage_source == UsageSource::LocalPromptCache;
         let upstream_metadata = record.usage_source == UsageSource::UpstreamMetadata;
-        let external_pool = record.route_kind == Some(UsageRouteKind::ExternalPool);
-        let external_billing = record.external_pool_billing.as_ref();
+        let account = record.route_kind == Some(UsageRouteKind::Account);
+        let external_billing = record.account_billing.as_ref();
         let external_priced =
-            external_pool && external_billing.is_some_and(|billing| billing.pricing_available);
+            account && external_billing.is_some_and(|billing| billing.pricing_available);
         Self {
             requests: sign,
             success_requests: signed_bool(success, sign),
@@ -6530,32 +6488,32 @@ impl UsageRollupMetrics {
             total_estimated_cost_usd: record.estimated_cost_usd * sign as f64,
             total_original_cost_usd: record.original_cost_usd * sign as f64,
 
-            external_pool_requests: signed_bool(external_pool, sign),
-            external_pool_priced_requests: signed_bool(external_priced, sign),
-            external_pool_unpriced_requests: signed_bool(external_pool && !external_priced, sign),
-            external_pool_cost_floor_applied_requests: signed_bool(
+            account_requests: signed_bool(account, sign),
+            account_priced_requests: signed_bool(external_priced, sign),
+            account_unpriced_requests: signed_bool(account && !external_priced, sign),
+            account_cost_floor_applied_requests: signed_bool(
                 external_billing.is_some_and(|billing| billing.cost_floor_applied),
                 sign,
             ),
-            external_pool_raw_cost_usd: external_billing
+            account_raw_cost_usd: external_billing
                 .map(|billing| billing.raw_cost_usd * sign as f64)
                 .unwrap_or(0.0),
-            external_pool_shaped_cost_usd: external_billing
+            account_shaped_cost_usd: external_billing
                 .map(|billing| billing.effective_shaped_cost_usd() * sign as f64)
                 .unwrap_or(0.0),
-            external_pool_uplifted_cost_usd: external_billing
+            account_uplifted_cost_usd: external_billing
                 .map(|billing| billing.effective_uplifted_cost_usd() * sign as f64)
                 .unwrap_or(0.0),
-            external_pool_profit_usd: external_billing
+            account_profit_usd: external_billing
                 .map(|billing| billing.effective_profit_usd() * sign as f64)
                 .unwrap_or(0.0),
-            external_pool_reported_cost_usd: external_billing
+            account_reported_cost_usd: external_billing
                 .map(|billing| billing.reported_cost_usd * sign as f64)
                 .unwrap_or(0.0),
-            external_pool_billable_cost_usd: external_billing
+            account_billable_cost_usd: external_billing
                 .map(|billing| billing.billable_cost_usd * sign as f64)
                 .unwrap_or(0.0),
-            external_pool_cost_floor_delta_usd: external_billing
+            account_cost_floor_delta_usd: external_billing
                 .map(|billing| billing.cost_floor_delta_usd * sign as f64)
                 .unwrap_or(0.0),
             duration_ms_sum: (record.duration_ms.min(i64::MAX as u64) as i64) * sign,
@@ -6591,18 +6549,17 @@ impl UsageRollupMetrics {
             other.local_prompt_cache_creation_input_tokens;
         self.total_estimated_cost_usd += other.total_estimated_cost_usd;
         self.total_original_cost_usd += other.total_original_cost_usd;
-        self.external_pool_requests += other.external_pool_requests;
-        self.external_pool_priced_requests += other.external_pool_priced_requests;
-        self.external_pool_unpriced_requests += other.external_pool_unpriced_requests;
-        self.external_pool_cost_floor_applied_requests +=
-            other.external_pool_cost_floor_applied_requests;
-        self.external_pool_raw_cost_usd += other.external_pool_raw_cost_usd;
-        self.external_pool_shaped_cost_usd += other.external_pool_shaped_cost_usd;
-        self.external_pool_uplifted_cost_usd += other.external_pool_uplifted_cost_usd;
-        self.external_pool_profit_usd += other.external_pool_profit_usd;
-        self.external_pool_reported_cost_usd += other.external_pool_reported_cost_usd;
-        self.external_pool_billable_cost_usd += other.external_pool_billable_cost_usd;
-        self.external_pool_cost_floor_delta_usd += other.external_pool_cost_floor_delta_usd;
+        self.account_requests += other.account_requests;
+        self.account_priced_requests += other.account_priced_requests;
+        self.account_unpriced_requests += other.account_unpriced_requests;
+        self.account_cost_floor_applied_requests += other.account_cost_floor_applied_requests;
+        self.account_raw_cost_usd += other.account_raw_cost_usd;
+        self.account_shaped_cost_usd += other.account_shaped_cost_usd;
+        self.account_uplifted_cost_usd += other.account_uplifted_cost_usd;
+        self.account_profit_usd += other.account_profit_usd;
+        self.account_reported_cost_usd += other.account_reported_cost_usd;
+        self.account_billable_cost_usd += other.account_billable_cost_usd;
+        self.account_cost_floor_delta_usd += other.account_cost_floor_delta_usd;
         self.duration_ms_sum += other.duration_ms_sum;
         self.duration_ms_count += other.duration_ms_count;
         self.duration_ms_max = self.duration_ms_max.max(other.duration_ms_max);
@@ -6948,12 +6905,12 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
         });
     }
 
-    if let Some(external_pool_id) = record.external_pool_id {
+    if let Some(account_id) = record.account_id {
         dimensions.push(UsageRollupDimension {
-            dimension: "external_pool",
-            key: external_pool_id.to_string(),
+            dimension: "account",
+            key: account_id.to_string(),
             label: record
-                .external_pool_name
+                .account_name
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -7016,11 +6973,11 @@ async fn upsert_usage_rollup_total(
             local_prompt_cache_input_tokens, local_prompt_cache_read_input_tokens,
             local_prompt_cache_creation_input_tokens, total_estimated_cost_usd,
             total_original_cost_usd,
-            external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
-            external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
-            external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
-            external_pool_profit_usd, external_pool_reported_cost_usd,
-            external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+            account_requests, account_priced_requests, account_unpriced_requests,
+            account_cost_floor_applied_requests, account_raw_cost_usd,
+            account_shaped_cost_usd, account_uplifted_cost_usd,
+            account_profit_usd, account_reported_cost_usd,
+            account_billable_cost_usd, account_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count, duration_ms_max, total_compat_input_tokens,
             updated_at
         )
@@ -7057,17 +7014,17 @@ async fn upsert_usage_rollup_total(
             total_estimated_cost_usd = usage_rollup_totals.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_totals.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
 
-            external_pool_requests = usage_rollup_totals.external_pool_requests + EXCLUDED.external_pool_requests,
-            external_pool_priced_requests = usage_rollup_totals.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
-            external_pool_unpriced_requests = usage_rollup_totals.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
-            external_pool_cost_floor_applied_requests = usage_rollup_totals.external_pool_cost_floor_applied_requests + EXCLUDED.external_pool_cost_floor_applied_requests,
-            external_pool_raw_cost_usd = usage_rollup_totals.external_pool_raw_cost_usd + EXCLUDED.external_pool_raw_cost_usd,
-            external_pool_shaped_cost_usd = usage_rollup_totals.external_pool_shaped_cost_usd + EXCLUDED.external_pool_shaped_cost_usd,
-            external_pool_uplifted_cost_usd = usage_rollup_totals.external_pool_uplifted_cost_usd + EXCLUDED.external_pool_uplifted_cost_usd,
-            external_pool_profit_usd = usage_rollup_totals.external_pool_profit_usd + EXCLUDED.external_pool_profit_usd,
-            external_pool_reported_cost_usd = usage_rollup_totals.external_pool_reported_cost_usd + EXCLUDED.external_pool_reported_cost_usd,
-            external_pool_billable_cost_usd = usage_rollup_totals.external_pool_billable_cost_usd + EXCLUDED.external_pool_billable_cost_usd,
-            external_pool_cost_floor_delta_usd = usage_rollup_totals.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
+            account_requests = usage_rollup_totals.account_requests + EXCLUDED.account_requests,
+            account_priced_requests = usage_rollup_totals.account_priced_requests + EXCLUDED.account_priced_requests,
+            account_unpriced_requests = usage_rollup_totals.account_unpriced_requests + EXCLUDED.account_unpriced_requests,
+            account_cost_floor_applied_requests = usage_rollup_totals.account_cost_floor_applied_requests + EXCLUDED.account_cost_floor_applied_requests,
+            account_raw_cost_usd = usage_rollup_totals.account_raw_cost_usd + EXCLUDED.account_raw_cost_usd,
+            account_shaped_cost_usd = usage_rollup_totals.account_shaped_cost_usd + EXCLUDED.account_shaped_cost_usd,
+            account_uplifted_cost_usd = usage_rollup_totals.account_uplifted_cost_usd + EXCLUDED.account_uplifted_cost_usd,
+            account_profit_usd = usage_rollup_totals.account_profit_usd + EXCLUDED.account_profit_usd,
+            account_reported_cost_usd = usage_rollup_totals.account_reported_cost_usd + EXCLUDED.account_reported_cost_usd,
+            account_billable_cost_usd = usage_rollup_totals.account_billable_cost_usd + EXCLUDED.account_billable_cost_usd,
+            account_cost_floor_delta_usd = usage_rollup_totals.account_cost_floor_delta_usd + EXCLUDED.account_cost_floor_delta_usd,
             duration_ms_sum = usage_rollup_totals.duration_ms_sum + EXCLUDED.duration_ms_sum,
             duration_ms_count = usage_rollup_totals.duration_ms_count + EXCLUDED.duration_ms_count,
             duration_ms_max = CASE
@@ -7103,17 +7060,17 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
 
-    .bind(metrics.external_pool_requests)
-    .bind(metrics.external_pool_priced_requests)
-    .bind(metrics.external_pool_unpriced_requests)
-    .bind(metrics.external_pool_cost_floor_applied_requests)
-    .bind(metrics.external_pool_raw_cost_usd)
-    .bind(metrics.external_pool_shaped_cost_usd)
-    .bind(metrics.external_pool_uplifted_cost_usd)
-    .bind(metrics.external_pool_profit_usd)
-    .bind(metrics.external_pool_reported_cost_usd)
-    .bind(metrics.external_pool_billable_cost_usd)
-    .bind(metrics.external_pool_cost_floor_delta_usd)
+    .bind(metrics.account_requests)
+    .bind(metrics.account_priced_requests)
+    .bind(metrics.account_unpriced_requests)
+    .bind(metrics.account_cost_floor_applied_requests)
+    .bind(metrics.account_raw_cost_usd)
+    .bind(metrics.account_shaped_cost_usd)
+    .bind(metrics.account_uplifted_cost_usd)
+    .bind(metrics.account_profit_usd)
+    .bind(metrics.account_reported_cost_usd)
+    .bind(metrics.account_billable_cost_usd)
+    .bind(metrics.account_cost_floor_delta_usd)
     .bind(metrics.duration_ms_sum)
     .bind(metrics.duration_ms_count)
     .bind(metrics.duration_ms_max)
@@ -7140,11 +7097,11 @@ async fn upsert_usage_rollup_time_bucket(
             total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
             local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd, total_original_cost_usd,
-            external_pool_requests, external_pool_priced_requests,
-            external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
-            external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
-            external_pool_uplifted_cost_usd, external_pool_profit_usd, external_pool_reported_cost_usd,
-            external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+            account_requests, account_priced_requests,
+            account_unpriced_requests, account_cost_floor_applied_requests,
+            account_raw_cost_usd, account_shaped_cost_usd,
+            account_uplifted_cost_usd, account_profit_usd, account_reported_cost_usd,
+            account_billable_cost_usd, account_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count,
             duration_ms_max, total_compat_input_tokens, updated_at
         )
@@ -7180,17 +7137,17 @@ async fn upsert_usage_rollup_time_bucket(
             total_estimated_cost_usd = usage_rollup_time_buckets.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_time_buckets.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
 
-            external_pool_requests = usage_rollup_time_buckets.external_pool_requests + EXCLUDED.external_pool_requests,
-            external_pool_priced_requests = usage_rollup_time_buckets.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
-            external_pool_unpriced_requests = usage_rollup_time_buckets.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
-            external_pool_cost_floor_applied_requests = usage_rollup_time_buckets.external_pool_cost_floor_applied_requests + EXCLUDED.external_pool_cost_floor_applied_requests,
-            external_pool_raw_cost_usd = usage_rollup_time_buckets.external_pool_raw_cost_usd + EXCLUDED.external_pool_raw_cost_usd,
-            external_pool_shaped_cost_usd = usage_rollup_time_buckets.external_pool_shaped_cost_usd + EXCLUDED.external_pool_shaped_cost_usd,
-            external_pool_uplifted_cost_usd = usage_rollup_time_buckets.external_pool_uplifted_cost_usd + EXCLUDED.external_pool_uplifted_cost_usd,
-            external_pool_profit_usd = usage_rollup_time_buckets.external_pool_profit_usd + EXCLUDED.external_pool_profit_usd,
-            external_pool_reported_cost_usd = usage_rollup_time_buckets.external_pool_reported_cost_usd + EXCLUDED.external_pool_reported_cost_usd,
-            external_pool_billable_cost_usd = usage_rollup_time_buckets.external_pool_billable_cost_usd + EXCLUDED.external_pool_billable_cost_usd,
-            external_pool_cost_floor_delta_usd = usage_rollup_time_buckets.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
+            account_requests = usage_rollup_time_buckets.account_requests + EXCLUDED.account_requests,
+            account_priced_requests = usage_rollup_time_buckets.account_priced_requests + EXCLUDED.account_priced_requests,
+            account_unpriced_requests = usage_rollup_time_buckets.account_unpriced_requests + EXCLUDED.account_unpriced_requests,
+            account_cost_floor_applied_requests = usage_rollup_time_buckets.account_cost_floor_applied_requests + EXCLUDED.account_cost_floor_applied_requests,
+            account_raw_cost_usd = usage_rollup_time_buckets.account_raw_cost_usd + EXCLUDED.account_raw_cost_usd,
+            account_shaped_cost_usd = usage_rollup_time_buckets.account_shaped_cost_usd + EXCLUDED.account_shaped_cost_usd,
+            account_uplifted_cost_usd = usage_rollup_time_buckets.account_uplifted_cost_usd + EXCLUDED.account_uplifted_cost_usd,
+            account_profit_usd = usage_rollup_time_buckets.account_profit_usd + EXCLUDED.account_profit_usd,
+            account_reported_cost_usd = usage_rollup_time_buckets.account_reported_cost_usd + EXCLUDED.account_reported_cost_usd,
+            account_billable_cost_usd = usage_rollup_time_buckets.account_billable_cost_usd + EXCLUDED.account_billable_cost_usd,
+            account_cost_floor_delta_usd = usage_rollup_time_buckets.account_cost_floor_delta_usd + EXCLUDED.account_cost_floor_delta_usd,
             duration_ms_sum = usage_rollup_time_buckets.duration_ms_sum + EXCLUDED.duration_ms_sum,
             duration_ms_count = usage_rollup_time_buckets.duration_ms_count + EXCLUDED.duration_ms_count,
             duration_ms_max = CASE
@@ -7227,17 +7184,17 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
 
-    .bind(metrics.external_pool_requests)
-    .bind(metrics.external_pool_priced_requests)
-    .bind(metrics.external_pool_unpriced_requests)
-    .bind(metrics.external_pool_cost_floor_applied_requests)
-    .bind(metrics.external_pool_raw_cost_usd)
-    .bind(metrics.external_pool_shaped_cost_usd)
-    .bind(metrics.external_pool_uplifted_cost_usd)
-    .bind(metrics.external_pool_profit_usd)
-    .bind(metrics.external_pool_reported_cost_usd)
-    .bind(metrics.external_pool_billable_cost_usd)
-    .bind(metrics.external_pool_cost_floor_delta_usd)
+    .bind(metrics.account_requests)
+    .bind(metrics.account_priced_requests)
+    .bind(metrics.account_unpriced_requests)
+    .bind(metrics.account_cost_floor_applied_requests)
+    .bind(metrics.account_raw_cost_usd)
+    .bind(metrics.account_shaped_cost_usd)
+    .bind(metrics.account_uplifted_cost_usd)
+    .bind(metrics.account_profit_usd)
+    .bind(metrics.account_reported_cost_usd)
+    .bind(metrics.account_billable_cost_usd)
+    .bind(metrics.account_cost_floor_delta_usd)
     .bind(metrics.duration_ms_sum)
     .bind(metrics.duration_ms_count)
     .bind(metrics.duration_ms_max)
@@ -7541,7 +7498,7 @@ impl DashboardTopGroup {
     fn detail_key_column(self) -> &'static str {
         match self {
             Self::Model => "COALESCE(NULLIF(BTRIM(r.model), ''), 'unknown')",
-            Self::Credential => "r.credential_id::text",
+            Self::Credential => "r.account_id::text",
             Self::Endpoint => "COALESCE(NULLIF(BTRIM(r.endpoint), ''), 'unknown')",
             Self::Error => "COALESCE(NULLIF(BTRIM(r.error_type), ''), r.status)",
         }
@@ -7549,7 +7506,7 @@ impl DashboardTopGroup {
 
     fn detail_label_column(self) -> &'static str {
         match self {
-            Self::Credential => "NULLIF(BTRIM(r.credential_label), '')",
+            Self::Credential => "NULLIF(BTRIM(r.account_label), '')",
             Self::Error => "NULLIF(BTRIM(r.error_message), '')",
             _ => "NULL::text",
         }
@@ -7557,7 +7514,7 @@ impl DashboardTopGroup {
 
     fn detail_filter(self) -> Option<&'static str> {
         match self {
-            Self::Credential => Some("r.credential_id IS NOT NULL"),
+            Self::Credential => Some("r.account_id IS NOT NULL"),
             Self::Error => Some("r.status <> 'success'"),
             _ => None,
         }
@@ -7595,18 +7552,18 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "model",
             "conversation_id",
             "data->>'requestApiKeyId'",
-            "credential_label",
+            "account_label",
             "status",
             "usage_source",
             "error_type",
             "error_message",
             "error_detail",
             "pricing_model",
-            "credential_id::text",
+            "account_id::text",
             "data->>'upstreamModel'",
             "data->>'externalOutboundModel'",
-            "data->>'externalPoolId'",
-            "data->>'externalPoolName'",
+            "data->>'accountId'",
+            "data->>'accountName'",
             "data->>'routeKind'",
             "data->>'routeSubtype'",
             "data->>'modelResolutionSource'",
@@ -7644,12 +7601,12 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
         builder.push_bind(request_api_key_id.to_string());
     }
     if let Some(credential_id) = query.credential_id {
-        builder.push(" AND credential_id = ");
+        builder.push(" AND account_id = ");
         builder.push_bind(credential_id as i64);
     }
-    if let Some(external_pool_id) = query.external_pool_id {
-        builder.push(" AND data->>'externalPoolId' = ");
-        builder.push_bind(external_pool_id.to_string());
+    if let Some(account_id) = query.account_id {
+        builder.push(" AND data->>'accountId' = ");
+        builder.push_bind(account_id.to_string());
     }
     if let Some(route_kind) = query.route_kind {
         builder.push(" AND data->>'routeKind' = ");
@@ -7769,8 +7726,8 @@ fn push_dashboard_windows_cte(
             records.usage_source,
             records.model,
             records.endpoint,
-            records.credential_id,
-            records.credential_label,
+            records.account_id,
+            records.account_label,
             records.error_type,
             records.error_message,
             records.stream,
@@ -7786,9 +7743,9 @@ fn push_dashboard_windows_cte(
             records.simulated,
 
 
-            records.data->>'externalPoolId' AS dashboard_external_pool_id,
-            NULLIF(BTRIM(records.data->>'externalPoolName'), '')
-                AS dashboard_external_pool_name,
+            records.data->>'accountId' AS dashboard_account_id,
+            NULLIF(BTRIM(records.data->>'accountName'), '')
+                AS dashboard_account_name,
             CASE
                 WHEN jsonb_typeof(records.data->'durationMs') = 'number'
                  AND records.data->>'durationMs' ~ '^[0-9]+$'
@@ -7798,45 +7755,45 @@ fn push_dashboard_windows_cte(
                 )::bigint
                 ELSE GREATEST(records.duration_ms, 0)
             END AS dashboard_duration_ms,
-            records.data->>'routeKind' = 'external_pool' AS dashboard_external_pool,
-            jsonb_typeof(records.data->'externalPoolBilling') = 'object'
+            records.data->>'routeKind' = 'account' AS dashboard_account,
+            jsonb_typeof(records.data->'accountBilling') = 'object'
                 AS dashboard_external_billing_present,
             COALESCE(
-                records.data #> '{externalPoolBilling,pricingAvailable}' = 'true'::jsonb,
+                records.data #> '{accountBilling,pricingAvailable}' = 'true'::jsonb,
                 false
             ) AS dashboard_external_pricing_available,
             COALESCE(
-                records.data #> '{externalPoolBilling,costFloorApplied}' = 'true'::jsonb,
+                records.data #> '{accountBilling,costFloorApplied}' = 'true'::jsonb,
                 false
             ) AS dashboard_external_cost_floor_applied,
             CASE
-                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawCostUsd}') = 'number'
-                THEN (records.data #>> '{externalPoolBilling,rawCostUsd}')::double precision
+                WHEN jsonb_typeof(records.data #> '{accountBilling,rawCostUsd}') = 'number'
+                THEN (records.data #>> '{accountBilling,rawCostUsd}')::double precision
                 ELSE 0::double precision
             END AS dashboard_external_raw_cost_usd,
             CASE
-                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,shapedCostUsd}') = 'number'
-                THEN (records.data #>> '{externalPoolBilling,shapedCostUsd}')::double precision
+                WHEN jsonb_typeof(records.data #> '{accountBilling,shapedCostUsd}') = 'number'
+                THEN (records.data #>> '{accountBilling,shapedCostUsd}')::double precision
                 ELSE 0::double precision
             END AS dashboard_external_shaped_cost_usd,
             CASE
-                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,upliftedCostUsd}') = 'number'
-                THEN (records.data #>> '{externalPoolBilling,upliftedCostUsd}')::double precision
+                WHEN jsonb_typeof(records.data #> '{accountBilling,upliftedCostUsd}') = 'number'
+                THEN (records.data #>> '{accountBilling,upliftedCostUsd}')::double precision
                 ELSE 0::double precision
             END AS dashboard_external_uplifted_cost_usd,
             CASE
-                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedCostUsd}') = 'number'
-                THEN (records.data #>> '{externalPoolBilling,reportedCostUsd}')::double precision
+                WHEN jsonb_typeof(records.data #> '{accountBilling,reportedCostUsd}') = 'number'
+                THEN (records.data #>> '{accountBilling,reportedCostUsd}')::double precision
                 ELSE 0::double precision
             END AS dashboard_external_reported_cost_usd,
             CASE
-                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,billableCostUsd}') = 'number'
-                THEN (records.data #>> '{externalPoolBilling,billableCostUsd}')::double precision
+                WHEN jsonb_typeof(records.data #> '{accountBilling,billableCostUsd}') = 'number'
+                THEN (records.data #>> '{accountBilling,billableCostUsd}')::double precision
                 ELSE 0::double precision
             END AS dashboard_external_billable_cost_usd,
             CASE
-                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,costFloorDeltaUsd}') = 'number'
-                THEN (records.data #>> '{externalPoolBilling,costFloorDeltaUsd}')::double precision
+                WHEN jsonb_typeof(records.data #> '{accountBilling,costFloorDeltaUsd}') = 'number'
+                THEN (records.data #>> '{accountBilling,costFloorDeltaUsd}')::double precision
                 ELSE 0::double precision
             END AS dashboard_external_cost_floor_delta_usd
         FROM window_boundary_ranges ranges
@@ -7893,17 +7850,17 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
 
             buckets.simulated_requests,
             buckets.upstream_metadata_requests,
-            buckets.external_pool_requests,
-            buckets.external_pool_priced_requests,
-            buckets.external_pool_unpriced_requests,
-            buckets.external_pool_cost_floor_applied_requests,
-            buckets.external_pool_raw_cost_usd,
-            buckets.external_pool_shaped_cost_usd,
-            buckets.external_pool_uplifted_cost_usd,
-            buckets.external_pool_profit_usd,
-            buckets.external_pool_reported_cost_usd,
-            buckets.external_pool_billable_cost_usd,
-            buckets.external_pool_cost_floor_delta_usd,
+            buckets.account_requests,
+            buckets.account_priced_requests,
+            buckets.account_unpriced_requests,
+            buckets.account_cost_floor_applied_requests,
+            buckets.account_raw_cost_usd,
+            buckets.account_shaped_cost_usd,
+            buckets.account_uplifted_cost_usd,
+            buckets.account_profit_usd,
+            buckets.account_reported_cost_usd,
+            buckets.account_billable_cost_usd,
+            buckets.account_cost_floor_delta_usd,
             buckets.duration_ms_sum::numeric AS duration_ms_sum,
             buckets.duration_ms_count
         FROM window_bounds w
@@ -7937,40 +7894,40 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
             COUNT(*) FILTER (WHERE records.simulated)::bigint AS simulated_requests,
             COUNT(*) FILTER (WHERE records.usage_source = 'upstream_metadata')::bigint
                 AS upstream_metadata_requests,
-            COUNT(*) FILTER (WHERE records.dashboard_external_pool)::bigint
-                AS external_pool_requests,
+            COUNT(*) FILTER (WHERE records.dashboard_account)::bigint
+                AS account_requests,
             COUNT(*) FILTER (
-                WHERE records.dashboard_external_pool
+                WHERE records.dashboard_account
                   AND records.dashboard_external_billing_present
                   AND records.dashboard_external_pricing_available
-            )::bigint AS external_pool_priced_requests,
+            )::bigint AS account_priced_requests,
             COUNT(*) FILTER (
-                WHERE records.dashboard_external_pool
+                WHERE records.dashboard_account
                   AND NOT (
                       records.dashboard_external_billing_present
                       AND records.dashboard_external_pricing_available
                   )
-            )::bigint AS external_pool_unpriced_requests,
+            )::bigint AS account_unpriced_requests,
             COUNT(*) FILTER (
                 WHERE records.dashboard_external_billing_present
                   AND records.dashboard_external_cost_floor_applied
-            )::bigint AS external_pool_cost_floor_applied_requests,
+            )::bigint AS account_cost_floor_applied_requests,
             COALESCE(SUM(records.dashboard_external_raw_cost_usd), 0)::double precision
-                AS external_pool_raw_cost_usd,
+                AS account_raw_cost_usd,
             COALESCE(SUM(records.dashboard_external_effective_shaped_cost_usd), 0)::double precision
-                AS external_pool_shaped_cost_usd,
+                AS account_shaped_cost_usd,
             COALESCE(SUM(records.dashboard_external_effective_uplifted_cost_usd), 0)::double precision
-                AS external_pool_uplifted_cost_usd,
+                AS account_uplifted_cost_usd,
             COALESCE(SUM(
                 records.dashboard_external_effective_uplifted_cost_usd
                 - records.dashboard_external_raw_cost_usd
-            ), 0)::double precision AS external_pool_profit_usd,
+            ), 0)::double precision AS account_profit_usd,
             COALESCE(SUM(records.dashboard_external_reported_cost_usd), 0)::double precision
-                AS external_pool_reported_cost_usd,
+                AS account_reported_cost_usd,
             COALESCE(SUM(records.dashboard_external_billable_cost_usd), 0)::double precision
-                AS external_pool_billable_cost_usd,
+                AS account_billable_cost_usd,
             COALESCE(SUM(records.dashboard_external_cost_floor_delta_usd), 0)::double precision
-                AS external_pool_cost_floor_delta_usd,
+                AS account_cost_floor_delta_usd,
             COALESCE(SUM(records.dashboard_duration_ms::numeric), 0)::numeric AS duration_ms_sum,
             COUNT(*)::bigint AS duration_ms_count
         FROM window_boundary_records records
@@ -7999,27 +7956,27 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
 
             SUM(segment_rows.simulated_requests)::bigint AS simulated_requests,
             SUM(segment_rows.upstream_metadata_requests)::bigint AS upstream_metadata_requests,
-            SUM(segment_rows.external_pool_requests)::bigint AS external_pool_requests,
-            SUM(segment_rows.external_pool_priced_requests)::bigint
-                AS external_pool_priced_requests,
-            SUM(segment_rows.external_pool_unpriced_requests)::bigint
-                AS external_pool_unpriced_requests,
-            SUM(segment_rows.external_pool_cost_floor_applied_requests)::bigint
-                AS external_pool_cost_floor_applied_requests,
-            SUM(segment_rows.external_pool_raw_cost_usd)::double precision
-                AS external_pool_raw_cost_usd,
-            SUM(segment_rows.external_pool_shaped_cost_usd)::double precision
-                AS external_pool_shaped_cost_usd,
-            SUM(segment_rows.external_pool_uplifted_cost_usd)::double precision
-                AS external_pool_uplifted_cost_usd,
-            SUM(segment_rows.external_pool_profit_usd)::double precision
-                AS external_pool_profit_usd,
-            SUM(segment_rows.external_pool_reported_cost_usd)::double precision
-                AS external_pool_reported_cost_usd,
-            SUM(segment_rows.external_pool_billable_cost_usd)::double precision
-                AS external_pool_billable_cost_usd,
-            SUM(segment_rows.external_pool_cost_floor_delta_usd)::double precision
-                AS external_pool_cost_floor_delta_usd,
+            SUM(segment_rows.account_requests)::bigint AS account_requests,
+            SUM(segment_rows.account_priced_requests)::bigint
+                AS account_priced_requests,
+            SUM(segment_rows.account_unpriced_requests)::bigint
+                AS account_unpriced_requests,
+            SUM(segment_rows.account_cost_floor_applied_requests)::bigint
+                AS account_cost_floor_applied_requests,
+            SUM(segment_rows.account_raw_cost_usd)::double precision
+                AS account_raw_cost_usd,
+            SUM(segment_rows.account_shaped_cost_usd)::double precision
+                AS account_shaped_cost_usd,
+            SUM(segment_rows.account_uplifted_cost_usd)::double precision
+                AS account_uplifted_cost_usd,
+            SUM(segment_rows.account_profit_usd)::double precision
+                AS account_profit_usd,
+            SUM(segment_rows.account_reported_cost_usd)::double precision
+                AS account_reported_cost_usd,
+            SUM(segment_rows.account_billable_cost_usd)::double precision
+                AS account_billable_cost_usd,
+            SUM(segment_rows.account_cost_floor_delta_usd)::double precision
+                AS account_cost_floor_delta_usd,
             SUM(segment_rows.duration_ms_sum)::numeric AS duration_ms_sum,
             SUM(segment_rows.duration_ms_count)::bigint AS duration_ms_count
         FROM dashboard_global_segment_rows segment_rows
@@ -8028,29 +7985,29 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
     );
 }
 
-fn push_dashboard_external_pool_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) {
+fn push_dashboard_account_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) {
     builder.push(
-        r#", dashboard_external_pool_segment_rows AS (
+        r#", dashboard_account_segment_rows AS (
         SELECT
             w.key AS window_key,
             date_trunc('hour', buckets.bucket_start AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
                 AS segment_hour,
             buckets.dimension_key AS pool_id,
             buckets.dimension_label AS pool_name,
-            buckets.external_pool_requests,
-            buckets.external_pool_priced_requests,
-            buckets.external_pool_unpriced_requests,
-            buckets.external_pool_cost_floor_applied_requests,
-            buckets.external_pool_raw_cost_usd,
-            buckets.external_pool_shaped_cost_usd,
-            buckets.external_pool_uplifted_cost_usd,
-            buckets.external_pool_profit_usd,
-            buckets.external_pool_reported_cost_usd,
-            buckets.external_pool_billable_cost_usd,
-            buckets.external_pool_cost_floor_delta_usd
+            buckets.account_requests,
+            buckets.account_priced_requests,
+            buckets.account_unpriced_requests,
+            buckets.account_cost_floor_applied_requests,
+            buckets.account_raw_cost_usd,
+            buckets.account_shaped_cost_usd,
+            buckets.account_uplifted_cost_usd,
+            buckets.account_profit_usd,
+            buckets.account_reported_cost_usd,
+            buckets.account_billable_cost_usd,
+            buckets.account_cost_floor_delta_usd
         FROM window_bounds w
         JOIN usage_rollup_time_buckets buckets
-          ON buckets.dimension = 'external_pool'
+          ON buckets.dimension = 'account'
          AND buckets.bucket_start >= w.full_from_at
          AND buckets.bucket_start < w.full_to_at
 
@@ -8059,76 +8016,76 @@ fn push_dashboard_external_pool_segments_cte(builder: &mut QueryBuilder<'_, Post
         SELECT
             records.window_key,
             records.boundary_hour AS segment_hour,
-            records.dashboard_external_pool_id AS pool_id,
-            MAX(records.dashboard_external_pool_name) AS pool_name,
-            COUNT(*) FILTER (WHERE records.dashboard_external_pool)::bigint
-                AS external_pool_requests,
+            records.dashboard_account_id AS pool_id,
+            MAX(records.dashboard_account_name) AS pool_name,
+            COUNT(*) FILTER (WHERE records.dashboard_account)::bigint
+                AS account_requests,
             COUNT(*) FILTER (
-                WHERE records.dashboard_external_pool
+                WHERE records.dashboard_account
                   AND records.dashboard_external_billing_present
                   AND records.dashboard_external_pricing_available
-            )::bigint AS external_pool_priced_requests,
+            )::bigint AS account_priced_requests,
             COUNT(*) FILTER (
-                WHERE records.dashboard_external_pool
+                WHERE records.dashboard_account
                   AND NOT (
                       records.dashboard_external_billing_present
                       AND records.dashboard_external_pricing_available
                   )
-            )::bigint AS external_pool_unpriced_requests,
+            )::bigint AS account_unpriced_requests,
             COUNT(*) FILTER (
                 WHERE records.dashboard_external_billing_present
                   AND records.dashboard_external_cost_floor_applied
-            )::bigint AS external_pool_cost_floor_applied_requests,
+            )::bigint AS account_cost_floor_applied_requests,
             COALESCE(SUM(records.dashboard_external_raw_cost_usd), 0)::double precision
-                AS external_pool_raw_cost_usd,
+                AS account_raw_cost_usd,
             COALESCE(SUM(records.dashboard_external_effective_shaped_cost_usd), 0)::double precision
-                AS external_pool_shaped_cost_usd,
+                AS account_shaped_cost_usd,
             COALESCE(SUM(records.dashboard_external_effective_uplifted_cost_usd), 0)::double precision
-                AS external_pool_uplifted_cost_usd,
+                AS account_uplifted_cost_usd,
             COALESCE(SUM(
                 records.dashboard_external_effective_uplifted_cost_usd
                 - records.dashboard_external_raw_cost_usd
-            ), 0)::double precision AS external_pool_profit_usd,
+            ), 0)::double precision AS account_profit_usd,
             COALESCE(SUM(records.dashboard_external_reported_cost_usd), 0)::double precision
-                AS external_pool_reported_cost_usd,
+                AS account_reported_cost_usd,
             COALESCE(SUM(records.dashboard_external_billable_cost_usd), 0)::double precision
-                AS external_pool_billable_cost_usd,
+                AS account_billable_cost_usd,
             COALESCE(SUM(records.dashboard_external_cost_floor_delta_usd), 0)::double precision
-                AS external_pool_cost_floor_delta_usd
+                AS account_cost_floor_delta_usd
         FROM window_boundary_records records
-        WHERE records.dashboard_external_pool_id ~ '^[0-9]+$'
+        WHERE records.dashboard_account_id ~ '^[0-9]+$'
         GROUP BY
             records.window_key,
             records.boundary_hour,
-            records.dashboard_external_pool_id
-        ), dashboard_external_pool_segments AS (
+            records.dashboard_account_id
+        ), dashboard_account_segments AS (
         SELECT
             segment_rows.window_key,
             segment_rows.segment_hour,
             segment_rows.pool_id,
             MAX(segment_rows.pool_name) AS pool_name,
-            SUM(segment_rows.external_pool_requests)::bigint AS external_pool_requests,
-            SUM(segment_rows.external_pool_priced_requests)::bigint
-                AS external_pool_priced_requests,
-            SUM(segment_rows.external_pool_unpriced_requests)::bigint
-                AS external_pool_unpriced_requests,
-            SUM(segment_rows.external_pool_cost_floor_applied_requests)::bigint
-                AS external_pool_cost_floor_applied_requests,
-            SUM(segment_rows.external_pool_raw_cost_usd)::double precision
-                AS external_pool_raw_cost_usd,
-            SUM(segment_rows.external_pool_shaped_cost_usd)::double precision
-                AS external_pool_shaped_cost_usd,
-            SUM(segment_rows.external_pool_uplifted_cost_usd)::double precision
-                AS external_pool_uplifted_cost_usd,
-            SUM(segment_rows.external_pool_profit_usd)::double precision
-                AS external_pool_profit_usd,
-            SUM(segment_rows.external_pool_reported_cost_usd)::double precision
-                AS external_pool_reported_cost_usd,
-            SUM(segment_rows.external_pool_billable_cost_usd)::double precision
-                AS external_pool_billable_cost_usd,
-            SUM(segment_rows.external_pool_cost_floor_delta_usd)::double precision
-                AS external_pool_cost_floor_delta_usd
-        FROM dashboard_external_pool_segment_rows segment_rows
+            SUM(segment_rows.account_requests)::bigint AS account_requests,
+            SUM(segment_rows.account_priced_requests)::bigint
+                AS account_priced_requests,
+            SUM(segment_rows.account_unpriced_requests)::bigint
+                AS account_unpriced_requests,
+            SUM(segment_rows.account_cost_floor_applied_requests)::bigint
+                AS account_cost_floor_applied_requests,
+            SUM(segment_rows.account_raw_cost_usd)::double precision
+                AS account_raw_cost_usd,
+            SUM(segment_rows.account_shaped_cost_usd)::double precision
+                AS account_shaped_cost_usd,
+            SUM(segment_rows.account_uplifted_cost_usd)::double precision
+                AS account_uplifted_cost_usd,
+            SUM(segment_rows.account_profit_usd)::double precision
+                AS account_profit_usd,
+            SUM(segment_rows.account_reported_cost_usd)::double precision
+                AS account_reported_cost_usd,
+            SUM(segment_rows.account_billable_cost_usd)::double precision
+                AS account_billable_cost_usd,
+            SUM(segment_rows.account_cost_floor_delta_usd)::double precision
+                AS account_cost_floor_delta_usd
+        FROM dashboard_account_segment_rows segment_rows
         GROUP BY segment_rows.window_key, segment_rows.segment_hour, segment_rows.pool_id
         ) "#,
     );
@@ -8156,7 +8113,7 @@ struct OverviewAccumulator {
     unpriced_requests: i64,
     duration_ms_sum: i64,
     duration_ms_count: i64,
-    external_pool_cost_floor_applied_requests: i64,
+    account_cost_floor_applied_requests: i64,
 }
 
 impl OverviewAccumulator {
@@ -8177,8 +8134,8 @@ impl OverviewAccumulator {
             unpriced_requests: row.try_get("unpriced_requests")?,
             duration_ms_sum: row.try_get("duration_ms_sum")?,
             duration_ms_count: row.try_get("duration_ms_count")?,
-            external_pool_cost_floor_applied_requests: row
-                .try_get("external_pool_cost_floor_applied_requests")?,
+            account_cost_floor_applied_requests: row
+                .try_get("account_cost_floor_applied_requests")?,
         })
     }
 
@@ -8197,8 +8154,7 @@ impl OverviewAccumulator {
         self.unpriced_requests += other.unpriced_requests;
         self.duration_ms_sum += other.duration_ms_sum;
         self.duration_ms_count += other.duration_ms_count;
-        self.external_pool_cost_floor_applied_requests +=
-            other.external_pool_cost_floor_applied_requests;
+        self.account_cost_floor_applied_requests += other.account_cost_floor_applied_requests;
     }
 
     fn to_metrics(self) -> UsageOverviewMetrics {
@@ -8247,7 +8203,7 @@ impl OverviewAccumulator {
     }
 }
 
-/// External-pool cost columns carried by every rollup row. Only external-pool
+/// External-pool cost columns carried by every rollup row. Only account
 /// records contribute non-zero values, so local-route cells stay at zero.
 #[derive(Debug, Clone, Copy, Default)]
 struct OverviewExternalCosts {
@@ -8259,9 +8215,9 @@ struct OverviewExternalCosts {
 impl OverviewExternalCosts {
     fn from_row(row: &PgRow) -> anyhow::Result<Self> {
         Ok(Self {
-            raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
-            billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
-            profit_usd: row.try_get("external_pool_profit_usd")?,
+            raw_cost_usd: row.try_get("account_raw_cost_usd")?,
+            billable_cost_usd: row.try_get("account_billable_cost_usd")?,
+            profit_usd: row.try_get("account_profit_usd")?,
         })
     }
 
@@ -8298,7 +8254,7 @@ impl OverviewSeriesCell {
 struct OverviewSeriesAccumulator {
     all: OverviewSeriesCell,
     external: OverviewSeriesCell,
-    external_pools: HashMap<String, OverviewSeriesCell>,
+    accounts: HashMap<String, OverviewSeriesCell>,
 }
 
 #[derive(Debug, Default)]
@@ -8350,13 +8306,13 @@ impl OverviewSeriesGroupAccumulator {
 
 #[derive(Debug, Default)]
 struct OverviewSeriesGroupsAccumulator {
-    external_pools: OverviewSeriesGroupAccumulator,
+    accounts: OverviewSeriesGroupAccumulator,
 }
 
 impl OverviewSeriesGroupsAccumulator {
     fn finish(self) -> UsageOverviewSeriesGroups {
         UsageOverviewSeriesGroups {
-            external_pools: self.external_pools.finish(|key| format!("#{key}")),
+            accounts: self.accounts.finish(|key| format!("#{key}")),
         }
     }
 }
@@ -8479,10 +8435,7 @@ fn overview_series_points(
                 label,
                 all: values.all.to_series_metrics(),
                 external: values.external.to_series_metrics(),
-                external_pools: overview_series_breakdown(
-                    &groups.external_pools,
-                    &values.external_pools,
-                ),
+                accounts: overview_series_breakdown(&groups.accounts, &values.accounts),
             }
         })
         .collect()
@@ -8558,23 +8511,23 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
 
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
-            external_pool_billing: UsageExternalPoolBillingSummary {
-                requests: row_i64_to_usize(&row, "external_pool_requests")?,
-                priced_requests: row_i64_to_usize(&row, "external_pool_priced_requests")?,
-                unpriced_requests: row_i64_to_usize(&row, "external_pool_unpriced_requests")?,
+            account_billing: UsageAccountBillingSummary {
+                requests: row_i64_to_usize(&row, "account_requests")?,
+                priced_requests: row_i64_to_usize(&row, "account_priced_requests")?,
+                unpriced_requests: row_i64_to_usize(&row, "account_unpriced_requests")?,
                 cost_floor_applied_requests: row_i64_to_usize(
                     &row,
-                    "external_pool_cost_floor_applied_requests",
+                    "account_cost_floor_applied_requests",
                 )?,
-                raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
-                shaped_cost_usd: row.try_get("external_pool_shaped_cost_usd")?,
-                uplifted_cost_usd: row.try_get("external_pool_uplifted_cost_usd")?,
-                profit_usd: row.try_get("external_pool_profit_usd")?,
-                reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
-                billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
-                cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
+                raw_cost_usd: row.try_get("account_raw_cost_usd")?,
+                shaped_cost_usd: row.try_get("account_shaped_cost_usd")?,
+                uplifted_cost_usd: row.try_get("account_uplifted_cost_usd")?,
+                profit_usd: row.try_get("account_profit_usd")?,
+                reported_cost_usd: row.try_get("account_reported_cost_usd")?,
+                billable_cost_usd: row.try_get("account_billable_cost_usd")?,
+                cost_floor_delta_usd: row.try_get("account_cost_floor_delta_usd")?,
             },
-            external_pool_billing_by_pool: Vec::new(),
+            account_billing_by_pool: Vec::new(),
             status_breakdown: Vec::new(),
             usage_source_breakdown: Vec::new(),
         },
@@ -8613,8 +8566,8 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
 
             simulated_requests: 0,
             upstream_metadata_requests: 0,
-            external_pool_billing: UsageExternalPoolBillingSummary::default(),
-            external_pool_billing_by_pool: Vec::new(),
+            account_billing: UsageAccountBillingSummary::default(),
+            account_billing_by_pool: Vec::new(),
             status_breakdown: Vec::new(),
             usage_source_breakdown: Vec::new(),
         },
@@ -8708,7 +8661,7 @@ fn usage_source_label(value: &str) -> String {
     .to_string()
 }
 
-fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoolEligibility> {
+fn account_eligibility_from_row(row: &PgRow) -> anyhow::Result<AccountEligibility> {
     let revision: i64 = row.try_get("revision")?;
     if revision <= 0 {
         anyhow::bail!("revision 必须为正数");
@@ -8726,30 +8679,29 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
         anyhow::bail!("api_key 不能为空");
     }
     let auth_type: String = row.try_get("auth_type")?;
-    ExternalPoolAuthType::parse_known(&auth_type)
-        .ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?;
+    AccountAuthType::parse_known(&auth_type).ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?;
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
     if max_concurrent_requests <= 0 {
         anyhow::bail!("max_concurrent_requests 必须为正数");
     }
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
-    ExternalPoolUsageProjectionMode::parse_known(&usage_projection_mode)
+    UsageProjectionMode::parse_known(&usage_projection_mode)
         .ok_or_else(|| anyhow::anyhow!("usage_projection_mode 值无效"))?;
     let stream_response_mode: Option<String> = row.try_get("stream_response_mode")?;
     if stream_response_mode
         .as_deref()
-        .is_some_and(|value| ExternalPoolStreamResponseMode::parse_known(value).is_none())
+        .is_some_and(|value| StreamResponseMode::parse_known(value).is_none())
     {
         anyhow::bail!("stream_response_mode 值无效");
     }
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
-    ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
+    AutoDisablePolicy::parse_known(&auto_disable_policy)
         .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?;
     let pre_output_stream_retry_mode: String = row.try_get("pre_output_stream_retry_mode")?;
-    ExternalPoolStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
+    StreamRetryMode::parse_known(&pre_output_stream_retry_mode)
         .ok_or_else(|| anyhow::anyhow!("pre_output_stream_retry_mode 值无效"))?;
     let header_profile: String = row.try_get("header_profile")?;
-    ExternalPoolHeaderProfile::parse_known(&header_profile)
+    AccountHeaderProfile::parse_known(&header_profile)
         .ok_or_else(|| anyhow::anyhow!("header_profile 值无效"))?;
     row.try_get::<bool, _>("append_beta_query")?;
     let header_overrides_value: serde_json::Value = row
@@ -8758,22 +8710,22 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     let header_overrides =
         serde_json::from_value::<HashMap<String, String>>(header_overrides_value)
             .map_err(|_| anyhow::anyhow!("header_overrides 必须是对象"))?;
-    normalize_external_pool_header_overrides(header_overrides)?;
+    normalize_account_header_overrides(header_overrides)?;
     let wire_profile: String = row.try_get("wire_profile")?;
-    ExternalPoolWireProfile::parse_known(&wire_profile)
+    AccountWireProfile::parse_known(&wire_profile)
         .ok_or_else(|| anyhow::anyhow!("wire_profile 值无效"))?;
     let tls_profile: String = row.try_get("tls_profile")?;
-    ExternalPoolTlsProfile::parse_known(&tls_profile)
+    AccountTlsProfile::parse_known(&tls_profile)
         .ok_or_else(|| anyhow::anyhow!("tls_profile 值无效"))?;
     let route_mode: String = row.try_get("route_mode")?;
-    let route_mode = ExternalPoolRouteMode::parse_known(&route_mode)
+    let route_mode = RouteRuleMode::parse_known(&route_mode)
         .ok_or_else(|| anyhow::anyhow!("route_mode 值无效"))?;
     let route_rules_value: serde_json::Value = row
         .try_get("route_rules")
         .map_err(|_| anyhow::anyhow!("route_rules 字段类型无效"))?;
     let route_rules = decode_account_route_rules(route_rules_value, true)?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
-    ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
+    ModelMappingMode::parse_known(&model_mapping_mode)
         .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?;
     row.try_get::<bool, _>("model_mapping_require_match")?;
     let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
@@ -8794,7 +8746,7 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     if supported_models.iter().any(|model| model.trim().is_empty()) {
         anyhow::bail!("supported_models 不能包含空模型名");
     }
-    Ok(ExternalPoolEligibility {
+    Ok(AccountEligibility {
         id: row.try_get::<i64, _>("id")?.max(0) as u64,
         enabled: row.try_get("enabled")?,
         auto_disabled: row.try_get("auto_disabled")?,
@@ -8833,15 +8785,15 @@ fn validate_account_route_rules(rules: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<ExternalPool> {
-    external_pool_from_row_with_policy(row, mask_secrets, false)
+fn account_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Account> {
+    account_from_row_with_policy(row, mask_secrets, false)
 }
 
-fn external_pool_from_row_with_policy(
+fn account_from_row_with_policy(
     row: PgRow,
     mask_secrets: bool,
     strict_dispatch: bool,
-) -> anyhow::Result<ExternalPool> {
+) -> anyhow::Result<Account> {
     let id: i64 = row.try_get("id")?;
     let revision: i64 = row.try_get("revision")?;
     let api_key: String = row.try_get("api_key")?;
@@ -8879,11 +8831,11 @@ fn external_pool_from_row_with_policy(
     let header_overrides = if strict_dispatch {
         let overrides = serde_json::from_value::<HashMap<String, String>>(header_overrides_value)
             .map_err(|_| anyhow::anyhow!("header_overrides 必须是对象"))?;
-        normalize_external_pool_header_overrides(overrides)?
+        normalize_account_header_overrides(overrides)?
     } else {
         serde_json::from_value::<HashMap<String, String>>(header_overrides_value)
             .ok()
-            .and_then(|overrides| normalize_external_pool_header_overrides(overrides).ok())
+            .and_then(|overrides| normalize_account_header_overrides(overrides).ok())
             .unwrap_or_default()
     };
     let wire_profile: String = if strict_dispatch {
@@ -8946,66 +8898,66 @@ fn external_pool_from_row_with_policy(
     });
 
     let auth_type = if strict_dispatch {
-        ExternalPoolAuthType::parse_known(&auth_type)
+        AccountAuthType::parse_known(&auth_type)
             .ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?
     } else {
-        ExternalPoolAuthType::parse(&auth_type)
+        AccountAuthType::parse(&auth_type)
     };
     let usage_projection_mode = if strict_dispatch {
-        ExternalPoolUsageProjectionMode::parse_known(&usage_projection_mode)
+        UsageProjectionMode::parse_known(&usage_projection_mode)
             .ok_or_else(|| anyhow::anyhow!("usage_projection_mode 值无效"))?
     } else {
-        ExternalPoolUsageProjectionMode::parse(&usage_projection_mode)
+        UsageProjectionMode::parse(&usage_projection_mode)
     };
     let stream_response_mode = match stream_response_mode.as_deref() {
         Some(value) if strict_dispatch => Some(
-            ExternalPoolStreamResponseMode::parse_known(value)
+            StreamResponseMode::parse_known(value)
                 .ok_or_else(|| anyhow::anyhow!("stream_response_mode 值无效"))?,
         ),
-        Some(value) => Some(ExternalPoolStreamResponseMode::parse(value)),
+        Some(value) => Some(StreamResponseMode::parse(value)),
         None => None,
     };
     let auto_disable_policy = if strict_dispatch {
-        ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
+        AutoDisablePolicy::parse_known(&auto_disable_policy)
             .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?
     } else {
-        ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy)
+        AutoDisablePolicy::parse(&auto_disable_policy)
     };
     let pre_output_stream_retry_mode = if strict_dispatch {
-        ExternalPoolStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
+        StreamRetryMode::parse_known(&pre_output_stream_retry_mode)
             .ok_or_else(|| anyhow::anyhow!("pre_output_stream_retry_mode 值无效"))?
     } else {
-        ExternalPoolStreamRetryMode::parse(&pre_output_stream_retry_mode)
+        StreamRetryMode::parse(&pre_output_stream_retry_mode)
     };
     let header_profile = if strict_dispatch {
-        ExternalPoolHeaderProfile::parse_known(&header_profile)
+        AccountHeaderProfile::parse_known(&header_profile)
             .ok_or_else(|| anyhow::anyhow!("header_profile 值无效"))?
     } else {
-        ExternalPoolHeaderProfile::parse(&header_profile)
+        AccountHeaderProfile::parse(&header_profile)
     };
     let wire_profile = if strict_dispatch {
-        ExternalPoolWireProfile::parse_known(&wire_profile)
+        AccountWireProfile::parse_known(&wire_profile)
             .ok_or_else(|| anyhow::anyhow!("wire_profile 值无效"))?
     } else {
-        ExternalPoolWireProfile::parse(&wire_profile)
+        AccountWireProfile::parse(&wire_profile)
     };
     let tls_profile = if strict_dispatch {
-        ExternalPoolTlsProfile::parse_known(&tls_profile)
+        AccountTlsProfile::parse_known(&tls_profile)
             .ok_or_else(|| anyhow::anyhow!("tls_profile 值无效"))?
     } else {
-        ExternalPoolTlsProfile::parse(&tls_profile)
+        AccountTlsProfile::parse(&tls_profile)
     };
     let route_mode = if strict_dispatch {
-        ExternalPoolRouteMode::parse_known(&route_mode)
+        RouteRuleMode::parse_known(&route_mode)
             .ok_or_else(|| anyhow::anyhow!("route_mode 值无效"))?
     } else {
-        ExternalPoolRouteMode::parse(&route_mode)
+        RouteRuleMode::parse(&route_mode)
     };
     let model_mapping_mode = if strict_dispatch {
-        ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
+        ModelMappingMode::parse_known(&model_mapping_mode)
             .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?
     } else {
-        ExternalPoolModelMappingMode::parse(&model_mapping_mode)
+        ModelMappingMode::parse(&model_mapping_mode)
     };
     let model_mapping_require_match = if strict_dispatch {
         row.try_get("model_mapping_require_match")?
@@ -9039,13 +8991,9 @@ fn external_pool_from_row_with_policy(
     let cost_multiplier: f64 = row.try_get("cost_multiplier")?;
     let overrides = serde_json::from_value(row.try_get("overrides")?)?;
     if strict_dispatch {
-        crate::external_pool::validate_account_fields(
-            proxy_url.as_deref(),
-            cost_multiplier,
-            &overrides,
-        )?;
+        crate::account::validate_account_fields(proxy_url.as_deref(), cost_multiplier, &overrides)?;
     }
-    Ok(ExternalPool {
+    Ok(Account {
         tags: row.try_get("tags")?,
         proxy_url,
         cost_multiplier,
@@ -9055,7 +9003,7 @@ fn external_pool_from_row_with_policy(
         name: row.try_get("name")?,
         base_url: row.try_get("base_url")?,
         api_key: (!mask_secrets).then_some(api_key.clone()),
-        masked_api_key: Some(mask_external_pool_key(&api_key)),
+        masked_api_key: Some(mask_account_key(&api_key)),
         auth_type,
         header_profile,
         append_beta_query,
@@ -9077,7 +9025,7 @@ fn external_pool_from_row_with_policy(
         normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
         model_mapping_mode,
         model_mapping_require_match,
-        model_mapping_rules: normalize_external_pool_model_mapping_rules(model_mapping_rules),
+        model_mapping_rules: normalize_account_model_mapping_rules(model_mapping_rules),
         supported_models,
         route_mode,
         route_rules,
@@ -9087,23 +9035,23 @@ fn external_pool_from_row_with_policy(
     })
 }
 
-fn validate_external_pool_input(
+fn validate_account_input(
     name: &str,
     base_url: &str,
     max_concurrent_requests: u32,
 ) -> anyhow::Result<()> {
     if name.trim().is_empty() {
-        anyhow::bail!("外部池名称不能为空");
+        anyhow::bail!("账号名称不能为空");
     }
     if base_url.trim().is_empty() {
-        anyhow::bail!("外部池 baseUrl 不能为空");
+        anyhow::bail!("账号 baseUrl 不能为空");
     }
     let parsed = url::Url::parse(base_url.trim())?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        anyhow::bail!("外部池 baseUrl 只支持 http/https");
+        anyhow::bail!("账号 baseUrl 只支持 http/https");
     }
     if max_concurrent_requests == 0 {
-        anyhow::bail!("外部池 maxConcurrentRequests 必须大于 0");
+        anyhow::bail!("账号 maxConcurrentRequests 必须大于 0");
     }
     Ok(())
 }
@@ -9138,7 +9086,7 @@ fn usage_source_value(source: crate::anthropic::usage::UsageSource) -> &'static 
 
 fn usage_route_kind_value(route_kind: UsageRouteKind) -> &'static str {
     match route_kind {
-        UsageRouteKind::ExternalPool => "external_pool",
+        UsageRouteKind::Account => "account",
     }
 }
 
@@ -9178,7 +9126,7 @@ ALTER TABLE runtime_config
     ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;
 
 
-CREATE TABLE IF NOT EXISTS external_upstream_pools (
+CREATE TABLE IF NOT EXISTS accounts (
     tags TEXT[] NOT NULL DEFAULT '{}',
     proxy_url TEXT,
     cost_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1,
@@ -9220,108 +9168,108 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     deleted_at TIMESTAMPTZ
 );
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS auth_type TEXT NOT NULL DEFAULT 'bearer';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 100;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS max_concurrent_requests INTEGER NOT NULL DEFAULT 10;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS usage_projection_mode TEXT NOT NULL DEFAULT 'current_path_policy';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS stream_response_mode TEXT;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false;
 
 
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS auto_disable_policy TEXT NOT NULL DEFAULT 'inherit';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS pre_output_stream_retry_mode TEXT NOT NULL DEFAULT 'inherit';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS header_profile TEXT NOT NULL DEFAULT 'generic';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS append_beta_query BOOLEAN NOT NULL DEFAULT false;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS header_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS wire_profile TEXT NOT NULL DEFAULT 'default';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS tls_profile TEXT NOT NULL DEFAULT 'default';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS auto_disabled BOOLEAN NOT NULL DEFAULT false;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS auto_disabled_reason TEXT;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS auto_disabled_at TIMESTAMPTZ;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS auto_disabled_until TIMESTAMPTZ;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS auto_disabled_last_error TEXT;
 
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS model_mapping_mode TEXT NOT NULL DEFAULT 'passthrough_mapping';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS model_mapping_require_match BOOLEAN NOT NULL DEFAULT false;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS supported_models JSONB NOT NULL DEFAULT '[]'::jsonb;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'allow_all';
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS route_rules JSONB NOT NULL DEFAULT '[]'::jsonb;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS notes TEXT;
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
-ALTER TABLE external_upstream_pools
+ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
-CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_active_priority
-    ON external_upstream_pools (priority ASC, id ASC)
+CREATE INDEX IF NOT EXISTS idx_accounts_active_priority
+    ON accounts (priority ASC, id ASC)
     WHERE deleted_at IS NULL AND enabled = true;
 
-CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_auto_disabled
-    ON external_upstream_pools (auto_disabled, auto_disabled_until)
+CREATE INDEX IF NOT EXISTS idx_accounts_auto_disabled
+    ON accounts (auto_disabled, auto_disabled_until)
     WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS usage_records (
@@ -9331,8 +9279,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
     stream BOOLEAN NOT NULL,
     model TEXT NOT NULL,
     conversation_id TEXT,
-    credential_id BIGINT,
-    credential_label TEXT,
+    account_id BIGINT,
+    account_label TEXT,
     status TEXT NOT NULL,
     usage_source TEXT NOT NULL,
     total_input_tokens INTEGER NOT NULL,
@@ -9440,17 +9388,17 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
 
-    external_pool_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_requests BIGINT NOT NULL DEFAULT 0,
+    account_priced_requests BIGINT NOT NULL DEFAULT 0,
+    account_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    account_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    account_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     duration_ms_count BIGINT NOT NULL DEFAULT 0,
     duration_ms_max BIGINT NOT NULL DEFAULT 0,
@@ -9484,17 +9432,17 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
 
-    ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_priced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_max BIGINT NOT NULL DEFAULT 0,
@@ -9529,17 +9477,17 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
 
-    external_pool_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
-    external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_requests BIGINT NOT NULL DEFAULT 0,
+    account_priced_requests BIGINT NOT NULL DEFAULT 0,
+    account_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    account_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    account_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     duration_ms_count BIGINT NOT NULL DEFAULT 0,
     duration_ms_max BIGINT NOT NULL DEFAULT 0,
@@ -9573,17 +9521,17 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
 
-    ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_priced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_max BIGINT NOT NULL DEFAULT 0,
@@ -9705,7 +9653,7 @@ CREATE TABLE IF NOT EXISTS route_scenarios (
 const USAGE_LEGACY_COST_FIELD_BACKFILL_SQL: &str = r#"
 UPDATE usage_records
 SET original_cost_usd = COALESCE(
-    NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision,
+    NULLIF(data #>> '{accountBilling,rawCostUsd}', '')::double precision,
     NULLIF(data #>> '{originalCostUsd}', '')::double precision,
     estimated_cost_usd,
     0
@@ -9713,54 +9661,54 @@ SET original_cost_usd = COALESCE(
 WHERE original_cost_usd = 0
   AND (
       estimated_cost_usd <> 0
-      OR NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '') IS NOT NULL
+      OR NULLIF(data #>> '{accountBilling,rawCostUsd}', '') IS NOT NULL
       OR NULLIF(data #>> '{originalCostUsd}', '') IS NOT NULL
   );
 
 UPDATE usage_rollup_totals
 SET total_original_cost_usd = CASE
-    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
-    THEN external_pool_raw_cost_usd
+    WHEN dimension = 'account' AND account_raw_cost_usd <> 0
+    THEN account_raw_cost_usd
     ELSE total_estimated_cost_usd
 END
 WHERE total_original_cost_usd = 0
-  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
+  AND (total_estimated_cost_usd <> 0 OR account_raw_cost_usd <> 0);
 
 UPDATE usage_rollup_time_buckets
 SET total_original_cost_usd = CASE
-    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
-    THEN external_pool_raw_cost_usd
+    WHEN dimension = 'account' AND account_raw_cost_usd <> 0
+    THEN account_raw_cost_usd
     ELSE total_estimated_cost_usd
 END
 WHERE total_original_cost_usd = 0
-  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
+  AND (total_estimated_cost_usd <> 0 OR account_raw_cost_usd <> 0);
 
 UPDATE usage_rollup_totals
-SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
-    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
-    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
-WHERE external_pool_requests > 0
-  AND external_pool_reported_cost_usd <> 0
-  AND external_pool_shaped_cost_usd = 0
-  AND external_pool_uplifted_cost_usd = 0
-  AND external_pool_profit_usd = 0;
+SET account_shaped_cost_usd = account_reported_cost_usd,
+    account_uplifted_cost_usd = account_reported_cost_usd,
+    account_profit_usd = account_reported_cost_usd - account_raw_cost_usd
+WHERE account_requests > 0
+  AND account_reported_cost_usd <> 0
+  AND account_shaped_cost_usd = 0
+  AND account_uplifted_cost_usd = 0
+  AND account_profit_usd = 0;
 
 UPDATE usage_rollup_time_buckets
-SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
-    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
-    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
-WHERE external_pool_requests > 0
-  AND external_pool_reported_cost_usd <> 0
-  AND external_pool_shaped_cost_usd = 0
-  AND external_pool_uplifted_cost_usd = 0
-  AND external_pool_profit_usd = 0;
+SET account_shaped_cost_usd = account_reported_cost_usd,
+    account_uplifted_cost_usd = account_reported_cost_usd,
+    account_profit_usd = account_reported_cost_usd - account_raw_cost_usd
+WHERE account_requests > 0
+  AND account_reported_cost_usd <> 0
+  AND account_shaped_cost_usd = 0
+  AND account_uplifted_cost_usd = 0
+  AND account_profit_usd = 0;
 "#;
 
-const EXTERNAL_POOL_DEFAULT_MODEL_MAPPING_PASSTHROUGH_SQL: &str = r#"
-ALTER TABLE external_upstream_pools
+const ACCOUNT_DEFAULT_MODEL_MAPPING_PASSTHROUGH_SQL: &str = r#"
+ALTER TABLE accounts
     ALTER COLUMN model_mapping_mode SET DEFAULT 'passthrough_mapping';
 
-UPDATE external_upstream_pools
+UPDATE accounts
 SET model_mapping_mode = 'passthrough_mapping',
     revision = revision + 1,
     updated_at = now()
@@ -9835,17 +9783,17 @@ SELECT
     COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
     COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
 
-    COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
-    COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
-    COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
-    COALESCE(SUM(external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
-    COALESCE(SUM(external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
-    COALESCE(SUM(external_pool_shaped_cost_usd), 0)::double precision AS external_pool_shaped_cost_usd,
-    COALESCE(SUM(external_pool_uplifted_cost_usd), 0)::double precision AS external_pool_uplifted_cost_usd,
-    COALESCE(SUM(external_pool_profit_usd), 0)::double precision AS external_pool_profit_usd,
-    COALESCE(SUM(external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
-    COALESCE(SUM(external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
-    COALESCE(SUM(external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd,
+    COALESCE(SUM(account_requests), 0)::bigint AS account_requests,
+    COALESCE(SUM(account_priced_requests), 0)::bigint AS account_priced_requests,
+    COALESCE(SUM(account_unpriced_requests), 0)::bigint AS account_unpriced_requests,
+    COALESCE(SUM(account_cost_floor_applied_requests), 0)::bigint AS account_cost_floor_applied_requests,
+    COALESCE(SUM(account_raw_cost_usd), 0)::double precision AS account_raw_cost_usd,
+    COALESCE(SUM(account_shaped_cost_usd), 0)::double precision AS account_shaped_cost_usd,
+    COALESCE(SUM(account_uplifted_cost_usd), 0)::double precision AS account_uplifted_cost_usd,
+    COALESCE(SUM(account_profit_usd), 0)::double precision AS account_profit_usd,
+    COALESCE(SUM(account_reported_cost_usd), 0)::double precision AS account_reported_cost_usd,
+    COALESCE(SUM(account_billable_cost_usd), 0)::double precision AS account_billable_cost_usd,
+    COALESCE(SUM(account_cost_floor_delta_usd), 0)::double precision AS account_cost_floor_delta_usd,
     COALESCE(SUM(duration_ms_sum), 0)::bigint AS duration_ms_sum,
     COALESCE(SUM(duration_ms_count), 0)::bigint AS duration_ms_count,
     COALESCE(MAX(duration_ms_max), 0)::bigint AS duration_ms_max,
@@ -9864,11 +9812,11 @@ INSERT INTO usage_rollup_time_buckets (
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
     total_estimated_cost_usd, total_original_cost_usd,
-    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
-    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
-    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
-    external_pool_profit_usd, external_pool_reported_cost_usd,
-    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    account_requests, account_priced_requests, account_unpriced_requests,
+    account_cost_floor_applied_requests, account_raw_cost_usd,
+    account_shaped_cost_usd, account_uplifted_cost_usd,
+    account_profit_usd, account_reported_cost_usd,
+    account_billable_cost_usd, account_cost_floor_delta_usd,
     duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
 )
 SELECT
@@ -9879,11 +9827,11 @@ SELECT
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
-    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
-    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
-    external_pool_profit_usd, external_pool_reported_cost_usd,
-    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    total_estimated_cost_usd, total_original_cost_usd, account_requests, account_priced_requests, account_unpriced_requests,
+    account_cost_floor_applied_requests, account_raw_cost_usd,
+    account_shaped_cost_usd, account_uplifted_cost_usd,
+    account_profit_usd, account_reported_cost_usd,
+    account_billable_cost_usd, account_cost_floor_delta_usd,
     duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
 FROM usage_rollup_time_buckets_hourly;
 
@@ -9956,17 +9904,17 @@ SELECT
     COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
     COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
 
-    COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
-    COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
-    COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
-    COALESCE(SUM(external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
-    COALESCE(SUM(external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
-    COALESCE(SUM(external_pool_shaped_cost_usd), 0)::double precision AS external_pool_shaped_cost_usd,
-    COALESCE(SUM(external_pool_uplifted_cost_usd), 0)::double precision AS external_pool_uplifted_cost_usd,
-    COALESCE(SUM(external_pool_profit_usd), 0)::double precision AS external_pool_profit_usd,
-    COALESCE(SUM(external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
-    COALESCE(SUM(external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
-    COALESCE(SUM(external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd,
+    COALESCE(SUM(account_requests), 0)::bigint AS account_requests,
+    COALESCE(SUM(account_priced_requests), 0)::bigint AS account_priced_requests,
+    COALESCE(SUM(account_unpriced_requests), 0)::bigint AS account_unpriced_requests,
+    COALESCE(SUM(account_cost_floor_applied_requests), 0)::bigint AS account_cost_floor_applied_requests,
+    COALESCE(SUM(account_raw_cost_usd), 0)::double precision AS account_raw_cost_usd,
+    COALESCE(SUM(account_shaped_cost_usd), 0)::double precision AS account_shaped_cost_usd,
+    COALESCE(SUM(account_uplifted_cost_usd), 0)::double precision AS account_uplifted_cost_usd,
+    COALESCE(SUM(account_profit_usd), 0)::double precision AS account_profit_usd,
+    COALESCE(SUM(account_reported_cost_usd), 0)::double precision AS account_reported_cost_usd,
+    COALESCE(SUM(account_billable_cost_usd), 0)::double precision AS account_billable_cost_usd,
+    COALESCE(SUM(account_cost_floor_delta_usd), 0)::double precision AS account_cost_floor_delta_usd,
     COALESCE(SUM(duration_ms_sum), 0)::bigint AS duration_ms_sum,
     COALESCE(SUM(duration_ms_count), 0)::bigint AS duration_ms_count,
     COALESCE(MAX(duration_ms_max), 0)::bigint AS duration_ms_max,
@@ -9986,11 +9934,11 @@ INSERT INTO usage_rollup_time_buckets (
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
     total_estimated_cost_usd, total_original_cost_usd,
-    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
-    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
-    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
-    external_pool_profit_usd, external_pool_reported_cost_usd,
-    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    account_requests, account_priced_requests, account_unpriced_requests,
+    account_cost_floor_applied_requests, account_raw_cost_usd,
+    account_shaped_cost_usd, account_uplifted_cost_usd,
+    account_profit_usd, account_reported_cost_usd,
+    account_billable_cost_usd, account_cost_floor_delta_usd,
     duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
 )
 SELECT
@@ -10002,11 +9950,11 @@ SELECT
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
-    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
-    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
-    external_pool_profit_usd, external_pool_reported_cost_usd,
-    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    total_estimated_cost_usd, total_original_cost_usd, account_requests, account_priced_requests, account_unpriced_requests,
+    account_cost_floor_applied_requests, account_raw_cost_usd,
+    account_shaped_cost_usd, account_uplifted_cost_usd,
+    account_profit_usd, account_reported_cost_usd,
+    account_billable_cost_usd, account_cost_floor_delta_usd,
     duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
 FROM usage_rollup_time_buckets_hourly;
 
@@ -10092,15 +10040,15 @@ mod tests {
 
     use super::*;
     use crate::anthropic::usage::{
-        ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRecordStatus, UsageRouteKind,
-        UsageRouteSubtype, UsageSource,
+        AccountBilling, AccountUsageSnapshot, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
+        UsageSource,
     };
     use serde_json::json;
 
     #[tokio::test]
     async fn production_pool_discards_connections_left_inside_a_transaction() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let url = config.postgres.url.clone().unwrap();
@@ -10144,7 +10092,7 @@ mod tests {
     }
 
     fn test_config() -> Option<Config> {
-        let url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")?;
+        let url = crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL")?;
         let mut config = Config::default();
         config.postgres.url = Some(url);
         config.postgres.max_connections = 2;
@@ -10155,7 +10103,7 @@ mod tests {
     fn new_account_model_and_usage_columns_are_in_create_table_definitions() {
         for (table, columns) in [
             (
-                "external_upstream_pools",
+                "accounts",
                 vec![
                     "tags TEXT[]",
                     "proxy_url TEXT",
@@ -10192,10 +10140,10 @@ mod tests {
             .map(|column| (column.table_name, column.column_name))
             .collect();
         for pair in [
-            ("external_upstream_pools", "revision"),
-            ("external_upstream_pools", "pre_output_stream_retry_mode"),
-            ("external_upstream_pools", "route_mode"),
-            ("external_upstream_pools", "route_rules"),
+            ("accounts", "revision"),
+            ("accounts", "pre_output_stream_retry_mode"),
+            ("accounts", "route_mode"),
+            ("accounts", "route_rules"),
             ("usage_records", "rollup_active"),
             ("usage_cleanup_jobs", "batch_size"),
             ("usage_records", "original_cost_usd"),
@@ -10212,8 +10160,7 @@ mod tests {
         let present: HashSet<(String, String)> = REQUIRED_POSTGRES_SCHEMA_COLUMNS
             .iter()
             .filter(|required| {
-                !(required.table_name == "external_upstream_pools"
-                    && required.column_name == "revision")
+                !(required.table_name == "accounts" && required.column_name == "revision")
             })
             .map(|required| {
                 (
@@ -10224,13 +10171,13 @@ mod tests {
             .collect();
 
         let missing = required_postgres_schema_missing_columns(&present);
-        assert_eq!(missing, vec!["external_upstream_pools.revision"]);
+        assert_eq!(missing, vec!["accounts.revision"]);
     }
 
     #[tokio::test]
     async fn account_change_log_filters_summarizes_and_expires() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -10258,9 +10205,9 @@ mod tests {
                 event("auto_disabled", "local", "b@example.com"),
             ),
             (
-                "system-external-pool",
-                "external_pool_account_event",
-                "external_pool",
+                "system-account",
+                "account_account_event",
+                "account",
                 "9",
                 event("quota_exhausted", "external", "pool-nine"),
             ),
@@ -10424,7 +10371,7 @@ mod tests {
             "TRUNCATE TABLE usage_records",
             "TRUNCATE TABLE model_pricing_sync_status",
             "TRUNCATE TABLE model_pricing",
-            "TRUNCATE TABLE external_upstream_pools CASCADE",
+            "TRUNCATE TABLE accounts CASCADE",
             "TRUNCATE TABLE runtime_config",
         ] {
             sqlx::query(statement).execute(store.pool()).await.unwrap();
@@ -10434,12 +10381,12 @@ mod tests {
     #[tokio::test]
     async fn postgres_schema_compatibility_check_rejects_missing_upgrade_column() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
 
-        sqlx::query("ALTER TABLE external_upstream_pools DROP COLUMN revision")
+        sqlx::query("ALTER TABLE accounts DROP COLUMN revision")
             .execute(store.pool())
             .await
             .unwrap();
@@ -10449,8 +10396,8 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("external_upstream_pools.revision"));
-        assert!(error.contains("KIRO_RS_POSTGRES_MIGRATE_ON_START=true"));
+        assert!(error.contains("accounts.revision"));
+        assert!(error.contains("CLAUDE_POOL_POSTGRES_MIGRATE_ON_START=true"));
         assert!(error.contains("startup migration is disabled"));
 
         store.drop_test_schema().await.unwrap();
@@ -10459,7 +10406,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_pool_isolated_from_exhausted_main_pool_for_three_rounds() {
         let Some(mut config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         config.postgres.max_connections = 1;
@@ -10500,7 +10447,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_startup_migration_repairs_usage_dashboard_upgrade_columns() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -10510,9 +10457,9 @@ mod tests {
             "ALTER TABLE usage_records DROP COLUMN pricing_available",
             "ALTER TABLE usage_records DROP COLUMN duration_ms",
             "ALTER TABLE usage_records DROP COLUMN data",
-            "ALTER TABLE usage_rollup_totals DROP COLUMN external_pool_reported_cost_usd",
+            "ALTER TABLE usage_rollup_totals DROP COLUMN account_reported_cost_usd",
             "ALTER TABLE usage_rollup_totals DROP COLUMN duration_ms_sum",
-            "ALTER TABLE usage_rollup_time_buckets DROP COLUMN external_pool_reported_cost_usd",
+            "ALTER TABLE usage_rollup_time_buckets DROP COLUMN account_reported_cost_usd",
             "ALTER TABLE usage_rollup_time_buckets DROP COLUMN duration_ms_sum",
         ] {
             sqlx::query(statement).execute(store.pool()).await.unwrap();
@@ -10524,7 +10471,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(missing_before.contains("usage_records.pricing_available"));
-        assert!(missing_before.contains("usage_rollup_totals.external_pool_reported_cost_usd"));
+        assert!(missing_before.contains("usage_rollup_totals.account_reported_cost_usd"));
         assert!(missing_before.contains("usage_rollup_time_buckets.duration_ms_sum"));
 
         store.migrate_with_options(false).await.unwrap();
@@ -10553,7 +10500,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_startup_migration_expands_usage_cleanup_batch_size_constraint() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -10677,11 +10624,11 @@ mod tests {
             route_kind: None,
             route_subtype: None,
 
-            external_pool_id: None,
-            external_pool_name: None,
+            account_id: None,
+            account_name: None,
             external_attempts: Vec::new(),
             usage_projection_applied: None,
-            external_pool_billing: None,
+            account_billing: None,
 
             error_type: None,
             error_message: None,
@@ -10793,7 +10740,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_job_is_persistent_exclusive_and_recoverable() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -10956,7 +10903,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_supervisor_only_sees_claimable_jobs_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11026,7 +10973,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_cancel_resume_and_expired_recovery_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11126,7 +11073,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_batches_are_bounded_idempotent_and_skip_locked() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11195,7 +11142,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_locked_rows_remain_visible_until_release_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11272,7 +11219,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_advisory_guards_are_test_schema_scoped() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store_a = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11327,7 +11274,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_rollup_update_subtracts_legacy_cost_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11381,7 +11328,7 @@ mod tests {
             let external_rollup: (i64, f64, f64, f64, i64) = sqlx::query_as(
                 r#"
                 SELECT requests, total_estimated_cost_usd, total_original_cost_usd,
-                       external_pool_raw_cost_usd, duration_ms_max
+                       account_raw_cost_usd, duration_ms_max
                 FROM usage_rollup_totals
                 WHERE dimension = 'global' AND dimension_key = 'all'
                 "#,
@@ -11409,9 +11356,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_external_pool_usage_risk_reports_cache_and_cost_risks() {
+    async fn postgres_account_usage_risk_reports_cache_and_cost_risks() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11419,10 +11366,10 @@ mod tests {
         let usage_store = PostgresUsageStore::new(store.clone());
 
         let mut high_cache = external_usage_record("external-risk-high-cache", 0.20, 0.18, 0.19);
-        high_cache.external_pool_billing.as_mut().unwrap().raw_usage =
+        high_cache.account_billing.as_mut().unwrap().raw_usage =
             external_usage_snapshot(1_000, 20, 910_000, 120_000);
         high_cache.raw_usage = high_cache
-            .external_pool_billing
+            .account_billing
             .as_ref()
             .map(|billing| billing.raw_usage);
         usage_store.record(high_cache).await.unwrap();
@@ -11431,8 +11378,8 @@ mod tests {
         usage_store.record(ok).await.unwrap();
 
         let response = usage_store
-            .external_pool_usage_risk(
-                UsageExternalPoolRiskQuery {
+            .account_usage_risk(
+                UsageAccountRiskQuery {
                     timezone: "UTC".to_string(),
                     window_key: "custom".to_string(),
                     window_label: "自定义".to_string(),
@@ -11446,7 +11393,7 @@ mod tests {
                     stream: None,
                     limit: 10,
                 },
-                UsageExternalPoolRiskCostConfig {
+                UsageAccountRiskCostConfig {
                     cost_floor_enabled: true,
                     cost_floor_margin_percent: 10,
                 },
@@ -11486,7 +11433,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_soft_cleanup_removes_rollups_and_costs_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11520,7 +11467,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_physical_cleanup_preserves_rollups_for_active_rows_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11577,7 +11524,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_recomputes_global_duration_max_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11664,7 +11611,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_hard_cleanup_removes_legacy_rollups_once_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11703,7 +11650,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_rejects_late_replay_but_accepts_newer_records_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11775,7 +11722,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_is_consistent_with_concurrent_old_writes_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11836,7 +11783,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_cleanup_watermark_waits_for_inflight_usage_commit_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11906,7 +11853,7 @@ mod tests {
     async fn postgres_usage_cleanup_batches_return_contention_signal_while_writer_guard_is_held_for_three_rounds()
      {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -11978,7 +11925,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_cleanup_watermark_lock_wait_is_bounded_and_recovers() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12022,7 +11969,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_prunes_high_cardinality_zero_rollups_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12181,7 +12128,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_lifecycle_fence_requires_offline_maintenance() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
 
@@ -12242,7 +12189,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_repeated_startup_migration_preserves_unchanged_inline_marker_time() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
 
@@ -12319,7 +12266,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_rollup_writes_hour_buckets() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
 
@@ -12372,7 +12319,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_concurrent_writers_keep_rollup_lock_order_stable() {
         let Some(mut config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         config.postgres.max_connections = 4;
@@ -12490,7 +12437,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_duration_p95_uses_weighted_histogram_and_negative_deltas() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12574,7 +12521,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_read_transaction_is_bounded_and_read_only() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -12611,7 +12558,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_uses_exact_utc_boundary_population_for_every_window_metric() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12769,7 +12716,7 @@ mod tests {
         );
 
         let billing = usage_store
-            .dashboard_external_pool_billing_by_pool(&specs)
+            .dashboard_account_billing_by_pool(&specs)
             .await
             .unwrap();
         let cross_billing = &billing["cross-hour"];
@@ -12783,7 +12730,7 @@ mod tests {
         assert!((cross_billing[0].uplifted_cost_usd - 0.016).abs() < 1e-12);
         assert!((cross_billing[0].profit_usd + 0.004).abs() < 1e-12);
         assert_eq!(
-            by_key["cross-hour"].summary.external_pool_billing.requests,
+            by_key["cross-hour"].summary.account_billing.requests,
             cross_billing[0].requests
         );
 
@@ -12839,7 +12786,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_applies_legacy_cost_fallback_after_utc_hour_regrouping() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12874,12 +12821,12 @@ mod tests {
                 r#"
                 INSERT INTO usage_rollup_time_buckets (
                     bucket_start, dimension, dimension_key, dimension_label,
-                    requests, external_pool_requests, external_pool_priced_requests,
-                    external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
-                    external_pool_uplifted_cost_usd, external_pool_profit_usd,
-                    external_pool_reported_cost_usd, external_pool_billable_cost_usd
+                    requests, account_requests, account_priced_requests,
+                    account_raw_cost_usd, account_shaped_cost_usd,
+                    account_uplifted_cost_usd, account_profit_usd,
+                    account_reported_cost_usd, account_billable_cost_usd
                 )
-                VALUES ($1, 'external_pool', '42', 'legacy-pool',
+                VALUES ($1, 'account', '42', 'legacy-pool',
                         1, 1, 1, $2, $3, $4, $5, $6, $4)
                 "#,
             )
@@ -12908,7 +12855,7 @@ mod tests {
         );
 
         let billing = usage_store
-            .dashboard_external_pool_billing_by_pool(&specs)
+            .dashboard_account_billing_by_pool(&specs)
             .await
             .unwrap();
         let pool = &billing["fixed"][0];
@@ -12924,7 +12871,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_duration_write_and_dashboard_histogram_saturate_without_signed_wrap() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12963,8 +12910,8 @@ mod tests {
         output_tokens: i32,
         cache_read_input_tokens: i32,
         cache_creation_input_tokens: i32,
-    ) -> ExternalPoolUsageSnapshot {
-        ExternalPoolUsageSnapshot {
+    ) -> AccountUsageSnapshot {
+        AccountUsageSnapshot {
             total_input_tokens: input_tokens
                 .saturating_add(cache_read_input_tokens)
                 .saturating_add(cache_creation_input_tokens),
@@ -13035,14 +12982,14 @@ mod tests {
             latency_trace: None,
             simulated: false,
 
-            route_kind: Some(UsageRouteKind::ExternalPool),
-            route_subtype: Some(UsageRouteSubtype::External),
+            route_kind: Some(UsageRouteKind::Account),
+            route_subtype: Some(UsageRouteSubtype::Account),
 
-            external_pool_id: Some(42),
-            external_pool_name: Some("backup-a".to_string()),
+            account_id: Some(42),
+            account_name: Some("backup-a".to_string()),
             external_attempts: Vec::new(),
             usage_projection_applied: Some(true),
-            external_pool_billing: Some(ExternalPoolBilling {
+            account_billing: Some(AccountBilling {
                 request_input_tokens: None,
                 raw_usage,
                 shaped_usage,
@@ -13083,9 +13030,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_external_pool_list_and_get_preserve_body_modes() {
+    async fn postgres_account_list_and_get_preserve_body_modes() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
 
@@ -13093,7 +13040,7 @@ mod tests {
         clean(&store).await;
 
         let created = store
-            .create_external_pool(CreateExternalPoolRequest {
+            .create_account(CreateAccountRequest {
                 tags: Vec::new(),
                 proxy_url: None,
                 cost_multiplier: 1.0,
@@ -13101,21 +13048,21 @@ mod tests {
                 name: "raw-pool".to_string(),
                 base_url: "https://example.com".to_string(),
                 api_key: "sk-test".to_string(),
-                auth_type: ExternalPoolAuthType::Bearer,
-                header_profile: ExternalPoolHeaderProfile::Generic,
+                auth_type: AccountAuthType::Bearer,
+                header_profile: AccountHeaderProfile::Generic,
                 append_beta_query: false,
                 header_overrides: HashMap::new(),
-                wire_profile: ExternalPoolWireProfile::Default,
-                tls_profile: ExternalPoolTlsProfile::Default,
+                wire_profile: AccountWireProfile::Default,
+                tls_profile: AccountTlsProfile::Default,
                 enabled: true,
                 priority: 1,
                 max_concurrent_requests: 2,
-                usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
-                stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
-                auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
-                pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Enabled,
+                usage_projection_mode: UsageProjectionMode::PassThrough,
+                stream_response_mode: Some(StreamResponseMode::EventPassthrough),
+                auto_disable_policy: AutoDisablePolicy::Inherit,
+                pre_output_stream_retry_mode: StreamRetryMode::Enabled,
                 normalize_model_version_dots: false,
-                model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
+                model_mapping_mode: ModelMappingMode::PassthroughMapping,
                 model_mapping_require_match: false,
                 model_mapping_rules: vec![ModelMappingRule {
                     enabled: true,
@@ -13125,7 +13072,7 @@ mod tests {
                     note: None,
                 }],
                 supported_models: Vec::new(),
-                route_mode: ExternalPoolRouteMode::AllowList,
+                route_mode: RouteRuleMode::AllowList,
                 route_rules: vec!["/CC".to_string(), "/ha".to_string()],
                 notes: None,
             })
@@ -13134,60 +13081,58 @@ mod tests {
 
         assert_eq!(
             created.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(StreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             created.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Enabled
+            StreamRetryMode::Enabled
         );
-        assert_eq!(created.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(created.route_mode, RouteRuleMode::AllowList);
         assert_eq!(
             created.route_rules,
             vec!["/cc".to_string(), "/ha".to_string()]
         );
 
-        let listed = store.list_external_pools(false).await.unwrap();
+        let listed = store.list_accounts(false).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(StreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             listed[0].pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Enabled
+            StreamRetryMode::Enabled
         );
 
         let loaded = store
-            .get_external_pool(created.id, false)
+            .get_account(created.id, false)
             .await
             .unwrap()
             .expect("pool should exist");
         assert_eq!(
             loaded.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(StreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             loaded.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Enabled
+            StreamRetryMode::Enabled
         );
-        assert_eq!(loaded.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(loaded.route_mode, RouteRuleMode::AllowList);
         assert_eq!(
             loaded.route_rules,
             vec!["/cc".to_string(), "/ha".to_string()]
         );
 
         let updated = store
-            .update_external_pool(
+            .update_account(
                 created.id,
-                UpdateExternalPoolRequest {
-                    stream_response_mode: Some(Some(
-                        ExternalPoolStreamResponseMode::EventPassthrough,
-                    )),
+                UpdateAccountRequest {
+                    stream_response_mode: Some(Some(StreamResponseMode::EventPassthrough)),
 
-                    pre_output_stream_retry_mode: Some(ExternalPoolStreamRetryMode::Disabled),
-                    route_mode: Some(ExternalPoolRouteMode::DenyList),
+                    pre_output_stream_retry_mode: Some(StreamRetryMode::Disabled),
+                    route_mode: Some(RouteRuleMode::DenyList),
                     route_rules: Some(vec!["/V1".to_string()]),
-                    ..UpdateExternalPoolRequest::default()
+                    ..UpdateAccountRequest::default()
                 },
             )
             .await
@@ -13195,21 +13140,21 @@ mod tests {
             .expect("pool should update");
         assert_eq!(
             updated.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(StreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             updated.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Disabled
+            StreamRetryMode::Disabled
         );
-        assert_eq!(updated.route_mode, ExternalPoolRouteMode::DenyList);
+        assert_eq!(updated.route_mode, RouteRuleMode::DenyList);
         assert_eq!(updated.route_rules, vec!["/v1".to_string()]);
 
         let inherited = store
-            .update_external_pool(
+            .update_account(
                 created.id,
-                UpdateExternalPoolRequest {
+                UpdateAccountRequest {
                     stream_response_mode: Some(None),
-                    ..UpdateExternalPoolRequest::default()
+                    ..UpdateAccountRequest::default()
                 },
             )
             .await
@@ -13218,18 +13163,18 @@ mod tests {
         assert_eq!(inherited.stream_response_mode, None);
         assert_eq!(
             inherited.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Disabled
+            StreamRetryMode::Disabled
         );
-        assert_eq!(inherited.route_mode, ExternalPoolRouteMode::DenyList);
+        assert_eq!(inherited.route_mode, RouteRuleMode::DenyList);
         assert_eq!(inherited.route_rules, vec!["/v1".to_string()]);
 
         store.drop_test_schema().await.unwrap();
     }
 
     #[tokio::test]
-    async fn postgres_rolls_up_external_pool_billing_for_large_samples_and_removes_after_cleanup() {
+    async fn postgres_rolls_up_account_billing_for_large_samples_and_removes_after_cleanup() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
             return;
         };
 
@@ -13255,20 +13200,17 @@ mod tests {
         usage_store.record_batch(records).await.unwrap();
 
         let summary = usage_store.summary(1_000).await.unwrap();
-        assert_eq!(summary.external_pool_billing.requests, 1000);
-        assert_eq!(summary.external_pool_billing.priced_requests, 1000);
-        assert_eq!(summary.external_pool_billing.unpriced_requests, 0);
-        assert_eq!(
-            summary.external_pool_billing.cost_floor_applied_requests,
-            500
-        );
-        assert!((summary.external_pool_billing.raw_cost_usd - 7.5).abs() < 0.000001);
-        assert!((summary.external_pool_billing.shaped_cost_usd - 6.5).abs() < 0.000001);
-        assert!((summary.external_pool_billing.uplifted_cost_usd - 8.5).abs() < 0.000001);
-        assert!((summary.external_pool_billing.profit_usd - 1.0).abs() < 0.000001);
-        assert!((summary.external_pool_billing.reported_cost_usd - 8.5).abs() < 0.000001);
-        assert!((summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
-        assert!((summary.external_pool_billing.cost_floor_delta_usd - 1.0).abs() < 0.000001);
+        assert_eq!(summary.account_billing.requests, 1000);
+        assert_eq!(summary.account_billing.priced_requests, 1000);
+        assert_eq!(summary.account_billing.unpriced_requests, 0);
+        assert_eq!(summary.account_billing.cost_floor_applied_requests, 500);
+        assert!((summary.account_billing.raw_cost_usd - 7.5).abs() < 0.000001);
+        assert!((summary.account_billing.shaped_cost_usd - 6.5).abs() < 0.000001);
+        assert!((summary.account_billing.uplifted_cost_usd - 8.5).abs() < 0.000001);
+        assert!((summary.account_billing.profit_usd - 1.0).abs() < 0.000001);
+        assert!((summary.account_billing.reported_cost_usd - 8.5).abs() < 0.000001);
+        assert!((summary.account_billing.billable_cost_usd - 8.5).abs() < 0.000001);
+        assert!((summary.account_billing.cost_floor_delta_usd - 1.0).abs() < 0.000001);
         assert!((summary.total_estimated_cost_usd - 8.5).abs() < 0.000001);
 
         let dashboard = usage_store
@@ -13280,16 +13222,13 @@ mod tests {
             .iter()
             .find(|window| window.key == "today")
             .unwrap();
-        assert_eq!(today.summary.external_pool_billing.requests, 1000);
+        assert_eq!(today.summary.account_billing.requests, 1000);
         assert_eq!(
-            today
-                .summary
-                .external_pool_billing
-                .cost_floor_applied_requests,
+            today.summary.account_billing.cost_floor_applied_requests,
             500
         );
-        assert!((today.summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
-        assert!((today.summary.external_pool_billing.profit_usd - 1.0).abs() < 0.000001);
+        assert!((today.summary.account_billing.billable_cost_usd - 8.5).abs() < 0.000001);
+        assert!((today.summary.account_billing.profit_usd - 1.0).abs() < 0.000001);
 
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         let cleanup_cutoff = Utc::now();
@@ -13313,16 +13252,10 @@ mod tests {
             .unwrap();
         assert_eq!(cleared_page.total, 0);
         let cleared_summary = usage_store.summary(1_000).await.unwrap();
-        assert_eq!(cleared_summary.external_pool_billing.requests, 0);
-        assert_eq!(cleared_summary.external_pool_billing.priced_requests, 0);
-        assert!(
-            cleared_summary
-                .external_pool_billing
-                .billable_cost_usd
-                .abs()
-                < 0.000001
-        );
-        assert!(cleared_summary.external_pool_billing.profit_usd.abs() < 0.000001);
+        assert_eq!(cleared_summary.account_billing.requests, 0);
+        assert_eq!(cleared_summary.account_billing.priced_requests, 0);
+        assert!(cleared_summary.account_billing.billable_cost_usd.abs() < 0.000001);
+        assert!(cleared_summary.account_billing.profit_usd.abs() < 0.000001);
         assert!(cleared_summary.total_estimated_cost_usd.abs() < 0.000001);
 
         store.drop_test_schema().await.unwrap();

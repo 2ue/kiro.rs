@@ -26,7 +26,7 @@
 //!
 //! # 使用示例
 //! ```rust,ignore
-//! use kiro_rs::anthropic;
+//! use claude_pool::anthropic;
 //!
 //! let app = anthropic::create_router("your-api-key");
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
@@ -43,11 +43,11 @@ pub(crate) mod envelope;
 mod handlers;
 mod image_resize;
 pub(crate) mod inference_attempt_budget;
-pub(crate) mod kiro_plus_shaping;
 mod middleware;
 pub(crate) mod model_capabilities;
 pub(crate) mod payload_guard;
 pub(crate) mod payload_guard_runtime;
+pub(crate) mod prefix_tool_plus_shaping;
 pub(crate) mod pricing;
 pub(crate) mod prompt_cache;
 pub(crate) mod prompt_cache_creation_control;

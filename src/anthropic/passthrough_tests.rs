@@ -1,9 +1,9 @@
 use super::*;
+use crate::account::passthrough_test_prepare;
 use crate::anthropic::{
     prompt_cache::PromptCacheTracker, prompt_cache_creation_control::PromptCacheCreationController,
     usage::UsageRecorder,
 };
-use crate::external_pool::passthrough_test_prepare;
 use crate::model::prompt_injection::{ItemSetting, RoutePayloadGuardConfig};
 use axum::{Router, extract::State, routing::post};
 use std::sync::Mutex as StdMutex;
@@ -60,7 +60,7 @@ async fn passthrough_default_bytes_and_headers_reach_mock_upstream() {
     for raw in bodies {
         let raw = Bytes::copy_from_slice(raw);
         assert_eq!(patched(&raw, RouteFeatureSet::default()).await, raw);
-        let pool = crate::external_pool::tests::test_pool(&format!("http://{address}"), false);
+        let pool = crate::account::tests::test_pool(&format!("http://{address}"), false);
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
         headers.insert("x-test-custom", "preserve-me".parse().unwrap());
@@ -385,14 +385,14 @@ async fn passthrough_reasoning_patch_preserves_remaining_field_order() {
 
 #[tokio::test]
 async fn passthrough_account_mapping_changes_only_model_bytes() {
-    use crate::external_pool::ExternalPoolModelMappingMode;
+    use crate::account::ModelMappingMode;
     use crate::model::config::ModelMappingRule;
     let raw = Bytes::from_static(br#" { "messages" : [{"role":"user","content":"old"}], "model" : "old", "metadata":{"model":"old"}, "unknown": 1 } "#);
-    let mut route = crate::external_pool::tests::test_route("old");
+    let mut route = crate::account::tests::test_route("old");
     route.effective_raw_body = raw.clone();
     route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&raw)));
-    let mut pool = crate::external_pool::tests::test_pool("https://example.invalid", false);
-    pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
+    let mut pool = crate::account::tests::test_pool("https://example.invalid", false);
+    pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
     pool.model_mapping_rules = vec![ModelMappingRule {
         enabled: true,
         source: "old".into(),

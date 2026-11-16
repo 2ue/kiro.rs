@@ -139,7 +139,7 @@ const FEATURE_TEXT: Record<Exclude<keyof RouteFeatureSet, 'thinkingTrigger'>, { 
   },
   channelLeakGuard: {
     label: '渠道信息输出过滤',
-    desc: '删除回复里"我是 Kiro""指令冲突"这类暴露上游的句子。正则较宽，讨论 kiro.rs 代码时可能误删正常句子。',
+    desc: '删除回复里"我是 上游""指令冲突"这类暴露上游的句子。正则较宽，讨论 claude-pool 代码时可能误删正常句子。',
   },
   channelLeakGuardStream: {
     label: '流式也过滤',
@@ -215,7 +215,7 @@ export function RouteBehaviorEditor({
   const setItem = (id: string, patch: InjectionItemOverride) => {
     const next = { ...injection, [id]: { ...(injection[id] ?? {}), ...patch } }
     const item = next[id]!
-    if (item.enabled === undefined && item.externalPool === undefined) delete next[id]
+    if (item.enabled === undefined && item.account === undefined) delete next[id]
     onInjectionChange(next)
   }
   const setFeature = <K extends keyof RouteFeatureSet>(key: K, next: RouteFeatureSet[K] | undefined) => {
@@ -247,16 +247,16 @@ export function RouteBehaviorEditor({
         control={
           <div className="space-y-1.5">
             <TriSelect id={controlId} value={own.enabled} inherited={inherited.enabled} onChange={(enabled) => setItem(id, { enabled })} />
-            {entry.externalPool && (
+            {entry.account && (
               <label className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground" htmlFor={`${controlId}-external`}>
-                <span className="shrink-0">外部池</span>
+                <span className="shrink-0">账号</span>
                 <span className="min-w-0 flex-1">
                   <TriSelect
                     id={`${controlId}-external`}
-                    value={own.externalPool}
-                    inherited={inherited.externalPool}
+                    value={own.account}
+                    inherited={inherited.account}
                     disabled={!effectiveEnabled}
-                    onChange={(externalPool) => setItem(id, { externalPool })}
+                    onChange={(account) => setItem(id, { account })}
                   />
                 </span>
               </label>

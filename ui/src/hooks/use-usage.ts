@@ -18,8 +18,8 @@ import {
   getUsageOverviewSummary,
   getUsageDashboardAccounts,
   getUsageDashboardBreakdown,
-  getUsageDashboardExternalPoolBilling,
-  getUsageDashboardExternalPoolRisk,
+  getUsageDashboardAccountBilling,
+  getUsageDashboardAccountRisk,
   getUsageDashboardSeries,
   getUsageDashboardTop,
   getUsageDashboardWindows,
@@ -30,14 +30,11 @@ import {
   previewUsageCleanup,
   resumeUsageCleanup,
   startUsageCleanup,
-  getSubscriptionModelLists,
-  setSubscriptionModelList,
   syncModelCapabilities,
   syncModelPricing,
-  syncSubscriptionModelList,
   upsertManualModel,
 } from '@/api/usage'
-import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageExternalPoolRiskQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageAccountRiskQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 type RefetchInterval = number | false
 
@@ -254,28 +251,28 @@ export function useUsageDashboardBreakdown(
   })
 }
 
-export function useUsageDashboardExternalPoolBilling(
+export function useUsageDashboardAccountBilling(
   timezone = 'Asia/Shanghai',
   windowKey = 'today',
   refetchInterval: RefetchInterval = false,
   enabled = true
 ) {
   return useQuery({
-    queryKey: ['usage-dashboard-external-pool-billing', timezone, windowKey],
-    queryFn: () => getUsageDashboardExternalPoolBilling(timezone, windowKey),
+    queryKey: ['usage-dashboard-account-billing', timezone, windowKey],
+    queryFn: () => getUsageDashboardAccountBilling(timezone, windowKey),
     refetchInterval,
     enabled,
   })
 }
 
-export function useUsageDashboardExternalPoolRisk(
-  query: UsageExternalPoolRiskQuery,
+export function useUsageDashboardAccountRisk(
+  query: UsageAccountRiskQuery,
   refetchInterval: RefetchInterval = false,
   enabled = true
 ) {
   return useQuery({
-    queryKey: ['usage-dashboard-external-pool-risk', query],
-    queryFn: () => getUsageDashboardExternalPoolRisk(query),
+    queryKey: ['usage-dashboard-account-risk', query],
+    queryFn: () => getUsageDashboardAccountRisk(query),
     refetchInterval,
     enabled,
   })
@@ -294,8 +291,8 @@ function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQuery
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-top'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-accounts'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-breakdown'] })
-  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-billing'] })
-  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-risk'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-account-billing'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-account-risk'] })
   queryClient.invalidateQueries({ queryKey: ['usage-writer-stats'] })
 }
 
@@ -444,29 +441,5 @@ export function useDeleteManualModel() {
       queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
       queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
     },
-  })
-}
-
-export function useSubscriptionModelLists() {
-  return useQuery({
-    queryKey: ['subscription-model-lists'],
-    queryFn: getSubscriptionModelLists,
-    refetchInterval: 60000,
-  })
-}
-
-export function useSetSubscriptionModelList() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ tier, models }: { tier: string; models: string[] }) => setSubscriptionModelList(tier, models),
-    onSuccess: (data) => queryClient.setQueryData(['subscription-model-lists'], data),
-  })
-}
-
-export function useSyncSubscriptionModelList() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ tier, credentialId }: { tier: string; credentialId?: number }) => syncSubscriptionModelList(tier, credentialId),
-    onSuccess: (data) => queryClient.setQueryData(['subscription-model-lists'], data),
   })
 }

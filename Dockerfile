@@ -21,7 +21,7 @@ ENV CARGO_PROFILE_RELEASE_LTO=false \
     CARGO_NET_RETRY=10 \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
-# Every release bumps the kiro-rs version in Cargo.toml/Cargo.lock. Normalizing it here keeps
+# Every release bumps the claude-pool version in Cargo.toml/Cargo.lock. Normalizing it here keeps
 # the dependency stage's inputs byte-identical across releases, so its cached layer is reused
 # and only a real dependency change (Cargo.lock, features, toolchain) rebuilds dependencies.
 FROM rust-base AS dependency-manifest
@@ -30,42 +30,42 @@ COPY Cargo.toml Cargo.lock ./
 RUN awk '!done && /^version = / { $0 = "version = \"0.0.0\""; done = 1 } { print }' \
         Cargo.toml > Cargo.toml.normalized \
     && mv Cargo.toml.normalized Cargo.toml \
-    && awk 'prev == "name = \"kiro-rs\"" && /^version = / { $0 = "version = \"0.0.0\"" } { print; prev = $0 }' \
+    && awk 'prev == "name = \"claude-pool\"" && /^version = / { $0 = "version = \"0.0.0\"" } { print; prev = $0 }' \
         Cargo.lock > Cargo.lock.normalized \
     && mv Cargo.lock.normalized Cargo.lock
 
 # Compiles every dependency against a placeholder main.rs. This layer is cached between
 # releases; the root crate's placeholder artifacts are removed so the real build below always
-# recompiles kiro-rs from the actual sources.
+# recompiles claude-pool from the actual sources.
 FROM rust-base AS dependencies
 WORKDIR /app
 COPY --from=dependency-manifest /manifest/Cargo.toml /manifest/Cargo.lock ./
 RUN mkdir -p src \
     && printf 'fn main() {}\n' > src/main.rs \
-    && mkdir -p src/bin && printf 'fn main() {}\n' > src/bin/kiro_loadtest.rs \
+    && mkdir -p src/bin && printf 'fn main() {}\n' > src/bin/pool_loadtest.rs \
     && cargo build --release --locked \
-    && rm -rf src target/release/kiro-rs target/release/kiro-rs.d \
-        target/release/kiro_loadtest target/release/kiro_loadtest.d \
-        target/release/deps/kiro_rs-* target/release/deps/kiro_loadtest-* \
-        target/release/.fingerprint/kiro-rs-* target/release/incremental
+    && rm -rf src target/release/claude-pool target/release/claude-pool.d \
+        target/release/pool_loadtest target/release/pool_loadtest.d \
+        target/release/deps/claude_pool-* target/release/deps/pool_loadtest-* \
+        target/release/.fingerprint/claude-pool-* target/release/incremental
 
 FROM dependencies AS builder
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY data ./data
 COPY --from=frontend-builder /app/ui/dist /app/ui/dist
-RUN cargo build --release --locked --bin kiro-rs \
-    && ./target/release/kiro-rs --version
+RUN cargo build --release --locked --bin claude-pool \
+    && ./target/release/claude-pool --version
 
 FROM alpine:3.23
 
 RUN apk add --no-cache busybox-extras ca-certificates python3
 
 WORKDIR /app
-COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
+COPY --from=builder /app/target/release/claude-pool /app/claude-pool
 
 VOLUME ["/app/config", "/app/logs"]
 
 EXPOSE 8990
 
-CMD ["./kiro-rs", "-c", "/app/config/config.json"]
+CMD ["./claude-pool", "-c", "/app/config/config.json"]

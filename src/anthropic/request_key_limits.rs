@@ -1,4 +1,4 @@
-//! Per request-API-key usage limits: billed amount (USD), Kiro credits and tokens, per day,
+//! Per request-API-key usage limits: billed amount (USD), 上游 credits and tokens, per day,
 //! per month or in total.
 //!
 //! Counters live in Redis so every instance sees the same totals. A request is checked before
@@ -23,7 +23,7 @@ use crate::storage::redis_cache::RedisStore;
 pub enum KeyLimitMetric {
     /// Billed amount in USD: `estimatedCostUsd`.
     CostUsd,
-    /// Kiro credits consumed on local accounts: `kiroMeteringUsage`.
+    /// 上游 credits consumed on local accounts: `upstreamMeteringUsage`.
     Credits,
     /// Input + output + cache read + cache creation tokens.
     Tokens,
@@ -657,10 +657,10 @@ mod tests {
     }
 
     async fn redis_limiter() -> Option<(Arc<RedisStore>, Arc<RequestKeyLimiter>)> {
-        let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
+        let url = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL")?;
         let mut config = crate::model::config::Config::default();
         config.redis.url = Some(url);
-        config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+        config.redis.key_prefix = format!("claude_pool:test:{}", uuid::Uuid::new_v4());
         let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
         Some((redis.clone(), Arc::new(RequestKeyLimiter::new(Some(redis)))))
     }
@@ -692,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn limits_count_reject_and_reset_through_redis() {
         let Some((redis, limiter)) = redis_limiter().await else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
             return;
         };
         let key = "key-under-test";

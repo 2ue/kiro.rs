@@ -358,6 +358,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
 
 [[package]]
+name = "claude-pool"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "fastrand",
+ "flate2",
+ "futures",
+ "hex",
+ "http",
+ "http-body",
+ "image",
+ "libc",
+ "mimalloc",
+ "mime_guess",
+ "once_cell",
+ "parking_lot",
+ "redis",
+ "regex",
+ "reqwest",
+ "rust-embed",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2 0.6.1",
+ "sqlx",
+ "subtle",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+ "webpki-roots 1.0.4",
+ "zip",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1234,52 +1280,6 @@ checksum = "464a3709c7f55f1f721e5389aa6ea4e3bc6aba669353300af094b29ffbdde1d8"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "kiro-rs"
-version = "0.0.252"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "fastrand",
- "flate2",
- "futures",
- "hex",
- "http",
- "http-body",
- "image",
- "libc",
- "mimalloc",
- "mime_guess",
- "once_cell",
- "parking_lot",
- "redis",
- "regex",
- "reqwest",
- "rust-embed",
- "rustls",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "sha2",
- "socket2 0.6.1",
- "sqlx",
- "subtle",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
- "webpki-roots 1.0.4",
- "zip",
 ]
 
 [[package]]

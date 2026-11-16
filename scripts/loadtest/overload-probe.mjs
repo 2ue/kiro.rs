@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Overload probe: does kiro-rs keep dispatching, and stay healthy, when load exceeds capacity?
+// Overload probe: does claude-pool keep dispatching, and stay healthy, when load exceeds capacity?
 //
-// Drives a kiro-rs on mock upstreams with an open-loop arrival rate (requests per second), so
+// Drives a claude-pool on mock upstreams with an open-loop arrival rate (requests per second), so
 // load keeps arriving whether or not earlier requests finished, like real traffic behind a
 // gateway. The rate follows a profile (steady, ramp, spike, square wave). Each arrival can retry
 // on 429 the way sub2api does: a few retries on the "same account" 500 ms apart, then "switch
@@ -22,7 +22,7 @@
 // - slowReject: p95 time for a 429 above 1 s (rejecting should be cheap);
 // - usageLag: usage writer backlog above 2000.
 //
-// Usage: node overload-probe.mjs --base-url URL --api-key KEY --admin-key KEY --kiro-mock URL
+// Usage: node overload-probe.mjs --base-url URL --api-key KEY --admin-key KEY --pool-mock URL
 //          --profile "steady:5:60,spike:40:30,steady:5:120" [--stream-share 0.7]
 //          [--retry sub2api|none|honor] [--same-account-retries 3] [--max-switches 10]
 //          [--accounts 57] [--per-account-concurrency 4] [--per-account-rpm 0]
@@ -41,7 +41,7 @@
 //
 // The client caps its connections (--max-sockets, default 300) and stops early when the host
 // runs short of local ports (TIME_WAIT above --max-time-wait, default 4000): a test must not
-// take the machine down with it. Only TIME_WAIT sockets on ephemeral ports count: kiro-rs sends
+// take the machine down with it. Only TIME_WAIT sockets on ephemeral ports count: claude-pool sends
 // `Connection: close` upstream, so the mock closes every upstream call first and its TIME_WAIT
 // sockets sit on the mock's own port, where they hold no local port. A second cap on all
 // TIME_WAIT sockets (4x the first) still bounds kernel state.
@@ -67,7 +67,7 @@ const args = parseArgs(process.argv.slice(2));
 const baseUrl = new URL(args.baseUrl);
 const apiKey = args.apiKey;
 const adminKey = args.adminKey || "";
-const kiroMock = args.kiroMock;
+const poolMock = args.poolMock;
 const streamShare = Number(args.streamShare ?? 0.7);
 const retryMode = args.retry || "sub2api";
 const sameAccountRetries = Number(args.sameAccountRetries ?? 3);
@@ -88,9 +88,9 @@ const sessions = Number(args.sessions || 0);
 const bodyKb = Number(args.bodyKb || 0);
 const path = args.path || "/cc/v1/messages";
 const clientTimeoutMs = Number(args.clientTimeoutMs || 300000);
-// Like a gateway, the client caps its connections to kiro-rs. Without a cap the retry storm opens
+// Like a gateway, the client caps its connections to claude-pool. Without a cap the retry storm opens
 // tens of thousands of sockets and exhausts the local ephemeral ports (16k on macOS), which then
-// also starves kiro-rs's own connections to the mock upstream on the same loopback.
+// also starves claude-pool's own connections to the mock upstream on the same loopback.
 // `maxFreeSockets` defaults to 256: past that, every finished response closes its connection,
 // and the retry storm churns through sockets until TIME_WAIT has used up every local port.
 const maxSockets = Number(args.maxSockets || 300);
@@ -133,7 +133,7 @@ function sendOne(marker, stream, sessionId) {
     messages: [{ role: "user", content: `overload probe ${marker} ${padding}` }],
   });
   // Latency is measured from when the request gets a connection: with the connection cap, time
-  // spent waiting for a free socket is the client's own queue, not kiro-rs.
+  // spent waiting for a free socket is the client's own queue, not claude-pool.
   let started = performance.now();
   return new Promise((resolve) => {
     const req = http.request(
@@ -287,7 +287,7 @@ async function main() {
       const sec = nowSec() - 1;
       const [ready, mock, writer] = await Promise.all([
         getJson(`${baseUrl.origin}/readyz`),
-        getJson(`${kiroMock}/__control`),
+        getJson(`${poolMock}/__control`),
         adminKey ? getJson(`${baseUrl.origin}/api/admin/usage-writer-stats`, { "x-api-key": adminKey }) : Promise.resolve({ body: null }),
       ]);
       const perToken = mock.body?.counters?.perToken || {};
@@ -364,7 +364,7 @@ async function main() {
         usageDropped: w.droppedPersistRecords ?? null,
         redisUsageBacklog:
           typeof w.redisWriterAccepted === "number" ? w.redisWriterAccepted - (w.redisWriterFinished || 0) : null,
-        // Stalled: requests are waiting in kiro-rs (queued, or readyz itself is not answering
+        // Stalled: requests are waiting in claude-pool (queued, or readyz itself is not answering
         // while clients wait beyond what is upstream) and no upstream call started for 5 s.
         // Long streams with an empty queue are not a stall.
         stall:
@@ -413,7 +413,7 @@ async function main() {
     segmentStartSecs.push(nowSec());
     const patch = upstreamPlan[segmentIndex];
     if (patch) {
-      await fetch(`${kiroMock}/__control`, {
+      await fetch(`${poolMock}/__control`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(patch),
@@ -510,9 +510,9 @@ async function main() {
       };
     },
   );
-  const finalMock = await getJson(`${kiroMock}/__control`);
+  const finalMock = await getJson(`${poolMock}/__control`);
   const perToken = finalMock.body?.counters?.perToken || {};
-  // kiro-rs's own count of calls it let through per account, to tell a real RPM overrun from
+  // claude-pool's own count of calls it let through per account, to tell a real RPM overrun from
   // calls that only arrived at the mock bunched together (arrival delay on a loaded host).
   const tokenIds = Object.keys(perToken)
     .map((token) => token.replace("mock-access-", ""))
@@ -550,7 +550,7 @@ async function main() {
     accountsOverConcurrencyDetail: overConcurrency
       .slice(0, 5)
       .map(([token, stats]) => ({ token, maxInFlight: stats.maxInFlight, limit: limitOf(token).conc })),
-    // Event-loop lag of the mock over the run: its arrival and close times trail kiro-rs by up
+    // Event-loop lag of the mock over the run: its arrival and close times trail claude-pool by up
     // to this much, so RPM and concurrency peaks within it are measurement, not dispatch.
     mockLoopLagMaxMs: finalMock.body?.counters?.loopLagMaxMs ?? null,
     accountsOverRpm: overRpm.length,

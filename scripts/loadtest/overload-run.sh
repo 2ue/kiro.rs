@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Overload reproduction runs on an isolated kiro-rs with mock upstreams.
+# Overload reproduction runs on an isolated claude-pool with mock upstreams.
 #
-# Each case starts kiro-rs on a fresh copy of the template database and an empty Redis db,
+# Each case starts claude-pool on a fresh copy of the template database and an empty Redis db,
 # seeds ACCOUNTS mock accounts, applies production-like dispatch settings (queue 200, 60 s wait,
 # global 1000, priority mode, no per-key admission), sets the mock upstream shape, runs
 # overload-probe.mjs with the case profile, then stops everything.
 #
-# Usage: BIN=/path/to/kiro-rs CASES="steady_ok spike_sub2api" scripts/loadtest/overload-run.sh
+# Usage: BIN=/path/to/claude-pool CASES="steady_ok spike_sub2api" scripts/loadtest/overload-run.sh
 # Env: ACCOUNTS (10), PER_CONC (4, or a range like 3-5), PER_RPM (0 = unlimited, or a range like
 #      20-30), QUEUE (200), WAIT_SECS (60), OUT_DIR (/tmp/overload-e2e/results), KEEP=1 to keep
 #      the database after the run. A range spreads the limit over the accounts in turn
@@ -18,8 +18,8 @@ set -uo pipefail
 
 D=${D:-/tmp/overload-e2e}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=${BIN:-/tmp/kiro-rs-rust-analyzer-target/release/kiro-rs}
-DB=${DB:-kiro_overload_probe}
+BIN=${BIN:-/tmp/claude-pool-rust-analyzer-target/release/claude-pool}
+DB=${DB:-pool_overload_probe}
 PORT=${PORT:-19381}
 MOCK_PORT=${MOCK_PORT:-39181}
 REDIS_DB=${REDIS_DB:-13}
@@ -36,19 +36,19 @@ MAX_DURATION_SECS=${MAX_DURATION_SECS:-3600}
 LEASE_MAX_SECS=${LEASE_MAX_SECS:-900}
 CASES=${CASES:-steady_ok}
 OUT_DIR=${OUT_DIR:-$D/results}
-PGPW=$(docker exec kiro-rs-postgres-local printenv POSTGRES_PASSWORD)
+PGPW=$(docker exec claude-pool-postgres-local printenv POSTGRES_PASSWORD)
 NODE=${NODE:-"/Users/yuanfeijie/.volta/bin/volta run --node 22.23.0 node"}
 mkdir -p "$D" "$OUT_DIR" && chmod 700 "$D"
-cp "$BIN" "$D/kiro-rs"
+cp "$BIN" "$D/claude-pool"
 
 stop_all() {
-  pkill -f "kiro-mock-upstream.mjs --overload-probe" 2>/dev/null || true
+  pkill -f "anthropic-mock-upstream.mjs --overload-probe" 2>/dev/null || true
   pkill -f "overload-probe.mjs" 2>/dev/null || true
   local pid
   pid=$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
   [ -n "$pid" ] && kill "$pid" 2>/dev/null
   for _ in $(seq 1 60); do [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "kiro-rs did not exit in 30 s, killing"; kill -9 "$pid"; }
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "claude-pool did not exit in 30 s, killing"; kill -9 "$pid"; }
   return 0
 }
 
@@ -58,8 +58,8 @@ wait_port() {
 }
 
 prepare() {
-  docker exec kiro-rs-postgres-local psql -U kiro_rs -d postgres -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" -c "CREATE DATABASE $DB TEMPLATE kiro_identity_e2e" 2>&1 | grep -v NOTICE
-  docker exec kiro-rs-redis-local redis-cli -n $REDIS_DB FLUSHDB >/dev/null
+  docker exec claude-pool-postgres-local psql -U claude_pool -d postgres -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" -c "CREATE DATABASE $DB TEMPLATE pool_identity_e2e" 2>&1 | grep -v NOTICE
+  docker exec claude-pool-redis-local redis-cli -n $REDIS_DB FLUSHDB >/dev/null
   python3 - "$D" "$PGPW" "$ACCOUNTS" "$PER_CONC" "$PER_RPM" "$QUEUE" "$WAIT_SECS" "$PORT" "$MOCK_PORT" "$DB" "$REDIS_DB" "$1" "$GLOBAL_MAX" "$IDLE_SECS" "$MAX_DURATION_SECS" "$LEASE_MAX_SECS" <<'PY'
 import json, hashlib, secrets, datetime, sys
 d, pgpw, accounts, per_conc, per_rpm, queue, wait_secs, port, mock_port, db, redis_db, case = sys.argv[1:13]
@@ -75,7 +75,7 @@ keys = open(f"{d}/keys").read().split()
 api_key, admin_key = keys[0], keys[1]
 exp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=6)).isoformat()
 q = lambda v: "'" + str(v).replace("'", "''") + "'"
-sql = ["BEGIN;", "UPDATE external_upstream_pools SET deleted_at=now(), enabled=false WHERE deleted_at IS NULL;",
+sql = ["BEGIN;", "UPDATE accounts SET deleted_at=now(), enabled=false WHERE deleted_at IS NULL;",
        "DELETE FROM credential_runtime_state;", "DELETE FROM credential_account_info;", "DELETE FROM credentials;", "DELETE FROM proxy_resources;"]
 for i in range(1, accounts + 1):
     cid = 7000 + i
@@ -97,38 +97,38 @@ json.dump(limits, open(f"{d}/limits.json", "w"))
 max_conc = max(v["conc"] for v in limits.values())
 open(f"{d}/seed.sql", "w").write("\n".join(sql) + "\n")
 patch = {"port": int(port), "host": "127.0.0.1", "apiKey": api_key, "adminApiKey": admin_key,
-         "tokenRefreshBackgroundEnabled": False, "kiroUpstreamBaseUrl": f"http://127.0.0.1:{mock_port}",
+         "tokenRefreshBackgroundEnabled": False, "poolUpstreamBaseUrl": f"http://127.0.0.1:{mock_port}",
          "loadBalancingMode": "priority", "credentialMaxConcurrentRequests": max_conc,
          "credentialRpm": None,
          "credentialWarmupRequests": 0, "dispatchMaxQueuedRequests": int(queue),
          "dispatchGlobalMaxConcurrentRequests": global_max, "credentialDispatchMaxWaitSecs": int(wait_secs),
-         "kiroUpstreamResponseTimeoutSecs": 300, "kiroUpstreamStreamIdleTimeoutSecs": idle_secs,
-         "kiroUpstreamStreamMaxDurationSecs": max_duration_secs, "credentialInFlightLeaseMaxSecs": lease_max_secs,
+         "poolUpstreamResponseTimeoutSecs": 300, "poolUpstreamStreamIdleTimeoutSecs": idle_secs,
+         "poolUpstreamStreamMaxDurationSecs": max_duration_secs, "credentialInFlightLeaseMaxSecs": lease_max_secs,
          "requestAdmission": {"rpm": 0, "maxConcurrentRequests": 0, "maxQueuedRequests": 0, "queueTimeoutMs": 0},
-         "externalPools": {"externalPoolsEnabled": False, "localPoolCircuitEnabled": False}}
+         "accounts": {"accountsEnabled": False, "localPoolCircuitEnabled": False}}
 open(f"{d}/patch.json", "w").write(json.dumps(patch))
 json.dump({"host": "127.0.0.1", "port": int(port), "apiKey": api_key, "adminApiKey": admin_key,
-           "postgres": {"url": f"postgres://kiro_rs:{pgpw}@127.0.0.1:25432/{db}", "maxConnections": 10},
-           "redis": {"url": f"redis://127.0.0.1:26379/{redis_db}", "keyPrefix": "kiro-overload-probe"}},
+           "postgres": {"url": f"postgres://claude_pool:{pgpw}@127.0.0.1:25432/{db}", "maxConnections": 10},
+           "redis": {"url": f"redis://127.0.0.1:26379/{redis_db}", "keyPrefix": "pool-overload-probe"}},
           open(f"{d}/config.json", "w"))
 PY
   chmod 600 "$D"/*.json "$D/seed.sql"
-  docker exec -i kiro-rs-postgres-local psql -U kiro_rs -d $DB -v ON_ERROR_STOP=1 -q < "$D/seed.sql" || return 1
-  docker exec kiro-rs-postgres-local psql -U kiro_rs -d $DB -qAt -c "select config::text from runtime_config where id='default'" > "$D/base-config.json"
+  docker exec -i claude-pool-postgres-local psql -U claude_pool -d $DB -v ON_ERROR_STOP=1 -q < "$D/seed.sql" || return 1
+  docker exec claude-pool-postgres-local psql -U claude_pool -d $DB -qAt -c "select config::text from runtime_config where id='default'" > "$D/base-config.json"
   python3 - "$D" <<'PY'
 import json, sys
 d = sys.argv[1]
 cfg = json.load(open(f"{d}/base-config.json")); patch = json.load(open(f"{d}/patch.json"))
 for k, v in patch.items():
-    if k == "externalPools":
-        ep = dict(cfg.get("externalPools") or {}); ep.update(v); cfg["externalPools"] = ep
+    if k == "accounts":
+        ep = dict(cfg.get("accounts") or {}); ep.update(v); cfg["accounts"] = ep
     elif v is None:
         cfg.pop(k, None)
     else:
         cfg[k] = v
 open(f"{d}/apply.sql", "w").write("update runtime_config set config = $cfg$" + json.dumps(cfg) + "$cfg$::jsonb where id='default';\n")
 PY
-  docker exec -i kiro-rs-postgres-local psql -U kiro_rs -d $DB -v ON_ERROR_STOP=1 -q < "$D/apply.sql"
+  docker exec -i claude-pool-postgres-local psql -U claude_pool -d $DB -v ON_ERROR_STOP=1 -q < "$D/apply.sql"
   rm -f "$D/seed.sql" "$D/apply.sql" "$D/base-config.json" "$D/patch.json"
 }
 
@@ -211,7 +211,7 @@ case_def() {
     # Every call is a 60 s stream (one chunk per 5 s): concurrency binds, not RPM. Half the
     # slots, then 2x arrivals so every slot is held by a long stream and requests queue.
     pool_long_full)   echo '{"headerDelayMs":800,"jitterMs":0,"streamChunks":30,"chunkDelayMs":100,"trickleRate":1,"trickleChunks":13,"trickleIntervalMs":5000}|steady:1.9:60,steady:7.6:120,steady:1.9:150|--retry sub2api --stream-share 1 --drain-secs 240' ;;
-    # One call in twenty hangs after its first chunk until kiro-rs gives up on it (stream idle
+    # One call in twenty hangs after its first chunk until claude-pool gives up on it (stream idle
     # timeout, 120 s here): about a third of the slots end up hung, the rest keeps being served,
     # and the hung slots come back.
     pool_hang)        echo '{"headerDelayMs":800,"jitterMs":1500,"streamChunks":30,"chunkDelayMs":100,"hangRate":0}|steady:14:60,steady:14:200|--retry sub2api --stream-share 1 --drain-secs 200|[{"hangRate":0.05},{"hangRate":0}]' ;;
@@ -232,7 +232,7 @@ for case_name in $CASES; do
   mock_json=${def%%|*}; rest=${def#*|}; profile=${rest%%|*}; rest=${rest#*|}; flags=${rest%%|*}
   plan=""; [ "$rest" != "$flags" ] && plan=${rest#*|}
   # TIME_WAIT holding ephemeral ports (see overload-probe.mjs).
-  # The host runs other work. Above this load the mock and kiro-rs both run seconds late and a
+  # The host runs other work. Above this load the mock and claude-pool both run seconds late and a
   # case measures the host, not the scheduler: wait (up to 20 min) for it to settle.
   for _ in $(seq 1 40); do
     load=$(uptime | awk -F'load averages: ' '{print $2}' | awk '{print int($1)}')
@@ -248,11 +248,11 @@ for case_name in $CASES; do
   printf '\n== %s  accounts=%s conc=%s rpm=%s queue=%s wait=%ss global=%s slots=%s profile=%s %s\n' "$case_name" "$ACCOUNTS" "$PER_CONC" "$PER_RPM" "$QUEUE" "$WAIT_SECS" "$GLOBAL_MAX" "$slots" "$profile" "$flags"
   stop_all
   prepare "$case_name" || { echo "prepare failed"; continue; }
-  (cd "$REPO" && PORT=$MOCK_PORT nohup $NODE scripts/loadtest/kiro-mock-upstream.mjs --overload-probe > "$D/mock.log" 2>&1 < /dev/null &)
+  (cd "$REPO" && PORT=$MOCK_PORT nohup $NODE scripts/loadtest/anthropic-mock-upstream.mjs --overload-probe > "$D/mock.log" 2>&1 < /dev/null &)
   wait_port $MOCK_PORT || continue
   curl -sS -m 5 -X POST "http://127.0.0.1:$MOCK_PORT/__control" -H 'content-type: application/json' \
     -d "$(echo "$mock_json" | python3 -c 'import json,sys;d=json.load(sys.stdin);d["resetCounters"]=True;print(json.dumps(d))')" >/dev/null
-  (cd "$D" && RUST_LOG=info nohup ./kiro-rs -c config.json > "$D/server-$case_name.log" 2>&1 < /dev/null &)
+  (cd "$D" && RUST_LOG=info nohup ./claude-pool -c config.json > "$D/server-$case_name.log" 2>&1 < /dev/null &)
   wait_port $PORT || { tail -20 "$D/server-$case_name.log"; stop_all; continue; }
   # Process CPU and RSS of the server for the whole case: a fault must not pin CPU, and the
   # pool must come back to idle CPU after it. One line per second: epoch utime stime rss_kb.
@@ -273,7 +273,7 @@ print(t)' "$1" 2>/dev/null || echo 0; }
   sleep 3
   # shellcheck disable=SC2086
   $NODE "$REPO/scripts/loadtest/overload-probe.mjs" --base-url "http://127.0.0.1:$PORT" --api-key "$API_KEY" --admin-key "$ADMIN_KEY" \
-    --kiro-mock "http://127.0.0.1:$MOCK_PORT" --accounts "$ACCOUNTS" --account-limits "$D/limits.json" \
+    --pool-mock "http://127.0.0.1:$MOCK_PORT" --accounts "$ACCOUNTS" --account-limits "$D/limits.json" \
     --profile "$profile" --max-sockets "${MAX_SOCKETS:-300}" --global-max "$GLOBAL_MAX" $flags ${plan:+--upstream-plan "$plan"} --out "$OUT_DIR/$case_name.json" 2>&1 | tail -12
   echo "load: $(uptime | awk -F'load averages: ' '{print $2}')  rss_mb: $(ps -o rss= -p "$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t | head -1)" 2>/dev/null | awk '{print int($1/1024)}')"
   kill "$SAMPLER" 2>/dev/null || true
@@ -296,7 +296,7 @@ if len(rows) > 2:
     print(f"cpu_total_pct: p50={cpu[n//2]:.0f} p95={cpu[int(n*0.95) if int(n*0.95) < n else n-1]:.0f} max={cpu[-1]:.0f} "
           f"secs_over_400={sum(1 for c in cpu if c > 400)}/{n} rss_end_mb={rss[-1]} rss_peak_mb={max(rss)}")
 PY
-  echo "redis leases after: $(docker exec kiro-rs-redis-local redis-cli -n $REDIS_DB GET kiro-overload-probe:scheduler:global:inflight:weighted_count)"
+  echo "redis leases after: $(docker exec claude-pool-redis-local redis-cli -n $REDIS_DB GET pool-overload-probe:scheduler:global:inflight:weighted_count)"
   sed -E 's/\x1b\[[0-9;]*m//g' "$D/server-$case_name.log" | grep -E " (WARN|ERROR) " \
     | grep -vE "machine_id|native reasoning|capability cohort|slow interaction diagnostic" \
     | sed -E 's/^[^ ]+ +//; s/req_[A-Za-z0-9]+/req_X/g; s/request_api_key_id=[0-9a-f]+/key=X/; s/credential_id=[0-9]+/cid=N/g; s/#[0-9]+/#N/g; s/[0-9]+/N/g' \
@@ -309,7 +309,7 @@ PY
 done
 stop_all
 if [ "${KEEP:-0}" != "1" ]; then
-  docker exec kiro-rs-postgres-local psql -U kiro_rs -d postgres -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" 2>&1 | grep -v NOTICE
-  docker exec kiro-rs-redis-local redis-cli -n $REDIS_DB FLUSHDB >/dev/null
-  rm -f "$D"/config.json "$D/kiro-rs" "$D/limits.json"
+  docker exec claude-pool-postgres-local psql -U claude_pool -d postgres -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" 2>&1 | grep -v NOTICE
+  docker exec claude-pool-redis-local redis-cli -n $REDIS_DB FLUSHDB >/dev/null
+  rm -f "$D"/config.json "$D/claude-pool" "$D/limits.json"
 fi

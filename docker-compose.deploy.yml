@@ -1,10 +1,10 @@
 services:
-  kiro-rs:
-    image: ${KIRO_RS_IMAGE:-ghcr.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
-    container_name: kiro-rs
+  claude-pool:
+    image: ${CLAUDE_POOL_IMAGE:-ghcr.io/2ue/claude-pool}:${CLAUDE_POOL_VERSION:-latest}
+    container_name: claude-pool
     restart: unless-stopped
     ports:
-      - "${KIRO_RS_PORT:-8990}:8990"
+      - "${CLAUDE_POOL_PORT:-8990}:8990"
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
@@ -23,10 +23,10 @@ services:
       retries: 3
       start_period: 20s
     # Concurrency leases are released on SIGTERM and queued requests answer at once. In-flight
-    # streams get KIRO_RS_HTTP_DRAIN_SECS to finish, then about 4 s of background shutdown;
+    # streams get CLAUDE_POOL_HTTP_DRAIN_SECS to finish, then about 4 s of background shutdown;
     # keep the grace period above their sum.
     environment:
-      KIRO_RS_HTTP_DRAIN_SECS: "${KIRO_RS_HTTP_DRAIN_SECS:-45}"
+      CLAUDE_POOL_HTTP_DRAIN_SECS: "${CLAUDE_POOL_HTTP_DRAIN_SECS:-45}"
     stop_grace_period: 60s
     # Keep logs across restarts within a bounded size, so an incident can still be read after
     # the container is recreated.

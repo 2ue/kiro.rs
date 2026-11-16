@@ -33,12 +33,12 @@ import {
   useUsageWriterStats,
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
-import { getCredentialList, getExternalPools } from '@/api/credentials'
+import { getCredentialList, getAccounts } from '@/api/credentials'
 import { cacheWriteTtlMarker, cacheWriteTtlTitle } from './cache-ttl-label'
 import { formatDate, formatCompact, formatNumber, formatPercent, formatUsdCsv, formatUsdFixed2, ratio } from '@/lib/format'
 import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import type { CredentialListItem, ExternalPool, UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageRecordsQuery, UsageRouteKindFilter, UsageSource, UsageSeriesPoint } from '@/types/api'
+import type { CredentialListItem, Account, UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageRecordsQuery, UsageRouteKindFilter, UsageSource, UsageSeriesPoint } from '@/types/api'
 import {
   PageContainer,
   PageHeader,
@@ -79,8 +79,6 @@ import {
   routeTone,
   formatLatency,
   sourceLabel,
-  formatAttemptSummary,
-  formatAttemptChain,
   formatExternalAttemptChain,
   upstreamModelLabel,
 } from './usage-helpers'
@@ -91,7 +89,7 @@ import { RequestApiKeyIdDisplay } from './request-api-key-id'
 
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
-const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
+const AUTO_REFRESH_KEY = 'claude-pool-admin:auto-refresh:usage'
 const DEFAULT_PAGE_SIZE = 20
 const EXPORT_LIMIT = 10_000
 const ROUTE_OPTION_LIMIT = 50
@@ -124,9 +122,9 @@ function usageInputTotal(record: UsageRecord): number {
 }
 
 function routeAccountLabel(record: UsageRecord, credentialLabel?: string): string {
-  if (record.routeKind === 'external_pool') {
-    const name = record.externalPoolName ? ` ${record.externalPoolName}` : ''
-    return `外部账号 #${record.externalPoolId ?? '-'}${name}`
+  if (record.routeKind === 'account') {
+    const name = record.accountName ? ` ${record.accountName}` : ''
+    return `外部账号 #${record.accountId ?? '-'}${name}`
   }
   const label = credentialLabel ? ` ${credentialLabel}` : ''
   return `账号 #${record.credentialId ?? '-'}${label}`
@@ -157,24 +155,24 @@ function credentialOptionMeta(credential: CredentialListItem): string {
   return parts.join(' · ')
 }
 
-function externalPoolOptionLabel(pool: ExternalPool): string {
-  return `外部池 #${pool.id} ${pool.name || '未命名'}`
+function accountOptionLabel(pool: Account): string {
+  return `账号 #${pool.id} ${pool.name || '未命名'}`
 }
 
-function externalPoolOptionMeta(pool: ExternalPool): string {
+function accountOptionMeta(pool: Account): string {
   return [pool.enabled ? '启用' : '禁用', pool.baseUrl].filter(Boolean).join(' · ')
 }
 
 function routeSelectionAllLabel(routeKind: UsageRouteKindFilter | '__all__'): string {
   if (routeKind === 'local_credential') return '全部本地账号'
-  if (routeKind === 'external_pool') return '全部外部池'
-  return '全部账号/外部池'
+  if (routeKind === 'account') return '全部账号'
+  return '全部账号/账号'
 }
 
 function routeSelectionFallbackLabel(value: RouteSelectionValue, routeKind: UsageRouteKindFilter | '__all__'): string {
   const parsed = parseRouteSelection(value)
   if (parsed.kind === 'credential') return `账号 #${parsed.id}`
-  if (parsed.kind === 'external') return `外部池 #${parsed.id}`
+  if (parsed.kind === 'external') return `账号 #${parsed.id}`
   return routeSelectionAllLabel(routeKind)
 }
 
@@ -241,8 +239,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'route_subtype',
     'credential_id',
     'credential_label',
-    'external_pool_id',
-    'external_pool_name',
+    'account_id',
+    'account_name',
     'usage_source',
     'total_input_tokens',
     'compat_input_tokens',
@@ -252,7 +250,6 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'cache_creation_input_tokens',
     'estimated_cost_usd',
     'original_cost_usd',
-    'kiro_metering_usage',
     'pricing_model',
     'duration_ms',
     'first_token_latency_ms',
@@ -273,8 +270,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.routeSubtype,
     record.credentialId,
     record.credentialLabel,
-    record.externalPoolId,
-    record.externalPoolName,
+    record.accountId,
+    record.accountName,
     record.usageSource,
     record.totalInputTokens,
     record.compatInputTokens,
@@ -284,7 +281,6 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.cacheCreationInputTokens,
     formatUsdCsv(record.estimatedCostUsd),
     formatUsdCsv(record.originalCostUsd),
-    record.kiroMeteringUsage,
     record.pricingModel,
     record.durationMs,
     record.firstTokenLatencyMs,
@@ -336,8 +332,8 @@ function RouteTargetSelect({
   const [search, setSearch] = useState('')
   const debouncedSearch = useDebouncedValue(search, 250)
   const searchText = debouncedSearch.trim()
-  const showCredentials = routeKind !== 'external_pool'
-  const showExternalPools = routeKind !== 'local_credential'
+  const showCredentials = routeKind !== 'account'
+  const showAccounts = routeKind !== 'local_credential'
 
   const credentials = useQuery({
     queryKey: ['usage-route-target-credentials', searchText],
@@ -350,15 +346,15 @@ function RouteTargetSelect({
     staleTime: 30_000,
   })
 
-  const externalPools = useQuery({
-    queryKey: ['usage-route-target-external-pools'],
-    queryFn: getExternalPools,
-    enabled: open && showExternalPools,
+  const accounts = useQuery({
+    queryKey: ['usage-route-target-accounts'],
+    queryFn: getAccounts,
+    enabled: open && showAccounts,
     staleTime: 30_000,
   })
 
   const filteredPools = useMemo(() => {
-    const pools = externalPools.data?.pools ?? []
+    const pools = accounts.data?.pools ?? []
     const q = searchText.toLowerCase()
     if (!q) return pools.slice(0, ROUTE_OPTION_LIMIT)
     return pools
@@ -373,7 +369,7 @@ function RouteTargetSelect({
         return haystack.includes(q)
       })
       .slice(0, ROUTE_OPTION_LIMIT)
-  }, [externalPools.data?.pools, searchText])
+  }, [accounts.data?.pools, searchText])
 
   const selectedLabel = useMemo(() => {
     const parsed = parseRouteSelection(value)
@@ -382,11 +378,11 @@ function RouteTargetSelect({
       return credential ? credentialOptionLabel(credential) : routeSelectionFallbackLabel(value, routeKind)
     }
     if (parsed.kind === 'external') {
-      const pool = externalPools.data?.pools.find((item) => item.id === parsed.id)
-      return pool ? externalPoolOptionLabel(pool) : routeSelectionFallbackLabel(value, routeKind)
+      const pool = accounts.data?.pools.find((item) => item.id === parsed.id)
+      return pool ? accountOptionLabel(pool) : routeSelectionFallbackLabel(value, routeKind)
     }
     return routeSelectionAllLabel(routeKind)
-  }, [credentials.data?.items, externalPools.data?.pools, routeKind, value])
+  }, [credentials.data?.items, accounts.data?.pools, routeKind, value])
 
   const selectValue = (next: RouteSelectionValue) => {
     onChange(next)
@@ -394,7 +390,7 @@ function RouteTargetSelect({
   }
 
   const credentialsLoading = showCredentials && credentials.isFetching
-  const poolsLoading = showExternalPools && externalPools.isFetching
+  const poolsLoading = showAccounts && accounts.isFetching
   const hasCredentialItems = (credentials.data?.items.length ?? 0) > 0
   const hasPoolItems = filteredPools.length > 0
 
@@ -412,7 +408,7 @@ function RouteTargetSelect({
           <Input
             value={search}
             onChange={(event) => setSearch(event.target.value)}
-            placeholder="搜索账号邮箱、key、外部池名称"
+            placeholder="搜索账号邮箱、key、账号名称"
             className="h-8 pl-7 text-xs"
           />
         </div>
@@ -465,16 +461,16 @@ function RouteTargetSelect({
             </div>
           )}
 
-          {showExternalPools && (
+          {showAccounts && (
             <div className="mt-1">
-              <div className="px-2 py-1 text-[0.65rem] font-medium text-muted-foreground">外部池</div>
+              <div className="px-2 py-1 text-[0.65rem] font-medium text-muted-foreground">账号</div>
               {poolsLoading && (
                 <div className="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
-                  <Spinner size="sm" />加载外部池...
+                  <Spinner size="sm" />加载账号...
                 </div>
               )}
               {!poolsLoading && !hasPoolItems && (
-                <div className="px-2 py-2 text-xs text-muted-foreground">没有匹配外部池</div>
+                <div className="px-2 py-2 text-xs text-muted-foreground">没有匹配账号</div>
               )}
               {filteredPools.map((pool) => {
                 const itemValue = `external:${pool.id}` as RouteSelectionValue
@@ -489,9 +485,9 @@ function RouteTargetSelect({
                     onClick={() => selectValue(itemValue)}
                   >
                     <span className="min-w-0">
-                      <span className="block truncate text-xs font-medium">{externalPoolOptionLabel(pool)}</span>
+                      <span className="block truncate text-xs font-medium">{accountOptionLabel(pool)}</span>
                       <span className="block truncate text-[0.65rem] text-muted-foreground">
-                        {externalPoolOptionMeta(pool)}
+                        {accountOptionMeta(pool)}
                       </span>
                     </span>
                     {value === itemValue && <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
@@ -596,21 +592,21 @@ function RecordsView({
   const [conversationId, setConversationId] = useState('')
   const initialRouteKind = searchParams.get('routeKind')
   const initialCredentialId = Number(searchParams.get('credentialId'))
-  const initialExternalPoolId = Number(searchParams.get('externalPoolId'))
+  const initialAccountId = Number(searchParams.get('accountId'))
   const initialRouteSelection: RouteSelectionValue =
     Number.isFinite(initialCredentialId) && initialCredentialId > 0
       ? `credential:${initialCredentialId}`
-      : Number.isFinite(initialExternalPoolId) && initialExternalPoolId > 0
-        ? `external:${initialExternalPoolId}`
+      : Number.isFinite(initialAccountId) && initialAccountId > 0
+        ? `external:${initialAccountId}`
         : 'all'
   const initialRouteFilter: UsageRouteKindFilter | '__all__' =
-    initialRouteKind === 'local_credential' || initialRouteKind === 'external_pool'
+    initialRouteKind === 'local_credential' || initialRouteKind === 'account'
       ? initialRouteKind
       : initialRouteSelection === 'all'
         ? '__all__'
         : initialRouteSelection.startsWith('credential:')
           ? 'local_credential'
-          : 'external_pool'
+          : 'account'
   const [routeSelection, setRouteSelection] = useState<RouteSelectionValue>(initialRouteSelection)
   const [routeKind, setRouteKind] = useState<UsageRouteKindFilter | '__all__'>(initialRouteFilter)
   const [status, setStatus] = useState<UsageRecordStatus | '__all__'>('__all__')
@@ -659,7 +655,7 @@ function RecordsView({
     if (conversationIdD.trim()) next.conversationId = conversationIdD.trim()
     if (routeKind !== '__all__') next.routeKind = routeKind
     if (selectedRouteTarget.kind === 'credential') next.credentialId = selectedRouteTarget.id
-    if (selectedRouteTarget.kind === 'external') next.externalPoolId = selectedRouteTarget.id
+    if (selectedRouteTarget.kind === 'external') next.accountId = selectedRouteTarget.id
     if (status !== '__all__') next.status = status
     if (source !== '__all__') next.source = source
     if (streamMode !== 'all') next.stream = streamMode === 'stream'
@@ -715,7 +711,7 @@ function RecordsView({
   const updateRouteKind = (value: UsageRouteKindFilter | '__all__') => {
     const selected = parseRouteSelection(routeSelection)
     if (value === 'local_credential' && selected.kind === 'external') setRouteSelection('all')
-    if (value === 'external_pool' && selected.kind === 'credential') setRouteSelection('all')
+    if (value === 'account' && selected.kind === 'credential') setRouteSelection('all')
     setRouteKind(value)
     setPage(1)
   }
@@ -724,7 +720,7 @@ function RecordsView({
     setRouteSelection(value)
     const selected = parseRouteSelection(value)
     if (selected.kind === 'credential') setRouteKind('local_credential')
-    if (selected.kind === 'external') setRouteKind('external_pool')
+    if (selected.kind === 'external') setRouteKind('account')
     setPage(1)
   }
 
@@ -752,7 +748,7 @@ function RecordsView({
       }
       const csv = usageRecordsToCsv(result.records)
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-      downloadTextFile(csv, `kiro-usage-records-${stamp}.csv`, 'text/csv;charset=utf-8')
+      downloadTextFile(csv, `claude-pool-usage-records-${stamp}.csv`, 'text/csv;charset=utf-8')
       const suffix = result.total > result.records.length
         ? `（最多导出 ${result.records.length}/${result.total} 条）`
         : ''
@@ -827,7 +823,7 @@ function RecordsView({
                   <SelectContent>
                     <SelectItem value="__all__">全部路由</SelectItem>
                     <SelectItem value="local_credential">本地账号</SelectItem>
-                    <SelectItem value="external_pool">外部池</SelectItem>
+                    <SelectItem value="account">账号</SelectItem>
                   </SelectContent>
                 </Select>
               </FilterField>
@@ -853,7 +849,7 @@ function RecordsView({
               <Button variant="ghost" size="xs" onClick={() => applyRecentHours(6)}>最近 6h</Button>
               <Button variant="ghost" size="xs" onClick={applySlowFirstTokenPreset}>慢首字 &gt;10s</Button>
               <Button variant="ghost" size="xs" onClick={() => { setStatus('error'); setPage(1); setAdvancedOpen(true) }}>错误</Button>
-              <Button variant="ghost" size="xs" onClick={() => updateRouteKind('external_pool')}>外部池</Button>
+              <Button variant="ghost" size="xs" onClick={() => updateRouteKind('account')}>账号</Button>
             </div>
 
             {showAdvancedFilters && (
@@ -943,7 +939,7 @@ function RecordsView({
                       </SelectContent>
                     </Select>
                   </FilterField>
-                  <FilterField label="账号 / 外部池">
+                  <FilterField label="账号 / 账号">
                     <RouteTargetSelect
                       value={routeSelection}
                       routeKind={routeKind}
@@ -997,8 +993,8 @@ function RecordsView({
                       record.cacheReadInputTokens + record.cacheCreationInputTokens,
                       reportedInputTotal,
                     )
-                    const attemptSummary = formatAttemptSummary(record)
-                    const attemptChain = formatAttemptChain(record)
+                    const attemptSummary = `账号尝试 ${record.externalAttempts?.length ?? 0} 次`
+                    const attemptChain = formatExternalAttemptChain(record)
                     const externalChain = formatExternalAttemptChain(record)
                     const targetLabel = routeAccountLabel(record, label)
                     const resolvedModel = upstreamModelLabel(record)

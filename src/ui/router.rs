@@ -19,8 +19,8 @@ use axum::{
 use rust_embed::Embed;
 
 const MOUNT_PREFIX: &str = "/ui";
-const ENV_PREFIX: &str = "KIRO_NEW_UI";
-const FALLBACK_ENV_PREFIX: &str = "KIRO_UI";
+const ENV_PREFIX: &str = "CLAUDE_POOL_NEW_UI";
+const FALLBACK_ENV_PREFIX: &str = "CLAUDE_POOL_UI";
 const DEFAULT_DIR: &str = "ui/dist";
 const DEFAULT_DEV_SERVER: &str = "http://127.0.0.1:9023/ui";
 const BUILD_HINT: &str = "UI not built. Run 'pnpm build' in ui directory.";

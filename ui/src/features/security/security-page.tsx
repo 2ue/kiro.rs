@@ -94,7 +94,7 @@ const DEFAULT_REQUEST_ADMISSION: RequestAdmissionConfig = {
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
 
-const REQUEST_API_KEY_PREFIX = 'sk-kiro-rs-'
+const REQUEST_API_KEY_PREFIX = 'sk-claude-pool-'
 
 function generateLocalRequestApiKey(): string {
   const bytes = new Uint8Array(32)
@@ -244,7 +244,7 @@ function RequestApiKeyDialog({
             </label>
           </div>
           <p className="mt-4 text-xs leading-5 text-muted-foreground">
-            此上限按实例、按 Key 生效；排队请求不会自动切换到外部池。
+            此上限按实例、按 Key 生效；排队请求不会自动切换到账号。
           </p>
 
           <div className="mt-5 space-y-3 border-t pt-4">
@@ -726,7 +726,7 @@ export function SecurityPage() {
     try {
       const response = await updateAdminApiKey({ adminApiKey })
       storage.setApiKey(response.adminApiKey)
-      window.dispatchEvent(new CustomEvent('kiro-admin-key-updated'))
+      window.dispatchEvent(new CustomEvent('claude-pool-admin-key-updated'))
       setKeysAndReset(response)
       setNextAdminKey('')
       toast.success('登录 Key 已更新，当前会话已自动切换')

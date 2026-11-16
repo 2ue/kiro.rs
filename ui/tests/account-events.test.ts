@@ -37,7 +37,7 @@ test('older scheduler rows fall back to credentialLabel and message', () => {
   assert.equal(view?.accountLabel, 'old@example.com')
   assert.equal(view?.reason, '连续失败')
   // External rows without an explicit source are recognised by object type.
-  assert.equal(accountEventView(row({ accountEvent: 'auto_disabled' }, { objectType: 'external_pool' }))?.source, 'external')
+  assert.equal(accountEventView(row({ accountEvent: 'auto_disabled' }, { objectType: 'account' }))?.source, 'external')
 })
 
 test('rows that are not account events are skipped', () => {

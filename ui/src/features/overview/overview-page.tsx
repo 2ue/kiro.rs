@@ -6,48 +6,34 @@ import {
   AlertTriangle,
   ArrowLeft,
   DollarSign,
-  ExternalLink,
   Layers3,
   RefreshCw,
   TrendingUp,
-  Wallet,
   Zap,
 } from 'lucide-react'
-import { getExternalPools, getExternalPoolsStatus } from '@/api/credentials'
+import { getAccounts, getAccountsStatus } from '@/api/credentials'
 import {
   useUsageOverviewExternal,
-  useUsageOverviewLocal,
   useUsageOverviewRankings,
   useUsageOverviewSeries,
   useUsageOverviewSummary,
 } from '@/hooks/use-usage'
-import {
-  useCredentials,
-  useCredentialAccountInfo,
-  useCredentialRuntime,
-  useRuntimeConfig,
-} from '@/hooks/use-credentials'
 import { cacheHitRate, cacheHitRateLevel, type CacheHitRateLevel } from './cache-hit-rate'
-import { compareUsageTier, credentialUsageTier, externalPoolUsageTier, type UsageTier } from './usage-order'
+import { compareUsageTier, accountUsageTier, type UsageTier } from './usage-order'
 import {
   OverviewTrendCard,
   externalTrendViews,
-  localTrendViews,
   summaryTrendViews,
 } from './overview-trends'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
-import { formatCompact, formatCredits, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
+import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import { credentialCreditStatus, credentialLabel, effectiveCreditRemaining, mapById } from '@/features/credentials/credential-utils'
 import { billingDeltaTextClass, billingDeltaTone } from '@/features/usage/usage-helpers'
 import type {
-  CredentialAccountInfo,
-  CredentialStatusItem,
-  ExternalPool,
-  ExternalPoolStatus,
+  Account,
+  AccountStatus,
   UsageOverviewMetrics,
   UsageOverviewRankRow,
-  UsageOverviewRouteRow,
   UsageOverviewSeriesPoint,
 } from '@/types/api'
 import {
@@ -77,24 +63,13 @@ import {
 } from '@/components/ui'
 
 const TIMEZONE = 'Asia/Shanghai'
-const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:overview'
+const AUTO_REFRESH_KEY = 'claude-pool-admin:auto-refresh:overview'
 
 type PresetRange = 'today' | 'yesterday' | 'last24h' | 'last7d' | 'last30d' | 'thisMonth'
-type OverviewTab = 'summary' | 'local' | 'external' | 'rankings'
+type OverviewTab = 'summary' | 'external' | 'rankings'
 type RankingDimension = 'models' | 'accounts' | 'keys' | 'paths' | 'errors'
 type TokenUsageMetrics = Pick<UsageOverviewMetrics, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens'>
 
-type LocalAccountOverviewRow = {
-  credential: CredentialStatusItem
-  credentialId: number
-  label: string
-  metrics: UsageOverviewMetrics
-  accountInfo?: CredentialAccountInfo
-  creditEstimateBlocked: boolean
-  creditEstimateBlockedReason?: string
-  estimatedRemainingCostUsd?: number
-  tier: UsageTier
-}
 
 type ExternalUsagePool = {
   poolId: number
@@ -122,7 +97,6 @@ const EMPTY_OVERVIEW_METRICS: UsageOverviewMetrics = {
   cacheCreationInputTokens: 0,
   estimatedCostUsd: 0,
   originalCostUsd: 0,
-  kiroMeteringUsage: 0,
   pricedRequests: 0,
   unpricedRequests: 0,
   averageDurationMs: 0,
@@ -170,57 +144,18 @@ function costDeltaPercent(deltaUsd: number, rawCostUsd: number): string {
   return `${((deltaUsd / rawCostUsd) * 100).toFixed(2)}%`
 }
 
-function localCostDiffInfo(estimatedCostUsd: number, originalCostUsd: number) {
-  const deltaUsd = estimatedCostUsd - originalCostUsd
-  const percentText = originalCostUsd > 0
-    ? ` (${deltaUsd >= 0 ? '+' : ''}${formatPercent(deltaUsd / originalCostUsd)})`
-    : ''
-  return {
-    deltaUsd,
-    text: `${deltaUsd >= 0 ? '+' : '-'}${formatUsdFixed2(Math.abs(deltaUsd))}`,
-    percentText,
-    textClass: deltaUsd === 0 ? 'text-muted-foreground' : 'text-info',
-  }
-}
-
-function creditCostRate(costUsd: number, usedCredits: number): number | undefined {
-  if (!(usedCredits > 0)) return undefined
-  return costUsd / usedCredits
-}
-
-function formatCreditCostRate(value: number | undefined): string {
-  if (value === undefined) return '-'
-  return `${new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 3,
-    maximumFractionDigits: 3,
-  }).format(value)}/积分`
-}
-
-function mergeCredentialRuntime(base: CredentialStatusItem, runtime?: Partial<CredentialStatusItem>): CredentialStatusItem {
-  if (!runtime) return base
-  return {
-    ...base,
-    ...runtime,
-    maxConcurrentRequests: runtime.maxConcurrentRequests ?? base.maxConcurrentRequests,
-    rpm: runtime.rpm ?? base.rpm,
-    warmupRemaining: runtime.warmupRemaining ?? base.warmupRemaining,
-  }
-}
-
 function totalTokenUsage(metrics: TokenUsageMetrics): number {
   return metrics.inputTokens + metrics.outputTokens + metrics.cacheReadInputTokens + metrics.cacheCreationInputTokens
 }
 
 function usageLink(
   navigate: ReturnType<typeof useNavigate>,
-  params: { routeKind: 'local_credential' | 'external_pool'; credentialId?: number; externalPoolId?: number; endpoint?: string; since: string; until: string },
+  params: { routeKind: 'local_credential' | 'account'; credentialId?: number; accountId?: number; endpoint?: string; since: string; until: string },
 ) {
   const search = new URLSearchParams()
   search.set('routeKind', params.routeKind)
   if (params.credentialId) search.set('credentialId', String(params.credentialId))
-  if (params.externalPoolId) search.set('externalPoolId', String(params.externalPoolId))
+  if (params.accountId) search.set('accountId', String(params.accountId))
   if (params.endpoint) search.set('endpoint', params.endpoint)
   if (params.since) search.set('since', localDateTimeValue(params.since))
   if (params.until) search.set('until', localDateTimeValue(params.until))
@@ -306,7 +241,7 @@ function OverallSummarySection({ totals }: { totals: { all: UsageOverviewMetrics
         <TokenSummaryCard metrics={metrics} className="sm:col-span-2" />
         <StatCard title="估算计费" value={formatUsdFixed2(metrics.estimatedCostUsd)} icon={<DollarSign />} tone="primary" />
         <StatCard title="原始计费" value={formatUsdFixed2(metrics.originalCostUsd)} icon={<DollarSign />} tone="warning" />
-        <StatCard title="Kiro 积分" value={formatCompact(metrics.kiroMeteringUsage)} valueTitle={formatNumber(metrics.kiroMeteringUsage)} icon={<Zap />} tone="info" />
+
         <CacheHitRateCard all={totals.all} local={totals.local} external={totals.external} />
       </div>
     </SectionCard>
@@ -367,255 +302,8 @@ function TokenBreakdownItem({
   )
 }
 
-function LocalPoolSection({
-  metrics,
-  routes,
-  accountRows,
-  accountsLoading,
-  range,
-  navigate,
-}: {
-  metrics: UsageOverviewMetrics
-  routes: UsageOverviewRouteRow[]
-  accountRows: LocalAccountOverviewRow[]
-  accountsLoading: boolean
-  range: { from: string; to: string }
-  navigate: ReturnType<typeof useNavigate>
-}) {
-  const availableCreditRows = accountRows.filter((account) => (
-    !account.creditEstimateBlocked &&
-    account.accountInfo?.creditRemaining != null
-  ))
-  const availableCreditRemaining = availableCreditRows.reduce(
-    (sum, account) => sum + (effectiveCreditRemaining(account.accountInfo)?.remaining ?? 0),
-    0,
-  )
-  const unavailableCreditCount = accountRows.filter((account) => account.creditEstimateBlocked).length
-  const unqueriedCreditCount = accountRows.filter((account) => (
-    !account.creditEstimateBlocked &&
-    account.accountInfo?.creditRemaining == null
-  )).length
-  const localCostDiff = localCostDiffInfo(metrics.estimatedCostUsd, metrics.originalCostUsd)
-  const estimatedCreditRate = creditCostRate(metrics.estimatedCostUsd, metrics.kiroMeteringUsage)
-  const originalCreditRate = creditCostRate(metrics.originalCostUsd, metrics.kiroMeteringUsage)
-  const estimatedRemainingCostUsd = estimatedCreditRate == null
-    ? undefined
-    : estimatedCreditRate * availableCreditRemaining
 
-  return (
-    <SectionCard>
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
-        <StatCard title="已消耗积分" value={formatNumber(metrics.kiroMeteringUsage)} valueTitle={formatNumber(metrics.kiroMeteringUsage)} desc="请求级 meteringEvent 消耗，包含已失效账号" icon={<Zap />} tone="info" />
-        <StatCard
-          title="估算费用"
-          value={formatUsdFixed2(metrics.estimatedCostUsd)}
-          desc={(
-            <span>
-              原始计费 {formatUsdFixed2(metrics.originalCostUsd)} ·{' '}
-              <span className={localCostDiff.textClass}>
-                差值 {localCostDiff.text}{localCostDiff.percentText}
-              </span>
-            </span>
-          )}
-          icon={<DollarSign />}
-          tone="primary"
-        />
-        <StatCard
-          title="积分转换率"
-          value={formatCreditCostRate(estimatedCreditRate)}
-          desc={`原始 ${formatCreditCostRate(originalCreditRate)}`}
-          icon={<TrendingUp />}
-          tone="info"
-        />
-        <StatCard
-          title="剩余积分"
-          value={formatCredits(availableCreditRemaining)}
-          desc={unavailableCreditCount > 0
-            ? `已排除 ${formatNumber(unavailableCreditCount)} 个不可用账号`
-            : unqueriedCreditCount > 0
-              ? `${formatNumber(unqueriedCreditCount)} 个账号未查询余额`
-              : '当前可用账号余额'}
-          icon={<Wallet />}
-          tone="success"
-        />
-        <StatCard
-          title="预估估算费用"
-          value={estimatedRemainingCostUsd == null ? '无法估算' : formatUsdFixed2(estimatedRemainingCostUsd)}
-          desc={estimatedCreditRate == null
-            ? '没有已消耗积分，无法估算'
-            : '总估算费用 / 总已消耗积分 × 剩余积分'}
-          icon={<DollarSign />}
-          tone={estimatedRemainingCostUsd == null ? 'warning' : 'success'}
-        />
-        <StatCard title="错误率" value={formatPercent(metrics.errorRate)} desc={`${formatCompact(metrics.errorRequests)} 个错误请求`} icon={<AlertTriangle />} tone={metrics.errorRate > 0.05 ? 'error' : metrics.errorRate > 0 ? 'warning' : 'success'} />
-      </div>
-      <div className="mt-4 flex justify-end">
-        <Button size="xs" variant="outline" onClick={() => navigate('/credentials')}>
-          账号管理 <ExternalLink className="size-3.5" />
-        </Button>
-      </div>
-      <div className="mt-4">
-        <div className="mb-2 flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold">本地路径积分消耗</h3>
-          <span className="text-[0.68rem] text-muted-foreground">{formatNumber(routes.length)} 个路径</span>
-        </div>
-        {routes.length === 0 ? (
-          <EmptyState title="暂无本地路径数据" className="py-6" />
-        ) : (
-          <div className="overflow-x-auto">
-            <Table className="min-w-[960px]">
-              <TableHeader>
-                <TableRow>
-                  <TableHead>路径</TableHead>
-                  <TableHead className="text-right">请求</TableHead>
-                  <TableHead className="text-right">积分</TableHead>
-                  <TableHead className="text-right">估算费用</TableHead>
-                  <TableHead className="text-right">原始费用</TableHead>
-                  <TableHead className="text-right">积分比</TableHead>
-                  <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
-                  <TableHead className="text-right">错误率</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {routes.map((route) => {
-                  const estimatedRate = creditCostRate(
-                    route.metrics.estimatedCostUsd,
-                    route.metrics.kiroMeteringUsage,
-                  )
-                  const originalRate = creditCostRate(
-                    route.metrics.originalCostUsd,
-                    route.metrics.kiroMeteringUsage,
-                  )
-                  return (
-                    <TableRow key={route.key}>
-                      <TableCell>
-                        <Button
-                          variant="link"
-                          size="xs"
-                          className="h-auto max-w-[280px] justify-start truncate px-0 text-left font-mono"
-                          title={`${route.label} · 查看本地账号 Usage 明细`}
-                          onClick={() => usageLink(navigate, {
-                            routeKind: 'local_credential',
-                            endpoint: route.key === 'unknown' ? undefined : route.key,
-                            since: range.from,
-                            until: range.to,
-                          })}
-                        >
-                          {route.label}
-                        </Button>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">{formatNumber(route.metrics.requests)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{formatNumber(route.metrics.kiroMeteringUsage)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(route.metrics.estimatedCostUsd)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(route.metrics.originalCostUsd)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        <div>{formatCreditCostRate(estimatedRate)}</div>
-                        <div className="text-[0.62rem] text-muted-foreground">原始 {formatCreditCostRate(originalRate)}</div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs"><HitRateCell metrics={route.metrics} /></TableCell>
-                      <TableCell className="text-right font-mono text-xs">{formatPercent(route.metrics.errorRate)}</TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-      </div>
-      {accountsLoading ? (
-        <LoadingState text="加载本地账号数据..." className="mt-3 py-8" />
-      ) : accountRows.length === 0 ? (
-        <EmptyState title="暂无本地账号" className="mt-3 py-8" />
-      ) : (
-        <div className="mt-2 overflow-x-auto">
-          <Table className="min-w-[1140px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead>账号</TableHead>
-                <TableHead className="text-right">请求</TableHead>
-                <TableHead className="text-right">已消耗积分</TableHead>
-                <TableHead className="text-right">估算费用</TableHead>
-                <TableHead className="text-right">积分转换率</TableHead>
-                <TableHead className="text-right">剩余积分</TableHead>
-                <TableHead className="text-right">预估估算费用</TableHead>
-                <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
-                <TableHead className="text-right">错误率</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {accountRows.map((account) => {
-                const accountCostDiff = localCostDiffInfo(account.metrics.estimatedCostUsd, account.metrics.originalCostUsd)
-                const accountEstimatedRate = creditCostRate(account.metrics.estimatedCostUsd, account.metrics.kiroMeteringUsage)
-                const accountOriginalRate = creditCostRate(account.metrics.originalCostUsd, account.metrics.kiroMeteringUsage)
-                return (
-                  <TableRow key={account.credentialId} className={account.credential.disabled ? 'opacity-65' : undefined}>
-                    <TableCell>
-                      <div className="flex min-w-0 items-center gap-1.5">
-                      <Button
-                        variant="link"
-                        size="xs"
-                        className="h-auto max-w-[260px] justify-start truncate px-0 text-left"
-                        title={`账号 #${account.credentialId} · 查看 Usage 明细`}
-                        onClick={() => usageLink(navigate, {
-                          routeKind: 'local_credential',
-                          credentialId: account.credentialId,
-                          since: range.from,
-                          until: range.to,
-                        })}
-                      >
-                        #{account.credentialId} {account.label}
-                      </Button>
-                      <UsageTierBadge tier={account.tier} inFlight={account.credential.inFlightRequests} />
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.requests)}</TableCell>
-                    <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.kiroMeteringUsage)}</TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      <div>{formatUsdFixed2(account.metrics.estimatedCostUsd)}</div>
-                      <div className="text-[0.62rem] text-muted-foreground">原始 {formatUsdFixed2(account.metrics.originalCostUsd)}</div>
-                      <div className={cn('text-[0.62rem]', accountCostDiff.textClass)} title="估算费用 - 原始计费">
-                        差值 {accountCostDiff.text}{accountCostDiff.percentText}
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      <div>{formatCreditCostRate(accountEstimatedRate)}</div>
-                      <div className="text-[0.62rem] text-muted-foreground">原始 {formatCreditCostRate(accountOriginalRate)}</div>
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      {account.creditEstimateBlocked ? (
-                        <span className="text-destructive" title={account.creditEstimateBlockedReason}>不可用</span>
-                      ) : account.accountInfo?.creditRemaining != null ? (
-                        <span title={effectiveCreditRemaining(account.accountInfo)?.estimated ? '估算：快照剩余减去快照之后本地记录的消耗' : '上次查询时的剩余'}>
-                          {effectiveCreditRemaining(account.accountInfo)?.estimated && '≈'}
-                          {formatCredits(effectiveCreditRemaining(account.accountInfo)?.remaining)}
-                        </span>
-                      ) : (
-                        <span className="text-muted-foreground">未查询</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs">
-                      {account.creditEstimateBlocked ? (
-                        <span className="text-destructive" title={account.creditEstimateBlockedReason}>不可估算</span>
-                      ) : account.estimatedRemainingCostUsd != null ? (
-                        formatUsdFixed2(account.estimatedRemainingCostUsd)
-                      ) : (
-                        <span className="text-muted-foreground">无法估算</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs"><HitRateCell metrics={account.metrics} /></TableCell>
-                    <TableCell className="text-right font-mono text-xs">{formatPercent(account.metrics.errorRate)}</TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-        </div>
-      )}
-    </SectionCard>
-  )
-}
-
-function ExternalPoolSection({
+function AccountSection({
   external,
   pools,
   poolStatuses,
@@ -633,8 +321,8 @@ function ExternalPoolSection({
     costFloorAppliedRequests: number
     pools: ExternalUsagePool[]
   }
-  pools: ExternalPool[]
-  poolStatuses: ExternalPoolStatus[]
+  pools: Account[]
+  poolStatuses: AccountStatus[]
   range: { from: string; to: string }
   navigate: ReturnType<typeof useNavigate>
 }) {
@@ -649,7 +337,7 @@ function ExternalPoolSection({
       priority: pool.priority,
       usage: usageById.get(pool.id),
       status: statusById.get(pool.id),
-      tier: externalPoolUsageTier(pool, statusById.get(pool.id)),
+      tier: accountUsageTier(pool, statusById.get(pool.id)),
     })),
     ...external.pools
       .filter((usage) => !configuredIds.has(usage.poolId))
@@ -660,7 +348,7 @@ function ExternalPoolSection({
         priority: Number.MAX_SAFE_INTEGER,
         usage,
         status: undefined,
-        tier: externalPoolUsageTier(undefined, undefined),
+        tier: accountUsageTier(undefined, undefined),
       })),
   ]
     // 正在使用的池排最前；同一层内沿用可计费金额排序。
@@ -683,7 +371,7 @@ function ExternalPoolSection({
     <SectionCard>
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
-          title="外部池请求"
+          title="账号请求"
           value={formatNumber(totalRequests)}
           desc={`可计价 ${formatNumber(pricedRequests)} / 未计价 ${formatNumber(unpricedRequests)}`}
           icon={<Zap />}
@@ -698,7 +386,7 @@ function ExternalPoolSection({
           tone="primary"
         />
         <StatCard
-          title="外部池可计费"
+          title="账号可计费"
           value={formatUsdFixed2(billableCost)}
           desc={(
             <span>
@@ -716,16 +404,16 @@ function ExternalPoolSection({
         <span className="font-medium text-foreground/75" title="按整形后的展示 usage 计算的中间成本">展示计费</span>
         {' '}是整形后的中间口径；
         <span className="ml-1 font-medium text-foreground/75" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</span>
-        {' '}是最终上报口径，外部池可计费取最终可计费金额。
+        {' '}是最终上报口径，账号可计费取最终可计费金额。
       </div>
       {rows.length === 0 ? (
-        <EmptyState title="暂无外部池配置" className="mt-3 py-8" />
+        <EmptyState title="暂无账号配置" className="mt-3 py-8" />
       ) : (
         <div className="mt-4 scrollbar-thin overflow-x-auto">
           <Table className="min-w-[1080px] text-xs">
             <TableHeader>
               <TableRow>
-                <TableHead>外部池</TableHead>
+                <TableHead>账号</TableHead>
                 <TableHead className="text-right">请求</TableHead>
                 <TableHead className="text-right">上游原始成本</TableHead>
                 <TableHead className="text-right" title="按整形后的展示 usage 计算的中间成本">展示计费</TableHead>
@@ -753,10 +441,10 @@ function ExternalPoolSection({
                           variant="link"
                           size="xs"
                           className="h-auto max-w-[260px] justify-start truncate px-0 text-left text-xs font-semibold"
-                          title={`外部池 #${poolId} · 查看 Usage 明细`}
+                          title={`账号 #${poolId} · 查看 Usage 明细`}
                           onClick={() => usageLink(navigate, {
-                            routeKind: 'external_pool',
-                            externalPoolId: poolId,
+                            routeKind: 'account',
+                            accountId: poolId,
                             since: range.from,
                             until: range.to,
                           })}
@@ -779,7 +467,7 @@ function ExternalPoolSection({
                     </TableCell>
                     <TableCell
                       className="text-right font-mono"
-                      title="最终上报/补偿后成本口径；当前用于外部池可计费金额"
+                      title="最终上报/补偿后成本口径；当前用于账号可计费金额"
                     >
                       {formatUsdFixed2(upliftedCostUsd)}
                     </TableCell>
@@ -905,18 +593,18 @@ export function OverviewPage() {
   const autoRefresh = useAutoRefreshPreference(AUTO_REFRESH_KEY, 30)
 
   const tabParam = searchParams.get('tab')
-  const activeTab: OverviewTab = tabParam === 'local' || tabParam === 'external' || tabParam === 'rankings'
+  const activeTab: OverviewTab = tabParam === 'external' || tabParam === 'rankings'
     ? tabParam
     : 'summary'
-  const externalPools = useQuery({
-    queryKey: ['external-pools'],
-    queryFn: getExternalPools,
+  const accounts = useQuery({
+    queryKey: ['accounts'],
+    queryFn: getAccounts,
     enabled: activeTab === 'external',
     refetchInterval: autoRefresh.refetchInterval || 30000,
   })
-  const externalPoolStatuses = useQuery({
-    queryKey: ['external-pools-status'],
-    queryFn: getExternalPoolsStatus,
+  const accountStatuses = useQuery({
+    queryKey: ['accounts-status'],
+    queryFn: getAccountsStatus,
     enabled: activeTab === 'external',
     refetchInterval: 5000,
   })
@@ -945,70 +633,15 @@ export function OverviewPage() {
   const refreshInterval = rangeKey && ['today', 'last24h', 'thisMonth'].includes(rangeKey)
     ? autoRefresh.refetchInterval
     : false
-  const summary = useUsageOverviewSummary(queryParams, refreshInterval, activeTab === 'summary' || activeTab === 'local' || activeTab === 'external' || activeTab === 'rankings')
+  const summary = useUsageOverviewSummary(queryParams, refreshInterval, activeTab === 'summary' || activeTab === 'external' || activeTab === 'rankings')
   const series = useUsageOverviewSeries(
     queryParams,
     refreshInterval,
-    (activeTab === 'summary' || activeTab === 'local' || activeTab === 'external') && !summary.isError,
+    (activeTab === 'summary' || activeTab === 'external') && !summary.isError,
   )
-  const runtimeConfig = useRuntimeConfig()
-  const creditUnitPriceUsd = runtimeConfig.data?.kiroCreditUnitPriceUsd ?? null
-  const local = useUsageOverviewLocal(queryParams, refreshInterval, activeTab === 'local' && !summary.isError)
+  const creditUnitPriceUsd: number | null = null
   const external = useUsageOverviewExternal(queryParams, refreshInterval, activeTab === 'external' && !summary.isError)
   const rankings = useUsageOverviewRankings(rankingQueryParams, refreshInterval, activeTab === 'rankings' && !summary.isError)
-  const localCredentials = useCredentials({
-    enabled: activeTab === 'local',
-    refetchInterval: refreshInterval || 30000,
-  })
-  const localCredentialIds = useMemo(
-    () => (localCredentials.data?.credentials ?? []).map((credential) => credential.id),
-    [localCredentials.data?.credentials],
-  )
-  const localCredentialRuntime = useCredentialRuntime(localCredentialIds)
-  const localCredentialAccountInfo = useCredentialAccountInfo(localCredentialIds, {
-    enabled: activeTab === 'local',
-    refetchInterval: refreshInterval || 60000,
-  })
-  const localAccountRows = useMemo(() => {
-    const usageByCredentialId = new Map((local.data?.local.accounts ?? []).map((account) => [account.credentialId, account]))
-    const runtimeById = mapById(localCredentialRuntime.data?.items)
-    const accountInfoById = mapById(localCredentialAccountInfo.data?.items)
-    return (localCredentials.data?.credentials ?? [])
-      .map((base) => {
-        const credential = mergeCredentialRuntime(base, runtimeById.get(base.id))
-        const metrics = usageByCredentialId.get(base.id)?.metrics ?? EMPTY_OVERVIEW_METRICS
-        const accountInfo = accountInfoById.get(base.id)
-        const creditStatus = credentialCreditStatus(credential)
-        const remaining = effectiveCreditRemaining(accountInfo)
-        const estimatedRemainingCostUsd = creditStatus.available && remaining && metrics.kiroMeteringUsage > 0
-          ? metrics.estimatedCostUsd / metrics.kiroMeteringUsage * remaining.remaining
-          : undefined
-        return {
-          credential,
-          credentialId: base.id,
-          label: credentialLabel(credential),
-          metrics,
-          accountInfo,
-          creditEstimateBlocked: !creditStatus.available,
-          creditEstimateBlockedReason: creditStatus.reason,
-          estimatedRemainingCostUsd,
-          tier: credentialUsageTier(credential, creditStatus.available),
-        }
-      })
-      // 正在使用的账号排最前；同一层内沿用消耗排序，避免刷新时乱跳。
-      .sort((left, right) =>
-        compareUsageTier(left.tier, right.tier) ||
-        right.metrics.estimatedCostUsd - left.metrics.estimatedCostUsd ||
-        right.metrics.requests - left.metrics.requests ||
-        left.credentialId - right.credentialId
-      )
-  }, [
-    local.data?.local.accounts,
-    localCredentialAccountInfo.data?.items,
-    localCredentialRuntime.data?.items,
-    localCredentials.data?.credentials,
-  ])
-
   const setOverviewTab = (tab: OverviewTab) => {
     const next = new URLSearchParams(searchParams)
     if (tab === 'summary') next.delete('tab')
@@ -1096,7 +729,7 @@ export function OverviewPage() {
 
   const summaryData = summary.data
   const seriesPoints = series.data?.series ?? []
-  const seriesGroups = series.data?.seriesGroups ?? { localRoutes: [], externalPools: [], externalReasons: [] }
+  const seriesGroups = series.data?.seriesGroups ?? { localRoutes: [], accounts: [], externalReasons: [] }
   // 还没结束的时段（当前小时或当天）：柱子半透明并在提示里标“进行中”。
   const dataThroughMs = Date.parse(series.data?.range.dataThrough ?? '')
   const bucketMs = seriesGranularity === 'day' ? 86_400_000 : 3_600_000
@@ -1105,13 +738,9 @@ export function OverviewPage() {
   const isDrilled = Boolean(searchParams.get('backRange') || searchParams.get('backFrom'))
   const partialErrors = [
     series.error ? `趋势：${extractErrorMessage(series.error)}` : '',
-    local.error ? `本地账号池：${extractErrorMessage(local.error)}` : '',
-    localCredentials.error ? `本地账号列表：${extractErrorMessage(localCredentials.error)}` : '',
-    localCredentialRuntime.error ? `本地账号状态：${extractErrorMessage(localCredentialRuntime.error)}` : '',
-    localCredentialAccountInfo.error ? `本地账号余额：${extractErrorMessage(localCredentialAccountInfo.error)}` : '',
-    external.error ? `外部池：${extractErrorMessage(external.error)}` : '',
-    externalPools.error ? `外部池配置：${extractErrorMessage(externalPools.error)}` : '',
-    externalPoolStatuses.error ? `外部池状态：${extractErrorMessage(externalPoolStatuses.error)}` : '',
+    external.error ? `账号：${extractErrorMessage(external.error)}` : '',
+    accounts.error ? `账号配置：${extractErrorMessage(accounts.error)}` : '',
+    accountStatuses.error ? `账号状态：${extractErrorMessage(accountStatuses.error)}` : '',
     rankings.error ? `排行：${extractErrorMessage(rankings.error)}` : '',
   ].filter(Boolean)
 
@@ -1145,13 +774,9 @@ export function OverviewPage() {
         <Button size="icon-sm" variant="ghost" title="刷新总览" onClick={() => {
           void summary.refetch()
           void series.refetch()
-          void local.refetch()
-          void localCredentials.refetch()
-          if (localCredentialIds.length > 0) void localCredentialRuntime.refetch()
-          if (localCredentialIds.length > 0) void localCredentialAccountInfo.refetch()
           void external.refetch()
-          void externalPools.refetch()
-          void externalPoolStatuses.refetch()
+          void accounts.refetch()
+          void accountStatuses.refetch()
           void rankings.refetch()
         }}>
           <RefreshCw className={cn('size-4', summary.isFetching && 'animate-spin')} />
@@ -1203,8 +828,7 @@ export function OverviewPage() {
       <Tabs value={activeTab} onValueChange={(value) => setOverviewTab(value as OverviewTab)}>
         <TabsList className="w-full justify-start overflow-x-auto">
           <TabsTrigger value="summary">汇总</TabsTrigger>
-          <TabsTrigger value="local">本地账号</TabsTrigger>
-          <TabsTrigger value="external">外部池</TabsTrigger>
+          <TabsTrigger value="external">账号</TabsTrigger>
           <TabsTrigger value="rankings">排行</TabsTrigger>
         </TabsList>
 
@@ -1225,38 +849,10 @@ export function OverviewPage() {
           </div>
         </TabsContent>
 
-        <TabsContent value="local">
-          <div className="space-y-3">
-          <OverviewTrendCard
-            key={`local-${creditUnitPriceUsd != null}`}
-            title="本地分时趋势"
-            icon={<Zap />}
-            views={localTrendViews(seriesGroups, creditUnitPriceUsd)}
-            points={seriesPoints}
-            hourly={seriesGranularity === 'hour'}
-            partialFrom={partialFrom}
-            loading={series.isFetching}
-            onDrillDown={seriesGranularity === 'day' ? drillDown : undefined}
-          />
-          {local.isLoading && !local.data ? (
-            <LoadingState text="加载本地账号池..." />
-          ) : (
-            <LocalPoolSection
-              metrics={summaryData.totals.local}
-              routes={local.data?.local.routes ?? []}
-              accountRows={localAccountRows}
-              accountsLoading={localCredentials.isLoading || (localCredentialIds.length > 0 && localCredentialRuntime.isLoading)}
-              range={summaryData.range}
-              navigate={navigate}
-            />
-          )}
-          </div>
-        </TabsContent>
-
         <TabsContent value="external">
           <div className="space-y-3">
           <OverviewTrendCard
-            title="外部池分时趋势"
+            title="账号分时趋势"
             icon={<DollarSign />}
             views={externalTrendViews(seriesGroups)}
             points={seriesPoints}
@@ -1266,9 +862,9 @@ export function OverviewPage() {
             onDrillDown={seriesGranularity === 'day' ? drillDown : undefined}
           />
           {external.isLoading && !external.data ? (
-            <LoadingState text="加载外部池..." />
+            <LoadingState text="加载账号..." />
           ) : (
-            <ExternalPoolSection
+            <AccountSection
               external={external.data?.external ?? {
                 rawCostUsd: 0,
                 shapedCostUsd: 0,
@@ -1280,8 +876,8 @@ export function OverviewPage() {
                 costFloorAppliedRequests: 0,
                 pools: [],
               }}
-              pools={externalPools.data?.pools ?? []}
-              poolStatuses={externalPoolStatuses.data?.pools ?? []}
+              pools={accounts.data?.pools ?? []}
+              poolStatuses={accountStatuses.data?.pools ?? []}
               range={summaryData.range}
               navigate={navigate}
             />

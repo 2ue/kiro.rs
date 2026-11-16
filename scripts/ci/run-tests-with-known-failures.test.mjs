@@ -58,7 +58,7 @@ test("known tests that pass are suggested for removal", () => {
 
 test("cargo failures without a test result keep the cargo exit code", () => {
   const result = evaluateTestRun({
-    output: "error: could not compile `kiro-rs` due to previous error",
+    output: "error: could not compile `claude-pool` due to previous error",
     cargoExitCode: 101,
     knownFailures,
   });
@@ -70,10 +70,10 @@ test("cargo failures without a test result keep the cargo exit code", () => {
 });
 
 test("a missing test result for a later binary fails after known failures", () => {
-  const laterBinary = "unittests src/bin/kiro_loadtest.rs (target/debug/deps/kiro_loadtest-deadbeef)";
+  const laterBinary = "unittests src/bin/pool_loadtest.rs (target/debug/deps/pool_loadtest-deadbeef)";
   const result = evaluateTestRun({
     output: [
-      "Running unittests src/main.rs (target/debug/deps/kiro_rs-deadbeef)",
+      "Running unittests src/main.rs (target/debug/deps/claude_pool-deadbeef)",
       `test ${knownFailure} ... FAILED`,
       "test result: FAILED. 0 passed; 1 failed;",
       `Running ${laterBinary}`,
@@ -97,9 +97,9 @@ test("a missing test result for a later binary fails after known failures", () =
 test("zero-test targets and doc-tests still count as completed test results", () => {
   const result = evaluateTestRun({
     output: [
-      "Running unittests src/lib.rs (target/debug/deps/kiro_rs-deadbeef)",
+      "Running unittests src/lib.rs (target/debug/deps/claude_pool-deadbeef)",
       "test result: ok. 0 passed; 0 failed; 0 ignored;",
-      "Doc-tests kiro_rs",
+      "Doc-tests claude_pool",
       "test result: ok. 0 passed; 0 failed; 0 ignored;",
     ].join("\n"),
     cargoExitCode: 0,
@@ -113,14 +113,14 @@ test("zero-test targets and doc-tests still count as completed test results", ()
 });
 
 test("doc-test output cannot hide a missing test result for a binary", () => {
-  const laterBinary = "unittests src/bin/kiro_loadtest.rs (target/debug/deps/kiro_loadtest-deadbeef)";
+  const laterBinary = "unittests src/bin/pool_loadtest.rs (target/debug/deps/pool_loadtest-deadbeef)";
   const result = evaluateTestRun({
     output: [
-      "Running unittests src/main.rs (target/debug/deps/kiro_rs-deadbeef)",
+      "Running unittests src/main.rs (target/debug/deps/claude_pool-deadbeef)",
       `test ${knownFailure} ... FAILED`,
       "test result: FAILED. 0 passed; 1 failed;",
       `Running ${laterBinary}`,
-      "Doc-tests kiro_rs",
+      "Doc-tests claude_pool",
       "test result: ok. 0 passed; 0 failed; 0 ignored;",
     ].join("\n"),
     cargoExitCode: 101,

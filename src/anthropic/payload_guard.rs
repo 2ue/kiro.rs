@@ -1336,7 +1336,7 @@ impl CurrentImageTooLarge {
 /// 检查当前轮（最后一条消息）中的 base64 图片是否超过上游限制，包括 tool_result 内嵌图片。
 ///
 /// 历史消息里的超大图片不在这里报错，仍由 payload guard 替换为占位文本，避免会话永久失败。
-/// 所有路由共用这一检查，保证本地与外部池行为一致。
+/// 所有路由共用这一检查，保证本地与账号行为一致。
 pub fn find_oversized_current_image(request: &MessagesRequest) -> Option<CurrentImageTooLarge> {
     let message_index = request.messages.len().checked_sub(1)?;
     let content = request.messages[message_index].content.as_array()?;
@@ -3104,7 +3104,7 @@ mod tests {
     fn warning_header_fragment_reports_changes() {
         let report = PayloadGuardReport {
             enabled: true,
-            limit_basis: "kiroWeighted".to_string(),
+            limit_basis: "poolWeighted".to_string(),
             max_bytes: 1000,
 
             original_bytes: 2000,

@@ -3,13 +3,11 @@ import {
   LayoutDashboard,
   Server,
   Boxes,
-  Network,
   BarChart3,
   FileClock,
   SlidersHorizontal,
   Boxes as ModelsIcon,
   ShieldCheck,
-  Archive,
   Gauge,
   Zap,
   Route,
@@ -24,12 +22,9 @@ export type DomainKey = 'overview' | 'resources' | 'analytics' | 'settings'
 /** 页面 key(二级,或单页域本身) */
 export type PageKey =
   | 'overview'
-  | 'credentials'
-  | 'inventory'
-  | 'external'
-  | 'proxies'
+  | 'accounts'
   | 'usage'
-  | 'externalPoolRisk'
+  | 'accountRisk'
   | 'audit'
   | 'runtime'
   | 'cachePolicies'
@@ -58,7 +53,7 @@ export interface NavDomain {
 
 export const navDomains: NavDomain[] = [
   { key: 'overview', label: '总览', icon: LayoutDashboard, path: 'overview' },
-  { key: 'resources', label: '资源', icon: Server, path: 'credentials' },
+  { key: 'resources', label: '资源', icon: Server, path: 'accounts' },
   { key: 'analytics', label: '分析', icon: BarChart3, path: 'usage' },
   { key: 'settings', label: '设置', icon: SlidersHorizontal, path: 'runtime' },
 ]
@@ -68,14 +63,11 @@ export const navPages: NavPage[] = [
   { key: 'overview', path: 'overview', label: '总览', description: '实时健康与关键指标', icon: LayoutDashboard, domain: 'overview' },
 
   // 资源域
-  { key: 'credentials', path: 'credentials', label: '账号', description: '本地账号池:筛选、批量、导入、校验', icon: Server, domain: 'resources' },
-  { key: 'inventory', path: 'inventory', label: '库存', description: '保管暂不使用的账号：自动续期，不参与调度', icon: Archive, domain: 'resources' },
-  { key: 'external', path: 'external-pools', label: '外部池', description: '外部账号池与计费', icon: Boxes, domain: 'resources' },
-  { key: 'proxies', path: 'proxies', label: '代理', description: '网络代理资源', icon: Network, domain: 'resources' },
+  { key: 'accounts', path: 'accounts', label: '账号', description: '账号池与计费', icon: Boxes, domain: 'resources' },
 
   // 分析域
   { key: 'usage', path: 'usage', label: '用量', description: '请求趋势与明细', icon: BarChart3, domain: 'analytics' },
-  { key: 'externalPoolRisk', path: 'external-pool-risk', label: '外部池风控', description: '缓存与成本风险检查', icon: Gauge, domain: 'analytics' },
+  { key: 'accountRisk', path: 'account-risk', label: '账号风控', description: '缓存与成本风险检查', icon: Gauge, domain: 'analytics' },
   { key: 'audit', path: 'audit', label: '审计', description: '关键操作记录', icon: FileClock, domain: 'analytics' },
 
   // 设置域
@@ -93,12 +85,9 @@ export function pagesOfDomain(domain: DomainKey): NavPage[] {
 
 export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   overview: { title: '总览', subtitle: '实时健康状态与关键指标一览' },
-  credentials: { title: '账号', subtitle: '维护本地账号池,保持调度稳定' },
-  inventory: { title: '库存', subtitle: '保管暂不使用的账号：自动续期、不参与调度，需要时推送到账号池' },
-  external: { title: '外部池', subtitle: '管理外部账号池与计费拆分' },
-  proxies: { title: '代理', subtitle: '维护网络代理资源与连通状态' },
+  accounts: { title: '账号', subtitle: '管理账号池与计费拆分' },
   usage: { title: '用量', subtitle: '请求趋势、Top 维度与明细记录' },
-  externalPoolRisk: { title: '外部池风控', subtitle: '检查外部池缓存分布与成本风险' },
+  accountRisk: { title: '账号风控', subtitle: '检查账号缓存分布与成本风险' },
   audit: { title: '审计', subtitle: '关键操作与变更记录' },
   runtime: { title: '运行配置', subtitle: '调度、限流、冷却、缓存与兼容策略' },
   cachePolicies: { title: '路由策略', subtitle: '按路由管理缓存、提示词注入和功能' },

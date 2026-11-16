@@ -1,5 +1,5 @@
 //! Account change log: quota exhausted, auto-disabled, risk control, recovered and manual
-//! enable/disable for external pools.
+//! enable/disable for accounts.
 //!
 //! Events are rows in `admin_audit_logs` whose `detail` carries an `accountEvent` kind, so the
 //! audit page can show them as their own view. Recording never blocks or fails the caller: the
@@ -61,7 +61,7 @@ impl AccountSource {
 
     fn object_type(self) -> &'static str {
         match self {
-            Self::External => "external_pool",
+            Self::External => "account",
         }
     }
 }
@@ -83,7 +83,7 @@ impl AccountEvent {
     /// with the fixed account-event keys.
     pub fn into_audit_parts(self) -> (&'static str, &'static str, String, Value) {
         let action = match self.source {
-            AccountSource::External => "external_pool_account_event",
+            AccountSource::External => "account_account_event",
         };
         let mut detail = match self.detail {
             Value::Object(map) => map,
@@ -135,8 +135,8 @@ pub fn record_account_event(
     })
 }
 
-/// Event kind and label for an external pool auto-disable reason.
-pub fn external_pool_disable_event(reason: &str) -> (AccountEventKind, &'static str) {
+/// Event kind and label for an account auto-disable reason.
+pub fn account_disable_event(reason: &str) -> (AccountEventKind, &'static str) {
     match reason {
         "quota_exhausted" => (AccountEventKind::QuotaExhausted, "额度耗尽"),
         "security_lock" => (AccountEventKind::RiskControlled, "安全锁定"),
@@ -269,27 +269,27 @@ mod tests {
             detail: Value::Null,
         };
         let (action, object_type, _, detail) = event.into_audit_parts();
-        assert_eq!(action, "external_pool_account_event");
-        assert_eq!(object_type, "external_pool");
+        assert_eq!(action, "account_account_event");
+        assert_eq!(object_type, "account");
         assert_eq!(detail["accountSource"], "external");
     }
 
     #[test]
-    fn external_pool_reasons_map_to_kinds() {
+    fn account_reasons_map_to_kinds() {
         assert_eq!(
-            external_pool_disable_event("quota_exhausted").0,
+            account_disable_event("quota_exhausted").0,
             AccountEventKind::QuotaExhausted
         );
         assert_eq!(
-            external_pool_disable_event("security_lock").0,
+            account_disable_event("security_lock").0,
             AccountEventKind::RiskControlled
         );
         assert_eq!(
-            external_pool_disable_event("auth_error"),
+            account_disable_event("auth_error"),
             (AccountEventKind::AutoDisabled, "鉴权失败")
         );
         assert_eq!(
-            external_pool_disable_event("unexpected").0,
+            account_disable_event("unexpected").0,
             AccountEventKind::AutoDisabled
         );
     }

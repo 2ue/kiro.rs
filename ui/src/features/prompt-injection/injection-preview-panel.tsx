@@ -51,7 +51,6 @@ export function InjectionPreviewPanel({
   const preview = usePromptInjectionPreview()
   const [request, setRequest] = React.useState<PromptInjectionPreviewRequest>({
     route: routes.includes('/cc') ? '/cc' : routes[0] ?? '/v1',
-    upstream: 'local',
     model: 'claude-sonnet-4-5',
     nativeReasoning: false,
     withSystem: true,
@@ -82,15 +81,6 @@ export function InjectionPreviewPanel({
             <SelectTrigger id="preview-route" size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
               {routes.map((route) => <SelectItem key={route} value={route}>{route}</SelectItem>)}
-            </SelectContent>
-          </Select>
-        </Field>
-        <Field label="上游" htmlFor="preview-upstream">
-          <Select value={request.upstream} onValueChange={(value) => set('upstream')(value as 'local' | 'external_pool')}>
-            <SelectTrigger id="preview-upstream" size="sm"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="local">本地 Kiro</SelectItem>
-              <SelectItem value="external_pool">外部池</SelectItem>
             </SelectContent>
           </Select>
         </Field>
@@ -172,7 +162,7 @@ export function InjectionPreviewPanel({
                 </tbody>
               </table>
             </div>
-            {result.externalSystem && <TextBlock title="发往外部池的 system" text={result.externalSystem.join('\n\n---\n\n')} />}
+            {result.externalSystem && <TextBlock title="发往账号的 system" text={result.externalSystem.join('\n\n---\n\n')} />}
             <TextBlock title="history 第一条（由 system 合成，后面跟一条 assistant：I will follow these instructions.）" text={result.systemTurn} />
             <TextBlock title="当前轮 user 消息" text={result.currentTurn} />
             {result.tools.length > 0 && (

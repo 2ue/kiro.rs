@@ -10,12 +10,10 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 
 use super::{middleware::AdminState, types::*};
+use crate::account::{CreateAccountRequest, SetAccountEnabledRequest, UpdateAccountRequest};
 use crate::anthropic::usage::{
-    UsageExternalPoolRiskQuery, UsageRecordQuery, UsageRecordStatus, UsageRouteKind, UsageSource,
+    UsageAccountRiskQuery, UsageRecordQuery, UsageRecordStatus, UsageRouteKind, UsageSource,
     usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
-};
-use crate::external_pool::{
-    CreateExternalPoolRequest, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -59,7 +57,7 @@ pub struct UsageRecordsQueryParams {
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
-    pub external_pool_id: Option<u64>,
+    pub account_id: Option<u64>,
     pub route_kind: Option<String>,
     pub model: Option<String>,
     pub status: Option<String>,
@@ -83,7 +81,7 @@ pub struct UsageRecordsPageQueryParams {
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
-    pub external_pool_id: Option<u64>,
+    pub account_id: Option<u64>,
     pub route_kind: Option<String>,
     pub model: Option<String>,
     pub status: Option<String>,
@@ -121,14 +119,14 @@ pub struct UsageDashboardWindowQueryParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageExternalPoolRiskQueryParams {
+pub struct UsageAccountRiskQueryParams {
     pub timezone: Option<String>,
     pub window_key: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
     pub warning_threshold_tokens: Option<i64>,
     pub critical_threshold_tokens: Option<i64>,
-    pub external_pool_id: Option<u64>,
+    pub account_id: Option<u64>,
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub stream: Option<bool>,
@@ -160,7 +158,7 @@ impl UsageRecordsQueryParams {
             conversation_id: non_blank(self.conversation_id),
             request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
-            external_pool_id: self.external_pool_id,
+            account_id: self.account_id,
             route_kind: parse_optional_usage_route_kind(self.route_kind)?,
             model: non_blank(self.model),
             status: parse_optional_usage_status(self.status)?,
@@ -194,7 +192,7 @@ impl UsageRecordsPageQueryParams {
             conversation_id: non_blank(self.conversation_id),
             request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
-            external_pool_id: self.external_pool_id,
+            account_id: self.account_id,
             route_kind: parse_optional_usage_route_kind(self.route_kind)?,
             model: non_blank(self.model),
             status: parse_optional_usage_status(self.status)?,
@@ -209,8 +207,8 @@ impl UsageRecordsPageQueryParams {
     }
 }
 
-impl UsageExternalPoolRiskQueryParams {
-    fn into_query(self) -> Result<UsageExternalPoolRiskQuery, String> {
+impl UsageAccountRiskQueryParams {
+    fn into_query(self) -> Result<UsageAccountRiskQuery, String> {
         const DEFAULT_WARNING_THRESHOLD_TOKENS: i64 = 800_000;
         const DEFAULT_CRITICAL_THRESHOLD_TOKENS: i64 = 1_000_000;
         const DEFAULT_SAMPLE_LIMIT: usize = 50;
@@ -260,7 +258,7 @@ impl UsageExternalPoolRiskQueryParams {
             .unwrap_or(DEFAULT_SAMPLE_LIMIT)
             .clamp(1, MAX_SAMPLE_LIMIT);
 
-        Ok(UsageExternalPoolRiskQuery {
+        Ok(UsageAccountRiskQuery {
             timezone,
             window_key,
             window_label,
@@ -268,7 +266,7 @@ impl UsageExternalPoolRiskQueryParams {
             to,
             warning_threshold_tokens,
             critical_threshold_tokens,
-            pool_id: self.external_pool_id,
+            pool_id: self.account_id,
             endpoint: non_blank(self.endpoint),
             model: non_blank(self.model),
             stream: self.stream,
@@ -334,7 +332,7 @@ fn parse_usage_source(value: &str) -> Result<UsageSource, String> {
 
 fn parse_usage_route_kind(value: &str) -> Result<UsageRouteKind, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "external_pool" | "external-pool" | "external" => Ok(UsageRouteKind::ExternalPool),
+        "account" | "external" => Ok(UsageRouteKind::Account),
         _ => Err(format!("无效 routeKind: {}", value)),
     }
 }
@@ -345,32 +343,29 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, String> {
         .map_err(|_| format!("无效时间: {}", value))
 }
 
-/// POST /api/admin/external-pools/:id/supported-models
-/// 设置外部池支持模型列表
-pub async fn set_external_pool_supported_models(
+/// POST /api/admin/accounts/:id/supported-models
+/// 设置账号支持模型列表
+pub async fn set_account_supported_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
     Json(payload): Json<SetSupportedModelsRequest>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .set_external_pool_supported_models(id, payload)
-    {
+    match state.service.set_account_supported_models(id, payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
-/// POST /api/admin/external-pools/:id/supported-models/sync
-/// 使用外部池自身的兼容 /v1/models 接口同步并写回支持模型列表
-pub async fn sync_external_pool_supported_models(
+/// POST /api/admin/accounts/:id/supported-models/sync
+/// 使用账号自身的兼容 /v1/models 接口同步并写回支持模型列表
+pub async fn sync_account_supported_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+    Json(payload): Json<DiscoverAccountSupportedModelsRequest>,
 ) -> impl IntoResponse {
     match state
         .service
-        .sync_external_pool_supported_models(id, payload)
+        .sync_account_supported_models(id, payload)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -378,15 +373,15 @@ pub async fn sync_external_pool_supported_models(
     }
 }
 
-/// POST /api/admin/external-pools/supported-models/discover
-/// 使用未保存的外部池配置发现支持模型，不写回。
-pub async fn discover_external_pool_supported_models_from_request(
+/// POST /api/admin/accounts/supported-models/discover
+/// 使用未保存的账号配置发现支持模型，不写回。
+pub async fn discover_account_supported_models_from_request(
     State(state): State<AdminState>,
-    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+    Json(payload): Json<DiscoverAccountSupportedModelsRequest>,
 ) -> impl IntoResponse {
     match state
         .service
-        .discover_external_pool_supported_models(None, payload)
+        .discover_account_supported_models(None, payload)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -394,16 +389,16 @@ pub async fn discover_external_pool_supported_models_from_request(
     }
 }
 
-/// POST /api/admin/external-pools/:id/supported-models/discover
-/// 使用已保存外部池配置发现支持模型，不写回。
-pub async fn discover_external_pool_supported_models(
+/// POST /api/admin/accounts/:id/supported-models/discover
+/// 使用已保存账号配置发现支持模型，不写回。
+pub async fn discover_account_supported_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+    Json(payload): Json<DiscoverAccountSupportedModelsRequest>,
 ) -> impl IntoResponse {
     match state
         .service
-        .discover_external_pool_supported_models(Some(id), payload)
+        .discover_account_supported_models(Some(id), payload)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -493,90 +488,90 @@ pub async fn delete_request_api_key(
     }
 }
 
-pub async fn get_external_pools(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.list_external_pools() {
+pub async fn get_accounts(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.list_accounts() {
         Ok(pools) => Json(serde_json::json!({ "pools": pools })).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn create_external_pool(
+pub async fn create_account(
     State(state): State<AdminState>,
-    Json(payload): Json<CreateExternalPoolRequest>,
+    Json(payload): Json<CreateAccountRequest>,
 ) -> impl IntoResponse {
-    match state.service.create_external_pool(payload) {
+    match state.service.create_account(payload) {
         Ok(pool) => Json(pool).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn update_external_pool(
+pub async fn update_account(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<UpdateExternalPoolRequest>,
+    Json(payload): Json<UpdateAccountRequest>,
 ) -> impl IntoResponse {
-    match state.service.update_external_pool(id, payload) {
+    match state.service.update_account(id, payload) {
         Ok(pool) => Json(pool).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn delete_external_pool(
+pub async fn delete_account(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.service.delete_external_pool(id) {
-        Ok(()) => Json(SuccessResponse::new("外部池已删除")).into_response(),
+    match state.service.delete_account(id) {
+        Ok(()) => Json(SuccessResponse::new("账号已删除")).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn set_external_pool_enabled(
+pub async fn set_account_enabled(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<SetExternalPoolEnabledRequest>,
+    Json(payload): Json<SetAccountEnabledRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_external_pool_enabled(id, payload) {
+    match state.service.set_account_enabled(id, payload) {
         Ok(pool) => Json(pool).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn clear_external_pool_auto_disabled(
+pub async fn clear_account_auto_disabled(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.service.clear_external_pool_auto_disabled(id) {
+    match state.service.clear_account_auto_disabled(id) {
         Ok(pool) => Json(pool).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn clear_external_pool_cooldown(
+pub async fn clear_account_cooldown(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.service.clear_external_pool_cooldown(id) {
+    match state.service.clear_account_cooldown(id) {
         Ok(pool) => Json(pool).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn get_external_pool_status(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.get_external_pool_status() {
+pub async fn get_account_status(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_account_status() {
         Ok(status) => Json(status).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
 
-pub async fn test_external_pool(
+pub async fn test_account(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    payload: Option<Json<ExternalPoolTestRequest>>,
+    payload: Option<Json<AccountTestRequest>>,
 ) -> impl IntoResponse {
     match state
         .service
-        .test_external_pool(id, payload.map(|Json(payload)| payload))
+        .test_account(id, payload.map(|Json(payload)| payload))
     {
         Ok(result) => Json(result).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
@@ -729,7 +724,7 @@ pub async fn get_usage_dashboard(
 }
 
 /// GET /api/admin/usage-dashboard/overview
-/// 获取外部池的 rollup-first 总览。
+/// 获取账号的 rollup-first 总览。
 pub async fn get_usage_dashboard_overview(
     State(state): State<AdminState>,
     Query(params): Query<UsageOverviewQueryParams>,
@@ -783,7 +778,7 @@ pub async fn get_usage_dashboard_overview_series(
     }
 }
 
-/// GET /api/admin/usage-dashboard/overview/external
+/// GET /api/admin/usage-dashboard/overview
 pub async fn get_usage_dashboard_overview_external(
     State(state): State<AdminState>,
     Query(params): Query<UsageOverviewQueryParams>,
@@ -874,30 +869,30 @@ pub async fn get_usage_dashboard_breakdown(
     }
 }
 
-/// GET /api/admin/usage-dashboard/external-pool-billing
-/// 获取 usage 仪表盘单个窗口的外部池费用明细。
-pub async fn get_usage_dashboard_external_pool_billing(
+/// GET /api/admin/usage-dashboard/account-billing
+/// 获取 usage 仪表盘单个窗口的账号费用明细。
+pub async fn get_usage_dashboard_account_billing(
     State(state): State<AdminState>,
     Query(params): Query<UsageDashboardWindowQueryParams>,
 ) -> impl IntoResponse {
     let window_key = params.window_key.unwrap_or_else(|| "today".to_string());
     match state
         .service
-        .get_usage_dashboard_external_pool_billing(params.timezone, window_key)
+        .get_usage_dashboard_account_billing(params.timezone, window_key)
     {
         Ok(data) => Json(data).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
-/// GET /api/admin/usage-dashboard/external-pool-risk
-/// 获取外部池 usage 风控统计。
-pub async fn get_usage_dashboard_external_pool_risk(
+/// GET /api/admin/usage-dashboard/account-risk
+/// 获取账号 usage 风控统计。
+pub async fn get_usage_dashboard_account_risk(
     State(state): State<AdminState>,
-    Query(params): Query<UsageExternalPoolRiskQueryParams>,
+    Query(params): Query<UsageAccountRiskQueryParams>,
 ) -> impl IntoResponse {
     match params.into_query() {
-        Ok(query) => match state.service.get_usage_dashboard_external_pool_risk(query) {
+        Ok(query) => match state.service.get_usage_dashboard_account_risk(query) {
             Ok(data) => Json(data).into_response(),
             Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
         },
@@ -1065,7 +1060,7 @@ mod tests {
             conversation_id: Some("   ".to_string()),
             request_api_key_id: Some("   ".to_string()),
             credential_id: Some(7),
-            external_pool_id: None,
+            account_id: None,
             route_kind: Some("external".to_string()),
             model: Some("".to_string()),
             status: Some("".to_string()),
@@ -1085,7 +1080,7 @@ mod tests {
         assert_eq!(query.conversation_id, None);
         assert_eq!(query.request_api_key_id, None);
         assert_eq!(query.credential_id, Some(7));
-        assert_eq!(query.route_kind, Some(UsageRouteKind::ExternalPool));
+        assert_eq!(query.route_kind, Some(UsageRouteKind::Account));
         assert_eq!(query.model, None);
         assert_eq!(query.status, None);
         assert_eq!(query.source, None);
@@ -1104,7 +1099,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
-            external_pool_id: None,
+            account_id: None,
             route_kind: None,
             model: None,
             status: None,
@@ -1155,7 +1150,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
-            external_pool_id: None,
+            account_id: None,
             route_kind: None,
             model: None,
             status: None,
@@ -1183,7 +1178,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
-            external_pool_id: None,
+            account_id: None,
             route_kind: None,
             model: None,
             status: Some("ok".to_string()),
@@ -1206,7 +1201,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
-            external_pool_id: None,
+            account_id: None,
             route_kind: None,
             model: None,
             status: None,
@@ -1229,7 +1224,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
-            external_pool_id: None,
+            account_id: None,
             route_kind: None,
             model: None,
             status: None,
@@ -1264,7 +1259,7 @@ mod tests {
             conversation_id: Some("session-a".to_string()),
             request_api_key_id: Some("A".repeat(64)),
             credential_id: None,
-            external_pool_id: None,
+            account_id: None,
             route_kind: None,
             model: None,
             status: None,
@@ -1289,11 +1284,11 @@ mod tests {
     }
 }
 
-pub async fn promote_external_pool_models(
+pub async fn promote_account_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> axum::response::Response {
-    match state.service.promote_external_pool_models(id).await {
+    match state.service.promote_account_models(id).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }

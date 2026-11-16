@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Phased scheduler scenarios against a running kiro-rs with mock upstreams.
+// Phased scheduler scenarios against a running claude-pool with mock upstreams.
 //
 // Each phase sets the mock faults, then keeps `concurrency` clients sending for `durationMs`.
 // Every second it samples /readyz and records per-second outcomes, so a stall, a burst of
 // errors or a slow recovery is visible in the timeline, not only in totals.
 //
 // Usage: node scheduler-scenarios.mjs --base-url http://127.0.0.1:PORT --api-key KEY
-//          --kiro-mock http://127.0.0.1:MOCK --external-mock http://127.0.0.1:EXT
+//          --pool-mock http://127.0.0.1:MOCK --external-mock http://127.0.0.1:EXT
 //          --scenario NAME [--path /cc/v1/messages] [--out file.json]
 
 import http from "node:http";
@@ -29,127 +29,127 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const baseUrl = new URL(args.baseUrl);
 const apiKey = args.apiKey;
-const kiroMock = args.kiroMock;
+const poolMock = args.poolMock;
 const externalMock = args.externalMock;
 const path = args.path || "/cc/v1/messages";
 const agent = new http.Agent({ keepAlive: true, maxSockets: 2048 });
 
 const QUIET = { errorRate: 0, headerDelayMs: 300, streamChunks: 0, chunkDelayMs: 0, failTokens: [] };
 
-// Every scenario is a list of phases. `kiro` / `external` patch the mocks at the phase start.
+// Every scenario is a list of phases. `pool` / `external` patch the mocks at the phase start.
 const SCENARIOS = {
-  normal: [{ name: "normal", concurrency: 6, durationMs: 10000, kiro: QUIET }],
+  normal: [{ name: "normal", concurrency: 6, durationMs: 10000, pool: QUIET }],
   sudden_burst: [
-    { name: "baseline", concurrency: 3, durationMs: 6000, kiro: QUIET },
+    { name: "baseline", concurrency: 3, durationMs: 6000, pool: QUIET },
     { name: "burst", concurrency: 60, durationMs: 15000 },
     { name: "after", concurrency: 3, durationMs: 8000 },
   ],
   sustained_overload: [
-    { name: "overload", concurrency: 60, durationMs: 40000, kiro: { ...QUIET, headerDelayMs: 1500 } },
-    { name: "after", concurrency: 3, durationMs: 8000, kiro: QUIET },
+    { name: "overload", concurrency: 60, durationMs: 40000, pool: { ...QUIET, headerDelayMs: 1500 } },
+    { name: "after", concurrency: 3, durationMs: 8000, pool: QUIET },
   ],
   burst_with_errors_recovering: [
-    { name: "baseline", concurrency: 6, durationMs: 5000, kiro: QUIET },
-    { name: "burst_errors", concurrency: 40, durationMs: 15000, kiro: { ...QUIET, errorRate: 0.3, errorStatus: 500 } },
-    { name: "recovered", concurrency: 40, durationMs: 10000, kiro: QUIET },
+    { name: "baseline", concurrency: 6, durationMs: 5000, pool: QUIET },
+    { name: "burst_errors", concurrency: 40, durationMs: 15000, pool: { ...QUIET, errorRate: 0.3, errorStatus: 500 } },
+    { name: "recovered", concurrency: 40, durationMs: 10000, pool: QUIET },
     { name: "after", concurrency: 3, durationMs: 6000 },
   ],
   burst_with_short_outage: [
-    { name: "baseline", concurrency: 6, durationMs: 5000, kiro: QUIET },
-    { name: "outage", concurrency: 30, durationMs: 4000, kiro: { ...QUIET, errorRate: 1, errorStatus: 503 } },
-    { name: "recovered", concurrency: 30, durationMs: 10000, kiro: QUIET },
+    { name: "baseline", concurrency: 6, durationMs: 5000, pool: QUIET },
+    { name: "outage", concurrency: 30, durationMs: 4000, pool: { ...QUIET, errorRate: 1, errorStatus: 503 } },
+    { name: "recovered", concurrency: 30, durationMs: 10000, pool: QUIET },
     { name: "after", concurrency: 3, durationMs: 6000 },
   ],
   burst_with_long_outage: [
-    { name: "baseline", concurrency: 6, durationMs: 5000, kiro: QUIET },
-    { name: "outage", concurrency: 30, durationMs: 30000, kiro: { ...QUIET, errorRate: 1, errorStatus: 429 } },
-    { name: "recovered", concurrency: 6, durationMs: 15000, kiro: QUIET },
+    { name: "baseline", concurrency: 6, durationMs: 5000, pool: QUIET },
+    { name: "outage", concurrency: 30, durationMs: 30000, pool: { ...QUIET, errorRate: 1, errorStatus: 429 } },
+    { name: "recovered", concurrency: 6, durationMs: 15000, pool: QUIET },
   ],
   single_account_failing: [
-    { name: "one_bad_account", concurrency: 12, durationMs: 15000, kiro: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: 500 } },
-    { name: "after", concurrency: 6, durationMs: 6000, kiro: QUIET },
+    { name: "one_bad_account", concurrency: 12, durationMs: 15000, pool: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: 500 } },
+    { name: "after", concurrency: 6, durationMs: 6000, pool: QUIET },
   ],
   risk_control_burst: [
-    { name: "suspended_two", concurrency: 12, durationMs: 12000, kiro: { ...QUIET, failTokens: ["mock-access-5001", "mock-access-5002"], errorStatus: 403 } },
-    { name: "after", concurrency: 6, durationMs: 6000, kiro: QUIET },
+    { name: "suspended_two", concurrency: 12, durationMs: 12000, pool: { ...QUIET, failTokens: ["mock-access-5001", "mock-access-5002"], errorStatus: 403 } },
+    { name: "after", concurrency: 6, durationMs: 6000, pool: QUIET },
   ],
   connection_resets: [
-    { name: "resets", concurrency: 20, durationMs: 12000, kiro: { ...QUIET, errorRate: 0.2, errorStatus: "reset" } },
-    { name: "after", concurrency: 6, durationMs: 6000, kiro: QUIET },
+    { name: "resets", concurrency: 20, durationMs: 12000, pool: { ...QUIET, errorRate: 0.2, errorStatus: "reset" } },
+    { name: "after", concurrency: 6, durationMs: 6000, pool: QUIET },
   ],
   long_stream_burst: [
-    { name: "long_streams", concurrency: 30, durationMs: 20000, stream: true, kiro: { ...QUIET, headerDelayMs: 200, streamChunks: 60, chunkDelayMs: 100 } },
-    { name: "after", concurrency: 3, durationMs: 6000, stream: true, kiro: QUIET },
+    { name: "long_streams", concurrency: 30, durationMs: 20000, stream: true, pool: { ...QUIET, headerDelayMs: 200, streamChunks: 60, chunkDelayMs: 100 } },
+    { name: "after", concurrency: 3, durationMs: 6000, stream: true, pool: QUIET },
   ],
   small_to_large_burst_errors: [
-    { name: "small", concurrency: 2, durationMs: 6000, kiro: QUIET },
-    { name: "large_errors", concurrency: 60, durationMs: 12000, kiro: { ...QUIET, errorRate: 0.5, errorStatus: 502 } },
-    { name: "large_recovered", concurrency: 60, durationMs: 10000, kiro: QUIET },
+    { name: "small", concurrency: 2, durationMs: 6000, pool: QUIET },
+    { name: "large_errors", concurrency: 60, durationMs: 12000, pool: { ...QUIET, errorRate: 0.5, errorStatus: 502 } },
+    { name: "large_recovered", concurrency: 60, durationMs: 10000, pool: QUIET },
     { name: "small_again", concurrency: 2, durationMs: 6000 },
   ],
 
   // Protocols: Anthropic and both OpenAI interfaces, streaming and not, under errors and overload.
   protocols_with_errors: [
-    { name: "messages_stream", concurrency: 8, durationMs: 6000, stream: true, kiro: { ...QUIET, errorRate: 0.3, errorStatus: 500 } },
+    { name: "messages_stream", concurrency: 8, durationMs: 6000, stream: true, pool: { ...QUIET, errorRate: 0.3, errorStatus: 500 } },
     { name: "chat", concurrency: 8, durationMs: 6000, protocol: "chat", path: "/cc/v1/chat/completions" },
     { name: "chat_stream", concurrency: 8, durationMs: 6000, protocol: "chat", path: "/cc/v1/chat/completions", stream: true },
     { name: "responses", concurrency: 8, durationMs: 6000, protocol: "responses", path: "/cc/v1/responses" },
     { name: "responses_stream", concurrency: 8, durationMs: 6000, protocol: "responses", path: "/cc/v1/responses", stream: true },
   ],
   openai_overload: [
-    { name: "chat_overload", concurrency: 60, durationMs: 10000, protocol: "chat", path: "/v1/chat/completions", kiro: { ...QUIET, headerDelayMs: 1500 } },
+    { name: "chat_overload", concurrency: 60, durationMs: 10000, protocol: "chat", path: "/v1/chat/completions", pool: { ...QUIET, headerDelayMs: 1500 } },
     { name: "responses_overload", concurrency: 60, durationMs: 10000, protocol: "responses", path: "/v1/responses" },
-    { name: "after", concurrency: 3, durationMs: 5000, protocol: "chat", path: "/v1/chat/completions", kiro: QUIET },
+    { name: "after", concurrency: 3, durationMs: 5000, protocol: "chat", path: "/v1/chat/completions", pool: QUIET },
   ],
   // Output has started when the upstream drops: the client sees overloaded_error (Claude Code
   // retries only that), never a silently cut stream.
   mid_stream_resets: [
-    { name: "cut_streams", concurrency: 15, durationMs: 12000, stream: true, kiro: { ...QUIET, streamChunks: 20, chunkDelayMs: 50, midStreamResetRate: 0.3 } },
-    { name: "after", concurrency: 6, durationMs: 5000, stream: true, kiro: QUIET },
+    { name: "cut_streams", concurrency: 15, durationMs: 12000, stream: true, pool: { ...QUIET, streamChunks: 20, chunkDelayMs: 50, midStreamResetRate: 0.3 } },
+    { name: "after", concurrency: 6, durationMs: 5000, stream: true, pool: QUIET },
   ],
-  // Named Kiro failures, each classified on its own.
+  // Named Anthropic failures, each classified on its own.
   tool_mismatch_500: [
-    { name: "tool_mismatch", concurrency: 6, durationMs: 5000, kiro: { ...QUIET, errorRate: 1, errorStatus: "tool_mismatch" } },
-    { name: "after", concurrency: 6, durationMs: 4000, kiro: QUIET },
+    { name: "tool_mismatch", concurrency: 6, durationMs: 5000, pool: { ...QUIET, errorRate: 1, errorStatus: "tool_mismatch" } },
+    { name: "after", concurrency: 6, durationMs: 4000, pool: QUIET },
   ],
   gateway_timeout_524: [
-    { name: "gateway_timeout", concurrency: 6, durationMs: 5000, kiro: { ...QUIET, errorRate: 1, errorStatus: "gateway_timeout" } },
-    { name: "after", concurrency: 6, durationMs: 4000, kiro: QUIET },
+    { name: "gateway_timeout", concurrency: 6, durationMs: 5000, pool: { ...QUIET, errorRate: 1, errorStatus: "gateway_timeout" } },
+    { name: "after", concurrency: 6, durationMs: 4000, pool: QUIET },
   ],
   image_count_exceeded: [
-    { name: "image_count", concurrency: 6, durationMs: 5000, kiro: { ...QUIET, errorRate: 1, errorStatus: "image_count" } },
-    { name: "after", concurrency: 6, durationMs: 4000, kiro: QUIET },
+    { name: "image_count", concurrency: 6, durationMs: 5000, pool: { ...QUIET, errorRate: 1, errorStatus: "image_count" } },
+    { name: "after", concurrency: 6, durationMs: 4000, pool: QUIET },
   ],
   // Account problems still cool or disable the account (only upstream-side faults do not).
   quota_account: [
-    { name: "quota_5001", concurrency: 12, durationMs: 8000, kiro: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: "quota" } },
-    { name: "after", concurrency: 6, durationMs: 5000, kiro: QUIET },
+    { name: "quota_5001", concurrency: 12, durationMs: 8000, pool: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: "quota" } },
+    { name: "after", concurrency: 6, durationMs: 5000, pool: QUIET },
   ],
   auth_account: [
-    { name: "auth_5001", concurrency: 12, durationMs: 8000, kiro: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: "auth" } },
-    { name: "after", concurrency: 6, durationMs: 5000, kiro: QUIET },
+    { name: "auth_5001", concurrency: 12, durationMs: 8000, pool: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: "auth" } },
+    { name: "after", concurrency: 6, durationMs: 5000, pool: QUIET },
   ],
   // Combination: one bad account inside the preferred tier, under overload, with 5xx waves.
   bad_account_in_preferred_tier_overload: [
-    { name: "overload_bad_5001", concurrency: 40, durationMs: 15000, kiro: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: 500, headerDelayMs: 800 } },
-    { name: "plus_5xx_wave", concurrency: 40, durationMs: 10000, kiro: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: 500, errorRate: 0.2, headerDelayMs: 800 } },
-    { name: "after", concurrency: 6, durationMs: 6000, kiro: QUIET },
+    { name: "overload_bad_5001", concurrency: 40, durationMs: 15000, pool: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: 500, headerDelayMs: 800 } },
+    { name: "plus_5xx_wave", concurrency: 40, durationMs: 10000, pool: { ...QUIET, failTokens: ["mock-access-5001"], errorStatus: 500, errorRate: 0.2, headerDelayMs: 800 } },
+    { name: "after", concurrency: 6, durationMs: 6000, pool: QUIET },
   ],
   // Clients that give up before the upstream answers leave client_dropped usage records.
   client_timeouts: [
-    { name: "impatient_clients", concurrency: 12, durationMs: 8000, clientTimeoutMs: 800, kiro: { ...QUIET, headerDelayMs: 2500 } },
-    { name: "after", concurrency: 6, durationMs: 5000, kiro: QUIET },
+    { name: "impatient_clients", concurrency: 12, durationMs: 8000, clientTimeoutMs: 800, pool: { ...QUIET, headerDelayMs: 2500 } },
+    { name: "after", concurrency: 6, durationMs: 5000, pool: QUIET },
   ],
-  // External pool: takes over when the local pool is full or failing, steps aside when it fails.
+  // Account: takes over when the local pool is full or failing, steps aside when it fails.
   external_overflow: [
-    { name: "local_full", concurrency: 40, durationMs: 10000, kiro: { ...QUIET, headerDelayMs: 1500 }, external: { errorRate: 0, headerDelayMs: 200 } },
-    { name: "local_failing", concurrency: 12, durationMs: 8000, kiro: { ...QUIET, errorRate: 1, errorStatus: 503 } },
-    { name: "external_failing", concurrency: 40, durationMs: 8000, kiro: { ...QUIET, headerDelayMs: 1500 }, external: { errorRate: 1, errorStatus: 503 } },
-    { name: "both_ok", concurrency: 12, durationMs: 6000, kiro: QUIET, external: { errorRate: 0 } },
+    { name: "local_full", concurrency: 40, durationMs: 10000, pool: { ...QUIET, headerDelayMs: 1500 }, external: { errorRate: 0, headerDelayMs: 200 } },
+    { name: "local_failing", concurrency: 12, durationMs: 8000, pool: { ...QUIET, errorRate: 1, errorStatus: 503 } },
+    { name: "external_failing", concurrency: 40, durationMs: 8000, pool: { ...QUIET, headerDelayMs: 1500 }, external: { errorRate: 1, errorStatus: 503 } },
+    { name: "both_ok", concurrency: 12, durationMs: 6000, pool: QUIET, external: { errorRate: 0 } },
   ],
   external_on_524: [
-    { name: "local_524", concurrency: 6, durationMs: 6000, kiro: { ...QUIET, errorRate: 1, errorStatus: "gateway_timeout" }, external: { errorRate: 0, headerDelayMs: 100 } },
-    { name: "after", concurrency: 6, durationMs: 4000, kiro: QUIET },
+    { name: "local_524", concurrency: 6, durationMs: 6000, pool: { ...QUIET, errorRate: 1, errorStatus: "gateway_timeout" }, external: { errorRate: 0, headerDelayMs: 100 } },
+    { name: "after", concurrency: 6, durationMs: 4000, pool: QUIET },
   ],
 };
 
@@ -257,7 +257,7 @@ function sendOne(stream, marker, phase = {}) {
 }
 
 async function runPhase(phase, startedAt, timeline) {
-  if (phase.kiro) await patchMock(kiroMock, phase.kiro);
+  if (phase.pool) await patchMock(poolMock, phase.pool);
   if (phase.external) await patchMock(externalMock, phase.external);
   const end = Date.now() + phase.durationMs;
   const results = [];
@@ -323,7 +323,7 @@ async function runPhase(phase, startedAt, timeline) {
 // Mock counters plus, from the recorded conversation identities, how often a call that followed
 // a failed one reused the failed call's conversationId (a retry must use a fresh one).
 async function upstreamSummary() {
-  const upstream = await mockCounters(kiroMock);
+  const upstream = await mockCounters(poolMock);
   if (!upstream) return { upstream };
   const conversations = upstream.conversations || [];
   delete upstream.conversations;

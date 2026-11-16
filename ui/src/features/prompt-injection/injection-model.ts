@@ -26,7 +26,7 @@ export type SettingSource = { kind: 'default' } | { kind: 'route'; prefix: strin
 
 export interface EffectiveItem {
   enabled: boolean
-  externalPool: boolean
+  account: boolean
   source: SettingSource
 }
 
@@ -34,21 +34,21 @@ export interface EffectiveItem {
 export function effectiveItem(config: PromptInjectionConfig, route: string, id: InjectionId): EffectiveItem {
   const path = routeEndpoint(route)
   let enabled: { value: boolean; prefix: string } | null = null
-  let externalPool: { value: boolean; prefix: string } | null = null
+  let account: { value: boolean; prefix: string } | null = null
   for (const [prefix, items] of Object.entries(config.pathOverrides)) {
     const item = items[id]
     if (!item || !prefixMatches(prefix, path)) continue
     if (item.enabled !== undefined && (!enabled || prefix.length > enabled.prefix.length)) {
       enabled = { value: item.enabled, prefix }
     }
-    if (item.externalPool !== undefined && (!externalPool || prefix.length > externalPool.prefix.length)) {
-      externalPool = { value: item.externalPool, prefix }
+    if (item.account !== undefined && (!account || prefix.length > account.prefix.length)) {
+      account = { value: item.account, prefix }
     }
   }
   const fallback = config.defaults[id]
   return {
     enabled: enabled?.value ?? fallback?.enabled ?? false,
-    externalPool: externalPool?.value ?? fallback?.externalPool ?? false,
+    account: account?.value ?? fallback?.account ?? false,
     source: enabled ? { kind: 'route', prefix: enabled.prefix } : { kind: 'default' },
   }
 }
@@ -76,7 +76,7 @@ export function withRouteOverride(
   next: InjectionItemOverride,
 ): PromptInjectionConfig {
   const items = { ...(config.pathOverrides[route] ?? {}) }
-  if (next.enabled === undefined && next.externalPool === undefined) delete items[id]
+  if (next.enabled === undefined && next.account === undefined) delete items[id]
   else items[id] = next
   const pathOverrides = { ...config.pathOverrides }
   if (Object.keys(items).length === 0) delete pathOverrides[route]
@@ -150,8 +150,8 @@ export const CATEGORY_LABEL: Record<InjectionCatalogEntry['category'], string> =
 
 export const BLOCK_REASON_LABEL: Record<string, string> = {
   off: '开关关闭',
-  external_pool_unsupported: '外部池不支持',
-  external_pool_off: '外部池开关关闭',
+  account_unsupported: '账号不支持',
+  account_off: '账号开关关闭',
   strict: 'strict 模式',
 }
 

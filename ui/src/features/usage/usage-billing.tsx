@@ -2,13 +2,13 @@ import type { ReactNode } from 'react'
 import { DollarSign } from 'lucide-react'
 import { Badge, Button } from '@/components/ui'
 import { SectionCard } from '@/components/patterns'
-import { formatCompact, formatMeteringUsage, formatNumber, formatUsdDetailed, formatUsdFixed2 } from '@/lib/format'
+import { formatCompact, formatNumber, formatUsdDetailed, formatUsdFixed2 } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import type {
-  ExternalPoolBilling,
-  ExternalPoolUsageSnapshot,
-  UsageExternalPoolBillingByPool,
-  UsageExternalPoolBillingSummary,
+  AccountBilling,
+  AccountUsageSnapshot,
+  UsageAccountBillingByPool,
+  UsageAccountBillingSummary,
   UsageRecord,
 } from '@/types/api'
 import { billingDeltaBadgeTone, billingDeltaTextClass, billingDeltaTone } from './usage-helpers'
@@ -16,34 +16,31 @@ import { billingDeltaBadgeTone, billingDeltaTextClass, billingDeltaTone } from '
 export interface UsageCostModel {
   estimatedCostUsd: number
   originalCostUsd: number
-  kiroMeteringUsage?: number
   pricingAvailable?: boolean
   pricingModel?: string
-  externalPoolBilling?: ExternalPoolBilling
+  accountBilling?: AccountBilling
 }
 
 export function usageRecordCostModel(record: UsageRecord): UsageCostModel {
   return {
     estimatedCostUsd: record.estimatedCostUsd,
     originalCostUsd: record.originalCostUsd,
-    kiroMeteringUsage: record.kiroMeteringUsage,
     pricingAvailable: record.pricingAvailable,
     pricingModel: record.pricingModel,
-    externalPoolBilling: record.externalPoolBilling,
+    accountBilling: record.accountBilling,
   }
 }
 
 export function simpleUsageCostModel(input: {
   estimatedCostUsd: number
   originalCostUsd: number
-  kiroMeteringUsage?: number
   pricingAvailable?: boolean
   pricingModel?: string
 }): UsageCostModel {
   return input
 }
 
-export function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
+export function formatUsageSnapshot(snapshot?: AccountUsageSnapshot): string {
   if (!snapshot) return '-'
   return [
     `输入 ${formatNumber(snapshot.inputTokens)}`,
@@ -120,11 +117,7 @@ export function UsageCostInline({
         原始 {formatUsdDetailed(model.originalCostUsd)}
       </div>
       <div className="text-[0.62rem] text-muted-foreground/60">{pricingLabel}</div>
-      {typeof model.kiroMeteringUsage === 'number' && (
-        <div className="text-[0.62rem] text-muted-foreground/60">
-          Kiro {formatMeteringUsage(model.kiroMeteringUsage)}
-        </div>
-      )}
+
     </div>
   )
 }
@@ -132,11 +125,9 @@ export function UsageCostInline({
 export function UsageCostTiles({
   model,
   className,
-  showKiro = true,
 }: {
   model: UsageCostModel
   className?: string
-  showKiro?: boolean
 }) {
   const pricingLabel = model.pricingAvailable
     ? `是（${model.pricingModel || 'priced'}）`
@@ -146,9 +137,7 @@ export function UsageCostTiles({
     <div className={cn('grid grid-cols-2 gap-2 sm:grid-cols-3', className)}>
       <CostMetric label="估算费用" value={formatUsdDetailed(model.estimatedCostUsd)} tone={model.estimatedCostUsd > 0 ? 'warning' : 'default'} />
       <CostMetric label="原始计费" value={formatUsdDetailed(model.originalCostUsd)} tone={model.originalCostUsd > 0 ? 'warning' : 'default'} />
-      {showKiro && typeof model.kiroMeteringUsage === 'number' && (
-        <CostMetric label="Kiro计量" value={formatMeteringUsage(model.kiroMeteringUsage)} />
-      )}
+
       <CostMetric label="有定价" value={pricingLabel} />
     </div>
   )
@@ -159,7 +148,7 @@ export function UsageCostBreakdown({
 }: {
   model: UsageCostModel
 }) {
-  const billing = model.externalPoolBilling
+  const billing = model.accountBilling
   const shapedCost = billing?.shapedCostUsd ?? billing?.reportedCostUsd ?? model.estimatedCostUsd
   const upliftedCost = billing?.upliftedCostUsd ?? billing?.reportedCostUsd ?? billing?.billableCostUsd ?? model.estimatedCostUsd
   const delta = billing
@@ -221,22 +210,19 @@ export function UsageCostBreakdown({
             tone={deltaTone === 'loss' ? 'error' : deltaTone === 'profit' ? 'warning' : 'default'}
             detail="展示计费 - 原始计费"
           />
-          <CostMetric
-            label="Kiro计量"
-            value={typeof model.kiroMeteringUsage === 'number' ? formatMeteringUsage(model.kiroMeteringUsage) : '-'}
-          />
+
         </div>
       )}
     </div>
   )
 }
 
-export function ExternalPoolBillingPanel({
+export function AccountBillingPanel({
   billing,
   billingByPool,
 }: {
-  billing: UsageExternalPoolBillingSummary
-  billingByPool: UsageExternalPoolBillingByPool[]
+  billing: UsageAccountBillingSummary
+  billingByPool: UsageAccountBillingByPool[]
 }) {
   const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
   const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
@@ -250,8 +236,8 @@ export function ExternalPoolBillingPanel({
 
   return (
     <SectionCard
-      title="外部池成本拆分"
-      description="区分上游原始成本、整形后成本、补偿后成本，并计算每个外部池的差额占比和原始/整形倍率"
+      title="账号成本拆分"
+      description="区分上游原始成本、整形后成本、补偿后成本，并计算每个账号的差额占比和原始/整形倍率"
       icon={<DollarSign />}
       actions={
         <Badge tone={billingDeltaBadgeTone(deltaTone)}>
@@ -262,7 +248,7 @@ export function ExternalPoolBillingPanel({
       <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <CostMetric
-            label="外部池请求"
+            label="账号请求"
             value={<span title={formatNumber(billing.requests)}>{formatCompact(billing.requests)}</span>}
             detail={<>可计价 <span title={formatNumber(billing.pricedRequests)}>{formatCompact(billing.pricedRequests)}</span> / 未计价 <span title={formatNumber(billing.unpricedRequests)}>{formatCompact(billing.unpricedRequests)}</span></>}
           />
@@ -300,19 +286,19 @@ export function ExternalPoolBillingPanel({
 
         <div className="pt-1">
           <div className="mb-2 flex items-center justify-between gap-2">
-            <div className="text-xs font-semibold text-foreground/70">各外部池成本与差额</div>
+            <div className="text-xs font-semibold text-foreground/70">各账号成本与差额</div>
             <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
           </div>
           {visiblePools.length === 0 ? (
             <div className="rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground/60">
-              当前窗口没有外部池计费样本；发生外部池请求后，这里会按池列出原始成本、差额占比和原始/整形倍率。
+              当前窗口没有账号计费样本；发生账号请求后，这里会按池列出原始成本、差额占比和原始/整形倍率。
             </div>
           ) : (
             <div className="scrollbar-thin overflow-x-auto rounded-lg bg-card">
               <table className="w-full min-w-[640px] text-xs">
                 <thead>
                   <tr className="bg-muted/40 text-muted-foreground">
-                    <th className="px-3 py-2 text-left font-medium">外部池</th>
+                    <th className="px-3 py-2 text-left font-medium">账号</th>
                     <th className="px-3 py-2 text-right font-medium">请求</th>
                     <th className="px-3 py-2 text-right font-medium">上游原始成本</th>
                     <th className="px-3 py-2 text-right font-medium">展示计费</th>

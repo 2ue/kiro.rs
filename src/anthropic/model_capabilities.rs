@@ -201,7 +201,7 @@ impl ModelCapabilitiesCatalog {
     }
 
     /// Claude Code protocol `/v1/models` listing: Claude models only under their Anthropic
-    /// hyphenated ids (never Kiro's dotted ids), without aliases or `-thinking` / `[1m]`
+    /// hyphenated ids (never 上游's dotted ids), without aliases or `-thinking` / `[1m]`
     /// variants. Those names stay valid as request models; they are just not listed.
     pub fn standard_anthropic_models(&self) -> Vec<Model> {
         standardize_model_listing(
@@ -213,7 +213,7 @@ impl ModelCapabilitiesCatalog {
     }
 
     /// Looks up one listed model. Accepts the listed id as well as request-side spellings
-    /// (dotted Kiro ids, aliases, `-thinking` / `[1m]` variants) and returns the listed entry
+    /// (dotted 上游 ids, aliases, `-thinking` / `[1m]` variants) and returns the listed entry
     /// they resolve to; unknown models return `None`.
     pub fn standard_anthropic_model(&self, requested_model: &str) -> Option<Model> {
         let models = self.standard_anthropic_models();
@@ -1153,7 +1153,7 @@ const MODEL_LISTING_ALIASES: &[&str] = &[
     "auto", "best", "default", "fable", "haiku", "opus", "opusplan", "sonnet",
 ];
 
-/// Kiro spells Claude versions with dots (`claude-opus-4.6`); the Claude Code protocol
+/// 上游 spells Claude versions with dots (`claude-opus-4.6`); the Claude Code protocol
 /// uses hyphens (`claude-opus-4-6`).
 fn claude_listing_id(model: &str) -> String {
     if model.starts_with("claude-") {
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_maps_legacy_dated_models_to_seeded_kiro_models() {
+    fn resolver_maps_legacy_dated_models_to_seeded_pool_models() {
         let models = seed_model_capabilities()
             .into_iter()
             .map(|item| item.model)
@@ -2143,7 +2143,7 @@ mod tests {
         for id in &ids {
             assert!(
                 !(id.starts_with("claude-") && id.contains('.')),
-                "Kiro dotted id listed: {id}"
+                "上游 dotted id listed: {id}"
             );
             assert!(
                 id == "sonnet-thinking" || !id.ends_with("-thinking"),

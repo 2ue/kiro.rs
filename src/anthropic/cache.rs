@@ -127,7 +127,7 @@ pub fn resolve_cache_write_ttl(
 ///
 /// `input_tokens` here means the billable uncached portion reported in Anthropic
 /// responses, while `total_input_tokens` keeps the full prompt token count used
-/// by Kiro metadata/context accounting.
+/// by 上游 metadata/context accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheUsage {
     pub total_input_tokens: i32,
@@ -800,7 +800,7 @@ impl ReportedCacheUsagePolicy {
 
     /// Apply only the final downstream-standard cache field caps.
     ///
-    /// This intentionally ignores `reportedUsage.enabled`: routes such as `kiro_rs_tool` can opt
+    /// This intentionally ignores `reportedUsage.enabled`: routes such as `prefix_tool` can opt
     /// out of full reported-usage projection while still keeping public standard fields bounded.
     /// Raw and diagnostic usage snapshots are preserved by their callers.
     pub fn apply_final_standard_cache_guards_for_standard_fields(
@@ -2428,12 +2428,8 @@ mod tests {
             );
         }
         let policy: CacheTtlPolicy =
-            serde_json::from_value(json!({"externalPool": "upstream_then_request_default_5m"}))
-                .unwrap();
-        assert_eq!(
-            policy.external_pool,
-            CacheTtlMode::UpstreamThenRequestDefault5m
-        );
+            serde_json::from_value(json!({"account": "upstream_then_request_default_5m"})).unwrap();
+        assert_eq!(policy.account, CacheTtlMode::UpstreamThenRequestDefault5m);
     }
 
     #[test]

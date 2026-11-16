@@ -18,11 +18,11 @@ use chrono::{DateTime, Utc};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use uuid::Uuid;
 
+use crate::account::AccountManager;
 use crate::common::auth;
 use crate::common::auth::RequestApiKeyStore;
-use crate::external_pool::ExternalPoolManager;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ImageProcessingConfig,
+    AccountsConfig, CachePolicyConfig, CompatProfile, ImageProcessingConfig,
     MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
     PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
     PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
@@ -257,7 +257,7 @@ pub struct AppState {
     pub runtime: Arc<crate::model::runtime::RuntimeConfigStore>,
     /// 客户端请求 API Key 内存索引。
     pub request_api_keys: Arc<RequestApiKeyStore>,
-    /// Kiro Provider（可选，用于实际 API 调用）
+    /// 上游 Provider（可选，用于实际 API 调用）
     /// 是否开启非流式响应的 thinking 块提取
     /// 请求级 usage 记录器
     pub usage_recorder: Arc<UsageRecorder>,
@@ -302,26 +302,26 @@ pub struct AppState {
     /// 模型映射和兜底规则
     pub model_mapping: Arc<ModelMappingConfig>,
     /// 是否在响应头中暴露代理改写动作
-    /// 是否启用发送 Kiro 上游前的最终 payload 防护
+    /// 是否启用发送 上游 上游前的最终 payload 防护
     pub payload_guard_enabled: bool,
     /// payload guard 大小裁剪触发模式
     pub payload_guard_mode: PayloadGuardMode,
     /// 通用 payload 的本地 byte soft target 和按大小处理总开关
     pub payload_guard_max_bytes: usize,
-    /// Kiro 上游请求体字符集加权体积目标
+    /// 上游 上游请求体字符集加权体积目标
     /// payload guard 安全余量字节数
     pub payload_guard_safety_margin_bytes: usize,
     /// payload 超限时是否裁剪旧历史
     pub payload_guard_trim_history: bool,
     /// 外部备用池是否复用同一套 payload guard / shaping 配置
     pub payload_guard_external_enabled: bool,
-    /// 是否把工具 cache_control 转成 Kiro cachePoint
+    /// 是否把工具 cache_control 转成 上游 cachePoint
     /// cachePoint 是否仅按工具 cache_control 插入
     /// 是否记录 cachePoint 插入计划
-    /// Kiro 上游流式响应正文静默超时秒数
+    /// 上游 上游流式响应正文静默超时秒数
     /// 多模态图片/文件预处理配置
     pub image_processing: ImageProcessingConfig,
-    /// 本地 Anthropic -> Kiro 转换能力配置
+    /// 本地 Anthropic -> 上游 转换能力配置
     /// 提示词注入配置
     pub prompt_injection: Arc<PromptInjectionConfig>,
     /// 按路由控制的功能
@@ -332,9 +332,9 @@ pub struct AppState {
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池和直连策略配置。
-    pub external_pools: Arc<ExternalPoolsConfig>,
+    pub accounts: Arc<AccountsConfig>,
     /// 外部备用号池管理器。
-    pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
+    pub account_manager: Option<Arc<AccountManager>>,
 }
 
 impl AppState {
@@ -385,8 +385,8 @@ impl AppState {
             route_features: Arc::new(RouteFeaturesConfig::default()),
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
-            external_pools: Arc::new(ExternalPoolsConfig::default()),
-            external_pool_manager: None,
+            accounts: Arc::new(AccountsConfig::default()),
+            account_manager: None,
         }
     }
 
@@ -553,18 +553,15 @@ impl AppState {
         self
     }
 
-    pub fn with_external_pool_manager(
-        mut self,
-        external_pool_manager: Arc<ExternalPoolManager>,
-    ) -> Self {
-        self.external_pool_manager = Some(external_pool_manager);
+    pub fn with_account_manager(mut self, account_manager: Arc<AccountManager>) -> Self {
+        self.account_manager = Some(account_manager);
         self
     }
 
-    pub fn with_external_pools(mut self, external_pools: ExternalPoolsConfig) -> Self {
-        self.external_pools = Arc::new(external_pools);
+    pub fn with_accounts(mut self, accounts: AccountsConfig) -> Self {
+        self.accounts = Arc::new(accounts);
         self.runtime
-            .install_local(|config| config.external_pools = self.external_pools.as_ref().clone());
+            .install_local(|config| config.accounts = self.accounts.as_ref().clone());
         self
     }
 }
