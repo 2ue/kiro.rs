@@ -25,7 +25,7 @@
 | `GET/PUT /routes` | 路由定义列表的读写（替代分散在 `/config/runtime` 里的五张 pathOverrides 表） |
 | `GET /routes/{prefix}/effective` | 该路由的最终生效配置及每个字段来自哪一层（global / route 默认 / route 显式） |
 | `POST /accounts/{id}/models/promote` | 把账号发现的模型加入目录 |
-| `POST /config/import-package`、`GET /config/export-package` | 配置包导入导出（`feat/config-package` 已有，扩展为新结构） |
+| `GET /config/export`、`POST /config/import` | 新系统自身的配置导出导入（账号、运行配置、路由、密钥、路由场景、模型目录；按自然键全量覆盖，机器本地字段不导出）。与 `import-legacy` 子命令不同：这是新→新迁移，用于多机同步 |
 | `GET /accounts/{id}/effective` | 账号最终生效的调度与传输参数及来源层 |
 
 ### 1.4 `/config/runtime` 的契约变化
