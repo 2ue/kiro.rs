@@ -6,7 +6,7 @@ s2 任务在删除 Kiro 时，把 `src/external_pool/tests.rs` 与 `src/anthropi
 
 ## 目标
 
-把下面两个清单里的测试从 `git show dac1e409:<file>`（阶段 1 提交，Kiro 仍在、测试完整）恢复到当前文件，按新代码做最小适配后全部通过。**不放宽断言**；只允许因字段/类型删除做机械适配。
+把下面两个清单里的测试从 `git show dac1e409:<file>`（阶段 1 提交，Kiro 仍在、测试完整；当前 HEAD 是 15ede804 阶段 2 提交）恢复到当前文件，按新代码做最小适配后全部通过。**不放宽断言**；只允许因字段/类型删除做机械适配。
 
 - `scripts/refactor/tasks/s2b-restore-tests.external.txt`：`src/external_pool/tests.rs` 中要恢复的函数名（含辅助函数）。
 - `scripts/refactor/tasks/s2b-restore-tests.handlers.txt`：`src/anthropic/handlers/tests.rs` 中要恢复的函数名（含辅助函数）。
@@ -24,8 +24,8 @@ s2 任务在删除 Kiro 时，把 `src/external_pool/tests.rs` 与 `src/anthropi
 ## 另外修复
 
 - `src/anthropic/handlers/tests.rs::parse_messages_payload_rejects_empty_model_before_routing`：s2 把它改成了 `to_response(&envelope::request_id())` 但断言 `request_id` 以 `req_01` 开头失败，说明 `error_response_with_id` 用的是传入的 id 还是别的。查 `envelope.rs`，让测试按原意通过（原来通过 `parse_messages_payload(&body)` 这个测试辅助函数，该辅助函数若被删就恢复它）。
-- `src/anthropic/transcript_sanitizer.rs` 里 10 个失败测试：codex 把 `deterministic_mapped_tool_name` / `legacy_overlong_mapped_tool_name` 从已删的 converter 搬进来了，函数体与原版一致，但测试仍失败。对比 `git show dac1e409:src/anthropic/transcript_sanitizer.rs` 找出差异（可能是 `sanitize` 测试辅助、known tool 集合或 `collect_known_tool_names_from_request` 的调用方被改）。修到全部通过，不改断言。
-- 下面这些是 Kiro 专有测试，**确认删除**即可，不恢复：`usage_rollup_dimensions_include_local_route_subtype_only_for_local_routes`、`standard_models_list_only_hyphenated_claude_ids`（断言 deepseek 在列表里）、`external_pool_capacity_wait_is_always_bounded` 与 `finite_external_queue_lease_covers_wait_without_periodic_renewal` 中把默认等待断言为 5 的部分（新默认 60，按设计 04 章第 9 节改断言为 60，这是设计决定不是放宽）、`required_postgres_schema_columns_cover_known_upgrade_breakers` 与 `usage_legacy_cost_backfill_is_explicit_maintenance_sql`（若它们引用的常量已随迁移删除则删测试；若常量还在则修测试）。
+- `src/anthropic/transcript_sanitizer.rs`：上一轮已修复，32 个测试全部通过，无需再动。
+- 上一轮结束时全量 1055 个测试已全部通过，上述“另外修复”中除恢复 `parse_messages_payload` 辅助函数外的问题都已不存在；重点只在恢复清单里的测试。
 
 ## 允许改动的文件
 
