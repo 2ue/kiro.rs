@@ -30,3 +30,6 @@ catch-test/
 # local secrets for project skills (cctest etc.)
 /.env
 /.env.local
+
+# refactor 监工运行日志
+/scripts/refactor/runs/
