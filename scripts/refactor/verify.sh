@@ -124,6 +124,23 @@ case "$TASK_ID" in
     run pnpm --dir ui check
     run pnpm --dir ui build
     ;;
+  s6-migration-tool)
+    step "编译"
+    run cargo build -q --bins
+    step "旧名只允许出现在 migration 模块"
+    hits=$(grep -rn "external_upstream_pools\|kiroRsTool\|externalPool" src --include=*.rs 2>/dev/null | grep -v "src/migration/" | grep -v "tests" || true)
+    [ -z "$hits" ] || { echo "!! 旧名泄漏到 migration 之外:"; echo "$hits" | head -20; fail=1; }
+    [ -f src/migration/mod.rs ] || { echo "!! 缺 src/migration/mod.rs"; fail=1; }
+    [ -f tests/migration/fixtures/legacy-sample.json ] || { echo "!! 缺 fixture"; fail=1; }
+    step "dry-run 报告可生成"
+    run cargo run -q --bin claude-pool -- import-legacy tests/migration/fixtures/legacy-sample.json
+    step "migration 单测"
+    run cargo test --bin claude-pool -q -- migration
+    step "golden"
+    run cargo test --bin claude-pool -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin claude-pool -q
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac
