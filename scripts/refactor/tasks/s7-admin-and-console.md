@@ -2,7 +2,9 @@
 
 ## 目标
 
-落实设计 `docs/claude-pool-refactor/08-管理API与控制台.md`。后端补齐路由、账号覆盖、模型 listed、配置导出导入的管理端点；前端删除无后端支持的页面，新增路由页，账号页改造，API/hooks/types 按领域拆分。前置：阶段 3/4/5 已完成（名字已是 `accounts`、`routes[]`、`AccountOverrides`、`listed`）。
+落实设计 `docs/claude-pool-refactor/08-管理API与控制台.md`。后端补齐路由、账号覆盖、模型 listed、配置导出导入的管理端点；前端删除无后端支持的页面，新增路由页，账号页改造，API/hooks/types 按领域拆分。前置：阶段 3/4/5/6 已完成（名字已是 `accounts`、`routes[]`、`AccountOverrides`、`listed`；`src/migration/` 已有 `import-legacy` 子命令，本任务的 `/config/export` 与 `/config/import` 是新系统自身的配置包，与 legacy 导入不同，可复用其 `report.rs` 的报告格式与 `postgres.rs` 的单事务覆盖函数）。
+
+注意：阶段 5 已删除 `ui/src/features/{credentials,inventory,proxies,public-pool}/`，页面目录现为 `account-risk accounts audit auth cache-policies models overview prompt-injection route-scenarios runtime security shared usage`；`ui/src/api/credentials.ts` 等文件名可能已改，以实际为准。
 
 ## 先读
 
