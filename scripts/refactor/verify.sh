@@ -69,6 +69,25 @@ case "$TASK_ID" in
     step "全量单测"
     run cargo test --bin kiro-rs -q
     ;;
+  s3-passthrough-features)
+    step "编译"
+    run cargo build -q --bins
+    step "normalized 模式与三字段已删"
+    hits=$(grep -rn "request_body_mode\|raw_model_mode\|preserve_path\|ExternalPoolRequestBodyMode\|ExternalPoolRawModelMode\|normalized_request_value\|body_mode_filter" src || true)
+    [ -z "$hits" ] || { echo "!! 仍有残留:"; echo "$hits" | head -30; fail=1; }
+    step "body_patch 模块存在"
+    [ -f src/anthropic/body_patch.rs ] || { echo "!! 缺 src/anthropic/body_patch.rs"; fail=1; }
+    step "serde_json preserve_order"
+    grep -q 'preserve_order' Cargo.toml || { echo "!! Cargo.toml 未启用 preserve_order"; fail=1; }
+    step "golden"
+    run cargo test --bin kiro-rs -q -- golden_usage
+    step "usage 投影"
+    run cargo test --bin kiro-rs -q -- external_pool::tests::usage_projection
+    step "passthrough 测试"
+    run cargo test --bin kiro-rs -q -- passthrough
+    step "全量单测"
+    run cargo test --bin kiro-rs -q
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac
