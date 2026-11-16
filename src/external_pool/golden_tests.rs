@@ -108,15 +108,12 @@ fn run_case(case: &GoldenCase) -> Value {
         PromptCacheSimulationMode::Disabled
     };
     route.reported_usage.default.enabled = true;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            enabled: true,
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        enabled: true,
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+        ..ReportedUsagePathPolicy::default()
+    };
     route.reset_preparation_cache();
 
     let mut pool = test_pool("http://pool.example.com", false);

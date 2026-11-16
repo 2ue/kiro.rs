@@ -1288,3 +1288,13 @@ mod tests {
         assert_eq!(query.endpoint.as_deref(), Some("/ha"));
     }
 }
+
+pub async fn promote_external_pool_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> axum::response::Response {
+    match state.service.promote_external_pool_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}

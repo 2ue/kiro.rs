@@ -213,6 +213,7 @@ pub async fn seed_usage_demo(
             };
             let duration_ms = 450 + rng.u64(0..4_500);
             let record = UsageRecord {
+                account_cost_usd: 0.0,
                 id,
                 created_at: created_at.to_rfc3339(),
                 endpoint: choose_endpoint(&mut rng).to_string(),

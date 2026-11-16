@@ -1,8 +1,7 @@
 //! 提示词注入配置：代理写进上游请求的每一段提示词各有一个开关，和路由的关联只在路由上显式设置。
 //!
 //! - `defaults`：没有单独设置的路由使用的值；
-//! - `pathOverrides`：按路由前缀设置。逐项取最长的、设置了这一项的匹配前缀，都没有设置时用
-//!   `defaults`；
+//! - `routes[].promptInjection`：命中路由覆盖各项开关，未设置的项继承 `defaults`；
 //! - `texts`：可编辑文本，缺省时使用 [`catalog`] 里的内置文本。
 //!
 //! 和提示词无关、但以前和提示词开关绑在一起的功能放在 [`RouteFeaturesConfig`]。
@@ -17,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use crate::model::config::{
     CompatProfile, ImageProcessingConfig, LocalRequestCompatConfig, MissingMaxTokensConfig,
     PayloadGuardMode, PayloadShapingConfig, PayloadTooLongHandling, ThinkingTriggerMode,
-    normalize_reported_usage_path_prefix, reported_usage_path_matches,
 };
 
 /// 单项文本上限（字符）。
@@ -133,9 +131,6 @@ pub struct PromptInjectionConfig {
     /// 改过的文本；没有出现的槽位使用内置文本。
     #[serde(default)]
     pub texts: BTreeMap<TextKey, String>,
-    /// 缺省时为空；新装配置里 `/cc` 的任务质量设置来自 [`PromptInjectionConfig::default`]。
-    #[serde(default)]
-    pub path_overrides: BTreeMap<String, BTreeMap<InjectionId, ItemOverride>>,
 }
 
 fn default_item_settings() -> BTreeMap<InjectionId, ItemSetting> {
@@ -152,18 +147,12 @@ fn default_item_settings() -> BTreeMap<InjectionId, ItemSetting> {
         .collect()
 }
 
-/// 内置路由默认不注入提示词。
-fn default_injection_path_overrides() -> BTreeMap<String, BTreeMap<InjectionId, ItemOverride>> {
-    BTreeMap::new()
-}
-
 impl Default for PromptInjectionConfig {
     fn default() -> Self {
         Self {
             apply_to_count_tokens: true,
             defaults: default_item_settings(),
             texts: BTreeMap::new(),
-            path_overrides: default_injection_path_overrides(),
         }
     }
 }
@@ -177,17 +166,6 @@ impl PromptInjectionConfig {
                 enabled: id.default_enabled(),
             });
         }
-        self.path_overrides = std::mem::take(&mut self.path_overrides)
-            .into_iter()
-            .filter_map(|(prefix, items)| {
-                let prefix = normalize_reported_usage_path_prefix(&prefix)?;
-                let items: BTreeMap<_, _> = items
-                    .into_iter()
-                    .filter(|(_, item)| !item.is_empty())
-                    .collect();
-                (!items.is_empty()).then_some((prefix, items))
-            })
-            .collect();
         self.texts = std::mem::take(&mut self.texts)
             .into_iter()
             .filter_map(|(key, text)| {
@@ -249,31 +227,14 @@ impl PromptInjectionConfig {
     }
 
     /// 这一项在 `endpoint` 上的开关和外部池开关，以及决定开关的来源。
-    pub fn item_setting_for_route(&self, endpoint: &str, id: InjectionId) -> RouteItemSetting {
-        let mut enabled = None;
-        let mut enabled_len = 0;
-        for (prefix, items) in &self.path_overrides {
-            let Some(item) = items.get(&id) else {
-                continue;
-            };
-            if !reported_usage_path_matches(prefix, endpoint) {
-                continue;
-            }
-            if let Some(value) = item.enabled
-                && (enabled.is_none() || prefix.len() > enabled_len)
-            {
-                enabled = Some((value, prefix.clone()));
-                enabled_len = prefix.len();
-            }
-        }
+    pub fn item_setting_for_route(&self, _endpoint: &str, id: InjectionId) -> RouteItemSetting {
         let default = self.defaults.get(&id).copied().unwrap_or(ItemSetting {
             enabled: id.default_enabled(),
         });
-        let (enabled, source) = match enabled {
-            Some((value, prefix)) => (value, Some(prefix)),
-            None => (default.enabled, None),
-        };
-        RouteItemSetting { enabled, source }
+        RouteItemSetting {
+            enabled: default.enabled,
+            source: None,
+        }
     }
 }
 
@@ -337,10 +298,22 @@ impl ResolvedInjections {
         profile: CompatProfile,
         config: &PromptInjectionConfig,
     ) -> Self {
+        Self::resolve_route(profile, config, endpoint, &BTreeMap::new())
+    }
+    pub fn resolve_route(
+        profile: CompatProfile,
+        config: &PromptInjectionConfig,
+        prefix: &str,
+        overrides: &BTreeMap<InjectionId, ItemOverride>,
+    ) -> Self {
         let items = InjectionId::ALL
             .iter()
             .map(|id| {
-                let setting = config.item_setting_for_route(endpoint, *id);
+                let mut setting = config.item_setting_for_route(prefix, *id);
+                if let Some(enabled) = overrides.get(id).and_then(|item| item.enabled) {
+                    setting.enabled = enabled;
+                    setting.source = Some(prefix.to_string());
+                }
                 let blocked = if !setting.enabled {
                     Some(BlockReason::Off)
                 } else if profile.is_strict() && id.blocked_by_strict() {
@@ -401,7 +374,6 @@ impl ResolvedInjections {
         profile: CompatProfile,
     ) -> Self {
         let mut config = PromptInjectionConfig::default();
-        config.path_overrides.clear();
         for (id, enabled) in changes {
             config
                 .defaults
@@ -533,8 +505,6 @@ impl RouteFeatureSet {
 pub struct RouteFeaturesConfig {
     #[serde(default)]
     pub defaults: RouteFeatureSet,
-    #[serde(default)]
-    pub path_overrides: BTreeMap<String, RouteFeatureOverride>,
 }
 
 impl RouteFeatureOverride {
@@ -543,79 +513,56 @@ impl RouteFeatureOverride {
     }
 }
 
+impl RouteFeatureOverride {
+    pub fn apply(&self, mut resolved: RouteFeatureSet) -> RouteFeatureSet {
+        let route = self;
+        if let Some(value) = route.missing_max_tokens {
+            resolved.missing_max_tokens = value;
+        }
+        if let Some(value) = route.reasoning_compat {
+            resolved.reasoning_compat = value;
+        }
+        if let Some(value) = route.history_sanitize {
+            resolved.history_sanitize = value;
+        }
+        if let Some(value) = route.thinking_model_name {
+            resolved.thinking_model_name = value;
+        }
+        if let Some(value) = route.thinking_trigger {
+            resolved.thinking_trigger = value;
+        }
+        if let Some(value) = route.payload_guard {
+            resolved.payload_guard = value;
+        }
+        if let Some(value) = route.payload_shaping {
+            resolved.payload_shaping = value;
+        }
+        if let Some(value) = route.image_processing {
+            resolved.image_processing = value;
+        }
+        resolved
+    }
+}
 impl RouteFeaturesConfig {
     pub fn validate(&self) -> Result<(), String> {
-        for feature in
-            std::iter::once(self.defaults).chain(self.path_overrides.values().map(|override_| {
-                let mut feature = RouteFeatureSet::default();
-                feature.missing_max_tokens = override_.missing_max_tokens.flatten();
-                feature.payload_guard = override_.payload_guard.flatten();
-                feature
-            }))
-        {
-            if let Some(config) = feature.missing_max_tokens {
-                config.validate()?;
-            }
-            if let Some(config) = feature.payload_guard {
-                if config.enabled
-                    && config.max_bytes > 0
-                    && config.max_bytes.saturating_sub(config.safety_margin_bytes) < 64 * 1024
-                {
-                    return Err("payloadGuard 实际裁剪目标不能小于 65536".to_string());
-                }
+        if let Some(config) = self.defaults.missing_max_tokens {
+            config.validate()?;
+        }
+        if let Some(config) = self.defaults.payload_guard {
+            if config.enabled
+                && config.max_bytes > 0
+                && config.max_bytes.saturating_sub(config.safety_margin_bytes) < 64 * 1024
+            {
+                return Err("payloadGuard 实际裁剪目标不能小于 65536".to_string());
             }
         }
         Ok(())
     }
-
-    pub fn normalized(mut self) -> Self {
-        self.path_overrides = std::mem::take(&mut self.path_overrides)
-            .into_iter()
-            .filter(|(_, route)| !route.is_empty())
-            .filter_map(|(prefix, route)| {
-                normalize_reported_usage_path_prefix(&prefix).map(|prefix| (prefix, route))
-            })
-            .collect();
+    pub fn normalized(self) -> Self {
         self
     }
-
-    /// 逐项取设置了这一项的最长匹配前缀，没有设置时用全局默认。
-    pub fn resolve(&self, endpoint: &str) -> RouteFeatureSet {
-        let mut matching: Vec<(&String, &RouteFeatureOverride)> = self
-            .path_overrides
-            .iter()
-            .filter(|(prefix, _)| reported_usage_path_matches(prefix, endpoint))
-            .collect();
-        // 短前缀先应用，长前缀覆盖。
-        matching.sort_by_key(|(prefix, _)| prefix.len());
-        let mut resolved = self.defaults;
-        for (_, route) in matching {
-            if let Some(value) = route.missing_max_tokens {
-                resolved.missing_max_tokens = value;
-            }
-            if let Some(value) = route.reasoning_compat {
-                resolved.reasoning_compat = value;
-            }
-            if let Some(value) = route.history_sanitize {
-                resolved.history_sanitize = value;
-            }
-            if let Some(value) = route.thinking_model_name {
-                resolved.thinking_model_name = value;
-            }
-            if let Some(value) = route.thinking_trigger {
-                resolved.thinking_trigger = value;
-            }
-            if let Some(value) = route.payload_guard {
-                resolved.payload_guard = value;
-            }
-            if let Some(value) = route.payload_shaping {
-                resolved.payload_shaping = value;
-            }
-            if let Some(value) = route.image_processing {
-                resolved.image_processing = value;
-            }
-        }
-        resolved
+    pub fn resolve(&self, _endpoint: &str) -> RouteFeatureSet {
+        self.defaults
     }
 }
 
@@ -702,28 +649,37 @@ mod passthrough_route_tests {
         ] {
             assert!(defaults.resolve(path).is_empty());
         }
-        let config: RouteFeaturesConfig = serde_json::from_value(serde_json::json!({
-            "defaults":{"reasoningCompat":{},"imageProcessing":{},"missingMaxTokens":{}},
-            "pathOverrides":{
-                "/cc":{"reasoningCompat":null,"historySanitize":true},
-                "/cc/nested":{"historySanitize":false,"imageProcessing":null}
+        let config = crate::model::config::Config::from_json_value(serde_json::json!({
+            "routeFeatures": {
+                "defaults":{"reasoningCompat":{},"imageProcessing":{},"missingMaxTokens":{}},
+                "pathOverrides":{
+                    "/cc":{"reasoningCompat":null,"historySanitize":true},
+                    "/cc/nested":{"historySanitize":false,"imageProcessing":null}
+                }
             }
         }))
         .unwrap();
-        let config: RouteFeaturesConfig =
-            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
-        let broad = config.resolve("/cc/v1/messages");
+        let config =
+            crate::model::config::Config::from_json_value(serde_json::to_value(config).unwrap())
+                .unwrap();
+        let compiled = config.routes.compile_with_config(&config);
+        let broad = compiled.match_endpoint("/cc/v1/messages").unwrap().features;
         assert!(broad.reasoning_compat.is_none());
         assert!(broad.image_processing.is_some());
         assert!(broad.history_sanitize);
-        let nested = config.resolve("/cc/nested/v1/messages");
+        let nested = compiled
+            .match_endpoint("/cc/nested/v1/messages")
+            .unwrap()
+            .features;
         assert!(nested.reasoning_compat.is_none());
         assert!(nested.image_processing.is_none());
         assert!(!nested.history_sanitize);
         assert!(nested.missing_max_tokens.is_some());
         assert!(
-            config
-                .resolve("/ccc/v1/messages")
+            compiled
+                .match_endpoint("/ccc/v1/messages")
+                .unwrap()
+                .features
                 .reasoning_compat
                 .is_some()
         );

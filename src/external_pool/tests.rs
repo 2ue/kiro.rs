@@ -1095,6 +1095,10 @@ fn external_perf_open_fd_count() -> Option<usize> {
 
 fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExternalPoolRequest {
     CreateExternalPoolRequest {
+        tags: Vec::new(),
+        proxy_url: None,
+        cost_multiplier: 1.0,
+        overrides: Default::default(),
         name: name.to_string(),
         base_url: format!("https://{}.example.test", name),
         api_key: format!("sk-{}", name),
@@ -1337,6 +1341,10 @@ fn assert_public_message_hides_internal_routing(message: &str) {
 pub(crate) fn test_pool(base_url: &str, _legacy_path: bool) -> ExternalPool {
     let now = Utc::now();
     ExternalPool {
+        tags: Vec::new(),
+        proxy_url: None,
+        cost_multiplier: 1.0,
+        overrides: Default::default(),
         id: 1,
         revision: 1,
         name: "test".to_string(),
@@ -1432,7 +1440,15 @@ pub(crate) fn test_route(model: &str) -> ExternalRouteRequest {
         model_resolution_note: None,
         route_subtype: UsageRouteSubtype::External,
 
-        reported_usage: ReportedUsageConfig::default(),
+        reported_usage: {
+            let config = Config::default();
+            ReportedUsageConfig {
+                default: config
+                    .cache_policy_for_path("/cc/v1/messages")
+                    .policy
+                    .reported_usage,
+            }
+        },
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
@@ -1581,18 +1597,12 @@ fn configure_usage_projection_test_path(
     policy: ReportedUsagePathPolicy,
 ) {
     route.endpoint = "/usage-policy/v1/messages".to_string();
-    route
-        .reported_usage
-        .path_overrides
-        .insert("/usage-policy".to_string(), policy);
+    route.reported_usage.default = policy;
     route.reset_preparation_cache();
 }
 
 fn disable_path_output_postprocess(route: &mut ExternalRouteRequest) {
     route.reported_usage.default.final_output_guard_enabled = false;
-    for policy in route.reported_usage.path_overrides.values_mut() {
-        policy.final_output_guard_enabled = false;
-    }
 }
 
 fn event_usage_i64(event: &str, key: &str) -> i64 {
@@ -2581,7 +2591,11 @@ async fn early_commit_mode_round_trips_through_postgres() {
     let (route, _recorder) =
         external_stream_route("req_early_commit_mixed_mode", "err_early_commit_mixed_mode");
     let pools = postgres.list_external_pools(false).await.unwrap();
-    assert!(!route_prefers_early_commit(&pools, &route));
+    assert!(!route_prefers_early_commit(
+        &pools,
+        &route,
+        &ExternalPoolsConfig::default()
+    ));
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -3830,6 +3844,7 @@ fn external_pool_billing_uses_output_uplift_as_final_reported_cost() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
@@ -9409,6 +9424,7 @@ async fn external_pool_route_mode_is_applied_per_pool_for_selection_and_eligibil
 
     let mut v1_route = test_route(&model);
     v1_route.endpoint = "/v1/messages".to_string();
+    v1_route.reported_usage = ReportedUsageConfig::default();
     let v1_selection = manager
         .select_pool_for_route(&HashSet::new(), &config, &v1_route)
         .await;
@@ -12222,7 +12238,6 @@ fn kiro_rs_tool_plus_usage_projection_shapes_external_pool_usage() {
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
     route.reported_usage = ReportedUsageConfig {
         default: ReportedUsagePathPolicy::disabled(),
-        path_overrides: Default::default(),
     };
     let mut plus = crate::model::config::KiroRsToolPlusCachePolicy::default();
     plus.shaping.cache_read.multiplier = 50.0;
@@ -12286,14 +12301,11 @@ fn kiro_rs_tool_usage_projection_applies_path_cache_creation_policy() {
     route.endpoint = "/cc/v1/messages".to_string();
     route.prompt_cache_strategy_type = PromptCacheStrategyType::KiroRsTool;
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            cache_creation: ReportedUsageFieldPolicy::sample_max(4_000),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        cache_creation: ReportedUsageFieldPolicy::sample_max(4_000),
+        ..ReportedUsagePathPolicy::default()
+    };
     payload_mut(&mut route).metadata = Some(Metadata {
         user_id: Some(
             "user_test_account__session_57f3e60f-2cc6-4e8f-ae7e-e43753320a09".to_string(),
@@ -12343,7 +12355,6 @@ fn kiro_rs_tool_usage_projection_commits_external_pool_cache_only_after_success(
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
     route.reported_usage = ReportedUsageConfig {
         default: ReportedUsagePathPolicy::disabled(),
-        path_overrides: Default::default(),
     };
     payload_mut(&mut route).metadata = Some(Metadata {
         user_id: Some(
@@ -14801,6 +14812,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":120
     let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
@@ -15130,13 +15142,10 @@ data: {"type":"message_delta","usage":{"input_tokens":4165,"output_tokens":2,"ca
     payload_mut(&mut route).stream = true;
     route.request_input_tokens = 4165;
     route.prompt_cache_target_read_ratio = 0.5;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection = projection_context(&route, &pool, 0).expect("projection");
@@ -15756,6 +15765,7 @@ fn usage_projection_applies_external_pool_uplift_after_path_policy() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -15804,13 +15814,10 @@ fn usage_projection_applies_external_pool_uplift_after_path_policy() {
 #[test]
 fn usage_projection_carries_cache_read_evidence_across_split_sse_events() {
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/v1".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection = projection_context(&route, &pool, 0).expect("projection");
@@ -16135,14 +16142,11 @@ fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
 #[test]
 fn usage_projection_disabled_reported_usage_blocks_non_stream_projection() {
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            enabled: false,
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        enabled: false,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16154,14 +16158,11 @@ fn usage_projection_disabled_reported_usage_blocks_non_stream_projection() {
 fn usage_projection_disabled_reported_usage_blocks_stream_projection() {
     let mut route = test_route("claude-sonnet-4-5");
     payload_mut(&mut route).stream = true;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            enabled: false,
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        enabled: false,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16209,13 +16210,10 @@ fn usage_projection_does_not_force_cache_for_small_current_path_request() {
 #[test]
 fn usage_projection_does_not_leak_uncommitted_read_evidence_to_next_request() {
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/v1".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let first_projection = projection_context(&route, &pool, 0).expect("first projection");
@@ -16261,16 +16259,13 @@ fn usage_projection_final_cache_creation_guard_runs_after_external_pool_uplift()
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.request_input_tokens = 200_000;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            final_cache_creation_max_tokens: 100,
-            final_cache_creation_jitter_min_tokens: 0,
-            final_cache_creation_jitter_max_tokens: 0,
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        final_cache_creation_max_tokens: 100,
+        final_cache_creation_jitter_min_tokens: 0,
+        final_cache_creation_jitter_max_tokens: 0,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16305,14 +16300,11 @@ fn usage_projection_final_cache_read_guard_runs_after_external_pool_uplift() {
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            final_cache_read_max_tokens: 100,
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        final_cache_read_max_tokens: 100,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16378,13 +16370,10 @@ fn usage_projection_final_input_guard_samples_input_without_cache_read_after_upl
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/v1".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16411,16 +16400,13 @@ fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
         );
     let mut route = test_route("claude-opus-4-6");
     route.request_input_tokens = 4165;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            final_output_max_tokens: 80,
-            final_output_jitter_min_tokens: 10,
-            final_output_jitter_max_tokens: 10,
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        final_output_max_tokens: 80,
+        final_output_jitter_min_tokens: 10,
+        final_output_jitter_max_tokens: 10,
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16506,6 +16492,7 @@ fn usage_projection_ignores_external_raw_cache_when_local_policy_reads() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16558,14 +16545,11 @@ fn usage_projection_no_cache_route_removes_external_cache_usage() {
     let mut route = test_route("claude-sonnet-4-5");
     route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(64),
-            output: ReportedUsageFieldPolicy::sample_max(5),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(64),
+        output: ReportedUsageFieldPolicy::sample_max(5),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16641,6 +16625,7 @@ fn usage_projection_output_uplift_changes_only_final_reported_usage() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
@@ -16680,6 +16665,7 @@ fn usage_projection_output_uplift_only_applies_above_threshold() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16711,14 +16697,11 @@ fn usage_projection_pass_through_keeps_body_unchanged() {
 #[test]
 fn usage_projection_path_skip_non_stream_blocks_external_projection() {
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            skip_non_stream_usage_projection: true,
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        skip_non_stream_usage_projection: true,
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16732,14 +16715,11 @@ fn usage_projection_path_skip_non_stream_keeps_external_usage_raw() {
             br#"{"type":"message","usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
         );
     let mut route = test_route("claude-opus-4-6");
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            skip_non_stream_usage_projection: true,
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        skip_non_stream_usage_projection: true,
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -16774,14 +16754,11 @@ fn usage_projection_path_skip_non_stream_keeps_external_usage_raw() {
 fn usage_projection_path_skip_non_stream_keeps_stream_projection_enabled() {
     let mut route = test_route("claude-sonnet-4-5");
     payload_mut(&mut route).stream = true;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            skip_non_stream_usage_projection: true,
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        skip_non_stream_usage_projection: true,
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -17068,13 +17045,10 @@ fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
     let mut route = test_route("claude-opus-4-6");
     route.request_input_tokens = 4165;
     route.prompt_cache_target_read_ratio = 0.5;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(1),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(1),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -17110,13 +17084,10 @@ fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
 #[test]
 fn usage_projection_stream_capture_uses_latest_projected_reported_usage() {
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/v1".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection = projection_context(&route, &pool, 0).expect("projection");
@@ -17173,7 +17144,7 @@ fn usage_projection_strict_cache_eligibility_is_switchable_per_stream_kind() {
             .reported_usage
             .default
             .strict_cache_eligibility_non_stream = non_stream;
-        for policy in route.reported_usage.path_overrides.values_mut() {
+        for policy in std::iter::once(&mut route.reported_usage.default) {
             policy.strict_cache_eligibility_stream = stream;
             policy.strict_cache_eligibility_non_stream = non_stream;
         }
@@ -17268,13 +17239,10 @@ fn usage_projection_strict_cache_eligibility_is_switchable_per_stream_kind() {
 #[test]
 fn usage_projection_treats_upstream_cache_read_as_evidence_not_value() {
     let mut route = test_route("claude-sonnet-4-5");
-    route.reported_usage.path_overrides.insert(
-        "/v1".to_string(),
-        ReportedUsagePathPolicy {
-            input: ReportedUsageFieldPolicy::sample_input_max(96),
-            ..ReportedUsagePathPolicy::default()
-        },
-    );
+    route.reported_usage.default = ReportedUsagePathPolicy {
+        input: ReportedUsageFieldPolicy::sample_input_max(96),
+        ..ReportedUsagePathPolicy::default()
+    };
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection = projection_context(&route, &pool, 0).expect("projection");
@@ -17337,6 +17305,7 @@ fn usage_projection_updates_external_pool_cache_after_success() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -17393,6 +17362,7 @@ fn usage_projection_uses_resolved_model_without_mutating_payload_model() {
         );
     let mut route = test_route("sonnet");
     route.endpoint = "/v1/messages".to_string();
+    route.reported_usage = ReportedUsageConfig::default();
     route.upstream_model = Some("claude-sonnet-4-5".to_string());
     route.model_resolution_source = Some("alias".to_string());
     let mut pool = test_pool("http://pool.example.com", false);
@@ -20708,4 +20678,132 @@ fn passthrough_response_history_sanitizer_is_route_optional() {
     }
     cleaned.extend(state.finish());
     assert!(!String::from_utf8_lossy(&cleaned).contains("secret tail"));
+}
+
+#[test]
+fn route_models_are_the_intersection_of_listing_route_and_account_rules() {
+    use crate::model::routes::{RouteRule, RoutesConfig};
+    let catalog = ModelCapabilitiesCatalog::new();
+    let mut status = ModelCapabilitiesCatalog::seed_status();
+    status
+        .models
+        .push(crate::anthropic::model_capabilities::ModelCapabilityItem {
+            model: "custom-hidden-model".into(),
+            display_name: "Hidden".into(),
+            listed: false,
+            description: None,
+            max_input_tokens: Some(200_000),
+            max_output_tokens: Some(64_000),
+            supports_prompt_caching: Some(true),
+            supported_input_types: vec!["TEXT".into()],
+            source: Some("manual".into()),
+        });
+    catalog.load_persisted_status(status);
+    let mut pool = test_pool("http://example.invalid", true);
+    pool.supported_models = vec![
+        "claude-sonnet-4-5".into(),
+        "claude-opus-4-6".into(),
+        "custom-hidden-model".into(),
+    ];
+    let pools = vec![external_pool_eligibility_from_pool(&pool)];
+    let mut routes = RoutesConfig::default();
+    routes.route_mut("/cc").model_rule = RouteRule {
+        mode: ExternalPoolRouteMode::AllowList,
+        rules: vec!["claude-sonnet-*".into()],
+    };
+    routes.route_mut("/ha").model_rule = RouteRule {
+        mode: ExternalPoolRouteMode::AllowList,
+        rules: vec!["claude-opus-*".into()],
+    };
+    for (prefix, expected) in [
+        (
+            "/cc",
+            vec!["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"],
+        ),
+        ("/ha", vec!["claude-opus-4-6"]),
+    ] {
+        let route = routes.route_mut(prefix);
+        let models = filter_models_for_route(
+            route,
+            &format!("{prefix}/v1/models"),
+            catalog.standard_anthropic_models(),
+            &pools,
+        );
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        route.account_rule = RouteRule {
+            mode: ExternalPoolRouteMode::DenyList,
+            rules: vec![pool.id.to_string()],
+        };
+        assert!(
+            filter_models_for_route(
+                route,
+                &format!("{prefix}/v1/models"),
+                catalog.standard_anthropic_models(),
+                &pools
+            )
+            .is_empty()
+        );
+    }
+    pool.supported_models.clear();
+    pool.route_mode = ExternalPoolRouteMode::AllowList;
+    pool.route_rules = vec!["/cc".into()];
+    let pools = vec![external_pool_eligibility_from_pool(&pool)];
+    let mut route = crate::model::routes::RouteConfig::new("/ha");
+    assert!(
+        filter_models_for_route(
+            &route,
+            "/ha/v1/models",
+            catalog.standard_anthropic_models(),
+            &pools
+        )
+        .is_empty()
+    );
+    route.prefix = "/cc".into();
+    assert!(
+        !filter_models_for_route(
+            &route,
+            "/cc/v1/models",
+            catalog.standard_anthropic_models(),
+            &pools
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn account_proxy_cost_and_override_validation() {
+    for url in [
+        "http://user:pass@127.0.0.1:8080",
+        "https://proxy.example.invalid",
+        "socks5://127.0.0.1:1080",
+        "socks5h://user:pass@proxy.example.invalid:1080",
+    ] {
+        validate_account_fields(Some(url), 1.0, &AccountOverrides::default()).unwrap();
+    }
+    for url in [
+        "file:///tmp/proxy",
+        "ftp://proxy.example.invalid",
+        "invalid",
+    ] {
+        assert!(validate_account_fields(Some(url), 1.0, &AccountOverrides::default()).is_err());
+    }
+    for multiplier in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+        assert!(validate_account_fields(None, multiplier, &AccountOverrides::default()).is_err());
+    }
+    let overrides = AccountOverrides {
+        request_timeout_secs: Some(86_401),
+        ..Default::default()
+    };
+    assert!(validate_account_fields(None, 1.0, &overrides).is_err());
+    let inherited: UpdateExternalPoolRequest = serde_json::from_value(json!({})).unwrap();
+    let cleared: UpdateExternalPoolRequest =
+        serde_json::from_value(json!({"proxyUrl":null})).unwrap();
+    assert!(inherited.proxy_url.is_none());
+    assert_eq!(cleared.proxy_url, Some(None));
 }

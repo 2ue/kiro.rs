@@ -232,7 +232,6 @@ mod tests {
         ];
         for off in all {
             let mut config = PromptInjectionConfig::default();
-            config.path_overrides.clear();
             config
                 .texts
                 .insert(TextKey::Custom, "custom text".to_string());
@@ -256,37 +255,36 @@ mod tests {
 
     #[test]
     fn route_override_wins_over_default_and_longest_prefix_wins() {
-        let mut config = PromptInjectionConfig::default();
-        config.path_overrides.clear();
-        set(&mut config, InjectionId::TaskQuality, true);
-        config.path_overrides.insert(
-            "/dfcache".to_string(),
-            [(
-                InjectionId::TaskQuality,
-                ItemOverride {
-                    enabled: Some(false),
-                },
-            )]
-            .into(),
+        let mut config = crate::model::config::Config::default();
+        set(&mut config.prompt_injection, InjectionId::TaskQuality, true);
+        config.routes.route_mut("/dfcache").prompt_injection.insert(
+            InjectionId::TaskQuality,
+            ItemOverride {
+                enabled: Some(false),
+            },
         );
-        config.path_overrides.insert(
-            "/dfcache/a".to_string(),
-            [(
+        config
+            .routes
+            .route_mut("/dfcache/a")
+            .prompt_injection
+            .insert(
                 InjectionId::TaskQuality,
                 ItemOverride {
                     enabled: Some(true),
                 },
-            )]
-            .into(),
-        );
-        let config = config.normalized();
+            );
+        let compiled = config.routes.compile_with_config(&config);
         for (endpoint, expected) in [
             ("/v1/messages", true),
             ("/dfcache/b/v1/messages", false),
             ("/dfcache/a/v1/messages", true),
         ] {
             assert_eq!(
-                resolve(&config, endpoint).allows(InjectionId::TaskQuality),
+                compiled
+                    .match_endpoint(endpoint)
+                    .unwrap()
+                    .injections
+                    .allows(InjectionId::TaskQuality),
                 expected,
                 "{endpoint}"
             );
@@ -338,7 +336,6 @@ mod tests {
     #[test]
     fn edited_text_is_injected_and_empty_custom_is_skipped() {
         let mut config = PromptInjectionConfig::default();
-        config.path_overrides.clear();
         set(&mut config, InjectionId::TaskQuality, true);
         set(&mut config, InjectionId::Custom, true);
         config

@@ -1,7 +1,5 @@
-//! Route scenarios: named snapshots of the route rules that already exist in four places
-//! (local pool route policy, external pool route policy, per local account, per external
-//! account). Applying a scenario writes those values back through the existing setters; the
-//! scheduler is not involved.
+//! Route scenarios: named snapshots of route definitions and per-account route rules.
+//! Applying a scenario writes those values through the existing setters.
 //!
 //! Applying is idempotent: each item is written to its target value, so a retry of the failed
 //! items converges without touching the ones that succeeded.
@@ -67,11 +65,11 @@ pub struct AccountRoutePolicy {
 }
 
 /// Scenario body. Accounts not listed are reset to "unrestricted" when the scenario is applied.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteScenarioContent {
     #[serde(default)]
-    pub external: RoutePolicy,
+    pub routes: crate::model::routes::RoutesConfig,
     #[serde(default)]
     pub external_accounts: Vec<AccountRoutePolicy>,
 }
@@ -89,7 +87,7 @@ impl RouteScenarioContent {
                 .collect()
         };
         Self {
-            external: self.external.normalized(),
+            routes: self.routes.clone(),
             external_accounts: dedup(&self.external_accounts),
         }
     }
@@ -215,7 +213,7 @@ pub struct RouteScenarioApplyResponse {
 
 /// Current state of every item a scenario covers.
 struct RouteState {
-    external: RoutePolicy,
+    routes: crate::model::routes::RoutesConfig,
     external_accounts: BTreeMap<u64, (String, RoutePolicy)>,
 }
 
@@ -224,6 +222,14 @@ struct PlannedItem {
     label: String,
     before: RoutePolicy,
     after: RoutePolicy,
+    route_before: Option<crate::model::routes::RoutesConfig>,
+    route_after: Option<crate::model::routes::RoutesConfig>,
+}
+
+impl PlannedItem {
+    fn unchanged(&self) -> bool {
+        self.before == self.after && self.route_before == self.route_after
+    }
 }
 
 fn validate_policy(policy: &RoutePolicy, label: &str) -> Result<(), AdminServiceError> {
@@ -239,11 +245,6 @@ fn validate_policy(policy: &RoutePolicy, label: &str) -> Result<(), AdminService
     {
         return Err(AdminServiceError::InvalidCredential(format!(
             "{label} 的路由单条长度不能超过 {MAX_RULE_CHARS}"
-        )));
-    }
-    if policy.route_mode == ExternalPoolRouteMode::AllowList && policy.route_rules.is_empty() {
-        return Err(AdminServiceError::InvalidCredential(format!(
-            "{label} 选择了“仅允许”，至少要选一个路由"
         )));
     }
     Ok(())
@@ -283,7 +284,10 @@ fn validate_request(
             "单个场景最多包含 {MAX_SCENARIO_ACCOUNTS} 个账号规则"
         )));
     }
-    validate_policy(&content.external, "外部整体")?;
+    content
+        .routes
+        .validate()
+        .map_err(AdminServiceError::InvalidCredential)?;
     for account in &content.external_accounts {
         validate_policy(&account.policy, &format!("外部账号 #{}", account.id))?;
     }
@@ -319,9 +323,11 @@ fn plan_items(
             kind: RouteScenarioItemKind::ExternalPool,
             id: 0,
         },
-        label: "外部整体".to_string(),
-        before: state.external.clone(),
-        after: content.external.clone(),
+        label: "路由定义".to_string(),
+        before: Default::default(),
+        after: Default::default(),
+        route_before: Some(state.routes.clone()),
+        route_after: Some(content.routes.clone()),
     }];
     let mut missing = Vec::new();
     for (kind, listed, current) in [(
@@ -346,6 +352,8 @@ fn plan_items(
                 label: label.clone(),
                 before: before.clone(),
                 after,
+                route_before: None,
+                route_after: None,
             });
         }
     }
@@ -369,11 +377,7 @@ impl AdminService {
             })
             .collect();
         Ok(RouteState {
-            external: RoutePolicy {
-                route_mode: config.external_pool_route_mode,
-                route_rules: config.external_pool_route_rules,
-            }
-            .normalized(),
+            routes: config.routes,
             external_accounts,
         })
     }
@@ -406,7 +410,7 @@ impl AdminService {
             Some(scenario) => {
                 let state = self.route_state()?;
                 let (items, _) = plan_items(&scenario.content, &state);
-                items.iter().all(|item| item.before == item.after)
+                items.iter().all(|item| item.unchanged())
             }
             None => false,
         };
@@ -504,7 +508,7 @@ impl AdminService {
                 .collect()
         };
         Ok(RouteScenarioContent {
-            external: state.external.clone(),
+            routes: state.routes.clone(),
             external_accounts: restricted(&state.external_accounts),
         })
     }
@@ -528,42 +532,42 @@ impl AdminService {
             }
         }
 
-        let after_of = |kind: RouteScenarioItemKind| {
-            items
-                .iter()
-                .filter(move |item| item.key.kind == kind)
-                .map(|item| &item.after)
-        };
-        let pool_after = |kind: RouteScenarioItemKind| {
-            items
-                .iter()
-                .find(|item| item.key.kind == kind)
-                .map(|item| item.after.clone())
-                .unwrap_or_default()
-        };
-        let external_pool = pool_after(RouteScenarioItemKind::ExternalPool);
-        let uncovered = |pool: &RoutePolicy, kind: RouteScenarioItemKind| -> Vec<String> {
-            routes
-                .iter()
-                .filter(|route| policy_accepts(pool, route))
-                .filter(|route| !after_of(kind).any(|policy| policy_accepts(policy, route)))
-                .cloned()
-                .collect()
-        };
-        let uncovered_external_routes =
-            uncovered(&external_pool, RouteScenarioItemKind::ExternalAccount);
+        let uncovered_external_routes = scenario
+            .content
+            .routes
+            .routes
+            .iter()
+            .filter(|route| route.enabled)
+            .filter(|route| {
+                let endpoint = format!("{}/v1/messages", route.prefix);
+                !items.iter().any(|item| {
+                    item.key.kind == RouteScenarioItemKind::ExternalAccount
+                        && route.account_rule.allows_account(item.key.id)
+                        && policy_accepts(&item.after, &endpoint)
+                })
+            })
+            .map(|route| route.prefix.clone())
+            .collect();
 
         let mut changes = Vec::new();
         let mut unchanged = 0;
         for item in items {
-            if item.before == item.after {
+            if item.unchanged() {
                 unchanged += 1;
             } else {
                 changes.push(RouteScenarioChange {
                     key: item.key,
                     label: item.label,
-                    before: item.before.summary(),
-                    after: item.after.summary(),
+                    before: item
+                        .route_before
+                        .as_ref()
+                        .map(|routes| format!("{} 条路由", routes.routes.len()))
+                        .unwrap_or_else(|| item.before.summary()),
+                    after: item
+                        .route_after
+                        .as_ref()
+                        .map(|routes| format!("{} 条路由", routes.routes.len()))
+                        .unwrap_or_else(|| item.after.summary()),
                 });
             }
         }
@@ -598,16 +602,16 @@ impl AdminService {
         let total = selected.len();
         let mut results = Vec::new();
         let mut skipped = 0;
-        let mut pool_update: Option<RoutePolicy> = None;
+        let mut pool_update: Option<crate::model::routes::RoutesConfig> = None;
         let mut pool_items = Vec::new();
         for item in selected {
-            if item.before == item.after {
+            if item.unchanged() {
                 skipped += 1;
                 continue;
             }
             match item.key.kind {
                 RouteScenarioItemKind::ExternalPool => {
-                    pool_update = Some(item.after.clone());
+                    pool_update = item.route_after.clone();
                     pool_items.push(item);
                 }
                 RouteScenarioItemKind::ExternalAccount => {
@@ -627,7 +631,7 @@ impl AdminService {
         }
         if let Some(external) = pool_update {
             let error = self
-                .set_pool_route_policies(&external)
+                .set_route_scenario_definitions(&external)
                 .err()
                 .map(|err| err.to_string());
             for item in pool_items {
@@ -645,7 +649,7 @@ impl AdminService {
                     plan_items(&scenario.content, &state)
                         .0
                         .iter()
-                        .all(|item| item.before == item.after)
+                        .all(|item| item.unchanged())
                 });
             if fully_applied {
                 self.set_route_scenario_active_id(Some(id));

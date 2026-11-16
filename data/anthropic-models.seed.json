@@ -4,6 +4,7 @@
   "models": [
     {
       "model": "claude-opus-4.8",
+      "listed": true,
       "displayName": "Claude Opus 4.8",
       "maxInputTokens": 1000000,
       "maxOutputTokens": 128000,
@@ -15,6 +16,7 @@
     },
     {
       "model": "claude-haiku-4-5-20251001",
+      "listed": true,
       "displayName": "Claude Haiku 4.5",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -26,6 +28,7 @@
     },
     {
       "model": "claude-haiku-4-5-20251001-thinking",
+      "listed": true,
       "displayName": "Claude Haiku 4.5 (Thinking)",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -37,6 +40,7 @@
     },
     {
       "model": "claude-haiku-4.5",
+      "listed": true,
       "displayName": "Claude Haiku 4.5",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -48,6 +52,7 @@
     },
     {
       "model": "claude-opus-4-5-20251101",
+      "listed": true,
       "displayName": "Claude Opus 4.5",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -59,6 +64,7 @@
     },
     {
       "model": "claude-opus-4-5-20251101-thinking",
+      "listed": true,
       "displayName": "Claude Opus 4.5 (Thinking)",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -70,6 +76,7 @@
     },
     {
       "model": "claude-opus-4-6",
+      "listed": true,
       "displayName": "Claude Opus 4.6",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -81,6 +88,7 @@
     },
     {
       "model": "claude-opus-4-6-thinking",
+      "listed": true,
       "displayName": "Claude Opus 4.6 (Thinking)",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -92,6 +100,7 @@
     },
     {
       "model": "claude-opus-4-7",
+      "listed": true,
       "displayName": "Claude Opus 4.7",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -103,6 +112,7 @@
     },
     {
       "model": "claude-opus-4-7-thinking",
+      "listed": true,
       "displayName": "Claude Opus 4.7 (Thinking)",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -114,6 +124,7 @@
     },
     {
       "model": "claude-opus-4.5",
+      "listed": true,
       "displayName": "Claude Opus 4.5",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -125,6 +136,7 @@
     },
     {
       "model": "claude-opus-4.6",
+      "listed": true,
       "displayName": "Claude Opus 4.6",
       "maxInputTokens": 1000000,
       "maxOutputTokens": 64000,
@@ -136,6 +148,7 @@
     },
     {
       "model": "claude-opus-4.7",
+      "listed": true,
       "displayName": "Claude Opus 4.7",
       "maxInputTokens": 1000000,
       "maxOutputTokens": 128000,
@@ -147,6 +160,7 @@
     },
     {
       "model": "claude-sonnet-4",
+      "listed": true,
       "displayName": "Claude Sonnet 4",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -158,6 +172,7 @@
     },
     {
       "model": "claude-sonnet-4-5-20250929",
+      "listed": true,
       "displayName": "Claude Sonnet 4.5",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -169,6 +184,7 @@
     },
     {
       "model": "claude-sonnet-4-5-20250929-thinking",
+      "listed": true,
       "displayName": "Claude Sonnet 4.5 (Thinking)",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -180,6 +196,7 @@
     },
     {
       "model": "claude-sonnet-4-6",
+      "listed": true,
       "displayName": "Claude Sonnet 4.6",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -191,6 +208,7 @@
     },
     {
       "model": "claude-sonnet-4-6-thinking",
+      "listed": true,
       "displayName": "Claude Sonnet 4.6 (Thinking)",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -202,6 +220,7 @@
     },
     {
       "model": "claude-sonnet-4.5",
+      "listed": true,
       "displayName": "Claude Sonnet 4.5",
       "maxInputTokens": 200000,
       "maxOutputTokens": 64000,
@@ -213,6 +232,7 @@
     },
     {
       "model": "claude-sonnet-4.6",
+      "listed": true,
       "displayName": "Claude Sonnet 4.6",
       "maxInputTokens": 1000000,
       "maxOutputTokens": 64000,

@@ -22,7 +22,7 @@ mod handlers;
 mod middleware;
 mod route_scenarios;
 mod router;
-mod service;
+pub(crate) mod service;
 pub mod types;
 
 pub use middleware::{AdminApiKeyStore, AdminState};

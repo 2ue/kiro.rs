@@ -69,6 +69,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(set_external_pool_enabled),
         )
         .route(
+            "/external-pools/{id}/models/promote",
+            post(promote_external_pool_models),
+        )
+        .route(
             "/external-pools/{id}/supported-models",
             post(set_external_pool_supported_models),
         )

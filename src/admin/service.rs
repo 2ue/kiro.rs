@@ -1025,6 +1025,35 @@ impl AdminService {
         })
     }
 
+    pub async fn promote_external_pool_models(
+        &self,
+        id: u64,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let pool = self
+            .postgres_store
+            .get_external_pool(id, false)
+            .await
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or_else(|| AdminServiceError::InvalidCredential("账号不存在".into()))?;
+        let promoted = self
+            .postgres_store
+            .promote_account_models(&pool.supported_models)
+            .await
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        if let Some(status) = self
+            .postgres_store
+            .load_model_capabilities_status()
+            .await
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+        {
+            self.model_capabilities.load_persisted_status(status);
+        }
+        Ok(SupportedModelsResponse {
+            count: promoted.len(),
+            supported_models: promoted,
+        })
+    }
+
     /// 使用外部池自身的兼容 /v1/models 接口发现模型，只返回可编辑建议，不写回。
     pub async fn discover_external_pool_supported_models(
         &self,
@@ -2482,7 +2511,7 @@ impl AdminService {
             prompt_cache_estimated_bytes_limit: config.prompt_cache_estimated_bytes_limit.clone(),
             reported_usage: config.reported_usage.clone(),
             cache_policy: config.cache_policy.clone(),
-            defined_cache_routes: config.defined_cache_routes.clone(),
+            routes: config.routes.clone(),
             external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold.clone(),
             compat_profile: config.compat_profile.clone(),
@@ -2588,8 +2617,8 @@ impl AdminService {
             if let Some(value) = req.cache_policy {
                 config.cache_policy = value;
             }
-            if let Some(value) = req.defined_cache_routes {
-                config.defined_cache_routes = value;
+            if let Some(value) = req.routes {
+                config.routes = value;
             }
             if let Some(value) = req.external_pools {
                 config.external_pools = value;
@@ -2712,23 +2741,22 @@ fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), Stri
         return Err("promptCacheEntryTtlSecs 必须大于 0".to_string());
     }
 
-    if config.defined_cache_routes.iter().any(|route| {
-        !route.trim().is_empty()
-            && crate::model::config::normalize_defined_cache_route(route).is_none()
-    }) {
-        return Err(
-            "自定义高缓存路由必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线"
-                .to_string(),
-        );
+    config.routes.validate()?;
+    let route_base = config.legacy_cache_route_policy_default();
+    for route in &mut config.routes.routes {
+        route.prefix = crate::model::routes::normalize_route_prefix(&route.prefix);
+        route
+            .cache_policy
+            .validate(&format!("路由 {}", route.prefix), route_base.clone())?;
+        if let Some(reported) = &route.reported_usage {
+            reported.validate("路由上报策略")?;
+        }
+        crate::model::config::RouteFeaturesConfig {
+            defaults: route.features.apply(config.route_features.defaults),
+        }
+        .validate()?;
     }
-    config.defined_cache_routes =
-        crate::model::config::normalize_defined_cache_routes(&config.defined_cache_routes);
-    config.cache_policy = config
-        .cache_policy
-        .clone()
-        .with_builtin_path_defaults()
-        .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
-        .normalized();
+    config.cache_policy = config.cache_policy.normalized();
     config.request_admission = config.request_admission.normalized();
     config.prompt_injection = config.prompt_injection.clone().normalized();
     config.route_features = config.route_features.clone().normalized();
@@ -2761,6 +2789,7 @@ fn manual_model_item_from_request(
         ));
     }
     Ok(ModelCapabilityItem {
+        listed: req.listed,
         model,
         display_name,
         description: req
@@ -3962,10 +3991,8 @@ impl AdminService {
     pub(super) fn route_scenario_store(&self) -> Arc<PostgresStore> {
         self.postgres_store.clone()
     }
-    pub(super) fn route_scenario_runtime_config(
-        &self,
-    ) -> crate::model::config::ExternalPoolsConfig {
-        self.runtime.config().external_pools
+    pub(super) fn route_scenario_runtime_config(&self) -> crate::model::config::Config {
+        self.runtime.config()
     }
     pub(super) fn route_scenario_routes(&self) -> Vec<String> {
         let config = self.runtime.config();
@@ -3975,20 +4002,8 @@ impl AdminService {
             .collect();
         let normalize =
             |path: &str| crate::model::config::normalize_route_rules(&[path.to_string()]);
-        for path in config
-            .cache_policy
-            .path_overrides
-            .keys()
-            .chain(config.reported_usage.path_overrides.keys())
-            .chain(config.prompt_injection.path_overrides.keys())
-            .chain(config.route_features.path_overrides.keys())
-            .chain(config.defined_cache_routes.iter())
-        {
-            routes.extend(
-                normalize(path)
-                    .into_iter()
-                    .filter(|route| route != "*" && route != "/"),
-            );
+        for route in &config.routes.routes {
+            routes.extend(normalize(&route.prefix));
         }
         routes.into_iter().collect()
     }
@@ -4004,18 +4019,16 @@ impl AdminService {
     pub(super) fn route_scenario_active_id(&self) -> Option<u64> {
         self.runtime.config().active_route_scenario_id
     }
-    pub(super) fn set_pool_route_policies(
+    pub(super) fn set_route_scenario_definitions(
         &self,
-        external: &super::route_scenarios::RoutePolicy,
+        routes: &crate::model::routes::RoutesConfig,
     ) -> Result<(), AdminServiceError> {
-        let mut external_pools = self.runtime.config().external_pools;
-        external_pools.external_pool_route_mode = external.route_mode;
-        external_pools.external_pool_route_rules = external.route_rules.clone();
-        validate_external_pools_config(&external_pools)
+        routes
+            .validate_with_config(&self.runtime.config())
             .map_err(AdminServiceError::InvalidCredential)?;
         self.runtime
-            .update(|config| config.external_pools = external_pools.clone())
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            .update(|config| config.routes = routes.clone())
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
         Ok(())
     }
@@ -4036,7 +4049,7 @@ impl AdminService {
     }
 }
 
-fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {
+pub(crate) fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {
     if config.external_pool_global_max_concurrent_requests > 100_000 {
         return Err("externalPoolGlobalMaxConcurrentRequests 不能大于 100000".to_string());
     }
@@ -4145,10 +4158,6 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     }
     if config.external_pool_recovery_ramp_secs > 86_400 {
         return Err("externalPoolRecoveryRampSecs 不能大于 86400".to_string());
-    }
-
-    if config.external_pool_route_rules.len() > 200 {
-        return Err("externalPoolRouteRules 不能超过 200 条".to_string());
     }
 
     if config.external_pool_auto_disable_failure_threshold == 0

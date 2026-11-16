@@ -307,7 +307,7 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_estimated_bytes_limit: u64,
     pub reported_usage: ReportedUsageConfig,
     pub cache_policy: CachePolicyConfig,
-    pub defined_cache_routes: Vec<String>,
+    pub routes: crate::model::routes::RoutesConfig,
     pub external_pools: ExternalPoolsConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
@@ -386,7 +386,7 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub cache_policy: Option<CachePolicyConfig>,
     #[serde(default)]
-    pub defined_cache_routes: Option<Vec<String>>,
+    pub routes: Option<crate::model::routes::RoutesConfig>,
     #[serde(default)]
     pub external_pools: Option<ExternalPoolsConfig>,
     #[serde(default)]
@@ -452,6 +452,8 @@ impl ManualModelPricingRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpsertManualModelRequest {
+    #[serde(default = "default_manual_model_listed")]
+    pub listed: bool,
     pub model: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -556,3 +558,7 @@ impl AdminErrorResponse {
 }
 
 // ============ 订阅等级模型列表 ============
+
+fn default_manual_model_listed() -> bool {
+    true
+}

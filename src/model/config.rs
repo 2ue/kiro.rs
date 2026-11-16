@@ -1,7 +1,9 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+pub use super::routes::{CompiledRoutes, RouteConfig, RoutesConfig};
 
 pub use super::kiro_rs_tool_plus::{
     KiroRsToolPlusCachePolicy, SelectedUsageShaping, SuppressedCreationTarget, UsageFieldShaping,
@@ -566,7 +568,7 @@ impl ReportedUsageFieldPolicy {
         normalized
     }
 
-    fn validate(&self, label: &str) -> Result<(), String> {
+    pub(crate) fn validate(&self, label: &str) -> Result<(), String> {
         if self.max_tokens < 0 {
             return Err(format!("{} 的 sample-max 上限不能小于 0", label));
         }
@@ -799,7 +801,7 @@ impl ReportedUsagePathPolicy {
         }
     }
 
-    fn validate(&self, label: &str) -> Result<(), String> {
+    pub(crate) fn validate(&self, label: &str) -> Result<(), String> {
         self.input.validate(&format!("{} input", label))?;
         self.output.validate(&format!("{} output", label))?;
         self.cache_read.validate(&format!("{} cacheRead", label))?;
@@ -891,84 +893,26 @@ impl ReportedUsagePathPolicy {
 pub struct ReportedUsageConfig {
     #[serde(default)]
     pub default: ReportedUsagePathPolicy,
-
-    #[serde(default)]
-    pub path_overrides: BTreeMap<String, ReportedUsagePathPolicy>,
 }
 
 impl Default for ReportedUsageConfig {
     fn default() -> Self {
-        let mut path_overrides = BTreeMap::new();
-        path_overrides.insert(
-            "/cc".to_string(),
-            ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::sample_input_max(96),
-                cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
-                ..ReportedUsagePathPolicy::default()
-            },
-        );
-        path_overrides.insert(
-            "/ha".to_string(),
-            ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::sample_input_max(96),
-                ..ReportedUsagePathPolicy::default()
-            },
-        );
-
         Self {
             default: ReportedUsagePathPolicy::default(),
-            path_overrides,
         }
     }
 }
-
 impl ReportedUsageConfig {
     pub fn normalized(&self) -> Self {
-        let path_overrides = self
-            .path_overrides
-            .iter()
-            .filter_map(|(prefix, policy)| {
-                normalize_reported_usage_path_prefix(prefix)
-                    .map(|prefix| (prefix, policy.normalized()))
-            })
-            .collect();
-
         Self {
             default: self.default.normalized(),
-            path_overrides,
         }
     }
-
     pub fn validate(&self) -> Result<(), String> {
-        self.default.validate("默认上报策略")?;
-        for (prefix, policy) in &self.path_overrides {
-            let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
-                return Err("路径覆盖前缀不能为空".to_string());
-            };
-            policy.validate(&format!("路径 {} 上报策略", normalized_prefix))?;
-        }
-        Ok(())
+        self.default.validate("默认上报策略")
     }
-
-    pub fn policy_for_path(&self, path: &str) -> ReportedUsagePathPolicy {
-        let normalized = self.normalized();
-        normalized
-            .path_overrides
-            .iter()
-            .filter(|(prefix, _)| reported_usage_path_matches(prefix, path))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(_, policy)| policy.clone())
-            .unwrap_or(normalized.default)
-    }
-
-    pub fn path_override_for_path(&self, path: &str) -> Option<ReportedUsagePathPolicy> {
-        let normalized = self.normalized();
-        normalized
-            .path_overrides
-            .iter()
-            .filter(|(prefix, _)| reported_usage_path_matches(prefix, path))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(_, policy)| policy.clone())
+    pub fn policy_for_path(&self, _path: &str) -> ReportedUsagePathPolicy {
+        self.default.normalized()
     }
 }
 
@@ -2942,62 +2886,11 @@ pub struct CachePolicyConfig {
     /// 上下限优先的本地模拟缓存策略模板（`bounded_high_cache`），不继承 `default`。
     #[serde(default)]
     pub bounded_high_cache: CacheRoutePolicyPatch,
-    #[serde(default)]
-    pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
 }
 
 impl CachePolicyConfig {
-    pub fn with_builtin_path_defaults(mut self) -> Self {
-        for prefix in ["/v1", "/cc", "/ha"] {
-            self.path_overrides
-                .entry(prefix.to_string())
-                .or_insert_with(|| CacheRoutePolicyPatch {
-                    cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                    route_namespace: Some(false),
-                    ..CacheRoutePolicyPatch::default()
-                });
-        }
-        self.path_overrides
-            .entry("/na".to_string())
-            .or_insert_with(|| CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::NoCache),
-                route_namespace: Some(false),
-                ..CacheRoutePolicyPatch::default()
-            });
-        self
-    }
-
-    pub fn with_legacy_defined_cache_route_defaults(mut self, routes: &[String]) -> Self {
-        for prefix in normalize_defined_cache_routes(routes) {
-            self.path_overrides
-                .entry(prefix)
-                .or_insert_with(|| CacheRoutePolicyPatch {
-                    cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                    route_namespace: Some(true),
-                    ..CacheRoutePolicyPatch::default()
-                });
-        }
-        self
-    }
-
     pub fn normalized(&self) -> Self {
-        let path_overrides = self
-            .path_overrides
-            .iter()
-            .filter_map(|(prefix, policy)| {
-                normalize_reported_usage_path_prefix(prefix).map(|prefix| (prefix, policy.clone()))
-            })
-            .filter(|(_, policy)| !policy.is_empty())
-            .collect();
-        Self {
-            default: self.default.clone(),
-            current_high_cache: self.current_high_cache.clone(),
-            kiro_rs_tool: self.kiro_rs_tool.clone(),
-            stable_segment_cache: self.stable_segment_cache.clone(),
-            kiro_rs_tool_plus: self.kiro_rs_tool_plus.clone(),
-            bounded_high_cache: self.bounded_high_cache.clone(),
-            path_overrides,
-        }
+        self.clone()
     }
 
     pub fn validate(&self, base: CacheRoutePolicy) -> Result<(), String> {
@@ -3013,12 +2906,6 @@ impl CachePolicyConfig {
             .validate("Kiro-RS-Tool Plus 缓存策略模板", base.clone())?;
         self.bounded_high_cache
             .validate("上下限优先缓存策略模板", base.clone())?;
-        for (prefix, policy) in &self.path_overrides {
-            let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
-                return Err("缓存策略路径前缀不能为空".to_string());
-            };
-            policy.validate(&format!("路径 {normalized_prefix} 缓存策略"), base.clone())?;
-        }
         Ok(())
     }
 
@@ -3240,35 +3127,23 @@ pub struct ResolvedCacheRoutePolicy {
     pub namespace: Option<String>,
 }
 
-pub fn resolve_cache_policy_for_path(
+pub fn resolve_cache_policy_for_route(
     base: CacheRoutePolicy,
-    reported_usage: &ReportedUsageConfig,
+    _reported_usage: &ReportedUsageConfig,
     cache_policy: &CachePolicyConfig,
-    path: &str,
+    route: &RouteConfig,
 ) -> ResolvedCacheRoutePolicy {
     let cache_policy = cache_policy.normalized();
-    let mut path_base = base.clone();
-
-    if let Some(reported_usage) = reported_usage.path_override_for_path(path) {
+    let mut path_base = base;
+    if let Some(reported_usage) = &route.reported_usage {
         path_base.reported_usage = reported_usage.normalized();
     }
-
-    let Some((prefix, override_policy)) = cache_policy
-        .path_overrides
-        .iter()
-        .filter(|(prefix, _)| reported_usage_path_matches(prefix, path))
-        .max_by_key(|(prefix, _)| prefix.len())
-    else {
-        return ResolvedCacheRoutePolicy {
-            policy: cache_policy.no_cache_policy(path_base),
-            namespace: None,
-        };
-    };
-
+    let prefix = &route.prefix;
+    let override_policy = &route.cache_policy;
     let cache_type = override_policy.explicit_cache_type();
     let mut policy = cache_policy.strategy_policy(cache_type, path_base);
     if override_policy.reported_usage.is_none() {
-        if let Some(reported_usage) = reported_usage.path_override_for_path(path) {
+        if let Some(reported_usage) = &route.reported_usage {
             policy.reported_usage = reported_usage.normalized();
         }
     }
@@ -3554,7 +3429,7 @@ pub enum ExternalPoolCapacityMode {
 
 impl Default for ExternalPoolCapacityMode {
     fn default() -> Self {
-        Self::FailFast
+        Self::Wait
     }
 }
 
@@ -3657,6 +3532,14 @@ impl ExternalPoolStreamResponseMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolsConfig {
+    #[serde(skip)]
+    pub transport_proxy_url: Option<String>,
+    #[serde(skip)]
+    pub transport_proxy_username: Option<String>,
+    #[serde(skip)]
+    pub transport_proxy_password: Option<String>,
+    #[serde(skip)]
+    pub routes: RoutesConfig,
     #[serde(default = "default_true")]
     pub external_pools_enabled: bool,
     #[serde(default = "default_external_pool_global_max_concurrent_requests")]
@@ -3762,10 +3645,6 @@ pub struct ExternalPoolsConfig {
     #[serde(default = "default_external_pool_recovery_ramp_secs")]
     pub external_pool_recovery_ramp_secs: u64,
     #[serde(default)]
-    pub external_pool_route_mode: ExternalPoolRouteMode,
-    #[serde(default)]
-    pub external_pool_route_rules: Vec<String>,
-    #[serde(default)]
     pub external_pool_auto_disable_enabled: bool,
     #[serde(default = "default_true")]
     pub external_pool_auto_disable_on_auth_error: bool,
@@ -3858,6 +3737,10 @@ pub struct ExternalPoolsConfig {
 impl Default for ExternalPoolsConfig {
     fn default() -> Self {
         Self {
+            routes: RoutesConfig::default(),
+            transport_proxy_url: None,
+            transport_proxy_username: None,
+            transport_proxy_password: None,
             external_pools_enabled: true,
             external_pool_global_max_concurrent_requests:
                 default_external_pool_global_max_concurrent_requests(),
@@ -3894,8 +3777,6 @@ impl Default for ExternalPoolsConfig {
             external_pool_max_probation_secs: default_external_pool_max_probation_secs(),
             external_pool_probe_share_percent: default_external_pool_probe_share_percent(),
             external_pool_recovery_ramp_secs: default_external_pool_recovery_ramp_secs(),
-            external_pool_route_mode: ExternalPoolRouteMode::default(),
-            external_pool_route_rules: Vec::new(),
             external_pool_auto_disable_enabled: false,
             external_pool_auto_disable_on_auth_error: true,
             external_pool_auto_disable_on_security_lock: true,
@@ -3959,14 +3840,6 @@ impl ExternalPoolsConfig {
         } else {
             self.external_pool_dispatch_max_wait_secs
         }
-    }
-
-    pub fn external_pool_route_allowed(&self, endpoint: &str) -> bool {
-        route_policy_allows(
-            self.external_pool_route_mode,
-            &self.external_pool_route_rules,
-            endpoint,
-        )
     }
 
     pub fn same_pool_retry_status_codes(&self) -> BTreeSet<u16> {
@@ -4277,6 +4150,8 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    #[serde(skip)]
+    pub compiled_routes: Option<std::sync::Arc<CompiledRoutes>>,
     /// Runtime config migration marker persisted in PgSQL.
     ///
     /// File configs loaded through `Config::load` are treated as current so
@@ -4462,7 +4337,7 @@ pub struct Config {
     /// `/dfcache/{name}/v1/messages` 等。未列入这里的 `/dfcache/*`
     /// 路径会直接报错，避免误放开未知路由。
     #[serde(default)]
-    pub defined_cache_routes: Vec<String>,
+    pub routes: RoutesConfig,
 
     /// Route scenario most recently applied in full from the admin route scenario page; only
     /// used to show which scenario is active.
@@ -4503,7 +4378,7 @@ fn default_port() -> u16 {
     8080
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 1;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 2;
 
 impl Config {}
 
@@ -5074,7 +4949,7 @@ pub fn normalize_defined_cache_route(route: &str) -> Option<String> {
     Some(format!("/dfcache/{name}"))
 }
 
-pub fn normalize_defined_cache_routes(routes: &[String]) -> Vec<String> {
+pub fn normalize_legacy_defined_cache_routes(routes: &[String]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     routes
         .iter()
@@ -5145,6 +5020,7 @@ fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -
 impl Default for Config {
     fn default() -> Self {
         Self {
+            compiled_routes: None,
             runtime_config_migration_version: CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
             postgres: PostgresConfig::default(),
             redis: RedisConfig::default(),
@@ -5181,7 +5057,7 @@ impl Default for Config {
             prompt_cache_estimated_bytes_limit: default_prompt_cache_estimated_bytes_limit(),
             reported_usage: ReportedUsageConfig::default(),
             cache_policy: CachePolicyConfig::default(),
-            defined_cache_routes: Vec::new(),
+            routes: RoutesConfig::default(),
             active_route_scenario_id: None,
             usage_record_limit: default_usage_record_limit(),
             high_cache_threshold: default_high_cache_threshold(),
@@ -5231,18 +5107,13 @@ impl Config {
         .normalized()
     }
 
-    #[cfg(test)]
     pub fn cache_policy_for_path(&self, path: &str) -> ResolvedCacheRoutePolicy {
-        resolve_cache_policy_for_path(
-            self.legacy_cache_route_policy_default(),
-            &self.reported_usage,
-            &self
-                .cache_policy
-                .clone()
-                .with_builtin_path_defaults()
-                .with_legacy_defined_cache_route_defaults(&self.defined_cache_routes),
-            path,
-        )
+        self.routes
+            .compile_with_config(self)
+            .match_endpoint(path)
+            .expect("builtin root route")
+            .cache_policy
+            .clone()
     }
 
     /// 返回规范化后的客户端调用 API Key 列表。
@@ -5374,6 +5245,14 @@ impl Config {
         changed
     }
 
+    pub fn from_json_value(mut value: serde_json::Value) -> anyhow::Result<Self> {
+        super::routes::migrate_path_overrides_to_routes(&mut value);
+        Ok(serde_json::from_value(value)?)
+    }
+    pub fn from_json_str(json: &str) -> anyhow::Result<Self> {
+        Self::from_json_value(serde_json::from_str(json)?)
+    }
+
     /// 从文件加载配置
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -5389,7 +5268,13 @@ impl Config {
         }
 
         let content = fs::read_to_string(path)?;
-        let mut config: Config = serde_json::from_str(&content)?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)?;
+        super::routes::migrate_path_overrides_to_routes(&mut value);
+        let mut config: Config = serde_json::from_value(value)?;
+        config
+            .routes
+            .validate_with_config(&config)
+            .map_err(anyhow::Error::msg)?;
         config.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
         config.apply_env_overrides();
         config
@@ -5469,11 +5354,22 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Default)]
+    struct TestEndpointRule {
+        mode: super::ExternalPoolRouteMode,
+        rules: Vec<String>,
+    }
+    impl TestEndpointRule {
+        fn allows(&self, endpoint: &str) -> bool {
+            super::route_policy_allows(self.mode, &self.rules, endpoint)
+        }
+    }
+
     use super::*;
 
     #[test]
     fn observability_redis_is_optional_and_uses_its_own_prefix() {
-        let config: Config = serde_json::from_str("{}").unwrap();
+        let config: Config = Config::from_json_str("{}").unwrap();
         assert!(config.observability_redis.url.is_none());
         assert_eq!(
             config.observability_redis.key_prefix,
@@ -5568,15 +5464,12 @@ mod tests {
                 "/na": { "cacheType": "no_cache" }
             }
         }"#;
-        let cache_policy: CachePolicyConfig = serde_json::from_str(json).unwrap();
+        let config = Config::from_json_value(serde_json::json!({"cachePolicy": serde_json::from_str::<serde_json::Value>(json).unwrap()})).unwrap();
+        let cache_policy = config.cache_policy.clone();
         let round_trip: CachePolicyConfig =
             serde_json::from_str(&serde_json::to_string(&cache_policy).unwrap()).unwrap();
         assert_eq!(round_trip, cache_policy);
 
-        let config = Config {
-            cache_policy,
-            ..Config::default()
-        };
         let minea = config
             .cache_policy_for_path("/dfcache/minea/v1/messages")
             .policy
@@ -5631,9 +5524,9 @@ mod tests {
         );
         assert!(!patch.is_empty());
         config
-            .cache_policy
-            .path_overrides
-            .insert("/dfcache/minea".to_string(), patch.clone());
+            .routes
+            .route_mut(&"/dfcache/minea".to_string())
+            .cache_policy = patch.clone();
         assert!(
             config
                 .cache_policy_for_path("/dfcache/minea/v1/messages")
@@ -5649,13 +5542,10 @@ mod tests {
                 .cold_request_guard
                 .enabled
         );
-        config.cache_policy.path_overrides.insert(
-            "/na".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::NoCache),
-                ..patch
-            },
-        );
+        config.routes.route_mut(&"/na".to_string()).cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::NoCache),
+            ..patch
+        };
         assert!(
             !config
                 .cache_policy_for_path("/na/v1/messages")
@@ -5667,7 +5557,7 @@ mod tests {
         let empty = CacheRoutePolicyPatch::default();
         assert!(empty.is_empty());
         let round_trip: CacheRoutePolicyPatch = serde_json::from_value(
-            serde_json::to_value(&config.cache_policy.path_overrides["/dfcache/minea"]).unwrap(),
+            serde_json::to_value(&config.routes.route_mut("/dfcache/minea").cache_policy).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -5727,14 +5617,14 @@ mod tests {
 
     #[test]
     fn request_api_keys_support_legacy_single_key() {
-        let config: Config = serde_json::from_str(r#"{"apiKey":" sk-legacy "}"#).unwrap();
+        let config: Config = Config::from_json_str(r#"{"apiKey":" sk-legacy "}"#).unwrap();
 
         assert_eq!(config.request_api_keys(), vec!["sk-legacy".to_string()]);
     }
 
     #[test]
     fn managed_request_key_policies_are_additive_and_keep_legacy_keys() {
-        let config: Config = serde_json::from_str(
+        let config: Config = Config::from_json_str(
             r#"{
                 "apiKey": "sk-legacy-primary",
                 "apiKeys": ["sk-legacy-extra"],
@@ -5780,7 +5670,7 @@ mod tests {
         );
 
         let round_trip: Config =
-            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            Config::from_json_value(serde_json::to_value(&config).unwrap()).unwrap();
         assert_eq!(round_trip.request_api_keys(), config.request_api_keys());
         assert_eq!(
             round_trip.request_api_key_policies(),
@@ -5805,17 +5695,17 @@ mod tests {
             fresh.request_admission
         );
 
-        let legacy: Config = serde_json::from_str(r#"{"apiKey":"sk-legacy"}"#).unwrap();
+        let legacy: Config = Config::from_json_str(r#"{"apiKey":"sk-legacy"}"#).unwrap();
         assert_eq!(legacy.request_admission, RequestAdmissionConfig::default());
 
         let legacy_null: Config =
-            serde_json::from_str(r#"{"apiKey":"sk-legacy","requestAdmission":null}"#).unwrap();
+            Config::from_json_str(r#"{"apiKey":"sk-legacy","requestAdmission":null}"#).unwrap();
         assert_eq!(
             legacy_null.request_admission,
             RequestAdmissionConfig::default()
         );
 
-        let partial: Config = serde_json::from_str(
+        let partial: Config = Config::from_json_str(
             r#"{
                 "apiKey":"sk-test",
                 "requestAdmission": { "rpm": 0 }
@@ -5828,7 +5718,7 @@ mod tests {
         assert_eq!(partial.request_admission.queue_timeout_ms, 1_000);
         assert!(partial.request_admission.normalized().enabled());
 
-        let queue_only: Config = serde_json::from_str(
+        let queue_only: Config = Config::from_json_str(
             r#"{
                 "requestAdmission": {
                     "rpm": 0,
@@ -5845,7 +5735,7 @@ mod tests {
             RequestAdmissionConfig::disabled()
         );
 
-        let partial_queue_disabled: Config = serde_json::from_str(
+        let partial_queue_disabled: Config = Config::from_json_str(
             r#"{
                 "requestAdmission": {
                     "rpm": 300,
@@ -5867,7 +5757,7 @@ mod tests {
             0
         );
 
-        let disabled: Config = serde_json::from_str(
+        let disabled: Config = Config::from_json_str(
             r#"{
                 "apiKey":"sk-test",
                 "requestAdmission": {
@@ -5920,7 +5810,7 @@ mod tests {
 
     #[test]
     fn request_api_keys_merge_and_deduplicate_primary_and_extra_keys() {
-        let config: Config = serde_json::from_str(
+        let config: Config = Config::from_json_str(
             r#"{
                 "apiKey": "sk-primary",
                 "apiKeys": ["sk-extra", "sk-primary", "", " sk-third "]
@@ -6027,63 +5917,63 @@ mod tests {
 
     #[test]
     fn external_pool_route_policy_denies_matching_routes_only() {
-        let mut config = ExternalPoolsConfig {
-            external_pool_route_mode: ExternalPoolRouteMode::DenyList,
-            external_pool_route_rules: vec!["/cc".to_string(), "/dfcache/team-a".to_string()],
-            ..ExternalPoolsConfig::default()
+        let mut config = TestEndpointRule {
+            mode: ExternalPoolRouteMode::DenyList,
+            rules: vec!["/cc".to_string(), "/dfcache/team-a".to_string()],
+            ..TestEndpointRule::default()
         };
 
-        assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.external_pool_route_allowed("/dfcache/team-a/v1/messages"));
-        assert!(config.external_pool_route_allowed("/v1/messages"));
+        assert!(!config.allows("/cc/v1/messages"));
+        assert!(!config.allows("/dfcache/team-a/v1/messages"));
+        assert!(config.allows("/v1/messages"));
 
-        config.external_pool_route_rules = vec!["*".to_string()];
-        assert!(!config.external_pool_route_allowed("/v1/messages"));
-        assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
+        config.rules = vec!["*".to_string()];
+        assert!(!config.allows("/v1/messages"));
+        assert!(!config.allows("/ha/v1/messages"));
     }
 
     #[test]
     fn external_pool_route_policy_allow_list_requires_a_match() {
-        let config = ExternalPoolsConfig {
-            external_pool_route_mode: ExternalPoolRouteMode::AllowList,
-            external_pool_route_rules: vec!["/ha".to_string(), "/dfcache/team-b".to_string()],
-            ..ExternalPoolsConfig::default()
+        let config = TestEndpointRule {
+            mode: ExternalPoolRouteMode::AllowList,
+            rules: vec!["/ha".to_string(), "/dfcache/team-b".to_string()],
+            ..TestEndpointRule::default()
         };
 
-        assert!(config.external_pool_route_allowed("/ha/v1/messages"));
-        assert!(config.external_pool_route_allowed("/dfcache/team-b/v1/messages"));
-        assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.external_pool_route_allowed("/v1/messages"));
+        assert!(config.allows("/ha/v1/messages"));
+        assert!(config.allows("/dfcache/team-b/v1/messages"));
+        assert!(!config.allows("/cc/v1/messages"));
+        assert!(!config.allows("/v1/messages"));
     }
 
     #[test]
     fn external_pool_route_policy_matches_case_insensitively() {
-        let config = ExternalPoolsConfig {
-            external_pool_route_mode: ExternalPoolRouteMode::AllowList,
-            external_pool_route_rules: vec!["/CC/V1".to_string()],
-            ..ExternalPoolsConfig::default()
+        let config = TestEndpointRule {
+            mode: ExternalPoolRouteMode::AllowList,
+            rules: vec!["/CC/V1".to_string()],
+            ..TestEndpointRule::default()
         };
 
-        assert!(config.external_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
+        assert!(config.allows("/cc/v1/messages"));
+        assert!(!config.allows("/ha/v1/messages"));
     }
 
     #[test]
     fn external_pool_route_policy_does_not_match_mid_path_segments() {
-        let config = ExternalPoolsConfig {
-            external_pool_route_mode: ExternalPoolRouteMode::AllowList,
-            external_pool_route_rules: vec!["/v1".to_string()],
-            ..ExternalPoolsConfig::default()
+        let config = TestEndpointRule {
+            mode: ExternalPoolRouteMode::AllowList,
+            rules: vec!["/v1".to_string()],
+            ..TestEndpointRule::default()
         };
 
-        assert!(config.external_pool_route_allowed("/v1/messages"));
-        assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
-        assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
+        assert!(config.allows("/v1/messages"));
+        assert!(!config.allows("/cc/v1/messages"));
+        assert!(!config.allows("/ha/v1/messages"));
     }
 
     #[test]
     fn external_pool_stream_response_mode_accepts_legacy_capture_value() {
-        let config: Config = serde_json::from_str(
+        let config: Config = Config::from_json_str(
             r#"{
                 "apiKey": "sk-test",
                 "externalPools": {
@@ -6101,7 +5991,7 @@ mod tests {
 
     #[test]
     fn reported_usage_deserializes_from_camel_case_config() {
-        let config: Config = serde_json::from_str(
+        let config: Config = Config::from_json_str(
             r#"{
                 "apiKey": "sk-test",
                 "reportedUsage": {
@@ -6162,7 +6052,13 @@ mod tests {
                 .final_cache_creation_max_tokens,
             500_000
         );
-        let policy = config.reported_usage.policy_for_path("/cc/v1/messages");
+        let policy = config
+            .routes
+            .match_endpoint("/cc/v1/messages")
+            .unwrap()
+            .reported_usage
+            .clone()
+            .unwrap();
         assert_eq!(policy.final_cache_read_max_tokens, 300_000);
         assert_eq!(policy.final_cache_read_jitter_min_tokens, 8_000);
         assert_eq!(policy.final_cache_read_jitter_max_tokens, 24_000);
@@ -6187,7 +6083,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_token_amplification_deserializes_from_camel_case_config() {
-        let config: Config = serde_json::from_str(
+        let config: Config = Config::from_json_str(
             r#"{
                 "apiKey": "sk-test",
                 "promptCacheTokenScale": 1.5,
@@ -6255,48 +6151,58 @@ mod tests {
 
     #[test]
     fn reported_usage_default_and_prefix_overrides_match_longest_prefix() {
-        let mut reported_usage = ReportedUsageConfig::default();
-        reported_usage.path_overrides.insert(
-            "/cc/v1".to_string(),
-            ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::sample_input_max(32),
-                ..ReportedUsagePathPolicy::default()
-            },
-        );
-
+        let mut config = Config::default();
+        config.routes.route_mut("/cc/v1").reported_usage = Some(ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(32),
+            ..Default::default()
+        });
         assert_eq!(
-            reported_usage.policy_for_path("/v1/messages").input.mode,
+            config
+                .cache_policy_for_path("/v1/messages")
+                .policy
+                .reported_usage
+                .input
+                .mode,
             ReportedUsageFieldMode::Raw
         );
         assert_eq!(
-            reported_usage
-                .policy_for_path("/v1/messages")
+            config
+                .cache_policy_for_path("/v1/messages")
+                .policy
+                .reported_usage
                 .final_cache_read_max_tokens,
             700_000
         );
         assert_eq!(
-            reported_usage
-                .policy_for_path("/cc/v1/messages")
+            config
+                .cache_policy_for_path("/cc/v1/messages")
+                .policy
+                .reported_usage
                 .input
                 .max_tokens,
             32
         );
         assert_eq!(
-            reported_usage.policy_for_path("/cc/other").input.max_tokens,
+            config
+                .cache_policy_for_path("/cc/other")
+                .policy
+                .reported_usage
+                .input
+                .max_tokens,
             96
         );
-        assert!(!reported_usage.path_overrides.contains_key("/na"));
-        assert!(reported_usage.policy_for_path("/na/v1/messages").enabled);
+        assert!(config.routes.route_mut("/na").reported_usage.is_none());
+        assert!(config.routes.route_mut("/na").reported_usage.is_none());
     }
 
     #[test]
-    fn defined_cache_routes_normalize_and_reject_unsafe_paths() {
+    fn legacy_defined_cache_routes_normalize_and_reject_unsafe_paths() {
         assert_eq!(
             normalize_defined_cache_route("dfcache/CC"),
             Some("/dfcache/cc".to_string())
         );
         assert_eq!(
-            normalize_defined_cache_routes(&[
+            normalize_legacy_defined_cache_routes(&[
                 "/dfcache/aa".to_string(),
                 "/dfcache/aa/".to_string(),
                 "dfcache/bb".to_string(),
@@ -6322,16 +6228,6 @@ mod tests {
                     input: ReportedUsageFieldPolicy::raw(),
                     ..ReportedUsagePathPolicy::default()
                 },
-                path_overrides: [(
-                    "/ha".to_string(),
-                    ReportedUsagePathPolicy {
-                        input: ReportedUsageFieldPolicy::sample_input_max(500),
-                        cache_creation: ReportedUsageFieldPolicy::sample_target(150_000),
-                        ..ReportedUsagePathPolicy::default()
-                    },
-                )]
-                .into_iter()
-                .collect(),
             },
             cache_policy: CachePolicyConfig {
                 default: CacheRoutePolicyPatch {
@@ -6344,20 +6240,20 @@ mod tests {
                     reported_usage: Some(current_high_cache_reported_usage),
                     ..CacheRoutePolicyPatch::default()
                 },
-                path_overrides: [(
-                    "/ha".to_string(),
-                    CacheRoutePolicyPatch {
-                        cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                        ..CacheRoutePolicyPatch::default()
-                    },
-                )]
-                .into_iter()
-                .collect(),
                 ..CachePolicyConfig::default()
             },
             ..Config::default()
         };
 
+        config.routes.route_mut("/ha").reported_usage = Some(ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(500),
+            cache_creation: ReportedUsageFieldPolicy::sample_target(150_000),
+            ..ReportedUsagePathPolicy::default()
+        });
+        config.routes.route_mut("/ha").cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            ..CacheRoutePolicyPatch::default()
+        };
         let ha = config.cache_policy_for_path("/ha/v1/messages");
         assert_eq!(
             ha.policy.cache_type,
@@ -6377,17 +6273,14 @@ mod tests {
             150_000
         );
 
-        config.cache_policy.path_overrides.insert(
-            "/ha".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                reported_usage: Some(ReportedUsagePathPolicy {
-                    input: ReportedUsageFieldPolicy::sample_input_max(42),
-                    ..ReportedUsagePathPolicy::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        config.routes.route_mut(&"/ha".to_string()).cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(42),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
 
         let explicit_ha = config.cache_policy_for_path("/ha/v1/messages");
         assert_eq!(explicit_ha.policy.reported_usage.input.max_tokens, 42);
@@ -6396,16 +6289,18 @@ mod tests {
     #[test]
     fn cache_policy_preserves_cache_type_only_override() {
         let mut config = Config::default();
-        config.cache_policy.path_overrides.insert(
-            "/tool".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        config.routes.route_mut(&"/tool".to_string()).cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+            ..CacheRoutePolicyPatch::default()
+        };
 
-        let normalized = config.cache_policy.normalized();
-        assert!(normalized.path_overrides.contains_key("/tool"));
+        assert!(
+            config
+                .routes
+                .routes
+                .iter()
+                .any(|route| route.prefix == "/tool")
+        );
 
         let resolved = config.cache_policy_for_path("/tool/v1/messages");
         assert_eq!(resolved.namespace.as_deref(), Some("/tool"));
@@ -6547,7 +6442,7 @@ mod tests {
 
     #[test]
     fn stable_segment_cache_policy_deserializes_template_and_path_patch() {
-        let mut config: Config = serde_json::from_value(serde_json::json!({
+        let mut config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "stableSegmentCache": {
                     "reportedUsage": {
@@ -6576,11 +6471,7 @@ mod tests {
             }
         }))
         .expect("deserialize config");
-        config.cache_policy = config
-            .cache_policy
-            .with_builtin_path_defaults()
-            .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
-            .normalized();
+        config.routes = config.routes.with_builtin_path_defaults();
 
         let builtin = config.cache_policy_for_path("/cc/v1/messages");
         assert_eq!(
@@ -6623,7 +6514,7 @@ mod tests {
 
     #[test]
     fn kiro_rs_tool_plus_policy_resolves_template_and_path_override() {
-        let mut config: Config = serde_json::from_value(serde_json::json!({
+        let mut config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "kiroRsToolPlus": {
                     "hitShaping": { "enabled": true },
@@ -6650,8 +6541,8 @@ mod tests {
         .expect("deserialize config");
         config.cache_policy = config.cache_policy.normalized();
         config
-            .cache_policy
-            .validate(config.legacy_cache_route_policy_default())
+            .routes
+            .validate_with_config(&config)
             .expect("valid plus policy");
 
         let template = config.cache_policy_for_path("/plus/v1/messages");
@@ -6700,7 +6591,7 @@ mod tests {
 
     #[test]
     fn bounded_high_cache_policy_resolves_own_template_and_path_override() {
-        let mut config: Config = serde_json::from_value(serde_json::json!({
+        let mut config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "default": { "hitShaping": { "enabled": true, "minCostRatio": 0.9 } },
                 "currentHighCache": { "hitShaping": { "targetHitRatio": 0.6 } },
@@ -6724,8 +6615,8 @@ mod tests {
         .expect("deserialize config");
         config.cache_policy = config.cache_policy.normalized();
         config
-            .cache_policy
-            .validate(config.legacy_cache_route_policy_default())
+            .routes
+            .validate_with_config(&config)
             .expect("valid bounded policy");
 
         let template = config.cache_policy_for_path("/bounded/v1/messages");
@@ -6761,7 +6652,7 @@ mod tests {
 
     #[test]
     fn kiro_rs_tool_plus_policy_rejects_invalid_path_override() {
-        let config: Config = serde_json::from_value(serde_json::json!({
+        let config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "pathOverrides": {
                     "/plus": {
@@ -6775,15 +6666,15 @@ mod tests {
         }))
         .expect("deserialize config");
         let err = config
-            .cache_policy
-            .validate(config.legacy_cache_route_policy_default())
+            .routes
+            .validate_with_config(&config)
             .expect_err("min > max should fail");
         assert!(err.contains("kiroRsToolPlus.shaping.output"), "{err}");
     }
 
     #[test]
     fn kiro_rs_tool_cache_policy_deserializes_template_and_path_patch() {
-        let mut config: Config = serde_json::from_value(serde_json::json!({
+        let mut config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "kiroRsTool": {
                     "reportedUsage": {
@@ -6813,11 +6704,7 @@ mod tests {
             }
         }))
         .expect("deserialize config");
-        config.cache_policy = config
-            .cache_policy
-            .with_builtin_path_defaults()
-            .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
-            .normalized();
+        config.routes = config.routes.with_builtin_path_defaults();
 
         let template = config.cache_policy_for_path("/cc/v1/messages");
         assert_eq!(
@@ -6868,7 +6755,7 @@ mod tests {
 
     #[test]
     fn kiro_rs_tool_cache_policy_rejects_invalid_values() {
-        let config: Config = serde_json::from_value(serde_json::json!({
+        let config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "pathOverrides": {
                     "/dfcache/bad": {
@@ -6883,12 +6770,12 @@ mod tests {
         .expect("deserialize config");
 
         let err = config
-            .cache_policy
-            .validate(config.legacy_cache_route_policy_default())
+            .routes
+            .validate_with_config(&config)
             .expect_err("invalid coverage ratio should fail");
         assert!(err.contains("coverageRatio"));
 
-        let invalid_range: Config = serde_json::from_value(serde_json::json!({
+        let invalid_range: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "pathOverrides": {
                     "/dfcache/bad-range": {
@@ -6904,8 +6791,8 @@ mod tests {
         .expect("deserialize config");
 
         let err = invalid_range
-            .cache_policy
-            .validate(invalid_range.legacy_cache_route_policy_default())
+            .routes
+            .validate_with_config(&invalid_range)
             .expect_err("invalid reported input range should fail");
         assert!(err.contains("reportedInputMinTokens"));
     }
@@ -6926,23 +6813,23 @@ mod tests {
             },
             ..Config::default()
         };
-        config.cache_policy.path_overrides.insert(
-            "/dfcache/team-a".to_string(),
-            CacheRoutePolicyPatch {
-                creation_control: Some(PromptCacheCreationControlConfig {
-                    enabled: true,
-                    scope_mode: PromptCacheCreationControlScopeMode::CredentialConversationModel,
-                    min_successful_requests_between_creation: 2,
-                    min_creation_interval_secs: 30,
-                    min_creation_delta_tokens: 8000,
-                    max_creation_tokens_per_event: 12000,
-                    creation_budget_window_secs: 180,
-                    max_creation_tokens_per_window: 50000,
-                    expire_after_idle_secs: 900,
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        config
+            .routes
+            .route_mut(&"/dfcache/team-a".to_string())
+            .cache_policy = CacheRoutePolicyPatch {
+            creation_control: Some(PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode: PromptCacheCreationControlScopeMode::CredentialConversationModel,
+                min_successful_requests_between_creation: 2,
+                min_creation_interval_secs: 30,
+                min_creation_delta_tokens: 8000,
+                max_creation_tokens_per_event: 12000,
+                creation_budget_window_secs: 180,
+                max_creation_tokens_per_window: 50000,
+                expire_after_idle_secs: 900,
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
 
         let overridden = config.cache_policy_for_path("/dfcache/team-a/v1/messages");
         assert_eq!(overridden.namespace.as_deref(), Some("/dfcache/team-a"));
@@ -6983,16 +6870,16 @@ mod tests {
     #[test]
     fn cache_policy_reported_usage_only_override_does_not_split_cache_scope() {
         let mut config = Config::default();
-        config.cache_policy.path_overrides.insert(
-            "/reports".to_string(),
-            CacheRoutePolicyPatch {
-                reported_usage: Some(ReportedUsagePathPolicy {
-                    input: ReportedUsageFieldPolicy::sample_input_max(64),
-                    ..ReportedUsagePathPolicy::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        config
+            .routes
+            .route_mut(&"/reports".to_string())
+            .cache_policy = CacheRoutePolicyPatch {
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(64),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
 
         let resolved = config.cache_policy_for_path("/reports/v1/messages");
 
@@ -7007,38 +6894,29 @@ mod tests {
     #[test]
     fn builtin_route_cache_strategy_is_config_driven() {
         let mut config = Config::default();
-        config.cache_policy.path_overrides.insert(
-            "/cc".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::NoCache),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-        config.cache_policy.path_overrides.insert(
-            "/na".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                route_namespace: Some(false),
-                simulation: Some(CacheSimulationPolicyPatch {
-                    enabled: Some(true),
-                    target_read_ratio: Some(0.72),
-                    ..CacheSimulationPolicyPatch::default()
-                }),
-                reported_usage: Some(ReportedUsagePathPolicy {
-                    input: ReportedUsageFieldPolicy::sample_input_max(77),
-                    ..ReportedUsagePathPolicy::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-        config.cache_policy.path_overrides.insert(
-            "/ha".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                route_namespace: Some(true),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        config.routes.route_mut(&"/cc".to_string()).cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::NoCache),
+            ..CacheRoutePolicyPatch::default()
+        };
+        config.routes.route_mut(&"/na".to_string()).cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(false),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.72),
+                ..CacheSimulationPolicyPatch::default()
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(77),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
+        config.routes.route_mut(&"/ha".to_string()).cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(true),
+            ..CacheRoutePolicyPatch::default()
+        };
 
         let cc = config.cache_policy_for_path("/cc/v1/messages");
         assert_eq!(cc.policy.cache_type, PromptCacheStrategyType::NoCache);
@@ -7065,52 +6943,29 @@ mod tests {
 
     #[test]
     fn cache_policy_builtin_defaults_do_not_overwrite_existing_path() {
-        let mut cache_policy = CachePolicyConfig::default();
-        cache_policy.path_overrides.insert(
-            "/cc".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-
-        cache_policy.path_overrides.insert(
-            "/na".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                simulation: Some(CacheSimulationPolicyPatch {
-                    enabled: Some(true),
-                    ..CacheSimulationPolicyPatch::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
-
-        let with_builtins = cache_policy.with_builtin_path_defaults();
-        for prefix in ["/v1", "/cc", "/ha", "/na"] {
-            assert!(with_builtins.path_overrides.contains_key(prefix));
+        let mut routes = RoutesConfig::default();
+        routes.route_mut("/cc").cache_policy.cache_type = Some(PromptCacheStrategyType::KiroRsTool);
+        routes.route_mut("/na").cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut routes = routes.with_builtin_path_defaults();
+        for prefix in ["", "/cc", "/ha", "/na"] {
+            assert!(routes.routes.iter().any(|route| route.prefix == prefix));
         }
         assert_eq!(
-            with_builtins
-                .path_overrides
-                .get("/cc")
-                .and_then(|policy| policy.cache_type),
+            routes.route_mut("/cc").cache_policy.cache_type,
             Some(PromptCacheStrategyType::KiroRsTool)
         );
         assert_eq!(
-            with_builtins
-                .path_overrides
-                .get("/na")
-                .and_then(|policy| policy.cache_type),
+            routes.route_mut("/na").cache_policy.cache_type,
             Some(PromptCacheStrategyType::CurrentHighCache)
         );
-        assert!(
-            with_builtins
-                .path_overrides
-                .get("/na")
-                .and_then(|policy| policy.simulation)
-                .is_some()
-        );
+        assert!(routes.route_mut("/na").cache_policy.simulation.is_some());
     }
 
     #[test]
@@ -7133,10 +6988,9 @@ mod tests {
 
     #[test]
     fn cache_policy_legacy_defined_cache_routes_default_to_current_strategy() {
-        let config = Config {
-            defined_cache_routes: vec!["/dfcache/team-a".to_string()],
-            ..Default::default()
-        };
+        let config =
+            Config::from_json_value(serde_json::json!({"definedCacheRoutes": ["/dfcache/team-a"]}))
+                .unwrap();
 
         let resolved = config.cache_policy_for_path("/dfcache/team-a/v1/messages");
 
@@ -7150,101 +7004,93 @@ mod tests {
     #[test]
     fn cache_policy_validation_rejects_invalid_path_values() {
         let mut config = Config::default();
-        config.cache_policy.path_overrides.insert(
-            "/bad".to_string(),
-            CacheRoutePolicyPatch {
-                simulation: Some(CacheSimulationPolicyPatch {
-                    target_read_ratio: Some(1.5),
-                    ..CacheSimulationPolicyPatch::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        config.routes.route_mut(&"/bad".to_string()).cache_policy = CacheRoutePolicyPatch {
+            simulation: Some(CacheSimulationPolicyPatch {
+                target_read_ratio: Some(1.5),
+                ..CacheSimulationPolicyPatch::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
 
-        assert!(
-            config
-                .cache_policy
-                .validate(config.legacy_cache_route_policy_default())
-                .is_err()
-        );
+        assert!(config.routes.validate_with_config(&config).is_err());
 
         let mut invalid_prefix = Config::default();
         invalid_prefix
-            .cache_policy
-            .path_overrides
-            .insert(" ".to_string(), CacheRoutePolicyPatch::default());
+            .routes
+            .routes
+            .push(crate::model::routes::RouteConfig::new(" "));
         assert!(
             invalid_prefix
-                .cache_policy
-                .validate(invalid_prefix.legacy_cache_route_policy_default())
+                .routes
+                .validate_with_config(&invalid_prefix)
                 .is_err()
         );
 
         let mut invalid_creation_control = Config::default();
-        invalid_creation_control.cache_policy.path_overrides.insert(
-            "/bad-creation".to_string(),
-            CacheRoutePolicyPatch {
-                creation_control: Some(PromptCacheCreationControlConfig {
-                    min_creation_delta_tokens: -1,
-                    ..PromptCacheCreationControlConfig::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        invalid_creation_control
+            .routes
+            .route_mut(&"/bad-creation".to_string())
+            .cache_policy = CacheRoutePolicyPatch {
+            creation_control: Some(PromptCacheCreationControlConfig {
+                min_creation_delta_tokens: -1,
+                ..PromptCacheCreationControlConfig::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
         assert!(
             invalid_creation_control
-                .cache_policy
-                .validate(invalid_creation_control.legacy_cache_route_policy_default())
+                .routes
+                .validate_with_config(&invalid_creation_control)
                 .is_err()
         );
 
         let mut invalid_bounds = Config::default();
-        invalid_bounds.cache_policy.path_overrides.insert(
-            "/bad-bounds".to_string(),
-            CacheRoutePolicyPatch {
-                bounds: Some(CacheBoundsPolicyPatch {
-                    entry_ttl_secs: Some(0),
-                    ..CacheBoundsPolicyPatch::default()
-                }),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        invalid_bounds
+            .routes
+            .route_mut(&"/bad-bounds".to_string())
+            .cache_policy = CacheRoutePolicyPatch {
+            bounds: Some(CacheBoundsPolicyPatch {
+                entry_ttl_secs: Some(0),
+                ..CacheBoundsPolicyPatch::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
         assert!(
             invalid_bounds
-                .cache_policy
-                .validate(invalid_bounds.legacy_cache_route_policy_default())
+                .routes
+                .validate_with_config(&invalid_bounds)
                 .is_err()
         );
 
         let mut invalid_stable_segment = Config::default();
-        invalid_stable_segment.cache_policy.path_overrides.insert(
-            "/bad-stable".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::StableSegmentCache),
-                stable_segment: Some(Box::new(StableSegmentCachePolicyPatch {
-                    coverage_ratio: Some(1.5),
-                    default_ttl_secs: Some(300),
-                    extended_ttl_secs: Some(60),
-                    ..StableSegmentCachePolicyPatch::default()
-                })),
-                ..CacheRoutePolicyPatch::default()
-            },
-        );
+        invalid_stable_segment
+            .routes
+            .route_mut(&"/bad-stable".to_string())
+            .cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::StableSegmentCache),
+            stable_segment: Some(Box::new(StableSegmentCachePolicyPatch {
+                coverage_ratio: Some(1.5),
+                default_ttl_secs: Some(300),
+                extended_ttl_secs: Some(60),
+                ..StableSegmentCachePolicyPatch::default()
+            })),
+            ..CacheRoutePolicyPatch::default()
+        };
         assert!(
             invalid_stable_segment
-                .cache_policy
-                .validate(invalid_stable_segment.legacy_cache_route_policy_default())
+                .routes
+                .validate_with_config(&invalid_stable_segment)
                 .is_err()
         );
     }
 
     #[test]
     fn inference_attempt_budget_uses_compatible_default_and_preserves_explicit_value() {
-        let historical: Config = serde_json::from_str("{}").unwrap();
+        let historical: Config = Config::from_json_str("{}").unwrap();
         assert_eq!(historical.inference_upstream_max_attempts, 4);
 
         let explicit: Config =
-            serde_json::from_str(r#"{"inferenceUpstreamMaxAttempts":7}"#).unwrap();
+            Config::from_json_str(r#"{"inferenceUpstreamMaxAttempts":7}"#).unwrap();
         assert_eq!(explicit.inference_upstream_max_attempts, 7);
     }
 }

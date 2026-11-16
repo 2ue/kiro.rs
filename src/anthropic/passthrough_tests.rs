@@ -22,8 +22,9 @@ fn state() -> AppState {
 
 async fn patched(raw: &Bytes, features: RouteFeatureSet) -> Bytes {
     let state = state();
-    let mut runtime = RequestRuntimeConfig::from_config(&Config::default());
-    runtime.route_features.defaults = features;
+    let mut config = Config::default();
+    config.route_features.defaults = features;
+    let runtime = RequestRuntimeConfig::from_config(&config);
     request_entry::route_body_patches(&state, &HeaderMap::new(), "/cc/v1/messages", raw, &runtime)
         .await
         .unwrap()
@@ -328,13 +329,11 @@ async fn passthrough_invalid_json_error_has_public_id() {
 async fn passthrough_count_tokens_image_processing_uses_route_feature() {
     let state = state();
     state.runtime.install_local(|config| {
-        config.route_features.path_overrides.insert(
-            "/images".into(),
+        config.routes.route_mut("/images").features =
             crate::model::prompt_injection::RouteFeatureOverride {
                 image_processing: Some(Some(ImageProcessingConfig::default())),
                 ..Default::default()
-            },
-        );
+            };
     });
     for (endpoint, expected_status) in [
         ("/v1/messages/count_tokens", StatusCode::OK),

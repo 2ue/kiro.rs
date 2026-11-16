@@ -56,6 +56,8 @@ impl ErrorResponse {
 /// RFC3339 `created_at`）的超集，保留旧的 `object`/`created`/`owned_by` 字段兼容已有客户端。
 #[derive(Debug, Serialize, Clone)]
 pub struct Model {
+    #[serde(skip)]
+    pub listed: bool,
     pub id: String,
     pub object: String,
     pub created: i64,
@@ -366,6 +368,7 @@ mod tests {
     fn listed(ids: &[&str]) -> Vec<Model> {
         ids.iter()
             .map(|id| Model {
+                listed: true,
                 id: id.to_string(),
                 object: "model".to_string(),
                 created: 0,

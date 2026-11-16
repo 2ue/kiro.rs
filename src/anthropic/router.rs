@@ -24,8 +24,8 @@ use super::{
     envelope,
     handlers::{
         count_tokens, count_tokens_cc, count_tokens_dfcache, count_tokens_ha, count_tokens_na,
-        get_model, get_model_dfcache, get_models, get_models_dfcache, post_messages,
-        post_messages_cc, post_messages_dfcache, post_messages_ha, post_messages_na,
+        get_model, get_models, post_messages, post_messages_cc, post_messages_dfcache,
+        post_messages_ha, post_messages_na,
     },
     middleware::{AppState, auth_middleware, capture_http_ingress, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
@@ -61,7 +61,7 @@ pub struct AnthropicRouterConfig {
     prompt_cache_bounds: PromptCacheBounds,
     reported_usage: ReportedUsageConfig,
     cache_policy: CachePolicyConfig,
-    defined_cache_routes: Vec<String>,
+    routes: crate::model::routes::RoutesConfig,
     compat_profile: CompatProfile,
     prompt_injection: PromptInjectionConfig,
     route_features: RouteFeaturesConfig,
@@ -97,7 +97,7 @@ impl AnthropicRouterConfig {
             ),
             reported_usage: config.reported_usage.clone(),
             cache_policy: config.cache_policy.clone(),
-            defined_cache_routes: config.defined_cache_routes.clone(),
+            routes: config.routes.clone(),
             compat_profile: config.compat_profile,
             prompt_injection: config.prompt_injection.clone().normalized(),
             route_features: config.route_features.clone().normalized(),
@@ -204,7 +204,7 @@ pub fn create_router(
         prompt_cache_bounds,
         reported_usage,
         cache_policy,
-        defined_cache_routes,
+        routes,
         compat_profile,
         prompt_injection,
         route_features,
@@ -244,7 +244,7 @@ pub fn create_router(
     .with_prompt_cache_bounds(prompt_cache_bounds)
     .with_reported_usage(reported_usage)
     .with_cache_policy(cache_policy)
-    .with_defined_cache_routes(defined_cache_routes)
+    .with_routes(routes)
     .with_prompt_injection(prompt_injection, route_features)
     .with_model_resolution_mode(model_resolution_mode)
     .with_model_mapping(model_mapping)
@@ -290,6 +290,10 @@ pub fn create_router(
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
             v1_state.clone(),
+            super::middleware::route_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            v1_state.clone(),
             auth_middleware,
         ))
         .with_state(v1_state);
@@ -308,6 +312,10 @@ pub fn create_router(
         .route("/messages/count_tokens", post(count_tokens_na))
         // Set before the auth layer so method probing still requires a key.
         .method_not_allowed_fallback(method_not_allowed)
+        .layer(middleware::from_fn_with_state(
+            na_v1_state.clone(),
+            super::middleware::route_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             na_v1_state.clone(),
             auth_middleware,
@@ -330,6 +338,10 @@ pub fn create_router(
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
             cc_v1_state.clone(),
+            super::middleware::route_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            cc_v1_state.clone(),
             auth_middleware,
         ))
         .with_state(cc_v1_state);
@@ -350,15 +362,19 @@ pub fn create_router(
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
             ha_v1_state.clone(),
+            super::middleware::route_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            ha_v1_state.clone(),
             auth_middleware,
         ))
         .with_state(ha_v1_state);
 
-    // 需要认证的 /dfcache/{route}/v1 路由。
-    // route 必须在 definedCacheRoutes 中显式定义，避免未知路径被默认放行。
+    // 自定义入口与兼容的 /dfcache/{route}/v1 入口共用处理器。
+    // 前缀必须在 routes 中显式定义。
     let dfcache_routes = Router::new()
-        .route("/{route}/v1/models", get(get_models_dfcache))
-        .route("/{route}/v1/models/{model_id}", get(get_model_dfcache))
+        .route("/{route}/v1/models", get(get_models))
+        .route("/{route}/v1/models/{model_id}", get(get_model))
         .route(
             "/{route}/v1/messages",
             post(post_messages_dfcache).layer(middleware::from_fn_with_state(
@@ -374,6 +390,10 @@ pub fn create_router(
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
             define_cache_state.clone(),
+            super::middleware::route_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            define_cache_state.clone(),
             auth_middleware,
         ))
         .with_state(define_cache_state);
@@ -387,7 +407,8 @@ pub fn create_router(
         .nest("/na/v1", na_v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .nest("/ha/v1", ha_v1_routes)
-        .nest("/dfcache", dfcache_routes)
+        .nest("/dfcache", dfcache_routes.clone())
+        .merge(dfcache_routes)
         .fallback(route_not_found)
         .layer(middleware::map_response(mark_non_retryable_client_errors))
         .layer(cors_layer())
@@ -569,7 +590,14 @@ mod tests {
                 .map(|(index, _)| format!("actual-route-{round}-{index}"))
                 .collect::<Vec<_>>();
             let mut config = Config::default();
-            config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+            config.routes.route_mut("/dfcache/demo").cache_policy =
+                crate::model::config::CacheRoutePolicyPatch {
+                    cache_type: Some(
+                        crate::model::config::PromptCacheStrategyType::CurrentHighCache,
+                    ),
+                    route_namespace: Some(true),
+                    ..Default::default()
+                };
             let app = create_router(
                 AnthropicRouterDependencies {
                     request_api_keys: Arc::new(RequestApiKeyStore::new(&keys)),
@@ -630,7 +658,12 @@ mod tests {
             "/dfcache/demo/v1/messages",
         ];
         let mut config = Config::default();
-        config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+        config.routes.route_mut("/dfcache/demo").cache_policy =
+            crate::model::config::CacheRoutePolicyPatch {
+                cache_type: Some(crate::model::config::PromptCacheStrategyType::CurrentHighCache),
+                route_namespace: Some(true),
+                ..Default::default()
+            };
         let app = create_router(
             AnthropicRouterDependencies {
                 request_api_keys: Arc::new(RequestApiKeyStore::new(["body-limit-key"])),
@@ -693,7 +726,12 @@ mod tests {
 
     fn test_router(keys: &[&str]) -> Router {
         let mut config = Config::default();
-        config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+        config.routes.route_mut("/dfcache/demo").cache_policy =
+            crate::model::config::CacheRoutePolicyPatch {
+                cache_type: Some(crate::model::config::PromptCacheStrategyType::CurrentHighCache),
+                route_namespace: Some(true),
+                ..Default::default()
+            };
         create_router(
             AnthropicRouterDependencies {
                 request_api_keys: Arc::new(RequestApiKeyStore::new(keys)),

@@ -417,6 +417,8 @@ pub struct UsagePublicError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecord {
+    #[serde(default)]
+    pub account_cost_usd: f64,
     pub id: String,
     pub created_at: String,
     pub endpoint: String,
@@ -614,6 +616,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
     let request_context = request_context.unwrap_or_default();
 
     UsageRecord {
+        account_cost_usd: 0.0,
         id: request_id.to_string(),
         created_at: Utc::now().to_rfc3339(),
         endpoint: endpoint.to_string(),
@@ -4415,6 +4418,7 @@ mod tests {
         created_at: String,
     ) -> UsageRecord {
         UsageRecord {
+            account_cost_usd: 0.0,
             id: id.to_string(),
             created_at,
             endpoint: "/v1/messages".to_string(),

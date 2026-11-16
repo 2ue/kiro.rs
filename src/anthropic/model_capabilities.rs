@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::anthropic::types::Model;
 use crate::model::config::{ModelMappingConfig, ModelMappingRuleKind, ModelResolutionMode};
 
+fn default_listed() -> bool {
+    true
+}
+
 pub const SEED_SOURCE: &str = "anthropic-seed";
 pub const MANUAL_SOURCE: &str = "manual";
 const SEED_JSON: &str = include_str!("../../data/anthropic-models.seed.json");
@@ -14,6 +18,8 @@ const SEED_JSON: &str = include_str!("../../data/anthropic-models.seed.json");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCapabilityItem {
+    #[serde(default = "default_listed")]
+    pub listed: bool,
     pub model: String,
     pub display_name: String,
     pub description: Option<String>,
@@ -147,6 +153,7 @@ impl ModelCapabilitiesCatalog {
             models.insert(
                 item.model.clone(),
                 Model {
+                    listed: item.listed,
                     id: item.model,
                     object: "model".to_string(),
                     created,
@@ -165,6 +172,14 @@ impl ModelCapabilitiesCatalog {
                 continue;
             }
             let resolution = resolve_model_with_catalog(&model.id, &upstream_ids);
+            if resolution
+                .upstream_model
+                .as_ref()
+                .and_then(|id| models.get(id))
+                .is_some_and(|entry| !entry.listed)
+            {
+                continue;
+            }
             if !matches!(
                 resolution.source,
                 ModelResolutionSource::Unsupported | ModelResolutionSource::PassThrough
@@ -189,7 +204,12 @@ impl ModelCapabilitiesCatalog {
     /// hyphenated ids (never Kiro's dotted ids), without aliases or `-thinking` / `[1m]`
     /// variants. Those names stay valid as request models; they are just not listed.
     pub fn standard_anthropic_models(&self) -> Vec<Model> {
-        standardize_model_listing(self.anthropic_models())
+        standardize_model_listing(
+            self.anthropic_models()
+                .into_iter()
+                .filter(|model| model.listed)
+                .collect(),
+        )
     }
 
     /// Looks up one listed model. Accepts the listed id as well as request-side spellings
@@ -1111,6 +1131,7 @@ fn static_model_capabilities() -> Vec<ModelCapabilityItem> {
     static_anthropic_models()
         .into_iter()
         .map(|model| ModelCapabilityItem {
+            listed: true,
             model: model.id,
             display_name: model.display_name,
             description: None,
@@ -1286,6 +1307,7 @@ pub fn static_anthropic_models() -> Vec<Model> {
     specs
         .into_iter()
         .map(|(id, display_name, created, max_tokens)| Model {
+            listed: true,
             id: id.to_string(),
             object: "model".to_string(),
             created,
@@ -2136,6 +2158,28 @@ mod tests {
         let mut deduped = ids.clone();
         deduped.dedup();
         assert_eq!(ids, deduped);
+    }
+
+    #[test]
+    fn unlisted_catalog_entries_are_not_resynthesized_by_compatibility_models() {
+        let catalog = ModelCapabilitiesCatalog::new();
+        let mut status = ModelCapabilitiesCatalog::seed_status();
+        for item in &mut status.models {
+            if item.model.contains("sonnet") {
+                item.listed = false;
+            }
+        }
+        catalog.load_persisted_status(status);
+        let models = catalog.standard_anthropic_models();
+        assert!(!models.is_empty());
+        assert!(models.iter().all(|model| !model.id.contains("sonnet")));
+        for id in [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4.5-thinking",
+            "sonnet-thinking",
+        ] {
+            assert!(catalog.standard_anthropic_model(id).is_none(), "{id}");
+        }
     }
 
     #[test]

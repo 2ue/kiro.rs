@@ -55,7 +55,7 @@ SELECT id, name, base_url, api_key, auth_type, enabled, priority,
        auto_disabled_until, auto_disabled_last_error,
        normalize_model_version_dots, model_mapping_mode,
        model_mapping_require_match, model_mapping_rules, supported_models,
-       route_mode, route_rules, notes,
+       route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
        revision, created_at, updated_at
 FROM external_upstream_pools
 WHERE deleted_at IS NULL
@@ -83,6 +83,30 @@ struct RequiredPostgresColumn {
 }
 
 const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "tags",
+    },
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "proxy_url",
+    },
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "cost_multiplier",
+    },
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "overrides",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_capabilities",
+        column_name: "listed",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "account_cost_usd",
+    },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
         column_name: "total_compat_input_tokens",
@@ -970,8 +994,16 @@ impl PostgresStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        let value: serde_json::Value = row.try_get("config")?;
+        let mut value: serde_json::Value = row.try_get("config")?;
+        let previous_migration = value
+            .get("runtimeConfigMigrationVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let migrated = crate::model::routes::migrate_path_overrides_to_routes(&mut value);
         let mut config: Config = serde_json::from_value(value)?;
+        if migrated {
+            config.runtime_config_migration_version = previous_migration.min(1);
+        }
         config.set_config_path_for_runtime(None);
         // 升级过程中旧版本实例可能写回旧的提示词字段；每次加载都转换，热加载也能拿到新结构。
         Ok(Some(config))
@@ -986,7 +1018,15 @@ impl PostgresStore {
         &self,
         config: &Config,
     ) -> anyhow::Result<i64> {
-        let value = serde_json::to_value(config)?;
+        config
+            .routes
+            .validate_with_config(config)
+            .map_err(anyhow::Error::msg)?;
+        let mut normalized = config.clone();
+        for route in &mut normalized.routes.routes {
+            route.prefix = crate::model::routes::normalize_route_prefix(&route.prefix);
+        }
+        let value = serde_json::to_value(normalized)?;
         let row = sqlx::query(
             r#"
             INSERT INTO runtime_config (id, config, updated_at)
@@ -1139,7 +1179,7 @@ impl PostgresStore {
                    auto_disabled_until, auto_disabled_last_error,
                    normalize_model_version_dots, model_mapping_mode,
                    model_mapping_require_match, model_mapping_rules, supported_models,
-                   route_mode, route_rules, notes,
+                   route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
                    revision, created_at, updated_at
             FROM external_upstream_pools
             WHERE id = $1 AND deleted_at IS NULL
@@ -1213,12 +1253,17 @@ impl PostgresStore {
             &request.base_url,
             request.max_concurrent_requests,
         )?;
+        crate::external_pool::validate_account_fields(
+            request.proxy_url.as_deref(),
+            request.cost_multiplier,
+            &request.overrides,
+        )?;
         let model_mapping_rules =
             normalize_external_pool_model_mapping_rules(request.model_mapping_rules);
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let supported_models = normalize_supported_models(request.supported_models);
         let supported_models_value = serde_json::to_value(&supported_models)?;
-        validate_external_pool_route_rules(&request.route_rules)?;
+        validate_account_route_rules(&request.route_rules)?;
         let route_rules = normalize_route_rules(&request.route_rules);
         let route_rules_value = serde_json::to_value(&route_rules)?;
         let header_overrides = normalize_external_pool_header_overrides(request.header_overrides)?;
@@ -1233,9 +1278,9 @@ impl PostgresStore {
                 wire_profile, tls_profile,
                 normalize_model_version_dots, model_mapping_mode,
                 model_mapping_require_match, model_mapping_rules, supported_models,
-                route_mode, route_rules, notes, updated_at
+                route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
                       auto_disable_policy, pre_output_stream_retry_mode,
@@ -1245,7 +1290,7 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
-                      route_mode, route_rules, notes,
+                      route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
                       revision, created_at, updated_at
             "#,
         )
@@ -1273,6 +1318,10 @@ impl PostgresStore {
         .bind(request.route_mode.as_str())
         .bind(route_rules_value)
         .bind(request.notes.map(|notes| notes.trim().to_string()))
+        .bind(&request.tags)
+        .bind(request.proxy_url.as_deref().filter(|url| !url.trim().is_empty()))
+        .bind(request.cost_multiplier)
+        .bind(serde_json::to_value(&request.overrides)?)
         .fetch_one(&self.pool)
         .await?;
         external_pool_from_row(row, mask_secrets)
@@ -1371,13 +1420,25 @@ impl PostgresStore {
         let route_rules = request
             .route_rules
             .map(|rules| {
-                validate_external_pool_route_rules(&rules)?;
+                validate_account_route_rules(&rules)?;
                 Ok::<_, anyhow::Error>(normalize_route_rules(&rules))
             })
             .transpose()?
             .unwrap_or(current.route_rules);
         let route_rules_value = serde_json::to_value(&route_rules)?;
         let notes = request.notes.or(current.notes);
+        let tags = request.tags.unwrap_or(current.tags);
+        let proxy_url = request
+            .proxy_url
+            .unwrap_or(current.proxy_url)
+            .filter(|url| !url.trim().is_empty());
+        let cost_multiplier = request.cost_multiplier.unwrap_or(current.cost_multiplier);
+        let overrides = request.overrides.unwrap_or(current.overrides);
+        crate::external_pool::validate_account_fields(
+            proxy_url.as_deref(),
+            cost_multiplier,
+            &overrides,
+        )?;
         validate_external_pool_input(&name, &base_url, max_concurrent_requests)?;
         let row = sqlx::query(
             r#"
@@ -1406,6 +1467,7 @@ impl PostgresStore {
                 route_mode = $23,
                 route_rules = $24,
                 notes = $25,
+                tags = $26, proxy_url = $27, cost_multiplier = $28, overrides = $29,
                 revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
@@ -1418,7 +1480,7 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
-                      route_mode, route_rules, notes,
+                      route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
                       revision, created_at, updated_at
             "#,
         )
@@ -1447,6 +1509,10 @@ impl PostgresStore {
         .bind(route_mode.as_str())
         .bind(route_rules_value)
         .bind(notes)
+        .bind(tags)
+        .bind(proxy_url)
+        .bind(cost_multiplier)
+        .bind(serde_json::to_value(&overrides)?)
         .fetch_one(&self.pool)
         .await?;
         Ok(Some(external_pool_from_row(row, mask_secrets)?))
@@ -1493,7 +1559,7 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
-                      route_mode, route_rules, notes,
+                      route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
                       revision, created_at, updated_at
             "#,
         )
@@ -1548,7 +1614,7 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
-                      route_mode, route_rules, notes,
+                      route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
                       revision, created_at, updated_at
             "#,
         )
@@ -1610,7 +1676,7 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models,
-                      route_mode, route_rules, notes,
+                      route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides,
                       revision, created_at, updated_at
             "#,
         )
@@ -1968,11 +2034,11 @@ impl PostgresStore {
                 INSERT INTO model_capabilities (
                     model, display_name, description, max_input_tokens, max_output_tokens,
                     supports_prompt_caching, supported_input_types, source,
-                    last_synced_at, last_error, updated_at
+                    last_synced_at, last_error, updated_at, listed
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), $11)
                 ON CONFLICT (model) DO UPDATE
-                SET display_name = EXCLUDED.display_name,
+                SET listed = EXCLUDED.listed, display_name = EXCLUDED.display_name,
                     description = EXCLUDED.description,
                     max_input_tokens = EXCLUDED.max_input_tokens,
                     max_output_tokens = EXCLUDED.max_output_tokens,
@@ -1994,6 +2060,7 @@ impl PostgresStore {
             .bind(item.source.as_deref().unwrap_or(&status.source))
             .bind(&status.last_synced_at)
             .bind(&status.last_error)
+            .bind(item.listed)
             .execute(&mut *tx)
             .await?;
         }
@@ -2043,7 +2110,7 @@ impl PostgresStore {
             r#"
             SELECT model, display_name, description, max_input_tokens, max_output_tokens,
                    supports_prompt_caching, supported_input_types, source,
-                   last_synced_at, last_error
+                   last_synced_at, last_error, listed
             FROM model_capabilities
             ORDER BY model ASC
             "#,
@@ -2079,6 +2146,7 @@ impl PostgresStore {
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
             models.push(ModelCapabilityItem {
+                listed: row.try_get("listed")?,
                 model: row.try_get("model")?,
                 display_name: row.try_get("display_name")?,
                 description: row.try_get("description")?,
@@ -2100,6 +2168,22 @@ impl PostgresStore {
         }))
     }
 
+    pub async fn promote_account_models(&self, models: &[String]) -> anyhow::Result<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        let mut promoted = Vec::new();
+        for model in models {
+            let Some(model) = crate::external_pool::normalize_catalog_model(model) else {
+                continue;
+            };
+            let inserted = sqlx::query("INSERT INTO model_capabilities (model, display_name, max_input_tokens, max_output_tokens, supports_prompt_caching, supported_input_types, source, listed) VALUES ($1, $1, 200000, 64000, true, ARRAY['TEXT'], 'account_discovery', false) ON CONFLICT (model) DO NOTHING RETURNING model").bind(&model).fetch_optional(&mut *tx).await?;
+            if inserted.is_some() {
+                promoted.push(model);
+            }
+        }
+        tx.commit().await?;
+        Ok(promoted)
+    }
+
     pub async fn save_manual_model(
         &self,
         item: &ModelCapabilityItem,
@@ -2112,11 +2196,11 @@ impl PostgresStore {
             INSERT INTO model_capabilities (
                 model, display_name, description, max_input_tokens, max_output_tokens,
                 supports_prompt_caching, supported_input_types, source,
-                last_synced_at, last_error, updated_at
+                last_synced_at, last_error, updated_at, listed
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, now(), $9)
             ON CONFLICT (model) DO UPDATE
-            SET display_name = EXCLUDED.display_name,
+            SET listed = EXCLUDED.listed, display_name = EXCLUDED.display_name,
                 description = EXCLUDED.description,
                 max_input_tokens = EXCLUDED.max_input_tokens,
                 max_output_tokens = EXCLUDED.max_output_tokens,
@@ -2135,6 +2219,7 @@ impl PostgresStore {
         .bind(item.supports_prompt_caching)
         .bind(&item.supported_input_types)
         .bind(item.source.as_deref().unwrap_or(MANUAL_SOURCE))
+        .bind(item.listed)
         .execute(&mut *tx)
         .await?;
 
@@ -6014,12 +6099,12 @@ async fn upsert_usage_record_in_tx(
             cache_creation_input_tokens, cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens, estimated_cost_usd, original_cost_usd,
             pricing_available, pricing_model, duration_ms, simulated,
-            error_type, error_message, error_detail, data
+            error_type, error_message, error_detail, data, account_cost_usd
         )
         SELECT
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
+            $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
         WHERE $2 >= COALESCE(
             (
                 SELECT cutoff_at
@@ -6059,6 +6144,7 @@ async fn upsert_usage_record_in_tx(
             error_message = EXCLUDED.error_message,
             error_detail = EXCLUDED.error_detail,
             data = EXCLUDED.data,
+            account_cost_usd = EXCLUDED.account_cost_usd,
             updated_at = now()
         WHERE usage_records.deleted_at IS NULL
           AND usage_records.rollup_active
@@ -6093,6 +6179,7 @@ async fn upsert_usage_record_in_tx(
     .bind(&record.error_message)
     .bind(&record.error_detail)
     .bind(value)
+    .bind(record.account_cost_usd)
     .fetch_optional(&mut **tx)
     .await?;
     Ok(applied.is_some())
@@ -8684,7 +8771,7 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     let route_rules_value: serde_json::Value = row
         .try_get("route_rules")
         .map_err(|_| anyhow::anyhow!("route_rules 字段类型无效"))?;
-    let route_rules = decode_external_pool_route_rules(route_rules_value, true)?;
+    let route_rules = decode_account_route_rules(route_rules_value, true)?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
     ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
         .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?;
@@ -8722,7 +8809,7 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     })
 }
 
-fn decode_external_pool_route_rules(
+fn decode_account_route_rules(
     value: serde_json::Value,
     strict_dispatch: bool,
 ) -> anyhow::Result<Vec<String>> {
@@ -8732,11 +8819,11 @@ fn decode_external_pool_route_rules(
     } else {
         serde_json::from_value::<Vec<String>>(value).unwrap_or_default()
     };
-    validate_external_pool_route_rules(&rules)?;
+    validate_account_route_rules(&rules)?;
     Ok(normalize_route_rules(&rules))
 }
 
-fn validate_external_pool_route_rules(rules: &[String]) -> anyhow::Result<()> {
+fn validate_account_route_rules(rules: &[String]) -> anyhow::Result<()> {
     if rules.len() > 200 {
         anyhow::bail!("route_rules 不能超过 200 条");
     }
@@ -8823,7 +8910,7 @@ fn external_pool_from_row_with_policy(
         row.try_get("route_rules")
             .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
     };
-    let route_rules = decode_external_pool_route_rules(route_rules_value, strict_dispatch)?;
+    let route_rules = decode_account_route_rules(route_rules_value, strict_dispatch)?;
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
     let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
@@ -8948,7 +9035,21 @@ fn external_pool_from_row_with_policy(
             anyhow::bail!("base_url 必须包含 host");
         }
     }
+    let proxy_url: Option<String> = row.try_get("proxy_url")?;
+    let cost_multiplier: f64 = row.try_get("cost_multiplier")?;
+    let overrides = serde_json::from_value(row.try_get("overrides")?)?;
+    if strict_dispatch {
+        crate::external_pool::validate_account_fields(
+            proxy_url.as_deref(),
+            cost_multiplier,
+            &overrides,
+        )?;
+    }
     Ok(ExternalPool {
+        tags: row.try_get("tags")?,
+        proxy_url,
+        cost_multiplier,
+        overrides,
         id: id.max(0) as u64,
         revision: revision.max(1) as u64,
         name: row.try_get("name")?,
@@ -9078,6 +9179,10 @@ ALTER TABLE runtime_config
 
 
 CREATE TABLE IF NOT EXISTS external_upstream_pools (
+    tags TEXT[] NOT NULL DEFAULT '{}',
+    proxy_url TEXT,
+    cost_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1,
+    overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
     id BIGSERIAL PRIMARY KEY,
     revision BIGINT NOT NULL DEFAULT 1,
     name TEXT NOT NULL,
@@ -9087,7 +9192,7 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     enabled BOOLEAN NOT NULL DEFAULT true,
     priority INTEGER NOT NULL DEFAULT 100,
     max_concurrent_requests INTEGER NOT NULL DEFAULT 10,
-    usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through',
+    usage_projection_mode TEXT NOT NULL DEFAULT 'current_path_policy',
     stream_response_mode TEXT,
     skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false,
     auto_disable_policy TEXT NOT NULL DEFAULT 'inherit',
@@ -9131,7 +9236,7 @@ ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS max_concurrent_requests INTEGER NOT NULL DEFAULT 10;
 
 ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through';
+    ADD COLUMN IF NOT EXISTS usage_projection_mode TEXT NOT NULL DEFAULT 'current_path_policy';
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS stream_response_mode TEXT;
@@ -9218,6 +9323,41 @@ CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_active_priority
 CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_auto_disabled
     ON external_upstream_pools (auto_disabled, auto_disabled_until)
     WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS usage_records (
+    id TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL,
+    endpoint TEXT NOT NULL,
+    stream BOOLEAN NOT NULL,
+    model TEXT NOT NULL,
+    conversation_id TEXT,
+    credential_id BIGINT,
+    credential_label TEXT,
+    status TEXT NOT NULL,
+    usage_source TEXT NOT NULL,
+    total_input_tokens INTEGER NOT NULL,
+    compat_input_tokens INTEGER NOT NULL,
+    billable_input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_read_input_tokens INTEGER NOT NULL,
+    cache_creation_input_tokens INTEGER NOT NULL,
+    cache_creation_5m_input_tokens INTEGER NOT NULL,
+    cache_creation_1h_input_tokens INTEGER NOT NULL,
+    estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pricing_available BOOLEAN NOT NULL DEFAULT false,
+    pricing_model TEXT,
+    duration_ms BIGINT NOT NULL DEFAULT 0,
+    simulated BOOLEAN NOT NULL DEFAULT false,
+    error_type TEXT,
+    error_message TEXT,
+    error_detail TEXT,
+    data JSONB NOT NULL,
+    deleted_at TIMESTAMPTZ,
+    rollup_active BOOLEAN NOT NULL DEFAULT true,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS usage_cleanup_watermarks (
     scope TEXT PRIMARY KEY,
@@ -9498,6 +9638,7 @@ CREATE TABLE IF NOT EXISTS model_pricing_sync_status (
 );
 
 CREATE TABLE IF NOT EXISTS model_capabilities (
+    listed BOOLEAN NOT NULL DEFAULT true,
     model TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
     description TEXT,
@@ -10011,6 +10152,40 @@ mod tests {
     }
 
     #[test]
+    fn new_account_model_and_usage_columns_are_in_create_table_definitions() {
+        for (table, columns) in [
+            (
+                "external_upstream_pools",
+                vec![
+                    "tags TEXT[]",
+                    "proxy_url TEXT",
+                    "cost_multiplier DOUBLE PRECISION",
+                    "overrides JSONB",
+                ],
+            ),
+            (
+                "model_capabilities",
+                vec!["listed BOOLEAN NOT NULL DEFAULT true"],
+            ),
+            (
+                "usage_records",
+                vec!["account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0"],
+            ),
+        ] {
+            let create = SCHEMA_SQL
+                .split(&format!("CREATE TABLE IF NOT EXISTS {table} ("))
+                .nth(1)
+                .unwrap()
+                .split("\n);")
+                .next()
+                .unwrap();
+            for column in columns {
+                assert!(create.contains(column), "{table}: {column}");
+            }
+        }
+    }
+
+    #[test]
     fn required_postgres_schema_columns_cover_known_upgrade_breakers() {
         let required: HashSet<(&str, &str)> = REQUIRED_POSTGRES_SCHEMA_COLUMNS
             .iter()
@@ -10461,6 +10636,7 @@ mod tests {
 
     fn usage_record(id: &str, cache_read: i32) -> UsageRecord {
         UsageRecord {
+            account_cost_usd: 0.0,
             id: id.to_string(),
             created_at: Utc::now().to_rfc3339(),
             endpoint: "/v1/messages".to_string(),
@@ -12821,6 +12997,7 @@ mod tests {
         };
         let profit_usd = uplifted_cost_usd - raw_cost_usd;
         UsageRecord {
+            account_cost_usd: 0.0,
             id: id.to_string(),
             created_at: Utc::now().to_rfc3339(),
             endpoint: "/cc/v1/messages".to_string(),
@@ -12917,6 +13094,10 @@ mod tests {
 
         let created = store
             .create_external_pool(CreateExternalPoolRequest {
+                tags: Vec::new(),
+                proxy_url: None,
+                cost_multiplier: 1.0,
+                overrides: Default::default(),
                 name: "raw-pool".to_string(),
                 base_url: "https://example.com".to_string(),
                 api_key: "sk-test".to_string(),

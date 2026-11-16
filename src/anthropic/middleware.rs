@@ -26,7 +26,6 @@ use crate::model::config::{
     MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
     PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
     PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
-    normalize_defined_cache_routes,
 };
 
 use super::request_body::MAX_MESSAGES_BODY_SIZE;
@@ -294,8 +293,8 @@ pub struct AppState {
     pub reported_usage: Arc<ReportedUsageConfig>,
     /// 路径级缓存策略覆盖
     pub cache_policy: Arc<CachePolicyConfig>,
-    /// 已定义的 /dfcache/{name} 自定义 high-cache 路由。
-    pub defined_cache_routes: Arc<Vec<String>>,
+    /// 路由定义及对应的策略。
+    pub routes: Arc<crate::model::routes::RoutesConfig>,
     /// Anthropic compatibility profile
     pub compat_profile: CompatProfile,
     /// 请求模型解析策略
@@ -371,7 +370,7 @@ impl AppState {
             prompt_cache_bounds: PromptCacheBounds::default(),
             reported_usage: Arc::new(ReportedUsageConfig::default()),
             cache_policy: Arc::new(CachePolicyConfig::default()),
-            defined_cache_routes: Arc::new(Vec::new()),
+            routes: Arc::new(crate::model::routes::RoutesConfig::default()),
             compat_profile,
             model_resolution_mode: ModelResolutionMode::Compatible,
             model_mapping: Arc::new(ModelMappingConfig::default()),
@@ -488,11 +487,10 @@ impl AppState {
         self
     }
 
-    pub fn with_defined_cache_routes(mut self, routes: Vec<String>) -> Self {
-        self.defined_cache_routes = Arc::new(normalize_defined_cache_routes(&routes));
-        self.runtime.install_local(|config| {
-            config.defined_cache_routes = self.defined_cache_routes.as_ref().clone()
-        });
+    pub fn with_routes(mut self, routes: crate::model::routes::RoutesConfig) -> Self {
+        self.routes = Arc::new(routes);
+        self.runtime
+            .install_local(|config| config.routes = self.routes.as_ref().clone());
         self
     }
 
@@ -569,6 +567,32 @@ impl AppState {
             .install_local(|config| config.external_pools = self.external_pools.as_ref().clone());
         self
     }
+}
+
+pub async fn route_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let endpoint = request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.0.path())
+        .unwrap_or_else(|| request.uri().path());
+    if !state
+        .runtime
+        .snapshot()
+        .compiled_routes
+        .as_ref()
+        .is_some_and(|routes| routes.endpoint_enabled(endpoint))
+    {
+        return envelope::error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("dfcache route is not configured: {endpoint}"),
+        );
+    }
+    next.run(request).await
 }
 
 /// API Key 认证中间件

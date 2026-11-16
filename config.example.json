@@ -52,15 +52,13 @@
         "enabled": false
       }
     },
-    "texts": {},
-    "pathOverrides": {}
+    "texts": {}
   },
   "routeFeatures": {
     "defaults": {
       "thinkingModelName": true,
       "thinkingTrigger": "real_request"
-    },
-    "pathOverrides": {}
+    }
   },
   "payloadShaping": {
     "enabled": true,
@@ -86,11 +84,100 @@
     "currentImagesMaxBytes": 180000,
     "oversizedImageHandling": "drop-with-placeholder"
   },
-  "runtimeConfigMigrationVersion": 1,
+  "runtimeConfigMigrationVersion": 2,
   "externalPools": {
     "externalPoolsEnabled": true,
     "externalPoolDispatchMaxWaitSecs": 60,
     "externalPoolCapacityMode": "wait",
     "externalPoolMaxQueuedRequests": 64
-  }
+  },
+  "routes": [
+    {
+      "prefix": "",
+      "name": "default",
+      "enabled": true,
+      "cachePolicy": {
+        "cacheType": "current_high_cache",
+        "routeNamespace": false
+      },
+      "accountRule": {
+        "mode": "allow_all",
+        "rules": []
+      },
+      "modelRule": {
+        "mode": "allow_all",
+        "rules": []
+      }
+    },
+    {
+      "prefix": "/cc",
+      "name": "/cc",
+      "enabled": true,
+      "cachePolicy": {
+        "cacheType": "current_high_cache",
+        "routeNamespace": false
+      },
+      "accountRule": {
+        "mode": "allow_all",
+        "rules": []
+      },
+      "modelRule": {
+        "mode": "allow_all",
+        "rules": []
+      },
+      "reportedUsage": {
+        "input": {
+          "mode": "sample-max",
+          "maxTokens": 96,
+          "moveDeltaToCacheRead": true
+        },
+        "cacheCreation": {
+          "mode": "sample-target",
+          "targetTokens": 3000,
+          "normalMaxMultiplier": 1.2
+        }
+      }
+    },
+    {
+      "prefix": "/ha",
+      "name": "/ha",
+      "enabled": true,
+      "cachePolicy": {
+        "cacheType": "current_high_cache",
+        "routeNamespace": false
+      },
+      "accountRule": {
+        "mode": "allow_all",
+        "rules": []
+      },
+      "modelRule": {
+        "mode": "allow_all",
+        "rules": []
+      },
+      "reportedUsage": {
+        "input": {
+          "mode": "sample-max",
+          "maxTokens": 96,
+          "moveDeltaToCacheRead": true
+        }
+      }
+    },
+    {
+      "prefix": "/na",
+      "name": "/na",
+      "enabled": true,
+      "cachePolicy": {
+        "cacheType": "no_cache",
+        "routeNamespace": false
+      },
+      "accountRule": {
+        "mode": "allow_all",
+        "rules": []
+      },
+      "modelRule": {
+        "mode": "allow_all",
+        "rules": []
+      }
+    }
+  ]
 }

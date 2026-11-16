@@ -37,7 +37,8 @@ fn next_config_generation() -> u64 {
 }
 
 impl RuntimeConfigStore {
-    pub fn new(initial: Config, postgres: Option<Arc<PostgresStore>>) -> Arc<Self> {
+    pub fn new(mut initial: Config, postgres: Option<Arc<PostgresStore>>) -> Arc<Self> {
+        initial.compiled_routes = Some(Arc::new(initial.routes.compile_with_config(&initial)));
         Arc::new(Self {
             config: RwLock::new(Arc::new(initial)),
             generation: AtomicU64::new(next_config_generation()),
@@ -128,13 +129,23 @@ impl RuntimeConfigStore {
     }
 
     fn validate(&self, config: &Config) -> anyhow::Result<()> {
+        config
+            .routes
+            .validate_with_config(config)
+            .map_err(anyhow::Error::msg)?;
         if let Some(validate) = self.validator.read().as_ref() {
             validate(config)?;
         }
         Ok(())
     }
 
-    fn install(&self, previous: Arc<Config>, config: Config, reason: RuntimeConfigChangeReason) {
+    fn install(
+        &self,
+        previous: Arc<Config>,
+        mut config: Config,
+        reason: RuntimeConfigChangeReason,
+    ) {
+        config.compiled_routes = Some(Arc::new(config.routes.compile_with_config(&config)));
         let current = Arc::new(config);
         {
             let mut config = self.config.write();
@@ -236,6 +247,26 @@ mod tests {
         assert_eq!(store.snapshot().port, 19023);
         assert!(!store.reload_from_postgres().unwrap());
         assert_eq!(store.generation(), next_generation);
+    }
+
+    #[test]
+    fn invalid_route_updates_are_rejected_without_an_optional_validator() {
+        let store = RuntimeConfigStore::new(Config::default(), None);
+        let original = store.snapshot();
+        assert!(
+            store
+                .update(|config| config.routes.routes.retain(|route| route.prefix != "/cc"))
+                .is_err()
+        );
+        assert!(
+            store
+                .update(|config| config
+                    .routes
+                    .routes
+                    .push(crate::model::routes::RouteConfig::new(" cc/ ")))
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&original, &store.snapshot()));
     }
 
     #[test]

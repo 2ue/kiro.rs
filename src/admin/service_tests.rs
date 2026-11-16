@@ -738,7 +738,7 @@ fn runtime_config_rejects_invalid_common_settings_before_install() {
         Box::new(|config| config.inference_upstream_max_attempts = 0),
         Box::new(|config| config.audit_log_retention_days = 0),
         Box::new(|config| config.high_cache_threshold = -1),
-        Box::new(|config| config.defined_cache_routes = vec!["/invalid".to_string()]),
+        Box::new(|config| config.routes.routes.clear()),
         Box::new(|config| config.request_admission.rpm = u32::MAX),
     ];
     for invalidate in invalid_cases {
@@ -751,16 +751,21 @@ fn runtime_config_rejects_invalid_common_settings_before_install() {
 #[test]
 fn runtime_config_normalizes_custom_routes_and_installs_defaults() {
     let mut config = Config::default();
-    config.defined_cache_routes = vec![
-        " dfcache/example/ ".to_string(),
-        "/dfcache/example".to_string(),
-    ];
+    config
+        .routes
+        .routes
+        .push(crate::model::routes::RouteConfig::new(" dfcache/example/ "));
     normalize_and_validate_runtime_config(&mut config).unwrap();
-    assert_eq!(config.defined_cache_routes, vec!["/dfcache/example"]);
     assert!(
         config
-            .cache_policy
-            .path_overrides
-            .contains_key("/dfcache/example")
+            .routes
+            .routes
+            .iter()
+            .any(|route| route.prefix == "/dfcache/example")
     );
+    config
+        .routes
+        .routes
+        .push(crate::model::routes::RouteConfig::new("/dfcache/example"));
+    assert!(normalize_and_validate_runtime_config(&mut config).is_err());
 }

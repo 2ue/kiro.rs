@@ -346,7 +346,7 @@ pub enum ExternalPoolUsageProjectionMode {
 
 impl Default for ExternalPoolUsageProjectionMode {
     fn default() -> Self {
-        Self::PassThrough
+        Self::CurrentPathPolicy
     }
 }
 
@@ -496,9 +496,91 @@ impl ExternalPoolModelMappingMode {
     }
 }
 
+#[derive(Default, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountOverrides {
+    pub request_timeout_secs: Option<u64>,
+    pub stream_request_timeout_secs: Option<u64>,
+    pub stream_idle_timeout_secs: Option<u64>,
+    pub stream_first_output_timeout_secs: Option<u64>,
+    pub usage_projection_uplift_percent: Option<u32>,
+    pub usage_projection_cost_floor_enabled: Option<bool>,
+    pub usage_projection_cost_floor_margin_percent: Option<u32>,
+    pub usage_projection_output_uplift_min_tokens: Option<i32>,
+    pub usage_projection_output_uplift_percent: Option<u32>,
+}
+impl AccountOverrides {
+    pub fn merge(&self, config: &ExternalPoolsConfig) -> ExternalPoolsConfig {
+        let mut effective = config.clone();
+        effective.external_pool_request_timeout_secs = self
+            .request_timeout_secs
+            .unwrap_or(config.external_pool_request_timeout_secs);
+        effective.external_pool_stream_request_timeout_secs = self
+            .stream_request_timeout_secs
+            .unwrap_or(config.external_pool_stream_request_timeout_secs);
+        effective.external_pool_stream_idle_timeout_secs = self
+            .stream_idle_timeout_secs
+            .unwrap_or(config.external_pool_stream_idle_timeout_secs);
+        effective.external_pool_stream_first_output_timeout_secs = self
+            .stream_first_output_timeout_secs
+            .unwrap_or(config.external_pool_stream_first_output_timeout_secs);
+        effective.external_pool_usage_projection_uplift_percent = self
+            .usage_projection_uplift_percent
+            .unwrap_or(config.external_pool_usage_projection_uplift_percent);
+        effective.external_pool_usage_projection_cost_floor_enabled = self
+            .usage_projection_cost_floor_enabled
+            .unwrap_or(config.external_pool_usage_projection_cost_floor_enabled);
+        effective.external_pool_usage_projection_cost_floor_margin_percent = self
+            .usage_projection_cost_floor_margin_percent
+            .unwrap_or(config.external_pool_usage_projection_cost_floor_margin_percent);
+        effective.external_pool_usage_projection_output_uplift_min_tokens = self
+            .usage_projection_output_uplift_min_tokens
+            .unwrap_or(config.external_pool_usage_projection_output_uplift_min_tokens);
+        effective.external_pool_usage_projection_output_uplift_percent = self
+            .usage_projection_output_uplift_percent
+            .unwrap_or(config.external_pool_usage_projection_output_uplift_percent);
+        effective
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        crate::admin::service::validate_external_pools_config(
+            &self.merge(&ExternalPoolsConfig::default()),
+        )
+    }
+}
+fn default_cost_multiplier() -> f64 {
+    1.0
+}
+pub(crate) fn validate_account_fields(
+    proxy_url: Option<&str>,
+    multiplier: f64,
+    overrides: &AccountOverrides,
+) -> anyhow::Result<()> {
+    if !multiplier.is_finite() || multiplier <= 0.0 {
+        anyhow::bail!("costMultiplier 必须大于 0");
+    }
+    if let Some(proxy) = proxy_url.filter(|url| !url.trim().is_empty()) {
+        let url = reqwest::Url::parse(proxy)?;
+        if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+            || url.host_str().is_none()
+        {
+            anyhow::bail!("proxyUrl 必须使用 http/https/socks5/socks5h");
+        }
+        reqwest::Proxy::all(proxy)?;
+    }
+    overrides.validate().map_err(anyhow::Error::msg)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPool {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default = "default_cost_multiplier")]
+    pub cost_multiplier: f64,
+    #[serde(default)]
+    pub overrides: AccountOverrides,
     pub id: u64,
     /// Monotonic PostgreSQL row revision used to fence selection-to-send races.
     #[serde(default = "default_external_pool_revision")]
@@ -624,6 +706,14 @@ impl ExternalPool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateExternalPoolRequest {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default = "default_cost_multiplier")]
+    pub cost_multiplier: f64,
+    #[serde(default)]
+    pub overrides: AccountOverrides,
     pub name: String,
     pub base_url: String,
     pub api_key: String,
@@ -674,6 +764,14 @@ pub struct CreateExternalPoolRequest {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateExternalPoolRequest {
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_proxy_url_update")]
+    pub proxy_url: Option<Option<String>>,
+    #[serde(default)]
+    pub cost_multiplier: Option<f64>,
+    #[serde(default)]
+    pub overrides: Option<AccountOverrides>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -1334,7 +1432,7 @@ fn external_pool_reqwest_client(
     wire_profile: ExternalPoolWireProfile,
     tls_profile: ExternalPoolTlsProfile,
 ) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().no_proxy();
     if matches!(wire_profile, ExternalPoolWireProfile::Http1TitleCase) {
         builder = builder.http1_only().http1_title_case_headers();
     }
@@ -1596,6 +1694,9 @@ impl ExternalPoolFinalError {
     }
 
     fn public_status(&self) -> StatusCode {
+        if self.route_error_type == "model_not_found" {
+            return StatusCode::NOT_FOUND;
+        }
         if self.is_rate_limit() {
             return StatusCode::TOO_MANY_REQUESTS;
         }
@@ -1609,6 +1710,9 @@ impl ExternalPoolFinalError {
     }
 
     fn public_error_type(&self) -> &'static str {
+        if self.route_error_type == "model_not_found" {
+            return "not_found_error";
+        }
         if self.is_rate_limit() {
             return "rate_limit_error";
         }
@@ -1622,6 +1726,9 @@ impl ExternalPoolFinalError {
     }
 
     fn public_message(&self, external_error_id: &str) -> String {
+        if self.route_error_type == "model_not_found" {
+            return envelope::public_message_with_error_id(&self.message, external_error_id);
+        }
         let message = if self.is_rate_limit() {
             envelope::PUBLIC_RATE_LIMIT_MESSAGE
         } else if self.is_external_image_too_large() {
@@ -3296,6 +3403,7 @@ pub struct ExternalPoolManager {
     postgres: Arc<PostgresStore>,
     redis: Arc<RedisStore>,
     instance_id: String,
+    proxy_clients: Arc<SyncMutex<HashMap<String, reqwest::Client>>>,
     client: reqwest::Client,
     http1_title_case_client: reqwest::Client,
     native_tls_client: reqwest::Client,
@@ -4596,6 +4704,7 @@ impl ExternalPoolManager {
             postgres,
             redis,
             instance_id: uuid::Uuid::new_v4().to_string(),
+            proxy_clients: Arc::new(SyncMutex::new(HashMap::new())),
             client: external_pool_reqwest_client(
                 ExternalPoolWireProfile::Default,
                 ExternalPoolTlsProfile::Default,
@@ -5748,6 +5857,16 @@ impl ExternalPoolManager {
         Ok(statuses)
     }
 
+    pub async fn filter_route_models(
+        &self,
+        route: &crate::model::routes::RouteConfig,
+        endpoint: &str,
+        models: Vec<crate::anthropic::types::Model>,
+    ) -> Vec<crate::anthropic::types::Model> {
+        let pools = self.load_static_pool_snapshot().await;
+        filter_models_for_route(route, endpoint, models, &pools)
+    }
+
     #[cfg(test)]
     pub async fn has_available_pool(&self, config: &ExternalPoolsConfig) -> bool {
         self.pool_availability_snapshot(&HashSet::new(), config)
@@ -5809,6 +5928,7 @@ impl ExternalPoolManager {
         pools.iter().any(|pool| {
             pool.enabled
                 && !pool.is_auto_disabled_at(now)
+                && route_account_allowed(config, pool.id, endpoint, model_candidates)
                 && external_pool_eligibility_route_allowed(pool, endpoint)
                 && external_pool_eligibility_matches_supported_models(pool, model_candidates)
         })
@@ -5886,6 +6006,7 @@ impl ExternalPoolManager {
         pools.iter().any(|pool| {
             pool.enabled
                 && !pool.is_auto_disabled_at(now)
+                && route_account_allowed(config, pool.id, endpoint, model_candidates)
                 && external_pool_eligibility_route_allowed(pool, endpoint)
                 && external_pool_eligibility_matches_supported_models(pool, model_candidates)
         })
@@ -5909,6 +6030,7 @@ impl ExternalPoolManager {
             .filter(|pool| {
                 pool.enabled
                     && !pool.is_auto_disabled_now()
+                    && route_account_allowed(config, pool.id, endpoint, model_candidates)
                     && external_pool_route_allowed(pool, endpoint)
                     && external_pool_matches_supported_models_normalized(pool, model_candidates)
             })
@@ -6018,7 +6140,7 @@ impl ExternalPoolManager {
         let snapshot = self.load_authoritative_pool_snapshot().await;
         let early_commit = snapshot
             .as_ref()
-            .is_ok_and(|pools| route_prefers_early_commit(pools, &route));
+            .is_ok_and(|pools| route_prefers_early_commit(pools, &route, &config));
         if early_commit {
             return Box::pin(self.forward_with_early_commit(config, route, snapshot)).await;
         }
@@ -6155,32 +6277,6 @@ impl ExternalPoolManager {
             });
         }
 
-        if !config.external_pool_route_allowed(&route.endpoint) {
-            self.record_external_failure(
-                &route,
-                None,
-                Vec::new(),
-                "external_pool_route_blocked",
-                "request route is blocked by external pool route policy",
-                synthetic_external_error_diagnostics(
-                    &route,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "external_dispatch",
-                ),
-            );
-            return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                response_error_type: "service_unavailable".to_string(),
-                route_error_type: "external_pool_route_blocked".to_string(),
-                message: "request route is blocked by external pool route policy".to_string(),
-                error_id: route.error_id.clone(),
-                retryable: false,
-                attempts: Vec::new(),
-                pool_id: None,
-                pool_name: None,
-            });
-        }
-
         let payload_guard_retry_enabled = route.payload_guard_retry_config.is_some();
         let mut max_pool_attempts = if config.external_pool_retry_max_attempts == 0 {
             None
@@ -6234,6 +6330,45 @@ impl ExternalPoolManager {
                 ));
             }
         };
+
+        let models = normalize_external_pool_support_candidates(
+            route.model_candidates_for_support().into_iter().flatten(),
+        );
+        let enabled = authoritative_pools
+            .iter()
+            .filter(|pool| pool.enabled)
+            .collect::<Vec<_>>();
+        if !enabled.is_empty()
+            && !enabled.iter().any(|pool| {
+                route_account_allowed(&config, pool.id, Some(&route.endpoint), Some(&models))
+                    && external_pool_route_allowed(pool, Some(&route.endpoint))
+                    && external_pool_matches_supported_models_normalized(pool, Some(&models))
+            })
+        {
+            self.record_external_failure(
+                &route,
+                None,
+                Vec::new(),
+                "model_not_found",
+                "model rejected by route or account rules",
+                synthetic_external_error_diagnostics(
+                    &route,
+                    StatusCode::NOT_FOUND,
+                    "external_dispatch",
+                ),
+            );
+            return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
+                status: StatusCode::NOT_FOUND,
+                response_error_type: "not_found_error".into(),
+                route_error_type: "model_not_found".into(),
+                message: format!("model: {}", route.requested_model()),
+                error_id: route.error_id.clone(),
+                retryable: false,
+                attempts: Vec::new(),
+                pool_id: None,
+                pool_name: None,
+            });
+        }
 
         // The shared dispatch deadline bounds queueing and capacity waits (it is ~15 seconds from
         // request start). A pool that already failed *before any downstream output* has used that
@@ -6927,6 +7062,8 @@ impl ExternalPoolManager {
         route: &ExternalRouteRequest,
         config: &ExternalPoolsConfig,
     ) -> Result<PreparedExternalForwardRequest, ExternalForwardError> {
+        let effective = pool.overrides.merge(config);
+        let config = &effective;
         let mut prepared = external_pool_prepare_request(route, pool)?;
         let url = external_pool_url(pool, &route.endpoint, config)?;
         let mut headers = forward_headers(&route.headers, pool, route.is_stream())?;
@@ -6943,7 +7080,20 @@ impl ExternalPoolManager {
         let outbound_model = prepared.outbound_model.clone();
         let outbound_body = prepared.body.clone();
         let known_tool_names = external_route_known_tool_names(route);
-        let client = self.client_for_pool(pool);
+        let client = self.client_for_pool(pool, config).map_err(|err| {
+            ExternalForwardError::new(
+                ExternalPoolError {
+                    status: None,
+                    message: err.to_string(),
+                    retryable: false,
+                    auto_disable_reason: None,
+                    cooldown: None,
+                    protocol_error: None,
+                    raw_upstream_error: None,
+                },
+                None,
+            )
+        })?;
         let mut request = client.post(url).headers(headers).body(prepared.body);
         if let Some(timeout) = external_request_send_timeout(route, config) {
             request = request.timeout(timeout);
@@ -6958,19 +7108,71 @@ impl ExternalPoolManager {
         })
     }
 
-    fn client_for_pool(&self, pool: &ExternalPool) -> &reqwest::Client {
-        match (pool.wire_profile, pool.tls_profile) {
-            (ExternalPoolWireProfile::Default, ExternalPoolTlsProfile::Default) => &self.client,
+    fn client_for_pool(
+        &self,
+        pool: &ExternalPool,
+        config: &ExternalPoolsConfig,
+    ) -> anyhow::Result<reqwest::Client> {
+        let proxy_url = pool
+            .proxy_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .or(config.transport_proxy_url.as_deref());
+        if let Some(proxy_url) = proxy_url {
+            let key = format!(
+                "{}:{}:{proxy_url}:{:?}:{:?}",
+                pool.wire_profile.as_str(),
+                pool.tls_profile.as_str(),
+                config.transport_proxy_username,
+                config.transport_proxy_password
+            );
+            let mut cache = self.proxy_clients.lock();
+            if let Some(client) = cache.get(&key) {
+                return Ok(client.clone());
+            }
+            let proxy_config = crate::http_client::ProxyConfig::new(proxy_url);
+            let mut proxy = reqwest::Proxy::all(&proxy_config.url)?;
+            if pool
+                .proxy_url
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .is_none()
+            {
+                if let (Some(username), Some(password)) = (
+                    &config.transport_proxy_username,
+                    &config.transport_proxy_password,
+                ) {
+                    proxy = proxy.basic_auth(username, password);
+                }
+            }
+            let mut builder = reqwest::Client::builder().proxy(proxy);
+            if pool.wire_profile == ExternalPoolWireProfile::Http1TitleCase {
+                builder = builder.http1_only().http1_title_case_headers();
+            }
+            if pool.tls_profile == ExternalPoolTlsProfile::NativeTls {
+                builder = apply_external_pool_native_tls_profile(builder);
+            }
+            let client = builder.build()?;
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(key, client.clone());
+            return Ok(client);
+        }
+        Ok(match (pool.wire_profile, pool.tls_profile) {
+            (ExternalPoolWireProfile::Default, ExternalPoolTlsProfile::Default) => {
+                self.client.clone()
+            }
             (ExternalPoolWireProfile::Http1TitleCase, ExternalPoolTlsProfile::Default) => {
-                &self.http1_title_case_client
+                self.http1_title_case_client.clone()
             }
             (ExternalPoolWireProfile::Default, ExternalPoolTlsProfile::NativeTls) => {
-                &self.native_tls_client
+                self.native_tls_client.clone()
             }
             (ExternalPoolWireProfile::Http1TitleCase, ExternalPoolTlsProfile::NativeTls) => {
-                &self.native_tls_http1_title_case_client
+                self.native_tls_http1_title_case_client.clone()
             }
-        }
+        })
     }
 
     #[cfg(test)]
@@ -6995,6 +7197,8 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         prepared: PreparedExternalForwardRequest,
     ) -> Result<ExternalForwardResponse, ExternalForwardError> {
+        let effective = pool.overrides.merge(config);
+        let config = &effective;
         let PreparedExternalForwardRequest {
             request,
             outbound_model,
@@ -7767,6 +7971,12 @@ impl ExternalPoolManager {
                 !excluded.contains(&pool.id)
                     && pool.enabled
                     && !pool.is_auto_disabled_now()
+                    && route_account_allowed(
+                        config,
+                        pool.id,
+                        Some(&route.endpoint),
+                        Some(&support_candidates),
+                    )
                     && external_pool_route_allowed(pool, Some(&route.endpoint))
                     && external_pool_matches_supported_models_normalized(
                         pool,
@@ -7868,6 +8078,7 @@ impl ExternalPoolManager {
                 !excluded.contains(&pool.id)
                     && pool.enabled
                     && !pool.is_auto_disabled_now()
+                    && route_account_allowed(config, pool.id, endpoint, model_candidates)
                     && external_pool_route_allowed(pool, endpoint)
                     && external_pool_matches_supported_models_normalized(pool, model_candidates)
             })
@@ -9871,6 +10082,16 @@ impl ExternalPoolManager {
             .find_map(|attempt| attempt.outbound_model.clone());
         let latency_trace = external_usage_latency_trace(route);
         route.recorder.record(UsageRecord {
+            account_cost_usd: if status == UsageRecordStatus::Success {
+                billing
+                    .as_ref()
+                    .map(|billing| {
+                        billing.raw_cost_usd * pool.map(|p| p.cost_multiplier).unwrap_or(1.0)
+                    })
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            },
             id: route.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
             endpoint: route.endpoint.to_string(),
@@ -11175,7 +11396,11 @@ fn effective_external_pool_pre_output_stream_retry_enabled(
 
 /// 只有流式请求、且本次请求所有可选池都设置了“提前提交首包”时才启用。
 /// 混合时不启用：普通池的首输出前语义（缓冲、首个输出超时）保持不变。
-fn route_prefers_early_commit(pools: &[ExternalPool], route: &ExternalRouteRequest) -> bool {
+fn route_prefers_early_commit(
+    pools: &[ExternalPool],
+    route: &ExternalRouteRequest,
+    config: &ExternalPoolsConfig,
+) -> bool {
     let support_candidates = normalize_external_pool_support_candidates(
         route.model_candidates_for_support().into_iter().flatten(),
     );
@@ -11184,6 +11409,12 @@ fn route_prefers_early_commit(pools: &[ExternalPool], route: &ExternalRouteReque
         .filter(|pool| {
             pool.enabled
                 && !pool.is_auto_disabled_now()
+                && route_account_allowed(
+                    config,
+                    pool.id,
+                    Some(&route.endpoint),
+                    Some(&support_candidates),
+                )
                 && external_pool_route_allowed(pool, Some(&route.endpoint))
                 && external_pool_matches_supported_models_normalized(
                     pool,
@@ -11827,7 +12058,7 @@ fn normalize_external_pool_models<'a>(
 ) -> Vec<String> {
     let mut normalized = Vec::new();
     for model in models {
-        let Some(model) = normalize_model_id(model) else {
+        let Some(model) = normalize_routing_model_id(model) else {
             continue;
         };
         let variants = if add_family_alias {
@@ -16437,4 +16668,88 @@ pub(crate) fn passthrough_test_prepare(
         external_pool_prepare_request(route, pool).unwrap().body,
         forward_headers(headers, pool, false).unwrap(),
     )
+}
+
+pub(crate) fn route_model_rule_allows(rule: &crate::model::routes::RouteRule, model: &str) -> bool {
+    let candidates = normalize_external_pool_support_candidates([model]);
+    let matched = rule.rules.iter().any(|value| {
+        let value = value.trim();
+        if value == "*" {
+            return true;
+        }
+        if let Some(prefix) = value.strip_suffix('*').and_then(normalize_routing_model_id) {
+            return candidates.iter().any(|candidate| {
+                split_external_pool_model_suffix(candidate)
+                    .0
+                    .starts_with(&prefix)
+            });
+        }
+        let values = normalize_external_pool_allowlist_models([value]);
+        candidates
+            .iter()
+            .any(|candidate| values.contains(candidate))
+    });
+    rule.allows_match(matched)
+}
+fn route_account_allowed(
+    config: &ExternalPoolsConfig,
+    id: u64,
+    endpoint: Option<&str>,
+    models: Option<&[String]>,
+) -> bool {
+    let Some(endpoint) = endpoint else {
+        return true;
+    };
+    let Some(route) = config.routes.match_endpoint(endpoint) else {
+        return false;
+    };
+    route.enabled
+        && route.account_rule.allows_account(id)
+        && models.is_none_or(|models| {
+            models
+                .iter()
+                .any(|model| route.model_rule.allows_model(model))
+        })
+}
+
+pub(crate) fn normalize_catalog_model(model: &str) -> Option<String> {
+    normalize_model_id(model)
+}
+
+fn normalize_routing_model_id(model: &str) -> Option<String> {
+    let normalized = crate::anthropic::model_capabilities::normalize_model_id(model);
+    normalize_model_id(normalized.strip_prefix("anthropic/").unwrap_or(&normalized))
+}
+
+fn filter_models_for_route(
+    route: &crate::model::routes::RouteConfig,
+    endpoint: &str,
+    models: Vec<crate::anthropic::types::Model>,
+    pools: &[ExternalPoolEligibility],
+) -> Vec<crate::anthropic::types::Model> {
+    models
+        .into_iter()
+        .filter(|model| {
+            model.listed
+                && route.enabled
+                && route.model_rule.allows_model(&model.id)
+                && pools.iter().any(|pool| {
+                    pool.enabled
+                        && route.account_rule.allows_account(pool.id)
+                        && external_pool_eligibility_route_allowed(pool, Some(endpoint))
+                        && external_pool_eligibility_matches_supported_models(
+                            pool,
+                            Some(&normalize_external_pool_support_candidates([model
+                                .id
+                                .as_str()])),
+                        )
+                })
+        })
+        .collect()
+}
+
+fn deserialize_proxy_url_update<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }

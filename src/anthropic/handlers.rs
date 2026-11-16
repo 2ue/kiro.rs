@@ -19,7 +19,7 @@ use crate::external_pool::{ExternalRouteRequest, ExternalRouteRequestPreparation
 use crate::{model::config::*, token};
 use axum::{
     Json as JsonExtractor,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -53,7 +53,7 @@ struct RequestRuntimeConfig {
     prompt_cache_bounds: PromptCacheBounds,
     reported_usage: ReportedUsageConfig,
     cache_policy: CachePolicyConfig,
-    defined_cache_routes: Vec<String>,
+    compiled_routes: Arc<CompiledRoutes>,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
     model_mapping: ModelMappingConfig,
@@ -77,7 +77,10 @@ struct RequestRuntimeConfig {
 impl RequestRuntimeConfig {
     /// `endpoint` 上生效的路由功能。
     fn route_features_for(&self, endpoint: &str) -> RouteFeatureSet {
-        self.route_features.resolve(endpoint)
+        self.compiled_routes
+            .match_endpoint(endpoint)
+            .map(|route| route.features)
+            .unwrap_or_default()
     }
 
     /// `endpoint` 上允许注入的项。
@@ -86,12 +89,11 @@ impl RequestRuntimeConfig {
         endpoint: &str,
         upstream: crate::model::config::UpstreamKind,
     ) -> crate::model::config::ResolvedInjections {
-        crate::model::config::ResolvedInjections::resolve(
-            endpoint,
-            upstream,
-            self.compat_profile,
-            &self.prompt_injection,
-        )
+        let _ = upstream;
+        self.compiled_routes
+            .match_endpoint(endpoint)
+            .map(|route| route.injections.clone())
+            .unwrap_or_default()
     }
 
     /// 外部池流式首输出前的静默保留窗口；0 表示一直保留到首个语义输出。
@@ -101,6 +103,7 @@ impl RequestRuntimeConfig {
     }
 
     fn from_app_state(state: &AppState) -> Self {
+        let config = state.runtime.snapshot();
         Self {
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
@@ -113,7 +116,10 @@ impl RequestRuntimeConfig {
             prompt_cache_bounds: state.prompt_cache_bounds,
             reported_usage: ReportedUsageConfig::clone(&state.reported_usage),
             cache_policy: CachePolicyConfig::clone(&state.cache_policy),
-            defined_cache_routes: state.defined_cache_routes.to_vec(),
+            compiled_routes: config
+                .compiled_routes
+                .clone()
+                .unwrap_or_else(|| Arc::new(config.routes.compile_with_config(&config))),
             compat_profile: state.compat_profile,
             model_resolution_mode: state.model_resolution_mode,
             model_mapping: ModelMappingConfig::clone(&state.model_mapping).normalized(),
@@ -132,7 +138,11 @@ impl RequestRuntimeConfig {
             missing_max_tokens: state.missing_max_tokens.normalized(),
             local_request_compat: crate::model::config::LocalRequestCompatConfig::default(),
             payload_shaping: state.payload_shaping,
-            external_pools: ExternalPoolsConfig::clone(&state.external_pools),
+            external_pools: {
+                let mut accounts = ExternalPoolsConfig::clone(&state.external_pools);
+                accounts.routes = config.routes.clone();
+                accounts
+            },
         }
     }
 
@@ -181,13 +191,11 @@ impl RequestRuntimeConfig {
                 config.prompt_cache_estimated_bytes_limit,
             ),
             reported_usage: config.reported_usage.normalized(),
-            cache_policy: config
-                .cache_policy
+            cache_policy: config.cache_policy.clone(),
+            compiled_routes: config
+                .compiled_routes
                 .clone()
-                .with_builtin_path_defaults()
-                .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
-                .normalized(),
-            defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
+                .unwrap_or_else(|| Arc::new(config.routes.compile_with_config(config))),
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
@@ -255,7 +263,14 @@ impl RequestRuntimeConfig {
                 .defaults
                 .payload_shaping
                 .unwrap_or_default(),
-            external_pools: config.external_pools.clone(),
+            external_pools: {
+                let mut accounts = config.external_pools.clone();
+                accounts.routes = config.routes.clone();
+                accounts.transport_proxy_url = config.proxy_url.clone();
+                accounts.transport_proxy_username = config.proxy_username.clone();
+                accounts.transport_proxy_password = config.proxy_password.clone();
+                accounts
+            },
         }
     }
 
@@ -334,16 +349,11 @@ impl RequestRuntimeConfig {
     }
 
     fn cache_policy_for_path(&self, path: &str) -> ResolvedCacheRoutePolicy {
-        resolve_cache_policy_for_path(
-            self.legacy_cache_route_policy_default(),
-            &self.reported_usage,
-            &self
-                .cache_policy
-                .clone()
-                .with_builtin_path_defaults()
-                .with_legacy_defined_cache_route_defaults(&self.defined_cache_routes),
-            path,
-        )
+        self.compiled_routes
+            .match_endpoint(path)
+            .expect("builtin root route")
+            .cache_policy
+            .clone()
     }
 }
 
@@ -399,10 +409,7 @@ fn prompt_cache_bounds_for_policy(policy: &CacheRoutePolicy) -> PromptCacheBound
 }
 
 fn reported_usage_config_for_policy(policy: ReportedUsagePathPolicy) -> ReportedUsageConfig {
-    ReportedUsageConfig {
-        default: policy,
-        path_overrides: Default::default(),
-    }
+    ReportedUsageConfig { default: policy }
 }
 
 fn request_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
@@ -461,32 +468,61 @@ fn current_image_too_large_response(
 
 pub async fn get_models(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<ModelsQuery>,
-) -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
-
-    models_list_response(&state, &query)
+) -> Response {
+    models_list_response(&state, &query, uri.path()).await
 }
-
-pub async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) -> Response {
-    model_retrieve_response(&state, &model_id)
+pub async fn get_model(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Path(params): Path<std::collections::HashMap<String, String>>,
+) -> Response {
+    let model_id = params
+        .get("model_id")
+        .map(String::as_str)
+        .unwrap_or_default();
+    model_retrieve_response(&state, model_id, uri.path()).await
 }
-
-fn models_list_response(state: &AppState, query: &ModelsQuery) -> Response {
-    let models = state.model_capabilities.standard_anthropic_models();
-    Json(ModelsResponse::paginate(models, query)).into_response()
+async fn route_models(state: &AppState, endpoint: &str) -> Vec<super::types::Model> {
+    let config = state.runtime.snapshot();
+    let Some(route) = config.routes.match_endpoint(endpoint) else {
+        return Vec::new();
+    };
+    let Some(manager) = &state.external_pool_manager else {
+        return Vec::new();
+    };
+    manager
+        .filter_route_models(
+            route,
+            endpoint,
+            state.model_capabilities.standard_anthropic_models(),
+        )
+        .await
 }
-
-fn model_retrieve_response(state: &AppState, model_id: &str) -> Response {
+async fn models_list_response(state: &AppState, query: &ModelsQuery, endpoint: &str) -> Response {
+    Json(ModelsResponse::paginate(
+        route_models(state, endpoint).await,
+        query,
+    ))
+    .into_response()
+}
+async fn model_retrieve_response(state: &AppState, model_id: &str, endpoint: &str) -> Response {
     let listed = state.model_capabilities.standard_anthropic_model(model_id);
-    match listed {
-        Some(model) => Json(model).into_response(),
-        None => envelope::error_response(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            format!("model: {model_id}"),
-        ),
+    if let Some(model) = listed {
+        if route_models(state, endpoint)
+            .await
+            .iter()
+            .any(|entry| entry.id == model.id)
+        {
+            return Json(model).into_response();
+        }
     }
+    envelope::error_response(
+        StatusCode::NOT_FOUND,
+        "not_found_error",
+        format!("model: {model_id}"),
+    )
 }
 
 pub(crate) fn resolve_defined_cache_route(
@@ -501,9 +537,10 @@ pub(crate) fn resolve_defined_cache_route(
             format!("dfcache route is invalid: {candidate}"),
         ));
     };
-    let defined_cache_routes =
-        normalize_defined_cache_routes(&state.runtime.snapshot().defined_cache_routes);
-    if !defined_cache_routes.iter().any(|item| item == &prefix) {
+    let config = state.runtime.snapshot();
+    if !config.routes.routes.iter().any(|route| {
+        route.enabled && crate::model::routes::normalize_route_prefix(&route.prefix) == prefix
+    }) {
         return Err(envelope::error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -556,29 +593,6 @@ fn record_pre_usage_rejection_with_metadata_and_context(
         extra_metadata,
         request_context,
     );
-}
-
-pub async fn get_models_dfcache(
-    State(state): State<AppState>,
-    Path(route): Path<String>,
-    Query(query): Query<ModelsQuery>,
-) -> Response {
-    if let Err(response) = resolve_defined_cache_route(&state, &route) {
-        return response;
-    }
-
-    models_list_response(&state, &query)
-}
-
-pub async fn get_model_dfcache(
-    State(state): State<AppState>,
-    Path((route, model_id)): Path<(String, String)>,
-) -> Response {
-    if let Err(response) = resolve_defined_cache_route(&state, &route) {
-        return response;
-    }
-
-    model_retrieve_response(&state, &model_id)
 }
 
 pub async fn post_messages(
@@ -637,30 +651,16 @@ pub async fn post_messages_ha(
 
 pub async fn post_messages_dfcache(
     State(state): State<AppState>,
-    Path(route): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     attribution: Option<Extension<RequestRejectionAttribution>>,
     MessagesBody(raw_body, request_api_key_id, ingress_id): MessagesBody,
 ) -> Response {
-    let endpoint = format!("/dfcache/{route}/v1/messages");
-    let prefix = match resolve_defined_cache_route(&state, &route) {
-        Ok(prefix) => prefix,
-        Err(response) => {
-            record_pre_usage_rejection(
-                attribution.as_ref().map(|Extension(value)| value),
-                RequestRejectionReason::DfcacheRouteInvalid,
-                &endpoint,
-                &response,
-            );
-            return response;
-        }
-    };
-    let endpoint = format!("{prefix}/v1/messages");
     post_messages_for_endpoint(
         state,
         headers,
         raw_body,
-        endpoint,
+        uri.path().to_string(),
         request_api_key_id,
         ingress_id,
         attribution.map(|Extension(value)| value),
@@ -806,15 +806,10 @@ async fn count_tokens_for_endpoint(
 
 pub async fn count_tokens_dfcache(
     State(state): State<AppState>,
-    Path(route): Path<String>,
+    OriginalUri(uri): OriginalUri,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> Response {
-    let prefix = match resolve_defined_cache_route(&state, &route) {
-        Ok(prefix) => prefix,
-        Err(response) => return response,
-    };
-    let endpoint = format!("{prefix}/v1/messages/count_tokens");
-    count_tokens_for_endpoint(state, payload, &endpoint).await
+    count_tokens_for_endpoint(state, payload, uri.path()).await
 }
 
 pub async fn post_messages_cc(

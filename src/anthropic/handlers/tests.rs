@@ -56,7 +56,15 @@ fn defined_cache_route_requires_explicit_configuration() {
         0.98,
         CompatProfile::ClaudeCode,
     )
-    .with_defined_cache_routes(vec!["/dfcache/cc".to_string()]);
+    .with_routes({
+        let mut routes = crate::model::routes::RoutesConfig::default();
+        routes.route_mut("/dfcache/cc").cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(true),
+            ..Default::default()
+        };
+        routes
+    });
 
     assert_eq!(
         resolve_defined_cache_route(&state, "cc").unwrap(),
@@ -176,19 +184,16 @@ async fn parse_messages_payload_rejects_empty_model_before_routing() {
 
 #[test]
 fn raw_external_route_request_applies_non_stream_skip_cache_route() {
-    let mut cache_policy = CachePolicyConfig::default();
-    cache_policy.path_overrides.insert(
-        "/cc".to_string(),
-        CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-            reported_usage: Some(ReportedUsagePathPolicy {
-                skip_non_stream_usage_projection: true,
-                input: ReportedUsageFieldPolicy::sample_input_max(1),
-                ..ReportedUsagePathPolicy::default()
-            }),
-            ..CacheRoutePolicyPatch::default()
-        },
-    );
+    let mut routes = crate::model::routes::RoutesConfig::default();
+    routes.route_mut(&"/cc".to_string()).cache_policy = CacheRoutePolicyPatch {
+        cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+        reported_usage: Some(ReportedUsagePathPolicy {
+            skip_non_stream_usage_projection: true,
+            input: ReportedUsageFieldPolicy::sample_input_max(1),
+            ..ReportedUsagePathPolicy::default()
+        }),
+        ..CacheRoutePolicyPatch::default()
+    };
     let state = AppState::new(
         Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
         Arc::new(UsageRecorder::new(10)),
@@ -198,7 +203,7 @@ fn raw_external_route_request_applies_non_stream_skip_cache_route() {
         0.98,
         CompatProfile::ClaudeCode,
     )
-    .with_cache_policy(cache_policy);
+    .with_routes(routes);
     let runtime_config = RequestRuntimeConfig::from_app_state(&state);
     let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
     assert_eq!(
@@ -1191,7 +1196,6 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
             let mut config = route_policy_matrix_config(&upstream.base_url);
             let injection = &mut config.prompt_injection;
             *injection = crate::model::config::PromptInjectionConfig::default();
-            injection.path_overrides.clear();
             for id in InjectionId::ALL {
                 injection.defaults.insert(id, ItemSetting { enabled: true });
             }
@@ -1321,7 +1325,11 @@ async fn multimodal_handler_test_router_with_usage(
 ) -> Option<(Router, Arc<UsageRecorder>)> {
     let mut config = Config::default();
 
-    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+    config.routes.route_mut("/dfcache/demo").cache_policy = CacheRoutePolicyPatch {
+        cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+        route_namespace: Some(true),
+        ..Default::default()
+    };
 
     multimodal_handler_test_router_from_config(config, base_url).await
 }
@@ -1453,51 +1461,38 @@ fn response_request_id(response: &Response) -> String {
 fn route_policy_matrix_config(_base_url: &str) -> Config {
     let mut config = Config::default();
 
-    config.cache_policy.path_overrides.insert(
-        "/cc".to_string(),
-        CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::NoCache),
-            ..CacheRoutePolicyPatch::default()
-        },
-    );
-    config.cache_policy.path_overrides.insert(
-        "/na".to_string(),
-        CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-            route_namespace: Some(false),
-            ..CacheRoutePolicyPatch::default()
-        },
-    );
-    config.cache_policy.path_overrides.insert(
-        "/ha".to_string(),
-        CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-            route_namespace: Some(true),
-            ..CacheRoutePolicyPatch::default()
-        },
-    );
+    config.routes.route_mut(&"/cc".to_string()).cache_policy = CacheRoutePolicyPatch {
+        cache_type: Some(PromptCacheStrategyType::NoCache),
+        ..CacheRoutePolicyPatch::default()
+    };
+    config.routes.route_mut(&"/na".to_string()).cache_policy = CacheRoutePolicyPatch {
+        cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+        route_namespace: Some(false),
+        ..CacheRoutePolicyPatch::default()
+    };
+    config.routes.route_mut(&"/ha".to_string()).cache_policy = CacheRoutePolicyPatch {
+        cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+        route_namespace: Some(true),
+        ..CacheRoutePolicyPatch::default()
+    };
 
     // 只有 /ha 显式开启自定义注入项；其他注入项全部关闭。
     {
         use crate::model::config::InjectionId;
         use crate::model::prompt_injection::{ItemOverride, ItemSetting, TextKey};
         let injection = &mut config.prompt_injection;
-        injection.path_overrides.clear();
         for id in InjectionId::ALL {
             injection
                 .defaults
                 .insert(id, ItemSetting { enabled: false });
         }
-        injection.path_overrides.insert(
-            "/ha".to_string(),
-            [(
-                InjectionId::Custom,
-                ItemOverride {
-                    enabled: Some(true),
-                },
-            )]
-            .into(),
-        );
+        config.routes.route_mut(&"/ha".to_string()).prompt_injection = [(
+            InjectionId::Custom,
+            ItemOverride {
+                enabled: Some(true),
+            },
+        )]
+        .into();
         injection.texts.insert(
             TextKey::Custom,
             format!(
@@ -1977,6 +1972,10 @@ async fn test_external_pool_manager_for_handlers(
     let manager = Arc::new(ExternalPoolManager::new(postgres.clone(), redis));
     postgres
         .create_external_pool(CreateExternalPoolRequest {
+            tags: Vec::new(),
+            proxy_url: None,
+            cost_multiplier: 1.0,
+            overrides: Default::default(),
             name: "handler-messages".to_string(),
             base_url: base_url.to_string(),
             api_key: "sk-handler-external-test".to_string(),
@@ -2083,13 +2082,20 @@ async fn external_pool_endpoint_gate_applies_global_enable_and_route_policy() {
     config.external_pools_enabled = true;
     assert!(external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
 
-    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::DenyList;
-    config.external_pool_route_rules = vec!["/cc".to_string()];
+    config.routes.route_mut("/cc").account_rule = crate::model::routes::RouteRule {
+        mode: crate::model::config::ExternalPoolRouteMode::DenyList,
+        rules: vec!["*".into()],
+    };
     assert!(!external_pool_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
     assert!(external_pool_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
 
-    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::AllowList;
-    config.external_pool_route_rules = vec!["/dfcache/team-a".to_string()];
+    for route in &mut config.routes.routes {
+        route.account_rule = crate::model::routes::RouteRule {
+            mode: crate::model::config::ExternalPoolRouteMode::DenyList,
+            rules: vec!["*".into()],
+        };
+    }
+    config.routes.route_mut("/dfcache/team-a").account_rule = Default::default();
     assert!(!external_pool_enabled_for_endpoint(&config, "/v1/messages", &manager).await);
     assert!(
         external_pool_enabled_for_endpoint(&config, "/dfcache/team-a/v1/messages", &manager).await
@@ -2103,6 +2109,7 @@ async fn external_pool_enabled_for_endpoint(
 ) -> bool {
     let mut config = Config::default();
     config.external_pools = external_pools.clone();
+    config.routes = external_pools.routes.clone();
     let (app, _usage) = handler_test_router(config, Some(manager.clone()));
     let response = app
         .oneshot(multimodal_handler_request(
@@ -2117,4 +2124,80 @@ async fn external_pool_enabled_for_endpoint(
         .await
         .expect("endpoint gate response");
     response.status() == StatusCode::OK
+}
+
+#[tokio::test]
+async fn custom_route_http_entrypoints_enforce_definition_and_enabled_state() {
+    let mut config = Config::default();
+    config.routes.route_mut("/team");
+    config.routes.route_mut("/dfcache/team");
+    config.routes.route_mut("/disabled").enabled = false;
+    config.routes.route_mut("/cc").enabled = false;
+    let (app, _) = handler_test_router(config, None);
+    for (prefix, enabled) in [
+        ("/team", true),
+        ("/dfcache/team", true),
+        ("/missing", false),
+        ("/dfcache/missing", false),
+        ("/disabled", false),
+        ("/cc", false),
+    ] {
+        for (method, suffix) in [
+            ("GET", "models"),
+            ("GET", "models/unknown"),
+            ("POST", "messages"),
+            ("POST", "messages/count_tokens"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("{prefix}/v1/{suffix}"))
+                        .header("x-api-key", "b07-handler-key")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            if enabled && method == "POST" {
+                assert_ne!(status, StatusCode::NOT_FOUND, "{prefix}/{suffix}");
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|error| {
+                panic!(
+                    "{prefix}/{suffix}: {status}: {error}: {}",
+                    String::from_utf8_lossy(&body)
+                )
+            });
+            if !enabled {
+                assert_eq!(status, StatusCode::NOT_FOUND, "{prefix}/{suffix}");
+                assert_eq!(value["error"]["type"], "not_found_error");
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("route is not configured")
+                );
+            } else if suffix == "models" {
+                assert_eq!(status, StatusCode::OK, "{prefix}");
+                assert_eq!(value["data"], json!([]));
+            } else if suffix == "models/unknown" {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("model: unknown")
+                );
+            } else {
+                assert_ne!(status, StatusCode::NOT_FOUND, "{prefix}/{suffix}");
+            }
+        }
+    }
 }
