@@ -259,7 +259,7 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.0 \
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | POST | `{prefix}/v1/messages` | Anthropic Messages；支持 SSE、thinking、工具调用和服务端工具透传 |
-| POST | `{prefix}/v1/messages/count_tokens` | 当前实现使用本地 token 估算；应用配置允许的注入和图片处理 |
+| POST | `{prefix}/v1/messages/count_tokens` | 本地 token 估算，按该路由的注入项与图片处理配置计算；不占账号额度 |
 | GET | `{prefix}/v1/models` | 返回目录与该路由可用账号模型的交集 |
 | GET | `{prefix}/v1/models/{model_id}` | 单个模型详情 |
 | GET / HEAD | `/api/hello`、`/cc/api/hello`、`/ha/api/hello`、`/na/api/hello`、`/dfcache/{name}/api/hello` | 无需鉴权的 Claude Code 预连接探测 |
