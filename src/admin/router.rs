@@ -25,9 +25,9 @@ use super::{
         force_refresh_token, get_access_keys, get_account_event_summary, get_all_credentials,
         get_audit_logs, get_credential_balance, get_credential_credit_summary,
         get_credential_diagnostics, get_credential_info, get_credentials_account_info,
-        get_credentials_list, get_credentials_page, get_credentials_runtime,
-        get_credentials_summary, get_credentials_usage_summary, get_external_pool_status,
-        get_external_pools, get_forced_model_catalog, get_load_balancing_mode,
+        get_credentials_facets, get_credentials_list, get_credentials_page,
+        get_credentials_runtime, get_credentials_summary, get_credentials_usage_summary,
+        get_external_pool_status, get_external_pools, get_forced_model_catalog, get_load_balancing_mode,
         get_model_capabilities, get_model_pricing, get_prompt_injection_catalog,
         get_proxy_resources, get_request_key_usage_limits, get_runtime_config,
         get_subscription_model_lists, get_system_version, get_usage_cleanup_status,
@@ -139,6 +139,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_credential_credit_summary),
         )
         .route("/credentials/summary", get(get_credentials_summary))
+        .route("/credentials/facets", get(get_credentials_facets))
         .route("/credentials/runtime", get(get_credentials_runtime))
         .route(
             "/credentials/{id}/diagnostics",

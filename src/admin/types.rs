@@ -422,6 +422,21 @@ pub struct CredentialListItem {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialFacetsResponse {
+    pub enable_all: usize,
+    pub enabled: usize,
+    pub disabled: usize,
+    pub health_all: usize,
+    pub normal: usize,
+    pub quota_exhausted: usize,
+    pub account_error: usize,
+    pub unknown: usize,
+    pub health_by_id: std::collections::HashMap<u64, &'static str>,
+    pub updated_at: String,
+}
+
 /// 凭据数量与全局调度容量概览。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -656,6 +671,8 @@ pub struct ExportCredentialsQuery {
     pub rpm: Option<u32>,
     pub concurrency: Option<u32>,
     pub status: Option<String>,
+    pub enabled: Option<bool>,
+    pub runtime_status: Option<String>,
     pub auth_method: Option<String>,
     pub subscription: Option<String>,
     pub proxy_resource_id: Option<u64>,

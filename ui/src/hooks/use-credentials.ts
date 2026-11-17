@@ -19,6 +19,7 @@ import {
   getCredentialList,
   getCredentialRuntime,
   getCredentialSummary,
+  getCredentialFacets,
   getCredentialUsageSummary,
   getCredentials,
   getCredentialsPage,
@@ -87,6 +88,7 @@ function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClien
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
   queryClient.invalidateQueries({ queryKey: ['credential-list'] })
   queryClient.invalidateQueries({ queryKey: ['credential-summary'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-facets'] })
   queryClient.invalidateQueries({ queryKey: ['credential-runtime'] })
   queryClient.invalidateQueries({ queryKey: ['credential-account-info'] })
   queryClient.invalidateQueries({ queryKey: ['credential-usage-summary'] })
@@ -125,6 +127,14 @@ export function useCredentialList(query: CredentialsPageQuery, options: QueryRef
     refetchInterval: options.refetchInterval ?? 30000,
     staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useCredentialFacets(query: CredentialsPageQuery) {
+  return useQuery({
+    queryKey: ['credential-facets', query],
+    queryFn: () => getCredentialFacets(query),
+    refetchInterval: 30_000,
   })
 }
 

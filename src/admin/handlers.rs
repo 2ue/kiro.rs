@@ -58,11 +58,37 @@ pub struct CredentialsPageQueryParams {
     pub rpm: Option<u32>,
     pub concurrency: Option<u32>,
     pub status: Option<String>,
+    pub enabled: Option<bool>,
+    pub runtime_status: Option<String>,
     pub auth_method: Option<String>,
     pub subscription: Option<String>,
     pub proxy_resource_id: Option<u64>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+}
+
+impl From<CredentialsPageQueryParams> for super::service::CredentialListQuery {
+    fn from(params: CredentialsPageQueryParams) -> Self {
+        Self {
+            q: non_blank(params.q),
+            credential_id: params.credential_id,
+            account: non_blank(params.account),
+            region: non_blank(params.region),
+            model: non_blank(params.model),
+            endpoint: non_blank(params.endpoint),
+            priority: params.priority,
+            rpm: params.rpm,
+            concurrency: params.concurrency,
+            status: non_blank(params.status),
+            enabled: params.enabled,
+            runtime_status: non_blank(params.runtime_status),
+            auth_method: non_blank(params.auth_method),
+            subscription: non_blank(params.subscription),
+            proxy_resource_id: params.proxy_resource_id,
+            sort_by: non_blank(params.sort_by),
+            sort_order: non_blank(params.sort_order),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,23 +484,7 @@ pub async fn get_credentials_page(
     Json(state.service.get_credentials_page(
         params.page.unwrap_or_default(),
         params.limit.unwrap_or_default(),
-        super::service::CredentialListQuery {
-            q: non_blank(params.q),
-            credential_id: params.credential_id,
-            account: non_blank(params.account),
-            region: non_blank(params.region),
-            model: non_blank(params.model),
-            endpoint: non_blank(params.endpoint),
-            priority: params.priority,
-            rpm: params.rpm,
-            concurrency: params.concurrency,
-            status: non_blank(params.status),
-            auth_method: non_blank(params.auth_method),
-            subscription: non_blank(params.subscription),
-            proxy_resource_id: params.proxy_resource_id,
-            sort_by: non_blank(params.sort_by),
-            sort_order: non_blank(params.sort_order),
-        },
+        params.into(),
     ))
 }
 
@@ -487,24 +497,15 @@ pub async fn get_credentials_list(
     Json(state.service.get_credentials_list(
         params.page.unwrap_or_default(),
         params.limit.unwrap_or_default(),
-        super::service::CredentialListQuery {
-            q: non_blank(params.q),
-            credential_id: params.credential_id,
-            account: non_blank(params.account),
-            region: non_blank(params.region),
-            model: non_blank(params.model),
-            endpoint: non_blank(params.endpoint),
-            priority: params.priority,
-            rpm: params.rpm,
-            concurrency: params.concurrency,
-            status: non_blank(params.status),
-            auth_method: non_blank(params.auth_method),
-            subscription: non_blank(params.subscription),
-            proxy_resource_id: params.proxy_resource_id,
-            sort_by: non_blank(params.sort_by),
-            sort_order: non_blank(params.sort_order),
-        },
+        params.into(),
     ))
+}
+
+pub async fn get_credentials_facets(
+    State(state): State<AdminState>,
+    Query(params): Query<CredentialsPageQueryParams>,
+) -> impl IntoResponse {
+    Json(state.service.get_credentials_facets(params.into()))
 }
 
 /// GET /api/admin/credentials/summary
@@ -1699,13 +1700,17 @@ fn export_credentials_filter(
         rpm: query.rpm,
         concurrency: query.concurrency,
         status,
+        enabled: query.enabled,
+        runtime_status: non_blank(query.runtime_status.clone()),
         auth_method: non_blank(query.auth_method.clone()),
         subscription: non_blank(query.subscription.clone()),
         proxy_resource_id: query.proxy_resource_id,
         sort_by: None,
         sort_order: None,
     };
-    let has_filter = filter.q.is_some()
+    let has_filter = filter.enabled.is_some()
+        || filter.runtime_status.is_some()
+        || filter.q.is_some()
         || filter.credential_id.is_some()
         || filter.account.is_some()
         || filter.region.is_some()
@@ -2511,6 +2516,17 @@ mod tests {
         assert_eq!(filter.proxy_resource_id, Some(3));
         assert_eq!(filter.q.as_deref(), Some("user@example.com"));
         assert!(filter.sort_by.is_none() && filter.sort_order.is_none());
+        let layered = export_credentials_filter(&parse(serde_json::json!({
+            "status": "normal", "enabled": false, "runtimeStatus": "rate_limited,concurrency_full"
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(layered.enabled, Some(false));
+        assert_eq!(layered.status.as_deref(), Some("normal"));
+        assert_eq!(
+            layered.runtime_status.as_deref(),
+            Some("rate_limited,concurrency_full")
+        );
 
         // The old `disabled=true` export keeps working as status=disabled.
         let legacy = export_credentials_filter(&parse(serde_json::json!({ "disabled": true })))

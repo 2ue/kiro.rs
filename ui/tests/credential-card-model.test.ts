@@ -36,6 +36,8 @@ const plain = {
   disabled: false,
   transientFailureStreak: 0,
   lastErrorReason: undefined,
+  lastErrorAtMs: undefined,
+  lastUsedAt: null,
   warmupRemaining: 0,
   routeMode: 'allow_all' as const,
   routeRules: [],
@@ -226,4 +228,19 @@ test('proxy choice resolves in the backend order and flags resources that block 
   assert.equal(proxyChoice({ url: 'direct' }, resources, { globalProxyUrl: 'http://g:1' }).title, '直连')
   assert.equal(proxyChoice({}, resources, { globalProxyUrl: 'http://g:1' }).title, '全局代理')
   assert.equal(proxyChoice({}, resources).title, '直连')
+})
+
+
+test('server health classification wins over card capacity badges', () => {
+  assert.equal(credentialStatusMeta({ ...healthy, healthStatus: 'account_error', cooledDown: true }).label, '账号异常')
+  assert.equal(credentialStatusMeta({ ...healthy, healthStatus: 'quota_exhausted', disabled: true }).label, '额度用尽')
+  assert.equal(credentialStatusMeta({ ...healthy, healthStatus: 'unknown', disabled: true }).label, '待确认')
+  assert.equal(credentialStatusMeta({ ...healthy, healthStatus: 'normal', rateLimited: true }).label, '限流')
+})
+
+test('a later success removes the stale error marker without changing scheduler counters', () => {
+  const residual = { ...plain, transientFailureStreak: 10, lastErrorAtMs: 1_000, lastUsedAt: '1970-01-01T00:00:02Z' }
+  assert.equal(credentialFlags(residual).some((flag) => flag.key === 'errors'), false)
+  assert.equal(residual.transientFailureStreak, 10)
+  assert.equal(credentialFlags({ ...residual, lastUsedAt: '1970-01-01T00:00:00Z' }).find((flag) => flag.key === 'errors')?.label, '错误记录 10')
 })

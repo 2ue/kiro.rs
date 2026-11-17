@@ -93,6 +93,7 @@ export function credentialStatusMeta(
   c: Pick<
     CredentialStatusItem,
     | 'disabled'
+    | 'healthStatus'
     | 'disabledReason'
     | 'cooledDown'
     | 'cooldownRemainingSecs'
@@ -106,6 +107,15 @@ export function credentialStatusMeta(
     | 'probationRemainingSecs'
   >,
 ): CredentialStatusMeta {
+  if (c.healthStatus === 'account_error') {
+    return { kind: 'error', label: '账号异常', title: c.disabledReason ? disabledReasonLabel(c.disabledReason) : '认证失败尚未恢复' }
+  }
+  if (c.healthStatus === 'quota_exhausted') {
+    return { kind: 'error', label: '额度用尽' }
+  }
+  if (c.healthStatus === 'unknown') {
+    return { kind: 'disabled', label: '待确认', title: c.disabledReason ? disabledReasonLabel(c.disabledReason) : '账号状况待确认' }
+  }
   if (c.disabled) {
     const manual = !c.disabledReason || c.disabledReason === 'Manual'
     return { kind: manual ? 'disabled' : 'error', label: disabledReasonLabel(c.disabledReason), title: c.disabledReason || undefined }
@@ -166,6 +176,7 @@ export function credentialFlags(
     | 'disabled'
     | 'transientFailureStreak'
     | 'lastErrorReason'
+    | 'lastErrorAtMs'
     | 'warmupRemaining'
     | 'routeMode'
     | 'routeRules'
@@ -175,13 +186,14 @@ export function credentialFlags(
     | 'supportedModels'
     | 'rateLimitAutoDisableEnabled'
     | 'hasProfileArn'
-  >,
+  > & Partial<Pick<CredentialStatusItem, 'lastUsedAt'>>,
 ): CredentialFlag[] {
   const flags: CredentialFlag[] = []
   if (c.isCurrent) flags.push({ key: 'current', kind: 'attention', label: '当前', tone: 'primary', title: '调度器当前选中的账号' })
   const streak = numberOrZero(c.transientFailureStreak)
-  if (!c.disabled && streak > 0) {
-    flags.push({ key: 'errors', kind: 'attention', label: `连续错误 ${streak}`, tone: 'error', title: c.lastErrorReason || undefined })
+  const recovered = c.lastErrorAtMs != null && c.lastUsedAt != null && Date.parse(c.lastUsedAt) > c.lastErrorAtMs
+  if (!c.disabled && streak > 0 && !recovered) {
+    flags.push({ key: 'errors', kind: 'attention', label: `错误记录 ${streak}`, tone: 'error', title: c.lastErrorReason || undefined })
   }
   if (c.warmupRemaining > 0) {
     flags.push({ key: 'warmup', kind: 'attention', label: `预热 ${c.warmupRemaining}`, tone: 'warning', title: `还需成功 ${c.warmupRemaining} 次才完全参与调度` })

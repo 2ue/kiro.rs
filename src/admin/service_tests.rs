@@ -1367,7 +1367,7 @@ fn credential_status_filters_keep_quota_and_account_errors_separate() {
     let mut cooling = credential_item(3, false, None, 0, 0.0, None);
     cooling.cooled_down = true;
     assert!(is_cooling_account(&cooling));
-    assert!(!is_normal_account(&cooling));
+    assert!(is_normal_account(&cooling));
 
     let normal = credential_item(4, false, None, 0, 0.0, None);
     assert!(is_normal_account(&normal));
@@ -2211,4 +2211,93 @@ async fn official_kiro_key_batch_skips_key_accounts_and_continues_after_failure(
     assert!(!response.items[2].ok);
     assert_eq!(response.keys[0].key.credential_id, 3);
     assert_eq!(response.keys[0].key.label, "batch-3");
+}
+
+#[test]
+fn credential_layers_partition_health_and_preserve_runtime_filters() {
+    let normal = credential_item(1, false, None, 1, 0.0, None);
+    let mut recovered = normal.clone();
+    recovered.id = 2;
+    recovered.last_error_kind = Some("auth".into());
+    recovered.last_error_reason = Some("token_refresh_credential_auth".into());
+    recovered.last_error_at_ms = Some(1_000);
+    recovered.last_used_at = Some("1970-01-01T00:00:02Z".into());
+    recovered.transient_failure_streak = 10;
+    recovered.rate_limited = true;
+    recovered.in_flight_requests = 2;
+    recovered.max_concurrent_requests = 2;
+    assert!(is_normal_account(&recovered));
+    let mut quota = credential_item(3, true, None, 0, 0.0, None);
+    quota.disabled_reason = Some("QuotaExceeded".into());
+    let mut suspended = credential_item(4, true, None, 0, 0.0, Some(100.0));
+    suspended.disabled_reason = Some("TemporarilySuspended".into());
+    let mut manual = credential_item(5, true, None, 0, 0.0, None);
+    manual.disabled_reason = Some("Manual".into());
+    let mut unknown = manual.clone();
+    unknown.id = 6;
+    unknown.disabled_reason = Some("TooManyFailures".into());
+    let credentials = vec![normal, recovered.clone(), quota, suspended, manual, unknown];
+    let query = CredentialListQuery::default();
+    let facets = credential_filter_facets(&credentials, &query);
+    assert_eq!(
+        (facets.enable_all, facets.enabled, facets.disabled),
+        (6, 2, 4)
+    );
+    assert_eq!(
+        (
+            facets.normal,
+            facets.quota_exhausted,
+            facets.account_error,
+            facets.unknown
+        ),
+        (3, 1, 1, 1)
+    );
+    assert_eq!(
+        facets.health_all,
+        facets.normal + facets.quota_exhausted + facets.account_error + facets.unknown
+    );
+    let query = CredentialListQuery {
+        enabled: Some(false),
+        status: Some("quota_exhausted".into()),
+        ..Default::default()
+    };
+    let facets = credential_filter_facets(&credentials, &query);
+    assert_eq!((facets.enable_all, facets.health_all), (6, 4));
+    assert_eq!(facets.health_by_id.len(), 1);
+    assert_eq!(facets.health_by_id.get(&3), Some(&"quota_exhausted"));
+    let query = CredentialListQuery {
+        enabled: Some(true),
+        status: Some("normal".into()),
+        runtime_status: Some("rate_limited,concurrency_full".into()),
+        ..Default::default()
+    };
+    let selected: Vec<_> = credentials
+        .iter()
+        .filter(|c| credential_matches_query(c, &query))
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(selected, vec![2]);
+    recovered.last_used_at = Some("1970-01-01T00:00:00Z".into());
+    assert!(is_account_error(&recovered));
+    recovered.last_used_at = Some("bad-date".into());
+    assert!(is_account_error(&recovered));
+}
+
+#[test]
+fn credential_facets_respect_search_without_changing_snapshot() {
+    let credentials: Vec<_> = (1..=6)
+        .map(|id| credential_item(id, id > 3, None, 0, 0.0, None))
+        .collect();
+    let query = CredentialListQuery {
+        enabled: Some(false),
+        q: Some("user5".into()),
+        ..Default::default()
+    };
+    let facets = credential_filter_facets(&credentials, &query);
+    assert_eq!(
+        (facets.enable_all, facets.health_all, facets.normal),
+        (1, 1, 1)
+    );
+    assert_eq!(facets.health_by_id.get(&5), Some(&"normal"));
+    assert_eq!(credentials[4].failure_count, 0);
 }

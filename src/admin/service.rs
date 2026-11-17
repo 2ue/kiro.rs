@@ -393,6 +393,8 @@ pub struct CredentialListQuery {
     pub rpm: Option<u32>,
     pub concurrency: Option<u32>,
     pub status: Option<String>,
+    pub enabled: Option<bool>,
+    pub runtime_status: Option<String>,
     pub auth_method: Option<String>,
     pub subscription: Option<String>,
     pub proxy_resource_id: Option<u64>,
@@ -2612,10 +2614,11 @@ impl AdminService {
     ) -> CredentialListResponse {
         let page = normalize_page(page);
         let limit = normalize_credentials_limit(limit);
-        if query
-            .status
-            .as_deref()
-            .is_some_and(status_requires_runtime_filter)
+        if query.runtime_status.is_some()
+            || query
+                .status
+                .as_deref()
+                .is_some_and(status_requires_runtime_filter)
         {
             let detailed = self
                 .credential_status_items(CredentialStatusBuildOptions {
@@ -2736,6 +2739,19 @@ impl AdminService {
             account_error,
             unavailable,
         }
+    }
+
+    pub fn get_credentials_facets(
+        &self,
+        query: CredentialListQuery,
+    ) -> super::types::CredentialFacetsResponse {
+        let credentials = self
+            .credential_status_items(CredentialStatusBuildOptions {
+                include_account_info: true,
+                include_cost_summary: false,
+            })
+            .7;
+        credential_filter_facets(&credentials, &query)
     }
 
     pub fn get_credentials_runtime(&self, ids: &[u64]) -> CredentialRuntimeResponse {
@@ -10044,6 +10060,12 @@ fn credential_matches_query(
     credential: &CredentialStatusItem,
     query: &CredentialListQuery,
 ) -> bool {
+    if query
+        .enabled
+        .is_some_and(|enabled| enabled == credential.disabled)
+    {
+        return false;
+    }
     if let Some(credential_id) = query.credential_id {
         if credential.id != credential_id {
             return false;
@@ -10139,6 +10161,15 @@ fn credential_matches_query(
         }
     }
 
+    if query.runtime_status.as_deref().is_some_and(|statuses| {
+        !statuses
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .all(|status| credential_matches_runtime_status(credential, status.trim()))
+    }) {
+        return false;
+    }
+
     if let Some(status) = query.status.as_deref() {
         let status = status.trim().to_lowercase();
         let matched = match status.as_str() {
@@ -10151,6 +10182,7 @@ fn credential_matches_query(
             "quota_exhausted" | "quota-exhausted" => is_quota_exhausted(credential),
             "account_error" | "account-error" => is_account_error(credential),
             "normal" => is_normal_account(credential),
+            "unknown" => credential_health_status(credential) == "unknown",
             "unavailable" => is_unavailable_account(credential),
             "proxy_blocked" | "proxy-blocked" => matches!(
                 credential.effective_proxy_source.as_str(),
@@ -10206,6 +10238,12 @@ fn credential_base_matches_query(
     credential: &CredentialListItem,
     query: &CredentialListQuery,
 ) -> bool {
+    if query
+        .enabled
+        .is_some_and(|enabled| enabled == credential.disabled)
+    {
+        return false;
+    }
     if let Some(credential_id) = query.credential_id {
         if credential.id != credential_id {
             return false;
@@ -10368,6 +10406,7 @@ fn status_requires_runtime_filter(status: &str) -> bool {
             | "account_error"
             | "account-error"
             | "normal"
+            | "unknown"
             | "unavailable"
             | "error"
     )
@@ -11554,6 +11593,11 @@ fn export_filter_audit_detail(filter: &CredentialListQuery) -> serde_json::Value
     put("rpm", filter.rpm.map(Into::into));
     put("concurrency", filter.concurrency.map(Into::into));
     put("status", filter.status.clone().map(Into::into));
+    put("enabled", filter.enabled.map(Into::into));
+    put(
+        "runtimeStatus",
+        filter.runtime_status.clone().map(Into::into),
+    );
     put("authMethod", filter.auth_method.clone().map(Into::into));
     put("subscription", filter.subscription.clone().map(Into::into));
     put("proxyResourceId", filter.proxy_resource_id.map(Into::into));
@@ -11640,10 +11684,10 @@ fn is_account_error(credential: &CredentialStatusItem) -> bool {
         return false;
     }
 
-    // last_error_* 在调用成功后不会清空，失败连击需仍未归零才视为当前异常。
-    !credential.disabled
-        && credential.last_error_kind.as_deref() == Some("auth")
+    // 全局刷新错误与模型成功分别计数，不能用残留健康计数覆盖后来的成功证据。
+    credential.last_error_kind.as_deref() == Some("auth")
         && credential.transient_failure_streak > 0
+        && !credential_success_after_error(credential)
 }
 
 fn is_cooling_account(credential: &CredentialStatusItem) -> bool {
@@ -11658,12 +11702,91 @@ fn is_unavailable_account(credential: &CredentialStatusItem) -> bool {
     credential.disabled || is_quota_exhausted(credential) || is_account_error(credential)
 }
 
+fn credential_success_after_error(credential: &CredentialStatusItem) -> bool {
+    credential
+        .last_error_at_ms
+        .zip(credential.last_used_at.as_deref().and_then(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|date| date.timestamp_millis())
+        }))
+        .is_some_and(|(error, success)| success > error)
+}
+
+fn credential_health_status(credential: &CredentialStatusItem) -> &'static str {
+    if is_account_error(credential) {
+        "account_error"
+    } else if is_quota_exhausted(credential) {
+        "quota_exhausted"
+    } else if credential.disabled
+        && credential
+            .disabled_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty() && reason != "Manual")
+    {
+        "unknown"
+    } else {
+        "normal"
+    }
+}
+
 fn is_normal_account(credential: &CredentialStatusItem) -> bool {
-    !credential.disabled
-        && !credential.cooled_down
-        && !credential.rate_limited
-        && !is_quota_exhausted(credential)
-        && !is_account_error(credential)
+    credential_health_status(credential) == "normal"
+}
+
+fn credential_matches_runtime_status(credential: &CredentialStatusItem, status: &str) -> bool {
+    match status {
+        "cooling" => credential.cooled_down,
+        "rate_limited" => credential.rate_limited,
+        "concurrency_full" => {
+            credential.max_concurrent_requests > 0
+                && credential.in_flight_requests >= credential.max_concurrent_requests
+        }
+        "probation" => credential.in_probation,
+        "proxy_blocked" => matches!(
+            credential.effective_proxy_source.as_str(),
+            "resource_disabled" | "resource_missing"
+        ),
+        _ => false,
+    }
+}
+
+fn credential_filter_facets(
+    credentials: &[CredentialStatusItem],
+    query: &CredentialListQuery,
+) -> super::types::CredentialFacetsResponse {
+    let mut enable_query = query.clone();
+    enable_query.enabled = None;
+    enable_query.status = None;
+    let mut health_query = query.clone();
+    health_query.status = None;
+    let mut response = super::types::CredentialFacetsResponse::default();
+    for credential in credentials {
+        if credential_matches_query(credential, &enable_query) {
+            response.enable_all += 1;
+            if credential.disabled {
+                response.disabled += 1;
+            } else {
+                response.enabled += 1;
+            }
+        }
+        if credential_matches_query(credential, &health_query) {
+            response.health_all += 1;
+            match credential_health_status(credential) {
+                "normal" => response.normal += 1,
+                "quota_exhausted" => response.quota_exhausted += 1,
+                "account_error" => response.account_error += 1,
+                _ => response.unknown += 1,
+            }
+        }
+    }
+    response.health_by_id = credentials
+        .iter()
+        .filter(|credential| credential_matches_query(credential, query))
+        .map(|credential| (credential.id, credential_health_status(credential)))
+        .collect();
+    response.updated_at = Utc::now().to_rfc3339();
+    response
 }
 
 fn merge_redis_delete_stats(
@@ -12011,9 +12134,15 @@ impl AdminService {
     }
 }
 
-/// Whether `credential` falls under the account page's status filter `status` (`normal`,
-/// `cooling`, `quota_exhausted`, `account_error`, `disabled`, ...), with the same rules.
+/// 公开账号池保留单层分类的正常口径，管理页的健康维度独立于启用和运行状态。
 pub(super) fn credential_matches_status(credential: &CredentialStatusItem, status: &str) -> bool {
+    if status.trim().eq_ignore_ascii_case("normal") {
+        return !credential.disabled
+            && !credential.cooled_down
+            && !credential.rate_limited
+            && !is_quota_exhausted(credential)
+            && !is_account_error(credential);
+    }
     credential_matches_query(
         credential,
         &CredentialListQuery {
