@@ -495,7 +495,7 @@ pub(crate) fn resolve_defined_cache_route(
         return Err(envelope::error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
-            format!("dfcache route is not configured: {prefix}"),
+            format!("route is not configured or disabled: {prefix}"),
         ));
     }
     Ok(prefix)

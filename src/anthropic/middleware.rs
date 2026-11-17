@@ -329,7 +329,7 @@ pub async fn route_middleware(
         return envelope::error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
-            format!("dfcache route is not configured: {endpoint}"),
+            format!("route is not configured or disabled: {endpoint}"),
         );
     }
     next.run(request).await
