@@ -39,6 +39,7 @@ pub use manager::{
     BackgroundTokenRefreshWorkerHandle, DispatchProgressStatus, MultiTokenManager,
     StatsFlushShutdownReport, StatsFlushWorkerHandle,
 };
+pub(crate) use redis_runtime::token_refreshed_event_credential_id;
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 #[allow(unused_imports)]
 pub use scheduler_error::{

@@ -104,6 +104,7 @@ use super::redis_runtime::{
     publish_credentials_changed as publish_redis_credentials_changed,
     publish_kiro_version_state_changed as publish_redis_kiro_version_state_changed,
     publish_runtime_config_changed as publish_redis_runtime_config_changed,
+    token_refreshed_event_payload,
 };
 use super::refresh::{
     RefreshFailure, RefreshFailureKind, RefreshFailureStage, RefreshSendAdmission,
@@ -9318,12 +9319,8 @@ impl MultiTokenManager {
                         }
                     }
                     if let Some(redis) = &self.redis_store {
-                        let payload = serde_json::json!({
-                            "kind": "credentials_changed",
-                            "reason": "token_refreshed",
-                            "changedAt": Utc::now().to_rfc3339(),
-                        })
-                        .to_string();
+                        let payload =
+                            token_refreshed_event_payload(&self.scheduler_instance_id, id);
                         match tokio::time::timeout_at(
                             deadlines.total,
                             redis.publish_credentials_changed(payload),
@@ -10589,6 +10586,37 @@ impl MultiTokenManager {
         } else {
             self.persist_credential_update(&base, &requested)
         }
+    }
+
+    /// Applies another instance's token refresh of credential `id`: reads that credential from
+    /// PgSQL and takes its token fields when they are newer, the same merge the refreshing
+    /// instance made locally. A refresh changes nothing else, so this replaces the full reload of
+    /// every credential that each refresh used to trigger.
+    pub fn reload_refreshed_credential_from_postgres(&self, id: u64) -> anyhow::Result<bool> {
+        let Some(store) = &self.postgres_store else {
+            return Ok(false);
+        };
+        let store = store.clone();
+        let loaded = block_on_storage("从 PgSQL 读取刷新后的凭据", async move {
+            credential_pgsql_sync_with_timeout(
+                "从 PgSQL 读取刷新后的凭据",
+                CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                store.load_credential_with_runtime_state(id),
+            )
+            .await
+        })?;
+        let Some((latest, _)) = loaded else {
+            return Ok(false);
+        };
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return Ok(false);
+        };
+        if latest.storage_revision <= entry.credentials.storage_revision {
+            return Ok(false);
+        }
+        Self::merge_refresh_fields(&mut entry.credentials, &latest);
+        Ok(true)
     }
 
     pub fn reload_credentials_from_postgres(&self) -> anyhow::Result<bool> {
@@ -16179,12 +16207,7 @@ impl MultiTokenManager {
             Self::merge_refresh_fields(&mut entry.credentials, &new_credentials);
         }
         if let Some(redis) = &self.redis_store {
-            let payload = serde_json::json!({
-                "kind": "credentials_changed",
-                "reason": "token_refreshed",
-                "changedAt": Utc::now().to_rfc3339(),
-            })
-            .to_string();
+            let payload = token_refreshed_event_payload(&self.scheduler_instance_id, id);
             let _ = tokio::time::timeout_at(
                 deadlines.total,
                 redis.publish_credentials_changed(payload),

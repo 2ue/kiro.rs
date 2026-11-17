@@ -62,6 +62,37 @@ fn runtime_event_payload(
     .to_string()
 }
 
+/// `reason` of the credentials_changed event a successful token refresh publishes.
+const TOKEN_REFRESHED_REASON: &str = "token_refreshed";
+
+/// The credentials_changed event of a token refresh. It names the publishing instance, which
+/// already holds the new token and skips its own event, and the refreshed credential, so other
+/// instances merge that one credential's token instead of reloading every credential.
+pub(super) fn token_refreshed_event_payload(
+    source_instance_id: &str,
+    credential_id: u64,
+) -> String {
+    serde_json::json!({
+        "kind": "credentials_changed",
+        "reason": TOKEN_REFRESHED_REASON,
+        "credentialId": credential_id,
+        "sourceInstanceId": source_instance_id,
+        "changedAt": Utc::now().to_rfc3339(),
+    })
+    .to_string()
+}
+
+/// The credential a token-refresh event names; `None` for every other credentials_changed event.
+pub(crate) fn token_refreshed_event_credential_id(payload: &str) -> Option<u64> {
+    let event = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    if event.get("reason").and_then(serde_json::Value::as_str) != Some(TOKEN_REFRESHED_REASON) {
+        return None;
+    }
+    event
+        .get("credentialId")
+        .and_then(serde_json::Value::as_u64)
+}
+
 #[cfg(test)]
 pub(super) fn test_runtime_event_payload(kind: &str, source_instance_id: &str) -> String {
     runtime_event_payload(kind, None, "test", source_instance_id)
