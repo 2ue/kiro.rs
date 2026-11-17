@@ -69,6 +69,7 @@ import {
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useCredentialList,
+  useCredentialFacets,
   useCredentialRuntime,
   useCredentialSummary,
   useCredentialAccountInfo,
@@ -238,7 +239,9 @@ export function CredentialsPage() {
   const [quickQuery, setQuickQuery] = useState('')
   const [modelQuery, setModelQuery] = useState('')
   const [regionFilter, setRegionFilter] = useState('__all__')
+  const [enabledFilter, setEnabledFilter] = useState('__all__')
   const [statusFilter, setStatusFilter] = useState('__all__')
+  const [runtimeFilters, setRuntimeFilters] = useState<string[]>([])
   const [subscriptionFilter, setSubscriptionFilter] = useState('__all__')
   const [proxyFilter, setProxyFilter] = useState('__all__')
   const [sortBy, setSortBy] = useState<CredentialSortBy>('default')
@@ -288,7 +291,9 @@ export function CredentialsPage() {
     credentialId: quickCredentialId,
     model: debouncedModelQuery.trim() || undefined,
     region: regionFilter !== '__all__' ? regionFilter : undefined,
+    enabled: enabledFilter === '__all__' ? undefined : enabledFilter === 'enabled',
     status: statusFilter !== '__all__' ? statusFilter : undefined,
+    runtimeStatus: runtimeFilters.length ? runtimeFilters.join(',') : undefined,
     subscription: subscriptionFilter !== '__all__' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== '__all__' ? Number(proxyFilter) : undefined,
     sortBy: sortBy !== 'default' ? sortBy : undefined,
@@ -300,7 +305,9 @@ export function CredentialsPage() {
     quickText,
     debouncedModelQuery,
     regionFilter,
+    enabledFilter,
     statusFilter,
+    runtimeFilters,
     subscriptionFilter,
     proxyFilter,
     sortBy,
@@ -313,6 +320,7 @@ export function CredentialsPage() {
   }, [listQuery])
 
   const credentials = useCredentialList(listQuery)
+  const credentialFacets = useCredentialFacets(listQuery)
   const pageTransitionPending = Boolean(
     credentials.data?.page !== undefined &&
     (credentials.isPlaceholderData || (credentials.isFetching && credentials.data.page !== page))
@@ -385,9 +393,10 @@ export function CredentialsPage() {
   const usageById = useLastKnownById(credentialUsage.data?.items, currentIds)
   const currentCredentials = useMemo(() => {
     return (credentials.data?.items || []).map((item) =>
-      mergeCredentialPlanes(item, runtimeById.get(item.id), accountById.get(item.id), usageById.get(item.id))
+      ({ ...mergeCredentialPlanes(item, runtimeById.get(item.id), accountById.get(item.id), usageById.get(item.id)),
+        healthStatus: credentialFacets.data?.healthById[item.id] })
     )
-  }, [credentials.data?.items, runtimeById, accountById, usageById])
+  }, [credentials.data?.items, runtimeById, accountById, usageById, credentialFacets.data])
 
   const importDuplicateCheckCredentials = allCredentials.data?.credentials || currentCredentials
   const totalPages = credentials.data?.totalPages || 0
@@ -398,7 +407,7 @@ export function CredentialsPage() {
     quickQuery.trim() ||
     modelQuery.trim(),
   )
-  const hasActiveFilters = regionFilter !== '__all__' || statusFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
+  const hasActiveFilters = enabledFilter !== '__all__' || runtimeFilters.length > 0 || regionFilter !== '__all__' || statusFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
   const hasAnyFilters = hasTextFilters || hasActiveFilters
   // The list's filters minus paging and sorting; undefined when nothing is filtered.
   const exportFilter = useMemo<CredentialExportFilter | undefined>(() => {
@@ -409,6 +418,8 @@ export function CredentialsPage() {
       model: listQuery.model,
       region: listQuery.region,
       status: listQuery.status,
+      enabled: listQuery.enabled,
+      runtimeStatus: listQuery.runtimeStatus,
       subscription: listQuery.subscription,
       proxyResourceId: listQuery.proxyResourceId,
     }
@@ -445,7 +456,9 @@ export function CredentialsPage() {
     debouncedQuickQuery,
     debouncedModelQuery,
     regionFilter,
+    enabledFilter,
     statusFilter,
+    runtimeFilters,
     subscriptionFilter,
     proxyFilter,
     sortBy,
@@ -474,6 +487,7 @@ export function CredentialsPage() {
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
     queryClient.invalidateQueries({ queryKey: ['credential-list'] })
     queryClient.invalidateQueries({ queryKey: ['credential-summary'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-facets'] })
     queryClient.invalidateQueries({ queryKey: ['credential-runtime'] })
     queryClient.invalidateQueries({ queryKey: ['credential-account-info'] })
     queryClient.invalidateQueries({ queryKey: ['credential-usage-summary'] })
@@ -710,13 +724,17 @@ export function CredentialsPage() {
     setModelQuery('')
     setRegionFilter('__all__')
     setStatusFilter('__all__')
+    setEnabledFilter('__all__')
+    setRuntimeFilters([])
     setSubscriptionFilter('__all__')
     setProxyFilter('__all__')
   }
 
-  const applyStatusFilter = (value: string) => {
-    setStatusFilter(value)
+  const applyEnabledFilter = (value: string) => {
+    setEnabledFilter(value)
+    setStatusFilter('__all__')
     setPage(1)
+    setSelectedIds(new Set())
   }
 
   const setLbMode = (mode: LoadBalancingMode) => {
@@ -962,7 +980,7 @@ export function CredentialsPage() {
                 <SelectItem value="weighted_least_inflight">低负载优先</SelectItem>
               </SelectContent>
             </Select>
-            <Button variant="outline" size="sm" onClick={() => credentials.refetch()}>
+            <Button variant="outline" size="sm" onClick={() => { credentials.refetch(); credentialFacets.refetch() }}>
               <RefreshCw className={`h-4 w-4 ${credentials.isFetching ? 'animate-spin' : ''}`} />
             </Button>
             <Button variant="outline" size="sm" onClick={queryAllCreditInfo} disabled={queryingCreditInfo} title="查询全部账号订阅和积分信息，刷新汇总">
@@ -991,10 +1009,9 @@ export function CredentialsPage() {
           const summary = credentialSummary.data
           const total = summary?.total ?? grandTotal
           const enabled = summary?.available ?? credentials.data?.available ?? 0
-          const schedulable = summary?.schedulable ?? enabled
           const coolingDown = summary?.coolingDown ?? 0
           const inUse = summary?.inUse ?? 0
-          const failing = summary?.failing ?? 0
+          const accountError = summary?.accountError ?? 0
           const inFlight = summary?.globalInFlightRequests ?? 0
           const maxInFlight = summary?.globalMaxConcurrentRequests ?? 0
           const queued = summary?.queuedRequests ?? 0
@@ -1010,12 +1027,12 @@ export function CredentialsPage() {
                 valueTitle={`启用 ${formatNumber(enabled)} / 共 ${formatNumber(total)}`}
                 desc={(
                   <>
-                    <span className={schedulable > 0 ? 'text-success' : 'text-muted-foreground'}>
-                      可调度 {formatNumber(schedulable)}
+                    <span className={enabled > 0 ? 'text-success' : 'text-muted-foreground'}>
+                      启用 {formatNumber(enabled)}
                     </span>
                     <span className="text-muted-foreground"> · </span>
-                    <span className={failing > 0 ? 'text-warning' : 'text-muted-foreground'}>
-                      异常 {formatNumber(failing)}
+                    <span className={accountError > 0 ? 'text-warning' : 'text-muted-foreground'}>
+                      账号异常 {formatNumber(accountError)}
                     </span>
                     <span className="text-muted-foreground"> · </span>
                     <span className={disabledCount > 0 ? 'text-destructive' : 'text-muted-foreground'}>
@@ -1083,43 +1100,64 @@ export function CredentialsPage() {
       >
         {/* Filters stay under the top bar while the cards scroll (desktop only: on a phone they fill the screen). */}
         <div className="z-20 -mx-4 -mt-1 border-b bg-card px-4 pb-1 pt-1 lg:sticky lg:top-[var(--header-h)]">
-        <div
-          className="mb-2 inline-flex max-w-full flex-wrap gap-0.5 self-start rounded-lg bg-muted p-0.5"
-          role="radiogroup"
-          aria-label="按状态快速筛选"
-        >
+        <div className="space-y-2 py-2">
           {([
-            ['__all__', '全部', credentialSummary.data?.total ?? grandTotal, 'bg-muted-foreground/60'],
-            ['normal', '正常', credentialSummary.data?.normal ?? 0, 'bg-success'],
-            ['cooling', '冷却', credentialSummary.data?.cooling ?? credentialSummary.data?.coolingDown ?? 0, 'bg-warning'],
-            ['quota_exhausted', '额度用尽', credentialSummary.data?.quotaExhausted ?? 0, 'bg-destructive'],
-            ['account_error', '账号异常', credentialSummary.data?.accountError ?? 0, 'bg-destructive'],
-            ['disabled', '已禁用', credentialSummary.data?.disabled ?? 0, 'bg-muted-foreground/40'],
-          ] as const).map(([value, label, count, dot]) => {
-            const selected = statusFilter === value
-            return (
-              <button
-                key={value}
-                type="button"
-                role="radio"
-                aria-checked={selected}
-                // Clicking the selected status again goes back to all accounts.
-                onClick={() => applyStatusFilter(selected ? '__all__' : value)}
-                className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${selected
-                  ? 'bg-card text-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {value !== '__all__' && <span className={`size-1.5 rounded-full ${dot}`} aria-hidden="true" />}
-                {label}
-                <span className={`tabular-nums ${selected ? 'text-foreground' : 'text-muted-foreground/80'}`}>{count}</span>
-              </button>
-            )
-          })}
+            {
+              label: '启用状态', value: enabledFilter,
+              onChange: applyEnabledFilter,
+              items: [
+                ['__all__', '全部', credentialFacets.data?.enableAll],
+                ['enabled', '启用', credentialFacets.data?.enabled],
+                ['disabled', '已禁用', credentialFacets.data?.disabled],
+              ],
+            },
+            {
+              label: '账号状况', value: statusFilter,
+              onChange: setStatusFilter,
+              items: [
+                ['__all__', '全部', credentialFacets.data?.healthAll],
+                ['normal', '正常', credentialFacets.data?.normal],
+                ['quota_exhausted', '额度用尽', credentialFacets.data?.quotaExhausted],
+                ['account_error', '账号异常', credentialFacets.data?.accountError],
+                ['unknown', '待确认', credentialFacets.data?.unknown],
+              ],
+            },
+          ] as const).map((group) => (
+            <div key={group.label} className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+              <span className="w-14 shrink-0 text-xs text-muted-foreground">{group.label}</span>
+              <div role="radiogroup" aria-label={group.label} className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
+                {group.items.map(([value, label, count]) => (
+                  <button key={value} type="button" role="radio" aria-checked={group.value === value}
+                    onClick={() => group.onChange(value)}
+                    className={`flex h-8 items-center gap-2 rounded-md px-3 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${group.value === value ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+                    {label}<span className="tabular-nums text-muted-foreground">{count ?? '—'}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+          <div role="group" aria-label="运行状态" className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span className="w-14 shrink-0 text-xs text-muted-foreground">运行状态</span>
+            <div className="flex flex-wrap gap-1.5">
+              {([
+                ['cooling', '冷却中'], ['rate_limited', 'RPM 限流'],
+                ['concurrency_full', '并发已满'], ['probation', '观察期'], ['proxy_blocked', '代理不可用'],
+              ] as const).map(([value, label]) => (
+                <button key={value} type="button" aria-pressed={runtimeFilters.includes(value)}
+                  onClick={() => setRuntimeFilters((current) => current.includes(value) ? current.filter((item) => item !== value) : [...current, value].sort())}
+                  className={`h-7 rounded-full border px-2.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${runtimeFilters.includes(value) ? 'border-primary/40 bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:bg-muted'}`}>
+                  {label}
+                </button>
+              ))}
+              {runtimeFilters.length > 0 && <button type="button" onClick={() => setRuntimeFilters([])} className="px-1 text-xs text-muted-foreground hover:text-foreground">清除运行状态</button>}
+            </div>
+            {runtimeFilters.length > 1 && <span className="text-[0.68rem] text-muted-foreground">同时满足所选状态</span>}
+          </div>
+          {credentialFacets.isError && <div className="text-xs text-destructive" role="status">分类统计加载失败 <button type="button" className="underline" onClick={() => credentialFacets.refetch()}>重试</button></div>}
         </div>
         {/* Toolbar */}
         <Toolbar className="mb-2">
-          <div className="grid w-full min-w-0 items-end gap-2 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1.5fr)_140px_minmax(180px,1fr)_130px_140px] 2xl:grid-cols-[minmax(230px,1.25fr)_130px_minmax(170px,0.95fr)_120px_130px_minmax(130px,0.85fr)_140px_90px_auto]">
+          <div className="grid w-full min-w-0 items-end gap-2 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1.5fr)_minmax(180px,1fr)_130px_140px] 2xl:grid-cols-[minmax(230px,1.25fr)_minmax(170px,0.95fr)_120px_130px_minmax(130px,0.85fr)_140px_90px_auto]">
             <CredentialFilterField label="快速定位">
               <Input
                 value={quickQuery}
@@ -1127,27 +1165,6 @@ export function CredentialsPage() {
                 placeholder="#ID / 邮箱 / Key / 错误"
                 className="h-8 text-xs"
               />
-            </CredentialFilterField>
-            <CredentialFilterField label="状态">
-              <Select value={statusFilter} onValueChange={setStatusFilter}>
-                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__all__">全部状态</SelectItem>
-                  <SelectItem value="enabled">启用</SelectItem>
-                  <SelectItem value="disabled">已禁用</SelectItem>
-                  <SelectItem value="current">当前活跃</SelectItem>
-                  <SelectItem value="cooldown">冷却中</SelectItem>
-                  <SelectItem value="cooling">冷却账号</SelectItem>
-                  <SelectItem value="rate_limited">限流中</SelectItem>
-                  <SelectItem value="quota_exhausted">额度用尽</SelectItem>
-                  <SelectItem value="account_error">账号异常</SelectItem>
-                  <SelectItem value="normal">正常</SelectItem>
-                  <SelectItem value="proxy_blocked">代理不可用</SelectItem>
-                  <SelectItem value="error">有错误</SelectItem>
-                  <SelectItem value="custom_scheduling">有调度覆盖</SelectItem>
-                  <SelectItem value="unknown_subscription">订阅未知</SelectItem>
-                </SelectContent>
-              </Select>
             </CredentialFilterField>
             <CredentialFilterField label="可用模型">
               <Select

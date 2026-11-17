@@ -31,9 +31,11 @@
 - Subscription filtering and display now follow Kiro's official names: `Kiro Free`, `Kiro Students`, `Kiro Pro`, `Kiro Pro+`, `Kiro Pro Max`, and `Kiro Power`. Historical titles and legacy trial labels normalize to the canonical filter set; substring matching no longer makes `Pro` include `Pro+` or `Pro Max`. The change is scoped to admin display/filtering/validation and does not affect request dispatch. Evidence: [订阅名称归一化](topics/overview-redesign-local-external-split-20261002.md#15-订阅名称归一化2026-10-03).
 - 对齐远端最新发布 `v0.0.183` 的外部池成本口径：总览卡片以“外部池可计费”作为最终管理指标，表格保留“展示计费”和“补偿后计费”作为成本拆分字段，并补充两者的中间口径/最终上报口径说明；零值回退改为与发布版一致的空值回退。证据见 [外部池计费字段对齐](topics/overview-redesign-local-external-split-20261002.md#16-外部池计费字段对齐2026-10-03).
 
+- [账号列表两层分类](topics/credential-classification.md) 已本地实现并验证：启用状态与账号状况分层、运行状态 AND 多选、卡片和导出对齐、修复历史认证错误误判；Rust 管理模块 135 项、前端 80 项、生产构建和本地 mock 浏览器验证通过。已授权准备 main 和 forced-main 两条发布线。
+
 ## In Progress
 
-- None for this scope.
+- None.
 
 ## Next
 

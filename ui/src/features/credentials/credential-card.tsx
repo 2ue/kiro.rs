@@ -711,6 +711,11 @@ export function CredentialCard({
       <div className="flex items-center gap-2 px-4 pt-4">
         <Checkbox checked={selected} onCheckedChange={onToggleSelect} aria-label={`选择 ${displayCredentialLabel}`} />
         <StatusBadge status={status} remaining={remaining} />
+        {credential.healthStatus === 'normal' && !['normal', 'disabled'].includes(status.kind) && (
+          <span className="rounded-full bg-success/10 px-2 py-0.5 text-[0.68rem] font-medium text-success">正常</span>
+        )}
+        {!credential.healthStatus && <span className="text-[0.68rem] text-muted-foreground">状况待加载</span>}
+
         {fast > 0 && (
           <button type="button" className="fast-badge" onClick={() => setEditingFast(true)}
             title={`Fast ${fast}：优先打满这个账号；点击修改`} aria-label={`Fast ${fast}，点击修改`}>

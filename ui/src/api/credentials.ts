@@ -21,6 +21,7 @@ import type {
   CredentialListResponse,
   CredentialRuntimeResponse,
   CredentialSummaryResponse,
+  CredentialFacetsResponse,
   CredentialStatusItem,
   CredentialUsageSummaryResponse,
   CredentialsPageQuery,
@@ -171,6 +172,11 @@ export async function getCredentialsMatching(
 
 export async function getCredentialList(query: CredentialsPageQuery): Promise<CredentialListResponse> {
   const { data } = await api.get<CredentialListResponse>('/credentials/list', { params: query })
+  return data
+}
+
+export async function getCredentialFacets(query: CredentialsPageQuery): Promise<CredentialFacetsResponse> {
+  const { data } = await api.get<CredentialFacetsResponse>('/credentials/facets', { params: query })
   return data
 }
 

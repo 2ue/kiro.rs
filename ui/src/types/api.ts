@@ -28,6 +28,21 @@ export interface CredentialListResponse {
   items: CredentialListItem[]
 }
 
+export type CredentialHealthStatus = 'normal' | 'quota_exhausted' | 'account_error' | 'unknown'
+
+export interface CredentialFacetsResponse {
+  enableAll: number
+  enabled: number
+  disabled: number
+  healthAll: number
+  normal: number
+  quotaExhausted: number
+  accountError: number
+  unknown: number
+  healthById: Record<number, CredentialHealthStatus>
+  updatedAt: string
+}
+
 export interface CredentialSummaryResponse {
   total: number
   available: number
@@ -86,6 +101,8 @@ export interface CredentialsPageQuery {
   rpm?: number
   concurrency?: number
   status?: string
+  enabled?: boolean
+  runtimeStatus?: string
   authMethod?: string
   subscription?: string
   proxyResourceId?: number
@@ -104,6 +121,7 @@ export interface CredentialStatusItem {
   routeMode: ExternalPoolRouteMode
   routeRules: string[]
   disabled: boolean
+  healthStatus?: CredentialHealthStatus
   failureCount: number
   isCurrent: boolean
   expiresAt: string | null
