@@ -2,10 +2,13 @@
 
 import { spawnSync } from "node:child_process";
 
+// claude-main releases are tagged `claude-vMAJOR.MINOR.PATCH` so they never collide with the
+// `v*` tags of the main branch in the same repository.
 const tag = process.argv[2] ?? "";
-if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) {
+const match = /^claude-v([0-9]+\.[0-9]+\.[0-9]+)$/.exec(tag);
+if (!match) {
   console.error(
-    `Release tags must use vMAJOR.MINOR.PATCH format; received ${JSON.stringify(tag)}.`,
+    `Release tags must use claude-vMAJOR.MINOR.PATCH format; received ${JSON.stringify(tag)}.`,
   );
   process.exit(1);
 }
@@ -30,7 +33,7 @@ if (!packageMetadata) {
   process.exit(1);
 }
 
-const taggedVersion = tag.slice(1);
+const taggedVersion = match[1];
 if (taggedVersion !== packageMetadata.version) {
   console.error(
     `Release tag ${tag} does not match Cargo package version ${packageMetadata.version}.`,

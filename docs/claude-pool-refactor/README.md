@@ -1,10 +1,10 @@
-> 实施状态：8 个阶段已全部完成并提交在 `fork/claude-pool`（2026-11-17），端到端走查、复测与负载/混沌矩阵（quick 19 用例、full 33 用例）全部通过，详见 [实施验收记录](13-实施验收记录.md) 与 [负载与混沌验收](14-负载混沌验收.md)。本目录为设计与实施记录，章节中引用的 `src/kiro/...` 等旧路径是改造前的历史位置。
+> 实施状态：8 个阶段已全部完成并提交在 `claude-main`（2026-11-17），端到端走查、复测与负载/混沌矩阵（quick 19 用例、full 33 用例）全部通过，详见 [实施验收记录](13-实施验收记录.md) 与 [负载与混沌验收](14-负载混沌验收.md)。本目录为设计与实施记录，章节中引用的 `src/kiro/...` 等旧路径是改造前的历史位置。
 
 # Claude 账号池调度系统改造方案
 
 目标：把 `kiro-rs` 改造成纯 Claude Code 协议（Anthropic Messages）账号的调度网关。账号以 `baseUrl + key` 接入；网关负责路由调度、模型限制与映射、优先级管理，并对下游 usage 做整形。所有 Kiro 相关能力删除。
 
-分支 `fork/claude-pool`，worktree `../2ue_kiro.rs-claude-pool`，从 `main@8946fe38`（kiro-rs 0.0.252）切出，只单向合入 main。
+分支 `claude-main`（原名 `fork/claude-pool`，2026-11-17 改名），worktree `../2ue_kiro.rs-claude-pool`，从 `main@8946fe38`（kiro-rs 0.0.252）切出，只单向合入 main，永不合回。独立发布：tag `claude-vX.Y.Z`，镜像 `ghcr.io/2ue/claude-pool`，门禁对 `claude-main` 触发（见根 README「分支与发布」）。
 
 ## 阅读顺序
 

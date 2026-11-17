@@ -122,6 +122,31 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.0 \
   docker compose -f docker-compose.database.yml up -d
 ```
 
+## 分支与发布
+
+`claude-pool` 维护在仓库 `2ue/kiro.rs` 的 **`claude-main`** 分支上，是一条独立主线：只单向从 `main` 合入通用修复，永不合回 `main`。版本号、tag、镜像都与 `main` 隔离：
+
+| 项 | `claude-main` | `main`（kiro-rs） |
+|---|---|---|
+| 包名 / 二进制 | `claude-pool` | `kiro-rs` |
+| 版本来源 | `Cargo.toml`（当前 `1.0.0`） | `Cargo.toml` |
+| 发布 tag | `claude-vMAJOR.MINOR.PATCH` | `vMAJOR.MINOR.PATCH` |
+| 镜像 | `ghcr.io/2ue/claude-pool`、`docker.io/<user>/claude-pool` | `ghcr.io/2ue/kiro-rs` |
+| 质量门禁 | 对 `claude-main` 的 push / PR 跑全量门禁 | 对 `main` |
+
+发布步骤（在 `claude-main` 的 worktree 内执行）：
+
+```bash
+# 1. 顺延版本号：Cargo.toml、Cargo.lock、package.json、ui/package.json 四处一致
+# 2. 提交
+git commit -am "chore(release): 1.0.1"
+# 3. 推送分支并打 tag，tag 必须严格等于 claude-v + Cargo 版本
+git push origin claude-main
+git tag claude-v1.0.1 && git push origin claude-v1.0.1
+```
+
+tag 推送后 `Publish Claude Pool Docker Images` 工作流会校验 tag 与 Cargo 版本一致、运行 release 档质量门禁、构建 amd64 与 arm64 镜像并推送多架构 manifest；`latest` 只在 `claude-v*` 命名空间内按最高版本更新。
+
 `docker-compose.yml` 和 `docker-compose.deploy.yml` 连接已有基础设施；`docker-compose.database.yml` 启动应用、PostgreSQL 和 Redis；`docker-compose.local-infra.yml` 只启动本地开发依赖。详见 [Docker 部署](docs/ai-docker-compose-deployment.md)。
 
 ## 核心概念

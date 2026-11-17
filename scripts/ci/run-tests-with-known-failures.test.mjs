@@ -142,17 +142,17 @@ test("known failure list holds only fully qualified test names", () => {
   }
 });
 
-test("Quality Gate runs the full profile on main pushes through the filter", () => {
+test("Quality Gate runs the full profile on claude-main pushes through the filter", () => {
   const workflow = readFileSync(new URL("../../.github/workflows/build.yaml", import.meta.url), "utf8");
 
-  assert.match(workflow, /push:\n\s+branches:\n\s+- main/);
+  assert.match(workflow, /push:\n\s+branches:\n\s+- claude-main/);
   assert.match(workflow, /quality-\$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/);
   assert.match(workflow, /QUALITY_PROFILE: \$\{\{ inputs\.profile \|\| 'full' \}\}/);
   // Both feature sets run in parallel matrix jobs, each multi-threaded.
   assert.match(workflow, /cargo_args: ''\n\s+- name: no default features\n\s+cargo_args: --no-default-features/);
   assert.match(
     workflow,
-    /node scripts\/ci\/run-tests-with-known-failures\.mjs -- --no-fail-fast --locked --all-targets \$\{\{ matrix\.cargo_args \}\}/,
+    /node scripts\/ci\/run-tests-with-known-failures\.mjs -- --no-fail-fast --locked --bin claude-pool \$\{\{ matrix\.cargo_args \}\}/,
   );
   assert.doesNotMatch(workflow, /run-tests-with-known-failures\.mjs[^\n]*--test-threads=1/);
 });
@@ -179,7 +179,7 @@ test("manifest checks a successful same-SHA push and exposes the documented esca
   assert.match(workflow, /workflow_dispatch run exists[\s\S]*?Manually confirm it used profile=full/);
   assert.match(workflow, /vars\.ALLOW_RELEASE_WITHOUT_FULL_QUALITY != 'true'/);
   assert.match(workflow, /vars\.ALLOW_RELEASE_WITHOUT_FULL_QUALITY == 'true'/);
-  assert.match(workflow, /Please wait for the Quality Gate run on main for this commit to finish and pass, or manually dispatch the full profile/);
+  assert.match(workflow, /Please wait for the Quality Gate run on claude-main for this commit to finish and pass, or manually dispatch the full profile/);
   // octokit 的方法名是 listWorkflowRuns（GET /actions/workflows/{id}/runs）；写错方法名只会在发版时才报
   // "is not a function"，所以在这里锁住。
   assert.match(workflow, /github\.rest\.actions\.listWorkflowRuns\(/);
