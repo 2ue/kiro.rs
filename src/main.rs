@@ -1553,6 +1553,18 @@ impl CredentialsReloadCoalescer {
     }
 }
 
+/// Another instance refreshed one credential's token: merge just that credential on a blocking
+/// thread. Folding refreshes into the full reload made every refresh rewrite the whole pool.
+fn spawn_refreshed_credential_reload(token_manager: Arc<MultiTokenManager>, credential_id: u64) {
+    tokio::task::spawn_blocking(move || {
+        match token_manager.reload_refreshed_credential_from_postgres(credential_id) {
+            Ok(true) => tracing::debug!(credential_id, "已根据 Redis 通知合并其他实例刷新的 Token"),
+            Ok(false) => tracing::debug!(credential_id, "收到 Token 刷新通知，本地凭据已是最新"),
+            Err(err) => tracing::warn!(credential_id, "合并其他实例刷新的 Token 失败: {}", err),
+        }
+    });
+}
+
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
@@ -1635,7 +1647,12 @@ fn spawn_redis_runtime_event_listener(
                                 Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
                             }
                         } else if channel == credentials_channel {
-                            credentials_reload.request(token_manager.clone(), payload);
+                            let refreshed_credential_id =
+                                kiro::token_manager::token_refreshed_event_credential_id(&payload);
+                            match refreshed_credential_id {
+                                Some(id) => spawn_refreshed_credential_reload(token_manager.clone(), id),
+                                None => credentials_reload.request(token_manager.clone(), payload),
+                            }
                         } else if channel == wakeup_channel {
                             if !token_manager.notify_remote_dispatch_state_changed(&payload) {
                                 tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");

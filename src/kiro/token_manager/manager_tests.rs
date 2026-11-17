@@ -16464,6 +16464,41 @@ fn runtime_events_published_by_this_instance_are_recognised() {
     assert!(!manager.runtime_event_is_from_this_instance("not json"));
 }
 
+/// Each token refresh used to publish credentials_changed without the instance id, so the
+/// publishing instance reloaded every credential from PgSQL on its own refreshes.
+#[test]
+fn token_refresh_events_name_the_instance_and_the_credential() {
+    let manager = queue_test_manager(1, 10);
+    let own = super::super::redis_runtime::token_refreshed_event_payload(
+        &manager.scheduler_instance_id,
+        42,
+    );
+    assert!(manager.runtime_event_is_from_this_instance(&own));
+    assert_eq!(
+        super::super::redis_runtime::token_refreshed_event_credential_id(&own),
+        Some(42)
+    );
+    let other = super::super::redis_runtime::token_refreshed_event_payload("another-instance", 7);
+    assert!(!manager.runtime_event_is_from_this_instance(&other));
+    assert_eq!(
+        super::super::redis_runtime::token_refreshed_event_credential_id(&other),
+        Some(7)
+    );
+    // Other credential changes still take the full reload.
+    let changed = super::super::redis_runtime::test_runtime_event_payload(
+        "credentials_changed",
+        "another-instance",
+    );
+    assert_eq!(
+        super::super::redis_runtime::token_refreshed_event_credential_id(&changed),
+        None
+    );
+    assert_eq!(
+        super::super::redis_runtime::token_refreshed_event_credential_id("not json"),
+        None
+    );
+}
+
 // ---- 2026-10-31 overload stall (feature/issues/overload-stall-20261031) ----
 
 /// A Redis scheduler timeout while this process runs tasks late is our slowness, not Redis.
