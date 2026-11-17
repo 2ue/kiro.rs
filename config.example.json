@@ -46,8 +46,7 @@
   "accounts": {
     "enabled": true,
     "dispatchMaxWaitSecs": 60,
-    "capacityMode": "wait",
-    "maxQueuedRequests": 64
+    "capacityMode": "wait"
   },
   "routes": [
     {

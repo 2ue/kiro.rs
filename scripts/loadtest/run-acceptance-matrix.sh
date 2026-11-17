@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Usage: scripts/loadtest/run-acceptance-matrix.sh [smoke|quick|full|scenarios CASE...|overload CASE...]
+# Usage: scripts/loadtest/run-acceptance-matrix.sh [smoke|quick|full|defaults|scenarios CASE...|overload CASE...]
+#   defaults: 不覆盖调度设置，用代码默认值（高并发默认）跑 quick 的闭环场景，验证开箱即用的配置。
 set -uo pipefail
 MODE=${1:-quick}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -20,13 +21,17 @@ case "$MODE" in
     OVERLOAD_CASES='steady_ok'
     export PROFILE_OVERRIDE=steady:5:20 ;;
   quick|full)
-    SCHEDULER_CASES='normal sudden_burst sustained_overload burst_with_errors_recovering burst_with_short_outage burst_with_long_outage single_account_failing connection_resets long_stream_burst mid_stream_resets client_timeouts burst_errors_then_recover burst_errors_never_recover sudden_burst_sustained'
+    SCHEDULER_CASES='normal sudden_burst sustained_overload burst_with_errors_recovering burst_with_short_outage burst_with_long_outage single_account_failing connection_resets long_stream_burst mid_stream_resets client_timeouts burst_errors_then_recover burst_errors_never_recover sudden_burst_sustained heterogeneous_accounts accounts_suspended_then_restored'
     OVERLOAD_CASES='steady_ok spike_sub2api storm_5xx storm_429 queue_overflow'
     if [ "$MODE" = full ]; then
-      SCHEDULER_CASES="$SCHEDULER_CASES long_stream_sessions mixed_chaos_soak"
+      SCHEDULER_CASES="$SCHEDULER_CASES long_streams_hold_slots long_stream_sessions mixed_chaos_soak everything_at_once"
       OVERLOAD_CASES="$OVERLOAD_CASES sustained_sub2api long_spike square_sub2api storm_reset storm_midstream spike_with_errors slow_wave slow_accounts_spike spike_impatient long_overload pool_hang pool_trickle"
     fi ;;
-  *) echo "Usage: $0 [smoke|quick|full|scenarios CASE...|overload CASE...]" >&2; exit 2 ;;
+  defaults)
+    export USE_CODE_DEFAULTS=1
+    SCHEDULER_CASES='normal sudden_burst sustained_overload burst_with_errors_recovering heterogeneous_accounts long_streams_hold_slots mid_stream_resets sudden_burst_sustained'
+    OVERLOAD_CASES='' ;;
+  *) echo "Usage: $0 [smoke|quick|full|defaults|scenarios CASE...|overload CASE...]" >&2; exit 2 ;;
 esac
 mkdir -p "$OUT_DIR"
 trap 'cleanup_instance' EXIT
@@ -47,7 +52,8 @@ for name in $SCHEDULER_CASES; do
   echo "== scheduler $name"
   $NODE "$REPO/scripts/loadtest/scheduler-scenarios.mjs" --base-url "http://127.0.0.1:$PORT" \
     --api-key "$API_KEY" --pool-mock "http://127.0.0.1:$MOCK_PORT" --scenario "$name" \
-    --target-pid "$SERVER_PID" --dispatch-max-wait-secs "$WAIT_SECS" \
+    --target-pid "$SERVER_PID" --dispatch-max-wait-secs "$WAIT_SECS" --accounts "$ACCOUNTS" \
+    --upstream-socket-cap "$UPSTREAM_SOCKET_CAP" --db-socket-cap "$DB_SOCKET_CAP" \
     --out "$OUT_DIR/$name.json" > "$OUT_DIR/$name.log" 2>&1 || FAILED=1
   if [ ! -s "$OUT_DIR/$name.json" ]; then
     printf '{"scenario":"%s","verdict":"FAIL","problems":["场景进程未产出报告"]}\n' "$name" > "$OUT_DIR/$name.json"

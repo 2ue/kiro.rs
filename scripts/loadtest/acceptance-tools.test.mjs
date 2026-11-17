@@ -75,11 +75,41 @@ test("process sample: liveness comes from signal-0, a failed ps/lsof only leaves
   assert.equal(self.alive, true);
   assert.ok(self.rssMb > 0 && self.fd > 0);
   const dead = processSample(999_999);
-  assert.deepEqual(dead, { rssMb: null, fd: null, alive: false });
+  assert.deepEqual(dead, { rssMb: null, fd: null, fdByKind: null, alive: false });
   // An alive sample whose ps/lsof failed must not be counted as "exited" and must not poison the summary.
-  const unsampled = { rssMb: null, fd: null, alive: true, sampled: false };
+  const unsampled = { rssMb: null, fd: null, fdByKind: null, alive: true, sampled: false };
   const summary = resourceSummary([self, unsampled, self]);
   assert.equal(summary.start.fd, self.fd);
   assert.equal(summary.end.alive, true);
   assert.equal([self, unsampled, self].some((s) => s && !s.alive), false);
+});
+
+test("fd leak verdict judges per kind: pooled idle sockets under their caps are not a leak", async () => {
+  const { classifyLsof, fdLeakProblems } = await import("./lib/process-sample.mjs");
+  const lsof = (rows) => ["COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME", ...rows].join("\n");
+  const listen = "claude-po 1 u 3u IPv4 0x1 0t0 TCP 127.0.0.1:19381 (LISTEN)";
+  const downstream = (n) => Array.from({ length: n }, (_, i) => `claude-po 1 u ${10 + i}u IPv4 0x1 0t0 TCP 127.0.0.1:19381->127.0.0.1:${50000 + i} (ESTABLISHED)`);
+  const upstream = (n) => Array.from({ length: n }, (_, i) => `claude-po 1 u ${100 + i}u IPv4 0x1 0t0 TCP 127.0.0.1:${51000 + i}->127.0.0.1:39181 (ESTABLISHED)`);
+  const pg = (n) => Array.from({ length: n }, (_, i) => `claude-po 1 u ${200 + i}u IPv6 0x1 0t0 TCP [::1]:${52000 + i}->[::1]:25432 (ESTABLISHED)`);
+  const redis = (n) => Array.from({ length: n }, (_, i) => `claude-po 1 u ${300 + i}u IPv4 0x1 0t0 TCP 127.0.0.1:${53000 + i}->127.0.0.1:26379 (ESTABLISHED)`);
+  const other = (n) => Array.from({ length: n }, (_, i) => i % 2 ? `claude-po 1 u ${400 + i}u KQUEUE count=0, state=0xa` : `claude-po 1 u ${400 + i}u unix 0x1 0t0 ->0x2`);
+  const ports = { downstreamPort: "19381", upstreamPort: "39181" };
+
+  const start = classifyLsof(lsof([listen, ...upstream(6), ...pg(9), ...redis(4), ...other(22)]), ports);
+  assert.deepEqual(start, { total: 42, downstream: 1, upstream: 6, db: 13, other: 22 });
+  // The situation that used to fail "FD did not recover": the pools warmed up and stayed idle.
+  const warmPools = classifyLsof(lsof([listen, ...upstream(24), ...pg(13), ...redis(4), ...other(22)]), ports);
+  assert.equal(warmPools.total, 64);
+  assert.deepEqual(fdLeakProblems({ fdByKind: start }, { fdByKind: warmPools }, { upstreamCap: 40, dbCap: 24 }), []);
+  // Real leaks are still caught, each on its own invariant.
+  const leakedClients = classifyLsof(lsof([listen, ...downstream(5), ...upstream(6), ...pg(9), ...redis(4), ...other(22)]), ports);
+  assert.match(fdLeakProblems({ fdByKind: start }, { fdByKind: leakedClients }, { upstreamCap: 40, dbCap: 24 }).join(";"), /downstream sockets not released 1 -> 6/);
+  const leakedUpstream = classifyLsof(lsof([listen, ...upstream(41), ...pg(9), ...redis(4), ...other(22)]), ports);
+  assert.match(fdLeakProblems({ fdByKind: start }, { fdByKind: leakedUpstream }, { upstreamCap: 40, dbCap: 24 }).join(";"), /upstream sockets 41 exceed slot cap 40/);
+  const leakedDb = classifyLsof(lsof([listen, ...upstream(6), ...pg(21), ...redis(4), ...other(22)]), ports);
+  assert.match(fdLeakProblems({ fdByKind: start }, { fdByKind: leakedDb }, { upstreamCap: 40, dbCap: 24 }).join(";"), /database sockets 25 exceed pool cap 24/);
+  const leakedHandles = classifyLsof(lsof([listen, ...upstream(6), ...pg(9), ...redis(4), ...other(33)]), ports);
+  assert.match(fdLeakProblems({ fdByKind: start }, { fdByKind: leakedHandles }, { upstreamCap: 40, dbCap: 24 }).join(";"), /non-socket FDs grew 22 -> 33/);
+  // Without a breakdown the verdict cannot be trusted and says so.
+  assert.deepEqual(fdLeakProblems({ fdByKind: null }, { fdByKind: start }, {}), ["FD breakdown unavailable"]);
 });

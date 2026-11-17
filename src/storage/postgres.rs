@@ -9178,11 +9178,7 @@ fn account_eligibility_from_row(row: &PgRow) -> anyhow::Result<AccountEligibilit
         enabled: row.try_get("enabled")?,
         auto_disabled: row.try_get("auto_disabled")?,
         auto_disabled_until: row.try_get("auto_disabled_until")?,
-        supported_models: Arc::new(
-            normalize_supported_models(supported_models)
-                .into_iter()
-                .collect::<HashSet<_>>(),
-        ),
+        supported_models: Arc::new(supported_models),
         route_mode,
         route_rules: Arc::new(route_rules),
     })

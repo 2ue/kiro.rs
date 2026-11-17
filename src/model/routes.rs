@@ -675,9 +675,12 @@ mod tests {
     #[test]
     fn scheduler_defaults_table() {
         let defaults = serde_json::to_value(AccountsConfig::default()).unwrap();
+        // 高并发默认值（04 章）：全局并发 1024、队列 256、首输出超时 45 秒。
         for (field, expected) in [
             ("dispatchMaxWaitSecs", json!(60)),
-            ("maxQueuedRequests", json!(64)),
+            ("maxQueuedRequests", json!(256)),
+            ("globalMaxConcurrentRequests", json!(1024)),
+            ("streamFirstOutputTimeoutSecs", json!(45)),
             ("capacityMode", json!("wait")),
             ("enabled", json!(true)),
         ] {

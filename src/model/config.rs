@@ -4628,11 +4628,11 @@ fn default_account_auto_disable_window_secs() -> u64 {
 }
 
 fn default_account_global_max_concurrent_requests() -> u32 {
-    512
+    1024
 }
 
 fn default_account_max_queued_requests() -> u32 {
-    64
+    256
 }
 
 fn default_account_dispatch_max_wait_secs() -> u64 {
@@ -4767,7 +4767,7 @@ fn default_account_stream_idle_timeout_secs() -> u64 {
 }
 
 fn default_account_stream_first_output_timeout_secs() -> u64 {
-    120
+    45
 }
 
 fn default_account_stream_pre_output_retry_enabled() -> bool {
@@ -4807,11 +4807,11 @@ fn default_account_wire_debug_max_files() -> u32 {
 }
 
 fn default_postgres_max_connections() -> u32 {
-    10
+    16
 }
 
 fn default_postgres_usage_max_connections() -> u32 {
-    4
+    6
 }
 
 fn default_redis_key_prefix() -> String {

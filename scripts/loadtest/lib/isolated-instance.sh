@@ -17,6 +17,12 @@ NODE=${NODE:-node}
 NODE=$($NODE -p 'process.execPath')
 ACCOUNTS=${ACCOUNTS:-10}
 PER_CONC=${PER_CONC:-4}
+# FD leak caps for the scenario verdict: upstream sockets can never exceed the slots that were
+# concurrently in flight; database sockets are bounded by the pools in the generated config.json
+# (postgres maxConnections=10, usage pool default 6) plus the Redis client and its three
+# connection managers / pub-sub (8 with slack).
+UPSTREAM_SOCKET_CAP=${UPSTREAM_SOCKET_CAP:-$((ACCOUNTS * PER_CONC))}
+DB_SOCKET_CAP=${DB_SOCKET_CAP:-$((10 + 6 + 8))}
 PER_RPM=0
 QUEUE=${QUEUE:-200}
 WAIT_SECS=${WAIT_SECS:-60}
@@ -74,6 +80,20 @@ PY
 
 apply_dispatch_settings() {
   admin_api config/runtime > "$D/runtime.json" || return 1
+  if [ "${USE_CODE_DEFAULTS:-0}" = 1 ]; then
+    # 只放开下游准入（压测客户端直打），账号池调度参数保持代码默认，验证开箱配置。
+    python3 - "$D" <<'PY'
+import json, sys
+from pathlib import Path
+d = Path(sys.argv[1])
+accounts = json.loads((d/'runtime.json').read_text())['accounts']
+print('code defaults:', {k: accounts.get(k) for k in ('globalMaxConcurrentRequests','maxQueuedRequests','dispatchMaxWaitSecs','streamFirstOutputTimeoutSecs','streamIdleTimeoutSecs','requestTimeoutSecs')})
+(d/'dispatch-settings.json').write_text(json.dumps(dict(
+    requestAdmission=dict(rpm=0, maxConcurrentRequests=0, maxQueuedRequests=0, queueTimeoutMs=0))))
+PY
+    admin_api config/runtime -X PUT --data-binary "@$D/dispatch-settings.json" > "$D/runtime-applied.json"
+    return
+  fi
   python3 - "$D" "$QUEUE" "$WAIT_SECS" "$GLOBAL_MAX" "$IDLE_SECS" "$MAX_DURATION_SECS" "$FIRST_OUTPUT_SECS" <<'PY'
 import json, sys
 from pathlib import Path

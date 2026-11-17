@@ -15652,6 +15652,124 @@ fn supported_model_filter_allows_empty_and_matches_route_candidates() {
     ));
 }
 
+/// 按旧算法（每次调用都重新展开列表）实现的参照，用来证明缓存版结果完全一致。
+fn uncached_supported_models_match(supported: &[String], candidates: Option<&[String]>) -> bool {
+    if supported.is_empty() {
+        return true;
+    }
+    let Some(candidates) = candidates else {
+        return false;
+    };
+    let expanded = normalize_account_allowlist_models(supported.iter().map(String::as_str));
+    candidates
+        .iter()
+        .any(|candidate| expanded.iter().any(|model| model == candidate))
+}
+
+#[test]
+fn cached_supported_models_match_agrees_with_expanding_on_every_call() {
+    let lists: Vec<Vec<String>> = [
+        vec![],
+        vec!["  ", ""],
+        vec![
+            "claude-haiku-4.5",
+            "claude-sonnet-4-5-20250929",
+            "deepseek-3.2",
+        ],
+        vec![
+            "Claude-Opus-4.8",
+            "claude-opus-4-8",
+            "claude-3-5-haiku-20241022",
+        ],
+        vec!["claude-sonnet-4.6-thinking", "glm-5", "claude-fable-5.1"],
+        vec!["claude-sonnet-4.6-thinking", "glm-5", "claude-fable-5.1"],
+        vec!["tenant-haiku-model"],
+    ]
+    .into_iter()
+    .map(|list| list.into_iter().map(str::to_string).collect())
+    .collect();
+    let requests = [
+        "claude-haiku-4-5",
+        " CLAUDE-HAIKU-4.5 ",
+        "haiku",
+        "sonnet",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4-5-20250929",
+        "claude-opus-4.8[1m]",
+        "claude-sonnet-4-6-thinking",
+        "glm-5",
+        "tenant-haiku-model",
+        "claude-fable-5-1",
+        "",
+    ];
+    // 两轮：第二轮全部命中缓存，结果必须与第一轮和参照实现一致。
+    for round in 0..2 {
+        for list in &lists {
+            for requested in requests {
+                let candidates = normalize_account_support_candidates([requested]);
+                for candidates in [Some(candidates.as_slice()), None] {
+                    assert_eq!(
+                        supported_models_match(list, candidates),
+                        uncached_supported_models_match(list, candidates),
+                        "round {round} list {list:?} requested {requested:?} candidates {candidates:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cached_supported_models_match_never_answers_a_changed_list_from_a_stale_entry() {
+    let candidates = normalize_account_support_candidates(["claude-haiku-4.5"]);
+    let haiku = vec!["claude-haiku-4.5".to_string()];
+    let sonnet = vec!["claude-sonnet-4.5".to_string()];
+    assert!(supported_models_match(&haiku, Some(&candidates)));
+    assert!(!supported_models_match(&sonnet, Some(&candidates)));
+    // 同一账号把列表从 haiku 改成 sonnet 再改回：每次都按当前列表判定。
+    assert!(supported_models_match(&haiku, Some(&candidates)));
+    assert!(!supported_models_match(&sonnet, Some(&candidates)));
+    // 缓存条目数超过上限后整体重建，判定仍正确。
+    for index in 0..(SUPPORTED_MODELS_CACHE_MAX_LISTS * 2) {
+        let list = vec![format!("vendor-model-{index}")];
+        assert!(!supported_models_match(&list, Some(&candidates)));
+    }
+    assert!(supported_models_match(&haiku, Some(&candidates)));
+}
+
+#[test]
+fn account_eligibility_and_authoritative_account_agree_on_supported_models() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    for (list, requested) in [
+        (vec!["claude-haiku-4.5"], "haiku"),
+        (vec!["claude-haiku-4.5"], "claude-haiku-4-5-20251001"),
+        (vec!["claude-sonnet-4-5-20250929"], "claude-sonnet-4.5"),
+        (vec!["tenant-haiku-model"], "haiku"),
+        (vec!["claude-opus-4.8"], "claude-opus-4-8[1m]"),
+    ] {
+        pool.supported_models = list.into_iter().map(str::to_string).collect();
+        let eligibility = account_eligibility_from_pool(&pool);
+        let candidates = normalize_account_support_candidates([requested]);
+        assert_eq!(
+            account_matches_supported_models_normalized(&pool, Some(&candidates)),
+            account_eligibility_matches_supported_models(&eligibility, Some(&candidates)),
+            "list {:?} requested {requested:?}",
+            pool.supported_models
+        );
+    }
+}
+
+#[test]
+fn deleting_an_account_drops_its_dispatch_counter_and_degraded_semaphores() {
+    let counters = DispatchCounters::default();
+    counters.record(7);
+    counters.record(8);
+    assert_eq!(counters.per_account.lock().len(), 2);
+    counters.per_account.lock().remove(&7);
+    assert_eq!(counters.per_account.lock().len(), 1);
+    assert!(counters.per_account.lock().contains_key(&8));
+}
+
 #[test]
 fn supported_model_filter_bridges_claude_code_aliases_to_pool_models() {
     let mut pool = test_pool("https://example.com/v1", true);

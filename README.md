@@ -28,7 +28,7 @@ pnpm --dir ui build
 cargo build --release --locked --bin claude-pool
 ```
 
-默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。发布前核对 CLI 版本，预期输出 `claude-pool 1.0.0`：
+默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。发布前核对 CLI 版本，预期输出 `claude-pool 1.0.1`：
 
 ```bash
 cargo run --release --locked --bin claude-pool -- --version
@@ -110,15 +110,15 @@ mkdir -p config logs
 cp config.example.json config/config.json
 # 编辑 config/config.json 中的下游密钥与管理密钥
 export CLAUDE_POOL_POSTGRES_PASSWORD='replace-with-database-password'
-export CLAUDE_POOL_VERSION=1.0.0
+export CLAUDE_POOL_VERSION=1.0.1
 docker compose -f docker-compose.database.yml up -d
 ```
 
 自建镜像：
 
 ```bash
-docker build -t claude-pool:1.0.0 .
-CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.0 \
+docker build -t claude-pool:1.0.1 .
+CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.1 \
   docker compose -f docker-compose.database.yml up -d
 ```
 
@@ -129,7 +129,7 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.0 \
 | 项 | `claude-main` | `main`（kiro-rs） |
 |---|---|---|
 | 包名 / 二进制 | `claude-pool` | `kiro-rs` |
-| 版本来源 | `Cargo.toml`（当前 `1.0.0`） | `Cargo.toml` |
+| 版本来源 | `Cargo.toml`（当前 `1.0.1`） | `Cargo.toml` |
 | 发布 tag | `claude-vMAJOR.MINOR.PATCH` | `vMAJOR.MINOR.PATCH` |
 | 镜像 | `ghcr.io/2ue/claude-pool`、`docker.io/<user>/claude-pool` | `ghcr.io/2ue/kiro-rs` |
 | 质量门禁 | 对 `claude-main` 的 push / PR 跑全量门禁 | 对 `main` |
@@ -193,7 +193,7 @@ tag 推送后 `Publish Claude Pool Docker Images` 工作流会校验 tag 与 Car
 |---|---|---|
 | `host`、`port` | 示例 `0.0.0.0`、`8990`；代码默认 `127.0.0.1`、`8080` | 监听地址与端口 |
 | `postgres.url` | 示例本地 `25432` | 配置、账号、用量、模型、审计的权威存储；启动必需 |
-| `postgres.maxConnections`、`usageMaxConnections` | `10`、`4` | 业务与 usage 独立连接池 |
+| `postgres.maxConnections`、`usageMaxConnections` | `16`、`6` | 业务与 usage 独立连接池 |
 | `postgres.migrateOnStart`、`compressUsageRollupsOnStart` | `true`、`false` | schema 初始化与历史 rollup 压缩开关 |
 | `redis.url`、`keyPrefix` | 示例本地 `26379`；前缀默认 `claude_pool:local` | 调度协调与热加载；同集群实例使用相同前缀 |
 | `observabilityRedis.url`、`keyPrefix` | `null`、`claude_pool:observability` | 可选观测 Redis；必须与业务 Redis 属于不同服务进程；未配置则使用 PostgreSQL/本机观测 |
@@ -217,7 +217,7 @@ tag 推送后 `Publish Claude Pool Docker Images` 工作流会校验 tag 与 Car
 | `promptCacheEntryTtlSecs`、`promptCacheEstimatedBytesLimit` | `86400`、`268435456` | 追踪条目 TTL 与估算内存限制 |
 | `cachePolicy`、`reportedUsage` | 默认模板 | 全局六种策略模板和字段整形默认值；路由负责挂载 |
 | `routes` | 示例四条内置路由 | 路由前缀、策略、功能、注入、账号和模型规则 |
-| `accounts` | 示例启用、等待 `60s`、队列 `64`、`wait` | 全局账号池容量、重试、质量、自动禁用、冷却、传输、usage 放大等默认值 |
+| `accounts` | 示例启用、等待 `60s`、`wait`；代码默认全局并发 `1024`、队列 `256`、首输出超时 `45s` | 全局账号池容量、重试、质量、自动禁用、冷却、传输、usage 放大等默认值 |
 | `activeRouteScenarioId` | 未设置 | 最近完整应用的路由场景标识 |
 | `usageRecordLimit`、`highCacheThreshold` | `5000`、`10000` | 内存记录上限与管理端高缓存判定阈值 |
 | `auditLogRetentionEnabled`、`auditLogRetentionDays` | `false`、`15` | 审计自动清理默认关闭 |

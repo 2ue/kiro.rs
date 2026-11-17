@@ -499,7 +499,12 @@ async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_
     };
     let mut config = crate::model::config::Config::default();
     config.postgres.url = Some(url);
-    config.postgres.max_connections = 2;
+    // Three connections, not two: one holds the injected row lock, one is left mid-UPDATE when
+    // a timed-out attempt drops its future (sqlx must then drain that statement, which itself
+    // waits for the lock, plus the after_release probe and a ping before the connection is
+    // usable again), and the third lets the next attempt run as soon as the lock is released
+    // instead of queueing behind that drain.
+    config.postgres.max_connections = 3;
     let postgres = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
     let usage_store = PostgresUsageStore::new(postgres.clone());
 
@@ -536,6 +541,17 @@ async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_
             .await
             .unwrap();
 
+        // Timeline: attempt 1 holds for the whole attempt timeout (the row is locked), the
+        // retry delay passes, attempt 2 starts, and only then is the lock released. Attempt 2
+        // must complete its UPDATE inside its own timeout, so the attempt timeout has to cover
+        // a Postgres round trip on a starved host, not just scheduler jitter: with 40 ms the
+        // test failed 4 of 6 runs next to 24 busy-loop processes, and even 200 ms failed 5 of 8
+        // because a lock-free UPDATE took up to 450 ms there. Size it like production (2 s
+        // attempt timeout) rather than like a unit test; the retry logic under test is the
+        // same either way.
+        let attempt_timeout = StdDuration::from_millis(1_000);
+        let retry_delay = StdDuration::from_millis(50);
+        let release_after = StdDuration::from_millis(1_100);
         let renewal_store = usage_store.clone();
         let renewal_job_id = job_id.clone();
         let renewal_worker_id = worker_id.clone();
@@ -547,25 +563,27 @@ async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_
                 &renewal_worker_id,
                 UsageCleanupHeartbeatPolicy {
                     lease_secs: 30,
-                    attempt_timeout: StdDuration::from_millis(40),
+                    attempt_timeout,
                     max_attempts: 3,
-                    retry_delay: StdDuration::from_millis(15),
+                    retry_delay,
                 },
             )
             .await
         });
 
-        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        tokio::time::sleep(release_after).await;
         blocker.rollback().await.unwrap();
         let renewed = renewal.await.unwrap().unwrap();
         let elapsed = started.elapsed();
         assert_eq!(renewed, Some(false), "round {round}");
         assert!(
-            elapsed >= StdDuration::from_millis(70),
+            elapsed >= attempt_timeout,
             "round {round}: the injected row lock must affect at least one attempt: {elapsed:?}"
         );
+        // Three attempts plus both back-off delays (50 ms, 100 ms) is the whole retry budget;
+        // anything beyond it would mean the heartbeat hung instead of giving up.
         assert!(
-            elapsed < StdDuration::from_millis(250),
+            elapsed < attempt_timeout * 3 + retry_delay * 3 + StdDuration::from_millis(500),
             "round {round}: heartbeat retry must stay bounded: {elapsed:?}"
         );
 

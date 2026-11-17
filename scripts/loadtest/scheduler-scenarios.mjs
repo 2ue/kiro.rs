@@ -11,7 +11,7 @@
 
 import http from "node:http";
 import { writeFileSync } from "node:fs";
-import { processSample, resourceSummary } from "./lib/process-sample.mjs";
+import { fdLeakProblems, processSample, resourceSummary } from "./lib/process-sample.mjs";
 
 function parseArgs(argv) {
   const out = {};
@@ -35,6 +35,9 @@ const poolMock = args.poolMock;
 const prefix = args.accountTokenPrefix || "mock-access-70";
 const path = args.path || "/cc/v1/messages";
 const agent = new http.Agent({ keepAlive: true, maxSockets: 2048 });
+// FD classification: the service's own listen port and the mock upstream port.
+const samplePorts = { downstreamPort: baseUrl.port, upstreamPort: new URL(poolMock).port };
+const sample = () => processSample(args.targetPid, samplePorts);
 
 const QUIET = { errorRate: 0, errorStatus: 500, headerDelayMs: 300, jitterMs: 0, streamChunks: 0,
   chunkDelayMs: 0, failTokens: [], slowTokens: [], midStreamResetRate: 0, hangRate: 0, trickleRate: 0, retryAfter: "1" };
@@ -154,6 +157,54 @@ const SCENARIOS = {
       pool: { ...QUIET, errorRate: 1, errorStatus: 500 } },
     { name: "after_failing", concurrency: 3, durationMs: 20000,
       expect: { ok_rate_min: 0, allowed_errors: ["overloaded_error", "api_error"], error_only: true, bounded_p95: true, max_stall_secs: 0 } },
+  ],
+  // 账号异质性：同一个池里同时有故障账号、慢账号、龟速涓流账号，健康账号必须扛住流量，
+  // 坏账号被冷却/避让后不能长期拖慢整体 p95。10 账号 x 4 槽 = 40 槽。
+  heterogeneous_accounts: [
+    { name: "baseline", concurrency: 6, durationMs: 6000, pool: QUIET },
+    // 7001 持续 500；7002/7003 首字节慢 8 秒；其余健康。健康 7 账号 28 槽承载 c=24。
+    { name: "bad_and_slow", concurrency: 24, durationMs: 45000,
+      expect: { ok_rate_min: 0.97 },
+      pool: { ...QUIET, failTokens: ["mock-access-7001"], errorStatus: 500,
+              slowTokens: ["mock-access-7002", "mock-access-7003"], slowExtraMs: 8000 } },
+    // 再叠加 7004/7005 变成龟速：每 4 秒一个 chunk 共 12 个 chunk（约 48 秒一条流）。
+    { name: "plus_trickle", concurrency: 24, durationMs: 60000, stream: true,
+      expect: { ok_rate_min: 0.95, require_terminal: true },
+      pool: { ...QUIET, failTokens: ["mock-access-7001"], errorStatus: 500,
+              slowTokens: ["mock-access-7002", "mock-access-7003"], slowExtraMs: 8000,
+              trickleRate: 0.25, trickleIntervalMs: 4000, trickleChunks: 12 } },
+    { name: "after", concurrency: 6, durationMs: 10000, stream: true, pool: QUIET },
+  ],
+  // 长流占满：30 个并发长流（每条约 60 秒，每 2 秒一个 chunk）把 40 槽占掉 30 个，
+  // 同时 20 并发短请求必须仍能在剩余槽位上推进，且长流结束后槽位全部回收。
+  long_streams_hold_slots: [
+    { name: "baseline", concurrency: 6, durationMs: 6000, pool: QUIET },
+    { name: "long_plus_short", concurrency: 50, durationMs: 90000, stream: true,
+      expect: { ok_rate_min: 0.97, require_terminal: true },
+      pool: { ...QUIET, trickleRate: 0.6, trickleIntervalMs: 2000, trickleChunks: 30 } },
+    { name: "after", concurrency: 6, durationMs: 15000, stream: true, pool: QUIET },
+  ],
+  // 账号在负载中途被禁用再恢复（管理端会怎样在真实场景发生：风控/人工）：用 mock 的
+  // failTokens 让 3 个账号同时 403 60 秒，期间其余 7 个账号承载；恢复后 10 个账号都要重新被调度到。
+  accounts_suspended_then_restored: [
+    { name: "baseline", concurrency: 12, durationMs: 6000, pool: QUIET },
+    { name: "three_suspended", concurrency: 20, durationMs: 60000,
+      expect: { ok_rate_min: 0.97 },
+      pool: { ...QUIET, failTokens: ["mock-access-7001", "mock-access-7002", "mock-access-7003"], errorStatus: 403 } },
+    { name: "restored", concurrency: 20, durationMs: 40000, expect: { ok_rate_min: 0.97, require_all_accounts_used: true }, pool: QUIET },
+    { name: "after", concurrency: 6, durationMs: 8000, pool: QUIET },
+  ],
+  // 全部叠加 8 分钟：故障账号 + 慢账号 + 龟速 + 长流 + 中途断流 + 偶发 429/500，c=40。
+  everything_at_once: [
+    { name: "baseline", concurrency: 6, durationMs: 6000, pool: QUIET },
+    { name: "storm", concurrency: 40, durationMs: 480000, stream: true,
+      expect: { ok_rate_min: 0.85, require_terminal: false, max_stall_secs: 5,
+                allowed_errors: ["api_error", "overloaded_error", "rate_limit_error"] },
+      pool: { ...QUIET, errorRate: 0.1, errorStatus: 500,
+              failTokens: ["mock-access-7001"], slowTokens: ["mock-access-7002"], slowExtraMs: 6000,
+              trickleRate: 0.15, trickleIntervalMs: 3000, trickleChunks: 15,
+              midStreamResetRate: 0.05, streamChunks: 20, chunkDelayMs: 50 } },
+    { name: "recovered", concurrency: 6, durationMs: 60000, stream: true, pool: QUIET },
   ],
   mixed_chaos_soak: [
     ...Array.from({ length: 9 }, (_, index) => ({
@@ -298,7 +349,7 @@ async function runPhase(phase, startedAt, timeline, resources) {
         ready = { status: response.status, dispatch: data.dispatch };
       } catch { ready = { status: "down" }; }
       const lastSecond = results.filter((result) => result.at > Date.now() - 1000);
-      resources.push(processSample(args.targetPid));
+      resources.push(sample());
       timeline.push({ t: Math.round((Date.now() - startedAt) / 1000), phase: phase.name,
         ok: lastSecond.filter((result) => result.status === "200").length,
         not_ok: lastSecond.filter((result) => result.status !== "200").length, ready });
@@ -335,6 +386,11 @@ async function runPhase(phase, startedAt, timeline, resources) {
   if (expect.allowed_statuses && results.some((r) => !expect.allowed_statuses.includes(r.status))) problems.push("unexpected status");
   if (expect.error_only && results.some((r) => r.status === "200")) problems.push("unexpected success during complete outage");
   if (expect.require_rounds && rounds.some((round) => round !== expect.require_rounds)) problems.push("incomplete session rounds");
+  if (expect.require_all_accounts_used) {
+    const used = Object.keys((await mockCounters(poolMock))?.perToken || {}).length;
+    const total = Number(args.accounts || 10);
+    if (used < total) problems.push(`only ${used}/${total} accounts were dispatched to after restore`);
+  }
   const p95 = pct(results.map((r) => r.ms), 95);
   if (expect.bounded_p95 && p95 >= (Number(args.dispatchMaxWaitSecs || 60) + 10) * 1000) problems.push("p95 exceeds dispatch wait + 10s");
   const recovery = results.filter((r) => r.elapsedMs <= (expect.recovery_within_secs || 0) * 1000);
@@ -369,7 +425,7 @@ async function main() {
   const phases = SCENARIOS[args.scenario];
   if (!phases) throw new Error(`unknown scenario ${args.scenario}; known: ${Object.keys(SCENARIOS).join(", ")}`);
   const startedAt = Date.now();
-  const timeline = [], results = [], resources = [processSample(args.targetPid)];
+  const timeline = [], results = [], resources = [sample()];
   for (const phase of phases) results.push(await runPhase(phase, startedAt, timeline, resources));
   // Observe release/drain after the last clients finish, including canceled upstream sockets.
   await patchMock(poolMock, QUIET);
@@ -378,16 +434,19 @@ async function main() {
   agent.destroy();
   // Soak scenarios judge FD recovery, so wait past the upstream client's idle-pool timeout
   // (reqwest default 90 s) before the final sample; other scenarios only need a short drain.
-  const fdChecked = ["long_stream_sessions", "mixed_chaos_soak"].includes(args.scenario);
+  const fdChecked = ["long_stream_sessions", "mixed_chaos_soak", "everything_at_once", "long_streams_hold_slots", "heterogeneous_accounts"].includes(args.scenario);
   await sleep(Number(args.settleSecs || (fdChecked ? 100 : 5)) * 1000);
-  resources.push(processSample(args.targetPid));
+  resources.push(sample());
   const resource = resourceSummary(resources);
   const problems = results.flatMap((result) => result.problems.map((problem) => `${result.phase}: ${problem}`));
   if (fdChecked) {
     if (!resource || !resource.end.alive) problems.push("resource samples unavailable or process exited");
     else {
       if (!(resource.end.rssMb <= resource.peak.rssMb * 0.8 || resource.end.rssMb <= resource.start.rssMb + 150)) problems.push("RSS did not recover");
-      if (resource.end.fd > resource.start.fd + 10) problems.push("FD did not recover");
+      // Pooled idle sockets (reqwest 90 s, sqlx 10 min) outlive the settle window and are bounded
+      // by caps, so FDs are judged per kind instead of as a total (see lib/process-sample.mjs).
+      problems.push(...fdLeakProblems(resource.start, resource.end, {
+        upstreamCap: Number(args.upstreamSocketCap || 0), dbCap: Number(args.dbSocketCap || 0) }));
     }
   }
   if (resources.some((sample) => sample && !sample.alive)) problems.push("service process exited");

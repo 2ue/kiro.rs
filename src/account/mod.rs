@@ -76,9 +76,7 @@ use crate::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
         process_model,
     },
-    model::model_support::{
-        expand_claude_supported_model_variants, normalize_model_id, normalize_supported_models,
-    },
+    model::model_support::{expand_claude_supported_model_variants, normalize_model_id},
     storage::{
         account_events::{
             AccountEvent, AccountSource, account_disable_event, record_account_event,
@@ -639,7 +637,9 @@ pub(crate) struct AccountEligibility {
     pub(crate) enabled: bool,
     pub(crate) auto_disabled: bool,
     pub(crate) auto_disabled_until: Option<DateTime<Utc>>,
-    pub(crate) supported_models: Arc<HashSet<String>>,
+    /// 原始 `supportedModels` 列表；匹配时经 [`supported_models_match`] 的线程局部缓存展开，
+    /// 与权威 `Account` 路径同一套 allowlist 规则（含家族别名），避免快照与权威判定不一致。
+    pub(crate) supported_models: Arc<Vec<String>>,
     pub(crate) route_mode: RouteRuleMode,
     pub(crate) route_rules: Arc<Vec<String>>,
 }
@@ -660,11 +660,7 @@ fn account_eligibility_from_pool(pool: &Account) -> AccountEligibility {
         enabled: pool.enabled,
         auto_disabled: pool.auto_disabled,
         auto_disabled_until: pool.auto_disabled_until,
-        supported_models: Arc::new(
-            normalize_supported_models(pool.supported_models.clone())
-                .into_iter()
-                .collect::<HashSet<_>>(),
-        ),
+        supported_models: Arc::new(pool.supported_models.clone()),
         route_mode: pool.route_mode,
         route_rules: Arc::new(normalize_route_rules(&pool.route_rules)),
     }
@@ -5160,6 +5156,10 @@ impl AccountManager {
 
     pub fn notify_account_deleted(&self, reason: &'static str, pool_id: u64) {
         self.apply_local_account_snapshot_mutation(None, Some(pool_id));
+        self.forget_account_dispatch_counter(pool_id);
+        self.degraded_fallback_local_leases
+            .lock()
+            .retain(|(existing_pool_id, _), _| *existing_pool_id != pool_id);
         self.publish_account_data_changed_async(reason, Some(pool_id));
     }
 
@@ -5913,6 +5913,13 @@ impl AccountManager {
                 Err(err)
             }
         }
+    }
+
+    fn forget_account_dispatch_counter(&self, account_id: u64) {
+        self.dispatch_counters
+            .per_account
+            .lock()
+            .remove(&account_id);
     }
 
     pub fn account_dispatched_total(&self, account_id: u64) -> u64 {
@@ -8853,12 +8860,15 @@ impl AccountManager {
     ) -> PoolAcquireResult {
         let global_max = config.global_max_concurrent_requests;
         let global_permit = if global_max > 0 {
-            let limiter = self
-                .degraded_global_leases
-                .lock()
-                .entry(global_max)
-                .or_insert_with(|| Arc::new(Semaphore::new(global_max as usize)))
-                .clone();
+            let limiter = {
+                let mut limiters = self.degraded_global_leases.lock();
+                // 全局上限改过之后旧值的信号量同样只会积累，不会再被取到。
+                limiters.retain(|existing_max, _| *existing_max == global_max);
+                limiters
+                    .entry(global_max)
+                    .or_insert_with(|| Arc::new(Semaphore::new(global_max as usize)))
+                    .clone()
+            };
             match limiter.try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
@@ -8876,6 +8886,11 @@ impl AccountManager {
         let max_concurrent = pool.max_concurrent_requests.max(1);
         let limiter = {
             let mut limiters = self.degraded_fallback_local_leases.lock();
+            // 账号改过并发上限后旧上限的信号量不再使用：同一账号只保留当前上限的一份，
+            // 否则每次改配置都会在这个 map 里多留一个永不回收的 Semaphore。
+            limiters.retain(|(existing_pool_id, existing_max), _| {
+                *existing_pool_id != pool.id || *existing_max == max_concurrent
+            });
             limiters
                 .entry((pool.id, max_concurrent))
                 .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent as usize)))
@@ -12426,17 +12441,84 @@ fn account_matches_supported_models_normalized(
     pool: &Account,
     model_candidates: Option<&[String]>,
 ) -> bool {
-    if pool.supported_models.is_empty() {
+    supported_models_match(&pool.supported_models, model_candidates)
+}
+
+/// 调度每次扫描都要问每个账号"是否支持本次请求的模型"，而账号的 `supportedModels` 列表通常
+/// 几百个账号共用同一份；每次都把列表展开成匹配变体会在调度锁下产生成百上千次字符串分配
+/// （main 分支现网 850 账号时占到进程 CPU 的 54%）。展开结果只取决于列表内容，这里按内容
+/// 缓存在线程局部：命中时比较存储的列表与传入列表，列表变化永远不会用到过期展开。
+fn supported_models_match(
+    supported_models: &[String],
+    model_candidates: Option<&[String]>,
+) -> bool {
+    if supported_models.is_empty() {
         return true;
     }
     let Some(model_candidates) = model_candidates else {
         return false;
     };
-    let supported_models =
-        normalize_account_allowlist_models(pool.supported_models.iter().map(String::as_str));
-    model_candidates
-        .iter()
-        .any(|candidate| supported_models.iter().any(|model| model == candidate))
+    SUPPORTED_MODELS_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let expanded = cache.expanded(supported_models);
+        model_candidates
+            .iter()
+            .any(|candidate| expanded.variants.contains(candidate))
+    })
+}
+
+thread_local! {
+    static SUPPORTED_MODELS_CACHE: std::cell::RefCell<SupportedModelsCache> =
+        std::cell::RefCell::new(SupportedModelsCache::default());
+}
+
+/// 每线程最多缓存多少份不同的 `supportedModels` 列表；超过就整体重建（列表种类通常个位数）。
+const SUPPORTED_MODELS_CACHE_MAX_LISTS: usize = 128;
+
+#[derive(Default)]
+struct SupportedModelsCache {
+    /// 上一次命中的列表：连续扫描的账号大多共用同一份，先比它省去哈希。
+    last: Option<std::rc::Rc<ExpandedSupportedModels>>,
+    lists: HashMap<u64, Vec<std::rc::Rc<ExpandedSupportedModels>>>,
+}
+
+struct ExpandedSupportedModels {
+    models: Vec<String>,
+    variants: HashSet<String>,
+}
+
+impl SupportedModelsCache {
+    fn expanded(&mut self, models: &[String]) -> std::rc::Rc<ExpandedSupportedModels> {
+        if let Some(last) = self.last.as_ref().filter(|last| last.models == models) {
+            return last.clone();
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            models.hash(&mut hasher);
+            hasher.finish()
+        };
+        let cached = self
+            .lists
+            .get(&key)
+            .and_then(|bucket| bucket.iter().find(|list| list.models == models))
+            .cloned();
+        let list = cached.unwrap_or_else(|| {
+            if self.lists.len() >= SUPPORTED_MODELS_CACHE_MAX_LISTS {
+                self.lists.clear();
+            }
+            let list = std::rc::Rc::new(ExpandedSupportedModels {
+                models: models.to_vec(),
+                variants: normalize_account_allowlist_models(models.iter().map(String::as_str))
+                    .into_iter()
+                    .collect(),
+            });
+            self.lists.entry(key).or_default().push(list.clone());
+            list
+        });
+        self.last = Some(list.clone());
+        list
+    }
 }
 
 fn account_route_policy_allows(
@@ -12466,17 +12548,7 @@ fn account_eligibility_matches_supported_models(
     pool: &AccountEligibility,
     model_candidates: Option<&[String]>,
 ) -> bool {
-    if pool.supported_models.is_empty() {
-        return true;
-    }
-    let Some(model_candidates) = model_candidates else {
-        return false;
-    };
-    let supported_models =
-        normalize_account_allowlist_models(pool.supported_models.iter().map(String::as_str));
-    model_candidates
-        .iter()
-        .any(|candidate| supported_models.iter().any(|model| model == candidate))
+    supported_models_match(&pool.supported_models, model_candidates)
 }
 
 fn deterministic_duration_jitter(base: Duration, percent: u8, seed: u64) -> Duration {
