@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Value, json};
 
+use super::signature::synthetic_thinking_signature;
 use super::stream::SseEvent;
 
 /// Longest text held back while waiting for a sentence boundary. A run without punctuation is
@@ -391,6 +392,12 @@ pub(crate) fn scrub_content_as(
         };
         if let Some(cleaned) = scrub_text_as(text, identity) {
             changed = true;
+            // The upstream signature covers the original thinking; replayed with the rewritten
+            // text it fails as THINKING_SIGNATURE_INVALID. A synthetic signature replays as
+            // unsigned thinking instead.
+            if field == "thinking" && block.get("signature").is_some() {
+                block["signature"] = json!(synthetic_thinking_signature(&cleaned));
+            }
             block[field] = json!(cleaned);
         }
     }
@@ -418,6 +425,10 @@ pub(crate) struct IdentityGuard {
     text_blocks: HashSet<i32>,
     /// Thinking blocks checked as well (only with a display identity, i.e. visible thinking).
     thinking_blocks: HashSet<i32>,
+    /// Thinking text of each block as received and as forwarded. When they differ the upstream
+    /// signature no longer matches the forwarded text and is replaced (see `apply`).
+    thinking_received: HashMap<i32, String>,
+    thinking_forwarded: HashMap<i32, String>,
     identity: Option<DisplayIdentity>,
     pending: HashMap<i32, String>,
     /// Whether any text has been forwarded for a block (used to insert the fallback reply).
@@ -433,6 +444,8 @@ impl IdentityGuard {
         Self {
             text_blocks: HashSet::new(),
             thinking_blocks: HashSet::new(),
+            thinking_received: HashMap::new(),
+            thinking_forwarded: HashMap::new(),
             identity: None,
             pending: HashMap::new(),
             emitted: HashSet::new(),
@@ -535,8 +548,9 @@ impl IdentityGuard {
                 break;
             }
         }
-        // Drop leading whitespace left behind by a removed first sentence.
-        if !self.emitted.contains(&index) {
+        // Drop leading whitespace left behind by a removed first sentence. Thinking sentences are
+        // only rewritten, never removed, and trimming would change the signed text.
+        if !self.emitted.contains(&index) && !self.thinking_blocks.contains(&index) {
             out = out.trim_start().to_string();
         }
         out
@@ -588,10 +602,18 @@ impl IdentityGuard {
                         && event.data["delta"]["type"] == "thinking_delta" =>
                 {
                     let text = event.data["delta"]["thinking"].as_str().unwrap_or_default();
+                    self.thinking_received
+                        .entry(index)
+                        .or_default()
+                        .push_str(text);
                     self.pending.entry(index).or_default().push_str(text);
                     let released = self.drain(index, false);
                     if !released.is_empty() {
                         self.emitted.insert(index);
+                        self.thinking_forwarded
+                            .entry(index)
+                            .or_default()
+                            .push_str(&released);
                         event.data["delta"]["thinking"] = json!(released);
                         output.push(event);
                     }
@@ -602,14 +624,26 @@ impl IdentityGuard {
                 {
                     let released = self.drain(index, true);
                     self.pending.remove(&index);
+                    let received = self.thinking_received.remove(&index).unwrap_or_default();
+                    let mut forwarded = self.thinking_forwarded.remove(&index).unwrap_or_default();
+                    forwarded.push_str(&released);
                     if !released.is_empty() {
                         output.push(Self::thinking_event(index, released));
+                    }
+                    // The upstream signature covers the text as received. Replayed next to rewritten
+                    // text it fails as THINKING_SIGNATURE_INVALID on every later turn, so rewritten
+                    // thinking gets a synthetic signature, which replays as unsigned thinking.
+                    if forwarded != received {
+                        event.data["delta"]["signature"] =
+                            json!(synthetic_thinking_signature(&forwarded));
                     }
                     output.push(event);
                 }
                 ("content_block_stop", Some(index)) if self.thinking_blocks.contains(&index) => {
                     let released = self.drain(index, true);
                     self.pending.remove(&index);
+                    self.thinking_received.remove(&index);
+                    self.thinking_forwarded.remove(&index);
                     if !released.is_empty() {
                         output.push(Self::thinking_event(index, released));
                     }
@@ -828,6 +862,112 @@ mod tests {
         );
         let out = guard.apply(vec![thinking, thinking_delta]);
         assert_eq!(out.len(), 2);
+    }
+
+    fn opus_identity() -> DisplayIdentity {
+        DisplayIdentity {
+            name: "Claude Opus 5.5".into(),
+            id: "claude-opus-5-5".into(),
+            exempt_rules: Vec::new(),
+            prefers_zh: false,
+        }
+    }
+
+    fn signed_thinking_block(index: i32, chunks: &[&str], signature: &str) -> Vec<SseEvent> {
+        let mut events = vec![SseEvent::new(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": index, "content_block": {"type": "thinking", "thinking": ""}}),
+        )];
+        for chunk in chunks {
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": chunk}}),
+            ));
+        }
+        events.push(SseEvent::new(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": index, "delta": {"type": "signature_delta", "signature": signature}}),
+        ));
+        events.push(SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
+        events
+    }
+
+    fn forwarded_thinking_and_signature(events: &[SseEvent]) -> (String, String) {
+        let thinking = events
+            .iter()
+            .filter_map(|event| event.data["delta"]["thinking"].as_str())
+            .collect();
+        let signature = events
+            .iter()
+            .find_map(|event| event.data["delta"]["signature"].as_str())
+            .expect("signature_delta is forwarded")
+            .to_string();
+        (thinking, signature)
+    }
+
+    /// The client replays thinking with its signature on the next turn; rewritten text next to
+    /// the upstream signature failed every later turn with THINKING_SIGNATURE_INVALID.
+    #[test]
+    fn rewritten_visible_thinking_gets_a_signature_that_replays_as_unsigned() {
+        let mut guard = IdentityGuard::new(FALLBACK).with_identity(Some(opus_identity()));
+        let out = guard.apply(signed_thinking_block(
+            0,
+            &["I am Claude Haiku 4.5", ". Let me read the file first."],
+            "upstream-signature",
+        ));
+        let (thinking, signature) = forwarded_thinking_and_signature(&out);
+        assert!(thinking.contains("Claude Opus 5.5"), "{thinking}");
+        assert!(!thinking.contains("Haiku"), "{thinking}");
+        assert_ne!(signature, "upstream-signature");
+        assert!(
+            crate::anthropic::signature::synthetic_thinking_signature_matches(
+                &thinking, &signature
+            )
+        );
+    }
+
+    #[test]
+    fn untouched_visible_thinking_keeps_its_text_and_upstream_signature() {
+        let mut guard = IdentityGuard::new(FALLBACK).with_identity(Some(opus_identity()));
+        let out = guard.apply(signed_thinking_block(
+            0,
+            &["\n  Let me read ", "the file first. Then fix the bug."],
+            "upstream-signature",
+        ));
+        let (thinking, signature) = forwarded_thinking_and_signature(&out);
+        assert_eq!(
+            thinking,
+            "\n  Let me read the file first. Then fix the bug."
+        );
+        assert_eq!(signature, "upstream-signature");
+    }
+
+    #[test]
+    fn non_stream_rewritten_thinking_gets_a_synthetic_signature() {
+        let identity = opus_identity();
+        let mut content = vec![
+            json!({"type": "thinking", "thinking": "I am Claude Haiku 4.5. Let me check.", "signature": "upstream-signature"}),
+            json!({"type": "text", "text": "Done."}),
+        ];
+        assert!(scrub_content_as(&mut content, FALLBACK, Some(&identity)));
+        let thinking = content[0]["thinking"].as_str().unwrap();
+        assert!(thinking.contains("Claude Opus 5.5"), "{thinking}");
+        assert!(
+            crate::anthropic::signature::synthetic_thinking_signature_matches(
+                thinking,
+                content[0]["signature"].as_str().unwrap()
+            )
+        );
+
+        let mut clean = vec![
+            json!({"type": "thinking", "thinking": "Let me check.", "signature": "upstream-signature"}),
+            json!({"type": "text", "text": "Done."}),
+        ];
+        assert!(!scrub_content_as(&mut clean, FALLBACK, Some(&identity)));
+        assert_eq!(clean[0]["signature"], "upstream-signature");
     }
 
     #[test]
