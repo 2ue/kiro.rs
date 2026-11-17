@@ -185,6 +185,28 @@ case "$TASK_ID" in
     run pnpm --dir ui check
     run pnpm --dir ui build
     ;;
+  s9-load-chaos-tooling)
+    step "编译（release）"
+    run cargo build -q --release --bins
+    step "readyz 单测"
+    run cargo test --bin claude-pool -q -- readyz
+    step "golden"
+    run cargo test --bin claude-pool -q -- golden_usage
+    step "全量单测"
+    run cargo test --bin claude-pool -q
+    step "脚本语法"
+    run node --check scripts/loadtest/overload-probe.mjs
+    run node --check scripts/loadtest/scheduler-scenarios.mjs
+    run bash -n scripts/loadtest/overload-run.sh
+    run bash -n scripts/loadtest/run-acceptance-matrix.sh
+    run bash -n scripts/loadtest/lib/isolated-instance.sh
+    step "受保护文件未改"
+    for f in src/anthropic/cache.rs src/anthropic/prompt_cache.rs src/anthropic/bounded_shaping.rs src/anthropic/prefix_tool_plus_shaping.rs src/account/usage_projection.rs src/account/golden_tests.rs; do
+      git diff --quiet HEAD -- "$f" || { echo "!! 受保护文件被改: $f"; fail=1; }
+    done
+    step "smoke 矩阵"
+    run env KEEP=0 scripts/loadtest/run-acceptance-matrix.sh smoke
+    ;;
   *)
     echo "未知任务 $TASK_ID"; exit 2;;
 esac
