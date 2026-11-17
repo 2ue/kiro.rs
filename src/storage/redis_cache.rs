@@ -644,7 +644,6 @@ impl GuardedUsagePipeline {
 }
 
 impl RedisStore {
-    #[cfg(test)]
     pub async fn account_dispatch_queue_size(&self) -> anyhow::Result<u32> {
         let mut manager = self.scheduler_capacity_manager();
         let count: i64 = redis::cmd("EVAL")

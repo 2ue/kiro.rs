@@ -45,7 +45,13 @@ rows = []
 for path in sorted(glob.glob(os.path.join(result_dir, "*.json"))):
     name = os.path.basename(path)[:-5]
     report = json.load(open(path))
+    if "phases" not in report or "capacity" not in report:
+        continue
     problems = []
+    summary = report.get("accountsSummary")
+    if summary is not None:
+        if summary.get("inFlightTotal") != 0 or summary.get("queuedRequests") != 0:
+            problems.append(f"drain left inFlightTotal={summary.get('inFlightTotal')} queuedRequests={summary.get('queuedRequests')}")
     if report.get("abortedReason"):
         problems.append(f"aborted: {report['abortedReason']}")
     if report.get("accountsOverConcurrency"):
@@ -134,12 +140,17 @@ for path in sorted(glob.glob(os.path.join(result_dir, "*.json"))):
     if any((sample["queued"] or 0) > 0 for sample in drain):
         problems.append("queue still not empty at the end")
     verdict = "PASS" if not problems else "FAIL"
+    report["verdict"] = verdict
+    report["problems"] = problems
+    with open(path, "w") as output:
+        json.dump(report, output, indent=2)
+        output.write("\n")
     failures += bool(problems)
     ok = sum(phase["ok"] for phase in phases)
     rejected = sum(phase["rejected"] for phase in phases)
     rows.append((name, verdict, ok, rejected, problems))
 
 for name, verdict, ok, rejected, problems in rows:
-    print(f"{verdict}  {name:22s} ok={ok:<6} 429={rejected:<7} {'; '.join(problems)}")
+    print(f"{verdict}  {name:22s} ok={ok:<6} 429/529={rejected:<7} {'; '.join(problems)}")
 print(f"\n{len(rows) - failures}/{len(rows)} passed")
 sys.exit(1 if failures else 0)

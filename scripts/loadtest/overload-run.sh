@@ -1,135 +1,36 @@
 #!/usr/bin/env bash
 # Overload reproduction runs on an isolated claude-pool with mock upstreams.
 #
-# Each case starts claude-pool on a fresh copy of the template database and an empty Redis db,
+# Each case starts claude-pool on a fresh empty database and an empty Redis db,
 # seeds ACCOUNTS mock accounts, applies production-like dispatch settings (queue 200, 60 s wait,
 # global 1000, priority mode, no per-key admission), sets the mock upstream shape, runs
 # overload-probe.mjs with the case profile, then stops everything.
 #
 # Usage: BIN=/path/to/claude-pool CASES="steady_ok spike_sub2api" scripts/loadtest/overload-run.sh
-# Env: ACCOUNTS (10), PER_CONC (4, or a range like 3-5), PER_RPM (0 = unlimited, or a range like
-#      20-30), QUEUE (200), WAIT_SECS (60), OUT_DIR (/tmp/overload-e2e/results), KEEP=1 to keep
+# Env: ACCOUNTS (10), PER_CONC (4, or a range like 3-5), PER_RPM (ignored: accounts have no RPM limit), QUEUE (200), WAIT_SECS (60), OUT_DIR (/tmp/overload-e2e/results), KEEP=1 to keep
 #      the database after the run. A range spreads the limit over the accounts in turn
 #      (3,4,5,3,...), so the pool mixes account sizes like production. MAX_SOCKETS (300) caps
-#      the client's connections. GLOBAL_MAX (1000) is dispatchGlobalMaxConcurrentRequests;
-#      IDLE_SECS (120), MAX_DURATION_SECS (3600) and LEASE_MAX_SECS (900) are the stream idle
-#      timeout, the response duration cap and the in-flight lease max age.
+#      the client's connections. GLOBAL_MAX (1000) is accounts.globalMaxConcurrentRequests;
+#      IDLE_SECS (120), MAX_DURATION_SECS (3600) are the stream idle
+#      timeout and the response duration cap.
 set -uo pipefail
-
-D=${D:-/tmp/overload-e2e}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=${BIN:-/tmp/claude-pool-rust-analyzer-target/release/claude-pool}
-DB=${DB:-pool_overload_probe}
-PORT=${PORT:-19381}
-MOCK_PORT=${MOCK_PORT:-39181}
-REDIS_DB=${REDIS_DB:-13}
-# A small pool by default: the case table expresses load relative to capacity, so 10 x 4 slots
-# reproduce the same overload ratios as production's 57 x 4 with a fraction of the connections.
-ACCOUNTS=${ACCOUNTS:-10}
-PER_CONC=${PER_CONC:-4}
-PER_RPM=${PER_RPM:-0}
-QUEUE=${QUEUE:-200}
-WAIT_SECS=${WAIT_SECS:-60}
-GLOBAL_MAX=${GLOBAL_MAX:-1000}
-IDLE_SECS=${IDLE_SECS:-120}
-MAX_DURATION_SECS=${MAX_DURATION_SECS:-3600}
-LEASE_MAX_SECS=${LEASE_MAX_SECS:-900}
+D=${D:-$(mktemp -d /tmp/overload-instance.XXXXXX)}
+OUT_DIR=${OUT_DIR:-/tmp/overload-e2e/results}
 CASES=${CASES:-steady_ok}
-OUT_DIR=${OUT_DIR:-$D/results}
-PGPW=$(docker exec claude-pool-postgres-local printenv POSTGRES_PASSWORD)
-NODE=${NODE:-"/Users/yuanfeijie/.volta/bin/volta run --node 22.23.0 node"}
-mkdir -p "$D" "$OUT_DIR" && chmod 700 "$D"
-cp "$BIN" "$D/claude-pool"
-
-stop_all() {
-  pkill -f "anthropic-mock-upstream.mjs --overload-probe" 2>/dev/null || true
-  pkill -f "overload-probe.mjs" 2>/dev/null || true
-  local pid
-  pid=$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null
-  for _ in $(seq 1 60); do [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "claude-pool did not exit in 30 s, killing"; kill -9 "$pid"; }
-  return 0
-}
-
-wait_port() {
-  for _ in $(seq 1 120); do lsof -nP -iTCP:$1 -sTCP:LISTEN >/dev/null 2>&1 && return 0; sleep 0.5; done
-  echo "port $1 did not open"; return 1
-}
+# shellcheck source=lib/isolated-instance.sh
+source "$REPO/scripts/loadtest/lib/isolated-instance.sh"
+mkdir -p "$OUT_DIR"
+trap '[ "${REUSE_INSTANCE:-0}" = 1 ] || cleanup_instance' EXIT
+trap 'exit 130' INT TERM
+FAILED=0
 
 prepare() {
-  docker exec claude-pool-postgres-local psql -U claude_pool -d postgres -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" -c "CREATE DATABASE $DB TEMPLATE pool_identity_e2e" 2>&1 | grep -v NOTICE
-  docker exec claude-pool-redis-local redis-cli -n $REDIS_DB FLUSHDB >/dev/null
-  python3 - "$D" "$PGPW" "$ACCOUNTS" "$PER_CONC" "$PER_RPM" "$QUEUE" "$WAIT_SECS" "$PORT" "$MOCK_PORT" "$DB" "$REDIS_DB" "$1" "$GLOBAL_MAX" "$IDLE_SECS" "$MAX_DURATION_SECS" "$LEASE_MAX_SECS" <<'PY'
-import json, hashlib, secrets, datetime, sys
-d, pgpw, accounts, per_conc, per_rpm, queue, wait_secs, port, mock_port, db, redis_db, case = sys.argv[1:13]
-global_max, idle_secs, max_duration_secs, lease_max_secs = (int(v) for v in sys.argv[13:17])
-accounts = int(accounts)
-def spread(spec, i):
-    # "3-5" -> 3,4,5,3,4,5,... over the accounts; "4" -> 4 for every account.
-    low, _, high = spec.partition("-")
-    low = int(low); high = int(high or low)
-    return low + (i - 1) % (high - low + 1)
-limits = {}
-keys = open(f"{d}/keys").read().split()
-api_key, admin_key = keys[0], keys[1]
-exp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=6)).isoformat()
-q = lambda v: "'" + str(v).replace("'", "''") + "'"
-sql = ["BEGIN;", "UPDATE accounts SET deleted_at=now(), enabled=false WHERE deleted_at IS NULL;",
-       "DELETE FROM credential_runtime_state;", "DELETE FROM credential_account_info;", "DELETE FROM credentials;", "DELETE FROM proxy_resources;"]
-for i in range(1, accounts + 1):
-    cid = 7000 + i
-    # Production has a priority-0 tier and a priority-10 tier; "tiers" cases model that.
-    priority = (0 if i <= accounts // 4 else 10) if case.startswith("tiers") else 0
-    conc, rpm = spread(per_conc, i), spread(per_rpm, i)
-    limits[f"mock-access-{cid}"] = {"conc": conc, "rpm": rpm}
-    rt = "mock-refresh-" + secrets.token_hex(16)
-    c = {"id": cid, "accessToken": f"mock-access-{cid}", "refreshToken": rt,
-         "profileArn": f"arn:aws:codewhisperer:us-east-1:111111111111:profile/MOCK{cid}",
-         "expiresAt": exp, "authMethod": "social", "region": "us-east-1", "priority": priority, "disabled": False,
-         "rateLimitAutoDisableEnabled": False, "maxConcurrentRequests": conc}
-    if rpm > 0:
-        c["rpm"] = rpm
-    sql.append(f"INSERT INTO credentials (id,priority,disabled,auth_kind,refresh_token_hash,data,created_at,updated_at,revision) VALUES ({cid},{priority},false,'social',{q(hashlib.sha256(rt.encode()).hexdigest())},{q(json.dumps(c))}::jsonb,now(),now(),1);")
-    sql.append(f"INSERT INTO credential_runtime_state (credential_id,failure_count,refresh_failure_count,disabled_reason,warmup_remaining,generation,revision,updated_at) VALUES ({cid},0,0,NULL,0,0,1,now());")
-sql.append("COMMIT;")
-json.dump(limits, open(f"{d}/limits.json", "w"))
-max_conc = max(v["conc"] for v in limits.values())
-open(f"{d}/seed.sql", "w").write("\n".join(sql) + "\n")
-patch = {"port": int(port), "host": "127.0.0.1", "apiKey": api_key, "adminApiKey": admin_key,
-         "tokenRefreshBackgroundEnabled": False, "poolUpstreamBaseUrl": f"http://127.0.0.1:{mock_port}",
-         "loadBalancingMode": "priority", "credentialMaxConcurrentRequests": max_conc,
-         "credentialRpm": None,
-         "credentialWarmupRequests": 0, "dispatchMaxQueuedRequests": int(queue),
-         "dispatchGlobalMaxConcurrentRequests": global_max, "credentialDispatchMaxWaitSecs": int(wait_secs),
-         "poolUpstreamResponseTimeoutSecs": 300, "poolUpstreamStreamIdleTimeoutSecs": idle_secs,
-         "poolUpstreamStreamMaxDurationSecs": max_duration_secs, "credentialInFlightLeaseMaxSecs": lease_max_secs,
-         "requestAdmission": {"rpm": 0, "maxConcurrentRequests": 0, "maxQueuedRequests": 0, "queueTimeoutMs": 0},
-         "accounts": {"accountsEnabled": False, "localPoolCircuitEnabled": False}}
-open(f"{d}/patch.json", "w").write(json.dumps(patch))
-json.dump({"host": "127.0.0.1", "port": int(port), "apiKey": api_key, "adminApiKey": admin_key,
-           "postgres": {"url": f"postgres://claude_pool:{pgpw}@127.0.0.1:25432/{db}", "maxConnections": 10},
-           "redis": {"url": f"redis://127.0.0.1:26379/{redis_db}", "keyPrefix": "pool-overload-probe"}},
-          open(f"{d}/config.json", "w"))
-PY
-  chmod 600 "$D"/*.json "$D/seed.sql"
-  docker exec -i claude-pool-postgres-local psql -U claude_pool -d $DB -v ON_ERROR_STOP=1 -q < "$D/seed.sql" || return 1
-  docker exec claude-pool-postgres-local psql -U claude_pool -d $DB -qAt -c "select config::text from runtime_config where id='default'" > "$D/base-config.json"
-  python3 - "$D" <<'PY'
-import json, sys
-d = sys.argv[1]
-cfg = json.load(open(f"{d}/base-config.json")); patch = json.load(open(f"{d}/patch.json"))
-for k, v in patch.items():
-    if k == "accounts":
-        ep = dict(cfg.get("accounts") or {}); ep.update(v); cfg["accounts"] = ep
-    elif v is None:
-        cfg.pop(k, None)
-    else:
-        cfg[k] = v
-open(f"{d}/apply.sql", "w").write("update runtime_config set config = $cfg$" + json.dumps(cfg) + "$cfg$::jsonb where id='default';\n")
-PY
-  docker exec -i claude-pool-postgres-local psql -U claude_pool -d $DB -v ON_ERROR_STOP=1 -q < "$D/apply.sql"
-  rm -f "$D/seed.sql" "$D/apply.sql" "$D/base-config.json" "$D/patch.json"
+  if [ "${REUSE_INSTANCE:-0}" = 1 ]; then
+    return 0
+  fi
+  stop_instance
+  start_instance "$1"
 }
 
 # Case table: mock upstream shape | probe profile | extra probe flags.
@@ -223,12 +124,18 @@ case_def() {
   esac
 }
 
-[ -f "$D/keys" ] || { printf 'sk-ovl-%s\nsk-ovl-admin-%s\n' "$(openssl rand -hex 12)" "$(openssl rand -hex 12)" > "$D/keys"; chmod 600 "$D/keys"; }
-API_KEY=$(sed -n 1p "$D/keys"); ADMIN_KEY=$(sed -n 2p "$D/keys")
-
+exec 3>&1 4>&2
 for case_name in $CASES; do
+  exec 1>&3 2>&4
+  exec > >(tee "$OUT_DIR/$case_name.log") 2>&1
+  case "$case_name" in
+    rpm_bound|pool_rpm_*)
+      echo "$case_name: not_applicable (no per-account RPM)"
+      printf '{"case":"%s","verdict":"not_applicable"}\n' "$case_name" > "$OUT_DIR/$case_name.json"
+      continue ;;
+  esac
   def=$(case_def "$case_name")
-  [ -z "$def" ] && { echo "unknown case $case_name"; continue; }
+  [ -z "$def" ] && { echo "unknown case $case_name"; FAILED=1; continue; }
   mock_json=${def%%|*}; rest=${def#*|}; profile=${rest%%|*}; rest=${rest#*|}; flags=${rest%%|*}
   plan=""; [ "$rest" != "$flags" ] && plan=${rest#*|}
   # TIME_WAIT holding ephemeral ports (see overload-probe.mjs).
@@ -245,19 +152,15 @@ for case_name in $CASES; do
   # them to the pool under test so every pool size sees the same relative load.
   slots=$(python3 -c "import sys;lo,_,hi=sys.argv[2].partition('-');lo=int(lo);hi=int(hi or lo);print(sum(lo+i%(hi-lo+1) for i in range(int(sys.argv[1]))))" "$ACCOUNTS" "$PER_CONC")
   profile=$(python3 "$REPO/scripts/loadtest/scale-profile.py" "$profile" "$slots")
+  profile=${PROFILE_OVERRIDE:-$profile}
   printf '\n== %s  accounts=%s conc=%s rpm=%s queue=%s wait=%ss global=%s slots=%s profile=%s %s\n' "$case_name" "$ACCOUNTS" "$PER_CONC" "$PER_RPM" "$QUEUE" "$WAIT_SECS" "$GLOBAL_MAX" "$slots" "$profile" "$flags"
-  stop_all
-  prepare "$case_name" || { echo "prepare failed"; continue; }
-  (cd "$REPO" && PORT=$MOCK_PORT nohup $NODE scripts/loadtest/anthropic-mock-upstream.mjs --overload-probe > "$D/mock.log" 2>&1 < /dev/null &)
-  wait_port $MOCK_PORT || continue
-  curl -sS -m 5 -X POST "http://127.0.0.1:$MOCK_PORT/__control" -H 'content-type: application/json' \
-    -d "$(echo "$mock_json" | python3 -c 'import json,sys;d=json.load(sys.stdin);d["resetCounters"]=True;print(json.dumps(d))')" >/dev/null
-  (cd "$D" && RUST_LOG=info nohup ./claude-pool -c config.json > "$D/server-$case_name.log" 2>&1 < /dev/null &)
-  wait_port $PORT || { tail -20 "$D/server-$case_name.log"; stop_all; continue; }
+  prepare "$case_name" || { echo "prepare failed"; FAILED=1; continue; }
+  curl --fail-with-body -sS -m 5 -X POST "http://127.0.0.1:$MOCK_PORT/__control" -H 'content-type: application/json' \
+    -d "$(echo "$mock_json" | python3 -c 'import json,sys;d=json.load(sys.stdin);d={"errorRate":0,"failTokens":[],"slowTokens":[],"hangRate":0,"trickleRate":0,"midStreamResetRate":0,**d};d["resetCounters"]=True;print(json.dumps(d))')" >/dev/null || { FAILED=1; continue; }
   # Process CPU and RSS of the server for the whole case: a fault must not pin CPU, and the
   # pool must come back to idle CPU after it. One line per second: epoch utime stime rss_kb.
   (
-    pid=$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
+    pid=$SERVER_PID
     [ -z "$pid" ] && exit 0
     while kill -0 "$pid" 2>/dev/null; do
       # macOS 没有 /proc；ps 的 utime/stime 是「[[dd-]hh:]mm:ss.ff」，统一转成秒。
@@ -274,7 +177,8 @@ print(t)' "$1" 2>/dev/null || echo 0; }
   # shellcheck disable=SC2086
   $NODE "$REPO/scripts/loadtest/overload-probe.mjs" --base-url "http://127.0.0.1:$PORT" --api-key "$API_KEY" --admin-key "$ADMIN_KEY" \
     --pool-mock "http://127.0.0.1:$MOCK_PORT" --accounts "$ACCOUNTS" --account-limits "$D/limits.json" \
-    --profile "$profile" --max-sockets "${MAX_SOCKETS:-300}" --global-max "$GLOBAL_MAX" $flags ${plan:+--upstream-plan "$plan"} --out "$OUT_DIR/$case_name.json" 2>&1 | tail -12
+    --profile "$profile" --max-sockets "${MAX_SOCKETS:-300}" --global-max "$GLOBAL_MAX" --target-pid "$SERVER_PID" $flags ${plan:+--upstream-plan "$plan"} --out "$OUT_DIR/$case_name.json" 2>&1 | tail -12
+  [ "${PIPESTATUS[0]}" = 0 ] || FAILED=1
   echo "load: $(uptime | awk -F'load averages: ' '{print $2}')  rss_mb: $(ps -o rss= -p "$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t | head -1)" 2>/dev/null | awk '{print int($1/1024)}')"
   kill "$SAMPLER" 2>/dev/null || true
   python3 - "$OUT_DIR/$case_name.cpu.txt" <<'PY'
@@ -296,20 +200,15 @@ if len(rows) > 2:
     print(f"cpu_total_pct: p50={cpu[n//2]:.0f} p95={cpu[int(n*0.95) if int(n*0.95) < n else n-1]:.0f} max={cpu[-1]:.0f} "
           f"secs_over_400={sum(1 for c in cpu if c > 400)}/{n} rss_end_mb={rss[-1]} rss_peak_mb={max(rss)}")
 PY
-  echo "redis leases after: $(docker exec claude-pool-redis-local redis-cli -n $REDIS_DB GET pool-overload-probe:scheduler:global:inflight:weighted_count)"
-  sed -E 's/\x1b\[[0-9;]*m//g' "$D/server-$case_name.log" | grep -E " (WARN|ERROR) " \
+  echo "redis leases after: $(docker exec "$REDIS_CONTAINER" redis-cli -n "$REDIS_DB" ZCARD "$KEY_PREFIX:account:global:inflight:last_seen")"
+  sed -E 's/\x1b\[[0-9;]*m//g' "${SERVER_LOG:-$D/server-$case_name.log}" | grep -E " (WARN|ERROR) " \
     | grep -vE "machine_id|native reasoning|capability cohort|slow interaction diagnostic" \
-    | sed -E 's/^[^ ]+ +//; s/req_[A-Za-z0-9]+/req_X/g; s/request_api_key_id=[0-9a-f]+/key=X/; s/credential_id=[0-9]+/cid=N/g; s/#[0-9]+/#N/g; s/[0-9]+/N/g' \
+    | sed -E 's/^[^ ]+ +//; s/req_[A-Za-z0-9]+/req_X/g; s/request_api_key_id=[0-9a-f]+/key=X/; s/(account_id|pool_id)=[0-9]+/account=N/g; s/#[0-9]+/#N/g; s/[0-9]+/N/g' \
     | cut -c1-180 | sort | uniq -c | sort -rn | head -8
   # Shutdown must finish well inside docker's 10 s grace period.
   pid=$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
   t0=$(python3 -c 'import time;print(time.time())')
-  stop_all
+  [ "${REUSE_INSTANCE:-0}" = 1 ] || stop_instance
   echo "shutdown_secs: $(python3 -c "import time;print(round(time.time()-$t0,1))")"
 done
-stop_all
-if [ "${KEEP:-0}" != "1" ]; then
-  docker exec claude-pool-postgres-local psql -U claude_pool -d postgres -qc "DROP DATABASE IF EXISTS $DB WITH (FORCE)" 2>&1 | grep -v NOTICE
-  docker exec claude-pool-redis-local redis-cli -n $REDIS_DB FLUSHDB >/dev/null
-  rm -f "$D"/config.json "$D/claude-pool" "$D/limits.json"
-fi
+exit "$FAILED"

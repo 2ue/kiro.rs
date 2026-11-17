@@ -47,6 +47,7 @@
 // TIME_WAIT sockets (4x the first) still bounds kernel state.
 
 import http from "node:http";
+import { processSample, resourceSummary } from "./lib/process-sample.mjs";
 
 function parseArgs(argv) {
   const out = {};
@@ -154,11 +155,9 @@ function sendOne(marker, stream, sessionId) {
         res.on("end", () => {
           const streamError = stream && res.statusCode === 200 && /event: error/.test(tail);
           let kind = "";
-          if (res.statusCode === 429) {
-            if (/Redis 调度协调/.test(tail)) kind = "redis_unavailable";
-            else if (/等待队列已满/.test(tail)) kind = "queue_full";
-            else if (/排队等待超时/.test(tail)) kind = "queue_timeout";
-            else kind = "other_429";
+          if (res.statusCode === 429 || res.statusCode === 529) {
+            try { kind = JSON.parse(tail).error?.type || "unknown"; }
+            catch { kind = "unknown"; }
           }
           resolve({
             status: streamError ? "stream_error" : String(res.statusCode),
@@ -191,7 +190,7 @@ const buckets = new Map();
 function bucket(sec) {
   let b = buckets.get(sec);
   if (!b) {
-    b = { arrivals: 0, attempts: 0, ok: 0, rejected: 0, rejectKinds: {}, other: 0, otherKinds: {}, finalFail: 0, okMs: [], rejectMs: [] };
+    b = { arrivals: 0, attempts: 0, ok: 0, rejected: 0, rejectKinds: {}, byStatus: {}, other: 0, otherKinds: {}, finalFail: 0, okMs: [], rejectMs: [] };
     buckets.set(sec, b);
   }
   return b;
@@ -215,12 +214,13 @@ async function arrival(n) {
     inFlightAttempts -= 1;
     const b = bucket(nowSec());
     b.attempts += 1;
+    b.byStatus[result.status] = (b.byStatus[result.status] || 0) + 1;
     if (result.status === "200") {
       b.ok += 1;
       b.okMs.push(result.ms);
       break;
     }
-    if (result.status === "429") {
+    if (result.status === "429" || result.status === "529") {
       b.rejected += 1;
       b.rejectMs.push(result.ms);
       b.rejectKinds[result.kind] = (b.rejectKinds[result.kind] || 0) + 1;
@@ -277,6 +277,7 @@ const pct = (list, p) => {
 
 async function main() {
   const timeline = [];
+  const resources = [processSample(args.targetPid)];
   let stop = false;
   let lastMockOk = 0;
   const mockOkHistory = [];
@@ -325,11 +326,13 @@ async function main() {
       const usageBacklog = typeof w.writerAccepted === "number" ? w.writerAccepted - (w.writerFinished || 0) : null;
       const waiting = (queued || 0) > 0 || b.rejected > 0;
       const rejectP95 = pct(b.rejectMs, 95);
+      resources.push(processSample(args.targetPid));
       timeline.push({
         t: sec,
         targetRate: Math.round(currentRate * 10) / 10,
         arrivals: b.arrivals,
         attempts: b.attempts,
+        byStatus: b.byStatus,
         ok: b.ok,
         rejected: b.rejected,
         rejectKinds: b.rejectKinds,
@@ -465,6 +468,8 @@ async function main() {
     (segment) => {
       const samples = timeline.filter((sample) => phaseOf(sample.t) === segment.index);
       const sum = (key) => samples.reduce((acc, sample) => acc + (sample[key] || 0), 0);
+      const byStatus = {};
+      for (const sample of samples) for (const [status, count] of Object.entries(sample.byStatus)) byStatus[status] = (byStatus[status] || 0) + count;
       const kinds = {};
       for (const sample of samples) for (const [k, v] of Object.entries(sample.rejectKinds)) kinds[k] = (kinds[k] || 0) + v;
       const otherKinds = {};
@@ -475,6 +480,7 @@ async function main() {
         secs: samples.length,
         arrivals: sum("arrivals"),
         attempts: sum("attempts"),
+        byStatus,
         ok: sum("ok"),
         rejected: sum("rejected"),
         rejectKinds: kinds,
@@ -498,6 +504,7 @@ async function main() {
           return Math.round((waiting.reduce((sum, sample) => sum + sample.freeUnits, 0) / waiting.length / Math.max(1, capacity)) * 1000) / 1000;
         })(),
         queuedMax: Math.max(0, ...samples.map((sample) => sample.queued || 0)),
+        okP95Max: Math.max(0, ...samples.map((sample) => sample.okP95 || 0)),
         rejectP95Max: Math.max(0, ...samples.map((sample) => sample.rejectP95 || 0)),
         readyMsMax: Math.max(0, ...samples.map((sample) => sample.readyMs || 0)),
         runtimeLagMsMax: Math.max(0, ...samples.map((sample) => sample.runtimeLagMs || 0)),
@@ -514,24 +521,22 @@ async function main() {
   const perToken = finalMock.body?.counters?.perToken || {};
   // claude-pool's own count of calls it let through per account, to tell a real RPM overrun from
   // calls that only arrived at the mock bunched together (arrival delay on a loaded host).
-  const tokenIds = Object.keys(perToken)
-    .map((token) => token.replace("mock-access-", ""))
-    .filter((id) => /^[0-9]+$/.test(id));
-  const runtime =
-    adminKey && tokenIds.length
-      ? await getJson(`${baseUrl.origin}/api/admin/credentials/runtime?ids=${tokenIds.join(",")}`, {
-          "x-api-key": adminKey,
-        })
-      : { body: null };
+  const runtime = adminKey
+    ? await getJson(`${baseUrl.origin}/api/admin/accounts/status`, { "x-api-key": adminKey })
+    : { body: null };
   const dispatchedByToken = {};
-  for (const item of runtime.body?.items || []) {
-    dispatchedByToken[`mock-access-${item.id}`] = item.schedulerSelectionCount ?? null;
+  for (const item of runtime.body?.accounts || []) {
+    dispatchedByToken[item.account.name] = item.dispatchedTotal ?? null;
   }
+  resources.push(processSample(args.targetPid));
   const maxInFlights = Object.values(perToken).map((stats) => stats.maxInFlight);
   const overConcurrency = Object.entries(perToken).filter(([token, stats]) => stats.maxInFlight > limitOf(token).conc);
   const overRpm = Object.entries(perToken).filter(([token, stats]) => limitOf(token).rpm > 0 && stats.maxPerMinute > limitOf(token).rpm);
   const report = {
     abortedReason,
+    accountsSummary: runtime.body?.summary ?? null,
+    dispatchedByToken,
+    resources: resourceSummary(resources),
     accounts,
     perConcurrency,
     perRpm,

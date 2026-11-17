@@ -8631,6 +8631,7 @@ async fn account_release_dispatcher_drains_10k_real_leases_after_commit_unknown_
                 .try_reserve()
                 .expect("10k leases must fit within the explicit release capacity");
             leases.push(AccountLease {
+                _in_flight_observation: InFlightObservation::new(manager.dispatch_counters.clone()),
                 manager: manager.clone(),
                 pool_id,
                 lease_id,

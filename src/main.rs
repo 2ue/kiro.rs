@@ -544,6 +544,7 @@ async fn async_main() {
         postgres_store: postgres_store.clone(),
         redis_store: redis_store.clone(),
         runtime_events: runtime_event_health.clone(),
+        account_manager: Some(account_manager.clone()),
 
         postgres_health: DependencyHealth::new(),
         redis_health: DependencyHealth::new(),
@@ -925,6 +926,7 @@ struct AppHealthState {
     postgres_store: Arc<PostgresStore>,
     redis_store: Arc<RedisStore>,
     runtime_events: Arc<RuntimeEventHealth>,
+    account_manager: Option<Arc<AccountManager>>,
 
     postgres_health: DependencyHealth,
     redis_health: DependencyHealth,
@@ -1001,6 +1003,11 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
+    let dispatch = match state.account_manager.as_ref() {
+        Some(manager) => Some(manager.dispatch_status().await),
+        None => None,
+    };
+
     (
         status,
         Json(json!({
@@ -1010,11 +1017,16 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
                 "redis": redis_ok,
                 "redisRuntimeEvents": redis_events_connected,
             },
+            "dispatch": readyz_dispatch_value(dispatch),
             "runtimeLagMs": common::runtime_lag::global().recent_max().as_millis() as u64,
             "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),
     )
+}
+
+fn readyz_dispatch_value(dispatch: Option<account::DispatchStatus>) -> Value {
+    serde_json::to_value(dispatch).expect("dispatch status contains JSON values")
 }
 
 fn refresh_admin_api_key_from_runtime_config(
@@ -1221,6 +1233,27 @@ async fn handle_maintenance_command(
 mod lifecycle_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn readyz_without_manager_has_null_dispatch() {
+        assert_eq!(readyz_dispatch_value(None), Value::Null);
+    }
+
+    #[test]
+    fn readyz_idle_manager_dispatch_is_progressing() {
+        let counters = account::DispatchCounters::default();
+        let value = readyz_dispatch_value(Some(counters.snapshot(Some(0), 0)));
+        assert_eq!(value["queuedRequests"], 0);
+        assert_eq!(value["progressing"], true);
+        assert_eq!(value["dispatchedTotal"], 0);
+        assert_eq!(value["globalInFlight"], 0);
+        assert_eq!(value["dispatchRatePerSec"], 0.0);
+        assert_eq!(value["secsSinceLastDispatch"], Value::Null);
+        assert_eq!(
+            readyz_dispatch_value(Some(counters.snapshot(None, 0)))["queuedRequests"],
+            Value::Null
+        );
+    }
 
     /// A slow check right after a good one keeps the dependency ready; only failing for the
     /// whole grace period makes it not ready, and one success brings it back.

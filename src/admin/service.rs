@@ -202,10 +202,6 @@ fn admin_usage_overview_cache_key(spec: &UsageOverviewSpec) -> String {
     )
 }
 
-fn admin_account_status_cache_key() -> &'static str {
-    "admin_cache:accounts:status"
-}
-
 fn admin_account_list_cache_key() -> &'static str {
     "admin_cache:accounts:list"
 }
@@ -1270,31 +1266,17 @@ impl AdminService {
     }
 
     pub fn get_account_status(&self) -> Result<AccountsStatusResponse, AdminServiceError> {
-        let cache_key = admin_account_status_cache_key();
-        if let Some(mut cached) = self.read_admin_cache::<AccountsStatusResponse>(cache_key) {
-            for status in &mut cached.accounts {
-                status.account = management::mask_account(status.account.clone());
-            }
-            return Ok(cached);
-        }
-
         let manager = self.account_manager.clone();
         let config = self.runtime.config().accounts;
-        let pools = block_on_admin_store(async move { manager.status(&config).await })
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-        let pools = pools
-            .into_iter()
-            .map(|mut status| {
-                status.account = management::mask_account(status.account);
-                status
-            })
-            .collect();
-        let response = AccountsStatusResponse { accounts: pools };
-        self.write_admin_cache(
-            cache_key.to_string(),
-            response.clone(),
-            ADMIN_ACCOUNT_STATUS_CACHE_TTL_SECS,
-        );
+        let mut response = block_on_admin_store(async move {
+            let accounts = manager.status(&config).await?;
+            let summary = manager.status_summary(&accounts).await;
+            Ok::<_, anyhow::Error>(AccountsStatusResponse { accounts, summary })
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        for status in &mut response.accounts {
+            status.account = management::mask_account(status.account.clone());
+        }
         Ok(response)
     }
 

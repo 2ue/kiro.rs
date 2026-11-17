@@ -223,6 +223,7 @@ export interface AccountsListResponse {
 export interface AccountStatus {
   account: Account;
   inFlight: number;
+  dispatchedTotal?: number;
   cooldownRemainingSecs: number;
   cooldownReason?: string;
   transientFailureStreak: number;
@@ -246,6 +247,16 @@ export interface AccountQualityView {
 
 export interface AccountsStatusResponse {
   accounts: AccountStatus[];
+  summary?: {
+    total: number;
+    enabled: number;
+    dispatchable: number;
+    inCooldown: number;
+    autoDisabled: number;
+    inFlightTotal: number;
+    globalInFlight: number;
+    queuedRequests: number | null;
+  };
 }
 
 export interface CreateAccountRequest {

@@ -836,6 +836,8 @@ pub struct SetAccountEnabledRequest {
 pub struct AccountStatus {
     pub account: Account,
     pub in_flight: u32,
+    #[serde(default)]
+    pub dispatched_total: u64,
     pub cooldown_remaining_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_reason: Option<String>,
@@ -900,6 +902,130 @@ impl AccountQualityView {
 #[serde(rename_all = "camelCase")]
 pub struct AccountsStatusResponse {
     pub accounts: Vec<AccountStatus>,
+    #[serde(default)]
+    pub summary: AccountsSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsSummary {
+    pub total: usize,
+    pub enabled: usize,
+    pub dispatchable: usize,
+    pub in_cooldown: usize,
+    pub auto_disabled: usize,
+    pub in_flight_total: u64,
+    pub global_in_flight: u64,
+    pub queued_requests: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchStatus {
+    pub queued_requests: Option<u32>,
+    pub global_in_flight: u64,
+    pub pending_redis_releases: usize,
+    pub dispatched_total: u64,
+    pub dispatch_rate_per_sec: f64,
+    pub secs_since_last_dispatch: Option<f64>,
+    pub progressing: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct DispatchCounters {
+    total: AtomicU64,
+    in_flight: AtomicU64,
+    per_account: SyncMutex<HashMap<u64, AtomicU64>>,
+    window: SyncMutex<VecDeque<(Instant, u64)>>,
+    last_dispatch: SyncMutex<Option<Instant>>,
+}
+
+impl DispatchCounters {
+    fn record(&self, account_id: u64) {
+        let now = Instant::now();
+        let mut window = self.window.lock();
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.per_account
+            .lock()
+            .entry(account_id)
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+        *self.last_dispatch.lock() = Some(now);
+        while window
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= Duration::from_secs(5))
+        {
+            window.pop_front();
+        }
+        if let Some((_, count)) = window
+            .back_mut()
+            .filter(|(at, _)| now.duration_since(*at) < Duration::from_millis(100))
+        {
+            *count += 1;
+        } else {
+            window.push_back((now, 1));
+        }
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        queued_requests: Option<u32>,
+        pending_redis_releases: usize,
+    ) -> DispatchStatus {
+        let now = Instant::now();
+        let mut window = self.window.lock();
+        while window
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= Duration::from_secs(5))
+        {
+            window.pop_front();
+        }
+        let secs_since_last_dispatch = self
+            .last_dispatch
+            .lock()
+            .map(|at| now.duration_since(at).as_secs_f64());
+        DispatchStatus {
+            queued_requests,
+            global_in_flight: self.in_flight.load(Ordering::Relaxed),
+            pending_redis_releases,
+            dispatched_total: self.total.load(Ordering::Relaxed),
+            dispatch_rate_per_sec: window.iter().map(|(_, count)| count).sum::<u64>() as f64 / 5.0,
+            secs_since_last_dispatch,
+            progressing: queued_requests == Some(0)
+                || secs_since_last_dispatch.is_some_and(|secs| secs < 5.0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_observation_tests {
+    use super::*;
+
+    #[test]
+    fn readyz_dispatch_counts_attempts_and_expires_window_without_losing_total() {
+        let counters = Arc::new(DispatchCounters::default());
+        counters.record(7);
+        counters.record(7);
+        counters.record(9);
+        let lease = InFlightObservation::new(counters.clone());
+        let busy = counters.snapshot(Some(1), 2);
+        assert_eq!(busy.dispatched_total, 3);
+        assert_eq!(busy.dispatch_rate_per_sec, 0.6);
+        assert_eq!(busy.global_in_flight, 1);
+        assert_eq!(busy.pending_redis_releases, 2);
+        assert!(busy.progressing);
+        assert_eq!(counters.per_account.lock()[&7].load(Ordering::Relaxed), 2);
+        drop(lease);
+        let old = Instant::now() - Duration::from_secs(6);
+        *counters.last_dispatch.lock() = Some(old);
+        *counters.window.lock() = VecDeque::from([(old, 3)]);
+        let stalled = counters.snapshot(Some(1), 0);
+        assert_eq!(stalled.dispatched_total, 3);
+        assert_eq!(stalled.dispatch_rate_per_sec, 0.0);
+        assert_eq!(stalled.global_in_flight, 0);
+        assert!(!stalled.progressing);
+        assert!(counters.snapshot(Some(0), 0).progressing);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3373,6 +3499,7 @@ pub struct AccountManager {
     postgres: Arc<PostgresStore>,
     redis: Arc<RedisStore>,
     instance_id: String,
+    dispatch_counters: Arc<DispatchCounters>,
     proxy_clients: Arc<SyncMutex<HashMap<String, reqwest::Client>>>,
     client: reqwest::Client,
     http1_title_case_client: reqwest::Client,
@@ -3446,6 +3573,22 @@ struct AccountLease {
     heartbeat: Option<AccountLeaseHeartbeat>,
     release_permit: Option<OwnedSemaphorePermit>,
     global_permit: Option<OwnedSemaphorePermit>,
+    _in_flight_observation: InFlightObservation,
+}
+
+struct InFlightObservation(Arc<DispatchCounters>);
+
+impl InFlightObservation {
+    fn new(counters: Arc<DispatchCounters>) -> Self {
+        counters.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self(counters)
+    }
+}
+
+impl Drop for InFlightObservation {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct AccountLeaseHeartbeat {
@@ -3845,6 +3988,7 @@ impl AccountLease {
         release_permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
+            _in_flight_observation: InFlightObservation::new(manager.dispatch_counters.clone()),
             manager,
             pool_id,
             lease_id,
@@ -3865,6 +4009,7 @@ impl AccountLease {
         global_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
+            _in_flight_observation: InFlightObservation::new(manager.dispatch_counters.clone()),
             manager,
             pool_id,
             lease_id,
@@ -4668,6 +4813,7 @@ impl AccountManager {
             postgres,
             redis,
             instance_id: uuid::Uuid::new_v4().to_string(),
+            dispatch_counters: Arc::new(DispatchCounters::default()),
             proxy_clients: Arc::new(SyncMutex::new(HashMap::new())),
             client: account_reqwest_client(AccountWireProfile::Default, AccountTlsProfile::Default),
             http1_title_case_client: account_reqwest_client(
@@ -5741,6 +5887,53 @@ impl AccountManager {
         }
     }
 
+    pub fn account_dispatched_total(&self, account_id: u64) -> u64 {
+        self.dispatch_counters
+            .per_account
+            .lock()
+            .get(&account_id)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub async fn dispatch_status(&self) -> DispatchStatus {
+        let queued = timeout(
+            Duration::from_millis(500),
+            self.redis.account_dispatch_queue_size(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        self.dispatch_counters
+            .snapshot(queued, self.release_dispatcher.pending_len())
+    }
+
+    pub async fn status_summary(&self, accounts: &[AccountStatus]) -> AccountsSummary {
+        let dispatch = self.dispatch_status().await;
+        AccountsSummary {
+            total: accounts.len(),
+            enabled: accounts
+                .iter()
+                .filter(|status| status.account.enabled)
+                .count(),
+            dispatchable: accounts.iter().filter(|status| status.dispatchable).count(),
+            in_cooldown: accounts
+                .iter()
+                .filter(|status| status.cooldown_remaining_secs > 0)
+                .count(),
+            auto_disabled: accounts
+                .iter()
+                .filter(|status| status.account.auto_disabled)
+                .count(),
+            in_flight_total: accounts
+                .iter()
+                .map(|status| u64::from(status.in_flight))
+                .sum(),
+            global_in_flight: dispatch.global_in_flight,
+            queued_requests: dispatch.queued_requests,
+        }
+    }
+
     pub async fn status(&self, config: &AccountsConfig) -> anyhow::Result<Vec<AccountStatus>> {
         let pools = self.postgres.list_accounts(true).await?;
         let pool_ids = pools.iter().map(|pool| pool.id).collect::<Vec<_>>();
@@ -5749,6 +5942,7 @@ impl AccountManager {
         for (pool, runtime) in pools.into_iter().zip(runtimes) {
             let Ok(runtime) = runtime else {
                 statuses.push(AccountStatus {
+                    dispatched_total: self.account_dispatched_total(pool.id),
                     account: pool,
                     in_flight: 0,
                     cooldown_remaining_secs: 0,
@@ -5786,6 +5980,7 @@ impl AccountManager {
                 .map(|quality| AccountQualityView::from_state(quality, config, account_now_ms()));
             statuses.push(AccountStatus {
                 dispatchable: skipped_reason.is_none(),
+                dispatched_total: self.account_dispatched_total(pool.id),
                 account: pool,
                 in_flight,
                 cooldown_remaining_secs,
@@ -6640,6 +6835,7 @@ impl AccountManager {
                             }
                         }
                     }
+                    self.dispatch_counters.record(pool.id);
                     self.forward_prepared_once(&pool, &route, lease, &config, prepared)
                         .await
                 }
