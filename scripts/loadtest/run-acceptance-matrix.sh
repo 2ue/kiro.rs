@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: scripts/loadtest/run-acceptance-matrix.sh [smoke|quick|full]
+# Usage: scripts/loadtest/run-acceptance-matrix.sh [smoke|quick|full|scenarios CASE...|overload CASE...]
 set -uo pipefail
 MODE=${1:-quick}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -11,6 +11,10 @@ MOCK_PORT=${MOCK_PORT:-39181}
 REDIS_DB=${REDIS_DB:-13}
 source "$REPO/scripts/loadtest/lib/isolated-instance.sh"
 case "$MODE" in
+  scenarios)
+    shift; SCHEDULER_CASES="$*"; OVERLOAD_CASES='' ;;
+  overload)
+    shift; SCHEDULER_CASES=''; OVERLOAD_CASES="$*" ;;
   smoke)
     SCHEDULER_CASES='normal'
     OVERLOAD_CASES='steady_ok'
@@ -22,7 +26,7 @@ case "$MODE" in
       SCHEDULER_CASES="$SCHEDULER_CASES long_stream_sessions mixed_chaos_soak"
       OVERLOAD_CASES="$OVERLOAD_CASES sustained_sub2api long_spike square_sub2api storm_reset storm_midstream spike_with_errors slow_wave slow_accounts_spike spike_impatient long_overload pool_hang pool_trickle"
     fi ;;
-  *) echo "Usage: $0 [smoke|quick|full]" >&2; exit 2 ;;
+  *) echo "Usage: $0 [smoke|quick|full|scenarios CASE...|overload CASE...]" >&2; exit 2 ;;
 esac
 mkdir -p "$OUT_DIR"
 trap 'cleanup_instance' EXIT
@@ -71,8 +75,10 @@ for name in $OVERLOAD_CASES; do
     QUEUE=$QUEUE MAX_DURATION_SECS=$MAX_DURATION_SECS \
     bash "$REPO/scripts/loadtest/overload-run.sh" >> "$OUT_DIR/matrix.log" 2>&1 || FAILED=1
 done
-python3 "$REPO/scripts/loadtest/overload-verdict.py" "$OUT_DIR" > "$OUT_DIR/overload-verdict.log" 2>&1 || FAILED=1
-cat "$OUT_DIR/overload-verdict.log"
+if [ -n "$OVERLOAD_CASES" ]; then
+  python3 "$REPO/scripts/loadtest/overload-verdict.py" "$OUT_DIR" > "$OUT_DIR/overload-verdict.log" 2>&1 || FAILED=1
+  cat "$OUT_DIR/overload-verdict.log"
+fi
 python3 "$REPO/scripts/loadtest/acceptance-summary.py" "$OUT_DIR" $SCHEDULER_CASES $OVERLOAD_CASES || FAILED=1
 # Keep the service and mock logs as reviewable artifacts before removing the instance directory.
 cp "$SERVER_LOG" "$OUT_DIR/server.log"

@@ -7699,6 +7699,7 @@ impl AccountManager {
                                                 ));
                                             }
                                             if buffer.len() > ACCOUNT_MAX_SSE_EVENT_BUFFER_BYTES {
+                                                let error_type = "api_error";
                                                 tracing::warn!(
                                                     request_id = %stream_error_mask.request_id,
                                                     error_id = %stream_error_mask.error_id,
@@ -7706,13 +7707,18 @@ impl AccountManager {
                                                     pool_name = %stream_error_mask.pool_name,
                                                     buffered_bytes = buffer.len(),
                                                     max_buffered_bytes = ACCOUNT_MAX_SSE_EVENT_BUFFER_BYTES,
+                                                    terminal_event = error_type,
                                                     "account stream event buffer exceeded limit"
                                                 );
                                                 drop(lease);
+                                                let event = external_post_output_terminal_error_event(
+                                                    stream_error_mask.as_ref(),
+                                                    error_type,
+                                                    Some(&usage_capture),
+                                                    "external stream event exceeded buffer limit",
+                                                );
                                                 return Some((
-                                                    Err(std::io::Error::other(
-                                                        "external stream event exceeded buffer limit".to_string(),
-                                                    )),
+                                                    Ok::<Bytes, std::io::Error>(Bytes::from(event)),
                                                     (
                                                         body_stream,
                                                         None,
@@ -7726,19 +7732,25 @@ impl AccountManager {
                                             }
                                         }
                                         Some(Err(_)) => {
+                                            let error_type = "overloaded_error";
                                             tracing::warn!(
                                                 request_id = %stream_error_mask.request_id,
                                                 error_id = %stream_error_mask.error_id,
                                                 pool_id = stream_error_mask.pool_id,
                                                 pool_name = %stream_error_mask.pool_name,
                                                 error_class = "external_stream_read_error",
+                                                terminal_event = error_type,
                                                 "account stream read failed"
                                             );
                                             drop(lease);
+                                            let event = external_post_output_terminal_error_event(
+                                                stream_error_mask.as_ref(),
+                                                error_type,
+                                                Some(&usage_capture),
+                                                "external stream read error",
+                                            );
                                             return Some((
-                                                Err(std::io::Error::other(
-                                                    "external stream read error".to_string(),
-                                                )),
+                                                Ok(Bytes::from(event)),
                                                 (
                                                     body_stream,
                                                     None,
@@ -7794,11 +7806,24 @@ impl AccountManager {
                                     }
                                 }
                                 _ = account_lease_lost(lease.as_ref()) => {
+                                    let error_type = "overloaded_error";
+                                    tracing::warn!(
+                                        request_id = %stream_error_mask.request_id,
+                                        error_id = %stream_error_mask.error_id,
+                                        pool_id = stream_error_mask.pool_id,
+                                        pool_name = %stream_error_mask.pool_name,
+                                        terminal_event = error_type,
+                                        "account lease coordination was lost"
+                                    );
                                     drop(lease);
+                                    let event = external_post_output_terminal_error_event(
+                                        stream_error_mask.as_ref(),
+                                        error_type,
+                                        Some(&usage_capture),
+                                        "account lease coordination was lost",
+                                    );
                                     return Some((
-                                        Err(std::io::Error::other(
-                                            "account lease coordination was lost".to_string(),
-                                        )),
+                                        Ok(Bytes::from(event)),
                                         (
                                             body_stream,
                                             None,
@@ -7815,11 +7840,24 @@ impl AccountManager {
                                     let seconds = stream_idle_timeout
                                         .map(|timeout| timeout.as_secs())
                                         .unwrap_or_default();
+                                    let error_type = "overloaded_error";
+                                    tracing::warn!(
+                                        request_id = %stream_error_mask.request_id,
+                                        error_id = %stream_error_mask.error_id,
+                                        pool_id = stream_error_mask.pool_id,
+                                        pool_name = %stream_error_mask.pool_name,
+                                        idle_timeout_secs = seconds,
+                                        terminal_event = error_type,
+                                        "model endpoint stream idle timeout"
+                                    );
+                                    let event = external_post_output_terminal_error_event(
+                                        stream_error_mask.as_ref(),
+                                        error_type,
+                                        Some(&usage_capture),
+                                        &format!("model endpoint stream idle timeout after {seconds} seconds"),
+                                    );
                                     return Some((
-                                        Err(std::io::Error::other(format!(
-                                            "model endpoint stream idle timeout after {} seconds",
-                                            seconds
-                                        ))),
+                                        Ok(Bytes::from(event)),
                                         (
                                             body_stream,
                                             None,
@@ -15326,6 +15364,32 @@ fn external_safe_processing_error_event(
         value["request_id"] = serde_json::Value::String(request_id.to_string());
     }
     format!("event: error\ndata: {value}\n\n").into_bytes()
+}
+
+/// 首输出之后上游不可恢复（断流/idle 超时/lease 丢失/缓冲超限）时写给下游的终止事件。
+/// overloaded_error 让 Claude Code 重试整个请求；缓冲超限用重试无用的 api_error。
+fn external_post_output_terminal_error_event(
+    mask: &ExternalStreamErrorMask,
+    error_type: &'static str,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    detail: &str,
+) -> Vec<u8> {
+    if let Some(capture) = capture {
+        let mut capture = capture.lock();
+        if capture.stream_error_message.is_none() {
+            capture.stream_error_message = Some(detail.to_string());
+        }
+    }
+    let message = envelope::public_message_with_error_id(
+        envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+        &mask.error_id,
+    );
+    let body = json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message},
+        "request_id": mask.request_id,
+    });
+    format!("event: error\ndata: {body}\n\n").into_bytes()
 }
 
 #[cfg(test)]

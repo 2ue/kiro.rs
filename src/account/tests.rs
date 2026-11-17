@@ -11585,6 +11585,54 @@ data: {"type":"error","error":{"type":"api_error","message":"raw external promo 
 }
 
 #[test]
+fn external_post_output_terminal_error_after_content_start_is_masked_and_preserves_first_detail() {
+    let mask = ExternalStreamErrorMask {
+        request_id: "req_post_output_mask".to_string(),
+        error_id: "err_post_output_mask".to_string(),
+        pool_id: 7,
+        pool_name: "private-pool-name".to_string(),
+    };
+    for error_type in ["overloaded_error", "api_error"] {
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        for detail in ["socket reset private detail", "later idle timeout detail"] {
+            let bytes = external_post_output_terminal_error_event(
+                &mask,
+                error_type,
+                Some(&capture),
+                detail,
+            );
+            let body = String::from_utf8(bytes).unwrap();
+            let events = parse_downstream_sse(&body);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].0, "error");
+            assert_eq!(events[0].1["type"], "error");
+            assert_eq!(events[0].1["error"]["type"], error_type);
+            assert_eq!(events[0].1["request_id"], mask.request_id);
+            assert_eq!(
+                events[0].1["error"]["message"],
+                envelope::public_message_with_error_id(
+                    envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+                    &mask.error_id,
+                )
+            );
+            assert!(!body.contains(detail));
+            assert!(!body.contains(&mask.pool_name));
+            assert_eq!(
+                capture.lock().stream_error_message.as_deref(),
+                Some("socket reset private detail")
+            );
+        }
+    }
+    let event = external_post_output_terminal_error_event(
+        &mask,
+        "overloaded_error",
+        None,
+        "socket reset private detail",
+    );
+    assert!(String::from_utf8(event).unwrap().contains("event: error"));
+}
+
+#[test]
 fn external_stream_request_timeout_zero_does_not_inherit_non_stream_timeout() {
     let config = AccountsConfig {
         request_timeout_secs: 2,
@@ -19590,6 +19638,184 @@ async fn account_stream_error_after_content_start_does_not_replay_request() {
         record.external_attempts[0].pool_name,
         "stream-post-commit-a"
     );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_read_error_after_content_start_ends_with_overloaded_error_event() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_post_output_read", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("partial")),
+        // 给 Hyper 留出冲刷前缀的机会，避免同次 poll 的 body Err 丢弃尚未发出的内容。
+        ExternalStreamFakeStep::delay(Duration::from_millis(100)),
+        ExternalStreamFakeStep::error("socket reset"),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_post_output_read_backup",
+        "should-not-replay",
+        222,
+        9,
+    ))
+    .await;
+    create_messages_pool(&postgres, "post-output-read-a", 1, &failing.base_url).await;
+    create_messages_pool(&postgres, "post-output-read-b", 10, &succeeding.base_url).await;
+
+    let request_id = "req_stream_post_output_read";
+    let error_id = "err_stream_post_output_read";
+    let (route, recorder) = external_stream_route(request_id, error_id);
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("post-output read error should return the original response")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("post-output read error must not fail over: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("partial"));
+    assert!(!body.contains("socket reset"));
+    assert!(!body.contains("external stream read error"));
+    assert!(!body.contains("should-not-replay"));
+    let events = parse_downstream_sse(&body);
+    let (name, event) = events.last().expect("terminal error event");
+    assert_eq!(name, "error");
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["type"], "overloaded_error");
+    assert_eq!(event["request_id"], request_id);
+    assert_eq!(
+        event["error"]["message"],
+        envelope::public_message_with_error_id(
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            error_id
+        )
+    );
+    assert!(!events.iter().any(|(name, _)| name == "message_stop"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::StreamError);
+    assert!(record.account_billing.is_none());
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_idle_timeout_after_content_start_ends_with_overloaded_error_event() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_post_output_idle", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("partial")),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("late")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_post_output_idle_backup",
+        "should-not-replay",
+        222,
+        9,
+    ))
+    .await;
+    create_messages_pool(&postgres, "post-output-idle-a", 1, &failing.base_url).await;
+    create_messages_pool(&postgres, "post-output-idle-b", 10, &succeeding.base_url).await;
+
+    let request_id = "req_stream_post_output_idle";
+    let error_id = "err_stream_post_output_idle";
+    let (route, recorder) = external_stream_route(request_id, error_id);
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("post-output idle timeout should return the original response")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("post-output idle timeout must not fail over: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("partial"));
+    assert!(!body.contains("late"));
+    assert!(!body.contains("idle timeout"));
+    assert!(!body.contains("should-not-replay"));
+    let events = parse_downstream_sse(&body);
+    let (name, event) = events.last().expect("terminal error event");
+    assert_eq!(name, "error");
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["type"], "overloaded_error");
+    assert_eq!(event["request_id"], request_id);
+    assert_eq!(
+        event["error"]["message"],
+        envelope::public_message_with_error_id(
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            error_id
+        )
+    );
+    assert!(!events.iter().any(|(name, _)| name == "message_stop"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::StreamError);
+    assert!(record.account_billing.is_none());
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_stream_eof_after_content_start_without_message_stop_is_not_an_error_event() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_post_output_eof", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("partial")),
+    ])
+    .await;
+    create_messages_pool(&postgres, "post-output-eof", 1, &upstream.base_url).await;
+
+    let (route, _recorder) =
+        external_stream_route("req_stream_post_output_eof", "err_stream_post_output_eof");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("post-output EOF should return the original response")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("post-output EOF must remain a clean end: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("partial"));
+    let events = parse_downstream_sse(&body);
+    assert!(!events.iter().any(|(name, _)| name == "error"));
+    assert!(!events.iter().any(|(name, _)| name == "message_stop"));
+    assert_eq!(upstream.snapshot(), 1);
 
     postgres.drop_test_schema().await.unwrap();
 }
