@@ -687,14 +687,22 @@ mod tests {
         let mut config = Config::default();
         config.set_request_api_keys(vec!["secret-request-key"]);
         config.admin_api_key = Some("secret-admin-key".into());
-        let rows = json!({"runtimeConfig":config,"accounts":[],"routeScenarios":[],"modelPricing":[],"manualModels":[]});
+        let account = crate::account::tests::test_pool("https://example.com/v1", false);
+        let account = serde_json::to_value(account).unwrap();
+        assert_eq!(account["supportedModels"], json!([]));
+        assert_eq!(account["routeRules"], json!([]));
+        assert_eq!(account["headerOverrides"], json!({}));
+        let rows = json!({"runtimeConfig":config,"accounts":[account],"routeScenarios":[],"modelPricing":[],"manualModels":[]});
         let package = package_from_rows(rows.clone(), true).unwrap();
         let serialized = serde_json::to_vec(&package).unwrap();
         let imported: ConfigPackage = serde_json::from_slice(&serialized).unwrap();
         validate_package(&imported, &config).unwrap();
         let report = compare_packages(&package, &imported, true).unwrap();
         assert!(report.changes.is_empty());
-        assert_eq!(report.unchanged, 2);
+        assert_eq!(report.unchanged, 3);
+        assert_eq!(imported.accounts[0]["supportedModels"], json!([]));
+        assert_eq!(imported.accounts[0]["routeRules"], json!([]));
+        assert_eq!(imported.accounts[0]["headerOverrides"], json!({}));
         let redacted = package_from_rows(rows, false).unwrap();
         assert!(contains_redacted(&json!(redacted)));
         assert!(

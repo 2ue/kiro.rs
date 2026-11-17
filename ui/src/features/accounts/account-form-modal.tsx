@@ -32,7 +32,7 @@ const OVERRIDES: Array<[keyof AccountOverrides, string]> = [
 ];
 export function AccountFormModal({
   mode,
-  pool,
+  account,
   open,
   draft,
   saving,
@@ -42,7 +42,7 @@ export function AccountFormModal({
   onDiscoverSupportedModels,
 }: {
   mode: "create" | "edit";
-  pool?: Account | null;
+  account?: Account | null;
   open: boolean;
   draft: AccountFormDraft;
   saving: boolean;
@@ -92,7 +92,7 @@ export function AccountFormModal({
     <ModalShell
       open={open}
       onClose={onClose}
-      title={mode === "edit" ? `编辑账号 #${pool?.id}` : "新增账号"}
+      title={mode === "edit" ? `编辑账号 #${account?.id}` : "新增账号"}
       width="max-w-4xl"
       footer={
         <Button onClick={onSubmit} disabled={saving}>

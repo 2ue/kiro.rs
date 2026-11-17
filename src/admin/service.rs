@@ -1272,8 +1272,8 @@ impl AdminService {
     pub fn get_account_status(&self) -> Result<AccountsStatusResponse, AdminServiceError> {
         let cache_key = admin_account_status_cache_key();
         if let Some(mut cached) = self.read_admin_cache::<AccountsStatusResponse>(cache_key) {
-            for status in &mut cached.pools {
-                status.pool = management::mask_account(status.pool.clone());
+            for status in &mut cached.accounts {
+                status.account = management::mask_account(status.account.clone());
             }
             return Ok(cached);
         }
@@ -1285,11 +1285,11 @@ impl AdminService {
         let pools = pools
             .into_iter()
             .map(|mut status| {
-                status.pool = management::mask_account(status.pool);
+                status.account = management::mask_account(status.account);
                 status
             })
             .collect();
-        let response = AccountsStatusResponse { pools };
+        let response = AccountsStatusResponse { accounts: pools };
         self.write_admin_cache(
             cache_key.to_string(),
             response.clone(),

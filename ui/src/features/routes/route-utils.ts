@@ -41,7 +41,7 @@ export function accountAllowsRoute(
   prefix: string,
 ): boolean {
   const endpoint = `${normalizeRoutePrefix(prefix)}/v1/messages`.toLowerCase();
-  const matched = account.routeRules.some((value) => {
+  const matched = (account.routeRules ?? []).some((value) => {
     const rule = value.trim().toLowerCase().replace(/\/+$/, "") || "/";
     return (
       rule === "*" ||

@@ -492,20 +492,18 @@ async fn async_main() {
     diagnostics::capture::init_global(capture_dir);
 
     // 构建 Anthropic API 路由
-    let anthropic_app = anthropic::create_router(
-        anthropic::AnthropicRouterDependencies {
-            request_api_keys: request_api_key_store.clone(),
-            request_admission: request_admission.clone(),
+    let anthropic_app = anthropic::create_router(anthropic::AnthropicRouterDependencies {
+        runtime: runtime.clone(),
+        request_api_keys: request_api_key_store.clone(),
+        request_admission: request_admission.clone(),
 
-            usage_recorder: usage_recorder.clone(),
-            prompt_cache: prompt_cache.clone(),
-            prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
-            pricing_catalog: pricing_catalog.clone(),
-            model_capabilities: model_capabilities.clone(),
-            account_manager: Some(account_manager.clone()),
-        },
-        anthropic::AnthropicRouterConfig::from_runtime_config(&config),
-    );
+        usage_recorder: usage_recorder.clone(),
+        prompt_cache: prompt_cache.clone(),
+        prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
+        pricing_catalog: pricing_catalog.clone(),
+        model_capabilities: model_capabilities.clone(),
+        account_manager: Some(account_manager.clone()),
+    });
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证

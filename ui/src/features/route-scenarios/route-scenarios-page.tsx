@@ -233,7 +233,7 @@ export function RouteScenariosPage() {
               <p className="text-sm text-muted-foreground">
                 快照包含 {editor.content.routes.length} 条路由。账号规则：
               </p>
-              {(accounts.data?.pools ?? []).map((account) => {
+              {(accounts.data?.accounts ?? []).map((account) => {
                 const rule = editor.content.externalAccounts.find(
                   (a) => a.id === account.id,
                 ) ?? {

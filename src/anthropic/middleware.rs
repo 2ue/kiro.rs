@@ -21,20 +21,13 @@ use uuid::Uuid;
 use crate::account::AccountManager;
 use crate::common::auth;
 use crate::common::auth::RequestApiKeyStore;
-use crate::model::config::{
-    AccountsConfig, CachePolicyConfig, CompatProfile, ImageProcessingConfig,
-    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-    PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
-};
+use crate::model::config::PromptCacheSimulationMode;
+use crate::model::runtime::RuntimeConfigStore;
 
 use super::request_body::MAX_MESSAGES_BODY_SIZE;
 use super::{
-    envelope,
-    model_capabilities::ModelCapabilitiesCatalog,
-    pricing::PricingCatalog,
-    prompt_cache::{PromptCacheBounds, PromptCacheTracker},
-    prompt_cache_creation_control::PromptCacheCreationController,
+    envelope, model_capabilities::ModelCapabilitiesCatalog, pricing::PricingCatalog,
+    prompt_cache::PromptCacheTracker, prompt_cache_creation_control::PromptCacheCreationController,
     usage::UsageRecorder,
 };
 
@@ -249,110 +242,38 @@ fn record_http_egress(response: Response, ingress_id: &str) -> Response {
 }
 
 /// 应用共享状态
-///
-/// axum clones the state for every request (router, middleware, extractor), so config sections
-/// that own maps and strings are behind `Arc`: a clone must not copy them.
 #[derive(Clone)]
 pub struct AppState {
-    pub runtime: Arc<crate::model::runtime::RuntimeConfigStore>,
+    pub runtime: Arc<RuntimeConfigStore>,
     /// 客户端请求 API Key 内存索引。
     pub request_api_keys: Arc<RequestApiKeyStore>,
-    /// 上游 Provider（可选，用于实际 API 调用）
-    /// 是否开启非流式响应的 thinking 块提取
-    /// 请求级 usage 记录器
+    /// 请求级 usage 记录器。
     pub usage_recorder: Arc<UsageRecorder>,
-    /// tool-use 格式错误内部诊断写盘器。关闭时为 no-op。
     /// 模型价格目录。仅用于统计计价，失败不影响请求。
     pub pricing_catalog: Arc<PricingCatalog>,
     /// 模型能力目录。仅用于 /models 和后台观测，失败不影响请求调度。
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    /// Anthropic Files 兼容上传暂存区，用于 Claude Code 图片/文件 source.file_id。
-    /// 本地 prompt-cache tracker
+    /// 本地 prompt-cache tracker。
     pub prompt_cache: Arc<PromptCacheTracker>,
-    /// 本地 prompt-cache creation 上报频次控制器
+    /// 本地 prompt-cache creation 上报频次控制器。
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
-    /// 本地 prompt-cache usage 模拟模式
+    /// 旧缓存策略的模拟模式；Config 中没有对应字段。
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
-    /// 本地 prompt-cache 模拟目标 cache read 比例
-    pub prompt_cache_target_read_ratio: f64,
-    /// high-cache 模拟专用的 total input 放大倍数
-    pub prompt_cache_token_scale: f64,
-    /// high-cache 模拟 total input 的上限
-    pub prompt_cache_max_simulated_input_tokens: i32,
-    /// high-cache 模拟触顶 soft-cap 最小扣减
-    pub prompt_cache_cap_jitter_min_tokens: i32,
-    /// high-cache 模拟触顶 soft-cap 最大扣减
-    pub prompt_cache_cap_jitter_max_tokens: i32,
-    /// high-cache 模拟启用 scale 的最小基础输入
-    pub prompt_cache_scale_min_input_tokens: i32,
-    /// 本地 prompt-cache creation 上报频次控制配置
-    pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
-    /// 本地 prompt-cache 内存和条目边界
-    pub prompt_cache_bounds: PromptCacheBounds,
-    /// 下游 usage 上报投影配置
-    pub reported_usage: Arc<ReportedUsageConfig>,
-    /// 路径级缓存策略覆盖
-    pub cache_policy: Arc<CachePolicyConfig>,
-    /// 路由定义及对应的策略。
-    pub routes: Arc<crate::model::routes::RoutesConfig>,
-    /// Anthropic compatibility profile
-    pub compat_profile: CompatProfile,
-    /// 请求模型解析策略
-    pub model_resolution_mode: ModelResolutionMode,
-    /// 模型映射和兜底规则
-    pub model_mapping: Arc<ModelMappingConfig>,
-    /// 是否在响应头中暴露代理改写动作
-    /// 是否启用发送 上游 上游前的最终 payload 防护
-    pub payload_guard_enabled: bool,
-    /// payload guard 大小裁剪触发模式
-    pub payload_guard_mode: PayloadGuardMode,
-    /// 通用 payload 的本地 byte soft target 和按大小处理总开关
-    pub payload_guard_max_bytes: usize,
-    /// 上游 上游请求体字符集加权体积目标
-    /// payload guard 安全余量字节数
-    pub payload_guard_safety_margin_bytes: usize,
-    /// payload 超限时是否裁剪旧历史
-    pub payload_guard_trim_history: bool,
-    /// 外部备用池是否复用同一套 payload guard / shaping 配置
-    pub payload_guard_external_enabled: bool,
-    /// 是否把工具 cache_control 转成 上游 cachePoint
-    /// cachePoint 是否仅按工具 cache_control 插入
-    /// 是否记录 cachePoint 插入计划
-    /// 上游 上游流式响应正文静默超时秒数
-    /// 多模态图片/文件预处理配置
-    pub image_processing: ImageProcessingConfig,
-    /// 本地 Anthropic -> 上游 转换能力配置
-    /// 提示词注入配置
-    pub prompt_injection: Arc<PromptInjectionConfig>,
-    /// 按路由控制的功能
-    pub route_features: Arc<RouteFeaturesConfig>,
-    /// `/v1/models` 只列出 Claude 模型
-    /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略
-    pub missing_max_tokens: MissingMaxTokensConfig,
-    /// payload shaping 配置
-    pub payload_shaping: PayloadShapingConfig,
-    /// 外部备用号池和直连策略配置。
-    pub accounts: Arc<AccountsConfig>,
-    /// 外部备用号池管理器。
+    /// 账号池管理器。
     pub account_manager: Option<Arc<AccountManager>>,
 }
 
 impl AppState {
-    /// 创建新的应用状态
+    /// 创建新的应用状态。
     pub fn new(
         request_api_keys: Arc<RequestApiKeyStore>,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
         prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
         prompt_cache_simulation_mode: PromptCacheSimulationMode,
-        prompt_cache_target_read_ratio: f64,
-        compat_profile: CompatProfile,
     ) -> Self {
-        let mut initial = crate::model::config::Config::default();
-        initial.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio.clamp(0.0, 0.99);
-        initial.compat_profile = compat_profile;
         Self {
-            runtime: crate::model::runtime::RuntimeConfigStore::new(initial, None),
+            runtime: RuntimeConfigStore::new(crate::model::config::Config::default(), None),
             request_api_keys,
             usage_recorder,
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -360,103 +281,12 @@ impl AppState {
             prompt_cache,
             prompt_cache_creation_controller,
             prompt_cache_simulation_mode,
-            prompt_cache_target_read_ratio: prompt_cache_target_read_ratio.clamp(0.0, 0.99),
-            prompt_cache_token_scale: 1.0,
-            prompt_cache_max_simulated_input_tokens: 0,
-            prompt_cache_cap_jitter_min_tokens: 0,
-            prompt_cache_cap_jitter_max_tokens: 0,
-            prompt_cache_scale_min_input_tokens: 0,
-            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
-            prompt_cache_bounds: PromptCacheBounds::default(),
-            reported_usage: Arc::new(ReportedUsageConfig::default()),
-            cache_policy: Arc::new(CachePolicyConfig::default()),
-            routes: Arc::new(crate::model::routes::RoutesConfig::default()),
-            compat_profile,
-            model_resolution_mode: ModelResolutionMode::Compatible,
-            model_mapping: Arc::new(ModelMappingConfig::default()),
-            payload_guard_enabled: true,
-            payload_guard_mode: PayloadGuardMode::OnTooLong,
-            payload_guard_max_bytes: 450 * 1024,
-            payload_guard_safety_margin_bytes: 32 * 1024,
-            payload_guard_trim_history: true,
-            payload_guard_external_enabled: true,
-            image_processing: ImageProcessingConfig::default(),
-            prompt_injection: Arc::new(PromptInjectionConfig::default()),
-            route_features: Arc::new(RouteFeaturesConfig::default()),
-            missing_max_tokens: MissingMaxTokensConfig::default(),
-            payload_shaping: PayloadShapingConfig::default(),
-            accounts: Arc::new(AccountsConfig::default()),
             account_manager: None,
         }
     }
 
-    pub fn with_prompt_cache_creation_control(
-        mut self,
-        config: PromptCacheCreationControlConfig,
-    ) -> Self {
-        self.prompt_cache_creation_control = config.normalized();
-        self.runtime.install_local(|config| {
-            config.prompt_cache_creation_control = self.prompt_cache_creation_control
-        });
-        self
-    }
-
-    pub fn with_prompt_injection(
-        mut self,
-        prompt_injection: PromptInjectionConfig,
-        route_features: RouteFeaturesConfig,
-    ) -> Self {
-        self.prompt_injection = Arc::new(prompt_injection.normalized());
-        self.runtime.install_local(|config| {
-            config.prompt_injection = self.prompt_injection.as_ref().clone()
-        });
-        self.route_features = Arc::new(route_features.normalized());
-        self.runtime
-            .install_local(|config| config.route_features = self.route_features.as_ref().clone());
-
-        self
-    }
-
-    pub fn with_prompt_cache_bounds(mut self, bounds: PromptCacheBounds) -> Self {
-        self.prompt_cache_bounds = bounds;
-        self.runtime.install_local(|config| {
-            config.prompt_cache_max_entries_per_account = bounds.max_entries_per_account;
-            config.prompt_cache_max_entries_global = bounds.max_entries_global;
-            config.prompt_cache_entry_ttl_secs = bounds.entry_ttl.as_secs();
-            config.prompt_cache_estimated_bytes_limit = bounds.estimated_bytes_limit;
-        });
-        self
-    }
-
-    pub fn with_prompt_cache_amplification(
-        mut self,
-        token_scale: f64,
-        max_simulated_input_tokens: i32,
-        cap_jitter_min_tokens: i32,
-        cap_jitter_max_tokens: i32,
-        scale_min_input_tokens: i32,
-    ) -> Self {
-        self.prompt_cache_token_scale = token_scale;
-        self.runtime.install_local(|config| {
-            config.prompt_cache_token_scale = self.prompt_cache_token_scale
-        });
-        self.prompt_cache_max_simulated_input_tokens = max_simulated_input_tokens;
-        self.runtime.install_local(|config| {
-            config.prompt_cache_max_simulated_input_tokens =
-                self.prompt_cache_max_simulated_input_tokens
-        });
-        self.prompt_cache_cap_jitter_min_tokens = cap_jitter_min_tokens;
-        self.runtime.install_local(|config| {
-            config.prompt_cache_cap_jitter_min_tokens = self.prompt_cache_cap_jitter_min_tokens
-        });
-        self.prompt_cache_cap_jitter_max_tokens = cap_jitter_max_tokens;
-        self.runtime.install_local(|config| {
-            config.prompt_cache_cap_jitter_max_tokens = self.prompt_cache_cap_jitter_max_tokens
-        });
-        self.prompt_cache_scale_min_input_tokens = scale_min_input_tokens;
-        self.runtime.install_local(|config| {
-            config.prompt_cache_scale_min_input_tokens = self.prompt_cache_scale_min_input_tokens
-        });
+    pub fn with_runtime(mut self, runtime: Arc<RuntimeConfigStore>) -> Self {
+        self.runtime = runtime;
         self
     }
 
@@ -473,95 +303,8 @@ impl AppState {
         self
     }
 
-    pub fn with_reported_usage(mut self, reported_usage: ReportedUsageConfig) -> Self {
-        self.reported_usage = Arc::new(reported_usage.normalized());
-        self.runtime
-            .install_local(|config| config.reported_usage = self.reported_usage.as_ref().clone());
-        self
-    }
-
-    pub fn with_cache_policy(mut self, cache_policy: CachePolicyConfig) -> Self {
-        self.cache_policy = Arc::new(cache_policy.normalized());
-        self.runtime
-            .install_local(|config| config.cache_policy = self.cache_policy.as_ref().clone());
-        self
-    }
-
-    pub fn with_routes(mut self, routes: crate::model::routes::RoutesConfig) -> Self {
-        self.routes = Arc::new(routes);
-        self.runtime
-            .install_local(|config| config.routes = self.routes.as_ref().clone());
-        self
-    }
-
-    pub fn with_model_resolution_mode(mut self, mode: ModelResolutionMode) -> Self {
-        self.model_resolution_mode = mode;
-        self.runtime
-            .install_local(|config| config.model_resolution_mode = self.model_resolution_mode);
-        self
-    }
-
-    pub fn with_model_mapping(mut self, model_mapping: ModelMappingConfig) -> Self {
-        self.model_mapping = Arc::new(model_mapping.normalized());
-        self.runtime
-            .install_local(|config| config.model_mapping = self.model_mapping.as_ref().clone());
-        self
-    }
-
-    pub fn with_payload_guard(
-        mut self,
-        enabled: bool,
-        mode: PayloadGuardMode,
-        max_bytes: usize,
-        safety_margin_bytes: usize,
-        trim_history: bool,
-        external_enabled: bool,
-        image_processing: ImageProcessingConfig,
-        payload_shaping: PayloadShapingConfig,
-    ) -> Self {
-        self.payload_guard_enabled = enabled;
-        self.payload_guard_mode = mode;
-        self.payload_guard_max_bytes = max_bytes;
-        self.payload_guard_safety_margin_bytes = safety_margin_bytes;
-        self.payload_guard_trim_history = trim_history;
-        self.payload_guard_external_enabled = external_enabled;
-        self.image_processing = image_processing.normalized();
-        self.payload_shaping = payload_shaping;
-        self.runtime.install_local(|config| {
-            config.route_features.defaults.payload_guard =
-                enabled.then_some(crate::model::prompt_injection::RoutePayloadGuardConfig {
-                    enabled,
-                    mode,
-                    max_bytes,
-                    safety_margin_bytes,
-                    trim_history,
-                    external_enabled,
-                    ..Default::default()
-                });
-            config.route_features.defaults.image_processing = Some(self.image_processing);
-            config.route_features.defaults.payload_shaping =
-                payload_shaping.enabled.then_some(payload_shaping);
-        });
-        self
-    }
-
-    pub fn with_missing_max_tokens(mut self, config: MissingMaxTokensConfig) -> Self {
-        self.missing_max_tokens = config.normalized();
-        self.runtime.install_local(|config| {
-            config.route_features.defaults.missing_max_tokens = Some(self.missing_max_tokens)
-        });
-        self
-    }
-
     pub fn with_account_manager(mut self, account_manager: Arc<AccountManager>) -> Self {
         self.account_manager = Some(account_manager);
-        self
-    }
-
-    pub fn with_accounts(mut self, accounts: AccountsConfig) -> Self {
-        self.accounts = Arc::new(accounts);
-        self.runtime
-            .install_local(|config| config.accounts = self.accounts.as_ref().clone());
         self
     }
 }
@@ -698,8 +441,6 @@ mod tests {
             Arc::new(PromptCacheTracker::default()),
             Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::HighCache,
-            0.98,
-            CompatProfile::ClaudeCode,
         )
     }
 

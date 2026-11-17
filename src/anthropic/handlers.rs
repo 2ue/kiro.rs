@@ -98,55 +98,11 @@ impl RequestRuntimeConfig {
     }
 
     fn from_app_state(state: &AppState) -> Self {
-        let config = state.runtime.snapshot();
-        Self {
-            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
-            prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
-            prompt_cache_token_scale: state.prompt_cache_token_scale,
-            prompt_cache_max_simulated_input_tokens: state.prompt_cache_max_simulated_input_tokens,
-            prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
-            prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
-            prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
-            prompt_cache_creation_control: state.prompt_cache_creation_control,
-            prompt_cache_bounds: state.prompt_cache_bounds,
-            reported_usage: ReportedUsageConfig::clone(&state.reported_usage),
-            cache_policy: CachePolicyConfig::clone(&state.cache_policy),
-            compiled_routes: config
-                .compiled_routes
-                .clone()
-                .unwrap_or_else(|| Arc::new(config.routes.compile_with_config(&config))),
-            compat_profile: state.compat_profile,
-            model_resolution_mode: state.model_resolution_mode,
-            model_mapping: ModelMappingConfig::clone(&state.model_mapping).normalized(),
-            payload_guard_enabled: state.payload_guard_enabled,
-            payload_guard_mode: state.payload_guard_mode,
-            payload_guard_max_bytes: state.payload_guard_max_bytes,
-            payload_guard_safety_margin_bytes: state.payload_guard_safety_margin_bytes,
-            payload_guard_trim_history: state.payload_guard_trim_history,
-            payload_guard_external_enabled: state.payload_guard_external_enabled,
-            stream_pre_output_hold_secs: 15,
-            inference_upstream_max_attempts:
-                super::inference_attempt_budget::DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
-            image_processing: state.image_processing.normalized(),
-            prompt_injection: PromptInjectionConfig::clone(&state.prompt_injection).normalized(),
-            route_features: RouteFeaturesConfig::clone(&state.route_features).normalized(),
-            missing_max_tokens: state.missing_max_tokens.normalized(),
-            local_request_compat: crate::model::config::LocalRequestCompatConfig::default(),
-            payload_shaping: state.payload_shaping,
-            accounts: {
-                let mut accounts = AccountsConfig::clone(&state.accounts);
-                accounts.routes = config.routes.clone();
-                accounts
-            },
-        }
-    }
-
-    fn from_config_with_fallback(config: &Config, fallback: Self) -> Self {
         Self::from_config_with_defaults(
-            config,
-            fallback.prompt_cache_simulation_mode,
-            fallback.prompt_cache_target_read_ratio,
-            fallback.prompt_cache_token_scale,
+            &state.runtime.snapshot(),
+            state.prompt_cache_simulation_mode,
+            0.0,
+            1.0,
         )
     }
 
@@ -413,8 +369,6 @@ fn request_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
         runtime: Arc::as_ptr(&state.runtime) as usize,
         generation,
         prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
-        prompt_cache_target_read_ratio_bits: state.prompt_cache_target_read_ratio.to_bits(),
-        prompt_cache_token_scale_bits: state.prompt_cache_token_scale.to_bits(),
     };
     {
         let cache = REQUEST_RUNTIME_CONFIG_CACHE.lock();
@@ -422,9 +376,11 @@ fn request_runtime_config(state: &AppState) -> Arc<RequestRuntimeConfig> {
             return cached.clone();
         }
     }
-    let built = Arc::new(RequestRuntimeConfig::from_config_with_fallback(
+    let built = Arc::new(RequestRuntimeConfig::from_config_with_defaults(
         &config,
-        RequestRuntimeConfig::from_app_state(state),
+        state.prompt_cache_simulation_mode,
+        0.0,
+        1.0,
     ));
     let mut cache = REQUEST_RUNTIME_CONFIG_CACHE.lock();
     // Entries of older generations are never asked for again.
@@ -832,8 +788,6 @@ struct RequestRuntimeConfigCacheKey {
     runtime: usize,
     generation: u64,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
-    prompt_cache_target_read_ratio_bits: u64,
-    prompt_cache_token_scale_bits: u64,
 }
 
 type RequestRuntimeConfigCacheEntry = (RequestRuntimeConfigCacheKey, Arc<RequestRuntimeConfig>);

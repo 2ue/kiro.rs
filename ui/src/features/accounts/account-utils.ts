@@ -155,7 +155,7 @@ export type AccountFormDraft = {
   notes: string
 }
 
-export const defaultPoolForm = (): AccountFormDraft => ({
+export const defaultAccountForm = (): AccountFormDraft => ({
  tagsText: '', proxyUrl: '', costMultiplier: 1, overrides: {},
   name: '',
   baseUrl: '',
@@ -183,32 +183,32 @@ export const defaultPoolForm = (): AccountFormDraft => ({
   notes: '',
 })
 
-export const poolFormFromPool = (pool: Account): AccountFormDraft => ({
- tagsText: (pool.tags??[]).join(', '), proxyUrl: pool.proxyUrl??'', costMultiplier: pool.costMultiplier??1, overrides: {...pool.overrides},
-  name: pool.name,
-  baseUrl: pool.baseUrl,
+export const accountFormFromAccount = (account: Account): AccountFormDraft => ({
+ tagsText: (account.tags??[]).join(', '), proxyUrl: account.proxyUrl??'', costMultiplier: account.costMultiplier??1, overrides: {...account.overrides},
+  name: account.name,
+  baseUrl: account.baseUrl,
   apiKey: '',
-  authType: pool.authType,
-  headerProfile: pool.headerProfile || 'generic',
-  appendBetaQuery: Boolean(pool.appendBetaQuery),
-  headerOverridesText: joinHeaderOverrides(pool.headerOverrides || {}),
-  wireProfile: pool.wireProfile || 'default',
-  tlsProfile: pool.tlsProfile || 'default',
-  enabled: pool.enabled,
-  priority: pool.priority,
-  maxConcurrentRequests: pool.maxConcurrentRequests,
-  usageProjectionMode: pool.usageProjectionMode,
-  streamResponseMode: pool.streamResponseMode || 'inherit',
-  preOutputStreamRetryMode: pool.preOutputStreamRetryMode || 'inherit',
-  autoDisablePolicy: pool.autoDisablePolicy,
-  normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
-  supportedModelsText: joinRules(pool.supportedModels || []),
-  routeMode: pool.routeMode || 'allow_all',
-  routeRules: [...(pool.routeRules || [])],
-  modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
-  modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),
-  modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
-  notes: pool.notes || '',
+  authType: account.authType,
+  headerProfile: account.headerProfile || 'generic',
+  appendBetaQuery: Boolean(account.appendBetaQuery),
+  headerOverridesText: joinHeaderOverrides(account.headerOverrides || {}),
+  wireProfile: account.wireProfile || 'default',
+  tlsProfile: account.tlsProfile || 'default',
+  enabled: account.enabled,
+  priority: account.priority,
+  maxConcurrentRequests: account.maxConcurrentRequests,
+  usageProjectionMode: account.usageProjectionMode,
+  streamResponseMode: account.streamResponseMode || 'inherit',
+  preOutputStreamRetryMode: account.preOutputStreamRetryMode || 'inherit',
+  autoDisablePolicy: account.autoDisablePolicy,
+  normalizeModelVersionDots: Boolean(account.normalizeModelVersionDots),
+  supportedModelsText: joinRules(account.supportedModels || []),
+  routeMode: account.routeMode || 'allow_all',
+  routeRules: [...(account.routeRules || [])],
+  modelMappingMode: account.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
+  modelMappingRequireMatch: Boolean(account.modelMappingRequireMatch),
+  modelMappingRulesText: joinModelMappingRules(account.modelMappingRules || []),
+  notes: account.notes || '',
 })
 
 export function modelMappingPresetsForMode(mode: AccountFormDraft['modelMappingMode']): AccountModelMappingPreset[] {
@@ -251,15 +251,15 @@ export function modelMappingDescription(mode: Account['modelMappingMode'] | unde
   return `先使用本系统解析后的模型匹配规则；${processedFallback}`
 }
 
-export function poolModelMappingSummary(pool: Account): string {
-  if (pool.modelMappingMode === 'passthrough') return '原样'
-  const count = pool.modelMappingRules?.length || 0
-  const mode = pool.modelMappingMode === 'passthrough_mapping'
+export function accountModelMappingSummary(account: Account): string {
+  if (account.modelMappingMode === 'passthrough') return '原样'
+  const count = account.modelMappingRules?.length || 0
+  const mode = account.modelMappingMode === 'passthrough_mapping'
     ? '原样+映射'
-    : pool.modelMappingMode === 'direct_mapping'
+    : account.modelMappingMode === 'direct_mapping'
       ? '映射+内部'
       : '内部+映射'
-  const fallback = pool.modelMappingRequireMatch ? '必须命中' : pool.normalizeModelVersionDots ? '未命中4.8->4-8' : '允许未命中'
+  const fallback = account.modelMappingRequireMatch ? '必须命中' : account.normalizeModelVersionDots ? '未命中4.8->4-8' : '允许未命中'
   return `${mode}${count ? ` ${count}条` : ''} · ${fallback}`
 }
 
@@ -273,9 +273,9 @@ export function headerProfileDescription(profile: Account['headerProfile'] | und
   return '保持旧版泛用转发策略，仅过滤认证、连接、cookie、x-goog-api-key 等敏感请求头；是否追加 beta=true 由下方开关控制。'
 }
 
-export function poolHeaderProfileSummary(pool: Account): string {
-  const profile = pool.headerProfile || 'generic'
-  const overrides = Object.keys(pool.headerOverrides || {}).length
+export function accountHeaderProfileSummary(account: Account): string {
+  const profile = account.headerProfile || 'generic'
+  const overrides = Object.keys(account.headerOverrides || {}).length
   const parts = [
     profile === 'claude_code_mimic'
       ? 'Header：Claude Code'
@@ -283,10 +283,10 @@ export function poolHeaderProfileSummary(pool: Account): string {
         ? 'Header：Anthropic'
         : 'Header：默认',
   ]
-  if (pool.appendBetaQuery || profile !== 'generic') parts.push('beta=true')
+  if (account.appendBetaQuery || profile !== 'generic') parts.push('beta=true')
   if (overrides > 0) parts.push(`${overrides} 个覆盖`)
-  if (pool.wireProfile === 'http1_title_case') parts.push('HTTP/1')
-  if (pool.tlsProfile === 'native_tls') parts.push('Native TLS')
+  if (account.wireProfile === 'http1_title_case') parts.push('HTTP/1')
+  if (account.tlsProfile === 'native_tls') parts.push('Native TLS')
   return parts.join(' · ')
 }
 
@@ -304,17 +304,17 @@ export function tlsProfileDescription(profile: Account['tlsProfile'] | undefined
   return '使用默认 TLS 栈。当前项目默认仍是常规 reqwest/rustls/native 配置，不伪造 Node.js ClientHello。'
 }
 
-export function poolSupportedModelsSummary(pool: Account): string {
-  const models = pool.supportedModels || []
+export function accountSupportedModelsSummary(account: Account): string {
+  const models = account.supportedModels || []
   if (models.length === 0) return '支持：不限制'
   if (models.length <= 2) return `支持：${models.join(', ')}`
   return `支持：${models[0]}, ${models[1]} 等 ${models.length} 个`
 }
 
-export function poolRouteSummary(pool: Account): string {
-  const rules = pool.routeRules || []
-  if (!pool.routeMode || pool.routeMode === 'allow_all') return '入口：不限制'
-  if (pool.routeMode === 'allow_list') {
+export function accountRouteSummary(account: Account): string {
+  const rules = account.routeRules || []
+  if (!account.routeMode || account.routeMode === 'allow_all') return '入口：不限制'
+  if (account.routeMode === 'allow_list') {
     if (rules.length === 0) return '入口：不允许'
     return rules.length <= 2
       ? `入口：仅 ${rules.join(', ')}`
@@ -353,8 +353,8 @@ export function streamRetryDescription(mode: AccountStreamRetryDraft): string {
   return '当前外部账号继承全局“流式首输出前错误换池”开关。'
 }
 
-export function streamRetrySummary(pool: Account, config: AccountsConfig): string {
-  const mode = pool.preOutputStreamRetryMode || 'inherit'
+export function streamRetrySummary(account: Account, config: AccountsConfig): string {
+  const mode = account.preOutputStreamRetryMode || 'inherit'
   if (mode === 'enabled') return '首输出恢复：启用'
   if (mode === 'disabled') return '首输出恢复：禁用'
   if (mode === 'early_commit') return '首输出恢复：先提交首包'
@@ -363,16 +363,16 @@ export function streamRetrySummary(pool: Account, config: AccountsConfig): strin
     : '首输出恢复：继承禁用'
 }
 
-export function poolUsageSummary(pool: Account, config: AccountsConfig): string {
-  const parts = pool.usageProjectionMode === 'current_path_policy'
+export function accountUsageSummary(account: Account, config: AccountsConfig): string {
+  const parts = account.usageProjectionMode === 'current_path_policy'
     ? ['Usage：按路径整理']
     : ['Usage：透传上游']
-  const streamMode = pool.streamResponseMode || config.streamResponseMode
+  const streamMode = account.streamResponseMode || config.streamResponseMode
   parts.push(streamMode === 'event_passthrough' ? '流式：事件透传' : '流式：继承默认')
-  if (pool.streamResponseMode) {
+  if (account.streamResponseMode) {
     parts.push('单池覆盖')
   }
-  if (pool.usageProjectionMode !== 'current_path_policy') {
+  if (account.usageProjectionMode !== 'current_path_policy') {
     return parts.join(' · ')
   }
   if (config.usageProjectionUpliftPercent > 0) {

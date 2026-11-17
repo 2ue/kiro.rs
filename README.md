@@ -28,7 +28,11 @@ pnpm --dir ui build
 cargo build --release --locked --bin claude-pool
 ```
 
-默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。
+默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。发布前核对 CLI 版本，预期输出 `claude-pool 1.0.0`：
+
+```bash
+cargo run --release --locked --bin claude-pool -- --version
+```
 
 ### 准备数据库与最小配置
 
@@ -122,13 +126,35 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.0 \
 
 ## 核心概念
 
-| 概念 | 含义与生效规则 |
-|---|---|
-| 账号 | 一个 `baseUrl + apiKey` 上游接入点；保存优先级、并发、支持模型和路由规则。`overrides` 中设置的超时与 usage 放大参数覆盖全局账号默认值；未设置时继承。 |
-| 路由 | 一个入口前缀与其完整行为配置，如 `/cc` 或 `/dfcache/team`。按最长前缀匹配；路由 `accountRule` 和账号 `routeRules` 都允许，账号才进入候选。 |
-| 策略 | 路由的 `cachePolicy` 和 `reportedUsage`，决定返回用量的模拟、字段整形、频次、TTL 与上下限。账号 `usageProjectionMode=pass_through` 可跳过整形。 |
-| 路由功能 | `features` 中显式启用的请求处理，包括补 `max_tokens`、reasoning 兼容、thinking 名称/触发、历史清洗、payload 和图片处理。默认关闭；全局默认可被路由覆盖。 |
-| 下游密钥 | 调用者使用的 key，与上游账号密钥分离。只控制鉴权、准入、额度和 `allowedRoutes`，不决定 usage 策略；限制逐层收紧。 |
+### 账号
+
+一个 `baseUrl + apiKey` 上游接入点，账号记录保存在 PostgreSQL。
+账号保存优先级、并发上限、支持模型和允许路由。
+`overrides` 中的超时与 usage 放大参数覆盖全局账号默认值，未设置的字段继承全局。
+
+### 路由
+
+一个入口前缀与其完整行为配置，例如 `/cc` 或 `/dfcache/team`。
+请求按最长前缀匹配，未知自定义前缀返回 404。
+路由 `accountRule` 和账号 `routeRules` 都放行，账号才进入候选；模型限制同时生效。
+
+### 策略
+
+路由的 `cachePolicy` 和 `reportedUsage` 决定用量模拟、字段整形、写入频次、TTL 与上下限。
+全局保存六种策略模板，路由选择模板并设置参数。
+账号 `usageProjectionMode=pass_through` 可跳过整形；需要严格上下限时使用 `bounded_high_cache`。
+
+### 路由功能
+
+`features` 控制补 `max_tokens`、reasoning 兼容、thinking 名称/触发、历史清洗、payload 和图片处理。
+这些请求处理默认关闭，按需在全局默认值或单条路由中显式开启。
+全局默认位于 `routeFeatures.defaults`，路由通过 `routes[].features` 覆盖对应字段。
+
+### 下游密钥
+
+调用者使用的 key 与上游账号密钥分开管理。
+密钥只控制鉴权、准入、额度和 `allowedRoutes`，限制逐层收紧。
+密钥不携带 usage 策略或请求改写配置；这些行为由命中的路由决定。
 
 完整字段与配置合并规则见 [03 领域模型与配置分层](docs/claude-pool-refactor/03-领域模型与配置分层.md)。
 
@@ -162,7 +188,7 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.0 \
 | `promptCacheMaxSimulatedInputTokens`、`promptCacheScaleMinInputTokens` | `300000`、`20000` | 模拟上限与倍率生效门槛 |
 | `promptCacheCapJitterMinTokens`、`promptCacheCapJitterMaxTokens` | `12000`、`24000` | 模拟上限的确定性浮动 |
 | `promptCacheCreationControl` | 默认频次配置 | 写入频率、增量、窗口预算等 |
-| `promptCacheMaxEntriesPerAccount`、`promptCacheMaxEntriesGlobal` | `200`、`20000` | 前缀追踪条目上限 |
+| `promptCacheMaxEntriesPerAccount`、`promptCacheMaxEntriesGlobal` | `200`、`20000` | 单会话 scope 与全局的前缀追踪条目上限；scope 由会话和路由命名空间组成，换号继续共享 |
 | `promptCacheEntryTtlSecs`、`promptCacheEstimatedBytesLimit` | `86400`、`268435456` | 追踪条目 TTL 与估算内存限制 |
 | `cachePolicy`、`reportedUsage` | 默认模板 | 全局六种策略模板和字段整形默认值；路由负责挂载 |
 | `routes` | 示例四条内置路由 | 路由前缀、策略、功能、注入、账号和模型规则 |
@@ -295,7 +321,9 @@ cargo run --release --locked --bin claude-pool -- -c config.json import-legacy l
 cargo run --release --locked --bin claude-pool -- -c config.json import-legacy legacy.json --apply
 ```
 
-导出以只读快照读取旧库，文件只允许当前用户读写且不覆盖已有文件。`--redact-secrets` 生成的脱敏包只用于检查，不能 apply。正式导入需要新库和 Redis；目标实例应使用独立数据库与 Redis 前缀。导入保留目标机器的存储与监听配置，保留旧账号 `usageProjectionMode`，按报告审查容量、注入、原字节透传及新默认值变化。新系统之间迁移使用管理 API 配置包接口。
+导出以只读快照读取旧库，文件只允许当前用户读写且不覆盖已有文件。`--redact-secrets` 生成的脱敏包只用于检查，不能 apply。正式导入需要新库和 Redis；目标实例应使用独立数据库与 Redis 前缀。`--apply` 会全量覆盖目标配置，执行前备份目标数据库，并按 dry-run 报告核对覆盖范围。
+
+导入保留目标机器的存储与监听配置，保留旧账号 `usageProjectionMode`，按报告审查容量、注入、原字节透传及新默认值变化。新系统之间迁移使用管理 API 配置包接口。
 
 ## 测试
 

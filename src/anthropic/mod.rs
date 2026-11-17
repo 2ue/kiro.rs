@@ -64,4 +64,4 @@ pub(crate) mod usage;
 pub(crate) use handlers::{
     PromptInjectionPreviewRequest, PromptInjectionPreviewResponse, preview_prompt_injection,
 };
-pub use router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router};
+pub use router::{AnthropicRouterDependencies, create_router};

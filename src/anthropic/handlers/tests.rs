@@ -6,7 +6,7 @@ use crate::anthropic::pricing::PricingCatalog;
 use crate::anthropic::prompt_cache::PromptCacheTracker;
 use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
 use crate::anthropic::request_admission::RequestAdmissionController;
-use crate::anthropic::router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router};
+use crate::anthropic::router::{AnthropicRouterDependencies, create_router};
 use crate::anthropic::types::{Message, OutputConfig};
 use crate::anthropic::usage::{
     UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecorder, UsageRouteKind,
@@ -53,17 +53,13 @@ fn defined_cache_route_requires_explicit_configuration() {
         Arc::new(PromptCacheTracker::default()),
         Arc::new(PromptCacheCreationController::default()),
         PromptCacheSimulationMode::HighCache,
-        0.98,
-        CompatProfile::ClaudeCode,
-    )
-    .with_routes({
-        let mut routes = crate::model::routes::RoutesConfig::default();
-        routes.route_mut("/dfcache/cc").cache_policy = CacheRoutePolicyPatch {
+    );
+    state.runtime.install_local(|config| {
+        config.routes.route_mut("/dfcache/cc").cache_policy = CacheRoutePolicyPatch {
             cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
             route_namespace: Some(true),
             ..Default::default()
         };
-        routes
     });
 
     assert_eq!(
@@ -72,6 +68,46 @@ fn defined_cache_route_requires_explicit_configuration() {
     );
     assert!(resolve_defined_cache_route(&state, "aa").is_err());
     assert!(resolve_defined_cache_route(&state, "aa/b").is_err());
+}
+
+#[test]
+fn admin_route_update_is_visible_to_request_path_config_snapshot() {
+    let state = AppState::new(
+        Arc::new(RequestApiKeyStore::new(["test-key"])),
+        Arc::new(UsageRecorder::new(10)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+    );
+    let previous = request_runtime_config(&state);
+    state
+        .runtime
+        .update(|config| {
+            config.prompt_cache_target_read_ratio = 0.75;
+            config.prompt_cache_token_scale = 2.0;
+            config.accounts.request_timeout_secs = 42;
+            config.routes.route_mut("/cc").cache_policy.cache_type =
+                Some(PromptCacheStrategyType::NoCache);
+        })
+        .unwrap();
+
+    let current = request_runtime_config(&state);
+    assert!(!Arc::ptr_eq(&previous, &current));
+    for runtime_config in [
+        current,
+        Arc::new(RequestRuntimeConfig::from_app_state(&state)),
+    ] {
+        assert_eq!(runtime_config.prompt_cache_target_read_ratio, 0.75);
+        assert_eq!(runtime_config.prompt_cache_token_scale, 2.0);
+        assert_eq!(runtime_config.accounts.request_timeout_secs, 42);
+        assert_eq!(
+            runtime_config
+                .cache_policy_for_path("/cc/v1/messages")
+                .policy
+                .cache_type,
+            PromptCacheStrategyType::NoCache
+        );
+    }
 }
 
 #[test]
@@ -200,10 +236,8 @@ fn raw_external_route_request_applies_non_stream_skip_cache_route() {
         Arc::new(PromptCacheTracker::default()),
         Arc::new(PromptCacheCreationController::default()),
         PromptCacheSimulationMode::HighCache,
-        0.98,
-        CompatProfile::ClaudeCode,
-    )
-    .with_routes(routes);
+    );
+    state.runtime.install_local(|config| config.routes = routes);
     let runtime_config = RequestRuntimeConfig::from_app_state(&state);
     let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
     assert_eq!(
@@ -287,8 +321,6 @@ fn raw_external_route_request_is_preparse_raw_only() {
         Arc::new(PromptCacheTracker::default()),
         Arc::new(PromptCacheCreationController::default()),
         PromptCacheSimulationMode::HighCache,
-        0.98,
-        CompatProfile::ClaudeCode,
     );
     let runtime_config = RequestRuntimeConfig::from_app_state(&state);
     let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
@@ -805,8 +837,6 @@ async fn messages_without_external_manager_return_529() {
             Arc::new(PromptCacheTracker::default()),
             Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::Disabled,
-            0.98,
-            CompatProfile::ClaudeCode,
         );
         let raw = Bytes::from_static(br#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#);
         let probe = Arc::new(probe_raw_messages_body(&raw));
@@ -846,8 +876,6 @@ async fn count_tokens_keeps_local_estimation_available_without_an_external_manag
         Arc::new(PromptCacheTracker::default()),
         Arc::new(PromptCacheCreationController::default()),
         PromptCacheSimulationMode::Disabled,
-        0.98,
-        CompatProfile::ClaudeCode,
     );
     let payload = CountTokensRequest {
         model: "claude-sonnet-4-6".to_string(),
@@ -1819,8 +1847,6 @@ fn runtime_config_for_payload_guard(
         Arc::new(PromptCacheTracker::default()),
         Arc::new(PromptCacheCreationController::default()),
         PromptCacheSimulationMode::HighCache,
-        0.98,
-        CompatProfile::ClaudeCode,
     );
     let mut runtime_config = RequestRuntimeConfig::from_app_state(&state);
     runtime_config.payload_guard_enabled = enabled;
@@ -1919,21 +1945,19 @@ fn handler_test_router(
     manager: Option<Arc<AccountManager>>,
 ) -> (Router, Arc<UsageRecorder>) {
     let usage_recorder = Arc::new(UsageRecorder::new(1_000));
-    let router = create_router(
-        AnthropicRouterDependencies {
-            request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
-            request_admission: Arc::new(RequestAdmissionController::new(
-                RequestAdmissionConfig::disabled(),
-            )),
-            usage_recorder: usage_recorder.clone(),
-            prompt_cache: Arc::new(PromptCacheTracker::default()),
-            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
-            pricing_catalog: Arc::new(PricingCatalog::new()),
-            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            account_manager: manager,
-        },
-        AnthropicRouterConfig::from_runtime_config(&config),
-    );
+    let router = create_router(AnthropicRouterDependencies {
+        runtime: crate::model::runtime::RuntimeConfigStore::new(config, None),
+        request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
+        request_admission: Arc::new(RequestAdmissionController::new(
+            RequestAdmissionConfig::disabled(),
+        )),
+        usage_recorder: usage_recorder.clone(),
+        prompt_cache: Arc::new(PromptCacheTracker::default()),
+        prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+        account_manager: manager,
+    });
     (router, usage_recorder)
 }
 

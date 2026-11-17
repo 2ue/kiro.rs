@@ -22,12 +22,12 @@ import {
 } from '@/components/ui'
 
 export function AccountTestModal({
-  pool,
+  account,
   open,
   onClose,
   onDone,
 }: {
-  pool: Account | null
+  account: Account | null
   open: boolean
   onClose: () => void
   onDone: () => void
@@ -41,8 +41,8 @@ export function AccountTestModal({
   const userSelectedModelRef = useRef(false)
 
   const modelOptions = useMemo(() => {
-    return buildAccountTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels)
-  }, [modelCapabilities.data?.models, pool?.supportedModels])
+    return buildAccountTestModelOptions(modelCapabilities.data?.models, account?.supportedModels)
+  }, [modelCapabilities.data?.models, account?.supportedModels])
   const defaultModel = defaultAccountTestModelForOptions(modelOptions)
 
   const selectedModelLabel = useMemo(
@@ -58,7 +58,7 @@ export function AccountTestModal({
     setError('')
     setRunning(false)
     userSelectedModelRef.current = false
-  }, [open, pool?.id])
+  }, [open, account?.id])
 
   useEffect(() => {
     if (!open || userSelectedModelRef.current) return
@@ -71,13 +71,13 @@ export function AccountTestModal({
   }
 
   const run = async () => {
-    if (!pool) return
+    if (!account) return
     const trimmedModel = model.trim()
     const trimmedPrompt = prompt.trim() || DEFAULT_TEST_PROMPT
     if (!trimmedModel) { toast.error('请选择或输入测试模型'); return }
     setRunning(true); setResult(null); setError('')
     try {
-      const response = await testAccount(pool.id, { model: trimmedModel, prompt: trimmedPrompt })
+      const response = await testAccount(account.id, { model: trimmedModel, prompt: trimmedPrompt })
       setResult(response)
       if (response.ok) toast.success(response.message || '外部账号模型调用测试通过')
       else toast.error(response.message || '外部账号模型调用测试失败')
@@ -98,22 +98,22 @@ export function AccountTestModal({
       footer={
         <>
           <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={running}>关闭</Button>
-          <Button type="button" size="sm" onClick={run} disabled={!pool || running}>
+          <Button type="button" size="sm" onClick={run} disabled={!account || running}>
             {running ? <Loader2 className="h-4 w-4 animate-spin" /> : result || error ? <RotateCw className="h-4 w-4" /> : <Play className="h-4 w-4" />}
             {result || error ? '重试' : '开始测试'}
           </Button>
         </>
       }
     >
-      {pool && (
+      {account && (
         <div className="space-y-4">
           <div className="rounded-lg bg-surface-subtle p-3">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-semibold">#{pool.id} {pool.name}</span>
-              <Badge tone="neutral">{pool.authType}</Badge>
-              <Badge tone={pool.enabled ? 'success' : 'error'}>{pool.enabled ? '启用' : '已禁用'}</Badge>
+              <span className="font-semibold">#{account.id} {account.name}</span>
+              <Badge tone="neutral">{account.authType}</Badge>
+              <Badge tone={account.enabled ? 'success' : 'error'}>{account.enabled ? '启用' : '已禁用'}</Badge>
             </div>
-            <div className="mt-1 break-all text-xs text-muted-foreground">{pool.baseUrl}</div>
+            <div className="mt-1 break-all text-xs text-muted-foreground">{account.baseUrl}</div>
           </div>
 
           <div className="grid gap-3 sm:grid-cols-[1fr_200px]">
@@ -136,7 +136,7 @@ export function AccountTestModal({
 
           <div className="rounded-lg bg-surface-subtle p-4 font-mono text-xs">
             <div className="space-y-1 text-muted-foreground">
-              <div><span className="text-info">外部账号：</span> #{pool.id} {pool.name}</div>
+              <div><span className="text-info">外部账号：</span> #{account.id} {account.name}</div>
               <div><span className="text-info">使用模型：</span> {model}</div>
               <div><span className="text-muted-foreground">发送消息：</span> "{prompt.trim() || DEFAULT_TEST_PROMPT}"</div>
             </div>

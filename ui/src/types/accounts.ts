@@ -217,11 +217,11 @@ export interface Account {
 }
 
 export interface AccountsListResponse {
-  pools: Account[];
+  accounts: Account[];
 }
 
 export interface AccountStatus {
-  pool: Account;
+  account: Account;
   inFlight: number;
   cooldownRemainingSecs: number;
   cooldownReason?: string;
@@ -245,7 +245,7 @@ export interface AccountQualityView {
 }
 
 export interface AccountsStatusResponse {
-  pools: AccountStatus[];
+  accounts: AccountStatus[];
 }
 
 export interface CreateAccountRequest {

@@ -6733,7 +6733,7 @@ async fn account_one_malformed_runtime_isolated_from_fifty_nine_healthy_for_five
             assert_eq!(statuses.len(), 60, "{malformed_kind} round {round}");
             let malformed = statuses
                 .iter()
-                .find(|status| status.pool.id == malformed_pool_id)
+                .find(|status| status.account.id == malformed_pool_id)
                 .expect("malformed pool status must be returned");
             assert!(!malformed.dispatchable, "{malformed_kind} round {round}");
             assert_eq!(
@@ -20102,7 +20102,7 @@ async fn account_transient_failure_penalty_moves_sustained_traffic_to_healthy_ba
     let statuses = manager.status(&config).await.expect("read account status");
     let primary_status = statuses
         .iter()
-        .find(|status| status.pool.id == primary.id)
+        .find(|status| status.account.id == primary.id)
         .expect("primary status");
     assert_eq!(primary_status.transient_failure_streak, 1);
     assert!(

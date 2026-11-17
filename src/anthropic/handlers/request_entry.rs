@@ -817,8 +817,6 @@ mod tests {
             Arc::new(PromptCacheTracker::default()),
             Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::HighCache,
-            0.98,
-            CompatProfile::ClaudeCode,
         )
     }
 

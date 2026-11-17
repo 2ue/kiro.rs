@@ -490,7 +490,7 @@ pub async fn delete_request_api_key(
 
 pub async fn get_accounts(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.list_accounts() {
-        Ok(pools) => Json(serde_json::json!({ "pools": pools })).into_response(),
+        Ok(accounts) => Json(serde_json::json!({ "accounts": accounts })).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }

@@ -15,8 +15,6 @@ fn state() -> AppState {
         Arc::new(PromptCacheTracker::default()),
         Arc::new(PromptCacheCreationController::default()),
         PromptCacheSimulationMode::Disabled,
-        0.0,
-        CompatProfile::ClaudeCode,
     )
 }
 

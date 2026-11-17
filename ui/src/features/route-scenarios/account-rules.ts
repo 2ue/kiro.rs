@@ -4,15 +4,15 @@ import type { AccountRoutePolicy,RoutePolicy,RouteScenarioAccountOption } from '
 
 export function policySummary(policy: RoutePolicy): string {
   if (policy.routeMode === 'allow_all') return '不限制'
-  if (!policy.routeRules.length) return policy.routeMode === 'allow_list' ? '不允许任何路由' : '不限制'
-  const routes = policy.routeRules.join('、')
+  if (!(policy.routeRules ?? []).length) return policy.routeMode === 'allow_list' ? '不允许任何路由' : '不限制'
+  const routes = (policy.routeRules ?? []).join('、')
   return policy.routeMode === 'allow_list' ? `仅允许 ${routes}` : `禁止 ${routes}`
 }
 
 /** Identity of a rule regardless of route order or case, so equal rules land in one group. */
 export function policyKey(policy: RoutePolicy): string {
   if (policy.routeMode === 'allow_all') return 'allow_all'
-  const routes = Array.from(new Set(policy.routeRules.map((route) => route.trim().toLowerCase()))).sort()
+  const routes = Array.from(new Set((policy.routeRules ?? []).map((route) => route.trim().toLowerCase()))).sort()
   return `${policy.routeMode}:${routes.join('\n')}`
 }
 

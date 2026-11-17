@@ -112,7 +112,7 @@ export function RouteEditPage() {
     );
   const set = <K extends keyof RouteConfig>(key: K, value: RouteConfig[K]) =>
     setDraft({ ...draft, [key]: value });
-  const availableAccounts = (accounts.data?.pools ?? []).filter(
+  const availableAccounts = (accounts.data?.accounts ?? []).filter(
     (a) =>
       a.enabled &&
       !a.autoDisabled &&
@@ -232,7 +232,7 @@ export function RouteEditPage() {
           />
           {draft.accountRule.mode !== "allow_all" && (
             <div className="grid gap-3 md:grid-cols-2">
-              {(accounts.data?.pools ?? []).map((a) => (
+              {(accounts.data?.accounts ?? []).map((a) => (
                 <label
                   className="flex items-center gap-3 rounded-lg border p-3"
                   key={a.id}

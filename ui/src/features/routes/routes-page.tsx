@@ -197,7 +197,7 @@ export function RoutesPage() {
                 <TableCell>
                   {r.accountRule.mode === "allow_all"
                     ? "全部"
-                    : (accounts.data?.pools ?? []).filter((a) =>
+                    : (accounts.data?.accounts ?? []).filter((a) =>
                         r.accountRule.mode === "allow_list"
                           ? r.accountRule.rules.includes("*") ||
                             r.accountRule.rules.includes(String(a.id))

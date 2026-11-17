@@ -587,7 +587,7 @@ pub struct Account {
     pub header_profile: AccountHeaderProfile,
     #[serde(default)]
     pub append_beta_query: bool,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
     pub header_overrides: HashMap<String, String>,
     #[serde(default)]
     pub wire_profile: AccountWireProfile,
@@ -619,11 +619,11 @@ pub struct Account {
     pub model_mapping_require_match: bool,
     #[serde(default)]
     pub model_mapping_rules: Vec<ModelMappingRule>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub supported_models: Vec<String>,
     #[serde(default)]
     pub route_mode: RouteRuleMode,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub route_rules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
@@ -834,7 +834,7 @@ pub struct SetAccountEnabledRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {
-    pub pool: Account,
+    pub account: Account,
     pub in_flight: u32,
     pub cooldown_remaining_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -899,7 +899,7 @@ impl AccountQualityView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountsStatusResponse {
-    pub pools: Vec<AccountStatus>,
+    pub accounts: Vec<AccountStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2158,7 +2158,7 @@ fn account_usage_debug_route_context(
 
 
         "requestInputTokens": route.request_input_tokens,
-        "pool": {
+        "account": {
             "id": pool.id,
             "name": pool.name.as_str(),
             "usageProjectionMode": pool.usage_projection_mode.as_str(),
@@ -2258,7 +2258,7 @@ fn account_wire_debug_route_context(
 
 
         "requestInputTokens": route.request_input_tokens,
-        "pool": {
+        "account": {
             "id": pool.id,
             "name": pool.name.as_str(),
             "usageProjectionMode": pool.usage_projection_mode.as_str(),
@@ -5749,7 +5749,7 @@ impl AccountManager {
         for (pool, runtime) in pools.into_iter().zip(runtimes) {
             let Ok(runtime) = runtime else {
                 statuses.push(AccountStatus {
-                    pool,
+                    account: pool,
                     in_flight: 0,
                     cooldown_remaining_secs: 0,
                     cooldown_reason: None,
@@ -5786,7 +5786,7 @@ impl AccountManager {
                 .map(|quality| AccountQualityView::from_state(quality, config, account_now_ms()));
             statuses.push(AccountStatus {
                 dispatchable: skipped_reason.is_none(),
-                pool,
+                account: pool,
                 in_flight,
                 cooldown_remaining_secs,
                 cooldown_reason,

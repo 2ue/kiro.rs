@@ -50,11 +50,11 @@ import { toast } from "sonner";
 import { AccountFormModal } from "./account-form-modal";
 import { AccountTestModal } from "./account-test-modal";
 import {
-  defaultPoolForm,
+  defaultAccountForm,
   parseHeaderOverridesText,
   parseModelMappingRules,
   parseSupportedModelsText,
-  poolFormFromPool,
+  accountFormFromAccount,
   type AccountFormDraft,
 } from "./account-utils";
 export function AccountsPage() {
@@ -87,7 +87,7 @@ export function AccountsPage() {
   });
   if (query.isLoading) return <LoadingState />;
   if (query.error) return <ErrorState title="读取账号失败" />;
-  const accounts = query.data?.pools ?? [],
+  const accounts = query.data?.accounts ?? [],
     tags = [...new Set(accounts.flatMap((a) => a.tags ?? []))].sort(),
     visible = accounts.filter(
       (a) =>
@@ -140,7 +140,7 @@ export function AccountsPage() {
         actions={
           <Button
             onClick={() =>
-              setEditor({ account: null, draft: defaultPoolForm() })
+              setEditor({ account: null, draft: defaultAccountForm() })
             }
           >
             <Plus />
@@ -191,8 +191,8 @@ export function AccountsPage() {
           </TableHeader>
           <TableBody>
             {visible.map((a) => {
-              const status = statuses.data?.pools.find(
-                (s) => s.pool.id === a.id,
+              const status = statuses.data?.accounts.find(
+                (s) => s.account.id === a.id,
               );
               return (
                 <TableRow key={a.id}>
@@ -235,7 +235,7 @@ export function AccountsPage() {
                         variant="ghost"
                         size="sm"
                         onClick={() =>
-                          setEditor({ account: a, draft: poolFormFromPool(a) })
+                          setEditor({ account: a, draft: accountFormFromAccount(a) })
                         }
                       >
                         <Pencil />
@@ -335,7 +335,7 @@ export function AccountsPage() {
       {editor && (
         <AccountFormModal
           mode={editor.account ? "edit" : "create"}
-          pool={editor.account}
+          account={editor.account}
           open
           draft={editor.draft}
           saving={mutation.isPending}
@@ -368,7 +368,7 @@ export function AccountsPage() {
         />
       )}
       <AccountTestModal
-        pool={testing}
+        account={testing}
         open={testing !== null}
         onClose={() => setTesting(null)}
         onDone={() =>

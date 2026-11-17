@@ -13,12 +13,8 @@ use axum::{
 
 use crate::account::AccountManager;
 use crate::common::auth::RequestApiKeyStore;
-use crate::model::config::{
-    AccountsConfig, CachePolicyConfig, CompatProfile, Config, ImageProcessingConfig,
-    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-    PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
-};
+use crate::model::config::PromptCacheSimulationMode;
+use crate::model::runtime::RuntimeConfigStore;
 
 use super::{
     envelope,
@@ -30,7 +26,7 @@ use super::{
     middleware::{AppState, auth_middleware, capture_http_ingress, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
     pricing::PricingCatalog,
-    prompt_cache::{PromptCacheBounds, PromptCacheTracker},
+    prompt_cache::PromptCacheTracker,
     prompt_cache_creation_control::PromptCacheCreationController,
     request_admission::{
         RequestAdmissionController, RequestAdmissionMiddlewareState, request_admission_middleware,
@@ -40,6 +36,7 @@ use super::{
 };
 
 pub struct AnthropicRouterDependencies {
+    pub runtime: Arc<RuntimeConfigStore>,
     pub request_api_keys: Arc<RequestApiKeyStore>,
     pub request_admission: Arc<RequestAdmissionController>,
     pub usage_recorder: Arc<UsageRecorder>,
@@ -48,117 +45,6 @@ pub struct AnthropicRouterDependencies {
     pub pricing_catalog: Arc<PricingCatalog>,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub account_manager: Option<Arc<AccountManager>>,
-}
-
-pub struct AnthropicRouterConfig {
-    prompt_cache_target_read_ratio: f64,
-    prompt_cache_token_scale: f64,
-    prompt_cache_max_simulated_input_tokens: i32,
-    prompt_cache_cap_jitter_min_tokens: i32,
-    prompt_cache_cap_jitter_max_tokens: i32,
-    prompt_cache_scale_min_input_tokens: i32,
-    prompt_cache_creation_control: PromptCacheCreationControlConfig,
-    prompt_cache_bounds: PromptCacheBounds,
-    reported_usage: ReportedUsageConfig,
-    cache_policy: CachePolicyConfig,
-    routes: crate::model::routes::RoutesConfig,
-    compat_profile: CompatProfile,
-    prompt_injection: PromptInjectionConfig,
-    route_features: RouteFeaturesConfig,
-    model_resolution_mode: ModelResolutionMode,
-    model_mapping: ModelMappingConfig,
-    payload_guard_enabled: bool,
-    payload_guard_mode: PayloadGuardMode,
-    payload_guard_max_bytes: usize,
-    payload_guard_safety_margin_bytes: usize,
-    payload_guard_trim_history: bool,
-    payload_guard_external_enabled: bool,
-    image_processing: ImageProcessingConfig,
-    missing_max_tokens: MissingMaxTokensConfig,
-    payload_shaping: PayloadShapingConfig,
-    accounts: AccountsConfig,
-}
-
-impl AnthropicRouterConfig {
-    pub fn from_runtime_config(config: &Config) -> Self {
-        Self {
-            prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
-            prompt_cache_token_scale: config.prompt_cache_token_scale,
-            prompt_cache_max_simulated_input_tokens: config.prompt_cache_max_simulated_input_tokens,
-            prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens,
-            prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens,
-            prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
-            prompt_cache_creation_control: config.prompt_cache_creation_control.normalized(),
-            prompt_cache_bounds: PromptCacheBounds::from_config(
-                config.prompt_cache_max_entries_per_account,
-                config.prompt_cache_max_entries_global,
-                config.prompt_cache_entry_ttl_secs,
-                config.prompt_cache_estimated_bytes_limit,
-            ),
-            reported_usage: config.reported_usage.clone(),
-            cache_policy: config.cache_policy.clone(),
-            routes: config.routes.clone(),
-            compat_profile: config.compat_profile,
-            prompt_injection: config.prompt_injection.clone().normalized(),
-            route_features: config.route_features.clone().normalized(),
-            model_resolution_mode: config.model_resolution_mode,
-            model_mapping: config.model_mapping.clone().normalized(),
-            payload_guard_enabled: config
-                .route_features
-                .defaults
-                .payload_guard
-                .map(|guard| guard.enabled)
-                .unwrap_or(false),
-            payload_guard_mode: config
-                .route_features
-                .defaults
-                .payload_guard
-                .map(|guard| guard.mode)
-                .unwrap_or(Default::default()),
-            payload_guard_max_bytes: config
-                .route_features
-                .defaults
-                .payload_guard
-                .map(|guard| guard.max_bytes)
-                .unwrap_or(0),
-            payload_guard_safety_margin_bytes: config
-                .route_features
-                .defaults
-                .payload_guard
-                .map(|guard| guard.safety_margin_bytes)
-                .unwrap_or(0),
-            payload_guard_trim_history: config
-                .route_features
-                .defaults
-                .payload_guard
-                .map(|guard| guard.trim_history)
-                .unwrap_or(false),
-            payload_guard_external_enabled: config
-                .route_features
-                .defaults
-                .payload_guard
-                .map(|guard| guard.external_enabled)
-                .unwrap_or(false),
-            image_processing: config
-                .route_features
-                .defaults
-                .image_processing
-                .unwrap_or_default()
-                .normalized(),
-            missing_max_tokens: config
-                .route_features
-                .defaults
-                .missing_max_tokens
-                .unwrap_or_default()
-                .normalized(),
-            payload_shaping: config
-                .route_features
-                .defaults
-                .payload_shaping
-                .unwrap_or_default(),
-            accounts: config.accounts.clone(),
-        }
-    }
 }
 
 /// 创建 Anthropic API 路由
@@ -179,11 +65,9 @@ impl AnthropicRouterConfig {
 /// - `x-api-key` header
 /// - `Authorization: Bearer <token>` header
 ///
-pub fn create_router(
-    dependencies: AnthropicRouterDependencies,
-    config: AnthropicRouterConfig,
-) -> Router {
+pub fn create_router(dependencies: AnthropicRouterDependencies) -> Router {
     let AnthropicRouterDependencies {
+        runtime,
         request_api_keys,
         request_admission,
         usage_recorder,
@@ -193,79 +77,18 @@ pub fn create_router(
         model_capabilities,
         account_manager,
     } = dependencies;
-    let AnthropicRouterConfig {
-        prompt_cache_target_read_ratio,
-        prompt_cache_token_scale,
-        prompt_cache_max_simulated_input_tokens,
-        prompt_cache_cap_jitter_min_tokens,
-        prompt_cache_cap_jitter_max_tokens,
-        prompt_cache_scale_min_input_tokens,
-        prompt_cache_creation_control,
-        prompt_cache_bounds,
-        reported_usage,
-        cache_policy,
-        routes,
-        compat_profile,
-        prompt_injection,
-        route_features,
-        model_resolution_mode,
-        model_mapping,
-        payload_guard_enabled,
-        payload_guard_mode,
-        payload_guard_max_bytes,
-        payload_guard_safety_margin_bytes,
-        payload_guard_trim_history,
-        payload_guard_external_enabled,
-        image_processing,
-        missing_max_tokens,
-        payload_shaping,
-        accounts,
-    } = config;
     let request_admission_state =
         RequestAdmissionMiddlewareState::new(request_admission, usage_recorder.clone());
-    let configured_features = route_features.clone();
     let mut base_state = AppState::new(
         request_api_keys,
         usage_recorder,
         prompt_cache,
         prompt_cache_creation_controller,
         PromptCacheSimulationMode::HighCache,
-        prompt_cache_target_read_ratio,
-        compat_profile,
     )
-    .with_prompt_cache_amplification(
-        prompt_cache_token_scale,
-        prompt_cache_max_simulated_input_tokens,
-        prompt_cache_cap_jitter_min_tokens,
-        prompt_cache_cap_jitter_max_tokens,
-        prompt_cache_scale_min_input_tokens,
-    )
-    .with_prompt_cache_creation_control(prompt_cache_creation_control)
-    .with_prompt_cache_bounds(prompt_cache_bounds)
-    .with_reported_usage(reported_usage)
-    .with_cache_policy(cache_policy)
-    .with_routes(routes)
-    .with_prompt_injection(prompt_injection, route_features)
-    .with_model_resolution_mode(model_resolution_mode)
-    .with_model_mapping(model_mapping)
-    .with_payload_guard(
-        payload_guard_enabled,
-        payload_guard_mode,
-        payload_guard_max_bytes,
-        payload_guard_safety_margin_bytes,
-        payload_guard_trim_history,
-        payload_guard_external_enabled,
-        image_processing,
-        payload_shaping,
-    )
-    .with_missing_max_tokens(missing_max_tokens)
-    .with_accounts(accounts)
+    .with_runtime(runtime)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
-
-    base_state
-        .runtime
-        .install_local(|config| config.route_features = configured_features);
 
     if let Some(manager) = account_manager {
         base_state = base_state.with_account_manager(manager);
@@ -470,7 +293,7 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::model::config::RequestAdmissionConfig;
+    use crate::model::config::{Config, RequestAdmissionConfig};
 
     use super::*;
 
@@ -481,8 +304,6 @@ mod tests {
             Arc::new(PromptCacheTracker::default()),
             Arc::new(PromptCacheCreationController::default()),
             mode,
-            0.98,
-            CompatProfile::ClaudeCode,
         )
     }
 
@@ -598,29 +419,25 @@ mod tests {
                     route_namespace: Some(true),
                     ..Default::default()
                 };
-            let app = create_router(
-                AnthropicRouterDependencies {
-                    request_api_keys: Arc::new(RequestApiKeyStore::new(&keys)),
-                    request_admission: Arc::new(RequestAdmissionController::new(
-                        RequestAdmissionConfig {
-                            rpm: 1,
-                            max_concurrent_requests: 0,
-                            max_queued_requests: 0,
-                            queue_timeout_ms: 0,
-                        },
-                    )),
+            let app = create_router(AnthropicRouterDependencies {
+                runtime: RuntimeConfigStore::new(config, None),
+                request_api_keys: Arc::new(RequestApiKeyStore::new(&keys)),
+                request_admission: Arc::new(RequestAdmissionController::new(
+                    RequestAdmissionConfig {
+                        rpm: 1,
+                        max_concurrent_requests: 0,
+                        max_queued_requests: 0,
+                        queue_timeout_ms: 0,
+                    },
+                )),
 
-                    usage_recorder: Arc::new(UsageRecorder::new(10)),
-                    prompt_cache: Arc::new(PromptCacheTracker::default()),
-                    prompt_cache_creation_controller: Arc::new(
-                        PromptCacheCreationController::default(),
-                    ),
-                    pricing_catalog: Arc::new(PricingCatalog::new()),
-                    model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                    account_manager: None,
-                },
-                AnthropicRouterConfig::from_runtime_config(&config),
-            );
+                usage_recorder: Arc::new(UsageRecorder::new(10)),
+                prompt_cache: Arc::new(PromptCacheTracker::default()),
+                prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+                pricing_catalog: Arc::new(PricingCatalog::new()),
+                model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+                account_manager: None,
+            });
 
             for (path, key) in PATHS.iter().zip(&keys) {
                 let make_request = || {
@@ -664,22 +481,20 @@ mod tests {
                 route_namespace: Some(true),
                 ..Default::default()
             };
-        let app = create_router(
-            AnthropicRouterDependencies {
-                request_api_keys: Arc::new(RequestApiKeyStore::new(["body-limit-key"])),
-                request_admission: Arc::new(RequestAdmissionController::new(
-                    RequestAdmissionConfig::disabled(),
-                )),
+        let app = create_router(AnthropicRouterDependencies {
+            runtime: RuntimeConfigStore::new(config, None),
+            request_api_keys: Arc::new(RequestApiKeyStore::new(["body-limit-key"])),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
 
-                usage_recorder: Arc::new(UsageRecorder::new(10)),
-                prompt_cache: Arc::new(PromptCacheTracker::default()),
-                prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
-                pricing_catalog: Arc::new(PricingCatalog::new()),
-                model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                account_manager: None,
-            },
-            AnthropicRouterConfig::from_runtime_config(&config),
-        );
+            usage_recorder: Arc::new(UsageRecorder::new(10)),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            account_manager: None,
+        });
         let oversized = Bytes::from(vec![b'x'; MAX_MESSAGES_BODY_SIZE + 1]);
 
         for _round in 0..5 {
@@ -732,22 +547,100 @@ mod tests {
                 route_namespace: Some(true),
                 ..Default::default()
             };
-        create_router(
-            AnthropicRouterDependencies {
-                request_api_keys: Arc::new(RequestApiKeyStore::new(keys)),
-                request_admission: Arc::new(RequestAdmissionController::new(
-                    RequestAdmissionConfig::disabled(),
-                )),
+        test_router_with_runtime(keys, RuntimeConfigStore::new(config, None))
+    }
 
-                usage_recorder: Arc::new(UsageRecorder::new(10)),
-                prompt_cache: Arc::new(PromptCacheTracker::default()),
-                prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
-                pricing_catalog: Arc::new(PricingCatalog::new()),
-                model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                account_manager: None,
-            },
-            AnthropicRouterConfig::from_runtime_config(&config),
-        )
+    fn test_router_with_runtime(keys: &[&str], runtime: Arc<RuntimeConfigStore>) -> Router {
+        create_router(AnthropicRouterDependencies {
+            runtime,
+            request_api_keys: Arc::new(RequestApiKeyStore::new(keys)),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
+
+            usage_recorder: Arc::new(UsageRecorder::new(10)),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            account_manager: None,
+        })
+    }
+
+    async fn message_status(app: &Router, endpoint: &str) -> StatusCode {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "runtime-update-key")
+                    .body(Body::from(
+                        r#"{"model":"claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        status
+    }
+
+    #[tokio::test]
+    async fn admin_route_update_is_visible_to_request_path() {
+        let runtime = RuntimeConfigStore::new(Config::default(), None);
+        let app = test_router_with_runtime(&["runtime-update-key"], runtime.clone());
+        assert_eq!(message_status(&app, "/cc/v1/messages").await.as_u16(), 529);
+
+        runtime
+            .update(|config| config.routes.route_mut("/cc").enabled = false)
+            .unwrap();
+        assert_eq!(
+            message_status(&app, "/cc/v1/messages").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(message_status(&app, "/na/v1/messages").await.as_u16(), 529);
+
+        runtime
+            .update(|config| config.routes.route_mut("/cc").enabled = true)
+            .unwrap();
+        assert_eq!(message_status(&app, "/cc/v1/messages").await.as_u16(), 529);
+    }
+
+    #[tokio::test]
+    async fn admin_route_update_is_visible_to_request_path_allowed_routes() {
+        let mut config = Config::default();
+        config.set_request_api_key_policies([crate::model::config::RequestApiKeyPolicy {
+            api_key: "runtime-update-key".into(),
+            name: "runtime update".into(),
+            enabled: true,
+            request_admission: None,
+            usage_limits: vec![],
+            allowed_routes: vec![],
+        }]);
+        let runtime = RuntimeConfigStore::new(config, None);
+        let app = test_router_with_runtime(&["runtime-update-key"], runtime.clone());
+        assert_eq!(message_status(&app, "/cc/v1/messages").await.as_u16(), 529);
+
+        runtime
+            .update(|config| {
+                config.request_api_key_policies[0].allowed_routes = vec!["/na".into()];
+            })
+            .unwrap();
+        assert_eq!(
+            message_status(&app, "/cc/v1/messages").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(message_status(&app, "/na/v1/messages").await.as_u16(), 529);
+
+        runtime
+            .update(|config| config.request_api_key_policies[0].allowed_routes.clear())
+            .unwrap();
+        assert_eq!(message_status(&app, "/cc/v1/messages").await.as_u16(), 529);
     }
 
     #[tokio::test]
