@@ -1,0 +1,164 @@
+## 在 CPU 上采样（perf record -F 299 --call-graph dwarf，15 秒，北京时间 2026-11-17 13:23）
+样本数 6944
+
+### 自身占比（叶子函数）前 25
+ 20.8%  memcpy
+  8.1%  alloc::fmt::format::format_inner
+  4.4%  _mi_page_malloc_zero
+  4.2%  <alloc::string::String as core::fmt::Write>::write_str
+  3.9%  syscall
+  3.9%  kiro_rs::token::count_tokens
+  3.1%  memcmp
+  2.8%  mi_free
+  2.7%  kiro_rs::model::model_support::claude_model_variants
+  2.3%  kiro_rs::token::estimate_image_tokens_from_base64
+  1.9%  <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter
+  1.9%  serde_json::ser::format_escaped_str_contents
+  1.8%  <base64::engine::general_purpose::GeneralPurpose as base64::engine::Engine>::internal_decode
+  1.6%  kiro_rs::anthropic::transcript_sanitizer::sanitize_raw_request_assistant_history_with_probe
+  1.5%  mi_theap_malloc_aligned
+  1.5%  kiro_rs::model::model_support::support_match_variants
+  1.4%  core::fmt::write
+  1.3%  kiro_rs::model::model_support::push_unique_model
+  1.3%  _mi_theap_realloc_zero
+  1.3%  serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize
+  1.2%  mi_theap_umalloc
+  1.1%  _mi_theap_malloc_zero
+  1.1%  core::str::<impl str>::trim_matches
+  1.0%  kiro_rs::model::model_support::expand_claude_supported_model_variants
+  1.0%  alloc::raw_vec::RawVecInner<A>::finish_grow
+
+### 含子调用占比前 50
+ 53.6%  kiro_rs::model::model_support::model_is_supported_by_list
+ 53.6%  <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter
+ 49.9%  kiro_rs::model::model_support::support_match_variants
+ 49.1%  <core::iter::adapters::flatten::FlatMap<I,U,F> as core::iter::traits::iterator::Iterator>::next
+ 44.6%  kiro_rs::model::model_support::expand_claude_supported_model_variants
+ 41.6%  kiro_rs::model::model_support::claude_model_variants
+ 36.6%  kiro_rs::kiro::provider::KiroProvider::local_pool_route_state_fresh_for_route
+ 36.6%  kiro_rs::kiro::token_manager::manager::MultiTokenManager::compute_local_pool_route_state
+ 32.7%  alloc::fmt::format::format_inner
+ 23.3%  core::fmt::write
+ 21.0%  kiro_rs::anthropic::handlers::request_entry::handle_messages_endpoint::{{closure}}
+ 20.8%  memcpy
+ 19.7%  kiro_rs::kiro::provider::KiroProvider::call_api_with_retry::{{closure}}
+ 19.3%  kiro_rs::anthropic::handlers::maybe_local_pool_preflight_external_outcome_for_local_request::{{closure}}
+ 19.2%  kiro_rs::kiro::token_manager::manager::MultiTokenManager::acquire_context_for_dispatch_with_version::{{closure}}
+ 18.3%  core::ops::function::impls::<impl core::ops::function::FnMut<A> for &mut F>::call_mut
+ 18.1%  kiro_rs::anthropic::handlers::post_messages_inner::{{closure}}
+ 18.1%  kiro_rs::kiro::token_manager::manager::MultiTokenManager::select_next_credential_excluding
+ 18.0%  kiro_rs::kiro::token_manager::capacity::credential_is_dispatchable
+ 17.3%  kiro_rs::anthropic::handlers::local_pool_preflight_reason_after_capacity_grace::{{closure}}
+ 11.0%  kiro_rs::anthropic::handlers::handle_non_stream_request::{{closure}}
+ 10.5%  kiro_rs::token::count_all_tokens_local
+  9.3%  <core::pin::Pin<P> as core::future::future::Future>::poll
+  9.3%  kiro_rs::anthropic::handlers::handle_stream_request::{{closure}}
+  8.6%  kiro_rs::anthropic::forced_backoff::fit_to_budget
+  7.5%  alloc::raw_vec::RawVecInner<A>::finish_grow
+  7.2%  <alloc::string::String as core::fmt::Write>::write_str
+  4.8%  alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle
+  4.4%  _mi_page_malloc_zero
+  4.3%  <core::iter::adapters::map::Map<I,F> as core::iter::traits::iterator::Iterator>::fold
+  4.2%  kiro_rs::anthropic::transcript_sanitizer::ToolTranscriptSanitizer::new
+  4.1%  kiro_rs::model::model_support::push_unique_model
+  4.1%  kiro_rs::token::estimate_image_tokens_from_base64
+  3.9%  syscall
+  3.9%  kiro_rs::token::count_tokens
+  3.8%  kiro_rs::anthropic::handlers::ExternalFallbackContext::refresh_payload
+  3.8%  <core::iter::adapters::cloned::Cloned<I> as core::iter::traits::iterator::Iterator>::fold
+  3.6%  kiro_rs::anthropic::transcript_sanitizer::sanitize_assistant_message_runs_with_policy
+  3.5%  core::ops::function::FnMut::call_mut
+  3.4%  alloc::raw_vec::RawVec<T,A>::grow_one
+  3.3%  serde_core::ser::Serializer::collect_map
+  3.1%  serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize
+  3.1%  memcmp
+  3.0%  kiro_rs::anthropic::transcript_sanitizer::sanitize_messages_request_assistant_history
+  2.9%  _mi_theap_realloc_zero
+  2.8%  kiro_rs::anthropic::transcript_sanitizer::sanitize_raw_request_assistant_history_with_probe
+  2.8%  mi_free
+  2.7%  kiro_rs::anthropic::converter::tools::deterministic_mapped_tool_name
+  2.3%  kiro_rs::anthropic::handlers::local_body_pipeline::prepare_with_plan
+  2.1%  serde_json::ser::format_escaped_str_contents
+
+## 线程切出时采样（perf record -e sched:sched_switch --call-graph dwarf，6 秒，北京时间 2026-11-17 13:31，仅统计成功展开的栈）
+样本数 3428
+
+### 自身占比（叶子函数）前 25
+ 20.3%  memcpy
+ 10.3%  _mi_page_malloc_zero
+  5.6%  sccp
+  5.2%  <alloc::string::String as core::fmt::Write>::write_str
+  5.1%  mi_free
+  3.2%  kiro_rs::model::model_support::claude_model_variants
+  2.7%  alloc::fmt::format::format_inner
+  2.5%  mi_theap_umalloc
+  2.3%  core::fmt::write
+  2.1%  mi_theap_malloc_aligned
+  2.0%  core::str::<impl str>::trim_matches
+  1.6%  kiro_rs::model::model_support::expand_claude_supported_model_variants
+  1.4%  kiro_rs::model::model_support::push_unique_model
+  1.3%  <core::str::pattern::CharSearcher as core::str::pattern::Searcher>::next_match
+  1.3%  <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter
+  1.3%  _mi_theap_malloc_zero
+  1.3%  core::str::pattern::TwoWaySearcher::next
+  1.1%  _mi_theap_realloc_zero
+  0.9%  alloc::raw_vec::RawVecInner<A>::finish_grow
+  0.8%  <alloc::string::String as core::clone::Clone>::clone
+  0.8%  serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize
+  0.8%  core::fmt::Formatter::pad
+  0.8%  kiro_rs::model::model_support::support_match_variants
+  0.8%  kiro_rs::token::count_tokens
+  0.8%  _mi_page_free_collect
+
+### 含子调用占比前 50
+ 65.3%  kiro_rs::model::model_support::model_is_supported_by_list
+ 64.9%  <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter
+ 60.7%  kiro_rs::model::model_support::support_match_variants
+ 59.3%  <core::iter::adapters::flatten::FlatMap<I,U,F> as core::iter::traits::iterator::Iterator>::next
+ 55.6%  kiro_rs::model::model_support::expand_claude_supported_model_variants
+ 50.6%  kiro_rs::model::model_support::claude_model_variants
+ 48.8%  kiro_rs::kiro::provider::KiroProvider::local_pool_route_state_fresh_for_route
+ 48.8%  kiro_rs::kiro::token_manager::manager::MultiTokenManager::compute_local_pool_route_state
+ 36.3%  alloc::fmt::format::format_inner
+ 32.6%  kiro_rs::anthropic::handlers::handle_stream_request::{{closure}}
+ 32.1%  core::fmt::write
+ 27.2%  kiro_rs::anthropic::handlers::request_entry::handle_messages_endpoint::{{closure}}
+ 26.4%  <F as axum::handler::Handler<(M,T1,T2,T3,T4),S>>::call::{{closure}}
+ 25.8%  kiro_rs::anthropic::handlers::local_pool_preflight_reason_after_capacity_grace::{{closure}}
+ 23.3%  kiro_rs::kiro::provider::KiroProvider::call_api_with_retry::{{closure}}
+ 23.0%  kiro_rs::anthropic::handlers::maybe_local_pool_preflight_external_outcome_for_local_request::{{closure}}
+ 20.4%  kiro_rs::kiro::token_manager::manager::MultiTokenManager::acquire_context_for_dispatch_with_version::{{closure}}
+ 20.3%  memcpy
+ 19.3%  core::ops::function::impls::<impl core::ops::function::FnMut<A> for &mut F>::call_mut
+ 18.2%  kiro_rs::kiro::token_manager::manager::MultiTokenManager::select_next_credential_excluding
+ 18.0%  kiro_rs::anthropic::handlers::handle_non_stream_request::{{closure}}
+ 18.0%  kiro_rs::kiro::token_manager::capacity::credential_is_dispatchable
+ 15.4%  kiro_rs::kiro::provider::KiroProvider::call_api_stream_with_request_id_and_attempt_budget_max_sends::{{closure}}
+ 15.2%  kiro_rs::anthropic::handlers::call_api_stream_maybe_fail_fast::{{closure}}
+ 10.5%  alloc::raw_vec::RawVecInner<A>::finish_grow
+ 10.3%  _mi_page_malloc_zero
+  9.4%  <alloc::string::String as core::fmt::Write>::write_str
+  8.0%  tokio::runtime::context::runtime::enter_runtime
+  7.8%  kiro_rs::kiro::provider::KiroProvider::call_api_with_context_with_request_id_and_attempt_budget_max_sends::{{closure}}
+  7.7%  kiro_rs::anthropic::handlers::call_api_maybe_fail_fast::{{closure}}
+  7.0%  <tokio::time::timeout::Timeout<T> as core::future::future::Future>::poll
+  7.0%  alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle
+  6.3%  kiro_rs::anthropic::handlers::post_messages_inner::{{closure}}
+  5.6%  sccp
+  5.1%  mi_free
+  5.1%  tokio::runtime::scheduler::multi_thread::worker::block_in_place
+  5.0%  tokio::runtime::runtime::Runtime::block_on
+  5.0%  tokio::runtime::park::CachedParkThread::block_on
+  4.8%  kiro_rs::model::model_support::push_unique_model
+  4.6%  _mi_theap_realloc_zero
+  4.2%  tokio::runtime::task::core::Core<T,S>::poll
+  4.2%  alloc::raw_vec::RawVec<T,A>::grow_one
+  4.2%  kiro_rs::anthropic::handlers::create_sse_stream::{{closure}}::{{closure}}
+  4.2%  tokio::runtime::task::harness::Harness<T,S>::poll
+  4.1%  std::sys::backtrace::__rust_begin_short_backtrace
+  4.0%  tokio::runtime::io::registration::Registration::try_io
+  3.9%  core::ops::function::FnOnce::call_once{{vtable.shim}}
+  3.8%  <alloc::string::String as core::clone::Clone>::clone
+  3.8%  start
+  3.8%  std::sys::thread::unix::Thread::new::thread_start
+

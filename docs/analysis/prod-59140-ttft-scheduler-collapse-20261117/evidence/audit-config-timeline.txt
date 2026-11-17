@@ -1,0 +1,121 @@
+# 59140 管理审计中的配置类变更（只读查询 admin_audit_logs，北京时间；Key 标识已隐去；详情截断到 900 字符）
+# 列：时间|动作|详情
+2026-11-16 11:54:38|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "bodyConversion.codeExecution.pathOverrides./dfcache/mine-hak-v218", "after": true, "before": null}, {"path": "externalPools.externalPoolCapacityMode", "after": "wait", "before": "fail_fast"}, {"path": "externalPools.externalPoolDispatchMaxWaitSecs", "after": 1, "before": 5}, {"path": "externalPools.externalPoolGlobalMaxConcurrentRequests", "after": 1000, "before": 512}, {"path": "externalPools.externalPoolLocalRescueMaxWaitSecs", "after": 5, "before": 15}, {"path": "externalPools.externalPoolMaxQueuedRequests", "after": 100, "before": 10}, {"path": "externalPools.externalPoolRateLimitCooldownSecs", "after": 5, "before": 30}, {"path": "externalPools.externalPoolRequestTimeoutSecs", "after": 360, "before": 180}, {"path": "externalPools.externalPoolRetryMaxAttempts", "after": 0, "before": 3}, {"path": "externalPools.externalPoolRouteMo
+2026-11-16 11:54:38|update_request_api_key|{"keyId": "<略>", "nextKeyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-16 12:26:23|update_request_api_key|{"keyId": "<略>", "nextKeyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-16 12:26:23|create_request_api_key|{"keyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-16 12:26:23|create_request_api_key|{"keyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-16 12:26:24|create_request_api_key|{"keyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-16 12:26:24|create_request_api_key|{"keyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-16 12:37:47|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "externalPools.localPoolRouteMode", "after": "allow_all", "before": "deny_list"}], "truncated": false, "changedCount": 1}
+2026-11-16 12:50:27|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "externalPools.externalPoolsEnabled", "after": false, "before": true}], "truncated": false, "changedCount": 1}
+2026-11-16 18:02:06|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "externalPools.externalPoolsEnabled", "after": true, "before": false}], "truncated": false, "changedCount": 1}
+2026-11-17 00:52:23|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "cachePolicy.pathOverrides./v1.hitShaping", "after": {"keys": 10, "type": "object"}, "before": null}, {"path": "cachePolicy.pathOverrides./v1.reportedUsage.finalCacheCreationMaxTokens", "after": 500000, "before": 300000}, {"path": "cachePolicy.pathOverrides./v1.reportedUsage.input.maxTokens", "after": 20000, "before": 0}, {"path": "cachePolicy.pathOverrides./v1.reportedUsage.input.mode", "after": "sample-max", "before": "raw"}, {"path": "cachePolicy.pathOverrides./v1.reportedUsage.input.moveDeltaToCacheRead", "after": true, "before": false}, {"path": "cachePolicy.pathOverrides./v1.reportedUsage.outputUpliftPercent", "after": 80, "before": 70}], "truncated": false, "changedCount": 6}
+2026-11-17 10:55:16|set_load_balancing_mode|{"mode": "balanced"}
+2026-11-17 11:04:20|batch_import_credentials|{"total": 5, "failed": 0, "skipped": 0, "success": 5}
+2026-11-17 11:06:38|batch_import_credentials|{"total": 5, "failed": 1, "skipped": 0, "success": 4}
+2026-11-17 11:07:02|batch_import_credentials|{"total": 5, "failed": 0, "skipped": 0, "success": 5}
+2026-11-17 11:07:55|batch_import_credentials|{"total": 5, "failed": 0, "skipped": 0, "success": 5}
+2026-11-17 11:08:30|batch_import_credentials|{"total": 5, "failed": 0, "skipped": 0, "success": 5}
+2026-11-17 11:09:54|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:10:19|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:10:32|batch_import_credentials|{"total": 20, "failed": 12, "skipped": 0, "success": 8}
+2026-11-17 11:10:40|batch_import_credentials|{"total": 20, "failed": 16, "skipped": 0, "success": 4}
+2026-11-17 11:10:46|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:10:50|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:10:55|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:10:59|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:04|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:09|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:14|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:19|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:24|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:29|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:35|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:40|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:47|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:53|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:11:58|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:12:05|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:12:11|batch_import_credentials|{"total": 20, "failed": 20, "skipped": 0, "success": 0}
+2026-11-17 11:15:04|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:15:51|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 1, "success": 0}
+2026-11-17 11:17:11|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:20:45|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:21:47|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:22:38|batch_import_credentials|{"total": 20, "failed": 12, "skipped": 0, "success": 8}
+2026-11-17 11:23:29|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:23:43|batch_import_credentials|{"total": 20, "failed": 10, "skipped": 0, "success": 10}
+2026-11-17 11:24:35|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:24:46|batch_import_credentials|{"total": 20, "failed": 13, "skipped": 0, "success": 7}
+2026-11-17 11:26:44|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:28:30|batch_import_credentials|{"total": 20, "failed": 4, "skipped": 0, "success": 16}
+2026-11-17 11:28:37|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:28:43|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:28:51|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:28:58|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:29:23|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:29:40|batch_import_credentials|{"total": 20, "failed": 9, "skipped": 0, "success": 11}
+2026-11-17 11:29:46|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:29:53|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:30:01|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:30:07|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:30:14|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:30:21|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:30:29|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:30:36|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:30:43|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:31:16|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:31:44|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:31:52|batch_import_credentials|{"total": 20, "failed": 16, "skipped": 0, "success": 4}
+2026-11-17 11:31:59|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:06|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:12|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:19|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:25|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:32|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:39|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:46|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:32:53|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:33:00|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:33:07|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:33:13|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:33:22|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:33:29|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:33:36|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:33:43|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:34:16|batch_import_credentials|{"total": 20, "failed": 4, "skipped": 0, "success": 16}
+2026-11-17 11:34:24|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:34:31|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:34:38|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:34:45|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:35:14|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:35:25|batch_import_credentials|{"total": 20, "failed": 15, "skipped": 0, "success": 5}
+2026-11-17 11:35:32|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:35:39|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:35:46|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:35:52|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:00|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:06|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:14|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:20|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:27|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:34|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:42|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:49|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:36:56|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:37:03|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:37:10|batch_import_credentials|{"total": 1, "failed": 0, "skipped": 0, "success": 1}
+2026-11-17 11:38:28|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:38:58|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:39:36|update_request_api_key|{"keyId": "<略>", "nextKeyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-17 11:40:11|batch_import_credentials|{"total": 20, "failed": 0, "skipped": 0, "success": 20}
+2026-11-17 11:42:32|batch_import_credentials|{"total": 20, "failed": 7, "skipped": 0, "success": 13}
+2026-11-17 11:43:50|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "credentialMaxConcurrentRequests", "after": 1, "before": 0}, {"path": "dispatchGlobalMaxConcurrentRequests", "after": 1000, "before": 512}, {"path": "dispatchMaxQueuedRequests", "after": 50, "before": 30}, {"path": "kiroUpstreamStreamIdleTimeoutSecs", "after": 300, "before": 180}, {"path": "requestAdmission.maxConcurrentRequests", "after": 0, "before": 32}, {"path": "requestAdmission.maxQueuedRequests", "after": 0, "before": 64}, {"path": "requestAdmission.queueTimeoutMs", "after": 0, "before": 1000}, {"path": "requestAdmission.rpm", "after": 0, "before": 300}], "truncated": false, "changedCount": 8}
+2026-11-17 11:43:58|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "credentialRpm", "after": 10, "before": 100}], "truncated": false, "changedCount": 1}
+2026-11-17 11:49:28|batch_import_credentials|{"total": 20, "failed": 12, "skipped": 0, "success": 8}
+2026-11-17 13:04:53|create_request_api_key|{"keyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-17 13:05:06|create_request_api_key|{"keyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-17 13:06:28|create_request_api_key|{"keyId": "<略>", "maskedApiKey": "<略>"}
+2026-11-17 15:35:39|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "credentialMaxConcurrentRequests", "after": 3, "before": 1}, {"path": "credentialRpm", "after": 20, "before": 10}], "truncated": false, "changedCount": 2}
+2026-11-17 15:35:55|update_runtime_config|{"kind": "runtime_config_change", "changes": [{"path": "credentialInfoRefreshConcurrency", "after": 16, "before": 3}], "truncated": false, "changedCount": 1}
