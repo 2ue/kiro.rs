@@ -66,3 +66,20 @@ test("probe retries 529 and maps masked accounts by name; drain verdict rejects 
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("process sample: liveness comes from signal-0, a failed ps/lsof only leaves rss/fd unknown", async () => {
+  const { processSample, processAlive, resourceSummary } = await import("./lib/process-sample.mjs");
+  assert.equal(processAlive(process.pid), true);
+  assert.equal(processAlive(999_999), false);
+  const self = processSample(process.pid);
+  assert.equal(self.alive, true);
+  assert.ok(self.rssMb > 0 && self.fd > 0);
+  const dead = processSample(999_999);
+  assert.deepEqual(dead, { rssMb: null, fd: null, alive: false });
+  // An alive sample whose ps/lsof failed must not be counted as "exited" and must not poison the summary.
+  const unsampled = { rssMb: null, fd: null, alive: true, sampled: false };
+  const summary = resourceSummary([self, unsampled, self]);
+  assert.equal(summary.start.fd, self.fd);
+  assert.equal(summary.end.alive, true);
+  assert.equal([self, unsampled, self].some((s) => s && !s.alive), false);
+});
