@@ -373,11 +373,17 @@ async function main() {
   for (const phase of phases) results.push(await runPhase(phase, startedAt, timeline, resources));
   // Observe release/drain after the last clients finish, including canceled upstream sockets.
   await patchMock(poolMock, QUIET);
-  await sleep(Number(args.settleSecs || 5) * 1000);
+  // Close this script's own keep-alive sockets first: idle downstream connections are the
+  // client's, not the service's, and must not count as service FDs in the recovery check.
+  agent.destroy();
+  // Soak scenarios judge FD recovery, so wait past the upstream client's idle-pool timeout
+  // (reqwest default 90 s) before the final sample; other scenarios only need a short drain.
+  const fdChecked = ["long_stream_sessions", "mixed_chaos_soak"].includes(args.scenario);
+  await sleep(Number(args.settleSecs || (fdChecked ? 100 : 5)) * 1000);
   resources.push(processSample(args.targetPid));
   const resource = resourceSummary(resources);
   const problems = results.flatMap((result) => result.problems.map((problem) => `${result.phase}: ${problem}`));
-  if (["long_stream_sessions", "mixed_chaos_soak"].includes(args.scenario)) {
+  if (fdChecked) {
     if (!resource || !resource.end.alive) problems.push("resource samples unavailable or process exited");
     else {
       if (!(resource.end.rssMb <= resource.peak.rssMb * 0.8 || resource.end.rssMb <= resource.start.rssMb + 150)) problems.push("RSS did not recover");
@@ -391,7 +397,6 @@ async function main() {
   if (args.out) writeFileSync(args.out, JSON.stringify(summary, null, 2));
   for (const result of results) console.log(`${args.scenario}/${result.phase} c=${result.concurrency} total=${result.total} ok%=${result.okRate} status=${JSON.stringify(result.byStatus)} p95=${result.p95} stall=${result.stallSecs} verdict=${result.verdict} ${result.problems.join("; ")}`);
   console.log(`verdict: ${summary.verdict}`);
-  agent.destroy();
   process.exitCode = summary.verdict === "PASS" ? 0 : 1;
 }
 

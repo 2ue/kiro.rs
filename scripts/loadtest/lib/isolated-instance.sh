@@ -22,6 +22,8 @@ QUEUE=${QUEUE:-200}
 WAIT_SECS=${WAIT_SECS:-60}
 GLOBAL_MAX=${GLOBAL_MAX:-1000}
 IDLE_SECS=${IDLE_SECS:-120}
+# 首输出超时要明显短于客户端 120s 超时，否则挂起流的换号与客户端放弃撞在同一刻。
+FIRST_OUTPUT_SECS=${FIRST_OUTPUT_SECS:-30}
 MAX_DURATION_SECS=${MAX_DURATION_SECS:-3600}
 SERVER_PID=${SERVER_PID:-}
 MOCK_PID=${MOCK_PID:-}
@@ -72,15 +74,15 @@ PY
 
 apply_dispatch_settings() {
   admin_api config/runtime > "$D/runtime.json" || return 1
-  python3 - "$D" "$QUEUE" "$WAIT_SECS" "$GLOBAL_MAX" "$IDLE_SECS" "$MAX_DURATION_SECS" <<'PY'
+  python3 - "$D" "$QUEUE" "$WAIT_SECS" "$GLOBAL_MAX" "$IDLE_SECS" "$MAX_DURATION_SECS" "$FIRST_OUTPUT_SECS" <<'PY'
 import json, sys
 from pathlib import Path
-d = Path(sys.argv[1]); queue, wait, maximum, idle, duration = map(int, sys.argv[2:])
+d = Path(sys.argv[1]); queue, wait, maximum, idle, duration, first_output = map(int, sys.argv[2:])
 accounts = json.loads((d/'runtime.json').read_text())['accounts']
 accounts.update(enabled=True, maxQueuedRequests=queue, dispatchMaxWaitSecs=wait,
                 globalMaxConcurrentRequests=maximum, capacityMode='wait',
                 streamIdleTimeoutSecs=idle, requestTimeoutSecs=duration,
-                streamRequestTimeoutSecs=duration)
+                streamRequestTimeoutSecs=duration, streamFirstOutputTimeoutSecs=first_output)
 (d/'dispatch-settings.json').write_text(json.dumps(dict(accounts=accounts,
     requestAdmission=dict(rpm=0, maxConcurrentRequests=0, maxQueuedRequests=0, queueTimeoutMs=0))))
 PY
