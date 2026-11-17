@@ -925,6 +925,7 @@ pub struct DispatchStatus {
     pub queued_requests: Option<u32>,
     pub global_in_flight: u64,
     pub pending_redis_releases: usize,
+    pub coordinator_admission_saturated: u64,
     pub dispatched_total: u64,
     pub dispatch_rate_per_sec: f64,
     pub secs_since_last_dispatch: Option<f64>,
@@ -988,6 +989,7 @@ impl DispatchCounters {
             queued_requests,
             global_in_flight: self.in_flight.load(Ordering::Relaxed),
             pending_redis_releases,
+            coordinator_admission_saturated: 0,
             dispatched_total: self.total.load(Ordering::Relaxed),
             dispatch_rate_per_sec: window.iter().map(|(_, count)| count).sum::<u64>() as f64 / 5.0,
             secs_since_last_dispatch,
@@ -3280,10 +3282,33 @@ impl AccountCoordinatorFailureKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountCoordinatorOpenKind {
+    BreakerOpen,
+    AdmissionSaturated,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AccountCoordinatorOpen {
+    kind: AccountCoordinatorOpenKind,
     retry_after: Duration,
 }
+
+impl std::fmt::Display for AccountCoordinatorOpen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.kind {
+            AccountCoordinatorOpenKind::BreakerOpen => "breaker is open",
+            AccountCoordinatorOpenKind::AdmissionSaturated => "admission saturated",
+        };
+        write!(
+            formatter,
+            "account coordinator {reason}; retry after {}ms",
+            self.retry_after.as_millis().max(1)
+        )
+    }
+}
+
+impl std::error::Error for AccountCoordinatorOpen {}
 
 #[derive(Debug)]
 struct AccountCoordinatorBreakerState {
@@ -3367,6 +3392,7 @@ impl AccountCoordinatorBreaker {
                 self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
                 self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
                 return Err(AccountCoordinatorOpen {
+                    kind: AccountCoordinatorOpenKind::AdmissionSaturated,
                     retry_after: Duration::from_millis(100),
                 });
             }
@@ -3378,6 +3404,7 @@ impl AccountCoordinatorBreaker {
                 self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
                 self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
                 return Err(AccountCoordinatorOpen {
+                    kind: AccountCoordinatorOpenKind::BreakerOpen,
                     retry_after: open_until.saturating_duration_since(now),
                 });
             }
@@ -3386,6 +3413,7 @@ impl AccountCoordinatorBreaker {
                     self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
                     self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
                     return Err(AccountCoordinatorOpen {
+                        kind: AccountCoordinatorOpenKind::BreakerOpen,
                         retry_after: Duration::from_millis(100),
                     });
                 }
@@ -5904,8 +5932,15 @@ impl AccountManager {
         .await
         .ok()
         .and_then(Result::ok);
-        self.dispatch_counters
-            .snapshot(queued, self.release_dispatcher.pending_len())
+        let mut status = self
+            .dispatch_counters
+            .snapshot(queued, self.release_dispatcher.pending_len());
+        status.coordinator_admission_saturated = self
+            .coordinator_breaker
+            .stats
+            .saturated
+            .load(Ordering::Relaxed);
+        status
     }
 
     pub async fn status_summary(&self, accounts: &[AccountStatus]) -> AccountsSummary {
@@ -6684,7 +6719,7 @@ impl AccountManager {
                             request_id = %route.request_id,
                             pool_id,
                             detail = unavailable.detail,
-                            "账号 Redis lease 准入不可用，尝试进程内有界 lease"
+                            "账号 Redis coordinator 熔断已打开，改用进程内有界 lease"
                         );
                         self.acquire_degraded_fallback_local_pool(&pool, &config)
                     }
@@ -8260,6 +8295,19 @@ impl AccountManager {
         {
             Ok(runtimes) => runtimes,
             Err(err) => {
+                if let Some(open) = err
+                    .downcast_ref::<AccountCoordinatorOpen>()
+                    .filter(|open| open.kind == AccountCoordinatorOpenKind::AdmissionSaturated)
+                {
+                    availability.temporary_unavailable_pools = pools.len();
+                    availability.wait_reason = Some(PoolCapacityWaitReason::Full);
+                    availability.wait_for = Some(open.retry_after);
+                    return PoolSelectionSnapshot {
+                        selected_pool: None,
+                        availability,
+                        degraded_fallback_local_lease: false,
+                    };
+                }
                 let recovery_wait = err.downcast_ref::<AccountCoordinatorGuardError>().and_then(
                     |guard| match &guard.state {
                         AccountCoordinatorGuardState::Recovering { remaining, .. } => {
@@ -9027,6 +9075,14 @@ impl AccountManager {
         }
         let coordinator_permit = match self.coordinator_breaker.try_begin() {
             Ok(permit) => permit,
+            Err(open) if open.kind == AccountCoordinatorOpenKind::AdmissionSaturated => {
+                return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::Full,
+                    wait_for: Some(open.retry_after),
+                    exclude_pool_for_reselect: false,
+                    detail: "coordinator_admission_saturated",
+                });
+            }
             Err(open) => {
                 return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
                     reason: PoolCapacityWaitReason::CoordinatorUnavailable,
@@ -9443,12 +9499,7 @@ impl AccountManager {
             .collect::<Vec<_>>();
         let mut epoch_reconciliations = 0usize;
         let coordinators = loop {
-            let coordinator_permit = self.coordinator_breaker.try_begin().map_err(|open| {
-                anyhow::anyhow!(
-                    "account coordinator breaker is open; retry after {}ms",
-                    open.retry_after.as_millis().max(1)
-                )
-            })?;
+            let coordinator_permit = self.coordinator_breaker.try_begin()?;
             let coordination_epoch = match self.account_coordination_epoch().await {
                 Ok(epoch) => epoch,
                 Err(err) => {

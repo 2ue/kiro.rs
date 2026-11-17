@@ -394,13 +394,29 @@ impl ExternalStreamFakeStep {
 #[derive(Clone)]
 struct ExternalStreamFakeState {
     hits: Arc<AtomicU64>,
+    concurrency: Arc<ExternalStreamFakeConcurrency>,
     status: StatusCode,
     steps: Arc<Vec<ExternalStreamFakeStep>>,
+}
+
+#[derive(Default)]
+struct ExternalStreamFakeConcurrency {
+    in_flight: AtomicU64,
+    max_in_flight: AtomicU64,
+}
+
+struct ExternalStreamFakeInFlight(Arc<ExternalStreamFakeConcurrency>);
+
+impl Drop for ExternalStreamFakeInFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct ExternalStreamFakeServer {
     base_url: String,
     hits: Arc<AtomicU64>,
+    concurrency: Arc<ExternalStreamFakeConcurrency>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -414,9 +430,16 @@ impl ExternalStreamFakeServer {
             axum::extract::State(state): axum::extract::State<ExternalStreamFakeState>,
         ) -> Response {
             state.hits.fetch_add(1, Ordering::Relaxed);
+            let in_flight = state.concurrency.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+            state
+                .concurrency
+                .max_in_flight
+                .fetch_max(in_flight, Ordering::AcqRel);
+            let observation = ExternalStreamFakeInFlight(state.concurrency.clone());
             let steps = state.steps.clone();
-            let stream =
-                futures::stream::unfold((steps, 0usize), |(steps, mut index)| async move {
+            let stream = futures::stream::unfold(
+                (steps, 0usize, observation),
+                |(steps, mut index, observation)| async move {
                     loop {
                         let step = steps.get(index).cloned()?;
                         index = index.saturating_add(1);
@@ -424,18 +447,22 @@ impl ExternalStreamFakeServer {
                             ExternalStreamFakeStep::Chunk(bytes) => {
                                 return Some((
                                     Ok::<Bytes, std::io::Error>(Bytes::from(bytes)),
-                                    (steps, index),
+                                    (steps, index, observation),
                                 ));
                             }
                             ExternalStreamFakeStep::Delay(duration) => {
                                 tokio::time::sleep(duration).await;
                             }
                             ExternalStreamFakeStep::Error(message) => {
-                                return Some((Err(std::io::Error::other(message)), (steps, index)));
+                                return Some((
+                                    Err(std::io::Error::other(message)),
+                                    (steps, index, observation),
+                                ));
                             }
                         }
                     }
-                });
+                },
+            );
             Response::builder()
                 .status(state.status)
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -444,8 +471,10 @@ impl ExternalStreamFakeServer {
         }
 
         let hits = Arc::new(AtomicU64::new(0));
+        let concurrency = Arc::new(ExternalStreamFakeConcurrency::default());
         let state = ExternalStreamFakeState {
             hits: hits.clone(),
+            concurrency: concurrency.clone(),
             status,
             steps: Arc::new(steps),
         };
@@ -464,6 +493,7 @@ impl ExternalStreamFakeServer {
         Self {
             base_url: format!("http://{address}"),
             hits,
+            concurrency,
             task,
         }
     }
@@ -4381,7 +4411,12 @@ async fn account_coordinator_admission_bounds_10k_simultaneous_first_timeout_wav
         assert!(remove.status().is_success(), "round {round}: {remove:?}");
         assert!(
             first_wave.iter().all(|selection| {
-                selection.selected_pool.is_none() && selection.availability.coordinator_unavailable
+                selection.selected_pool.is_none()
+                    && (selection.availability.coordinator_unavailable
+                        || (selection.availability.wait_reason
+                            == Some(PoolCapacityWaitReason::Full)
+                            && selection.availability.wait_for == Some(Duration::from_millis(100))
+                            && !selection.degraded_fallback_local_lease))
             }),
             "round {round}: the injected first timeout wave must fail closed"
         );
@@ -4572,8 +4607,9 @@ async fn account_coordinator_breaker_single_probe_and_cancellation_recover_for_f
             .try_begin()
             .expect("round must admit exactly one recovery probe");
         for _ in 0..64 {
-            assert!(
-                breaker.try_begin().is_err(),
+            assert_eq!(
+                breaker.try_begin().err().unwrap().kind,
+                AccountCoordinatorOpenKind::BreakerOpen,
                 "round {round}: concurrent recovery probes must fail fast"
             );
         }
@@ -4613,6 +4649,231 @@ fn account_coordinator_breaker_uses_bounded_exponential_backoff() {
             Duration::from_secs(expected_secs)
         );
     }
+}
+
+#[test]
+fn account_coordinator_admission_saturation_preserves_typed_error_without_opening_breaker() {
+    let mut breaker = AccountCoordinatorBreaker::default();
+    breaker.operation_semaphore = Arc::new(Semaphore::new(1));
+    let breaker = Arc::new(breaker);
+    let permit = breaker.try_begin().unwrap();
+    let open = breaker.try_begin().err().unwrap();
+    assert_eq!(open.kind, AccountCoordinatorOpenKind::AdmissionSaturated);
+    assert_eq!(open.retry_after, Duration::from_millis(100));
+    let error = anyhow::Error::new(open);
+    assert_eq!(
+        error.downcast_ref::<AccountCoordinatorOpen>().unwrap().kind,
+        AccountCoordinatorOpenKind::AdmissionSaturated
+    );
+    assert_eq!(
+        error.to_string(),
+        "account coordinator admission saturated; retry after 100ms"
+    );
+    assert!(breaker.state.lock().open_until.is_none());
+    assert_eq!(breaker.stats.failures.load(Ordering::Relaxed), 0);
+    permit.failure(AccountCoordinatorFailureKind::Timeout);
+    let open = breaker.try_begin().err().unwrap();
+    assert_eq!(open.kind, AccountCoordinatorOpenKind::BreakerOpen);
+    assert!(open.to_string().contains("coordinator breaker is open"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_admission_saturation_waits_instead_of_degrading_to_local_lease() {
+    assert_coordinator_local_lease_admission(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_breaker_truly_open_still_degrades_to_bounded_local_lease() {
+    assert_coordinator_local_lease_admission(true).await;
+}
+
+async fn assert_coordinator_local_lease_admission(breaker_open: bool) {
+    let Some((mut manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let mut steps = vec![ExternalStreamFakeStep::delay(Duration::from_millis(500))];
+    steps.extend(external_stream_success_steps(
+        "msg_coordinator_admission",
+        "coordinator-ok",
+        10,
+        1,
+    ));
+    let upstream = ExternalStreamFakeServer::start(steps).await;
+    let mut request = create_pool_request("coordinator-admission", 1, true);
+    request.base_url = upstream.base_url.clone();
+    request.max_concurrent_requests = 1;
+    let pool = postgres.create_account(request).await.unwrap();
+    let config = AccountsConfig {
+        capacity_mode: CapacityMode::Wait,
+        dispatch_max_wait_secs: 10,
+        ..early_commit_config_for_test()
+    };
+    manager.account_coordination_epoch().await.unwrap();
+    let mut breaker = AccountCoordinatorBreaker::new(vec![Duration::from_secs(30)]);
+    breaker.operation_semaphore = Arc::new(Semaphore::new(1));
+    manager.coordinator_breaker = Arc::new(breaker);
+    let redis_lease = if breaker_open {
+        None
+    } else {
+        match manager.acquire_pool(&pool, &config).await {
+            PoolAcquireResult::Acquired(lease) => {
+                assert_ne!(lease.coordination_epoch, "degraded-fallback-local");
+                Some(lease)
+            }
+            PoolAcquireResult::Unavailable(unavailable) => panic!("{unavailable:?}"),
+        }
+    };
+    let permit = manager.coordinator_breaker.try_begin().unwrap();
+    let held_permit = if breaker_open {
+        permit.failure(AccountCoordinatorFailureKind::Timeout);
+        None
+    } else {
+        Some(permit)
+    };
+    match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Unavailable(unavailable) => {
+            assert!(!unavailable.exclude_pool_for_reselect);
+            if breaker_open {
+                assert_eq!(
+                    unavailable.reason,
+                    PoolCapacityWaitReason::CoordinatorUnavailable
+                );
+                assert_eq!(unavailable.detail, "coordinator_breaker_open");
+            } else {
+                assert_eq!(unavailable.reason, PoolCapacityWaitReason::Full);
+                assert_eq!(unavailable.wait_for, Some(Duration::from_millis(100)));
+                assert_eq!(unavailable.detail, "coordinator_admission_saturated");
+            }
+        }
+        PoolAcquireResult::Acquired(_) => panic!("coordinator admission must be blocked"),
+    }
+    if !breaker_open {
+        let error = manager
+            .load_pool_runtime_snapshots(&[pool.id], &[])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<AccountCoordinatorOpen>().unwrap().kind,
+            AccountCoordinatorOpenKind::AdmissionSaturated
+        );
+        let selection = manager
+            .select_pool_for_route_from_snapshot(
+                &Arc::new(vec![pool.clone()]),
+                &HashSet::new(),
+                &config,
+                &test_route("claude-sonnet-4-6"),
+            )
+            .await;
+        assert!(selection.selected_pool.is_none());
+        assert_eq!(
+            selection.availability.wait_reason,
+            Some(PoolCapacityWaitReason::Full)
+        );
+        assert_eq!(
+            selection.availability.wait_for,
+            Some(Duration::from_millis(100))
+        );
+        assert!(!selection.availability.coordinator_unavailable);
+        assert!(
+            selection
+                .availability
+                .coordinator_unavailable_kind
+                .is_none()
+        );
+        assert!(!selection.degraded_fallback_local_lease);
+    }
+    let saturated_before = manager
+        .coordinator_breaker
+        .stats
+        .saturated
+        .load(Ordering::Relaxed);
+    let mut tasks = Vec::new();
+    for index in 0..3 {
+        let (route, _) = external_stream_route(
+            format!("req_coordinator_admission_{breaker_open}_{index}"),
+            format!("err_coordinator_admission_{breaker_open}_{index}"),
+        );
+        let manager = manager.clone();
+        let config = config.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = forward_early_commit(&manager, config, route).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let (body, error) = read_response_body_text_allow_error(response).await;
+            assert_eq!(error, None);
+            assert!(body.contains("coordinator-ok"), "{body}");
+            assert_eq!(
+                downstream_events_named(&parse_downstream_sse(&body), "message_stop").len(),
+                1
+            );
+        }));
+    }
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let observed = if breaker_open {
+                upstream.snapshot() > 0
+            } else {
+                manager
+                    .coordinator_breaker
+                    .stats
+                    .saturated
+                    .load(Ordering::Relaxed)
+                    >= saturated_before + 3
+            };
+            if observed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("requests must exercise coordinator admission");
+    if breaker_open {
+        assert!(!manager.degraded_fallback_local_leases.lock().is_empty());
+    } else {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(upstream.snapshot(), 0);
+        assert!(manager.degraded_fallback_local_leases.lock().is_empty());
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+        assert!(
+            manager
+                .dispatch_status()
+                .await
+                .coordinator_admission_saturated
+                >= 3
+        );
+        held_permit.unwrap().success();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            upstream.snapshot(),
+            0,
+            "existing Redis lease must still reserve the account slot"
+        );
+        drop(redis_lease);
+    }
+    timeout(Duration::from_secs(10), async {
+        for task in tasks {
+            task.await.unwrap();
+        }
+    })
+    .await
+    .expect("all requests must finish within the dispatch wait budget");
+    assert_eq!(upstream.snapshot(), 3);
+    assert_eq!(
+        upstream.concurrency.max_in_flight.load(Ordering::Acquire),
+        1
+    );
+    assert_eq!(
+        manager.degraded_fallback_local_leases.lock().is_empty(),
+        !breaker_open
+    );
+    assert!(
+        manager
+            .drain_release_intents(Duration::from_secs(5))
+            .await
+            .drained
+    );
+    postgres.drop_test_schema().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4844,8 +5105,9 @@ fn account_coordinator_first_failure_wave_has_a_hard_in_flight_cap_for_five_roun
             );
         }
         for _ in 0..10_000 {
-            assert!(
-                breaker.try_begin().is_err(),
+            assert_eq!(
+                breaker.try_begin().err().unwrap().kind,
+                AccountCoordinatorOpenKind::AdmissionSaturated,
                 "round {round}: operations above the hard cap must not create waiting tasks"
             );
         }

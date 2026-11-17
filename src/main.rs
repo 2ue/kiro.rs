@@ -1247,6 +1247,7 @@ mod lifecycle_tests {
         assert_eq!(value["progressing"], true);
         assert_eq!(value["dispatchedTotal"], 0);
         assert_eq!(value["globalInFlight"], 0);
+        assert_eq!(value["coordinatorAdmissionSaturated"], 0);
         assert_eq!(value["dispatchRatePerSec"], 0.0);
         assert_eq!(value["secsSinceLastDispatch"], Value::Null);
         assert_eq!(
