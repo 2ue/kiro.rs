@@ -294,6 +294,12 @@ pub(crate) fn count_all_tokens_local(
     total.max(1)
 }
 
+/// Local estimate of one message's content: `count_all_tokens_local` is the sum of these plus the
+/// system prompt and tool definitions, so removing a message lowers the total by exactly this.
+pub(crate) fn count_message_tokens_local(message: &Message) -> u64 {
+    count_message_content_tokens(&message.content)
+}
+
 fn count_message_content_tokens(content: &Value) -> u64 {
     match content {
         Value::String(text) => count_tokens(text),

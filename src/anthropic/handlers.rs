@@ -8110,6 +8110,7 @@ async fn forced_request_pipeline(
     model_resolution: &ModelResolution,
     payload: &mut MessagesRequest,
     on_demand_compaction: Option<String>,
+    request_body_bytes: usize,
 ) -> Option<Response> {
     let forced = model_resolution.forced.as_ref()?;
     if super::forced_summary::apply_client_compaction_block(&mut payload.messages) {
@@ -8143,7 +8144,15 @@ async fn forced_request_pipeline(
             .await,
         );
     }
-    apply_forced_context_fitting(payload, forced, runtime_config, endpoint, summary_context).await;
+    apply_forced_context_fitting(
+        payload,
+        forced,
+        runtime_config,
+        endpoint,
+        summary_context,
+        request_body_bytes,
+    )
+    .await;
     None
 }
 
@@ -8156,6 +8165,7 @@ async fn apply_forced_context_fitting(
     runtime_config: &RequestRuntimeConfig,
     endpoint: &str,
     summary_context: forced_summary_call::SummaryContext,
+    request_body_bytes: usize,
 ) {
     let Some(config) = runtime_config.forced_model_mapping_for(endpoint) else {
         return;
@@ -8191,7 +8201,10 @@ async fn apply_forced_context_fitting(
         &config.context_backoff,
     )
     .await;
-    let report = super::forced_backoff::fit_to_budget(payload, budget, &config.context_backoff);
+    // Counting a long history is CPU work; keep it off the async worker for large requests.
+    let report = local_body_pipeline::run_cpu_heavy_in_place(request_body_bytes, false, || {
+        super::forced_backoff::fit_to_budget(payload, budget, &config.context_backoff)
+    });
     if report.changed() || summarized {
         tracing::info!(
             endpoint,
@@ -8832,6 +8845,7 @@ async fn post_messages_inner(
             &model_resolution,
             &mut payload,
             on_demand_compaction,
+            request_body_bytes,
         ))
         .await
         {

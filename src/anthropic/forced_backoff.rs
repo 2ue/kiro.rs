@@ -112,13 +112,19 @@ pub(crate) fn fit_to_budget(
         return report;
     }
 
-    while report.final_tokens > budget_tokens {
+    // The estimate is a sum over messages, so each dropped turn lowers it by that turn's own
+    // count; re-estimating the whole request after every turn made long histories quadratic.
+    let mut remaining_tokens = report.final_tokens as i64;
+    while remaining_tokens > budget_tokens as i64 {
         let removed = drop_oldest_turn(&mut request.messages);
-        if removed == 0 {
+        if removed.is_empty() {
             break;
         }
-        report.removed_messages += removed;
-        report.final_tokens = estimate(request);
+        report.removed_messages += removed.len();
+        remaining_tokens -= removed
+            .iter()
+            .map(|message| crate::token::count_message_tokens_local(message) as i64)
+            .sum::<i64>();
     }
     if report.removed_messages > 0 {
         // Without a trace the model would not know earlier turns existed and could redo finished
@@ -512,12 +518,12 @@ fn mark_omitted_turns(messages: &mut [Message]) {
 }
 
 /// 删除最早的一轮（首条用户消息之后的第一组 assistant + 回应它的 user），保持配对；
-/// 最后一条消息（当前轮）不动。返回删除的消息数。
-fn drop_oldest_turn(messages: &mut Vec<Message>) -> usize {
+/// 最后一条消息（当前轮）不动。返回被删除的消息，没有可删的轮次时为空。
+fn drop_oldest_turn(messages: &mut Vec<Message>) -> Vec<Message> {
     // Keep the first user message (the original request) and the current turn.
     let keep_tail = 2;
     if messages.len() <= 1 + keep_tail {
-        return 0;
+        return Vec::new();
     }
     let start = if messages.first().is_some_and(|m| m.role == "user") {
         1
@@ -529,7 +535,7 @@ fn drop_oldest_turn(messages: &mut Vec<Message>) -> usize {
         .iter()
         .position(|m| m.role == "assistant")
     else {
-        return 0;
+        return Vec::new();
     };
     let first = start + offset;
     let mut end = first + 1;
@@ -547,11 +553,10 @@ fn drop_oldest_turn(messages: &mut Vec<Message>) -> usize {
         }
     }
     if end > messages.len() - keep_tail {
-        return 0;
+        return Vec::new();
     }
-    messages.drain(first..end);
     // A dangling leading assistant (no user before it) is not allowed; the first user stays.
-    end - first
+    messages.drain(first..end).collect()
 }
 
 fn text_len_tokens(text: &str) -> i32 {
@@ -709,6 +714,124 @@ mod tests {
             }
         }
         true
+    }
+
+    /// `fit_to_budget` as it was before dropping turns stopped re-estimating the whole request
+    /// after each turn: same steps, a full estimate after every dropped turn.
+    fn fit_to_budget_reestimating(
+        request: &mut MessagesRequest,
+        budget_tokens: i32,
+        config: &ForcedContextBackoffConfig,
+    ) -> BackoffReport {
+        let original = estimate(request);
+        let mut report = BackoffReport {
+            budget_tokens,
+            original_tokens: original,
+            final_tokens: original,
+            ..BackoffReport::default()
+        };
+        if original <= budget_tokens {
+            return report;
+        }
+        report.removed_thinking_blocks = drop_old_thinking(&mut request.messages);
+        report.final_tokens = estimate(request);
+        if report.final_tokens <= budget_tokens {
+            return report;
+        }
+        let overflow = report.final_tokens - budget_tokens;
+        let rounds = (overflow / config.step_tokens.max(1)) as usize + 1;
+        report.cleared_tool_results = clear_old_tool_results(
+            &mut request.messages,
+            config.keep_recent_tool_results,
+            rounds,
+        );
+        report.final_tokens = estimate(request);
+        if report.final_tokens <= budget_tokens {
+            return report;
+        }
+        report.cleared_tool_results += clear_old_tool_results(
+            &mut request.messages,
+            config.keep_recent_tool_results,
+            usize::MAX,
+        );
+        report.final_tokens = estimate(request);
+        if report.final_tokens <= budget_tokens {
+            return report;
+        }
+        while report.final_tokens > budget_tokens {
+            let removed = drop_oldest_turn(&mut request.messages);
+            if removed.is_empty() {
+                break;
+            }
+            report.removed_messages += removed.len();
+            report.final_tokens = estimate(request);
+        }
+        if report.removed_messages > 0 {
+            mark_omitted_turns(&mut request.messages);
+            report.final_tokens = estimate(request);
+        }
+        while report.final_tokens > budget_tokens {
+            let excess = report.final_tokens - budget_tokens;
+            if !truncate_largest_block(&mut request.messages, excess) {
+                break;
+            }
+            report.truncated_blocks += 1;
+            report.final_tokens = estimate(request);
+        }
+        report
+    }
+
+    fn chatty_conversation(turns: usize, words: usize) -> MessagesRequest {
+        let mut messages = vec![json!({"role": "user", "content": "please fix the build"})];
+        for i in 0..turns {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "text", "text": big(words + i % 7)},
+                {"type": "tool_use", "id": format!("toolu_{i}"), "name": "Bash", "input": {"command": big(3)}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("toolu_{i}"), "content": big(words / 2)},
+                {"type": "text", "text": big(words / 3)}
+            ]}));
+        }
+        messages.push(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}));
+        messages.push(json!({"role": "user", "content": "now run the tests"}));
+        serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 32000,
+            "messages": messages
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn dropping_turns_without_reestimating_matches_reestimating_every_turn() {
+        for (turns, words, budget) in [
+            (40, 200, 30_000),
+            (120, 120, 20_000),
+            (300, 60, 50_000),
+            (60, 400, 1_000),
+            (5, 50, 100),
+        ] {
+            for request in [
+                chatty_conversation(turns, words),
+                conversation(turns, words),
+            ] {
+                let mut fast = request.clone();
+                let mut reference = request;
+                let fast_report = fit_to_budget(&mut fast, budget, &config());
+                let reference_report =
+                    fit_to_budget_reestimating(&mut reference, budget, &config());
+                assert_eq!(
+                    fast_report, reference_report,
+                    "turns={turns} words={words} budget={budget}"
+                );
+                assert_eq!(
+                    serde_json::to_value(&fast.messages).unwrap(),
+                    serde_json::to_value(&reference.messages).unwrap(),
+                    "turns={turns} words={words} budget={budget}"
+                );
+            }
+        }
     }
 
     #[test]
