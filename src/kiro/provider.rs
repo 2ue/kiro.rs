@@ -77,6 +77,7 @@ const MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS: usize = 4;
 const MODEL_DISCOVERY_MAX_HTTP_SENDS: usize = 20;
 
 mod api_keys;
+mod rejected_reasoning;
 
 #[derive(Debug)]
 struct ModelDiscoverySendBudget {
@@ -662,6 +663,8 @@ pub struct KiroProvider {
     self_handle: std::sync::OnceLock<std::sync::Weak<KiroProvider>>,
     /// Tiers whose model list is being fetched, so concurrent calls fetch once.
     tier_list_fetches: Mutex<HashSet<&'static str>>,
+    /// Historical thinking signatures the upstream rejected, per conversation.
+    rejected_reasoning_signatures: rejected_reasoning::RejectedReasoningSignatures,
 }
 
 struct ProviderClientCacheEntry {
@@ -6951,6 +6954,55 @@ mod tests {
         }
     }
 
+    /// The client resends the rejected history on every later turn; only the first turn pays
+    /// for the rejected send, later turns go out without the rejected reasoning.
+    #[tokio::test]
+    async fn rejected_thinking_signatures_are_dropped_before_later_turns_are_sent() {
+        let server = FakeBadRequestServer::start().await;
+        let scenario = "thinking_signature_root_success";
+        for is_stream in [false, true] {
+            let (provider, manager) = fake_thinking_signature_provider(&server.base_url, 3);
+            let request_body = thinking_signature_request_body(scenario, 200);
+            for turn in 1..=3 {
+                let retry_body = strip_reasoning_content_for_provider_test(&request_body);
+                let budget = Arc::new(InferenceAttemptBudget::new(4));
+                let hits_before = server.state.scenario_hits(scenario);
+                let (_, attempts) = call_thinking_signature_retry(
+                    &provider,
+                    &request_body,
+                    is_stream,
+                    budget.clone(),
+                    false,
+                    None,
+                    move || Ok(retry_body),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("stream={is_stream} turn {turn}: {error}"));
+                let expected_sends = if turn == 1 { 2 } else { 1 };
+                assert_eq!(
+                    server.state.scenario_hits(scenario) - hits_before,
+                    expected_sends,
+                    "stream={is_stream} turn {turn}"
+                );
+                assert_eq!(
+                    attempts.len(),
+                    expected_sends,
+                    "stream={is_stream} turn {turn}"
+                );
+                assert!(
+                    attempts.iter().all(|attempt| attempt.action
+                        != "thinking_signature_retry_same_credential"
+                        || turn == 1),
+                    "stream={is_stream} turn {turn}"
+                );
+                assert_signature_retry_did_not_cool_down(
+                    &manager,
+                    &format!("remembered stream={is_stream} turn {turn}"),
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn thinking_signature_retry_ignores_message_code_substring_case_and_status_five_rounds() {
         let server = FakeBadRequestServer::start().await;
@@ -11098,6 +11150,7 @@ impl KiroProvider {
             model_catalog: std::sync::OnceLock::new(),
             self_handle: std::sync::OnceLock::new(),
             tier_list_fetches: Mutex::new(HashSet::new()),
+            rejected_reasoning_signatures: Default::default(),
         }
     }
 
@@ -15456,8 +15509,11 @@ impl KiroProvider {
         let mut excluded_ids: HashSet<u64> =
             self.route_excluded_credential_ids(inference_attempt_budget);
         // Replaced after an attempt the upstream had already started processing, so the retry
-        // carries a fresh request identity (see `refresh_kiro_request_identity`).
-        let mut refreshed_request_body: Option<String> = None;
+        // carries a fresh request identity (see `refresh_kiro_request_identity`). Starts without
+        // the historical reasoning this conversation already had rejected for its signature.
+        let mut refreshed_request_body: Option<String> = conversation_id
+            .as_deref()
+            .and_then(|id| self.rejected_reasoning_signatures.strip(id, request_body));
         let auxiliary_attempt_budget = inference_attempt_budget
             .map(InferenceAttemptBudget::auxiliary_budget)
             .unwrap_or_else(|| {
@@ -16660,6 +16716,12 @@ impl KiroProvider {
             {
                 let is_signature_retry =
                     reasoning_compatibility_reason == "THINKING_SIGNATURE_INVALID";
+                if is_signature_retry && let Some(conversation_id) = conversation_id.as_deref() {
+                    self.rejected_reasoning_signatures.remember(
+                        conversation_id,
+                        refreshed_request_body.as_deref().unwrap_or(request_body),
+                    );
+                }
                 let first_retry_action = if is_signature_retry {
                     "thinking_signature_retry_same_credential"
                 } else {
