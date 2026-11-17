@@ -1,3 +1,9 @@
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
 pub fn normalize_model_id(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -227,33 +233,112 @@ pub fn model_is_supported_by_list(models: &[String], candidates: &[Option<&str>]
     if candidates
         .iter()
         .flatten()
-        .all(|candidate| normalize_model_id(candidate).is_none())
+        .all(|candidate| candidate.trim().is_empty())
     {
         return true;
     }
 
-    let supported_models = normalize_supported_models(models.iter().cloned())
-        .into_iter()
-        .flat_map(support_match_variants)
-        .collect::<Vec<_>>();
-    if supported_models.is_empty() {
-        return false;
+    MODEL_SUPPORT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let supported = cache.supported_variants(models);
+        if supported.is_empty() {
+            return false;
+        }
+        candidates.iter().flatten().any(|candidate| {
+            let candidate = candidate.trim();
+            !candidate.is_empty()
+                && cache
+                    .candidate_variants(candidate)
+                    .iter()
+                    .any(|variant| supported.contains(variant))
+        })
+    })
+}
+
+// Scheduler scans ask every account whether it serves the request model, several times per
+// request, and most accounts share one subscription-tier list. Expanding that list into match
+// variants on every call allocated hundreds of strings per account; with ~900 accounts it was
+// over half the process CPU, all of it under the scheduler's `entries` lock. The expansions are
+// pure functions of the list and candidate text, so they are cached by content: a hit compares
+// the stored list with the given one, so a changed list never reuses a stale expansion.
+thread_local! {
+    static MODEL_SUPPORT_CACHE: RefCell<ModelSupportCache> =
+        RefCell::new(ModelSupportCache::default());
+}
+
+/// Distinct lists or candidates kept per thread before the cache starts over.
+const MODEL_SUPPORT_CACHE_MAX_ENTRIES: usize = 256;
+
+#[derive(Default)]
+struct ModelSupportCache {
+    /// The list of the previous lookup: consecutive accounts usually share it, so this skips
+    /// hashing the list again.
+    last: Option<Rc<CachedModelList>>,
+    lists: HashMap<u64, Vec<Rc<CachedModelList>>>,
+    candidates: HashMap<String, Rc<[String]>>,
+}
+
+struct CachedModelList {
+    models: Vec<String>,
+    variants: HashSet<String>,
+}
+
+impl ModelSupportCache {
+    fn supported_variants(&mut self, models: &[String]) -> Rc<CachedModelList> {
+        if let Some(last) = self.last.as_ref().filter(|last| last.models == models) {
+            return last.clone();
+        }
+        let key = {
+            let mut hasher = DefaultHasher::new();
+            models.hash(&mut hasher);
+            hasher.finish()
+        };
+        let cached = self
+            .lists
+            .get(&key)
+            .and_then(|bucket| bucket.iter().find(|list| list.models == models))
+            .cloned();
+        let list = cached.unwrap_or_else(|| {
+            if self.lists.len() >= MODEL_SUPPORT_CACHE_MAX_ENTRIES {
+                self.lists.clear();
+            }
+            let list = Rc::new(CachedModelList {
+                models: models.to_vec(),
+                variants: normalize_supported_models(models.iter().cloned())
+                    .into_iter()
+                    .flat_map(support_match_variants)
+                    .collect(),
+            });
+            self.lists.entry(key).or_default().push(list.clone());
+            list
+        });
+        self.last = Some(list.clone());
+        list
     }
 
-    for candidate in candidates.iter().flatten() {
-        let Some(model) = normalize_model_id(candidate) else {
-            continue;
-        };
-        let candidate_variants = support_match_variants(model);
-        if supported_models.iter().any(|supported| {
-            candidate_variants
-                .iter()
-                .any(|candidate| candidate == supported)
-        }) {
-            return true;
+    /// `candidate` is already trimmed and not empty.
+    fn candidate_variants(&mut self, candidate: &str) -> Rc<[String]> {
+        if let Some(variants) = self.candidates.get(candidate) {
+            return variants.clone();
         }
+        if self.candidates.len() >= MODEL_SUPPORT_CACHE_MAX_ENTRIES {
+            self.candidates.clear();
+        }
+        let variants: Rc<[String]> = support_match_variants(candidate.to_ascii_lowercase()).into();
+        self.candidates
+            .insert(candidate.to_string(), variants.clone());
+        variants
     }
-    false
+}
+
+impl CachedModelList {
+    fn is_empty(&self) -> bool {
+        self.variants.is_empty()
+    }
+
+    fn contains(&self, variant: &str) -> bool {
+        self.variants.contains(variant)
+    }
 }
 
 /// Subscription tier of a Kiro subscription title, the same keys the account page uses:
@@ -262,6 +347,27 @@ pub fn subscription_tier_key(title: Option<&str>) -> &'static str {
     let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) else {
         return "unknown";
     };
+    // Scheduler scans resolve the tier of every account, and accounts share a handful of
+    // titles: remember the last title instead of lowercasing it again for each account.
+    LAST_SUBSCRIPTION_TIER.with(|last| {
+        let mut last = last.borrow_mut();
+        if let Some((last_title, tier)) = last.as_ref()
+            && last_title == title
+        {
+            return *tier;
+        }
+        let tier = subscription_tier_key_uncached(title);
+        *last = Some((title.to_string(), tier));
+        tier
+    })
+}
+
+thread_local! {
+    static LAST_SUBSCRIPTION_TIER: RefCell<Option<(String, &'static str)>> =
+        const { RefCell::new(None) };
+}
+
+fn subscription_tier_key_uncached(title: &str) -> &'static str {
     let lower = title.to_lowercase();
     let compact: String = lower
         .chars()
@@ -494,5 +600,124 @@ mod tests {
             &["claude-opus-4.8".to_string()],
             &[Some("claude-sonnet-4.6")]
         ));
+    }
+
+    /// The match as computed before the cache: expand both sides on every call.
+    fn uncached_model_is_supported_by_list(models: &[String], candidates: &[Option<&str>]) -> bool {
+        if models.is_empty() {
+            return true;
+        }
+        if candidates
+            .iter()
+            .flatten()
+            .all(|candidate| normalize_model_id(candidate).is_none())
+        {
+            return true;
+        }
+        let supported = normalize_supported_models(models.iter().cloned())
+            .into_iter()
+            .flat_map(support_match_variants)
+            .collect::<Vec<_>>();
+        if supported.is_empty() {
+            return false;
+        }
+        candidates.iter().flatten().any(|candidate| {
+            normalize_model_id(candidate).is_some_and(|model| {
+                support_match_variants(model)
+                    .iter()
+                    .any(|variant| supported.contains(variant))
+            })
+        })
+    }
+
+    #[test]
+    fn cached_support_match_agrees_with_expanding_on_every_call() {
+        let lists: Vec<Vec<String>> = [
+            vec![],
+            vec!["  ", ""],
+            vec![
+                "auto",
+                "claude-haiku-4.5",
+                "claude-sonnet-4-5-20250929",
+                "deepseek-3.2",
+            ],
+            vec![
+                "Claude-Opus-4.8",
+                "claude-opus-4-8",
+                "claude-3-5-haiku-20241022",
+            ],
+            vec!["claude-sonnet-4.6-thinking", "glm-5", "claude-fable-5.1"],
+        ]
+        .into_iter()
+        .map(|list| list.into_iter().map(str::to_string).collect())
+        .collect();
+        let candidates: [&[Option<&str>]; 9] = [
+            &[],
+            &[None],
+            &[Some("  ")],
+            &[Some("claude-haiku-4-5")],
+            &[Some(" CLAUDE-HAIKU-4.5 ")],
+            &[None, Some("claude-opus-4.8-thinking")],
+            &[Some("claude-3.5-haiku"), Some("glm-5")],
+            &[Some("claude-sonnet-4-6[1m]")],
+            &[Some("deepseek-3.2"), Some("claude-opus-5")],
+        ];
+        // Two rounds: the second one answers from the cache.
+        for _ in 0..2 {
+            for list in &lists {
+                for candidate in candidates {
+                    assert_eq!(
+                        model_is_supported_by_list(list, candidate),
+                        uncached_model_is_supported_by_list(list, candidate),
+                        "{list:?} {candidate:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_support_match_follows_list_changes() {
+        let mut list = vec![
+            "claude-haiku-4.5".to_string(),
+            "claude-sonnet-4.5".to_string(),
+        ];
+        assert!(model_is_supported_by_list(
+            &list,
+            &[Some("claude-sonnet-4-5")]
+        ));
+        // Same allocation, different content: must not reuse the previous expansion.
+        list[1] = "claude-opus-4.8".to_string();
+        assert!(!model_is_supported_by_list(
+            &list,
+            &[Some("claude-sonnet-4-5")]
+        ));
+        assert!(model_is_supported_by_list(
+            &list,
+            &[Some("claude-opus-4-8")]
+        ));
+        // Switching between lists keeps each answer.
+        let other = vec!["claude-sonnet-4.5".to_string()];
+        for _ in 0..3 {
+            assert!(model_is_supported_by_list(
+                &other,
+                &[Some("claude-sonnet-4-5")]
+            ));
+            assert!(!model_is_supported_by_list(
+                &list,
+                &[Some("claude-sonnet-4-5")]
+            ));
+        }
+    }
+
+    #[test]
+    fn subscription_tier_key_cache_follows_title_changes() {
+        for _ in 0..2 {
+            assert_eq!(subscription_tier_key(Some("KIRO FREE")), "free");
+            assert_eq!(subscription_tier_key(Some(" KIRO FREE ")), "free");
+            assert_eq!(subscription_tier_key(Some("KIRO POWER")), "power");
+            assert_eq!(subscription_tier_key(Some("KIRO PRO+")), "pro_plus");
+            assert_eq!(subscription_tier_key(Some("KIRO PRO")), "pro");
+        }
     }
 }
