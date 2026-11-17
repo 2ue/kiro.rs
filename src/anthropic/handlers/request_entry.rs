@@ -170,6 +170,15 @@ pub(super) async fn route_body_patches(
         .map_err(|error| {
             EntryRequestError::invalid(error.to_string(), "image_processing_failed")
         })?;
+        // 物化（含可选压缩）之后仍超过上游 5MB 内联上限的当前轮图片，按官方 400 拒绝；
+        // 不这样做模型会当作看不到图片继续回答。功能关闭时不做此检查，原样透传。
+        if let Some(violation) = super::super::payload_guard::find_oversized_current_image(&payload)
+        {
+            return Err(EntryRequestError::invalid(
+                violation.message(),
+                "current_image_too_large",
+            ));
+        }
         for (index, message) in payload.messages.iter().enumerate() {
             if let (Some(original), Some(processed)) = (
                 value.pointer_mut(&format!("/messages/{index}/content")),

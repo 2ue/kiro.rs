@@ -1052,10 +1052,16 @@ async fn assert_remote_multimodal_limit_response(response: Response, path: &str,
         "round {round} path {path}"
     );
     assert_eq!(value["request_id"], request_id, "round {round} path {path}");
-    assert_eq!(
-        value["error"]["message"],
-        "remote image/document source count 21 exceeds the request limit of 20",
-        "round {round} path {path}"
+    let message = value["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message
+            .starts_with("remote image/document source count 21 exceeds the request limit of 20"),
+        "round {round} path {path}: {message}"
+    );
+    // 入口拒绝统一带请求编号后缀，便于按日志定位。
+    assert!(
+        message.ends_with(&format!("(request-id: {request_id})")),
+        "round {round} path {path}: {message}"
     );
     assert!(
         !String::from_utf8_lossy(&body).contains("b07-source-"),
@@ -1352,6 +1358,13 @@ async fn multimodal_handler_test_router_with_usage(
     base_url: &str,
 ) -> Option<(Router, Arc<UsageRecorder>)> {
     let mut config = Config::default();
+    // 远程图片/文档源的物化与数量上限属于 imageProcessing 路由功能，默认关闭（透传）；
+    // 这些多模态前置检查用例显式打开它。
+    config
+        .route_features
+        .defaults
+        .image_processing
+        .get_or_insert_with(Default::default);
 
     config.routes.route_mut("/dfcache/demo").cache_policy = CacheRoutePolicyPatch {
         cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
@@ -1782,15 +1795,18 @@ where
 /// upstream.
 async fn run_oversized_current_image_is_resized_when_switched_on() {
     let data = oversized_noise_png_base64();
-    for resize in [false, true] {
+    // (imageProcessing 功能是否开启, resize 是否开启)。功能关闭时按协议透传，上游说了算。
+    for (feature_on, resize) in [(false, false), (true, false), (true, true)] {
         let upstream = MultimodalHandlerUpstream::start().await;
         let mut config = Config::default();
-        config
-            .route_features
-            .defaults
-            .image_processing
-            .get_or_insert_with(Default::default)
-            .resize_enabled = resize;
+        if feature_on {
+            config
+                .route_features
+                .defaults
+                .image_processing
+                .get_or_insert_with(Default::default)
+                .resize_enabled = resize;
+        }
         let Some((app, _usage_recorder)) =
             multimodal_handler_test_router_from_config(config, &upstream.base_url).await
         else {
@@ -1819,7 +1835,17 @@ async fn run_oversized_current_image_is_resized_when_switched_on() {
             .await
             .expect("read body");
         let body = String::from_utf8_lossy(&body);
-        if resize {
+        if !feature_on {
+            // 透传：不改写也不拦截，原图原样到达上游。
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(upstream.hits(), 1);
+            let sent = upstream.bodies_snapshot()[0].to_string();
+            assert!(
+                sent.len() > 5 * 1024 * 1024,
+                "passthrough body is {} bytes",
+                sent.len()
+            );
+        } else if resize {
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(upstream.hits(), 1);
             let sent = upstream.bodies_snapshot()[0].to_string();
@@ -1875,6 +1901,8 @@ impl MultimodalHandlerUpstream {
         let state = MultimodalHandlerUpstreamState::default();
         let app = Router::new()
             .route("/v1/messages", post(multimodal_handler_upstream))
+            // 透传用例会把 >5MB 的内联图片原样发到这里，超过 axum 默认 2MB 的 body 上限。
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2099,8 +2127,12 @@ async fn account_endpoint_gate_applies_global_enable_and_route_policy() {
     let Some(manager) = test_account_manager_for_handlers(&upstream.base_url).await else {
         return;
     };
+    // 账号池是唯一上游路径，默认开启；显式关闭总开关后请求必须被拒。
     let mut config = AccountsConfig::default();
+    assert!(config.enabled);
+    assert!(account_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
 
+    config.enabled = false;
     assert!(!account_enabled_for_endpoint(&config, "/cc/v1/messages", &manager).await);
 
     config.enabled = true;

@@ -5545,7 +5545,7 @@ impl PostgresUsageStore {
                         THEN r.original_cost_usd
                         ELSE COALESCE(r.estimated_cost_usd, 0)
                     END
-                ), 0)::double precision AS total_original_cost_usd,
+                ), 0)::double precision AS total_original_cost_usd
             FROM window_boundary_records r
             "#,
         );
@@ -5571,7 +5571,7 @@ impl PostgresUsageStore {
                 SUM(total_cache_read_input_tokens)::bigint AS total_cache_read_input_tokens,
                 SUM(total_cache_creation_input_tokens)::bigint AS total_cache_creation_input_tokens,
                 SUM(total_estimated_cost_usd)::double precision AS total_estimated_cost_usd,
-                SUM(total_original_cost_usd)::double precision AS total_original_cost_usd,
+                SUM(total_original_cost_usd)::double precision AS total_original_cost_usd
             FROM top_metric_segments
             GROUP BY item_key
             )
@@ -9734,6 +9734,38 @@ CREATE TABLE IF NOT EXISTS usage_records (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE usage_records
+    ADD COLUMN IF NOT EXISTS endpoint TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS conversation_id TEXT,
+    ADD COLUMN IF NOT EXISTS account_id BIGINT,
+    ADD COLUMN IF NOT EXISTS account_label TEXT,
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS usage_source TEXT NOT NULL DEFAULT 'none',
+    ADD COLUMN IF NOT EXISTS total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS compat_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS billable_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS output_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS pricing_available BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS pricing_model TEXT,
+    ADD COLUMN IF NOT EXISTS duration_ms BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS simulated BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS error_type TEXT,
+    ADD COLUMN IF NOT EXISTS error_message TEXT,
+    ADD COLUMN IF NOT EXISTS error_detail TEXT,
+    ADD COLUMN IF NOT EXISTS data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS rollup_active BOOLEAN NOT NULL DEFAULT true,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
 CREATE TABLE IF NOT EXISTS usage_cleanup_watermarks (
     scope TEXT PRIMARY KEY,
     cutoff_at TIMESTAMPTZ NOT NULL,
@@ -10419,6 +10451,50 @@ INSERT INTO usage_duration_rollup_time_buckets (
 SELECT bucket_start, duration_ms, requests, updated_at
 FROM usage_duration_rollup_time_buckets_hourly;
 "#;
+
+fn remap_configuration_account_ids(
+    config: &mut Config,
+    scenarios: &mut [serde_json::Value],
+    ids: &std::collections::BTreeMap<u64, u64>,
+) -> anyhow::Result<()> {
+    fn remap_routes(
+        routes: &mut crate::model::routes::RoutesConfig,
+        ids: &std::collections::BTreeMap<u64, u64>,
+    ) -> anyhow::Result<()> {
+        for route in &mut routes.routes {
+            for rule in &mut route.account_rule.rules {
+                if rule == "*" {
+                    continue;
+                }
+                let id = rule.parse::<u64>()?;
+                *rule = ids
+                    .get(&id)
+                    .ok_or_else(|| anyhow::anyhow!("路由引用了导入包中不存在的账号: {id}"))?
+                    .to_string();
+            }
+        }
+        Ok(())
+    }
+    remap_routes(&mut config.routes, ids)?;
+    for value in scenarios {
+        let mut routes: crate::model::routes::RoutesConfig =
+            serde_json::from_value(value["content"]["routes"].clone())?;
+        remap_routes(&mut routes, ids)?;
+        value["content"]["routes"] = serde_json::to_value(routes)?;
+        if let Some(accounts) = value["content"]["externalAccounts"].as_array_mut() {
+            for account in accounts {
+                let id = account["id"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("场景账号缺少 id"))?;
+                account["id"] = serde_json::json!(
+                    ids.get(&id)
+                        .ok_or_else(|| anyhow::anyhow!("场景引用了导入包中不存在的账号: {id}"))?
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -13687,48 +13763,4 @@ mod tests {
 
         store.drop_test_schema().await.unwrap();
     }
-}
-
-fn remap_configuration_account_ids(
-    config: &mut Config,
-    scenarios: &mut [serde_json::Value],
-    ids: &std::collections::BTreeMap<u64, u64>,
-) -> anyhow::Result<()> {
-    fn remap_routes(
-        routes: &mut crate::model::routes::RoutesConfig,
-        ids: &std::collections::BTreeMap<u64, u64>,
-    ) -> anyhow::Result<()> {
-        for route in &mut routes.routes {
-            for rule in &mut route.account_rule.rules {
-                if rule == "*" {
-                    continue;
-                }
-                let id = rule.parse::<u64>()?;
-                *rule = ids
-                    .get(&id)
-                    .ok_or_else(|| anyhow::anyhow!("路由引用了导入包中不存在的账号: {id}"))?
-                    .to_string();
-            }
-        }
-        Ok(())
-    }
-    remap_routes(&mut config.routes, ids)?;
-    for value in scenarios {
-        let mut routes: crate::model::routes::RoutesConfig =
-            serde_json::from_value(value["content"]["routes"].clone())?;
-        remap_routes(&mut routes, ids)?;
-        value["content"]["routes"] = serde_json::to_value(routes)?;
-        if let Some(accounts) = value["content"]["externalAccounts"].as_array_mut() {
-            for account in accounts {
-                let id = account["id"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("场景账号缺少 id"))?;
-                account["id"] = serde_json::json!(
-                    ids.get(&id)
-                        .ok_or_else(|| anyhow::anyhow!("场景引用了导入包中不存在的账号: {id}"))?
-                );
-            }
-        }
-    }
-    Ok(())
 }

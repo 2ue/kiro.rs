@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS: u32 = 4;
 pub(crate) const MIN_INFERENCE_UPSTREAM_MAX_ATTEMPTS: u32 = 1;
 pub(crate) const MAX_INFERENCE_UPSTREAM_MAX_ATTEMPTS: u32 = 10;
 
@@ -74,6 +73,7 @@ impl InferenceAttemptBudget {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record_credential_dispatch_elapsed(&self, elapsed: Duration) {
         saturating_add_ms(&self.credential_dispatch_elapsed_ms, elapsed);
     }
@@ -119,6 +119,7 @@ impl InferenceAttemptBudget {
         self.dispatch_deadline.get().copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatch_remaining(&self) -> Option<Duration> {
         self.dispatch_deadline()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))

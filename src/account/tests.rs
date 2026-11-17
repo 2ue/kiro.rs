@@ -4653,9 +4653,10 @@ fn account_coordinator_breaker_uses_bounded_exponential_backoff() {
 
 #[test]
 fn account_coordinator_admission_saturation_preserves_typed_error_without_opening_breaker() {
-    let mut breaker = AccountCoordinatorBreaker::default();
-    breaker.operation_semaphore = Arc::new(Semaphore::new(1));
-    let breaker = Arc::new(breaker);
+    let breaker = Arc::new(AccountCoordinatorBreaker {
+        operation_semaphore: Arc::new(Semaphore::new(1)),
+        ..Default::default()
+    });
     let permit = breaker.try_begin().unwrap();
     let open = breaker.try_begin().err().unwrap();
     assert_eq!(open.kind, AccountCoordinatorOpenKind::AdmissionSaturated);
@@ -13222,11 +13223,12 @@ async fn legacy_zero_external_wait_reaches_a_bounded_final_error() {
         dispatch_max_wait_secs: 0,
         ..AccountsConfig::default()
     };
-    assert_eq!(config.effective_dispatch_max_wait_secs(), 5);
+    // 0 表示“使用默认”，默认等待 60 秒（04 章）；这里把开始时间拨到 61 秒前让它立刻到期。
+    assert_eq!(config.effective_dispatch_max_wait_secs(), 60);
 
     let route = test_route("claude-sonnet-4-5");
     let mut queue_guard = None;
-    let mut wait_started_at = Some(Instant::now() - Duration::from_secs(31));
+    let mut wait_started_at = Some(Instant::now() - Duration::from_secs(61));
     let mut capacity_waiter = manager.capacity_signal.register();
     let decision = manager
         .handle_capacity_unavailable(

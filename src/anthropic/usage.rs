@@ -527,27 +527,6 @@ pub(crate) struct RequestRejectionUsageContext {
 }
 
 impl RequestRejectionUsageContext {
-    pub(crate) fn from_request(
-        payload: &crate::anthropic::types::MessagesRequest,
-        resolution: Option<&crate::anthropic::model_capabilities::ModelResolution>,
-    ) -> Self {
-        Self {
-            model: non_empty_string(&payload.model),
-            stream: Some(payload.stream),
-            requested_max_tokens: (payload.max_tokens > 0).then_some(payload.max_tokens),
-            upstream_model: resolution.and_then(|resolution| {
-                resolution
-                    .upstream_model
-                    .as_deref()
-                    .and_then(non_empty_string)
-            }),
-            model_resolution_source: resolution
-                .map(|resolution| resolution.source.as_str().to_string()),
-            model_resolution_note: resolution
-                .and_then(|resolution| resolution.note.as_deref().and_then(non_empty_string)),
-        }
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.model.is_none()
             && self.stream.is_none()
@@ -556,11 +535,6 @@ impl RequestRejectionUsageContext {
             && self.model_resolution_source.is_none()
             && self.model_resolution_note.is_none()
     }
-}
-
-fn non_empty_string(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Builds a bounded diagnostic record for a sampled gateway rejection.
@@ -1437,14 +1411,6 @@ pub struct UsageOverviewAccountRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageOverviewRouteRow {
-    pub key: String,
-    pub label: String,
-    pub metrics: UsageOverviewMetrics,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UsageOverviewRankRow {
     pub key: String,
     pub label: String,
@@ -1501,15 +1467,6 @@ pub struct UsageOverviewSeriesResponse {
     pub range: UsageOverviewRange,
     pub series: Vec<UsageOverviewSeriesPoint>,
     pub series_groups: UsageOverviewSeriesGroups,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageOverviewExternalResponse {
-    pub generated_at: String,
-    pub timezone: String,
-    pub range: UsageOverviewRange,
-    pub external: UsageOverviewExternal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

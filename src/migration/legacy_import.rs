@@ -416,15 +416,14 @@ fn migrate_global_features(value: &mut Value, report: &mut MigrationReport) {
         ("imageProcessing", "imageProcessing"),
     ] {
         if let Some(mut config) = root.remove(old) {
-            if old == "localRequestCompat" {
-                if let Some(fields) = config.as_object_mut() {
-                    if let Some(v) = fields.remove("zeroUsageOnHoldExpiredMessageStart") {
-                        report.discarded(
-                            "runtimeConfig.localRequestCompat.zeroUsageOnHoldExpiredMessageStart",
-                            &v,
-                        );
-                    }
-                }
+            if old == "localRequestCompat"
+                && let Some(fields) = config.as_object_mut()
+                && let Some(v) = fields.remove("zeroUsageOnHoldExpiredMessageStart")
+            {
+                report.discarded(
+                    "runtimeConfig.localRequestCompat.zeroUsageOnHoldExpiredMessageStart",
+                    &v,
+                );
             }
             let enabled = match old {
                 "missingMaxTokens" => config["policy"] != "reject",
@@ -559,16 +558,17 @@ fn clean_injection_items(
             report.discarded(&format!("{path}.{key}"), &old);
             continue;
         }
-        if !text {
-            if let Some(fields) = items.get_mut(&key).and_then(Value::as_object_mut) {
-                if let Some(old) = fields.remove("externalPool") {
-                    if old == false && fields.get("enabled") == Some(&json!(true)) {
-                        report.local_injections.push(format!("{path}.{key}"));
-                        report.highlights.push(format!("{path}.{key}: 原 externalPool=false 且 enabled=true，导入后会对账号生效"));
-                    }
-                    report.discarded(&format!("{path}.{key}.externalPool"), &old);
-                }
+        if !text
+            && let Some(fields) = items.get_mut(&key).and_then(Value::as_object_mut)
+            && let Some(old) = fields.remove("externalPool")
+        {
+            if old == false && fields.get("enabled") == Some(&json!(true)) {
+                report.local_injections.push(format!("{path}.{key}"));
+                report.highlights.push(format!(
+                    "{path}.{key}: 原 externalPool=false 且 enabled=true，导入后会对账号生效"
+                ));
             }
+            report.discarded(&format!("{path}.{key}.externalPool"), &old);
         }
     }
 }

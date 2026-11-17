@@ -356,25 +356,25 @@ pub async fn auth_middleware(
                 .request_api_key_policies()
                 .iter()
                 .find(|policy| auth::request_api_key_id(&policy.api_key) == identity.stable_id())
+                .filter(|policy| !policy.allowed_routes.is_empty())
             {
-                if !policy.allowed_routes.is_empty() {
-                    let prefix = config
-                        .compiled_routes
-                        .as_ref()
-                        .and_then(|routes| routes.match_endpoint(endpoint))
-                        .map(|route| route.config.prefix.as_str());
-                    let allowed = prefix.is_some_and(|prefix| {
-                        policy.allowed_routes.iter().any(|rule| {
-                            crate::model::routes::normalize_route_prefix(rule) == prefix
-                        })
-                    });
-                    if !allowed {
-                        return envelope::error_response(
-                            StatusCode::FORBIDDEN,
-                            "permission_error",
-                            "API key is not allowed to access this route",
-                        );
-                    }
+                let prefix = config
+                    .compiled_routes
+                    .as_ref()
+                    .and_then(|routes| routes.match_endpoint(endpoint))
+                    .map(|route| route.config.prefix.as_str());
+                let allowed = prefix.is_some_and(|prefix| {
+                    policy
+                        .allowed_routes
+                        .iter()
+                        .any(|rule| crate::model::routes::normalize_route_prefix(rule) == prefix)
+                });
+                if !allowed {
+                    return envelope::error_response(
+                        StatusCode::FORBIDDEN,
+                        "permission_error",
+                        "API key is not allowed to access this route",
+                    );
                 }
             }
             request.extensions_mut().insert(identity);

@@ -13823,9 +13823,11 @@ fn process_non_stream_response_usage(
     projection: Option<&ExternalUsageProjectionContext>,
     known_tool_names: impl IntoIterator<Item = String>,
 ) -> ProjectedNonStreamBody {
-    let mut usage_capture = ExternalUsageCapture::default();
-    usage_capture.request_input_tokens =
-        route.map(|route| estimated_external_request_input_tokens(route, projection));
+    let mut usage_capture = ExternalUsageCapture {
+        request_input_tokens: route
+            .map(|route| estimated_external_request_input_tokens(route, projection)),
+        ..Default::default()
+    };
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         if let Some(estimated) =
             estimate_unrecognized_non_stream_response_usage(route, projection, None)

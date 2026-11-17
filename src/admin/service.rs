@@ -33,10 +33,10 @@ use crate::anthropic::{
     request_admission::RequestAdmissionController,
     usage::{
         UsageAccountRiskCostConfig, UsageAccountRiskQuery, UsageAccountRiskResponse,
-        UsageDashboardResponse, UsageOverviewExternalResponse, UsageOverviewRankingsResponse,
-        UsageOverviewResponse, UsageOverviewSeriesResponse, UsageOverviewSpec,
-        UsageOverviewSummaryResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
-        UsageRecordsPageResult, UsageRecordsResult, UsageSummary, resolve_usage_overview_spec,
+        UsageDashboardResponse, UsageOverviewRankingsResponse, UsageOverviewResponse,
+        UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse,
+        UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
+        UsageRecordsResult, UsageSummary, resolve_usage_overview_spec,
     },
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
@@ -1870,32 +1870,6 @@ impl AdminService {
             range: overview.range,
             series: overview.series,
             series_groups: overview.series_groups,
-        })
-    }
-
-    pub fn get_usage_dashboard_overview_external(
-        &self,
-        timezone: Option<String>,
-        range: Option<String>,
-        from: Option<String>,
-        to: Option<String>,
-        granularity: Option<String>,
-        top_n: Option<usize>,
-    ) -> Result<UsageOverviewExternalResponse, AdminServiceError> {
-        let spec = self.resolve_usage_overview_spec(
-            timezone.as_deref(),
-            range.as_deref(),
-            from.as_deref(),
-            to.as_deref(),
-            granularity.as_deref(),
-            top_n,
-        )?;
-        let overview = self.get_cached_usage_dashboard_overview(spec)?;
-        Ok(UsageOverviewExternalResponse {
-            generated_at: overview.generated_at,
-            timezone: overview.timezone,
-            range: overview.range,
-            external: overview.external,
         })
     }
 

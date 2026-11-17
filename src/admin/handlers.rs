@@ -723,25 +723,6 @@ pub async fn get_usage_dashboard(
     }
 }
 
-/// GET /api/admin/usage-dashboard/overview
-/// 获取账号的 rollup-first 总览。
-pub async fn get_usage_dashboard_overview(
-    State(state): State<AdminState>,
-    Query(params): Query<UsageOverviewQueryParams>,
-) -> impl IntoResponse {
-    match state.service.get_usage_dashboard_overview(
-        params.timezone,
-        params.range,
-        params.from,
-        params.to,
-        params.granularity,
-        params.top_n,
-    ) {
-        Ok(data) => Json(data).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
 /// GET /api/admin/usage-dashboard/overview/summary
 pub async fn get_usage_dashboard_overview_summary(
     State(state): State<AdminState>,
@@ -766,24 +747,6 @@ pub async fn get_usage_dashboard_overview_series(
     Query(params): Query<UsageOverviewQueryParams>,
 ) -> impl IntoResponse {
     match state.service.get_usage_dashboard_overview_series(
-        params.timezone,
-        params.range,
-        params.from,
-        params.to,
-        params.granularity,
-        params.top_n,
-    ) {
-        Ok(data) => Json(data).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// GET /api/admin/usage-dashboard/overview
-pub async fn get_usage_dashboard_overview_external(
-    State(state): State<AdminState>,
-    Query(params): Query<UsageOverviewQueryParams>,
-) -> impl IntoResponse {
-    match state.service.get_usage_dashboard_overview_external(
         params.timezone,
         params.range,
         params.from,

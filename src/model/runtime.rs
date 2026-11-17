@@ -18,6 +18,7 @@ type Validator = Box<dyn Fn(&Config) -> anyhow::Result<()> + Send + Sync>;
 pub enum RuntimeConfigChangeReason {
     Updated,
     Reloaded,
+    #[cfg(test)]
     LocalInstall,
 }
 
@@ -26,7 +27,6 @@ pub struct RuntimeConfigStore {
     generation: AtomicU64,
     postgres: Option<Arc<PostgresStore>>,
     mutation: Mutex<()>,
-    saved_version: RwLock<Option<i64>>,
     validator: RwLock<Option<Validator>>,
     listeners: RwLock<Vec<Listener>>,
 }
@@ -44,7 +44,6 @@ impl RuntimeConfigStore {
             generation: AtomicU64::new(next_config_generation()),
             postgres,
             mutation: Mutex::new(()),
-            saved_version: RwLock::new(None),
             validator: RwLock::new(None),
             listeners: RwLock::new(Vec::new()),
         })
@@ -59,6 +58,7 @@ impl RuntimeConfigStore {
         (config.clone(), self.generation.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -67,17 +67,13 @@ impl RuntimeConfigStore {
         Config::clone(&self.config.read())
     }
 
+    #[cfg(test)]
     pub fn set_validator(&self, validator: Validator) {
         *self.validator.write() = Some(validator);
     }
 
     pub fn subscribe(&self, listener: Listener) {
         self.listeners.write().push(listener);
-    }
-
-    /// 当前更新已保存的 PG version，供同步订阅回调发布 Redis 通知。
-    pub(crate) fn saved_version(&self) -> Option<i64> {
-        *self.saved_version.read()
     }
 
     pub fn update(&self, mutate: impl FnOnce(&mut Config)) -> anyhow::Result<Option<i64>> {
@@ -97,7 +93,6 @@ impl RuntimeConfigStore {
         } else {
             None
         };
-        *self.saved_version.write() = version;
         self.install(previous, updated, RuntimeConfigChangeReason::Updated);
         Ok(version)
     }
@@ -120,6 +115,7 @@ impl RuntimeConfigStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn install_local(&self, mutate: impl FnOnce(&mut Config)) {
         let _mutation = self.mutation.lock();
         let previous = self.snapshot();

@@ -681,7 +681,15 @@ fn multimodal_preprocessing_error_response(message: String) -> Response {
         );
         response
     } else {
-        envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+        // 与 messages 入口的拒绝一致：文案末尾带请求编号，便于按日志定位。
+        let request_id = envelope::request_id();
+        envelope::error_response_with_id_and_headers(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::public_message_with_error_id(&message, &request_id),
+            &request_id,
+            [("x-error-id", request_id.clone())],
+        )
     }
 }
 
