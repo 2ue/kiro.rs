@@ -5102,7 +5102,10 @@ impl AccountManager {
             static_pools.push(account_eligibility_from_pool(pool));
         }
         Self::sort_static_pool_eligibility(&mut static_pools);
-        if upsert_pool.is_some() || had_previous_static_pools {
+        // 只有手里有一份完整的旧快照时才能就地合并本次变更；旧快照已过期时直接作废，
+        // 让下一次请求从 PgSQL 读全量。否则"只含本次变更账号"的快照会被当成完整列表，
+        // 其它账号在新快照过期前全部不可调度（低流量时编辑账号即触发）。
+        if had_previous_static_pools {
             let (static_fresh_ttl, static_stale_ttl) = self.static_snapshot_ttls(generation);
             let _ = self.publish_static_pool_snapshot_arc(
                 generation,
@@ -5140,7 +5143,8 @@ impl AccountManager {
             authoritative_pools.push(pool.clone());
         }
         Self::sort_authoritative_pools(&mut authoritative_pools);
-        if upsert_pool.is_some() || had_previous_authoritative_pools {
+        // 同上：没有完整旧快照就不发布局部快照，交给下一次读取走 PgSQL 全量加载。
+        if had_previous_authoritative_pools {
             let _ = self.publish_authoritative_pool_snapshot_success_arc(
                 generation,
                 Arc::new(authoritative_pools),
@@ -14064,10 +14068,14 @@ fn classify_external_error(
         )
         .with_raw_upstream_error(Some(raw_upstream_error));
     }
+    // 正文没指明模型问题的裸 404，多半是该账号的服务地址或路径配错，换个账号就能成功。
+    // 标为可重试只是把是否换号交还给 retryStatusCodes（默认含 404）；不写冷却、不自动禁用，
+    // 避免请求本身引用了不存在的资源时误伤账号，降权只靠被动质量采样。
+    let retryable = status == StatusCode::NOT_FOUND;
     classified_external_error(
         status,
         "external upstream returned an unexpected error",
-        false,
+        retryable,
         None,
         None,
     )

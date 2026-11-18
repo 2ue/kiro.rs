@@ -6349,6 +6349,94 @@ async fn account_local_mutations_keep_all_pools_when_own_event_is_observed() {
     postgres.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_local_mutation_after_snapshot_expiry_keeps_other_pools_dispatchable() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let config = AccountsConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let first = postgres
+        .create_account(create_pool_request("expiry-first", 0, true))
+        .await
+        .unwrap();
+    let second = postgres
+        .create_account(create_pool_request("expiry-second", 5, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .load_authoritative_pool_snapshot()
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // 低流量时两份快照都会过期（stale_until 已过）；此时编辑一个账号不能把"只含该账号"的
+    // 局部列表当成完整快照发布，否则另一个账号在新快照过期前无法被调度、也无法切号。
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("monotonic clock has at least one second of history");
+    if let Some(snapshot) = manager.authoritative_pool_snapshot.lock().as_mut() {
+        snapshot.fresh_until = expired;
+        snapshot.stale_until = expired;
+    }
+    if let Some(snapshot) = manager.static_pool_snapshot.lock().as_mut() {
+        snapshot.fresh_until = expired;
+        snapshot.stale_until = expired;
+    }
+    let edited = postgres
+        .update_account(
+            first.id,
+            UpdateAccountRequest {
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                ..UpdateAccountRequest::default()
+            },
+        )
+        .await
+        .unwrap()
+        .expect("edited pool remains present");
+    manager.notify_account_data_changed_with_local_pool("test_local_update", &edited);
+
+    let snapshot = manager.load_authoritative_pool_snapshot().await.unwrap();
+    let mut ids = snapshot.iter().map(|pool| pool.id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![first.id, second.id],
+        "an edit after snapshot expiry must reload every pool, not publish only the edited one"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .find(|pool| pool.id == first.id)
+            .map(|pool| pool.base_url.as_str()),
+        Some("http://127.0.0.1:1"),
+        "the reloaded snapshot must carry the edit"
+    );
+    let failover = manager
+        .scan_pool_availability_from_snapshot(
+            &snapshot,
+            &HashSet::from([first.id]),
+            &config,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        failover.selected_pool.map(|pool| pool.id),
+        Some(second.id),
+        "after the edited pool fails, the request must still fail over to the other pool"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test]
 async fn account_manager_distinguishes_global_capacity_from_no_pool() {
     let Some((manager, postgres)) = test_account_manager().await else {
@@ -6873,6 +6961,92 @@ async fn account_not_found_invalid_model_uses_default_cross_pool_retry_status_co
         AccountForwardOutcome::Response(response) => response,
         AccountForwardOutcome::FinalError(error) => {
             panic!("404 invalid-model should fail over to the next pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn account_error_classifies_bare_not_found_as_retryable_without_cooldown() {
+    let err = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(br#"{"message":"not found"}"#),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+
+    assert!(
+        err.retryable,
+        "裸 404 必须交给 retryStatusCodes 决定是否换号"
+    );
+    assert!(
+        err.cooldown.is_none(),
+        "裸 404 不能写冷却，避免请求自身问题误伤账号"
+    );
+    assert!(err.auto_disable_reason.is_none(), "裸 404 不能触发自动禁用");
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &AccountsConfig::default(),
+        &err
+    ));
+    assert!(!retry_pipeline::should_retry_cross_pool(
+        &AccountsConfig {
+            retry_status_codes: vec![StatusCode::TOO_MANY_REQUESTS.as_u16()],
+            ..AccountsConfig::default()
+        },
+        &err
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_bare_not_found_fails_over_to_the_next_pool() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::NOT_FOUND,
+        fake_external_error_body("not found"),
+    )
+    .await;
+    let succeeding = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("bare-404-ok"),
+    )
+    .await;
+    create_messages_pool(&postgres, "bare-not-found-primary", 1, &failing.base_url).await;
+    create_messages_pool(
+        &postgres,
+        "bare-not-found-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 8,
+        retry_max_attempts: 2,
+        same_pool_retry_count: 0,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_bare_not_found_failover".to_string();
+    route.error_id = "err_bare_not_found_failover".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("bare 404 failover should finish")
+    {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("bare 404 from a misconfigured account must fail over: {error:?}")
         }
     };
     assert_eq!(response.status(), StatusCode::OK);
