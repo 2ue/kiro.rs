@@ -367,6 +367,99 @@ export function accountTrendViews(groups: UsageOverviewSeriesGroups): TrendView[
   ]
 }
 
+/** 每个成员一条平均耗时折线；时段内没有请求时断开，汇总按请求数加权。 */
+function durationLines(
+  groups: UsageOverviewSeriesGroup[],
+  rows: (point: UsageOverviewSeriesPoint) => UsageOverviewSeriesBreakdown[] | undefined,
+): TrendLine[] {
+  return stackSeries(groups.slice(0, MAX_STACK_MEMBERS), rows, () => 0).map((series) => {
+    const memberMetrics = (point: UsageOverviewSeriesPoint) => rows(point)?.find((item) => item.key === series.key)?.metrics
+    return {
+      key: `duration:${series.key}`,
+      name: series.name,
+      color: series.color,
+      value: (point) => {
+        const metrics = memberMetrics(point)
+        return metrics && metrics.requests > 0 ? metrics.averageDurationMs ?? 0 : null
+      },
+      aggregate: (points) => weightedAverageDuration(points, (point) => memberMetrics(point) ?? { requests: 0 }),
+    }
+  })
+}
+
+/**
+ * 路由分区：按路由前缀堆叠的可计费、上游成本、请求，以及每个路由的命中率与平均耗时。
+ * `labelOf` 把前缀换成路由配置里的显示名；配置里找不到时沿用前缀。
+ */
+export function routeTrendViews(
+  groups: UsageOverviewSeriesGroups,
+  labelOf: (routeKey: string) => string = (routeKey) => routeKey,
+): TrendView[] {
+  const routeGroups = (groups.routes ?? []).map((group) => ({ key: group.key, label: labelOf(group.key) }))
+  const rows = (point: UsageOverviewSeriesPoint) => point.routes
+  const byRoute = (pick: (metrics: UsageOverviewSeriesMetrics) => number) => stackSeries(routeGroups, rows, pick)
+  return [
+    {
+      key: 'billable',
+      label: '可计费',
+      format: 'usd',
+      bars: byRoute((m) => m.billableCostUsd),
+      lines: [{
+        key: 'rawCost',
+        name: '上游成本',
+        color: INK_COLOR,
+        reference: true,
+        value: (point) => point.all.rawCostUsd,
+        aggregate: (points) => sumOver(points, (point) => point.all.rawCostUsd),
+      }],
+      extraRows: [{ label: '毛利', value: (point) => formatUsdFixed2(point.all.profitUsd) }],
+      footnote: '柱子是各路由对下游的可计费金额，虚线是账号实际花出去的上游成本合计。',
+    },
+    {
+      key: 'rawCost',
+      label: '上游成本',
+      format: 'usd',
+      bars: byRoute((m) => m.rawCostUsd),
+      lines: [{
+        key: 'billable',
+        name: '可计费',
+        color: INK_COLOR,
+        reference: true,
+        value: (point) => point.all.billableCostUsd,
+        aggregate: (points) => sumOver(points, (point) => point.all.billableCostUsd),
+      }],
+      footnote: '柱子是各路由的请求实际花出去的上游成本，虚线是对下游的可计费金额合计。',
+    },
+    {
+      key: 'requests',
+      label: '请求',
+      format: 'count',
+      bars: byRoute((m) => m.requests),
+      extraRows: [{ label: '错误率', value: (point) => errorRate(point.all) }],
+    },
+    {
+      key: 'cacheHitRate',
+      label: '缓存命中率',
+      format: 'percent',
+      bars: [],
+      ratioAxis: true,
+      reference: HIT_RATE_REFERENCE,
+      lines: hitRateLines(routeGroups, rows),
+      headline: { label: '整体命中率', value: (points) => aggregateHitRate(points, (point) => point.all) },
+      footnote: HIT_RATE_FOOTNOTE,
+    },
+    {
+      key: 'duration',
+      label: '耗时',
+      format: 'ms',
+      bars: [],
+      lines: durationLines(routeGroups, rows),
+      headline: { label: '平均耗时', value: (points) => weightedAverageDuration(points, (point) => point.all) },
+      footnote: '每条线是该路由时段内请求的平均总耗时，汇总按请求数加权；超过 5 个路由时只画前 5 个。',
+    },
+  ]
+}
+
 // ─── 图表 ───────────────────────────────────────────────────────────────────────
 
 type ChartRow = Record<string, number | string | boolean | null>

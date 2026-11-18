@@ -24,6 +24,7 @@ UsageRecordsPageQuery,
 UsageRecordsPageResult,
 UsageRecordsQuery,
 UsageRecordsResult,
+UsageRouteLatencyResponse,
 UsageSummary
 } from '@/types/api'
 
@@ -165,6 +166,21 @@ export type UsageAccountLatencyQuery = {
 /** 按账号的总耗时 / 首字延迟 p50 / p95 / p99；扫明细，范围最长 8 天。 */
 export async function getUsageAccountLatency(params: UsageAccountLatencyQuery = {}): Promise<UsageAccountLatencyResponse> {
   const { data } = await api.get<UsageAccountLatencyResponse>('/usage-dashboard/account-latency', {
+    params: { timezone: 'Asia/Shanghai', range: 'today', ...params },
+  })
+  return data
+}
+
+export type UsageRouteLatencyQuery = {
+  timezone?: string
+  range?: string
+  from?: string
+  to?: string
+}
+
+/** 按路由前缀的总耗时 / 首字延迟 p50 / p95 / p99；扫明细，范围最长 8 天。 */
+export async function getUsageRouteLatency(params: UsageRouteLatencyQuery = {}): Promise<UsageRouteLatencyResponse> {
+  const { data } = await api.get<UsageRouteLatencyResponse>('/usage-dashboard/route-latency', {
     params: { timezone: 'Asia/Shanghai', range: 'today', ...params },
   })
   return data

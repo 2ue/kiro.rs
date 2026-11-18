@@ -594,7 +594,7 @@ pub async fn usage_overview(
             json!({"generatedAt":overview.generated_at,"timezone":overview.timezone,"range":overview.range,
             "totals":overview.totals.all,"billing":overview.external,"series":overview.series.iter().map(|point| json!({"bucketStart":point.bucket_start,"label":point.label,"metrics":point.all})).collect::<Vec<_>>(),
             "topModels":overview.top_models,"topAccounts":overview.top_accounts,"topKeys":overview.top_keys,
-            "topPaths":overview.top_paths,"topErrors":overview.top_errors,
+            "topPaths":overview.top_paths,"topErrors":overview.top_errors,"routes":overview.routes,
             "accountCostUsd":overview.external.account_cost_usd,"rawTokens":overview.external.raw_tokens})
         });
     respond(result)

@@ -161,6 +161,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_usage_dashboard_account_latency),
         )
         .route(
+            "/usage-dashboard/route-latency",
+            get(get_usage_dashboard_route_latency),
+        )
+        .route(
             "/accounts/{id}/quality-history",
             get(get_account_quality_history),
         )

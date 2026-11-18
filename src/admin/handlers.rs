@@ -58,6 +58,8 @@ pub struct UsageRecordsQueryParams {
     pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
+    /// 路由前缀（默认路由传 `/`），精确匹配 `{前缀}/v1/` 开头的入口。
+    pub route: Option<String>,
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
@@ -82,6 +84,8 @@ pub struct UsageRecordsPageQueryParams {
     pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
+    /// 路由前缀（默认路由传 `/`），精确匹配 `{前缀}/v1/` 开头的入口。
+    pub route: Option<String>,
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
@@ -176,6 +180,7 @@ impl UsageRecordsQueryParams {
             request_id,
             q,
             endpoint: non_blank(self.endpoint),
+            route: non_blank(self.route),
             conversation_id: non_blank(self.conversation_id),
             request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
@@ -210,6 +215,7 @@ impl UsageRecordsPageQueryParams {
             request_id,
             q,
             endpoint: non_blank(self.endpoint),
+            route: non_blank(self.route),
             conversation_id: non_blank(self.conversation_id),
             request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
@@ -952,6 +958,23 @@ pub async fn get_usage_dashboard_account_latency(
     }
 }
 
+/// GET /api/admin/usage-dashboard/route-latency?range=today
+/// 按路由前缀的总耗时 / 首字延迟分位数；范围最长 8 天。
+pub async fn get_usage_dashboard_route_latency(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageOverviewQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_route_latency(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/accounts/{id}/quality-history?hours=24
 /// 账号质量分历史（错误率 / 首字 / 耗时 EWMA 快照），按时间升序。
 pub async fn get_account_quality_history(
@@ -1138,6 +1161,7 @@ mod tests {
             status: Some("".to_string()),
             source: Some("   ".to_string()),
             endpoint: Some("   ".to_string()),
+            route: None,
             stream: Some(true),
             min_cache_read: Some(10_000),
             min_first_token_latency_ms: Some(10_000),
@@ -1177,6 +1201,7 @@ mod tests {
             status: None,
             source: None,
             endpoint: None,
+            route: None,
             stream: None,
             min_cache_read: None,
             min_first_token_latency_ms: None,
@@ -1228,6 +1253,7 @@ mod tests {
             status: None,
             source: None,
             endpoint: None,
+            route: None,
             stream: None,
             min_cache_read: None,
             min_first_token_latency_ms: None,
@@ -1256,6 +1282,7 @@ mod tests {
             status: Some("ok".to_string()),
             source: None,
             endpoint: None,
+            route: None,
             stream: None,
             min_cache_read: None,
             min_first_token_latency_ms: None,
@@ -1279,6 +1306,7 @@ mod tests {
             status: None,
             source: Some("cache".to_string()),
             endpoint: None,
+            route: None,
             stream: None,
             min_cache_read: None,
             min_first_token_latency_ms: None,
@@ -1302,6 +1330,7 @@ mod tests {
             status: None,
             source: None,
             endpoint: None,
+            route: None,
             stream: None,
             min_cache_read: None,
             min_first_token_latency_ms: None,
@@ -1337,6 +1366,7 @@ mod tests {
             status: None,
             source: None,
             endpoint: Some("/ha".to_string()),
+            route: None,
             stream: None,
             min_cache_read: None,
             min_first_token_latency_ms: None,

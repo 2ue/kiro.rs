@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Timelike, Utc};
@@ -22,21 +22,23 @@ use crate::anthropic::pricing::{
     MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
 };
 use crate::anthropic::usage::{
-    REALTIME_USAGE_WINDOW_SECS, UsageAccountBillingByPool, UsageAccountBillingSummary,
-    UsageAccountLatencyResponse, UsageAccountLatencyRow, UsageAccountRiskBucket,
-    UsageAccountRiskCacheStats, UsageAccountRiskCostConfig, UsageAccountRiskCostStats,
-    UsageAccountRiskFilters, UsageAccountRiskGroup, UsageAccountRiskQuery,
-    UsageAccountRiskResponse, UsageAccountRiskSample, UsageAccountRiskThresholds,
-    UsageAccountRiskTotals, UsageAccountRiskWindow, UsageAggregate, UsageBreakdownItem,
-    UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop,
-    UsageDashboardWindow, UsageDashboardWindowSpec, UsageOverviewExternal, UsageOverviewMetrics,
-    UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse,
-    UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup, UsageOverviewSeriesGroups,
-    UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals,
-    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
-    UsageRecordsResult, UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary,
-    UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
-    usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
+    REALTIME_USAGE_WINDOW_SECS, USAGE_DEFAULT_ROUTE_KEY, UsageAccountBillingByPool,
+    UsageAccountBillingSummary, UsageAccountLatencyResponse, UsageAccountLatencyRow,
+    UsageAccountRiskBucket, UsageAccountRiskCacheStats, UsageAccountRiskCostConfig,
+    UsageAccountRiskCostStats, UsageAccountRiskFilters, UsageAccountRiskGroup,
+    UsageAccountRiskQuery, UsageAccountRiskResponse, UsageAccountRiskSample,
+    UsageAccountRiskThresholds, UsageAccountRiskTotals, UsageAccountRiskWindow, UsageAggregate,
+    UsageBreakdownItem, UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary,
+    UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec, UsageOverviewExternal,
+    UsageOverviewMetrics, UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse,
+    UsageOverviewRouteRow, UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup,
+    UsageOverviewSeriesGroups, UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint,
+    UsageOverviewSpec, UsageOverviewTotals, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
+    UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult, UsageRouteKind,
+    UsageRouteLatencyResponse, UsageRouteLatencyRow, UsageSeriesPoint, UsageSource, UsageSummary,
+    UsageTopAggregate, normalize_usage_route_filter, usage_dashboard_daily_windows,
+    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
+    usage_dashboard_windows, usage_route_prefix_for_endpoint,
 };
 use crate::model::config::{
     Config, ModelMappingRule, RouteRuleMode, StreamResponseMode, normalize_route_rules,
@@ -4012,6 +4014,9 @@ impl PostgresUsageStore {
         let mut keys = HashMap::<String, OverviewRankAccumulator>::new();
         let mut paths = HashMap::<String, OverviewRankAccumulator>::new();
         let mut errors = HashMap::<String, OverviewRankAccumulator>::new();
+        // 路由前缀 -> 指标与成本；入口集合单独记，给表格显示该路由下有哪些路径。
+        let mut routes = HashMap::<String, OverviewPoolAccumulator>::new();
+        let mut route_endpoints = HashMap::<String, BTreeSet<String>>::new();
 
         for row in rows {
             let bucket_start: DateTime<Utc> = row.try_get("bucket_start")?;
@@ -4090,6 +4095,46 @@ impl PostgresUsageStore {
                     if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
                         rank.label = label.to_string();
                     }
+                    // 每条记录都带完整计费列，所以入口维度按前缀合并就是路由口径，
+                    // 不需要新维度，也不需要回填历史。
+                    let route = usage_route_prefix_for_endpoint(&dimension_key);
+                    let costs = OverviewExternalCosts::from_row(&row)?;
+                    series
+                        .entry(series_key)
+                        .or_default()
+                        .routes
+                        .entry(route.clone())
+                        .or_default()
+                        .add(metrics, costs);
+                    series_groups.routes.add(
+                        &route,
+                        None,
+                        costs.billable_cost_usd,
+                        metrics.requests,
+                    );
+                    route_endpoints
+                        .entry(route.clone())
+                        .or_default()
+                        .insert(dimension_key.clone());
+                    let entry = routes.entry(route).or_default();
+                    entry.metrics.add(metrics);
+                    entry.account_cost_usd += row.try_get::<f64, _>("account_cost_usd")?;
+                    entry.raw_cost_usd += row.try_get::<f64, _>("account_raw_cost_usd")?;
+                    entry.shaped_cost_usd += row.try_get::<f64, _>("account_shaped_cost_usd")?;
+                    entry.uplifted_cost_usd +=
+                        row.try_get::<f64, _>("account_uplifted_cost_usd")?;
+                    entry.reported_cost_usd +=
+                        row.try_get::<f64, _>("account_reported_cost_usd")?;
+                    entry.billable_cost_usd +=
+                        row.try_get::<f64, _>("account_billable_cost_usd")?;
+                    entry.profit_usd += row.try_get::<f64, _>("account_profit_usd")?;
+                    entry.cost_floor_delta_usd +=
+                        row.try_get::<f64, _>("account_cost_floor_delta_usd")?;
+                    entry.cost_floor_applied_requests =
+                        entry.cost_floor_applied_requests.saturating_add(
+                            row.try_get::<i64, _>("account_cost_floor_applied_requests")?
+                                .max(0) as usize,
+                        );
                 }
                 "request_api_key" => {
                     let rank = keys.entry(dimension_key.clone()).or_default();
@@ -4112,6 +4157,34 @@ impl PostgresUsageStore {
         let series_groups = series_groups.finish();
         let series_points = overview_series_points(spec, series, &series_groups);
         let external_metrics = external.to_metrics();
+
+        let mut route_rows = routes
+            .into_iter()
+            .map(|(route, value)| UsageOverviewRouteRow {
+                endpoints: route_endpoints
+                    .remove(&route)
+                    .map(|set| set.into_iter().collect())
+                    .unwrap_or_default(),
+                route,
+                metrics: value.metrics.to_metrics(),
+                raw_cost_usd: value.raw_cost_usd,
+                shaped_cost_usd: value.shaped_cost_usd,
+                uplifted_cost_usd: value.uplifted_cost_usd,
+                reported_cost_usd: value.reported_cost_usd,
+                billable_cost_usd: value.billable_cost_usd,
+                profit_usd: value.profit_usd,
+                cost_floor_delta_usd: value.cost_floor_delta_usd,
+                cost_floor_applied_requests: value.cost_floor_applied_requests,
+                account_cost_usd: value.account_cost_usd.max(0.0),
+            })
+            .collect::<Vec<_>>();
+        route_rows.sort_by(|left, right| {
+            right
+                .billable_cost_usd
+                .total_cmp(&left.billable_cost_usd)
+                .then_with(|| right.metrics.requests.cmp(&left.metrics.requests))
+                .then_with(|| left.route.cmp(&right.route))
+        });
 
         let cost_floor_applied_requests = pools
             .values()
@@ -4225,6 +4298,7 @@ impl PostgresUsageStore {
                 raw_tokens: all.account_raw_tokens.max(0),
                 pools: pool_rows,
             },
+            routes: route_rows,
             series: series_points,
             series_groups,
             top_models,
@@ -4323,6 +4397,102 @@ impl PostgresUsageStore {
                 granularity: spec.granularity.clone(),
             },
             accounts,
+        })
+    }
+
+    /// 按路由前缀的总耗时与首字延迟 p50/p95/p99，扫 `usage_records` 明细，
+    /// 调用方同样把范围限制在 `USAGE_OVERVIEW_HOURLY_MAX_DAYS` 内。路由前缀在 SQL 里用
+    /// 贪婪匹配取最后一个 `/v1/` 之前的部分，与 `usage_route_prefix_for_endpoint` 同一口径。
+    pub async fn route_latency(
+        &self,
+        spec: &UsageOverviewSpec,
+    ) -> anyhow::Result<UsageRouteLatencyResponse> {
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = sqlx::query(
+            r#"
+            WITH scoped AS (
+                SELECT
+                    COALESCE(NULLIF(BTRIM(endpoint), ''), 'unknown') AS endpoint,
+                    duration_ms::double precision AS duration_ms,
+                    CASE
+                        WHEN data->>'firstTokenLatencyMs' ~ '^[0-9]+$'
+                        THEN (data->>'firstTokenLatencyMs')::double precision
+                        ELSE NULL
+                    END AS first_token_latency_ms
+                FROM usage_records
+                WHERE deleted_at IS NULL
+                  AND created_at >= $1
+                  AND created_at < $2
+            ),
+            routed AS (
+                SELECT
+                    CASE
+                        WHEN endpoint ~ '/v1(/|$)'
+                        THEN regexp_replace(endpoint, '^(.*)/v1(/.*)?$', '\1')
+                        ELSE endpoint
+                    END AS route,
+                    duration_ms,
+                    first_token_latency_ms
+                FROM scoped
+            )
+            SELECT
+                route,
+                COUNT(*)::bigint AS samples,
+                COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms), 0)::double precision AS p50_duration_ms,
+                COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::double precision AS p95_duration_ms,
+                COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms), 0)::double precision AS p99_duration_ms,
+                COUNT(first_token_latency_ms)::bigint AS first_token_samples,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY first_token_latency_ms)::double precision AS p50_first_token_latency_ms,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY first_token_latency_ms)::double precision AS p95_first_token_latency_ms,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY first_token_latency_ms)::double precision AS p99_first_token_latency_ms
+            FROM routed
+            GROUP BY route
+            ORDER BY samples DESC, route ASC
+            "#,
+        )
+        .bind(spec.from)
+        .bind(spec.to)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let routes = rows
+            .into_iter()
+            .map(|row| {
+                let route: String = row.try_get("route")?;
+                let route = route.trim().trim_end_matches('/').to_string();
+                Ok(UsageRouteLatencyRow {
+                    route: if route.is_empty() {
+                        USAGE_DEFAULT_ROUTE_KEY.to_string()
+                    } else {
+                        route
+                    },
+                    samples: row_i64_to_usize(&row, "samples")?,
+                    p50_duration_ms: row.try_get("p50_duration_ms")?,
+                    p95_duration_ms: row.try_get("p95_duration_ms")?,
+                    p99_duration_ms: row.try_get("p99_duration_ms")?,
+                    first_token_samples: row_i64_to_usize(&row, "first_token_samples")?,
+                    p50_first_token_latency_ms: row.try_get("p50_first_token_latency_ms")?,
+                    p95_first_token_latency_ms: row.try_get("p95_first_token_latency_ms")?,
+                    p99_first_token_latency_ms: row.try_get("p99_first_token_latency_ms")?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(UsageRouteLatencyResponse {
+            generated_at: Utc::now().to_rfc3339(),
+            timezone: spec.timezone.clone(),
+            range: crate::anthropic::usage::UsageOverviewRange {
+                key: spec.range_key.clone(),
+                requested_from: spec.requested_from.to_rfc3339(),
+                requested_to: spec.requested_to.to_rfc3339(),
+                from: spec.from.to_rfc3339(),
+                to: spec.to.to_rfc3339(),
+                data_through: spec.data_through.to_rfc3339(),
+                granularity: spec.granularity.clone(),
+            },
+            routes,
         })
     }
 
@@ -8680,6 +8850,21 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
         builder.push(" AND endpoint ILIKE ");
         builder.push_bind(format!("%{}%", endpoint));
     }
+    if let Some(route) = query
+        .route
+        .as_deref()
+        .and_then(normalize_usage_route_filter)
+    {
+        // 入口固定是 `{前缀}/v1/...`；默认路由的前缀为空，即 `/v1/` 开头。
+        let prefix = if route == USAGE_DEFAULT_ROUTE_KEY {
+            ""
+        } else {
+            route.as_str()
+        };
+        builder.push(" AND endpoint LIKE ");
+        builder.push_bind(format!("{}/v1/%", escape_like_pattern(prefix)));
+        builder.push(" ESCAPE '\\'");
+    }
     if let Some(conversation_id) = &query.conversation_id {
         builder.push(" AND conversation_id = ");
         builder.push_bind(conversation_id.clone());
@@ -9356,6 +9541,7 @@ struct OverviewSeriesAccumulator {
     all: OverviewSeriesCell,
     external: OverviewSeriesCell,
     accounts: HashMap<String, OverviewSeriesCell>,
+    routes: HashMap<String, OverviewSeriesCell>,
 }
 
 #[derive(Debug, Default)]
@@ -9408,12 +9594,14 @@ impl OverviewSeriesGroupAccumulator {
 #[derive(Debug, Default)]
 struct OverviewSeriesGroupsAccumulator {
     accounts: OverviewSeriesGroupAccumulator,
+    routes: OverviewSeriesGroupAccumulator,
 }
 
 impl OverviewSeriesGroupsAccumulator {
     fn finish(self) -> UsageOverviewSeriesGroups {
         UsageOverviewSeriesGroups {
             accounts: self.accounts.finish(|key| format!("#{key}")),
+            routes: self.routes.finish(str::to_string),
         }
     }
 }
@@ -9567,6 +9755,7 @@ fn overview_series_points(
                 all: values.all.to_series_metrics(),
                 external: values.external.to_series_metrics(),
                 accounts: overview_series_breakdown(&groups.accounts, &values.accounts),
+                routes: overview_series_breakdown(&groups.routes, &values.routes),
             }
         })
         .collect()
@@ -13099,6 +13288,173 @@ mod tests {
             .await
             .unwrap();
         assert!((since_now.credits - 2.0).abs() < 1e-9, "{since_now:?}");
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 路由页签：入口维度按路由前缀合并出完整指标与成本，时序按路由拆分，
+    /// 延迟分位与明细筛选用同一个前缀口径（自定义路由名含 v1 也不截错）。
+    #[tokio::test]
+    async fn postgres_overview_groups_endpoints_by_route_prefix() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let now = Utc::now();
+        let record = |id: &str, endpoint: &str, duration_ms: u64, account_cost: f64| {
+            let mut record = external_usage_record(id, 1.0, 0.8, 1.2);
+            record.created_at = now.to_rfc3339();
+            record.endpoint = endpoint.to_string();
+            record.duration_ms = duration_ms;
+            record.account_cost_usd = account_cost;
+            record
+        };
+        let cc_messages = record("route-cc-1", "/cc/v1/messages", 100, 1.5);
+        let mut cc_failed = record("route-cc-2", "/cc/v1/messages/count_tokens", 300, 0.5);
+        cc_failed.status = UsageRecordStatus::Error;
+        cc_failed.error_type = Some("overloaded".to_string());
+        let default_route = record("route-default", "/v1/messages", 50, 1.0);
+        let custom = record("route-custom", "/dfcache/v1/v1/messages", 70, 1.0);
+        usage_store
+            .record_batch(vec![
+                cc_messages.clone(),
+                cc_failed.clone(),
+                default_route.clone(),
+                custom.clone(),
+            ])
+            .await
+            .unwrap();
+
+        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
+            Utc::now(),
+            Some("UTC"),
+            Some("today"),
+            None,
+            None,
+            Some("hour"),
+            Some(10),
+        )
+        .unwrap();
+        let overview = usage_store.dashboard_overview(&spec).await.unwrap();
+        let route = |key: &str| {
+            overview
+                .routes
+                .iter()
+                .find(|row| row.route == key)
+                .unwrap_or_else(|| panic!("route {key} missing: {:?}", overview.routes))
+                .clone()
+        };
+        assert_eq!(overview.routes.len(), 3, "{:?}", overview.routes);
+        let cc = route("/cc");
+        assert_eq!(
+            cc.endpoints,
+            vec![
+                "/cc/v1/messages".to_string(),
+                "/cc/v1/messages/count_tokens".to_string()
+            ]
+        );
+        assert_eq!(cc.metrics.requests, 2);
+        assert_eq!(cc.metrics.success_requests, 1);
+        assert_eq!(cc.metrics.error_requests, 1);
+        assert!((cc.metrics.average_duration_ms - 200.0).abs() < 1e-9);
+        assert!((cc.account_cost_usd - 2.0).abs() < 1e-9, "{cc:?}");
+        let billing = cc_messages.account_billing.as_ref().expect("billing");
+        assert!(
+            (cc.raw_cost_usd - billing.raw_cost_usd * 2.0).abs() < 1e-9,
+            "{cc:?}"
+        );
+        assert!(
+            (cc.billable_cost_usd - billing.billable_cost_usd * 2.0).abs() < 1e-9,
+            "{cc:?}"
+        );
+        assert_eq!(route("/").metrics.requests, 1);
+        assert_eq!(route("/dfcache/v1").metrics.requests, 1);
+        // 路由合计与全局一致：每条记录只落一个路由。
+        let routed_requests: usize = overview.routes.iter().map(|row| row.metrics.requests).sum();
+        assert_eq!(routed_requests, overview.totals.all.requests);
+
+        // 时序：分组按可计费降序，/cc 两条记录排第一；每个点按路由拆分。
+        assert_eq!(
+            overview
+                .series_groups
+                .routes
+                .first()
+                .map(|group| group.key.as_str()),
+            Some("/cc"),
+            "{:?}",
+            overview.series_groups.routes
+        );
+        let point = overview
+            .series
+            .iter()
+            .find(|point| point.all.requests > 0)
+            .expect("series point");
+        let cc_point = point
+            .routes
+            .iter()
+            .find(|item| item.key == "/cc")
+            .expect("cc breakdown");
+        assert_eq!(cc_point.metrics.requests, 2);
+        assert_eq!(
+            point
+                .routes
+                .iter()
+                .map(|item| item.metrics.requests)
+                .sum::<usize>(),
+            4
+        );
+
+        // 延迟分位：同一前缀口径。
+        let latency = usage_store.route_latency(&spec).await.unwrap();
+        let latency_cc = latency
+            .routes
+            .iter()
+            .find(|row| row.route == "/cc")
+            .expect("cc latency");
+        assert_eq!(latency_cc.samples, 2);
+        assert!(
+            (latency_cc.p50_duration_ms - 200.0).abs() < 1e-9,
+            "{latency_cc:?}"
+        );
+        let mut latency_keys = latency
+            .routes
+            .iter()
+            .map(|row| row.route.clone())
+            .collect::<Vec<_>>();
+        latency_keys.sort();
+        assert_eq!(latency_keys, vec!["/", "/cc", "/dfcache/v1"]);
+
+        // 明细筛选：按前缀精确匹配，默认路由不吞掉其它路由。
+        for (route_filter, expected) in [
+            ("/cc", vec!["route-cc-1", "route-cc-2"]),
+            ("/", vec!["route-default"]),
+            ("/dfcache/v1", vec!["route-custom"]),
+            ("/dfcache/v1/", vec!["route-custom"]),
+            ("/ha", vec![]),
+        ] {
+            let page = usage_store
+                .query_page(
+                    UsageRecordQuery {
+                        route: Some(route_filter.to_string()),
+                        ..UsageRecordQuery::default()
+                    },
+                    1,
+                    50,
+                )
+                .await
+                .unwrap();
+            let mut ids = page
+                .records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids, expected, "route filter {route_filter}");
+        }
 
         store.drop_test_schema().await.unwrap();
     }

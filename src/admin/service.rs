@@ -37,7 +37,7 @@ use crate::anthropic::{
         UsageOverviewRankRow, UsageOverviewRankingsResponse, UsageOverviewResponse,
         UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse,
         UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
-        UsageRecordsResult, UsageSummary, resolve_usage_overview_spec,
+        UsageRecordsResult, UsageRouteLatencyResponse, UsageSummary, resolve_usage_overview_spec,
     },
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
@@ -2138,6 +2138,32 @@ impl AdminService {
         }
         self.usage_recorder
             .account_latency(spec, account_id)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    /// 按路由前缀的总耗时 / 首字延迟分位数。扫明细，范围同样限制在按小时总览的上限内。
+    pub fn get_usage_dashboard_route_latency(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<UsageRouteLatencyResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            None,
+            None,
+        )?;
+        if spec.to - spec.from > ChronoDuration::days(USAGE_OVERVIEW_HOURLY_MAX_DAYS) {
+            return Err(AdminServiceError::InvalidRequest(format!(
+                "路由延迟分位需要扫描用量明细，时间范围不能超过 {USAGE_OVERVIEW_HOURLY_MAX_DAYS} 天"
+            )));
+        }
+        self.usage_recorder
+            .route_latency(spec)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 

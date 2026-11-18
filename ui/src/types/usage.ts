@@ -364,6 +364,8 @@ export interface UsageOverviewSeriesPoint {
   external: UsageOverviewSeriesMetrics;
   /** 按账号拆分，成员与 `UsageOverviewSeriesGroups.accounts` 对应 */
   accounts: UsageOverviewSeriesBreakdown[];
+  /** 按路由前缀拆分（默认路由为 "/"），成员与 `UsageOverviewSeriesGroups.routes` 对应；旧后端不返回 */
+  routes?: UsageOverviewSeriesBreakdown[];
 }
 
 export interface UsageOverviewSeriesGroup {
@@ -374,6 +376,27 @@ export interface UsageOverviewSeriesGroup {
 export interface UsageOverviewSeriesGroups {
   /** 按上游原始成本降序 */
   accounts: UsageOverviewSeriesGroup[];
+  /** 按可计费降序；key 与 label 都是路由前缀，显示名由前端用路由配置替换；旧后端不返回 */
+  routes?: UsageOverviewSeriesGroup[];
+}
+
+/** 一个路由前缀在范围内的用量与计费，来自汇总表的入口维度按前缀合并。 */
+export interface UsageOverviewRouteRow {
+  /** 路由前缀：默认路由为 "/"，无法解析为 "unknown" */
+  route: string;
+  /** 该路由下出现过的入口路径，升序 */
+  endpoints: string[];
+  metrics: UsageOverviewMetrics;
+  rawCostUsd: number;
+  shapedCostUsd: number;
+  upliftedCostUsd: number;
+  reportedCostUsd: number;
+  billableCostUsd: number;
+  profitUsd: number;
+  costFloorDeltaUsd: number;
+  costFloorAppliedRequests: number;
+  /** 账号成本：上游原始成本 × 各账号成本倍率 */
+  accountCostUsd: number;
 }
 
 export interface UsageOverviewPoolRow {
@@ -440,6 +463,26 @@ export interface UsageAccountLatencyResponse {
   accounts: UsageAccountLatencyRow[];
 }
 
+/** 一个路由前缀在范围内的总耗时与首字延迟分位数（扫明细，范围最长 8 天） */
+export interface UsageRouteLatencyRow {
+  route: string;
+  samples: number;
+  p50DurationMs: number;
+  p95DurationMs: number;
+  p99DurationMs: number;
+  firstTokenSamples: number;
+  p50FirstTokenLatencyMs?: number | null;
+  p95FirstTokenLatencyMs?: number | null;
+  p99FirstTokenLatencyMs?: number | null;
+}
+
+export interface UsageRouteLatencyResponse {
+  generatedAt: string;
+  timezone: string;
+  range: UsageOverviewResponse["range"];
+  routes: UsageRouteLatencyRow[];
+}
+
 export interface UsageOverviewResponse {
   generatedAt: string;
   timezone: string;
@@ -477,6 +520,8 @@ export interface UsageOverviewResponse {
   topKeys: UsageOverviewRankRow[];
   topPaths: UsageOverviewRankRow[];
   topErrors: UsageOverviewRankRow[];
+  /** 按路由前缀汇总；旧后端不返回 */
+  routes?: UsageOverviewRouteRow[];
 }
 
 export interface UsageOverviewSummaryResponse {
@@ -816,6 +861,8 @@ export interface UsageRecordsQuery {
   requestApiKeyId?: string;
   q?: string;
   endpoint?: string;
+  /** 路由前缀精确匹配（默认路由传 "/"），匹配入口以 `{前缀}/v1/` 开头的记录 */
+  route?: string;
   conversationId?: string;
   accountId?: number;
   routeKind?: UsageRouteKindFilter;

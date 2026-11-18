@@ -728,6 +728,9 @@ pub struct UsageRecordQuery {
     pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
+    /// 路由前缀（默认路由为 `/`）：只匹配入口以 `{前缀}/v1/` 开头的记录，
+    /// 与总览"路由"页签的分组口径一致。
+    pub route: Option<String>,
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
@@ -750,6 +753,7 @@ impl Default for UsageRecordQuery {
             request_id: None,
             q: None,
             endpoint: None,
+            route: None,
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
@@ -765,6 +769,49 @@ impl Default for UsageRecordQuery {
             until: None,
         }
     }
+}
+
+/// 默认路由（空前缀）在统计里的键。
+pub const USAGE_DEFAULT_ROUTE_KEY: &str = "/";
+
+/// 从入口路径取路由前缀：入口固定是 `{前缀}/v1/...`，取最后一个 `/v1/` 之前的部分，
+/// 这样自定义路由名本身含 `v1`（如 `/dfcache/v1`）也不会被截错。默认路由返回 `/`，
+/// 空或 `unknown` 返回 `unknown`，不含 `/v1/` 的路径原样返回。
+pub fn usage_route_prefix_for_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() || endpoint == "unknown" {
+        return "unknown".to_string();
+    }
+    let Some(index) = endpoint.rfind("/v1/").or_else(|| {
+        endpoint
+            .ends_with("/v1")
+            .then(|| endpoint.len().saturating_sub(3))
+    }) else {
+        return endpoint.to_string();
+    };
+    let prefix = endpoint[..index].trim_end_matches('/');
+    if prefix.is_empty() {
+        USAGE_DEFAULT_ROUTE_KEY.to_string()
+    } else {
+        prefix.to_string()
+    }
+}
+
+/// 路由前缀筛选：把 `/` 归一成默认路由的空前缀，其余去掉结尾斜杠；空串表示不筛选。
+pub fn normalize_usage_route_filter(route: &str) -> Option<String> {
+    let route = route.trim();
+    if route.is_empty() {
+        return None;
+    }
+    if route == USAGE_DEFAULT_ROUTE_KEY {
+        return Some(USAGE_DEFAULT_ROUTE_KEY.to_string());
+    }
+    let normalized = route.trim_end_matches('/');
+    Some(if normalized.starts_with('/') {
+        normalized.to_string()
+    } else {
+        format!("/{normalized}")
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1393,6 +1440,9 @@ pub struct UsageOverviewSeriesPoint {
     pub external: UsageOverviewSeriesMetrics,
     #[serde(default)]
     pub accounts: Vec<UsageOverviewSeriesBreakdown>,
+    /// 按路由前缀拆分（键同 `UsageOverviewRouteRow::route`）。
+    #[serde(default)]
+    pub routes: Vec<UsageOverviewSeriesBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1409,6 +1459,9 @@ pub struct UsageOverviewSeriesGroup {
 pub struct UsageOverviewSeriesGroups {
     #[serde(default)]
     pub accounts: Vec<UsageOverviewSeriesGroup>,
+    /// 范围内有流量的路由前缀，按可计费金额降序；label 是前缀，显示名由前端按路由配置替换。
+    #[serde(default)]
+    pub routes: Vec<UsageOverviewSeriesGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1440,6 +1493,27 @@ pub struct UsageOverviewPoolRow {
     /// 尝试口径平均耗时（毫秒）。
     #[serde(default)]
     pub attempt_average_duration_ms: f64,
+}
+
+/// 一个路由前缀在范围内的完整指标，从汇总表的 `endpoint` 维度按前缀合并得到。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewRouteRow {
+    /// 路由前缀；默认路由为 `/`，入口无法解析时为 `unknown`。
+    pub route: String,
+    /// 该路由下出现过的入口路径（升序）。
+    pub endpoints: Vec<String>,
+    pub metrics: UsageOverviewMetrics,
+    pub raw_cost_usd: f64,
+    pub shaped_cost_usd: f64,
+    pub uplifted_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub profit_usd: f64,
+    pub cost_floor_delta_usd: f64,
+    pub cost_floor_applied_requests: usize,
+    /// 账号成本：上游原始成本 × 各账号成本倍率。
+    pub account_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1496,6 +1570,31 @@ pub struct UsageAccountLatencyResponse {
     pub accounts: Vec<UsageAccountLatencyRow>,
 }
 
+/// 一个路由前缀在时间范围内的总耗时与首字延迟分位数，直接扫明细算出。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRouteLatencyRow {
+    /// 路由前缀，口径同 `UsageOverviewRouteRow::route`。
+    pub route: String,
+    pub samples: usize,
+    pub p50_duration_ms: f64,
+    pub p95_duration_ms: f64,
+    pub p99_duration_ms: f64,
+    pub first_token_samples: usize,
+    pub p50_first_token_latency_ms: Option<f64>,
+    pub p95_first_token_latency_ms: Option<f64>,
+    pub p99_first_token_latency_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRouteLatencyResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub routes: Vec<UsageRouteLatencyRow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageOverviewRange {
@@ -1516,6 +1615,9 @@ pub struct UsageOverviewResponse {
     pub range: UsageOverviewRange,
     pub totals: UsageOverviewTotals,
     pub external: UsageOverviewExternal,
+    /// 按路由前缀的完整指标（成本口径同账号表）。
+    #[serde(default)]
+    pub routes: Vec<UsageOverviewRouteRow>,
     pub series: Vec<UsageOverviewSeriesPoint>,
     #[serde(default)]
     pub series_groups: UsageOverviewSeriesGroups,
@@ -3311,6 +3413,22 @@ impl UsageRecorder {
         )
     }
 
+    /// 按路由前缀的总耗时 / 首字延迟分位数；扫明细，走同一个 dashboard 查询闸门。
+    pub fn route_latency(
+        &self,
+        spec: UsageOverviewSpec,
+    ) -> anyhow::Result<UsageRouteLatencyResponse> {
+        let Some(store) = &self.postgres_store else {
+            anyhow::bail!("路由延迟分位需要 PgSQL usage 明细存储");
+        };
+        let store = store.clone();
+        self.dashboard_query(
+            "PgSQL route latency percentiles",
+            USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+            async move { store.route_latency(&spec).await },
+        )
+    }
+
     pub fn dashboard_windows(
         &self,
         timezone: Option<&str>,
@@ -4186,6 +4304,14 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
             return false;
         }
     }
+    if let Some(route) = query
+        .route
+        .as_deref()
+        .and_then(normalize_usage_route_filter)
+        && usage_route_prefix_for_endpoint(&record.endpoint) != route
+    {
+        return false;
+    }
     if let Some(conversation_id) = &query.conversation_id {
         if record.conversation_id.as_ref() != Some(conversation_id) {
             return false;
@@ -4352,6 +4478,55 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::sync::{Notify, Semaphore};
+
+    /// 路由前缀取最后一个 `/v1/` 之前的部分；默认路由为 `/`。
+    #[test]
+    fn route_prefix_comes_from_the_last_v1_segment() {
+        for (endpoint, expected) in [
+            ("/v1/messages", "/"),
+            ("/v1/messages/count_tokens", "/"),
+            ("/cc/v1/messages", "/cc"),
+            ("/cc/v1/messages/count_tokens", "/cc"),
+            ("/dfcache/team-a/v1/messages", "/dfcache/team-a"),
+            ("/dfcache/v1/v1/messages", "/dfcache/v1"),
+            ("/cc/v1", "/cc"),
+            ("  /ha/v1/messages  ", "/ha"),
+            ("", "unknown"),
+            ("unknown", "unknown"),
+            ("/healthz", "/healthz"),
+        ] {
+            assert_eq!(
+                usage_route_prefix_for_endpoint(endpoint),
+                expected,
+                "{endpoint}"
+            );
+        }
+        assert_eq!(normalize_usage_route_filter(" "), None);
+        assert_eq!(normalize_usage_route_filter("/").as_deref(), Some("/"));
+        assert_eq!(normalize_usage_route_filter("/cc/").as_deref(), Some("/cc"));
+        assert_eq!(normalize_usage_route_filter("cc").as_deref(), Some("/cc"));
+    }
+
+    /// 内存查询的路由筛选与 PgSQL 同一口径：默认路由不吞其它路由。
+    #[test]
+    fn record_matches_route_filter_by_exact_prefix() {
+        let mut default_route = record("default", 0, UsageSource::UpstreamMetadata);
+        default_route.endpoint = "/v1/messages".to_string();
+        let mut cc = record("cc", 0, UsageSource::UpstreamMetadata);
+        cc.endpoint = "/cc/v1/messages".to_string();
+        let mut nested = record("nested", 0, UsageSource::UpstreamMetadata);
+        nested.endpoint = "/dfcache/cc/v1/messages".to_string();
+        let query = |route: &str| UsageRecordQuery {
+            route: Some(route.to_string()),
+            ..UsageRecordQuery::default()
+        };
+        assert!(record_matches(&default_route, &query("/")));
+        assert!(!record_matches(&cc, &query("/")));
+        assert!(record_matches(&cc, &query("/cc")));
+        assert!(!record_matches(&nested, &query("/cc")));
+        assert!(record_matches(&nested, &query("/dfcache/cc/")));
+        assert!(record_matches(&cc, &query("  ")));
+    }
 
     /// 请求密钥的“积分”限额按账号成本（上游原始成本 × 账号倍率）计数，不再固定写 0。
     #[test]

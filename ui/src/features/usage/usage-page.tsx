@@ -33,6 +33,8 @@ import {
 import { useModelPricing, useSyncModelPricing } from '@/hooks/use-models'
 import { getUsageRecords } from '@/api/usage-dashboard'
 import { getAccounts } from '@/api/accounts'
+import { getRoutes } from '@/api/routes'
+import { displayRoutePrefix, sortRoutes } from '@/features/routes/route-utils'
 import { cacheWriteTtlMarker, cacheWriteTtlTitle } from './cache-ttl-label'
 import { formatDate, formatCompact, formatNumber, formatPercent, formatUsdCsv, formatUsdFixed2, ratio } from '@/lib/format'
 import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
@@ -270,6 +272,45 @@ function FilterField({
   )
 }
 
+const ALL_ROUTES = '__all__'
+
+/** 路由筛选：值是路由前缀（默认路由为 "/"），与总览路由表跳过来的 `route` 参数一致。 */
+function RouteTargetSelect({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (value: string) => void
+}) {
+  const routes = useQuery({ queryKey: ['routes'], queryFn: getRoutes, staleTime: 30_000 })
+  const options = useMemo(
+    () => sortRoutes(routes.data ?? []).map((route) => {
+      const key = displayRoutePrefix(route.prefix)
+      const name = route.name.trim()
+      return { key, label: name && name !== key ? `${name} · ${key}` : key, enabled: route.enabled }
+    }),
+    [routes.data],
+  )
+  // 从总览带过来的前缀可能已在路由页删除：保留为一个选项，否则下拉显示不出当前条件。
+  const missing = value !== ALL_ROUTES && !options.some((option) => option.key === value)
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger size="sm" className="w-full">
+        <SelectValue placeholder="全部路由" />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={ALL_ROUTES}>全部路由</SelectItem>
+        {options.map((option) => (
+          <SelectItem key={option.key} value={option.key}>
+            {option.label}{option.enabled ? '' : '（停用）'}
+          </SelectItem>
+        ))}
+        {missing && <SelectItem value={value}>{value}（已删除）</SelectItem>}
+      </SelectContent>
+    </Select>
+  )
+}
+
 function AccountTargetSelect({
   value,
   onChange,
@@ -470,6 +511,8 @@ function RecordsView({
   const initialAccountSelection: AccountSelectionValue =
     Number.isFinite(initialAccountId) && initialAccountId > 0 ? `account:${initialAccountId}` : 'all'
   const [accountSelection, setAccountSelection] = useState<AccountSelectionValue>(initialAccountSelection)
+  // 总览路由表跳过来时带 route（路由前缀，默认路由为 "/"）。
+  const [route, setRoute] = useState(() => searchParams.get('route')?.trim() || ALL_ROUTES)
   const initialStatus = searchParams.get('status')
   const [status, setStatus] = useState<UsageRecordStatus | '__all__'>(
     initialStatus && ['success', 'error', 'stream_error', 'upstream_timeout', 'client_dropped'].includes(initialStatus)
@@ -523,6 +566,7 @@ function RecordsView({
     if (endpointD.trim()) next.endpoint = endpointD.trim()
     if (conversationIdD.trim()) next.conversationId = conversationIdD.trim()
     if (selectedAccountId !== undefined) next.accountId = selectedAccountId
+    if (route !== ALL_ROUTES) next.route = route
     if (status !== '__all__') next.status = status
     if (source !== '__all__') next.source = source
     if (streamMode !== 'all') next.stream = streamMode === 'stream'
@@ -545,6 +589,7 @@ function RecordsView({
     pageSize,
     qD,
     requestIdD,
+    route,
     normalizedRequestApiKeyId,
     selectedAccountId,
     sinceD,
@@ -565,12 +610,12 @@ function RecordsView({
     status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
     !!q.trim() || !!requestId.trim() || !!requestApiKeyId.trim() || !!model.trim() ||
     !!endpoint.trim() || !!conversationId.trim() ||
-    accountSelection !== 'all' || !!minCacheRead.trim() ||
+    accountSelection !== 'all' || route !== ALL_ROUTES || !!minCacheRead.trim() ||
     !!minFirstTokenLatencyMs.trim() || !!since.trim() || !!until.trim()
 
   const clearFilters = () => {
     setQ(''); setRequestId(''); setRequestApiKeyId(''); setModel(''); setEndpoint(''); setConversationId('')
-    setAccountSelection('all'); setStatus('__all__'); setSource('__all__')
+    setAccountSelection('all'); setRoute(ALL_ROUTES); setStatus('__all__'); setSource('__all__')
     setStreamMode('all'); setMinCacheRead(''); setMinFirstTokenLatencyMs(''); setSince(''); setUntil('')
   }
 
@@ -630,7 +675,7 @@ function RecordsView({
       >
         <div className="space-y-3 px-4 pt-4 pb-2">
           <div className="rounded-xl bg-card p-3 shadow-sm">
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1fr_1fr_1fr_0.9fr_0.95fr_auto]">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1fr_1fr_1fr_0.9fr_0.95fr_0.95fr_auto]">
               <FilterField label="请求 ID">
                 <Input
                   placeholder="req_..."
@@ -674,6 +719,9 @@ function RecordsView({
               </FilterField>
               <FilterField label="账号">
                 <AccountTargetSelect value={accountSelection} onChange={updateAccountSelection} />
+              </FilterField>
+              <FilterField label="路由">
+                <RouteTargetSelect value={route} onChange={(value) => { setRoute(value); setPage(1) }} />
               </FilterField>
               <div className="flex items-end gap-2">
                 <Button

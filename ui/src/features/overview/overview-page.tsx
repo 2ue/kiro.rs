@@ -6,19 +6,25 @@ import {
   AlertTriangle,
   ArrowLeft,
   DollarSign,
+  Edit3,
   Layers3,
   RefreshCw,
+  Route as RouteIcon,
   TrendingUp,
   Wallet,
   Zap,
 } from 'lucide-react'
 import { getAccounts, getAccountsStatus } from '@/api/accounts'
+import { getRoutes } from '@/api/routes'
+import { CACHE_STRATEGIES } from '@/features/cache-policies/route-cache-editor'
+import { routeEditorPath } from '@/features/routes/route-utils'
 import {
   useUsageAccountLatency,
   useUsageOverview,
   useUsageOverviewRankings,
   useUsageOverviewSeries,
   useUsageOverviewSummary,
+  useUsageRouteLatency,
   useUsageSummary,
 } from '@/hooks/use-usage'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
@@ -33,7 +39,14 @@ import {
   metricsShare,
   totalTokenUsage,
 } from './overview-metrics'
-import { OverviewTrendCard, accountTrendViews, summaryTrendViews } from './overview-trends'
+import { OverviewTrendCard, accountTrendViews, routeTrendViews, summaryTrendViews } from './overview-trends'
+import {
+  buildRouteOverviewRows,
+  routeInsights,
+  routeLabelResolver,
+  type RouteOverviewRow,
+  type RouteRowStatus,
+} from './route-overview'
 import { billingDeltaTextClass, billingDeltaTone } from '@/features/usage/usage-helpers'
 import { RequestApiKeyIdDisplay } from '@/features/usage/request-api-key-id'
 import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
@@ -46,7 +59,10 @@ import type {
   UsageOverviewMetrics,
   UsageOverviewPoolRow,
   UsageOverviewRankRow,
+  UsageOverviewRouteRow,
   UsageOverviewSeriesPoint,
+  UsageRouteLatencyRow,
+  RouteConfig,
 } from '@/types/api'
 import {
   Callout,
@@ -79,7 +95,7 @@ const TIMEZONE = 'Asia/Shanghai'
 const AUTO_REFRESH_KEY = 'claude-pool-admin:auto-refresh:overview'
 
 type PresetRange = 'today' | 'yesterday' | 'last24h' | 'last7d' | 'last30d' | 'thisMonth'
-type OverviewTab = 'summary' | 'accounts' | 'rankings'
+type OverviewTab = 'summary' | 'accounts' | 'routes' | 'rankings'
 type RankingDimension = 'models' | 'accounts' | 'keys' | 'paths' | 'errors'
 
 const PRESETS: Array<{ key: PresetRange; label: string }> = [
@@ -151,6 +167,8 @@ function usageLink(
   params: {
     accountId?: number
     endpoint?: string
+    /** 路由前缀，默认路由为 "/" */
+    route?: string
     model?: string
     requestApiKeyId?: string
     since: string
@@ -160,6 +178,7 @@ function usageLink(
   const search = new URLSearchParams()
   if (params.accountId) search.set('accountId', String(params.accountId))
   if (params.endpoint) search.set('endpoint', params.endpoint)
+  if (params.route) search.set('route', params.route)
   if (params.model) search.set('model', params.model)
   if (params.requestApiKeyId) search.set('requestApiKeyId', params.requestApiKeyId)
   if (params.since) search.set('since', localDateTimeValue(params.since))
@@ -602,6 +621,210 @@ function AccountsSection({
   )
 }
 
+// ─── 路由分区 ───────────────────────────────────────────────────────────────────
+
+const ROUTE_STATUS_BADGE: Record<RouteRowStatus, { label: string; tone: 'success' | 'neutral' | 'warning' }> = {
+  enabled: { label: '启用', tone: 'success' },
+  disabled: { label: '停用', tone: 'neutral' },
+  deleted: { label: '已删除', tone: 'neutral' },
+  unknown: { label: '未识别', tone: 'warning' },
+}
+
+/** 缓存策略名称沿用路由编辑页的叫法；未设置时按后端默认的本地模拟缓存。 */
+function routeStrategyLabel(route?: RouteConfig): string | undefined {
+  if (!route) return undefined
+  const type = route.cachePolicy?.cacheType ?? 'current_high_cache'
+  return CACHE_STRATEGIES.find(([key]) => key === type)?.[1] ?? type
+}
+
+function RoutesSection({
+  routes,
+  usage,
+  latency,
+  latencyUnavailable,
+  range,
+  navigate,
+}: {
+  routes: RouteConfig[]
+  usage: UsageOverviewRouteRow[]
+  /** 按路由的延迟分位；范围超过 8 天或接口失败时为空 */
+  latency: UsageRouteLatencyRow[]
+  latencyUnavailable: string
+  range: { from: string; to: string }
+  navigate: ReturnType<typeof useNavigate>
+}) {
+  const rows = buildRouteOverviewRows(routes, usage, latency)
+  const insights = routeInsights(rows)
+  const labelOf = routeLabelResolver(routes)
+  const totalBillableUsd = rows.reduce((sum, row) => sum + (row.usage?.billableCostUsd ?? 0), 0)
+  const rowLabel = (row: RouteOverviewRow) => labelOf(row.key)
+  return (
+    <SectionCard>
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          title="活跃路由"
+          value={formatNumber(insights.activeRoutes)}
+          desc={`已启用 ${formatNumber(insights.enabledRoutes)} / 已配置 ${formatNumber(insights.configuredRoutes)}${insights.unconfiguredActiveRoutes > 0 ? ` · ${formatNumber(insights.unconfiguredActiveRoutes)} 个已删除前缀仍有流量` : ''}`}
+          icon={<RouteIcon />}
+          tone="info"
+        />
+        <StatCard
+          title="可计费最高"
+          value={insights.topBillable ? formatUsdFixed2(insights.topBillable.usage?.billableCostUsd ?? 0) : '-'}
+          desc={insights.topBillable
+            ? `${rowLabel(insights.topBillable)} · 占 ${formatPercent(metricsShare(insights.topBillable.usage?.billableCostUsd ?? 0, totalBillableUsd))}`
+            : '当前范围没有可计费金额'}
+          icon={<DollarSign />}
+          tone="primary"
+        />
+        <StatCard
+          title="命中率最低"
+          value={insights.lowestHitRate ? formatHitRate(insights.lowestHitRate.rate) : '-'}
+          desc={insights.lowestHitRate
+            ? [rowLabel(insights.lowestHitRate.row), routeStrategyLabel(insights.lowestHitRate.row.route)].filter(Boolean).join(' · ')
+            : '当前范围没有输入 token'}
+          icon={<Layers3 />}
+          tone={insights.lowestHitRate ? HIT_RATE_TONE[cacheHitRateLevel(insights.lowestHitRate.rate)] : 'default'}
+        />
+        <StatCard
+          title="错误率最高"
+          value={insights.highestErrorRate ? formatPercent(insights.highestErrorRate.rate) : '无错误'}
+          desc={insights.highestErrorRate
+            ? `${rowLabel(insights.highestErrorRate.row)} · ${formatNumber(insights.highestErrorRate.row.usage?.metrics.errorRequests ?? 0)} / ${formatNumber(insights.highestErrorRate.row.usage?.metrics.requests ?? 0)} 次`
+            : '有流量的路由都没有错误请求'}
+          icon={<AlertTriangle />}
+          tone={!insights.highestErrorRate ? 'success' : insights.highestErrorRate.rate > 0.05 ? 'error' : 'warning'}
+        />
+      </div>
+      <div className="mt-3 rounded-lg bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
+        按请求进入的路由前缀汇总，前缀之后的入口路径（messages、count_tokens 等）合并计算；
+        <span className="ml-1 font-medium text-foreground/75">展示计费</span>
+        {' '}是整形后的中间口径，
+        <span className="ml-1 font-medium text-foreground/75">补偿后计费</span>
+        {' '}是最终上报口径，
+        <span className="ml-1 font-medium text-foreground/75">可计费</span>
+        {' '}取最终可计费金额，
+        <span className="ml-1 font-medium text-foreground/75">账号成本</span>
+        {' '}按各账号倍率折算。命中率随路由的缓存策略变化，对照策略名称看。
+        {latencyUnavailable && <span className="ml-1">耗时分位：{latencyUnavailable}</span>}
+      </div>
+      {rows.length === 0 ? (
+        <EmptyState title="暂无路由" className="mt-3 py-8" />
+      ) : (
+        <div className="mt-4 scrollbar-thin overflow-x-auto">
+          <Table className="min-w-[1500px] text-xs">
+            <TableHeader>
+              <TableRow>
+                <TableHead>路由</TableHead>
+                <TableHead className="text-right">请求</TableHead>
+                <TableHead className="text-right" title="错误请求 ÷ 请求数">错误率</TableHead>
+                <TableHead className="text-right">上游原始成本</TableHead>
+                <TableHead className="text-right" title="上游原始成本 × 账号成本倍率">账号成本</TableHead>
+                <TableHead className="text-right" title="按整形后的展示 usage 计算的中间成本">展示计费</TableHead>
+                <TableHead className="text-right" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</TableHead>
+                <TableHead className="text-right" title="最终对下游的可计费金额">可计费</TableHead>
+                <TableHead className="text-right">差额占原始</TableHead>
+                <TableHead className="text-right">原始/整形倍率</TableHead>
+                <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
+                <TableHead className="text-right" title="该路由请求总耗时的中位数 / 95 分位，直接按明细算">p50 / p95 耗时</TableHead>
+                <TableHead className="text-right" title="流式请求首字延迟的 95 分位">p95 首字</TableHead>
+                <TableHead className="text-right">未计价</TableHead>
+                <TableHead className="text-right">兜底</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((row) => {
+                const { key, route, name, status, usage: rowUsage, latency: rowLatency } = row
+                const metrics = rowUsage?.metrics ?? EMPTY_OVERVIEW_METRICS
+                const rawCostUsd = rowUsage?.rawCostUsd ?? 0
+                const shapedCostUsd = rowUsage?.shapedCostUsd ?? 0
+                const upliftedCostUsd = rowUsage?.upliftedCostUsd ?? 0
+                const rowDelta = rowUsage?.profitUsd ?? (upliftedCostUsd - rawCostUsd)
+                const rowTone = billingDeltaTone(rowDelta)
+                const badge = ROUTE_STATUS_BADGE[status]
+                const strategy = routeStrategyLabel(route)
+                const endpoints = rowUsage?.endpoints ?? []
+                return (
+                  <TableRow key={key}>
+                    <TableCell>
+                      <div className="flex min-w-[220px] flex-wrap items-center gap-1.5">
+                        {key === 'unknown' ? (
+                          <span className="text-xs font-semibold">{name}</span>
+                        ) : (
+                          <Button
+                            variant="link"
+                            size="xs"
+                            className="h-auto max-w-[220px] justify-start truncate px-0 text-left text-xs font-semibold"
+                            title={`路由 ${key} · 查看用量明细`}
+                            onClick={() => usageLink(navigate, { route: key, since: range.from, until: range.to })}
+                          >
+                            {name}
+                          </Button>
+                        )}
+                        <Badge tone={badge.tone} size="xs">{badge.label}</Badge>
+                        {metrics.requests === 0 && <Badge tone="secondary" size="xs">无流量</Badge>}
+                        {route && (
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            title="编辑路由"
+                            aria-label={`编辑路由 ${key}`}
+                            onClick={() => navigate(routeEditorPath(route.id))}
+                          >
+                            <Edit3 className="size-3" />
+                          </Button>
+                        )}
+                      </div>
+                      <div
+                        className="mt-0.5 font-mono text-[0.62rem] text-muted-foreground"
+                        title={endpoints.length > 0 ? `入口：${endpoints.join('、')}` : undefined}
+                      >
+                        {key}{strategy && <span className="font-sans"> · {strategy}</span>}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono" title={formatNumber(metrics.requests)}>{formatNumber(metrics.requests)}</TableCell>
+                    <TableCell
+                      className={cn('text-right font-mono', metrics.errorRate > 0.05 && 'text-destructive')}
+                      title={`${formatNumber(metrics.requests)} 次请求里错误 ${formatNumber(metrics.errorRequests)} 次`}
+                    >
+                      {metrics.requests > 0 ? formatPercent(metrics.errorRate) : '-'}
+                    </TableCell>
+                    <TableCell className="text-right font-mono">{formatUsdFixed2(rawCostUsd)}</TableCell>
+                    <TableCell className="text-right font-mono" title="上游原始成本 × 账号成本倍率">{formatUsdFixed2(rowUsage?.accountCostUsd ?? 0)}</TableCell>
+                    <TableCell className="text-right font-mono" title="整形后的中间成本口径">{formatUsdFixed2(shapedCostUsd)}</TableCell>
+                    <TableCell className="text-right font-mono" title="最终上报/补偿后成本口径">{formatUsdFixed2(upliftedCostUsd)}</TableCell>
+                    <TableCell className="text-right font-mono" title="最终对下游的可计费金额">{formatUsdFixed2(rowUsage?.billableCostUsd ?? 0)}</TableCell>
+                    <TableCell className={cn('text-right font-mono', billingDeltaTextClass(rowTone))}>
+                      <div>{rowDelta >= 0 ? '+' : ''}{formatUsdFixed2(rowDelta)}</div>
+                      <div className="text-[0.62rem]" title="当前路由差额 ÷ 当前路由上游原始成本">{costDeltaPercent(rowDelta, rawCostUsd)}</div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono" title="上游原始成本 ÷ 整形后展示成本">{costMultiplier(rawCostUsd, shapedCostUsd)}</TableCell>
+                    <TableCell className="text-right"><HitRateCell metrics={metrics} /></TableCell>
+                    <TableCell
+                      className="text-right font-mono"
+                      title={rowLatency ? `${formatNumber(rowLatency.samples)} 条请求 · p99 ${formatMs(rowLatency.p99DurationMs)}` : undefined}
+                    >
+                      {rowLatency ? `${formatMs(rowLatency.p50DurationMs)} / ${formatMs(rowLatency.p95DurationMs)}` : '-'}
+                    </TableCell>
+                    <TableCell
+                      className="text-right font-mono"
+                      title={rowLatency && rowLatency.firstTokenSamples > 0 ? `${formatNumber(rowLatency.firstTokenSamples)} 条流式请求 · p50 ${formatMs(rowLatency.p50FirstTokenLatencyMs)}` : undefined}
+                    >
+                      {rowLatency && rowLatency.firstTokenSamples > 0 ? formatMs(rowLatency.p95FirstTokenLatencyMs) : '-'}
+                    </TableCell>
+                    <TableCell className="text-right font-mono" title={formatNumber(metrics.unpricedRequests)}>{formatNumber(metrics.unpricedRequests)}</TableCell>
+                    <TableCell className="text-right font-mono" title={formatNumber(rowUsage?.costFloorAppliedRequests ?? 0)}>{formatNumber(rowUsage?.costFloorAppliedRequests ?? 0)}</TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </SectionCard>
+  )
+}
+
 // ─── 排行分区 ───────────────────────────────────────────────────────────────────
 
 /** 排行行的缓存命中率：后端给分子分母，这里按同一口径算。 */
@@ -773,7 +996,7 @@ export function OverviewPage() {
   const autoRefresh = useAutoRefreshPreference(AUTO_REFRESH_KEY, 30)
 
   const tabParam = searchParams.get('tab')
-  const activeTab: OverviewTab = tabParam === 'accounts' || tabParam === 'rankings' ? tabParam : 'summary'
+  const activeTab: OverviewTab = tabParam === 'accounts' || tabParam === 'routes' || tabParam === 'rankings' ? tabParam : 'summary'
 
   const rangeParam = searchParams.get('range')
   const isPreset = PRESETS.some((item) => item.key === rangeParam)
@@ -807,7 +1030,7 @@ export function OverviewPage() {
   const summary = useUsageOverviewSummary(queryParams, refreshInterval)
   // 全量接口额外带账号成本与上游原始量（汇总接口没有）；按账号拆分的计费表也在这里。
   const overview = useUsageOverview(queryParams, refreshInterval, !summary.isError)
-  const series = useUsageOverviewSeries(queryParams, refreshInterval, (activeTab === 'summary' || activeTab === 'accounts') && !summary.isError)
+  const series = useUsageOverviewSeries(queryParams, refreshInterval, (activeTab === 'summary' || activeTab === 'accounts' || activeTab === 'routes') && !summary.isError)
   const rankings = useUsageOverviewRankings(rankingQueryParams, refreshInterval, activeTab === 'rankings' && !summary.isError)
   // 延迟分位扫明细，后端限制 8 天以内：30 天 / 本月 / 过长的自定义范围不请求。
   const latencyRangeOk = rangeKey
@@ -818,6 +1041,9 @@ export function OverviewPage() {
     return rest
   }, [queryParams])
   const latency = useUsageAccountLatency(latencyParams, refreshInterval, activeTab === 'accounts' && latencyRangeOk && !summary.isError)
+  const routeLatency = useUsageRouteLatency(latencyParams, refreshInterval, activeTab === 'routes' && latencyRangeOk && !summary.isError)
+  // 路由配置给路由表补上无流量的路由、显示名、启停状态和缓存策略。
+  const routeConfigs = useQuery({ queryKey: ['routes'], queryFn: getRoutes, enabled: activeTab === 'routes', staleTime: 30_000 })
   // 实时 RPM 来自进程内最近 60 秒窗口，与时间范围无关。
   const usageSummary = useUsageSummary(autoRefresh.refetchInterval || 30000)
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: getAccounts, enabled: activeTab === 'accounts', refetchInterval: refreshInterval || 30000 })
@@ -914,10 +1140,17 @@ export function OverviewPage() {
     accountStatuses.error ? `账号状态：${extractErrorMessage(accountStatuses.error)}` : '',
     rankings.error ? `排行：${extractErrorMessage(rankings.error)}` : '',
     latency.error ? `账号耗时分位：${extractErrorMessage(latency.error)}` : '',
+    routeLatency.error ? `路由耗时分位：${extractErrorMessage(routeLatency.error)}` : '',
+    routeConfigs.error ? `路由配置：${extractErrorMessage(routeConfigs.error)}` : '',
   ].filter(Boolean)
   const latencyUnavailable = !latencyRangeOk
     ? '只在 8 天以内的范围计算（需要扫用量明细）'
     : latency.error
+      ? '读取失败'
+      : ''
+  const routeLatencyUnavailable = !latencyRangeOk
+    ? '只在 8 天以内的范围计算（需要扫用量明细）'
+    : routeLatency.error
       ? '读取失败'
       : ''
 
@@ -930,6 +1163,10 @@ export function OverviewPage() {
       void accounts.refetch()
       void accountStatuses.refetch()
       if (latencyRangeOk) void latency.refetch()
+    }
+    if (activeTab === 'routes') {
+      void routeConfigs.refetch()
+      if (latencyRangeOk) void routeLatency.refetch()
     }
     if (activeTab === 'rankings') void rankings.refetch()
   }
@@ -1027,6 +1264,7 @@ export function OverviewPage() {
         <TabsList className="w-full justify-start overflow-x-auto">
           <TabsTrigger value="summary">汇总</TabsTrigger>
           <TabsTrigger value="accounts">账号</TabsTrigger>
+          <TabsTrigger value="routes">路由</TabsTrigger>
           <TabsTrigger value="rankings">排行</TabsTrigger>
         </TabsList>
 
@@ -1073,6 +1311,33 @@ export function OverviewPage() {
                 statuses={accountStatuses.data?.accounts ?? []}
                 latency={latencyRangeOk ? latency.data?.accounts ?? [] : []}
                 latencyUnavailable={latencyUnavailable}
+                range={summaryData.range}
+                navigate={navigate}
+              />
+            )}
+          </div>
+        </TabsContent>
+
+        <TabsContent value="routes">
+          <div className="space-y-3">
+            <OverviewTrendCard
+              title="路由分时趋势"
+              icon={<RouteIcon />}
+              views={routeTrendViews(seriesGroups, routeLabelResolver(routeConfigs.data ?? []))}
+              points={seriesPoints}
+              hourly={seriesGranularity === 'hour'}
+              partialFrom={partialFrom}
+              loading={series.isFetching}
+              onDrillDown={seriesGranularity === 'day' ? drillDown : undefined}
+            />
+            {(overview.isLoading && !overviewData) || (routeConfigs.isLoading && !routeConfigs.data) ? (
+              <LoadingState text="加载路由用量..." />
+            ) : (
+              <RoutesSection
+                routes={routeConfigs.data ?? []}
+                usage={overviewData?.routes ?? []}
+                latency={latencyRangeOk ? routeLatency.data?.routes ?? [] : []}
+                latencyUnavailable={routeLatencyUnavailable}
                 range={summaryData.range}
                 navigate={navigate}
               />
