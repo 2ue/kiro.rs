@@ -20,7 +20,7 @@ import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import { useCheckInventory, useDeleteInventory, useInventory, useInventoryGroups } from '@/hooks/use-inventory'
 import { formatFullDate, formatLastUsed } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
-import type { InventoryItem, InventoryStatus } from '@/types/api'
+import type { InventoryItem, InventoryOrigin, InventoryStatus } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import { QuotaBar } from '@/features/credentials/credential-card'
 import { authLabel, credentialSubscriptionLabel, disabledReasonLabel, quotaBarModel } from '@/features/credentials/credential-utils'
@@ -36,6 +36,52 @@ import {
 /** 分组筛选：全部、某个分组、未分组（后端用 `__none__`）。 */
 const ALL_GROUPS = '__all__'
 const UNGROUPED = '__none__'
+
+/** 来源筛选：账号池移入（可再按原禁用原因细分）或导入。 */
+const ALL_ORIGINS = '__all__'
+const ORIGIN_POOL = '__pool__'
+const ORIGIN_IMPORTED = '__imported__'
+const ORIGIN_REASONS = ['QuotaExceeded', 'Manual', 'TooManyFailures', 'TooManyRefreshFailures', 'InvalidRefreshToken', 'AccountSuspended', 'AccountLocked', 'TemporarilySuspended', 'InvalidConfig']
+
+const HEALTH_LABEL: Record<string, string> = {
+  account_error: '账号异常',
+  quota_exhausted: '额度耗尽',
+  unknown: '状态未知',
+  normal: '正常',
+}
+
+/** 卡片上的原状态：来源、禁用原因、订阅，以及原来的调度参数。 */
+function originLines(origin: InventoryOrigin): { summary: string; settings: string; detail: string } {
+  const summary = [
+    `来自账号池 #${origin.credentialId}`,
+    origin.disabledReason ? disabledReasonLabel(origin.disabledReason) : null,
+    origin.healthStatus && origin.healthStatus !== 'normal' && !(origin.healthStatus === 'quota_exhausted' && origin.disabledReason === 'QuotaExceeded')
+      ? HEALTH_LABEL[origin.healthStatus] ?? origin.healthStatus
+      : null,
+    origin.subscriptionTitle ? credentialSubscriptionLabel(origin.subscriptionTitle) : null,
+  ].filter(Boolean).join(' · ')
+  const settings = [
+    origin.priority ? `优先级 ${origin.priority}` : null,
+    origin.rpm ? `RPM ${origin.rpm}` : null,
+    origin.maxConcurrentRequests ? `并发 ${origin.maxConcurrentRequests}` : null,
+    origin.supportedModels?.length ? `模型 ${origin.supportedModels.length} 个` : null,
+    origin.tags?.length ? `标签 ${origin.tags.join('、')}` : null,
+  ].filter(Boolean).join(' · ')
+  const detail = [
+    summary,
+    origin.email ? `邮箱：${origin.email}` : null,
+    origin.usageLimit ? `额度：${(origin.currentUsage ?? 0).toFixed(2)} / ${origin.usageLimit}` : null,
+    settings ? `原调度参数：${settings}` : null,
+    origin.supportedModels?.length ? `模型：${origin.supportedModels.join('、')}` : null,
+    origin.hadProxy ? `原代理：${origin.proxyResourceName || (origin.proxyResourceId ? `#${origin.proxyResourceId}` : '直连代理')}` : null,
+    `失败 ${origin.failureCount ?? 0} 次 · 刷新失败 ${origin.refreshFailureCount ?? 0} 次 · 成功 ${origin.successCount ?? 0} 次`,
+    origin.lastErrorReason ? `最后错误：${origin.lastErrorKind ? `[${origin.lastErrorKind}] ` : ''}${origin.lastErrorReason}` : null,
+    origin.lastUsedAt ? `最后使用：${formatFullDate(origin.lastUsedAt)}` : null,
+    origin.createdAt ? `加入账号池：${formatFullDate(origin.createdAt)}` : null,
+    origin.movedAt ? `移入库存：${formatFullDate(origin.movedAt)}` : null,
+  ].filter(Boolean).join('\n')
+  return { summary, settings, detail }
+}
 
 
 const STATUS_META: Record<InventoryStatus, { label: string; tone: 'success' | 'error' | 'warning' | 'info'; dot: string }> = {
@@ -125,11 +171,18 @@ function InventoryCard({ item, selected, onToggle, onEdit }: {
           </>
         )}
         {error && item.status !== 'pushed' && <p className="line-clamp-2 text-[11px] leading-4 text-destructive" title={error}>{error}</p>}
-        {item.origin && (
-          <p className="truncate text-[11px] text-muted-foreground">
-            来自账号池 #{item.origin.credentialId}{item.origin.disabledReason ? ` · ${disabledReasonLabel(item.origin.disabledReason)}` : ''}
-          </p>
+        {item.status === 'stored' && item.nextRenewAt && item.lastRefreshError && (
+          <p className="text-[11px] text-muted-foreground">续期失败 {item.refreshFailureCount} 次，{formatFullDate(item.nextRenewAt)} 再试</p>
         )}
+        {item.origin && (() => {
+          const origin = originLines(item.origin)
+          return (
+            <div className="rounded-md bg-muted/40 px-2 py-1.5 text-[11px] leading-4 text-muted-foreground" title={origin.detail}>
+              <p className="truncate font-medium text-foreground/80">{origin.summary}</p>
+              {origin.settings && <p className="truncate">原参数 {origin.settings}</p>}
+            </div>
+          )
+        })()}
         {(item.source || item.note) && (
           <p className="truncate text-[11px] text-muted-foreground" title={[item.source, item.note].filter(Boolean).join(' · ')}>
             {[item.source, item.note].filter(Boolean).join(' · ')}
@@ -145,6 +198,7 @@ export function InventoryPage() {
   const [pageSize, setPageSize] = useState(20)
   const [statusFilter, setStatusFilter] = useState<'__all__' | InventoryStatus>('__all__')
   const [groupFilter, setGroupFilter] = useState<string>(ALL_GROUPS)
+  const [originFilter, setOriginFilter] = useState<string>(ALL_ORIGINS)
   const [queryText, setQueryText] = useState('')
   const query = useDebouncedValue(queryText.trim(), 300)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -164,12 +218,13 @@ export function InventoryPage() {
     status: statusFilter === '__all__' ? undefined : statusFilter,
     q: query || undefined,
     group: groupFilter === ALL_GROUPS ? undefined : groupFilter,
-  }), [page, pageSize, statusFilter, query, groupFilter])
+    origin: originFilter === ALL_ORIGINS ? undefined : originFilter,
+  }), [page, pageSize, statusFilter, query, groupFilter, originFilter])
   const inventory = useInventory(listQuery)
   const check = useCheckInventory()
   const remove = useDeleteInventory()
 
-  useEffect(() => { setPage(1) }, [statusFilter, query, pageSize, groupFilter])
+  useEffect(() => { setPage(1) }, [statusFilter, query, pageSize, groupFilter, originFilter])
   // A dissolved or renamed group is no longer a valid filter.
   useEffect(() => {
     if (groupFilter === ALL_GROUPS || groupFilter === UNGROUPED || !groups.data) return
@@ -225,14 +280,17 @@ export function InventoryPage() {
   const exportFilter = {
     status: statusFilter === '__all__' ? undefined : statusFilter,
     group: groupFilter === ALL_GROUPS ? undefined : groupFilter,
+    origin: originFilter === ALL_ORIGINS ? undefined : originFilter,
     q: query || undefined,
   }
   const exportFilterLabel = [
     statusFilter !== '__all__' ? STATUS_META[statusFilter].label : null,
     groupFilter === UNGROUPED ? '未分组' : groupFilter !== ALL_GROUPS ? `分组「${groupFilter}」` : null,
+    originFilter === ORIGIN_POOL ? '账号池移入' : originFilter === ORIGIN_IMPORTED ? '导入' : originFilter !== ALL_ORIGINS ? `原状态「${disabledReasonLabel(originFilter)}」` : null,
     query ? `搜索“${query}”` : null,
   ].filter(Boolean).join(' · ')
 
+  const renewal = inventory.data?.renewal
   const meta = pageMeta.inventory
   if (inventory.isLoading && !inventory.data) return <LoadingState text="加载库存..." />
   if (inventory.error) return <ErrorState message={extractErrorMessage(inventory.error)} />
@@ -255,7 +313,16 @@ export function InventoryPage() {
       />
 
       <StatGrid>
-        <StatCard title="在库" value={counts?.stored ?? 0} desc="自动续期，不参与调度" tone="success" />
+        <StatCard
+          title="在库"
+          value={counts?.stored ?? 0}
+          desc={renewal
+            ? renewal.enabled
+              ? `每 ${Math.round(renewal.minIntervalSecs / 3600)} 小时续期一次，每轮最多 ${renewal.maxPerPass} 个；与账号池共用刷新限流`
+              : '后台刷新已关闭，库存账号不会自动续期'
+            : '自动续期，不参与调度'}
+          tone={renewal && !renewal.enabled ? 'warning' : 'success'}
+        />
         <StatCard title="已入池" value={counts?.pushed ?? 0} desc="由账号池接管" tone="info" />
         <StatCard title="失效" value={counts?.invalid ?? 0} desc="refreshToken 被拒，已停止续期" tone="error" />
         <StatCard title="合计" value={counts?.total ?? 0} desc={counts?.pushing ? `推送中 ${counts.pushing}` : '库存全部记录'} />
@@ -287,6 +354,18 @@ export function InventoryPage() {
                 )
               })}
             </div>
+            <Select value={originFilter} onValueChange={setOriginFilter}>
+              <SelectTrigger size="sm" className="w-40" aria-label="按来源和原状态筛选"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_ORIGINS}>全部来源</SelectItem>
+                <SelectItem value={ORIGIN_IMPORTED}>导入</SelectItem>
+                <SelectItem value={ORIGIN_POOL}>账号池移入</SelectItem>
+                <SelectSeparator />
+                {ORIGIN_REASONS.map((reason) => (
+                  <SelectItem key={reason} value={reason}>移入·{disabledReasonLabel(reason)}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Select value={groupFilter} onValueChange={setGroupFilter}>
               <SelectTrigger size="sm" className="w-44" aria-label="按分组筛选"><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -340,7 +419,7 @@ export function InventoryPage() {
           {items.length === 0 ? (
             <EmptyState
               icon={<Archive className="h-12 w-12" />}
-              title={statusFilter !== '__all__' || query || groupFilter !== ALL_GROUPS ? '没有符合条件的账号' : '库存是空的'}
+              title={statusFilter !== '__all__' || query || groupFilter !== ALL_GROUPS || originFilter !== ALL_ORIGINS ? '没有符合条件的账号' : '库存是空的'}
               description="库存用来保管暂不使用的账号：自动续期，不参与调度，需要时推送到账号池。账号页的禁用账号也可以一键移入库存。"
               action={<Button size="sm" onClick={() => setImportOpen(true)}><Upload />导入到库存</Button>}
             />

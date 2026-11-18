@@ -83,6 +83,8 @@ const FIELD_LABELS: Record<string, string> = {
   tokenRefreshBackgroundEnabled: '闲置账号后台刷新',
   tokenRefreshBackgroundIntervalSecs: '后台刷新扫描间隔',
   tokenRefreshBackgroundLeadSecs: '后台刷新提前量',
+  inventoryRenewMinIntervalSecs: '库存账号续期间隔',
+  inventoryRenewMaxPerPass: '库存每轮最多续期',
   credentialWarmupRequests: '预热请求数',
   credentialWarmupSelectionPercent: '预热起始比例',
   credentialWarmupMaxSelectionPercent: '预热账号总占比上限',

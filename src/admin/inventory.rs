@@ -24,12 +24,13 @@ use super::types::{
     CredentialStatusItem,
 };
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::token_manager::{AuxiliaryConcurrencySaturated, RefreshFailureStage};
 use crate::kiro::token_manager::{
     KeepThenDeleteError, MultiTokenManager, RefreshFailure, RefreshFailureKind,
 };
 use crate::storage::credential_inventory::{
     GroupFilter, InventoryListFilter, InventoryRow, InventoryStore, MAX_GROUP_NAME_CHARS,
-    MovedInventoryRow, NewInventoryRow, RenewOutcome, STATUS_INVALID, STATUS_PUSHED,
+    MovedInventoryRow, NewInventoryRow, OriginFilter, RenewOutcome, STATUS_INVALID, STATUS_PUSHED,
     STATUS_PUSHING, STATUS_STORED, UNGROUPED_FILTER,
 };
 
@@ -37,7 +38,6 @@ const MAX_IMPORT: usize = 500;
 const MAX_PAGE_SIZE: usize = 1000;
 /// A `pushing` row older than this was left by a crash and is reconciled at startup.
 const STALE_PUSH_SECS: i64 = 300;
-const RENEW_ROWS_PER_PASS: usize = 200;
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -100,6 +100,22 @@ fn is_invalid_grant(error: &anyhow::Error) -> bool {
         .downcast_ref::<RefreshFailure>()
         .is_some_and(|failure| failure.kind == RefreshFailureKind::InvalidGrant)
 }
+
+/// The refresh never left this process: the token refresh limiter or the auxiliary concurrency
+/// shared with the pool turned it away. Nothing is wrong with the account.
+fn refresh_deferred_locally(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AuxiliaryConcurrencySaturated>()
+        .is_some()
+        || error
+            .downcast_ref::<RefreshFailure>()
+            .is_some_and(|failure| {
+                failure.stage == RefreshFailureStage::Coordination && !failure.send_committed
+            })
+}
+
+/// Shown when a manual refresh was turned away by the shared limiter.
+const REFRESH_DEFERRED_MESSAGE: &str = "Token 刷新限流中（与账号池共用），请稍后再试";
 
 fn credential_from_row(row: &InventoryRow) -> Result<KiroCredentials, AdminServiceError> {
     let data = row.data.clone().ok_or_else(|| {
@@ -201,6 +217,9 @@ pub struct InventoryListQuery {
     /// Group name; `__none__` lists the accounts without a group.
     #[serde(default)]
     pub group: Option<String>,
+    /// `__pool__` (moved from the pool), `__imported__`, or a disabled reason of moved rows.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// State of the pool account an inventory row was pushed to.
@@ -257,6 +276,9 @@ pub struct InventoryItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_refresh_error: Option<String>,
     pub refresh_failure_count: i32,
+    /// After a failed renewal, the next one waits until then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_renew_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -268,19 +290,127 @@ pub struct InventoryItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<InventoryOrigin>,
+    pub origin: Option<OriginSnapshot>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// The pool account a row was moved in from.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InventoryOrigin {
+/// The pool account's state when it was moved into the inventory. Kept on the row so the console
+/// still shows what the account was, and so a push can bring its scheduling settings back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OriginSnapshot {
     pub credential_id: u64,
-    /// Disabled reason code the pool account had when it was moved.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub auth_method: Option<String>,
+    /// Disabled reason code (`QuotaExceeded`, `Manual`, ...).
     pub disabled_reason: Option<String>,
+    /// The account page's health: `account_error`, `quota_exhausted`, `unknown` or `normal`.
+    pub health_status: Option<String>,
+    pub subscription_title: Option<String>,
+    pub current_usage: Option<f64>,
+    pub usage_limit: Option<f64>,
+    pub priority: u32,
+    pub fast: u32,
+    /// The account's own RPM / concurrency settings (`None` when it used the defaults).
+    pub rpm: Option<u32>,
+    pub max_concurrent_requests: Option<u32>,
+    pub supported_models: Vec<String>,
+    pub tags: Vec<String>,
+    pub endpoint: Option<String>,
+    pub had_proxy: bool,
+    pub proxy_resource_id: Option<u64>,
+    pub proxy_resource_name: Option<String>,
+    pub failure_count: u32,
+    pub refresh_failure_count: u32,
+    pub success_count: u64,
+    pub last_error_kind: Option<String>,
+    pub last_error_reason: Option<String>,
+    pub last_used_at: Option<String>,
+    /// When the account was added to the pool.
+    pub created_at: Option<String>,
+    pub moved_at: Option<DateTime<Utc>>,
+}
+
+/// Longest last error kept in the snapshot, in characters.
+const ORIGIN_ERROR_MAX_CHARS: usize = 300;
+
+impl OriginSnapshot {
+    fn from_pool_item(item: &CredentialStatusItem, moved_at: DateTime<Utc>) -> Self {
+        let info = item.account_info.as_ref();
+        Self {
+            credential_id: item.id,
+            email: item.email.clone(),
+            auth_method: item.auth_method.clone(),
+            disabled_reason: item
+                .disabled_reason
+                .clone()
+                .filter(|reason| !reason.is_empty()),
+            health_status: Some(credential_health_status_public(item).to_string()),
+            subscription_title: item
+                .subscription_title
+                .clone()
+                .or_else(|| info.and_then(|info| info.subscription_title.clone())),
+            current_usage: info.map(|info| info.current_usage),
+            usage_limit: info.map(|info| info.usage_limit),
+            priority: item.priority,
+            fast: item.fast,
+            rpm: item.rpm_override,
+            max_concurrent_requests: item.max_concurrent_requests_override,
+            supported_models: item.supported_models.clone(),
+            tags: item.tags.clone(),
+            endpoint: Some(item.endpoint.clone()).filter(|endpoint| !endpoint.is_empty()),
+            had_proxy: item.has_proxy,
+            proxy_resource_id: item.proxy_resource_id,
+            proxy_resource_name: item.proxy_resource_name.clone(),
+            failure_count: item.failure_count,
+            refresh_failure_count: item.refresh_failure_count,
+            success_count: item.success_count,
+            last_error_kind: item.last_error_kind.clone(),
+            last_error_reason: item
+                .last_error_reason
+                .as_deref()
+                .map(|reason| reason.chars().take(ORIGIN_ERROR_MAX_CHARS).collect()),
+            last_used_at: item.last_used_at.clone(),
+            created_at: item.created_at.clone(),
+            moved_at: Some(moved_at),
+        }
+    }
+
+    /// The snapshot of a row, or what the row's columns still tell for rows without one.
+    fn of_row(row: &InventoryRow) -> Option<Self> {
+        let credential_id = row.origin_credential_id?;
+        let mut snapshot = row
+            .origin_snapshot
+            .clone()
+            .and_then(|value| serde_json::from_value::<Self>(value).ok())
+            .unwrap_or_default();
+        snapshot.credential_id = credential_id;
+        if snapshot.disabled_reason.is_none() {
+            snapshot.disabled_reason = row.origin_reason.clone();
+        }
+        Some(snapshot)
+    }
+
+    /// Puts the account's own scheduling settings back on a push request. Push defaults only
+    /// fill what is still unset afterwards.
+    fn restore_settings(&self, request: &mut AddCredentialRequest) {
+        if self.priority > 0 {
+            request.priority = self.priority;
+        }
+        if self.fast > 0 {
+            request.fast = self.fast;
+        }
+        if self.rpm.is_some() {
+            request.rpm = self.rpm;
+        }
+        if self.max_concurrent_requests.is_some() {
+            request.max_concurrent_requests = self.max_concurrent_requests;
+        }
+        if request.supported_models.is_empty() && !self.supported_models.is_empty() {
+            request.supported_models = self.supported_models.clone();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +432,19 @@ pub struct InventoryListResponse {
     pub total_pages: usize,
     pub counts: InventoryCountsResponse,
     pub items: Vec<InventoryItem>,
+    pub renewal: InventoryRenewalSettings,
+}
+
+/// How stored accounts are renewed: the pool's background refresh switch and scan interval,
+/// plus the inventory's own interval and per-pass cap. Refreshes share the pool's limiter.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryRenewalSettings {
+    pub enabled: bool,
+    pub scan_interval_secs: u64,
+    pub min_interval_secs: u64,
+    pub max_per_pass: u32,
+    pub token_refresh_max_rpm: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -342,6 +485,10 @@ pub struct InventoryPushRequest {
     pub defaults: BatchCredentialImportDefaults,
     #[serde(default)]
     pub auto_discover_supported_models: bool,
+    /// Accounts moved in from the pool get their own priority, RPM, concurrency and model list
+    /// back; the push defaults only fill what they did not have.
+    #[serde(default = "default_true")]
+    pub restore_origin_settings: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -423,6 +570,8 @@ pub struct InventoryExportQuery {
     #[serde(default)]
     pub group: Option<String>,
     #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
     pub q: Option<String>,
 }
 
@@ -433,7 +582,12 @@ pub struct MoveToInventoryRequest {
     /// Only these pool accounts, and only the disabled ones; every disabled account when empty.
     #[serde(default)]
     pub ids: Vec<u64>,
-    /// Leave out the accounts the account page lists as 账号异常.
+    /// Disabled reason codes to move (`__none__` for accounts without one); every reason when
+    /// missing.
+    #[serde(default)]
+    pub reasons: Option<Vec<String>>,
+    /// Also leave out the accounts the account page lists as 账号异常 (this also catches an
+    /// authentication failure on an account disabled for another reason).
     #[serde(default = "default_true")]
     pub exclude_abnormal: bool,
     /// Keep the account's proxy; by default it is removed and chosen again when pushed.
@@ -457,6 +611,9 @@ pub struct MovePreviewReason {
     pub abnormal: usize,
     /// How many are moved with the current options.
     pub moving: usize,
+    /// Selected by default: quota exhaustion, manual disabling and no reason. The others
+    /// (rejected tokens, suspensions, failure streaks) are left to the operator.
+    pub suggested: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -465,7 +622,7 @@ pub struct MoveToInventoryPreview {
     /// Disabled accounts in scope.
     pub disabled: usize,
     pub moving: usize,
-    /// Left out as account errors.
+    /// Left out: a reason not selected, or an account error.
     pub excluded: usize,
     /// Selected accounts that are not disabled; they are never moved.
     pub not_disabled: usize,
@@ -561,17 +718,13 @@ impl AdminService {
             last_refresh_at: row.last_refresh_at,
             last_refresh_error: row.last_refresh_error.clone(),
             refresh_failure_count: row.refresh_failure_count,
+            next_renew_at: row.next_renew_at,
             source: row.source.clone(),
             note: row.note.clone(),
             pool: row.pushed_credential_id.map(|id| pool.link(id)),
             pushed_at: row.pushed_at,
             group: row.group_name.clone(),
-            origin: row
-                .origin_credential_id
-                .map(|credential_id| InventoryOrigin {
-                    credential_id,
-                    disabled_reason: row.origin_reason.clone(),
-                }),
+            origin: OriginSnapshot::of_row(&row),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -649,6 +802,7 @@ impl AdminService {
             status,
             query: query.q,
             group: GroupFilter::parse(query.group.as_deref()),
+            origin: OriginFilter::parse(query.origin.as_deref()),
             limit: limit as i64,
             offset: ((page - 1) * limit) as i64,
         };
@@ -675,7 +829,19 @@ impl AdminService {
                 .into_iter()
                 .map(|row| self.inventory_item(row, &pool))
                 .collect(),
+            renewal: self.inventory_renewal_settings(),
         })
+    }
+
+    fn inventory_renewal_settings(&self) -> InventoryRenewalSettings {
+        let config = self.inventory_runtime_config();
+        InventoryRenewalSettings {
+            enabled: config.token_refresh_background_enabled,
+            scan_interval_secs: config.token_refresh_background_interval_secs,
+            min_interval_secs: config.inventory_renew_min_interval_secs,
+            max_per_pass: config.inventory_renew_max_per_pass,
+            token_refresh_max_rpm: config.token_refresh_max_rpm,
+        }
     }
 
     pub async fn import_inventory(
@@ -899,6 +1065,11 @@ impl AdminService {
                         AdminServiceError::InternalError(format!("保存续期结果失败: {e}"))
                     })?;
                     refreshed
+                }
+                Err(err) if refresh_deferred_locally(&err) => {
+                    return Err(AdminServiceError::Conflict(
+                        REFRESH_DEFERRED_MESSAGE.to_string(),
+                    ));
                 }
                 Err(err) => {
                     let invalid = is_invalid_grant(&err);
@@ -1168,6 +1339,11 @@ impl AdminService {
                         AdminServiceError::InternalError(format!("转换库存账号失败: {e}"))
                     })?;
                 request.disabled = None;
+                if req.restore_origin_settings
+                    && let Some(origin) = OriginSnapshot::of_row(&row)
+                {
+                    origin.restore_settings(&mut request);
+                }
                 let round_robin = rotation.get(index % rotation.len().max(1)).copied();
                 let request = super::service::apply_batch_import_defaults_public(
                     request,
@@ -1358,6 +1534,7 @@ impl AdminService {
             status,
             query: query.q,
             group: GroupFilter::parse(query.group.as_deref()),
+            origin: OriginFilter::parse(query.origin.as_deref()),
             ..InventoryListFilter::default()
         };
         let rows = super::service::block_on_admin_store_public(
@@ -1458,7 +1635,7 @@ impl AdminService {
         let mut moving = 0;
         for item in &disabled {
             let abnormal = is_abnormal(item);
-            let moved = !(abnormal && req.exclude_abnormal);
+            let moved = is_moved(item, &req);
             let reason = item
                 .disabled_reason
                 .clone()
@@ -1466,6 +1643,7 @@ impl AdminService {
             let entry = reasons
                 .entry(reason.clone())
                 .or_insert_with(|| MovePreviewReason {
+                    suggested: reason_suggested(reason.as_deref()),
                     reason,
                     count: 0,
                     abnormal: 0,
@@ -1498,20 +1676,27 @@ impl AdminService {
     ) -> Result<MoveToInventoryResponse, AdminServiceError> {
         let group = normalize_group_name(req.group.as_deref())?;
         let (disabled, _) = self.move_candidates(&req.ids);
-        if disabled.is_empty() {
+        if !disabled.iter().any(|item| is_moved(item, &req)) {
             return Err(AdminServiceError::InvalidCredential(
-                "没有可移入库存的已禁用账号".to_string(),
+                "没有可移入库存的已禁用账号（检查选中的禁用原因）".to_string(),
             ));
         }
         let store = self.inventory_store();
         let mut items = Vec::with_capacity(disabled.len());
         let mut excluded = 0;
+        let moved_at = Utc::now();
         for item in &disabled {
-            if req.exclude_abnormal && is_abnormal(item) {
+            if !is_moved(item, &req) {
                 excluded += 1;
                 continue;
             }
-            items.push(self.move_one_to_inventory(&store, item, req.keep_proxy, group.as_deref()));
+            items.push(self.move_one_to_inventory(
+                &store,
+                item,
+                req.keep_proxy,
+                group.as_deref(),
+                moved_at,
+            ));
         }
         if req.check {
             for item in items.iter_mut().filter(|item| item.ok) {
@@ -1541,7 +1726,9 @@ impl AdminService {
                 "attempted": items.len(),
                 "moved": moved,
                 "skipped": skipped,
-                "excluded": excluded,
+                                "excluded": excluded,
+                "reasons": req.reasons,
+                "excludeAbnormal": req.exclude_abnormal,
                 "keepProxy": req.keep_proxy,
                 "group": group,
                 "selected": !req.ids.is_empty(),
@@ -1563,8 +1750,10 @@ impl AdminService {
         item: &CredentialStatusItem,
         keep_proxy: bool,
         group: Option<&str>,
+        moved_at: DateTime<Utc>,
     ) -> MoveToInventoryItem {
         let id = item.id;
+        let origin = serde_json::to_value(OriginSnapshot::from_pool_item(item, moved_at)).ok();
         let reason = item
             .disabled_reason
             .clone()
@@ -1598,6 +1787,7 @@ impl AdminService {
                     account_info_at: snapshot.as_ref().and_then(|(_, at)| *at),
                     origin_credential_id: id,
                     origin_reason: reason.as_deref(),
+                    origin_snapshot: origin.as_ref(),
                 };
                 let matches =
                     super::service::block_on_admin_store_public(store.find_move_matches(
@@ -1736,6 +1926,28 @@ fn is_abnormal(item: &CredentialStatusItem) -> bool {
     credential_health_status_public(item) == "account_error"
 }
 
+/// Reason code used for a disabled account without a recorded reason.
+const NO_REASON: &str = "__none__";
+
+/// Reasons selected by default; for every other reason the operator decides.
+fn reason_suggested(reason: Option<&str>) -> bool {
+    matches!(reason, None | Some("QuotaExceeded") | Some("Manual"))
+}
+
+/// Whether a disabled account is moved with these options.
+fn is_moved(item: &CredentialStatusItem, req: &MoveToInventoryRequest) -> bool {
+    let reason = item
+        .disabled_reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(NO_REASON);
+    let selected = req
+        .reasons
+        .as_ref()
+        .is_none_or(|reasons| reasons.iter().any(|wanted| wanted == reason));
+    selected && !(req.exclude_abnormal && is_abnormal(item))
+}
+
 /// The pool's copy of an account as the inventory keeps it: scheduling parameters are chosen
 /// again when it is pushed, and the proxy is dropped unless asked to keep it.
 fn prepare_moved_credential(credential: &mut KiroCredentials, keep_proxy: bool) {
@@ -1829,18 +2041,34 @@ pub fn spawn_inventory_renewal_worker(
         loop {
             let config = manager.runtime_config();
             if config.token_refresh_background_enabled {
-                let due_before = Utc::now()
+                let now = Utc::now();
+                let due_before = now
                     + chrono::Duration::seconds(config.token_refresh_background_lead_secs as i64);
+                // A stored account only needs its refresh token kept alive, not a fresh access
+                // token every hour; this keeps the inventory from taking over the refresh limit
+                // the pool shares with it.
+                let renewed_before = now
+                    - chrono::Duration::seconds(config.inventory_renew_min_interval_secs as i64);
                 let manager_for_pass = manager.clone();
                 let result = store
-                    .renew_due(due_before, RENEW_ROWS_PER_PASS, |row| {
-                        let manager = manager_for_pass.clone();
-                        async move { renew_row(&manager, row).await }
-                    })
+                    .renew_due(
+                        due_before,
+                        renewed_before,
+                        config.inventory_renew_max_per_pass.max(1) as usize,
+                        |row| {
+                            let manager = manager_for_pass.clone();
+                            async move { renew_row(&manager, row).await }
+                        },
+                    )
                     .await;
                 match result {
-                    Ok((renewed, failed)) if renewed > 0 || failed > 0 => {
-                        tracing::info!(renewed, failed, "库存账号 Token 续期扫描完成");
+                    Ok(pass) if pass.renewed > 0 || pass.failed > 0 || pass.deferred => {
+                        tracing::info!(
+                            renewed = pass.renewed,
+                            failed = pass.failed,
+                            deferred = pass.deferred,
+                            "库存账号 Token 续期扫描完成"
+                        );
                     }
                     Ok(_) => {}
                     Err(err) => {
@@ -1872,6 +2100,7 @@ async fn renew_row(manager: &MultiTokenManager, row: InventoryRow) -> RenewOutco
         }
     };
     match manager.refresh_detached_credential(credential).await {
+        Err(err) if refresh_deferred_locally(&err) => RenewOutcome::Deferred,
         Ok(refreshed) => match credential_json(&refreshed) {
             Ok(data) => {
                 let (_, _, hash) = secret_hashes(&refreshed);
@@ -2367,6 +2596,135 @@ mod tests {
         assert!(!req.check);
         assert!(req.ids.is_empty());
         assert_eq!(req.group, None);
+    }
+
+    #[test]
+    fn only_quota_manual_and_unknown_reasons_are_suggested() {
+        assert!(reason_suggested(None));
+        assert!(reason_suggested(Some("QuotaExceeded")));
+        assert!(reason_suggested(Some("Manual")));
+        for reason in [
+            "InvalidRefreshToken",
+            "TooManyRefreshFailures",
+            "TooManyFailures",
+            "AccountSuspended",
+            "AccountLocked",
+            "TemporarilySuspended",
+            "InvalidConfig",
+        ] {
+            assert!(!reason_suggested(Some(reason)), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_push_restores_the_accounts_own_scheduling_settings() {
+        let origin = OriginSnapshot {
+            credential_id: 12,
+            priority: 3,
+            fast: 1,
+            rpm: Some(30),
+            max_concurrent_requests: Some(4),
+            supported_models: vec!["claude-sonnet-4-5".to_string()],
+            ..OriginSnapshot::default()
+        };
+        let mut request: AddCredentialRequest =
+            serde_json::from_value(json!({ "refreshToken": "rt" })).unwrap();
+        origin.restore_settings(&mut request);
+        assert_eq!((request.priority, request.fast), (3, 1));
+        assert_eq!(request.rpm, Some(30));
+        assert_eq!(request.max_concurrent_requests, Some(4));
+        assert_eq!(
+            request.supported_models,
+            vec!["claude-sonnet-4-5".to_string()]
+        );
+
+        // Settings the account did not have stay unset, for the push defaults to fill.
+        let mut bare: AddCredentialRequest =
+            serde_json::from_value(json!({ "refreshToken": "rt" })).unwrap();
+        OriginSnapshot::default().restore_settings(&mut bare);
+        assert_eq!(bare.priority, 0);
+        assert_eq!(bare.rpm, None);
+    }
+
+    #[test]
+    fn rows_without_a_snapshot_still_name_their_pool_account() {
+        let row = |origin_credential_id, origin_snapshot| InventoryRow {
+            id: 1,
+            status: STATUS_STORED.to_string(),
+            auth_kind: "social".to_string(),
+            refresh_token_hash: None,
+            api_key_hash: None,
+            identity_key: None,
+            email: None,
+            data: None,
+            source: None,
+            note: None,
+            account_info: None,
+            last_check_at: None,
+            last_check_error: None,
+            last_refresh_at: None,
+            last_refresh_error: None,
+            refresh_failure_count: 0,
+            pushed_credential_id: None,
+            pushed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            group_name: None,
+            origin_credential_id,
+            origin_reason: Some("QuotaExceeded".to_string()),
+            origin_snapshot,
+            next_renew_at: None,
+        };
+        assert_eq!(OriginSnapshot::of_row(&row(None, None)), None);
+        let fallback = OriginSnapshot::of_row(&row(Some(9), None)).unwrap();
+        assert_eq!(fallback.credential_id, 9);
+        assert_eq!(fallback.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        let full = OriginSnapshot::of_row(&row(
+            Some(9),
+            Some(json!({ "credentialId": 9, "priority": 5, "healthStatus": "quota_exhausted" })),
+        ))
+        .unwrap();
+        assert_eq!(full.priority, 5);
+        assert_eq!(full.health_status.as_deref(), Some("quota_exhausted"));
+        assert_eq!(full.disabled_reason.as_deref(), Some("QuotaExceeded"));
+    }
+
+    #[test]
+    fn push_requests_restore_origin_settings_by_default() {
+        let req: InventoryPushRequest = serde_json::from_value(json!({ "ids": [1] })).unwrap();
+        assert!(req.restore_origin_settings);
+        let move_req: MoveToInventoryRequest = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(move_req.reasons, None);
+    }
+
+    #[test]
+    fn only_refreshes_turned_away_locally_are_deferred() {
+        let failure = |stage, kind, send_committed| {
+            anyhow::Error::new(RefreshFailure::new(stage, kind, None, None, send_committed))
+        };
+        // The shared limiter said no before anything was sent: not the account's fault.
+        assert!(refresh_deferred_locally(&failure(
+            RefreshFailureStage::Coordination,
+            RefreshFailureKind::RateLimited,
+            false
+        )));
+        assert!(refresh_deferred_locally(&failure(
+            RefreshFailureStage::Coordination,
+            RefreshFailureKind::Coordination,
+            false
+        )));
+        // Anything that reached the upstream counts against the account.
+        assert!(!refresh_deferred_locally(&failure(
+            RefreshFailureStage::ResponseStatus,
+            RefreshFailureKind::RateLimited,
+            true
+        )));
+        assert!(!refresh_deferred_locally(&failure(
+            RefreshFailureStage::ResponseStatus,
+            RefreshFailureKind::InvalidGrant,
+            true
+        )));
+        assert!(!refresh_deferred_locally(&anyhow::anyhow!("network down")));
     }
 
     #[test]

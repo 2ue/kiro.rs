@@ -355,6 +355,8 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     tokenRefreshBackgroundEnabled: Boolean(draft.tokenRefreshBackgroundEnabled),
     tokenRefreshBackgroundIntervalSecs: toWhole(draft.tokenRefreshBackgroundIntervalSecs, 10, 3600),
     tokenRefreshBackgroundLeadSecs: toWhole(draft.tokenRefreshBackgroundLeadSecs, 60, 3600),
+    inventoryRenewMinIntervalSecs: toWhole(draft.inventoryRenewMinIntervalSecs, 3600, 604800),
+    inventoryRenewMaxPerPass: toWhole(draft.inventoryRenewMaxPerPass, 1, 200),
     kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
     kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
     kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
@@ -895,6 +897,8 @@ export function RuntimePage() {
                 <TogField label="闲置账号后台刷新" desc="服务端定期扫描长期未调用的 OAuth/外部 IdP 账号，在过期前主动轮换 Token；关闭后仅保留请求触发刷新。" checked={draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundEnabled')} />
                 <NumField label="后台刷新扫描间隔" desc="后台扫描账号的间隔；范围 10 到 3600 秒。" value={draft.tokenRefreshBackgroundIntervalSecs} min={10} max={3600} suffix="秒" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundIntervalSecs')} />
                 <NumField label="后台刷新提前量" desc="Token 剩余多少秒时进入主动刷新窗口；范围 60 到 3600 秒。" value={draft.tokenRefreshBackgroundLeadSecs} min={60} max={3600} suffix="秒" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundLeadSecs')} />
+                <NumField label="库存账号续期间隔" desc="库存账号不参与调度，续期只为保住 refreshToken，不必每小时轮换。两次续期至少间隔这么久；范围 3600 到 604800 秒，默认 21600（6 小时）。与上面的后台刷新共用开关、扫描间隔和刷新限流。" value={draft.inventoryRenewMinIntervalSecs} min={3600} max={604800} step={3600} suffix="秒" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('inventoryRenewMinIntervalSecs')} />
+                <NumField label="库存每轮最多续期" desc="每轮扫描最多续期多少个库存账号，避免库存占满与账号池共用的刷新额度；共用限流繁忙时这一轮会提前停下，不算失败。范围 1 到 200，默认 10。" value={draft.inventoryRenewMaxPerPass} min={1} max={200} suffix="个" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('inventoryRenewMaxPerPass')} />
                 <div className="rounded-lg border bg-muted/20 p-4 text-xs leading-5 text-muted-foreground md:col-span-2">
                   当前辅助通道：进行中 {draft.auxiliaryUpstreamRuntime.inFlight}，历史峰值 {draft.auxiliaryUpstreamRuntime.peakInFlight}，饱和拒绝 {draft.auxiliaryUpstreamRuntime.rejected}。Refresh client 缓存 {draft.auxiliaryUpstreamRuntime.refreshClientCacheEntries}/{draft.auxiliaryUpstreamRuntime.refreshClientCacheMaxEntries}，构建 {draft.auxiliaryUpstreamRuntime.refreshClientBuilds}，命中 {draft.auxiliaryUpstreamRuntime.refreshClientHits}，未命中 {draft.auxiliaryUpstreamRuntime.refreshClientMisses}，容量拒绝 {draft.auxiliaryUpstreamRuntime.refreshClientCacheSaturated}。
                   <br />Token refresh authority {draft.tokenRefreshAdmissionRuntime.authority}，准入 {draft.tokenRefreshAdmissionRuntime.admitted}，RPM 拒绝 {draft.tokenRefreshAdmissionRuntime.rateLimited}，协调拒绝 {draft.tokenRefreshAdmissionRuntime.coordinationRejected}，Redis 错误 {draft.tokenRefreshAdmissionRuntime.redisErrors}，剩余 {draft.tokenRefreshAdmissionRuntime.remainingMilliTokens / 1000} tokens。
