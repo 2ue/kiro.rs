@@ -5,7 +5,7 @@
 //! 以及模型列表等对外口径；它不参与上游能力判断。
 
 use crate::anthropic::model_capabilities::strip_model_compat_suffixes;
-use crate::model::forced_model_mapping::ForcedModelMappingConfig;
+use crate::model::forced_model_mapping::{ForcedModelMappingConfig, ForcedTooLongResponse};
 
 /// 一次请求的收敛结果，挂在请求上下文里供对外字段和转换使用。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,10 @@ pub(crate) struct ForcedTarget {
     pub interleaved_text_as_thinking: bool,
     /// 目标模型的输入窗口（上游模型目录值，取不到时 200K），用于服务端上下文退避。
     pub target_window_tokens: i32,
+    /// 服务端重新裁剪后上游仍判定输入过长时对客户端的答复。
+    pub too_long_response: ForcedTooLongResponse,
+    /// 发送前的上下文退避结果；上游判定过长时服务端按它缩小预算重试。
+    pub fit: Option<super::forced_backoff::ForcedFit>,
 }
 
 /// 外显模型不传 `thinking` 时的官方行为。
@@ -652,6 +656,8 @@ pub(crate) fn resolve_forced_target(
         knowledge_facts: 0,
         interleaved_text_as_thinking: config.interleaved_text_as_thinking,
         target_window_tokens: FORCED_TARGET_DEFAULT_WINDOW_TOKENS,
+        too_long_response: config.context_backoff.too_long_response,
+        fit: None,
     })
 }
 

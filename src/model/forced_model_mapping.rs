@@ -110,6 +110,31 @@ pub struct ForcedContextBackoffConfig {
     /// 同步等待摘要的上限（秒），超时就本次走硬裁剪，摘要在后台继续完成。
     #[serde(default = "default_summary_timeout_secs")]
     pub summary_timeout_secs: u64,
+    /// 上游仍判定输入过长时，按 `本次预算 × 该比例` 重新裁剪再发一次；同一会话后续请求沿用
+    /// 缩小后的预算，不再先失败一次。
+    #[serde(default = "default_retry_budget_ratio")]
+    pub retry_budget_ratio: f64,
+    /// 请求超出预算时，工具定义最多占预算的比例；超出就分级压缩工具描述和参数说明。
+    #[serde(default = "default_tool_budget_ratio")]
+    pub tool_budget_ratio: f64,
+    /// 服务端重新裁剪后上游仍判定输入过长时，对客户端的答复。
+    #[serde(default)]
+    pub too_long_response: ForcedTooLongResponse,
+}
+
+/// 服务端退避用尽、上游仍判定输入过长时对客户端的答复。两种都不带 token 数字，不暴露服务窗口。
+///
+/// Claude Code 只要错误文本里有 `prompt is too long` 就会自动压缩（不看状态码，也不要求带数字；
+/// `N tokens > M maximum` 只用来估算压缩请求自身超长时每次多裁多少），其他主流客户端也按这句
+/// 识别上下文超限。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedTooLongResponse {
+    /// 400 `prompt is too long`：客户端自动压缩上下文后重发。
+    #[default]
+    PromptTooLong,
+    /// 529 overloaded（旧行为）：客户端当成临时错误原样重试，同样的输入会一直失败。
+    Overloaded,
 }
 
 fn default_safety_margin_ratio() -> f64 {
@@ -144,6 +169,14 @@ fn default_summary_timeout_secs() -> u64 {
     120
 }
 
+fn default_retry_budget_ratio() -> f64 {
+    0.65
+}
+
+fn default_tool_budget_ratio() -> f64 {
+    0.3
+}
+
 impl Default for ForcedContextBackoffConfig {
     fn default() -> Self {
         Self {
@@ -156,6 +189,9 @@ impl Default for ForcedContextBackoffConfig {
             summary_precompact_ratio: default_summary_precompact_ratio(),
             summary_target_ratio: default_summary_target_ratio(),
             summary_timeout_secs: default_summary_timeout_secs(),
+            retry_budget_ratio: default_retry_budget_ratio(),
+            tool_budget_ratio: default_tool_budget_ratio(),
+            too_long_response: ForcedTooLongResponse::default(),
         }
     }
 }
@@ -183,6 +219,14 @@ impl ForcedContextBackoffConfig {
             .summary_target_ratio
             .clamp(0.2, (self.summary_precompact_ratio - 0.1).max(0.2));
         self.summary_timeout_secs = self.summary_timeout_secs.clamp(5, 300);
+        if !self.retry_budget_ratio.is_finite() {
+            self.retry_budget_ratio = default_retry_budget_ratio();
+        }
+        self.retry_budget_ratio = self.retry_budget_ratio.clamp(0.3, 0.95);
+        if !self.tool_budget_ratio.is_finite() {
+            self.tool_budget_ratio = default_tool_budget_ratio();
+        }
+        self.tool_budget_ratio = self.tool_budget_ratio.clamp(0.05, 1.0);
         self
     }
 }
@@ -514,6 +558,9 @@ mod tests {
                 summary_precompact_ratio: f64::NAN,
                 summary_target_ratio: 5.0,
                 summary_timeout_secs: 0,
+                retry_budget_ratio: 2.0,
+                tool_budget_ratio: f64::NAN,
+                too_long_response: ForcedTooLongResponse::Overloaded,
             },
             ..ForcedModelMappingConfig::default()
         }
@@ -526,6 +573,32 @@ mod tests {
         assert_eq!(config.context_backoff.summary_precompact_ratio, 0.75);
         assert_eq!(config.context_backoff.summary_target_ratio, 0.65);
         assert_eq!(config.context_backoff.summary_timeout_secs, 5);
+        assert_eq!(config.context_backoff.retry_budget_ratio, 0.95);
+        assert_eq!(config.context_backoff.tool_budget_ratio, 0.3);
+        assert_eq!(
+            config.context_backoff.too_long_response,
+            ForcedTooLongResponse::Overloaded
+        );
+    }
+
+    #[test]
+    fn too_long_response_defaults_to_prompt_too_long_and_parses_snake_case() {
+        let config: ForcedContextBackoffConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            config.too_long_response,
+            ForcedTooLongResponse::PromptTooLong
+        );
+        assert_eq!(config.retry_budget_ratio, 0.65);
+        assert_eq!(config.tool_budget_ratio, 0.3);
+        let config: ForcedContextBackoffConfig =
+            serde_json::from_str(r#"{"tooLongResponse":"overloaded","retryBudgetRatio":0.5}"#)
+                .unwrap();
+        assert_eq!(config.too_long_response, ForcedTooLongResponse::Overloaded);
+        assert_eq!(config.retry_budget_ratio, 0.5);
+        assert_eq!(
+            serde_json::to_value(ForcedTooLongResponse::PromptTooLong).unwrap(),
+            serde_json::json!("prompt_too_long")
+        );
     }
 
     #[test]

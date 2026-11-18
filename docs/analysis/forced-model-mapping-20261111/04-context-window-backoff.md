@@ -60,13 +60,13 @@ Claude Code 官方文档（`code.claude.com/docs/en/model-config`，"Context win
 
 ### 上游仍然拒绝
 
-本地估算和上游 tokenizer 之间有偏差，上游仍可能返回输入过长。处理方式：
+本地估算和上游 tokenizer 之间有偏差（中文和 JSON schema 偏差最大），上游仍可能返回输入过长。2026-11-18 起的处理方式（原方案"对外永远不返回 `prompt is too long`、改成 529"会让客户端原样重试、永远失败，已废弃，排查见 `docs/analysis/forced-too-long-529-loop-20261118.md`）：
 
-1. 复用现有 `too_long_retry` 路径（`local_body_pipeline.rs:393`），内部升一级退避后重试，最多两次。
-2. 两次之后直接按 L4/L5 强制裁剪，保证请求能发出去。
-3. **对外永远不返回 `prompt is too long`。**
+1. 发送前的退避多了第 0 步：工具定义超过预算的 `toolBudgetRatio`（默认 0.3）时分级压缩描述和参数说明，工具名和参数名不变。L4 截断也覆盖系统提示块。
+2. 上游判定过长时，服务端按 `本次预算 × retryBudgetRatio`（默认 0.65）重新跑一遍退避、重新转换，再发一次；并按会话记住缩小后的比例（6 小时），同一会话后续请求直接按它裁剪，不再先失败一次。
+3. 仍然超长时按 `tooLongResponse` 答复：默认 400 `prompt is too long`（不带 token 数字，不暴露服务窗口，Claude Code 据此自动压缩），或旧的 529。强制模式下任何配置都不会返回 `N tokens > M maximum`。
 
-现有的 `payloadTooLongHandling=client_compaction` 在强制模式下不生效。不管配置是什么，都按本节的服务端退避处理。
+现有的 `payloadTooLongHandling=client_compaction` 在强制模式下不生效。不管配置是什么，都先按本节的服务端退避处理。
 
 ### Claude Code 自己的压缩请求
 

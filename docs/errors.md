@@ -30,7 +30,7 @@
 | 429 | rate_limit_error | Too many requests right now. Please try again shortly. / Too many requests right now. Please try again in N seconds. | 请求频率过高或处理容量暂时用满 | 按提示的秒数后重试 |
 | 503 | api_error | The service is starting up. Please try again shortly. | 服务刚启动或正在切换 | 稍后重试 |
 | 400 | invalid_request_error | The request could not be processed. Please check the message history, tool results, files, or images and try again. | 请求结构不被接受 | 检查历史消息、工具结果或附件；原样重试不会成功 |
-| 400 | invalid_request_error | `prompt is too long: ...` | 输入超过长度上限 | 压缩上下文（如 `/compact`）或新开对话。此文案保持英文，Claude Code 依赖它自动压缩 |
+| 400 | invalid_request_error | `prompt is too long: ...` | 输入超过长度上限 | 压缩上下文（如 `/compact`）或新开对话。此文案保持英文，Claude Code 依赖它自动压缩。强制模型收敛路由默认不带 token 数字（`forcedModelMapping.contextBackoff.tooLongResponse`） |
 | 400 | invalid_request_error | One or more images exceed the 5 MB size limit. Please resize or remove them and try again. | 单张图片过大 | 压缩或移除图片 |
 | 400 | invalid_request_error | The request contains more than 100 images. Please send fewer images and try again. | 图片数量过多 | 减少图片数量 |
 | 400 | invalid_request_error | An image format is not supported. Please convert it to PNG, JPEG, GIF, or WebP and try again. | 图片格式不支持 | 转换格式后重试 |

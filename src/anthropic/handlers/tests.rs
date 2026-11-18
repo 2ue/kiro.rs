@@ -1180,6 +1180,7 @@ fn prompt_too_long_messages_use_claude_code_protocol_prefix() {
         requested_model: None,
         served_model: None,
         forced: false,
+        ..Default::default()
     };
     assert_eq!(
         official_prompt_too_long_message(Some(over), false),
@@ -1191,6 +1192,7 @@ fn prompt_too_long_messages_use_claude_code_protocol_prefix() {
         requested_model: None,
         served_model: None,
         forced: false,
+        ..Default::default()
     };
     for (context, window_full) in [
         (Some(under), false),
@@ -1264,6 +1266,7 @@ async fn upstream_too_long_errors_map_to_prompt_is_too_long_for_five_rounds() {
                     requested_model: None,
                     served_model: None,
                     forced: false,
+                    ..Default::default()
                 }),
             );
             assert_eq!(
@@ -3893,6 +3896,10 @@ enum HandlerEventStreamFault {
     NonStreamChunkedOverLimit,
     NonStreamExactLimit,
     NonStreamSmallBody,
+    /// Every call is rejected as too long (`CONTENT_LENGTH_EXCEEDS_THRESHOLD`).
+    TooLongEveryAttempt,
+    /// Only the first call is rejected as too long; later calls answer normally.
+    TooLongOnFirstHit,
 }
 
 #[derive(Clone)]
@@ -4126,6 +4133,7 @@ async fn handler_eventstream_fault_upstream(
             HandlerEventStreamFault::EmptyJsonBodyEveryAttempt => {
                 handler_eventstream_json_labeled_bytes_response(Vec::new())
             }
+            HandlerEventStreamFault::TooLongEveryAttempt => handler_eventstream_too_long_response(),
             _ => handler_eventstream_bytes_response(handler_eventstream_normal_body()),
         };
     }
@@ -4651,7 +4659,21 @@ async fn handler_eventstream_fault_upstream(
         HandlerEventStreamFault::NonStreamSmallBody => {
             handler_eventstream_bytes_response(handler_eventstream_normal_body())
         }
+        HandlerEventStreamFault::TooLongEveryAttempt
+        | HandlerEventStreamFault::TooLongOnFirstHit => handler_eventstream_too_long_response(),
     }
+}
+
+fn handler_eventstream_too_long_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(json!({
+            "message": "Input content length exceeds threshold.",
+            "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+        })),
+    )
+        .into_response()
 }
 
 fn handler_eventstream_fault_router_with_credential_count(
@@ -10671,6 +10693,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-limit".to_string()),
@@ -10795,6 +10818,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-dfcache-tool".to_string()),
@@ -10897,6 +10921,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-upstream-raw-limit".to_string()),
@@ -11004,6 +11029,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-prod-like".to_string()),
@@ -11146,6 +11172,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("context-estimate-session".to_string()),
@@ -11238,6 +11265,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-kiro-strategy".to_string()),
@@ -11394,6 +11422,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-latency".to_string()),
@@ -11740,6 +11769,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-policy".to_string()),
@@ -11923,6 +11953,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-creation-policy".to_string()),
@@ -12041,6 +12072,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-error".to_string()),
@@ -12139,6 +12171,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-large-failure".to_string()),
@@ -13007,6 +13040,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-a".to_string()),
@@ -13119,6 +13153,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-high-cache".to_string()),
@@ -17433,6 +17468,7 @@ fn stable_segment_usage_context(policy: StableSegmentCachePolicy) -> RequestUsag
         identity_output_guard: false,
         display_identity: None,
         client_input_tokens: None,
+        forced_too_long_response: None,
         interleaved_text_as_thinking: None,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-ssc".to_string()),
@@ -19295,4 +19331,203 @@ fn empty_turn_retry_backoff_delays_the_next_attempt() {
             }
         }
     });
+}
+
+// ============ 强制映射：上游判定输入过长 ============
+
+/// A forced-mapping request near the serving budget: one long user message (local estimate about
+/// 166K tokens against a budget of about 182K, so the retry budget of about 118K cuts it by a
+/// third). `marker` keeps conversations of different cases apart, since the remembered budget is
+/// kept per conversation.
+fn forced_too_long_body(marker: &str, stream: bool) -> String {
+    json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 8192,
+        "stream": stream,
+        "messages": [{
+            "role": "user",
+            "content": format!(
+                "{marker} BEGIN {} END",
+                "lorem ipsum dolor sit amet consectetur ".repeat(17_000)
+            )
+        }]
+    })
+    .to_string()
+}
+
+fn forced_too_long_router(
+    base_url: &str,
+    response: crate::model::forced_model_mapping::ForcedTooLongResponse,
+) -> (Router, Arc<UsageRecorder>) {
+    websearch_handler_test_router_with_config(base_url, |config| {
+        config.forced_model_mapping.enabled = true;
+        config.forced_model_mapping.default_target = "claude-haiku-4-5".to_string();
+        config
+            .forced_model_mapping
+            .context_backoff
+            .too_long_response = response;
+        config.kiro_upstream_response_timeout_secs = 10;
+    })
+}
+
+async fn send_forced_too_long(
+    router: Router,
+    body: String,
+) -> (StatusCode, HeaderMap, String, String) {
+    let response = router
+        .oneshot(multimodal_handler_request("/v1/messages", body))
+        .await
+        .expect("forced too-long response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let request_id = response_request_id(&response);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("forced too-long body");
+    (
+        status,
+        headers,
+        request_id,
+        String::from_utf8_lossy(&body).to_string(),
+    )
+}
+
+fn upstream_body_lengths(upstream: &HandlerEventStreamFaultUpstream) -> Vec<usize> {
+    upstream
+        .bodies_snapshot()
+        .iter()
+        .map(|body| body.to_string().len())
+        .collect()
+}
+
+async fn run_forced_too_long_refits_to_a_smaller_budget_and_remembers_it() {
+    use crate::model::forced_model_mapping::ForcedTooLongResponse;
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TooLongOnFirstHit).await;
+    let body = forced_too_long_body("refit-and-remember", false);
+
+    let (router, recorder) =
+        forced_too_long_router(&upstream.base_url, ForcedTooLongResponse::PromptTooLong);
+    let (status, _, request_id, text) = send_forced_too_long(router, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        upstream.hits(),
+        2,
+        "first call rejected, re-fitted retry accepted"
+    );
+    let lengths = upstream_body_lengths(&upstream);
+    assert!(
+        lengths[1] * 10 < lengths[0] * 8,
+        "the retry is fitted to a smaller budget: {lengths:?}"
+    );
+    let retry = upstream.bodies_snapshot()[1].to_string();
+    assert!(retry.contains("refit-and-remember BEGIN"), "head kept");
+    assert!(retry.contains("END"), "tail kept");
+    assert_eq!(
+        usage_record_for_request(&recorder, &request_id).status,
+        UsageRecordStatus::Success
+    );
+
+    // The next request of the conversation starts from the smaller budget: no rejected call.
+    let (router, _) =
+        forced_too_long_router(&upstream.base_url, ForcedTooLongResponse::PromptTooLong);
+    let (status, _, _, text) = send_forced_too_long(router, body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(upstream.hits(), 3);
+    let lengths = upstream_body_lengths(&upstream);
+    assert!(
+        lengths[2] * 10 < lengths[0] * 8,
+        "remembered budget used on the first call: {lengths:?}"
+    );
+}
+
+#[test]
+fn forced_too_long_refits_to_a_smaller_budget_and_remembers_it() {
+    run_handler_fixture_on_large_stack_thread("forced-too-long-refit", || async {
+        run_forced_too_long_refits_to_a_smaller_budget_and_remembers_it().await;
+    });
+}
+
+async fn run_forced_too_long_after_refit_answers_as_configured() {
+    use crate::model::forced_model_mapping::ForcedTooLongResponse;
+    for stream in [false, true] {
+        // Default: prompt is too long without figures, so the client compacts and the serving
+        // window stays hidden.
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TooLongEveryAttempt)
+                .await;
+        let (router, recorder) =
+            forced_too_long_router(&upstream.base_url, ForcedTooLongResponse::PromptTooLong);
+        let (status, headers, request_id, text) = send_forced_too_long(
+            router,
+            forced_too_long_body(&format!("answer-default-{stream}"), stream),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "stream={stream}: {text}");
+        assert_eq!(upstream.hits(), 2, "one re-fitted retry, no more");
+        let value: Value = serde_json::from_str(&text).expect("error JSON");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert_eq!(message, FORCED_PROMPT_TOO_LONG_MESSAGE);
+        assert!(message.starts_with("prompt is too long"));
+        assert!(
+            !message.chars().any(|ch| ch.is_ascii_digit()),
+            "no token figures: {message}"
+        );
+        assert!(!text.contains("haiku"), "{text}");
+        assert!(headers.get("x-error-id").is_some());
+        let record = usage_record_for_request(&recorder, &request_id);
+        assert_eq!(record.public_error_status_code, Some(400));
+        assert_eq!(
+            record.public_error_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            record.public_error_message.as_deref(),
+            Some(FORCED_PROMPT_TOO_LONG_MESSAGE)
+        );
+
+        // Legacy: a transient overload.
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TooLongEveryAttempt)
+                .await;
+        let (router, _) =
+            forced_too_long_router(&upstream.base_url, ForcedTooLongResponse::Overloaded);
+        let (status, _, _, text) = send_forced_too_long(
+            router,
+            forced_too_long_body(&format!("answer-overloaded-{stream}"), stream),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 529, "stream={stream}: {text}");
+        assert!(text.contains("overloaded_error"), "{text}");
+        assert!(!text.contains(" tokens > "), "no token figures: {text}");
+    }
+}
+
+#[test]
+fn forced_too_long_after_refit_answers_as_configured() {
+    run_handler_fixture_on_large_stack_thread("forced-too-long-answer", || async {
+        run_forced_too_long_after_refit_answers_as_configured().await;
+    });
+}
+
+#[test]
+fn forced_too_long_replies_never_carry_token_figures() {
+    let (status, error_type, message, append_error_id) =
+        forced_too_long_reply(ForcedTooLongResponse::PromptTooLong);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_type, "invalid_request_error");
+    assert!(message.starts_with("prompt is too long"), "{message}");
+    assert!(!append_error_id);
+    let (status, error_type, overloaded, append_error_id) =
+        forced_too_long_reply(ForcedTooLongResponse::Overloaded);
+    assert_eq!(status.as_u16(), 529);
+    assert_eq!(error_type, "overloaded_error");
+    assert!(append_error_id);
+    for message in [message, overloaded] {
+        assert!(
+            !message.chars().any(|ch| ch.is_ascii_digit()),
+            "no token figures: {message}"
+        );
+    }
 }

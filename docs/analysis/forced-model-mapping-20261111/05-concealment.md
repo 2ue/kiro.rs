@@ -10,7 +10,7 @@
 | OpenAI Responses 出口 | 同一套机制（`openai/responses_*.rs`） | 同上，实现时要确认 |
 | usage 记录 `model` | 客户端模型 | 不变 |
 | usage 记录 `upstream_model` / `pricing_model` | 内部模型 | 只在管理端展示。下游用量同步（sub2api 等）只给外显模型 |
-| 错误文案：输入过长 | `prompt is too long: N tokens > 200000 maximum` 会暴露窗口 | 强制模式下不再出现（见 04） |
+| 错误文案：输入过长 | `prompt is too long: N tokens > 200000 maximum` 会暴露窗口 | 只回不带数字的 `prompt is too long`（客户端照样自动压缩），强制模式下任何配置都不出现 token 数字（见 04） |
 | 错误文案：上游原文 | 已去掉渠道标识（`envelope.rs:78`），但上游 message 里可能带模型 ID | 对外文案中出现的目标模型或上游模型 ID，替换成外显模型 |
 | 错误文案：模型不存在 | `model_not_found_message(requested_model)` | 只用外显模型 |
 | 响应头 | `x-kiro-rs-warnings` 默认关闭（`config.rs:5888`） | 强制映射不写任何响应头；即使开启 warnings，也不包含映射信息 |

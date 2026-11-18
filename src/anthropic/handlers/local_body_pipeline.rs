@@ -29,6 +29,93 @@ pub(super) struct PreparedLocalKiroBody {
     pub(super) applied_injections: Vec<crate::model::config::InjectionId>,
 }
 
+/// Forced model mapping: what the server needs to fit the request again with a smaller budget and
+/// convert it once more, after the upstream still rejected the fitted request as too long. Only
+/// kept for requests near their budget.
+pub(super) struct ForcedRefit {
+    /// The fitted request as it was converted.
+    payload: MessagesRequest,
+    converter_options: ConverterOptions,
+    model_resolution: ModelResolution,
+    pub(super) guard_config: PayloadGuardConfig,
+    fit: crate::anthropic::forced_backoff::ForcedFit,
+    backoff: crate::model::forced_model_mapping::ForcedContextBackoffConfig,
+}
+
+impl ForcedRefit {
+    fn for_request(
+        payload: &MessagesRequest,
+        converter_options: &ConverterOptions,
+        model_resolution: &ModelResolution,
+        guard_config: PayloadGuardConfig,
+        runtime_config: &RequestRuntimeConfig,
+        endpoint: &str,
+    ) -> Option<Arc<Self>> {
+        let fit = model_resolution
+            .forced
+            .as_ref()?
+            .fit
+            .as_ref()
+            .filter(|fit| fit.near_budget())?;
+        let backoff = runtime_config
+            .forced_model_mapping_for(endpoint)?
+            .context_backoff
+            .clone();
+        Some(Arc::new(Self {
+            payload: payload.clone(),
+            converter_options: converter_options.clone(),
+            model_resolution: model_resolution.clone(),
+            guard_config,
+            fit: fit.clone(),
+            backoff,
+        }))
+    }
+
+    /// Fits the request into `budget × retryBudgetRatio` and converts it again. The smaller
+    /// scale is remembered for the conversation first, so its next requests start from it even
+    /// when this retry fails.
+    pub(super) fn rebuild(&self, request_id: &str, endpoint: &str) -> Result<KiroRequest, String> {
+        use crate::anthropic::forced_backoff;
+        let budget = forced_backoff::retry_budget(self.fit.budget_tokens, &self.backoff);
+        if let Some(key) = self.fit.conversation_key.clone() {
+            forced_backoff::remember_budget_scale(
+                key,
+                budget as f64 / self.fit.base_budget_tokens.max(1) as f64,
+            );
+        }
+        let mut payload = self.payload.clone();
+        let report = forced_backoff::fit_to_budget(&mut payload, budget, &self.backoff);
+        tracing::warn!(
+            request_id,
+            endpoint,
+            previous_budget_tokens = self.fit.budget_tokens,
+            budget_tokens = budget,
+            original_tokens = report.original_tokens,
+            final_tokens = report.final_tokens,
+            compressed_tools = report.compressed_tools,
+            removed_thinking_blocks = report.removed_thinking_blocks,
+            cleared_tool_results = report.cleared_tool_results,
+            removed_messages = report.removed_messages,
+            truncated_blocks = report.truncated_blocks,
+            remembered_for_conversation = self.fit.conversation_key.is_some(),
+            "forced model mapping: upstream rejected the request as too long, re-fitting it to a smaller budget"
+        );
+        let conversion = convert_request_with_resolved_model(
+            &payload,
+            self.converter_options.clone(),
+            &self.model_resolution,
+        )
+        .map_err(|error| conversion_error_public_message(&error))?;
+        Ok(KiroRequest {
+            conversation_state: conversion.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: conversion.additional_model_request_fields,
+            tool_cache_point_insert_after: conversion.tool_cache_point_insert_after,
+            cache_point_plan_recording_enabled: conversion.cache_point_plan_recording_enabled,
+        })
+    }
+}
+
 pub(super) struct LocalBodyPrepareError {
     pub(super) response: Response,
     pub(super) error_metadata: serde_json::Value,
@@ -404,6 +491,14 @@ pub(super) fn prepare_with_plan(
                 .forced
                 .as_ref()
                 .map(|forced| forced.target_window_tokens),
+            ForcedRefit::for_request(
+                conversion_payload,
+                &converter_options,
+                model_resolution,
+                plan.payload_guard.config,
+                runtime_config,
+                endpoint,
+            ),
         )
     } else {
         None

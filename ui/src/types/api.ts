@@ -1815,7 +1815,13 @@ export interface ForcedContextBackoffConfig {
   summaryPrecompactRatio: number
   summaryTargetRatio: number
   summaryTimeoutSecs: number
+  retryBudgetRatio: number
+  toolBudgetRatio: number
+  tooLongResponse: ForcedTooLongResponse
 }
+
+/** 服务端重新裁剪后上游仍判定输入过长时，对客户端的答复（都不带 token 数字）。 */
+export type ForcedTooLongResponse = 'prompt_too_long' | 'overloaded'
 
 export type ForcedKnowledgeLocale = 'en' | 'zh'
 

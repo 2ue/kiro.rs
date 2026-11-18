@@ -3,22 +3,52 @@
 //! 客户端按外显模型的窗口（多为 1M）发送历史，目标模型（4.5 系）只有 200K。请求超出目标窗口时，
 //! 在转换前按固定顺序裁剪，直到估算值落进预算：
 //!
+//! 0. 工具定义超过预算的一定比例时分级压缩（只看工具本身，每轮结果相同）；
 //! 1. 去掉最后一条 assistant 之前所有 assistant 的 thinking 块；
 //! 2. 清理较早的工具结果：保留最近若干条原文，更早的换成和官方清理一致的占位文字；
 //! 3. 从最早的轮次开始成对删除历史，保持 tool_use / tool_result 配对，首条用户文字保留；
-//! 4. 仍超出时，对最大的单个文本或工具结果做中间截断。
+//! 4. 仍超出时，对最大的单个文本、工具结果或系统提示块做中间截断。
 //!
 //! 每一步都只依赖请求内容和预算，同一请求得到同一结果；清理边界按步长推进，历史增长不到一个
 //! 步长时前缀保持不变，缓存照常命中。
+//!
+//! 本地估算和上游计数有偏差（中文、JSON schema 偏差最大），上游仍判定过长时按更小的预算重来一次，
+//! 并按会话记住缩小后的比例，同一会话后续请求直接按它裁剪。
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 use serde_json::Value;
 
-use crate::anthropic::types::{Message, MessagesRequest};
+use crate::anthropic::types::{Message, MessagesRequest, Tool};
 use crate::model::forced_model_mapping::ForcedContextBackoffConfig;
 
 /// 官方清理旧工具结果后的占位文字。
 pub(crate) const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared]";
 const TRUNCATED_MARKER: &str = "\n\n[... content truncated ...]\n\n";
+
+/// 发送前的退避结果，挂在 `ForcedTarget` 上：上游仍判定输入过长时，服务端按它缩小预算重试。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForcedFit {
+    /// 按目标窗口算出的完整预算。
+    pub base_budget_tokens: i32,
+    /// 本次实际使用的预算（会话之前被拒过时小于完整预算）。
+    pub budget_tokens: i32,
+    /// 退避后的本地估算。
+    pub final_tokens: i32,
+    /// 记住缩小比例用的会话标识；只为大请求计算。
+    pub conversation_key: Option<String>,
+}
+
+impl ForcedFit {
+    /// Requests well below the budget are not kept for a re-fit retry: the upstream does not
+    /// reject them as too long, and keeping a copy of every request would cost memory.
+    pub fn near_budget(&self) -> bool {
+        self.final_tokens.saturating_mul(2) >= self.budget_tokens
+    }
+}
 
 /// 一次退避的结果，用于日志和诊断。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -30,11 +60,13 @@ pub(crate) struct BackoffReport {
     pub cleared_tool_results: usize,
     pub removed_messages: usize,
     pub truncated_blocks: usize,
+    pub compressed_tools: usize,
 }
 
 impl BackoffReport {
     pub fn changed(&self) -> bool {
-        self.removed_thinking_blocks > 0
+        self.compressed_tools > 0
+            || self.removed_thinking_blocks > 0
             || self.cleared_tool_results > 0
             || self.removed_messages > 0
             || self.truncated_blocks > 0
@@ -80,6 +112,18 @@ pub(crate) fn fit_to_budget(
     };
     if original <= budget_tokens {
         return report;
+    }
+
+    // Tool definitions do not shrink as the conversation is trimmed. Past their share of the
+    // budget they are compressed first, judged by the tools alone, so every turn of a
+    // conversation gets the same tool definitions.
+    let tool_budget = (budget_tokens as f64 * config.tool_budget_ratio).max(1.0) as i32;
+    report.compressed_tools = compress_tools_to_budget(request, tool_budget);
+    if report.compressed_tools > 0 {
+        report.final_tokens = estimate(request);
+        if report.final_tokens <= budget_tokens {
+            return report;
+        }
     }
 
     report.removed_thinking_blocks = drop_old_thinking(&mut request.messages);
@@ -135,13 +179,275 @@ pub(crate) fn fit_to_budget(
 
     while report.final_tokens > budget_tokens {
         let excess = report.final_tokens - budget_tokens;
-        if !truncate_largest_block(&mut request.messages, excess) {
+        if !truncate_largest_block(request, excess) {
             break;
         }
         report.truncated_blocks += 1;
         report.final_tokens = estimate(request);
     }
     report
+}
+
+/// Budget for the server-side retry after the upstream still rejected the input as too long.
+pub(crate) fn retry_budget(budget_tokens: i32, config: &ForcedContextBackoffConfig) -> i32 {
+    ((budget_tokens as f64) * config.retry_budget_ratio).max(1.0) as i32
+}
+
+// ============ 按会话记住的预算比例 ============
+
+/// 记住的比例的有效期：会话停下来超过这个时间就按完整预算重新开始。
+const BUDGET_SCALE_TTL: Duration = Duration::from_secs(6 * 3600);
+const BUDGET_SCALE_CAPACITY: usize = 10_000;
+/// 连续被拒时比例逐次相乘，不低于这个值。
+pub(crate) const MIN_BUDGET_SCALE: f64 = 0.25;
+
+static BUDGET_SCALES: LazyLock<Mutex<HashMap<String, (f64, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The budget scale remembered for `key` after an earlier too-long rejection.
+pub(crate) fn remembered_budget_scale(key: &str) -> Option<f64> {
+    let mut scales = BUDGET_SCALES.lock();
+    match scales.get(key) {
+        Some((scale, at)) if at.elapsed() < BUDGET_SCALE_TTL => Some(*scale),
+        Some(_) => {
+            scales.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Remembers `scale` for `key`; later requests of the conversation are fitted to it first.
+pub(crate) fn remember_budget_scale(key: String, scale: f64) {
+    let scale = scale.clamp(MIN_BUDGET_SCALE, 1.0);
+    let mut scales = BUDGET_SCALES.lock();
+    if scales.len() >= BUDGET_SCALE_CAPACITY && !scales.contains_key(&key) {
+        scales.retain(|_, (_, at)| at.elapsed() < BUDGET_SCALE_TTL);
+        if scales.len() >= BUDGET_SCALE_CAPACITY
+            && let Some(oldest) = scales
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone())
+        {
+            scales.remove(&oldest);
+        }
+    }
+    scales.insert(key, (scale, Instant::now()));
+}
+
+#[cfg(test)]
+pub(crate) fn forget_budget_scale(key: &str) {
+    BUDGET_SCALES.lock().remove(key);
+}
+
+// ============ 工具定义压缩 ============
+
+/// One compression level for tool definitions; levels are tried in order until the tools fit.
+struct ToolCompression {
+    description_chars: usize,
+    /// Schema `description` / `title` / `$comment` cap; 0 removes them.
+    annotation_chars: usize,
+    /// Enum value lists are cut to this many entries.
+    enum_max: Option<usize>,
+    /// Schema nodes at this depth or deeper keep only their `type` (the top-level properties are
+    /// depth 1); `$ref` nodes become `{}` and `$defs` are dropped.
+    flatten_depth: Option<usize>,
+}
+
+const TOOL_COMPRESSION_LEVELS: [ToolCompression; 4] = [
+    ToolCompression {
+        description_chars: 2_000,
+        annotation_chars: 300,
+        enum_max: None,
+        flatten_depth: None,
+    },
+    ToolCompression {
+        description_chars: 800,
+        annotation_chars: 100,
+        enum_max: None,
+        flatten_depth: None,
+    },
+    ToolCompression {
+        description_chars: 300,
+        annotation_chars: 0,
+        enum_max: Some(64),
+        flatten_depth: None,
+    },
+    ToolCompression {
+        description_chars: 120,
+        annotation_chars: 0,
+        enum_max: Some(32),
+        flatten_depth: Some(2),
+    },
+];
+
+fn tools_tokens(tools: &[Tool]) -> i32 {
+    crate::token::count_all_tokens_local(None, &[], Some(tools)).min(i32::MAX as u64) as i32
+}
+
+/// Compresses the client's tool definitions until they fit `budget_tokens`, trying the levels
+/// from the mildest; the strongest level is kept when none fits. Names and parameter names never
+/// change, so the model's tool calls still match the client's tools. Server tools are left alone.
+/// Returns the number of tools changed.
+fn compress_tools_to_budget(request: &mut MessagesRequest, budget_tokens: i32) -> usize {
+    let Some(tools) = request.tools.as_mut() else {
+        return 0;
+    };
+    if tools.is_empty() || tools_tokens(tools) <= budget_tokens {
+        return 0;
+    }
+    let original = tools.clone();
+    let mut changed = 0;
+    for level in &TOOL_COMPRESSION_LEVELS {
+        let mut candidate = original.clone();
+        changed = candidate
+            .iter_mut()
+            .map(|tool| usize::from(compress_tool(tool, level)))
+            .sum();
+        *tools = candidate;
+        if tools_tokens(tools) <= budget_tokens {
+            break;
+        }
+    }
+    changed
+}
+
+fn compress_tool(tool: &mut Tool, level: &ToolCompression) -> bool {
+    if tool
+        .tool_type
+        .as_deref()
+        .is_some_and(|kind| kind != "custom")
+    {
+        return false;
+    }
+    let mut changed = shorten_text(&mut tool.description, level.description_chars);
+    if tool.input_schema.is_empty() {
+        return changed;
+    }
+    let mut schema = Value::Object(std::mem::take(&mut tool.input_schema).into_iter().collect());
+    if level.flatten_depth.is_some()
+        && let Value::Object(map) = &mut schema
+    {
+        changed |= map.remove("$defs").is_some();
+        changed |= map.remove("definitions").is_some();
+    }
+    changed |= shrink_schema(&mut schema, level, 0);
+    if let Value::Object(map) = schema {
+        tool.input_schema = map.into_iter().collect();
+    }
+    changed
+}
+
+const SCHEMA_ANNOTATION_KEYS: [&str; 3] = ["description", "title", "$comment"];
+const SCHEMA_CHILD_MAPS: [&str; 5] = [
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+const SCHEMA_CHILDREN: [&str; 11] = [
+    "items",
+    "additionalProperties",
+    "additionalItems",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+];
+const SCHEMA_ALTERNATIVES: [&str; 4] = ["anyOf", "oneOf", "allOf", "prefixItems"];
+
+/// Shrinks one JSON Schema node. Keys inside `properties` are parameter names, never annotations,
+/// so a parameter called `description` is kept.
+fn shrink_schema(node: &mut Value, level: &ToolCompression, depth: usize) -> bool {
+    let Value::Object(map) = node else {
+        return false;
+    };
+    if let Some(flatten_depth) = level.flatten_depth {
+        if map.contains_key("$ref") {
+            map.clear();
+            return true;
+        }
+        if depth >= flatten_depth {
+            let kind = map.remove("type");
+            let changed = !map.is_empty();
+            map.clear();
+            if let Some(kind) = kind {
+                map.insert("type".to_string(), kind);
+            }
+            return changed;
+        }
+    }
+    let mut changed = map.remove("examples").is_some();
+    for key in SCHEMA_ANNOTATION_KEYS {
+        let Some(Value::String(text)) = map.get_mut(key) else {
+            continue;
+        };
+        if level.annotation_chars == 0 {
+            map.remove(key);
+            changed = true;
+        } else {
+            changed |= shorten_text(text, level.annotation_chars);
+        }
+    }
+    if let Some(max) = level.enum_max
+        && let Some(Value::Array(values)) = map.get_mut("enum")
+        && values.len() > max
+    {
+        values.truncate(max);
+        changed = true;
+    }
+    for key in SCHEMA_CHILD_MAPS {
+        if let Some(Value::Object(children)) = map.get_mut(key) {
+            for child in children.values_mut() {
+                changed |= shrink_schema(child, level, depth + 1);
+            }
+        }
+    }
+    for key in SCHEMA_CHILDREN {
+        match map.get_mut(key) {
+            Some(child @ Value::Object(_)) => changed |= shrink_schema(child, level, depth + 1),
+            Some(Value::Array(children)) => {
+                for child in children {
+                    changed |= shrink_schema(child, level, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    for key in SCHEMA_ALTERNATIVES {
+        if let Some(Value::Array(children)) = map.get_mut(key) {
+            for child in children {
+                changed |= shrink_schema(child, level, depth);
+            }
+        }
+    }
+    changed
+}
+
+/// Cuts `text` to at most `max_chars` characters, at the last sentence or line end in the second
+/// half when there is one, and marks the cut with an ellipsis.
+fn shorten_text(text: &mut String, max_chars: usize) -> bool {
+    if text.chars().count() <= max_chars {
+        return false;
+    }
+    let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    let boundary = cut
+        .char_indices()
+        .filter(|(_, ch)| matches!(ch, '.' | '\n' | '!' | '?' | '。' | '！' | '？'))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .rfind(|end| cut[..*end].chars().count() * 2 >= max_chars);
+    let mut shortened = boundary
+        .map_or(cut.as_str(), |end| &cut[..end])
+        .trim_end()
+        .to_string();
+    shortened.push('…');
+    *text = shortened;
+    true
 }
 
 /// 客户端的 `context_management.edits`，按官方参数在本地执行（`clear_thinking_*` 先于
@@ -563,8 +869,42 @@ fn text_len_tokens(text: &str) -> i32 {
     crate::token::count_tokens(text).min(i32::MAX as u64) as i32
 }
 
-/// 最大单块（文本或工具结果）做中间截断，至少去掉 `excess` 个 token。找不到可截断的块时返回 false。
-fn truncate_largest_block(messages: &mut [Message], excess: i32) -> bool {
+/// 最大单块（文本、工具结果或系统提示块）做中间截断，至少去掉 `excess` 个 token。找不到可截断的块时
+/// 返回 false。
+fn truncate_largest_block(request: &mut MessagesRequest, excess: i32) -> bool {
+    let largest_system = request.system.as_ref().and_then(|blocks| {
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (index, text_len_tokens(&block.text)))
+            .max_by_key(|(_, tokens)| *tokens)
+    });
+    let largest_message = largest_message_block(&request.messages);
+    match largest_system {
+        Some((index, tokens))
+            if tokens >= 64 && largest_message.is_none_or(|(_, _, _, t)| tokens > t) =>
+        {
+            let Some(block) = request
+                .system
+                .as_mut()
+                .and_then(|blocks| blocks.get_mut(index))
+            else {
+                return false;
+            };
+            let keep_tokens = (tokens - excess - 32).max(tokens / 8).max(16);
+            let truncated = truncate_middle(&block.text, keep_tokens, tokens);
+            if truncated.len() >= block.text.len() {
+                return false;
+            }
+            block.text = truncated;
+            true
+        }
+        _ => truncate_message_block(&mut request.messages, largest_message, excess),
+    }
+}
+
+/// 消息里最大的单块：(消息下标, 块下标或 `usize::MAX` 表示整条字符串, 工具结果内的条目下标, tokens)。
+fn largest_message_block(messages: &[Message]) -> Option<(usize, usize, Option<usize>, i32)> {
     let mut best: Option<(usize, usize, Option<usize>, i32)> = None;
     for (mi, message) in messages.iter().enumerate() {
         let Some(blocks) = message.content.as_array() else {
@@ -614,6 +954,14 @@ fn truncate_largest_block(messages: &mut [Message], excess: i32) -> bool {
             }
         }
     }
+    best
+}
+
+fn truncate_message_block(
+    messages: &mut [Message],
+    best: Option<(usize, usize, Option<usize>, i32)>,
+    excess: i32,
+) -> bool {
     let Some((mi, bi, item, tokens)) = best else {
         return false;
     };
@@ -772,7 +1120,7 @@ mod tests {
         }
         while report.final_tokens > budget_tokens {
             let excess = report.final_tokens - budget_tokens;
-            if !truncate_largest_block(&mut request.messages, excess) {
+            if !truncate_largest_block(request, excess) {
                 break;
             }
             report.truncated_blocks += 1;
@@ -1042,5 +1390,205 @@ mod phase2_tests {
         let text = messages[0].content.to_string();
         assert_eq!(text.matches("Some earlier turns").count(), 1, "{text}");
         assert!(text.contains("task"));
+    }
+}
+
+#[cfg(test)]
+mod too_long_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn config() -> ForcedContextBackoffConfig {
+        ForcedContextBackoffConfig::default()
+    }
+
+    fn long_text(words: usize) -> String {
+        "Runs the selected operation against the workspace. ".repeat(words)
+    }
+
+    /// Many client tools with long descriptions and nested, annotated schemas, as sent by
+    /// clients with many MCP servers.
+    fn tool_heavy_request(tools: usize) -> MessagesRequest {
+        let tools: Vec<Value> = (0..tools)
+            .map(|i| {
+                json!({
+                    "name": format!("mcp__server__tool_{i}"),
+                    "description": long_text(120),
+                    "input_schema": {
+                        "type": "object",
+                        "$defs": {"Mode": {"type": "string", "description": long_text(40)}},
+                        "properties": {
+                            "description": {"type": "string", "description": long_text(40)},
+                            "options": {
+                                "type": "object",
+                                "description": long_text(40),
+                                "examples": [{"a": 1}, {"b": 2}],
+                                "properties": {
+                                    "mode": {"$ref": "#/$defs/Mode"},
+                                    "level": {"type": "string", "enum": (0..200).map(|n| format!("v{n}")).collect::<Vec<_>>()}
+                                }
+                            }
+                        },
+                        "required": ["description"]
+                    }
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 8192,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "first task"},
+                {"role": "assistant", "content": "working on it"},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn oversized_tool_definitions_are_compressed_before_history_is_touched() {
+        let mut request = tool_heavy_request(120);
+        let tool_names: Vec<String> = request
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let before = tools_tokens(request.tools.as_ref().unwrap());
+        let budget = before / 2;
+        let report = fit_to_budget(&mut request, budget, &config());
+        assert!(report.compressed_tools > 0, "{report:?}");
+        assert_eq!(report.removed_messages, 0, "{report:?}");
+        assert!(report.final_tokens <= budget, "{report:?}");
+        let tools = request.tools.as_ref().unwrap();
+        let after = tools_tokens(tools);
+        assert!(
+            after <= (budget as f64 * config().tool_budget_ratio) as i32 || after < before / 3,
+            "tools {before} -> {after}"
+        );
+        // Names and parameter names never change, so the model's calls still match the client.
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            tool_names
+        );
+        let properties = tools[0].input_schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("description"), "{properties:?}");
+        assert!(properties.contains_key("options"), "{properties:?}");
+        assert!(tools[0].description.ends_with('…'));
+        assert_eq!(request.messages.len(), 3);
+    }
+
+    #[test]
+    fn tool_compression_is_deterministic_and_skipped_within_budget() {
+        let mut first = tool_heavy_request(60);
+        let mut second = tool_heavy_request(60);
+        let budget = tools_tokens(first.tools.as_ref().unwrap()) / 2;
+        fit_to_budget(&mut first, budget, &config());
+        fit_to_budget(&mut second, budget, &config());
+        assert_eq!(
+            serde_json::to_value(&first.tools).unwrap(),
+            serde_json::to_value(&second.tools).unwrap()
+        );
+
+        let mut within = tool_heavy_request(5);
+        let original = serde_json::to_value(&within.tools).unwrap();
+        let report = fit_to_budget(&mut within, i32::MAX, &config());
+        assert_eq!(report.compressed_tools, 0);
+        assert_eq!(serde_json::to_value(&within.tools).unwrap(), original);
+    }
+
+    #[test]
+    fn strongest_level_flattens_nested_schemas_but_keeps_top_level_parameters() {
+        let mut tool = tool_heavy_request(1).tools.unwrap().remove(0);
+        assert!(compress_tool(&mut tool, &TOOL_COMPRESSION_LEVELS[3]));
+        let schema = Value::Object(tool.input_schema.clone().into_iter().collect());
+        assert!(schema.get("$defs").is_none(), "{schema}");
+        // A parameter called `description` is a parameter, not an annotation.
+        assert_eq!(
+            schema["properties"]["description"],
+            json!({"type": "string"})
+        );
+        let options = &schema["properties"]["options"];
+        assert_eq!(options["type"], "object", "{schema}");
+        assert!(options.get("description").is_none(), "{schema}");
+        assert!(options.get("examples").is_none(), "{schema}");
+        // Deeper nodes keep only their type; references become an empty schema.
+        assert_eq!(options["properties"]["level"], json!({"type": "string"}));
+        assert_eq!(options["properties"]["mode"], json!({}));
+        assert_eq!(schema["required"], json!(["description"]));
+        assert!(tool.description.chars().count() <= 120);
+    }
+
+    #[test]
+    fn server_tools_are_not_compressed() {
+        let mut tool: Tool = serde_json::from_value(json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5
+        }))
+        .unwrap();
+        assert!(!compress_tool(&mut tool, &TOOL_COMPRESSION_LEVELS[3]));
+    }
+
+    #[test]
+    fn a_huge_system_prompt_is_truncated_when_it_is_the_largest_block() {
+        let mut request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1000,
+            "system": [
+                {"type": "text", "text": "short rules"},
+                {"type": "text", "text": format!("HEAD{}TAIL", long_text(20_000))}
+            ],
+            "messages": [
+                {"role": "user", "content": "summarize the document"}
+            ]
+        }))
+        .unwrap();
+        let report = fit_to_budget(&mut request, 50_000, &config());
+        assert!(report.final_tokens <= 50_000, "{report:?}");
+        assert!(report.truncated_blocks > 0, "{report:?}");
+        let system = request.system.as_ref().unwrap();
+        assert_eq!(system[0].text, "short rules");
+        assert!(system[1].text.starts_with("HEAD"));
+        assert!(system[1].text.ends_with("TAIL"));
+        assert!(system[1].text.contains("content truncated"));
+        assert_eq!(
+            request.messages[0].content.as_str(),
+            Some("summarize the document")
+        );
+    }
+
+    #[test]
+    fn shorten_text_prefers_a_sentence_end_and_counts_characters() {
+        let mut text = "第一句话说明用途。第二句话补充细节。第三句话很长很长很长".to_string();
+        assert!(shorten_text(&mut text, 20));
+        assert_eq!(text, "第一句话说明用途。第二句话补充细节。…");
+        let mut short = "fits".to_string();
+        assert!(!shorten_text(&mut short, 10));
+        assert_eq!(short, "fits");
+    }
+
+    #[test]
+    fn retry_budget_scales_the_budget() {
+        assert_eq!(retry_budget(100_000, &config()), 65_000);
+    }
+
+    #[test]
+    fn budget_scales_are_remembered_per_conversation_and_clamped() {
+        let key = "too-long-test-conversation".to_string();
+        forget_budget_scale(&key);
+        assert_eq!(remembered_budget_scale(&key), None);
+        remember_budget_scale(key.clone(), 0.65);
+        assert_eq!(remembered_budget_scale(&key), Some(0.65));
+        remember_budget_scale(key.clone(), 0.01);
+        assert_eq!(remembered_budget_scale(&key), Some(MIN_BUDGET_SCALE));
+        forget_budget_scale(&key);
+        assert_eq!(remembered_budget_scale(&key), None);
     }
 }

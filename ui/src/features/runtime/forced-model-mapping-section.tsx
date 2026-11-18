@@ -39,6 +39,7 @@ import {
 } from '@/lib/runtime-config-defaults'
 import type {
   ForcedContextBackoffConfig,
+  ForcedTooLongResponse,
   ForcedKnowledgeEntry,
   ForcedKnowledgeLocale,
   ForcedModelCatalog,
@@ -49,6 +50,16 @@ import type {
 } from '@/types/api'
 import { useForcedModelCatalog, useForcedModelKnowledge, useForcedModelTargets } from '@/hooks/use-usage'
 import { NumField, TogField } from './runtime-sections'
+
+const TOO_LONG_RESPONSE_LABEL: Record<ForcedTooLongResponse, string> = {
+  prompt_too_long: '提示输入过长，客户端自动压缩',
+  overloaded: '临时过载 529（旧行为）',
+}
+
+const TOO_LONG_RESPONSE_DESC: Record<ForcedTooLongResponse, string> = {
+  prompt_too_long: '返回 400 prompt is too long，不带 token 数字，不暴露服务窗口。Claude Code 等客户端据此自动压缩上下文后重发，用户基本无感。',
+  overloaded: '返回 529 overloaded。客户端当成临时错误原样重试，同样的输入每次都会失败，不建议使用。',
+}
 
 const FAMILY_LABEL: Record<string, string> = {
   opus: 'Opus',
@@ -1070,7 +1081,7 @@ export function ForcedModelMappingSection({
 
       <SubBlock
         title="上下文退避"
- desc="客户端按外显模型的窗口（多为 1M）发送历史。超出目标模型窗口时，先把早期对话浓缩成一段工作记录（摘要检查点），放不下再依次去掉旧的思考块、清理旧的工具结果、从最早的轮次删除历史、截断最大的单个内容块。窗口取目标模型在模型目录里的输入上限，没有时按 200K。强制收敛开启时，没有显式配置的路由会默认使用模型驱动的 WebSearch。"
+ desc="客户端按外显模型的窗口（多为 1M）发送历史。超出目标模型窗口时，先把早期对话浓缩成一段工作记录（摘要检查点），放不下再依次压缩过大的工具定义、去掉旧的思考块、清理旧的工具结果、从最早的轮次删除历史、截断最大的单个内容块。上游仍判定输入过长时，服务端按更小的预算重新裁剪再发一次，并记住这个会话的预算；还不行才按下面的设置答复客户端。窗口取目标模型在模型目录里的输入上限，没有时按 200K。强制收敛开启时，没有显式配置的路由会默认使用模型驱动的 WebSearch。"
       >
  <div className="grid gap-x-6 gap-y-5 md:grid-cols-2">
           <TogField
@@ -1156,6 +1167,45 @@ export function ForcedModelMappingSection({
             suffix="tokens"
             onChange={setBackoff('stepTokens')}
           />
+          <NumField
+            label="工具定义预算比例"
+            desc={`请求超出预算时，工具定义最多占预算的这个比例，超出就分级压缩工具描述和参数说明（工具名和参数名不变）。范围 ${limits.toolBudgetRatio.min}–${limits.toolBudgetRatio.max}，默认 0.3。`}
+            value={mapping.contextBackoff.toolBudgetRatio}
+            min={limits.toolBudgetRatio.min}
+            max={limits.toolBudgetRatio.max}
+            step={0.05}
+            suffix="比例"
+            onChange={setBackoff('toolBudgetRatio')}
+          />
+          <NumField
+            label="超长重试预算比例"
+            desc={`上游仍判定输入过长时，按 本次预算 × 该比例 重新裁剪再发一次；同一会话后续请求直接按缩小后的预算裁剪，不再先失败一次。范围 ${limits.retryBudgetRatio.min}–${limits.retryBudgetRatio.max}，默认 0.65。`}
+            value={mapping.contextBackoff.retryBudgetRatio}
+            min={limits.retryBudgetRatio.min}
+            max={limits.retryBudgetRatio.max}
+            step={0.05}
+            suffix="比例"
+            onChange={setBackoff('retryBudgetRatio')}
+          />
+          <div className="min-w-0 space-y-1.5">
+            <label className="block text-[13px] font-medium leading-5 text-foreground">仍超长时的答复</label>
+            <Select
+              value={mapping.contextBackoff.tooLongResponse}
+              onValueChange={(value) => setBackoff('tooLongResponse')(value as ForcedTooLongResponse)}
+            >
+              <SelectTrigger size="sm" className="w-64" aria-label="仍超长时的答复">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(TOO_LONG_RESPONSE_LABEL) as ForcedTooLongResponse[]).map((value) => (
+                  <SelectItem key={value} value={value}>{TOO_LONG_RESPONSE_LABEL[value]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div className="max-w-[34rem] text-[11px] leading-4 text-muted-foreground">
+              {TOO_LONG_RESPONSE_DESC[mapping.contextBackoff.tooLongResponse]} 两种答复都不带 token 数字。
+            </div>
+          </div>
         </div>
       </SubBlock>
 

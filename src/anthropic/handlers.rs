@@ -23,6 +23,7 @@ use crate::model::config::{
     RouteFeatureSet, RouteFeaturesConfig, StableSegmentCachePolicy, ThinkingTriggerMode,
     normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
+use crate::model::forced_model_mapping::ForcedTooLongResponse;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -388,6 +389,9 @@ struct RequestUsageContext {
     display_identity: Option<super::identity_guard::DisplayIdentity>,
     /// Forced model mapping: input tokens of the client's original request.
     client_input_tokens: Option<i32>,
+    /// Forced model mapping: the reply to an input-too-long rejection left after the server-side
+    /// re-fit.
+    forced_too_long_response: Option<ForcedTooLongResponse>,
     /// Forced model mapping to a model that returns the text it writes between tool calls as
     /// thinking blocks (Opus 5.5, the Fable / Mythos 5 family): `None` leaves the text alone,
     /// `Some(false)` sends it as an empty thinking block (`display: "omitted"`), `Some(true)` keeps it
@@ -1468,6 +1472,9 @@ struct PayloadTooLongRetryRequest {
     /// Forced model mapping: an `Improperly formed request` rejection also flattens history tool
     /// calls into text on the retry, so a structural problem trimming can't fix does not fail.
     flatten_history_tool_uses: bool,
+    /// Forced model mapping: an input-too-long rejection re-fits the request to a smaller budget
+    /// and converts it again, instead of trimming the converted request.
+    forced_refit: Option<Arc<local_body_pipeline::ForcedRefit>>,
     endpoint: String,
     requested_model: String,
     upstream_model: Option<String>,
@@ -1522,13 +1529,15 @@ impl PayloadTooLongRetryRequest {
             conversation_id,
             conversion_warnings,
             None,
+            None,
         )
     }
 
     /// `forced_window_tokens`: a forced model mapping serves a smaller window than the client
-    /// assumes. Every input-too-long rejection is then trimmed to that window and retried on the
-    /// server instead of being returned, since the client never compacts for a window it does
-    /// not know about.
+    /// assumes. Every input-too-long rejection is then retried on the server before anything is
+    /// returned, since the client never compacts for a window it does not know about:
+    /// `forced_refit` (requests near their budget) fits the request again to a smaller budget,
+    /// otherwise the converted request is trimmed to the window.
     #[allow(clippy::too_many_arguments)]
     fn new_with_window(
         payload: &MessagesRequest,
@@ -1539,6 +1548,7 @@ impl PayloadTooLongRetryRequest {
         conversation_id: &str,
         conversion_warnings: Option<String>,
         forced_window_tokens: Option<i32>,
+        forced_refit: Option<Arc<local_body_pipeline::ForcedRefit>>,
     ) -> Option<Self> {
         let requested_model = payload.model.as_str();
         let mut config = runtime_config.payload_guard_config();
@@ -1568,6 +1578,7 @@ impl PayloadTooLongRetryRequest {
                 request: request.clone(),
                 config,
                 flatten_history_tool_uses: true,
+                forced_refit,
                 endpoint: endpoint.to_string(),
                 requested_model: requested_model.to_string(),
                 upstream_model: upstream_model.map(str::to_string),
@@ -1599,6 +1610,7 @@ impl PayloadTooLongRetryRequest {
                 request: request.clone(),
                 config,
                 flatten_history_tool_uses: false,
+                forced_refit: None,
                 endpoint: endpoint.to_string(),
                 requested_model: requested_model.to_string(),
                 upstream_model: upstream_model.map(str::to_string),
@@ -1623,6 +1635,35 @@ impl PayloadTooLongRetryRequest {
                     .as_ref()
                     .is_some_and(|raw| is_upstream_improperly_formed_error(&raw.body))
         });
+        let too_long = attempts.last().is_some_and(|attempt| {
+            attempt
+                .error_message
+                .as_deref()
+                .is_some_and(is_upstream_too_long_error)
+                || attempt
+                    .raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| is_upstream_too_long_error(&raw.body))
+        });
+        if too_long && let Some(refit) = self.forced_refit.take() {
+            // Fitting and converting a request this large is CPU work; keep it off the async
+            // worker.
+            let rebuilt = local_body_pipeline::run_cpu_heavy_in_place(usize::MAX, false, || {
+                refit.rebuild(&usage_context.request_id, &self.endpoint)
+            });
+            match rebuilt {
+                Ok(request) => {
+                    self.request = request;
+                    self.config = refit.guard_config;
+                }
+                Err(error) => tracing::warn!(
+                    request_id = %usage_context.request_id,
+                    endpoint = %self.endpoint,
+                    error = %error,
+                    "forced model mapping could not convert the re-fitted request; trimming the converted request instead"
+                ),
+            }
+        }
         if self.flatten_history_tool_uses && improperly_formed {
             let flattened = self
                 .request
@@ -5474,12 +5515,14 @@ impl CredentialUsageContext {
             && (is_upstream_payload_too_long_error(&error_message)
                 || is_upstream_context_window_full_error(&error_message))
         {
-            // Forced model mapping: recorded the same way it was returned (a transient overload).
+            // Forced model mapping: recorded the same way it was returned.
+            let (status, error_type, message, append_error_id) =
+                forced_too_long_reply(self.request.forced_too_long_response.unwrap_or_default());
             Some(usage_public_error(
-                StatusCode::from_u16(529).expect("529 is a valid status code"),
-                "overloaded_error",
-                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
-                Some(&self.request.error_id),
+                status,
+                error_type,
+                message,
+                append_error_id.then_some(self.request.error_id.as_str()),
             ))
         } else {
             Some(provider_public_error_for_message(
@@ -6484,6 +6527,10 @@ fn prepare_usage_context_with_inference_attempt_budget(
             .as_ref()
             .and_then(|resolution| resolution.forced.as_ref())
             .map(|forced| forced.client_input_tokens),
+        forced_too_long_response: model_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.forced.as_ref())
+            .map(|forced| forced.too_long_response),
         interleaved_text_as_thinking: model_resolution
             .as_ref()
             .and_then(|resolution| resolution.forced.as_ref())
@@ -6996,14 +7043,42 @@ struct ProviderErrorContext<'a> {
     /// Forced mapping target, used only to redact upstream model names from public errors.
     served_model: Option<&'a str>,
     /// Forced model mapping: the client asked for a model with a larger window. An input-too-long
-    /// rejection left after server-side backoff is reported as a transient overload, never as
-    /// `prompt is too long` (which would reveal the serving window).
+    /// rejection left after the server-side re-fit is answered as `forced_too_long_response`
+    /// says.
     forced: bool,
+    forced_too_long_response: ForcedTooLongResponse,
 }
 
 const PROMPT_TOO_LONG_THRESHOLD_MESSAGE: &str = "prompt is too long: the request input exceeds the upstream content length limit, which is separate from the model context window. Reduce conversation history, tools, documents, images, or tool results.";
 const PROMPT_TOO_LONG_CONTEXT_WINDOW_MESSAGE: &str =
     "prompt is too long: the conversation exceeds the model context window.";
+/// Forced model mapping: carries no token figures and names no limit, so the serving window is
+/// not revealed. Claude Code compacts on any error text containing `prompt is too long`; the
+/// `N tokens > M maximum` figures only tune how much it trims when the compaction request itself
+/// is too long. Must not contain digits.
+const FORCED_PROMPT_TOO_LONG_MESSAGE: &str = "prompt is too long: the request exceeds the maximum input length. Compact the conversation, or reduce tool definitions, files, or images.";
+
+/// Forced model mapping: the reply to an input-too-long rejection left after the server-side
+/// re-fit, as (status, error type, message, whether the request id is appended to the message).
+/// Neither reply carries token figures.
+fn forced_too_long_reply(
+    mode: ForcedTooLongResponse,
+) -> (StatusCode, &'static str, &'static str, bool) {
+    match mode {
+        ForcedTooLongResponse::PromptTooLong => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            FORCED_PROMPT_TOO_LONG_MESSAGE,
+            false,
+        ),
+        ForcedTooLongResponse::Overloaded => (
+            StatusCode::from_u16(529).expect("529 is a valid status code"),
+            "overloaded_error",
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            true,
+        ),
+    }
+}
 
 /// Claude Code protocol wording for an upstream input-too-long rejection. Exact token figures
 /// are only reported when the local estimate really exceeds the window; Kiro also rejects on a
@@ -7183,23 +7258,44 @@ fn map_provider_error_inner(
     }
     let _ = scheduler_error_kind_from_string_fallback(&err_str);
 
-    if prompt_context.is_some_and(|context| context.forced)
+    if let Some(context) = prompt_context.filter(|context| context.forced)
         && (is_upstream_payload_too_long_error(&err_str)
             || is_upstream_context_window_full_error(&err_str))
     {
+        let (status, error_type, message, append_error_id) =
+            forced_too_long_reply(context.forced_too_long_response);
         log_provider_warning_with_hint(
             &err_str,
-            "强制模型收敛：上游判定输入过长且服务端退避已用尽，按临时过载返回",
+            match context.forced_too_long_response {
+                ForcedTooLongResponse::Overloaded => {
+                    "强制模型收敛：上游判定输入过长且服务端重新裁剪后仍超长，按临时过载返回"
+                }
+                _ => {
+                    "强制模型收敛：上游判定输入过长且服务端重新裁剪后仍超长，返回 prompt is too long 让客户端压缩"
+                }
+            },
             error_id,
         );
-        return public_error_response(
-            StatusCode::from_u16(529).expect("529 is a valid status code"),
-            "overloaded_error",
-            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE.to_string(),
-            request_id,
-            error_id,
-            std::iter::empty::<(&'static str, String)>(),
-        );
+        return if append_error_id {
+            public_error_response(
+                status,
+                error_type,
+                message,
+                request_id,
+                error_id,
+                std::iter::empty::<(&'static str, String)>(),
+            )
+        } else {
+            // Keep the protocol message verbatim; the error id travels in a header.
+            public_error_response(
+                status,
+                error_type,
+                message,
+                request_id,
+                None,
+                prompt_too_long_headers(error_id),
+            )
+        };
     }
 
     // Provider content length thresholds and model context windows are different limits.
@@ -8107,12 +8203,13 @@ async fn forced_request_pipeline(
     endpoint: &str,
     runtime_config: &Arc<RequestRuntimeConfig>,
     cache_route: &ResolvedCacheRoutePolicy,
-    model_resolution: &ModelResolution,
+    model_resolution: &mut ModelResolution,
     payload: &mut MessagesRequest,
     on_demand_compaction: Option<String>,
     request_body_bytes: usize,
 ) -> Option<Response> {
     let forced = model_resolution.forced.as_ref()?;
+    let target_window_tokens = forced.target_window_tokens;
     if super::forced_summary::apply_client_compaction_block(&mut payload.messages) {
         tracing::info!(
             endpoint,
@@ -8144,15 +8241,18 @@ async fn forced_request_pipeline(
             .await,
         );
     }
-    apply_forced_context_fitting(
+    let fit = apply_forced_context_fitting(
         payload,
-        forced,
+        target_window_tokens,
         runtime_config,
         endpoint,
         summary_context,
         request_body_bytes,
     )
     .await;
+    if let Some(forced) = model_resolution.forced.as_mut() {
+        forced.fit = fit;
+    }
     None
 }
 
@@ -8161,15 +8261,13 @@ async fn forced_request_pipeline(
 /// window.
 async fn apply_forced_context_fitting(
     payload: &mut MessagesRequest,
-    forced: &super::forced_model::ForcedTarget,
+    target_window_tokens: i32,
     runtime_config: &RequestRuntimeConfig,
     endpoint: &str,
     summary_context: forced_summary_call::SummaryContext,
     request_body_bytes: usize,
-) {
-    let Some(config) = runtime_config.forced_model_mapping_for(endpoint) else {
-        return;
-    };
+) -> Option<super::forced_backoff::ForcedFit> {
+    let config = runtime_config.forced_model_mapping_for(endpoint)?;
     // The target cannot run Anthropic's hosted code execution; without the local executor for
     // this route the tool would come back as a call nobody can run, so it is dropped.
     if !runtime_config
@@ -8188,11 +8286,32 @@ async fn apply_forced_context_fitting(
             "forced model mapping applied the client's context edits"
         );
     }
-    let budget = super::forced_backoff::input_budget(
-        forced.target_window_tokens,
+    let base_budget = super::forced_backoff::input_budget(
+        target_window_tokens,
         payload.max_tokens,
         &config.context_backoff,
     );
+    // A conversation the upstream rejected as too long earlier starts from the smaller budget the
+    // server-side retry used, instead of failing once more on every turn. The key is derived from
+    // the request before trimming, so it stays the same across the conversation. Deriving it
+    // hashes the system prompt and tools, so it is skipped for bodies smaller than the budget in
+    // bytes: every token takes at least one byte, so those requests are far from any budget.
+    let conversation_key = (request_body_bytes as u64 >= base_budget.max(0) as u64)
+        .then(|| extract_stable_conversation_id(payload))
+        .flatten();
+    let scale = conversation_key
+        .as_deref()
+        .and_then(super::forced_backoff::remembered_budget_scale)
+        .unwrap_or(1.0);
+    let budget = ((base_budget as f64) * scale).max(1.0) as i32;
+    if budget < base_budget {
+        tracing::info!(
+            endpoint,
+            base_budget_tokens = base_budget,
+            budget_tokens = budget,
+            "forced model mapping fitted a conversation the upstream rejected as too long earlier to its smaller budget"
+        );
+    }
     // Condense early turns into a checkpoint summary first; trimming only handles what is left.
     let summarized = forced_summary_call::apply_summary_checkpoint(
         payload,
@@ -8216,9 +8335,16 @@ async fn apply_forced_context_fitting(
             cleared_tool_results = report.cleared_tool_results,
             removed_messages = report.removed_messages,
             truncated_blocks = report.truncated_blocks,
+            compressed_tools = report.compressed_tools,
             "forced model mapping fitted the request into the target context window"
         );
     }
+    Some(super::forced_backoff::ForcedFit {
+        base_budget_tokens: base_budget,
+        budget_tokens: budget,
+        final_tokens: report.final_tokens,
+        conversation_key,
+    })
 }
 
 fn websearch_supported_for_profile(profile: CompatProfile) -> bool {
@@ -8784,48 +8910,48 @@ async fn post_messages_inner(
         }
     }
 
-    let model_resolution = match resolve_request_model(&state, &runtime_config, &endpoint, &payload)
-    {
-        Ok(mut resolution) => {
-            resolution.forced = forced_target.clone().map(|mut forced| {
-                if let Some(window) = resolution
-                    .upstream_model
-                    .as_deref()
-                    .and_then(|model| state.model_capabilities.max_input_tokens_for(model))
-                    .filter(|tokens| *tokens > 0)
-                {
-                    forced.target_window_tokens = window;
-                }
-                forced
-            });
-            resolution
-        }
-        Err(response) => {
-            if let Some(external_response) = maybe_forward_external_after_local_error(
-                external_fallback.as_ref(),
-                &envelope::request_id(),
-                &format!("模型不支持: {}", payload.model),
-                Vec::new(),
-            )
-            .await
-            {
-                return external_response;
+    let mut model_resolution =
+        match resolve_request_model(&state, &runtime_config, &endpoint, &payload) {
+            Ok(mut resolution) => {
+                resolution.forced = forced_target.clone().map(|mut forced| {
+                    if let Some(window) = resolution
+                        .upstream_model
+                        .as_deref()
+                        .and_then(|model| state.model_capabilities.max_input_tokens_for(model))
+                        .filter(|tokens| *tokens > 0)
+                    {
+                        forced.target_window_tokens = window;
+                    }
+                    forced
+                });
+                resolution
             }
-            let rejected_resolution = forced_target.clone().map(|forced| ModelResolution {
-                forced: Some(forced),
-                ..ModelResolution::unsupported(payload.model.clone())
-            });
-            record_pre_usage_rejection_for_request(
-                attribution.as_ref(),
-                RequestRejectionReason::ModelUnsupported,
-                &endpoint,
-                &response,
-                &payload,
-                rejected_resolution.as_ref(),
-            );
-            return response;
-        }
-    };
+            Err(response) => {
+                if let Some(external_response) = maybe_forward_external_after_local_error(
+                    external_fallback.as_ref(),
+                    &envelope::request_id(),
+                    &format!("模型不支持: {}", payload.model),
+                    Vec::new(),
+                )
+                .await
+                {
+                    return external_response;
+                }
+                let rejected_resolution = forced_target.clone().map(|forced| ModelResolution {
+                    forced: Some(forced),
+                    ..ModelResolution::unsupported(payload.model.clone())
+                });
+                record_pre_usage_rejection_for_request(
+                    attribution.as_ref(),
+                    RequestRejectionReason::ModelUnsupported,
+                    &endpoint,
+                    &response,
+                    &payload,
+                    rejected_resolution.as_ref(),
+                );
+                return response;
+            }
+        };
     if let Some(external) = external_fallback.as_mut() {
         external.model_resolution = Some(external_route_model_resolution(model_resolution.clone()));
     }
@@ -8842,7 +8968,7 @@ async fn post_messages_inner(
             &endpoint,
             &runtime_config,
             &cache_route,
-            &model_resolution,
+            &mut model_resolution,
             &mut payload,
             on_demand_compaction,
             request_body_bytes,
@@ -10276,6 +10402,7 @@ async fn handle_stream_request(
         requested_model: Some(requested_model.as_str()),
         served_model: served_model.as_deref(),
         forced: usage_context.display_identity.is_some(),
+        forced_too_long_response: usage_context.forced_too_long_response.unwrap_or_default(),
     };
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
@@ -13796,6 +13923,7 @@ async fn handle_non_stream_request(
         requested_model: Some(requested_model.as_str()),
         served_model: served_model.as_deref(),
         forced: usage_context.display_identity.is_some(),
+        forced_too_long_response: usage_context.forced_too_long_response.unwrap_or_default(),
     };
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;

@@ -9,6 +9,7 @@ import type {
   ForcedModelMappingConfig,
   ForcedModelRouteOverride,
   ForcedModelRule,
+  ForcedTooLongResponse,
   ImageProcessingConfig,
   MissingMaxTokensConfig,
   LocalRequestCompatConfig,
@@ -565,7 +566,11 @@ export const FORCED_CONTEXT_BACKOFF_LIMITS = {
   summaryPrecompactRatio: { min: 0.3, max: 0.95 },
   summaryTargetRatio: { min: 0.2, max: 0.85 },
   summaryTimeoutSecs: { min: 5, max: 300 },
+  retryBudgetRatio: { min: 0.3, max: 0.95 },
+  toolBudgetRatio: { min: 0.05, max: 1 },
 } as const
+
+export const FORCED_TOO_LONG_RESPONSES: readonly ForcedTooLongResponse[] = ['prompt_too_long', 'overloaded']
 
 export function defaultForcedModelRules(): ForcedModelRule[] {
   return []
@@ -582,6 +587,9 @@ export function defaultForcedContextBackoff(): ForcedContextBackoffConfig {
     summaryPrecompactRatio: 0.75,
     summaryTargetRatio: 0.45,
     summaryTimeoutSecs: 120,
+    retryBudgetRatio: 0.65,
+    toolBudgetRatio: 0.3,
+    tooLongResponse: 'prompt_too_long',
   }
 }
 
@@ -674,6 +682,11 @@ export function normalizeForcedModelMapping(input?: Partial<ForcedModelMappingCo
     summaryPrecompactRatio: clampBackoffNumber(backoffInput.summaryPrecompactRatio, backoffBase.summaryPrecompactRatio, limits.summaryPrecompactRatio.min, limits.summaryPrecompactRatio.max, false),
     summaryTargetRatio: clampBackoffNumber(backoffInput.summaryTargetRatio, backoffBase.summaryTargetRatio, limits.summaryTargetRatio.min, limits.summaryTargetRatio.max, false),
     summaryTimeoutSecs: clampBackoffNumber(backoffInput.summaryTimeoutSecs, backoffBase.summaryTimeoutSecs, limits.summaryTimeoutSecs.min, limits.summaryTimeoutSecs.max, true),
+    retryBudgetRatio: clampBackoffNumber(backoffInput.retryBudgetRatio, backoffBase.retryBudgetRatio, limits.retryBudgetRatio.min, limits.retryBudgetRatio.max, false),
+    toolBudgetRatio: clampBackoffNumber(backoffInput.toolBudgetRatio, backoffBase.toolBudgetRatio, limits.toolBudgetRatio.min, limits.toolBudgetRatio.max, false),
+    tooLongResponse: FORCED_TOO_LONG_RESPONSES.includes(backoffInput.tooLongResponse as ForcedTooLongResponse)
+      ? backoffInput.tooLongResponse as ForcedTooLongResponse
+      : backoffBase.tooLongResponse,
   }
 
   const knowledge: ForcedKnowledgeEntry[] = (input?.knowledge ?? [])
