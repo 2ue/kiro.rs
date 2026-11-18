@@ -528,6 +528,7 @@ export interface TokenRefreshAdmissionRuntime {
 export interface RuntimeConfig {
   proxyUrl?: string | null;
   proxyUsername?: string | null;
+  /** 读取时是脱敏值（如 `ab...yz`），只表示“已设置”；写入时传明文即替换，不传则保持不变。 */
   proxyPassword?: string | null;
   tlsBackend: "rustls" | "native-tls";
   requestAdmission: RequestAdmissionConfig;

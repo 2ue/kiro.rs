@@ -12258,6 +12258,93 @@ fn forward_headers_strips_auth_cookie_and_google_api_key_residue() {
     );
 }
 
+#[tokio::test]
+async fn account_internal_503_outcomes_are_published_as_529_overloaded() {
+    // 内部用 503 标记"账号不可用/调度被拒/等待超时"，对外一律 529 overloaded_error；
+    // api_error 只留给真正的上游 5xx。
+    for route_error_type in [
+        "account_unavailable",
+        "inference_attempt_policy",
+        "account_deadline_exceeded",
+        "account_capacity_full",
+    ] {
+        let error = AccountFinalError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            response_error_type: "service_unavailable".to_string(),
+            route_error_type: route_error_type.to_string(),
+            message: "internal detail".to_string(),
+            error_id: "err_test".to_string(),
+            retryable: false,
+            attempts: Vec::new(),
+            pool_id: None,
+            pool_name: None,
+        };
+        let public = error.public_error();
+        assert_eq!(public.status_code, 529, "{route_error_type}");
+        assert_eq!(public.error_type, "overloaded_error", "{route_error_type}");
+        let response = error.into_response("req_test");
+        assert_eq!(response.status().as_u16(), 529, "{route_error_type}");
+    }
+    let upstream = AccountFinalError {
+        status: StatusCode::BAD_GATEWAY,
+        response_error_type: "api_error".to_string(),
+        route_error_type: "upstream_error".to_string(),
+        message: "upstream failed".to_string(),
+        error_id: "err_test".to_string(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: None,
+        pool_name: None,
+    };
+    assert_eq!(upstream.public_error().error_type, "api_error");
+}
+
+#[test]
+fn account_probe_headers_follow_header_profile_auth_type_and_overrides() {
+    // 管理端探测（模型发现、账号测试）要和真实转发同一套请求头。
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.auth_type = AccountAuthType::XApiKey;
+    pool.header_profile = AccountHeaderProfile::ClaudeCodeMimic;
+    pool.header_overrides
+        .insert("x-custom-tenant".to_string(), "team-a".to_string());
+
+    let headers = account_probe_headers(&pool).expect("probe headers");
+
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("x-api-key"))
+            .and_then(|value| value.to_str().ok()),
+        Some("sk-test")
+    );
+    assert!(headers.get(header::AUTHORIZATION).is_none());
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("x-custom-tenant"))
+            .and_then(|value| value.to_str().ok()),
+        Some("team-a")
+    );
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("anthropic-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    // ClaudeCodeMimic 的指纹头也带上，和转发一致。
+    assert!(headers.get(header::USER_AGENT).is_some());
+    assert!(headers.get(header::ACCEPT).is_some());
+    assert!(headers.get(header::CONTENT_TYPE).is_some());
+
+    let mut generic = test_pool("https://example.com/v1", true);
+    generic.header_profile = AccountHeaderProfile::Generic;
+    let headers = account_probe_headers(&generic).expect("generic probe headers");
+    assert_eq!(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer sk-test")
+    );
+}
+
 #[test]
 fn forwarded_response_headers_drop_provider_fingerprints() {
     let mut upstream_headers = HeaderMap::new();
@@ -12287,9 +12374,10 @@ fn forwarded_response_headers_drop_provider_fingerprints() {
 
     assert_eq!(headers["content-type"], "application/json");
     assert_eq!(headers["retry-after"], "3");
-    assert_eq!(headers["anthropic-ratelimit-requests-remaining"], "10");
     assert_eq!(headers["request-id"], "req_01local");
+    // 上游配额头暴露的是账号自己的额度，不透传。
     for dropped in [
+        "anthropic-ratelimit-requests-remaining",
         "server",
         "cf-ray",
         "x-amzn-requestid",

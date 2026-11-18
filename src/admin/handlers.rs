@@ -116,6 +116,23 @@ pub struct UsageOverviewQueryParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageAccountLatencyQueryParams {
+    pub timezone: Option<String>,
+    pub range: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub account_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQualityHistoryQueryParams {
+    /// 回看小时数，1 到 168，默认 24。
+    pub hours: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageDashboardWindowQueryParams {
     pub timezone: Option<String>,
     pub window_key: Option<String>,
@@ -914,6 +931,40 @@ pub async fn get_usage_dashboard_account_risk(
             Json(AdminErrorResponse::invalid_request(message)),
         )
             .into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/account-latency
+/// 按账号的总耗时 / 首字延迟 p50 / p95 / p99（扫明细，范围最长 8 天）。
+pub async fn get_usage_dashboard_account_latency(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageAccountLatencyQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_account_latency(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+        params.account_id,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/accounts/{id}/quality-history?hours=24
+/// 账号质量分历史（错误率 / 首字 / 耗时 EWMA 快照），按时间升序。
+pub async fn get_account_quality_history(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(params): Query<AccountQualityHistoryQueryParams>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .get_account_quality_history(id, params.hours.unwrap_or(24))
+    {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 

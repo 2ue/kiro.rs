@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import { getAccounts, getAccountsStatus } from '@/api/accounts'
 import {
+  useUsageAccountLatency,
   useUsageOverview,
   useUsageOverviewRankings,
   useUsageOverviewSeries,
@@ -34,11 +35,14 @@ import {
 } from './overview-metrics'
 import { OverviewTrendCard, accountTrendViews, summaryTrendViews } from './overview-trends'
 import { billingDeltaTextClass, billingDeltaTone } from '@/features/usage/usage-helpers'
+import { RequestApiKeyIdDisplay } from '@/features/usage/request-api-key-id'
+import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
   Account,
   AccountStatus,
+  UsageAccountLatencyRow,
   UsageOverviewMetrics,
   UsageOverviewPoolRow,
   UsageOverviewRankRow,
@@ -141,18 +145,54 @@ function formatHitRate(rate: number | null): string {
   return rate == null ? '-' : formatPercent(rate)
 }
 
-/** 跳到用量页，带上账号与时间范围筛选。 */
+/** 跳到用量页，带上账号 / 路由 / 模型 / 请求 Key 与时间范围筛选。 */
 function usageLink(
   navigate: ReturnType<typeof useNavigate>,
-  params: { accountId?: number; endpoint?: string; since: string; until: string },
+  params: {
+    accountId?: number
+    endpoint?: string
+    model?: string
+    requestApiKeyId?: string
+    since: string
+    until: string
+  },
 ) {
   const search = new URLSearchParams()
   if (params.accountId) search.set('accountId', String(params.accountId))
   if (params.endpoint) search.set('endpoint', params.endpoint)
+  if (params.model) search.set('model', params.model)
+  if (params.requestApiKeyId) search.set('requestApiKeyId', params.requestApiKeyId)
   if (params.since) search.set('since', localDateTimeValue(params.since))
   if (params.until) search.set('until', localDateTimeValue(params.until))
   navigate(`/usage?${search.toString()}`)
 }
+
+/** 排行各页签点击一行时带到用量页的筛选键。错误页签没有对应筛选。 */
+function rankUsageFilter(dimension: RankingDimension, key: string): Parameters<typeof usageLink>[1] | null {
+  const base = { since: '', until: '' }
+  switch (dimension) {
+    case 'models':
+      return { ...base, model: key }
+    case 'paths':
+      return { ...base, endpoint: key }
+    case 'keys':
+      return { ...base, requestApiKeyId: key }
+    case 'accounts': {
+      const accountId = Number(key)
+      return Number.isFinite(accountId) && accountId > 0 ? { ...base, accountId } : null
+    }
+    default:
+      return null
+  }
+}
+
+function formatMs(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '-'
+  return `${formatNumber(Math.round(value))} ms`
+}
+
+/** 延迟分位扫明细，后端限制范围 8 天以内；更长范围不请求、列显示 -。 */
+const LATENCY_MAX_RANGE_MS = 8 * 86_400_000
 
 // ─── 小组件 ─────────────────────────────────────────────────────────────────────
 
@@ -346,16 +386,25 @@ function AccountsSection({
   billing,
   accounts,
   statuses,
+  latency,
+  latencyUnavailable,
   range,
   navigate,
 }: {
   billing: BillingTotals & { pools: UsageOverviewPoolRow[] }
   accounts: Account[]
   statuses: AccountStatus[]
+  /** 按账号的延迟分位；范围超过 8 天或接口失败时为空 */
+  latency: UsageAccountLatencyRow[]
+  latencyUnavailable: string
   range: { from: string; to: string }
   navigate: ReturnType<typeof useNavigate>
 }) {
   const usageById = new Map(billing.pools.map((item) => [item.poolId, item]))
+  const latencyById = new Map(latency.map((item) => [item.accountId, item]))
+  const totalAccountCostUsd = billing.pools.reduce((sum, item) => sum + (item.accountCostUsd ?? 0), 0)
+  const totalAttempts = billing.pools.reduce((sum, item) => sum + (item.attemptRequests ?? 0), 0)
+  const totalAttemptErrors = billing.pools.reduce((sum, item) => sum + (item.attemptErrorRequests ?? 0), 0)
   const statusById = new Map(statuses.map((item) => [item.account.id, item]))
   const configuredIds = new Set(accounts.map((account) => account.id))
   const rows = [
@@ -402,13 +451,28 @@ function AccountsSection({
           icon={<Zap />}
           tone="info"
         />
-        <StatCard title="上游原始成本" value={formatUsdFixed2(billing.rawCostUsd)} icon={<DollarSign />} tone="warning" />
+        <StatCard
+          title="上游原始成本"
+          value={formatUsdFixed2(billing.rawCostUsd)}
+          desc={`账号成本 ${formatUsdFixed2(totalAccountCostUsd)}（× 各账号倍率）`}
+          icon={<DollarSign />}
+          tone="warning"
+        />
         <StatCard
           title="展示计费"
           value={formatUsdFixed2(billing.shapedCostUsd)}
           desc="整形后的中间成本口径"
           icon={<DollarSign />}
           tone="primary"
+        />
+        <StatCard
+          title="账号尝试"
+          value={formatNumber(totalAttempts)}
+          desc={totalAttempts > 0
+            ? `含切走 ${formatNumber(totalAttemptErrors)} 次失败 · 尝试错误率 ${formatPercent(metricsShare(totalAttemptErrors, totalAttempts))}`
+            : '每次落到账号的调度都算一次，含中途失败被切走的'}
+          icon={<Activity />}
+          tone={totalAttempts > 0 && totalAttemptErrors / totalAttempts > 0.05 ? 'warning' : 'info'}
         />
         <StatCard
           title="可计费"
@@ -430,24 +494,32 @@ function AccountsSection({
         <span className="font-medium text-foreground/75" title="按整形后的展示 usage 计算的中间成本">展示计费</span>
         {' '}是整形后的中间口径；
         <span className="ml-1 font-medium text-foreground/75" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</span>
-        {' '}是最终上报口径，可计费取最终可计费金额。
+        {' '}是最终上报口径，可计费取最终可计费金额；
+        <span className="ml-1 font-medium text-foreground/75" title="上游原始成本 × 账号成本倍率">账号成本</span>
+        {' '}按账号倍率折算。
+        <span className="ml-1 font-medium text-foreground/75">错误率</span>
+        {' '}先看最终落到该账号的请求，再看“含切走”：把中途失败后换到别的账号的尝试也算进来。
+        {latencyUnavailable && <span className="ml-1">耗时分位：{latencyUnavailable}</span>}
       </div>
       {rows.length === 0 ? (
         <EmptyState title="暂无账号" className="mt-3 py-8" />
       ) : (
         <div className="mt-4 scrollbar-thin overflow-x-auto">
-          <Table className="min-w-[1120px] text-xs">
+          <Table className="min-w-[1500px] text-xs">
             <TableHeader>
               <TableRow>
                 <TableHead>账号</TableHead>
                 <TableHead className="text-right">请求</TableHead>
-                <TableHead className="text-right">错误率</TableHead>
+                <TableHead className="text-right" title="最终：落到该账号并由它返回的请求的错误率；含切走：把中途失败后被切到别的账号的尝试也算进来">错误率</TableHead>
                 <TableHead className="text-right">上游原始成本</TableHead>
+                <TableHead className="text-right" title="上游原始成本 × 账号成本倍率">账号成本</TableHead>
                 <TableHead className="text-right" title="按整形后的展示 usage 计算的中间成本">展示计费</TableHead>
                 <TableHead className="text-right" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</TableHead>
                 <TableHead className="text-right">差额占原始</TableHead>
                 <TableHead className="text-right">原始/整形倍率</TableHead>
                 <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
+                <TableHead className="text-right" title="该账号请求总耗时的中位数 / 95 分位，直接按明细算">p50 / p95 耗时</TableHead>
+                <TableHead className="text-right" title="流式请求首字延迟的 95 分位">p95 首字</TableHead>
                 <TableHead className="text-right">未计价</TableHead>
                 <TableHead className="text-right">兜底</TableHead>
               </TableRow>
@@ -460,6 +532,9 @@ function AccountsSection({
                 const upliftedCostUsd = usage?.upliftedCostUsd ?? 0
                 const rowDelta = usage?.profitUsd ?? (upliftedCostUsd - rawCostUsd)
                 const rowTone = billingDeltaTone(rowDelta)
+                const attemptRequests = usage?.attemptRequests ?? 0
+                const attemptErrorRate = usage?.attemptErrorRate ?? 0
+                const rowLatency = latencyById.get(accountId)
                 return (
                   <TableRow key={accountId}>
                     <TableCell>
@@ -481,8 +556,19 @@ function AccountsSection({
                       </div>
                     </TableCell>
                     <TableCell className="text-right font-mono" title={formatNumber(metrics.requests)}>{formatNumber(metrics.requests)}</TableCell>
-                    <TableCell className={cn('text-right font-mono', metrics.errorRate > 0.05 && 'text-destructive')}>{formatPercent(metrics.errorRate)}</TableCell>
+                    <TableCell
+                      className="text-right font-mono"
+                      title={attemptRequests > 0
+                        ? `最终落到该账号的 ${formatNumber(metrics.requests)} 次请求里错误 ${formatNumber(metrics.errorRequests)} 次；算上中途失败被切走的，共尝试 ${formatNumber(attemptRequests)} 次、失败 ${formatNumber(usage?.attemptErrorRequests ?? 0)} 次`
+                        : `最终落到该账号的 ${formatNumber(metrics.requests)} 次请求里错误 ${formatNumber(metrics.errorRequests)} 次`}
+                    >
+                      <span className={cn(metrics.errorRate > 0.05 && 'text-destructive')}>最终 {formatPercent(metrics.errorRate)}</span>
+                      {attemptRequests > 0 && (
+                        <span className={cn('ml-1 text-muted-foreground', attemptErrorRate > 0.05 && 'text-warning')}>· 含切走 {formatPercent(attemptErrorRate)}</span>
+                      )}
+                    </TableCell>
                     <TableCell className="text-right font-mono">{formatUsdFixed2(rawCostUsd)}</TableCell>
+                    <TableCell className="text-right font-mono" title="上游原始成本 × 账号成本倍率">{formatUsdFixed2(usage?.accountCostUsd ?? 0)}</TableCell>
                     <TableCell className="text-right font-mono" title="整形后的中间成本口径">{formatUsdFixed2(shapedCostUsd)}</TableCell>
                     <TableCell className="text-right font-mono" title="最终上报/补偿后成本口径；当前用于可计费金额">{formatUsdFixed2(upliftedCostUsd)}</TableCell>
                     <TableCell className={cn('text-right font-mono', billingDeltaTextClass(rowTone))}>
@@ -491,6 +577,18 @@ function AccountsSection({
                     </TableCell>
                     <TableCell className="text-right font-mono" title="上游原始成本 ÷ 整形后展示成本">{costMultiplier(rawCostUsd, shapedCostUsd)}</TableCell>
                     <TableCell className="text-right"><HitRateCell metrics={metrics} /></TableCell>
+                    <TableCell
+                      className="text-right font-mono"
+                      title={rowLatency ? `${formatNumber(rowLatency.samples)} 条请求 · p99 ${formatMs(rowLatency.p99DurationMs)}` : undefined}
+                    >
+                      {rowLatency ? `${formatMs(rowLatency.p50DurationMs)} / ${formatMs(rowLatency.p95DurationMs)}` : '-'}
+                    </TableCell>
+                    <TableCell
+                      className="text-right font-mono"
+                      title={rowLatency && rowLatency.firstTokenSamples > 0 ? `${formatNumber(rowLatency.firstTokenSamples)} 条流式请求 · p50 ${formatMs(rowLatency.p50FirstTokenLatencyMs)}` : undefined}
+                    >
+                      {rowLatency && rowLatency.firstTokenSamples > 0 ? formatMs(rowLatency.p95FirstTokenLatencyMs) : '-'}
+                    </TableCell>
                     <TableCell className="text-right font-mono" title={formatNumber(metrics.unpricedRequests)}>{formatNumber(metrics.unpricedRequests)}</TableCell>
                     <TableCell className="text-right font-mono" title={formatNumber(usage?.costFloorAppliedRequests ?? 0)}>{formatNumber(usage?.costFloorAppliedRequests ?? 0)}</TableCell>
                   </TableRow>
@@ -506,35 +604,107 @@ function AccountsSection({
 
 // ─── 排行分区 ───────────────────────────────────────────────────────────────────
 
-function RankPanel({ rows, total, errorRank = false }: { rows: UsageOverviewRankRow[]; total: number; errorRank?: boolean }) {
+/** 排行行的缓存命中率：后端给分子分母，这里按同一口径算。 */
+function rankHitRate(row: UsageOverviewRankRow): number | null {
+  return cacheHitRate({
+    uncachedInputTokens: row.uncachedInputTokens ?? 0,
+    cacheReadInputTokens: row.cacheReadInputTokens ?? 0,
+    cacheCreationInputTokens: row.cacheCreationInputTokens ?? 0,
+  })
+}
+
+function RankPanel({
+  dimension,
+  rows,
+  total,
+  errorRank = false,
+  onOpen,
+}: {
+  dimension: RankingDimension
+  rows: UsageOverviewRankRow[]
+  total: number
+  errorRank?: boolean
+  /** 点击一行跳到用量页；错误页签没有筛选键，不可点 */
+  onOpen?: (row: UsageOverviewRankRow) => void
+}) {
+  const isKeys = dimension === 'keys'
   return (
     <div className="mt-3">
       {rows.length === 0 ? (
         <EmptyState title="暂无排行数据" className="py-8" />
       ) : (
-        <Table className="min-w-[560px]">
+        <Table className={errorRank ? 'min-w-[560px]' : 'min-w-[1140px]'}>
           <TableHeader>
             <TableRow>
               <TableHead className="w-10">#</TableHead>
               <TableHead>名称</TableHead>
               <TableHead className="text-right">{errorRank ? '错误数' : '请求数'}</TableHead>
               <TableHead className="text-right">{errorRank ? '占错误' : '占请求'}</TableHead>
-              <TableHead className="text-right">估算计费</TableHead>
+              {!errorRank && <TableHead className="text-right" title="错误请求 ÷ 请求数">错误率</TableHead>}
+              {!errorRank && <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>}
+              <TableHead className="text-right" title="按最终上报 usage 计价">估算计费</TableHead>
+              {!errorRank && <TableHead className="text-right" title="按上游原始 usage 计价">原始计费</TableHead>}
+              {!errorRank && <TableHead className="text-right" title="上游原始成本 × 各账号成本倍率">账号成本</TableHead>}
+              {!errorRank && <TableHead className="text-right" title="估算计费 - 账号成本，括号里是占账号成本的比例">差额</TableHead>}
+              {!errorRank && <TableHead className="text-right">平均耗时</TableHead>}
             </TableRow>
           </TableHeader>
           <TableBody>
-            {rows.map((row, index) => (
-              <TableRow key={row.key}>
-                <TableCell className="font-mono text-xs text-muted-foreground">{index + 1}</TableCell>
-                <TableCell>
-                  <div className="max-w-[250px] truncate text-xs font-semibold" title={row.label}>{row.label}</div>
-                  {row.label !== row.key && <div className="max-w-[250px] truncate font-mono text-[0.62rem] text-muted-foreground/60">{row.key}</div>}
-                </TableCell>
-                <TableCell className="text-right font-mono text-xs">{formatCompact(errorRank ? row.errorRequests : row.requests)}</TableCell>
-                <TableCell className="text-right font-mono text-xs">{formatPercent(metricsShare(errorRank ? row.errorRequests : row.requests, total))}</TableCell>
-                <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(row.estimatedCostUsd)}</TableCell>
-              </TableRow>
-            ))}
+            {rows.map((row, index) => {
+              const errorRate = metricsShare(row.errorRequests, row.requests)
+              const hitRate = rankHitRate(row)
+              const hitLevel = cacheHitRateLevel(hitRate)
+              const accountCostUsd = row.accountCostUsd ?? 0
+              const delta = accountCostDelta(row.estimatedCostUsd, accountCostUsd)
+              const clickable = Boolean(onOpen)
+              return (
+                <TableRow
+                  key={row.key}
+                  className={cn(clickable && 'cursor-pointer')}
+                  title={clickable ? '查看该项的用量明细' : undefined}
+                  onClick={clickable ? () => onOpen?.(row) : undefined}
+                >
+                  <TableCell className="font-mono text-xs text-muted-foreground">{index + 1}</TableCell>
+                  <TableCell>
+                    <div className="max-w-[260px] truncate text-xs font-semibold" title={row.label}>{row.label}</div>
+                    {isKeys && normalizeRequestApiKeyId(row.key) ? (
+                      <div className="mt-0.5 text-muted-foreground/70" onClick={(event) => event.stopPropagation()}>
+                        <RequestApiKeyIdDisplay value={row.key} />
+                      </div>
+                    ) : (
+                      row.label !== row.key && <div className="max-w-[260px] truncate font-mono text-[0.62rem] text-muted-foreground/60">{row.key}</div>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs" title={formatNumber(errorRank ? row.errorRequests : row.requests)}>
+                    {formatCompact(errorRank ? row.errorRequests : row.requests)}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatPercent(metricsShare(errorRank ? row.errorRequests : row.requests, total))}</TableCell>
+                  {!errorRank && (
+                    <TableCell className={cn('text-right font-mono text-xs', errorRate > 0.05 && 'text-destructive')} title={`${formatNumber(row.errorRequests)} 次错误`}>
+                      {formatPercent(errorRate)}
+                    </TableCell>
+                  )}
+                  {!errorRank && (
+                    <TableCell className={cn('text-right font-mono text-xs', HIT_RATE_TEXT[hitLevel])} title={HIT_RATE_HINT[hitLevel] || undefined}>
+                      {formatHitRate(hitRate)}
+                    </TableCell>
+                  )}
+                  <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(row.estimatedCostUsd)}</TableCell>
+                  {!errorRank && <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(row.originalCostUsd ?? 0)}</TableCell>}
+                  {!errorRank && <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(accountCostUsd)}</TableCell>}
+                  {!errorRank && (
+                    <TableCell
+                      className={cn('text-right font-mono text-xs', delta.tone === 'loss' && 'text-destructive')}
+                      title={`占账号成本 ${delta.percentText}`}
+                    >
+                      {`${delta.deltaUsd >= 0 ? '+' : '-'}${formatUsdFixed2(Math.abs(delta.deltaUsd))}`}
+                      <div className="text-[0.62rem] text-muted-foreground">{delta.percentText}</div>
+                    </TableCell>
+                  )}
+                  {!errorRank && <TableCell className="text-right font-mono text-xs">{row.requests > 0 ? formatMs(row.averageDurationMs) : '-'}</TableCell>}
+                </TableRow>
+              )
+            })}
           </TableBody>
         </Table>
       )}
@@ -544,6 +714,8 @@ function RankPanel({ rows, total, errorRank = false }: { rows: UsageOverviewRank
 
 function RankingsSection({
   rankings,
+  range,
+  navigate,
 }: {
   rankings: {
     totalRequests: number
@@ -554,8 +726,15 @@ function RankingsSection({
     topPaths: UsageOverviewRankRow[]
     topErrors: UsageOverviewRankRow[]
   }
+  range: { from: string; to: string }
+  navigate: ReturnType<typeof useNavigate>
 }) {
   const [dimension, setDimension] = useState<RankingDimension>('models')
+  const openUsage = (view: RankingDimension) => (row: UsageOverviewRankRow) => {
+    const filter = rankUsageFilter(view, row.key)
+    if (!filter) return
+    usageLink(navigate, { ...filter, since: range.from, until: range.to })
+  }
   const rankViews: Array<{ key: RankingDimension; label: string; rows: UsageOverviewRankRow[]; total: number; errorRank?: boolean }> = [
     { key: 'models', label: '模型', rows: rankings.topModels, total: rankings.totalRequests },
     { key: 'accounts', label: '账号', rows: rankings.topAccounts, total: rankings.totalRequests },
@@ -571,9 +750,16 @@ function RankingsSection({
         </TabsList>
         {rankViews.map((view) => (
           <TabsContent key={view.key} value={view.key}>
-            <RankPanel rows={view.rows} total={view.total} errorRank={view.errorRank} />
+            <RankPanel
+              dimension={view.key}
+              rows={view.rows}
+              total={view.total}
+              errorRank={view.errorRank}
+              onOpen={view.errorRank ? undefined : openUsage(view.key)}
+            />
           </TabsContent>
         ))}
+        <p className="mt-2 text-[0.68rem] text-muted-foreground">点击一行跳到用量页查看该项在当前范围内的明细；错误页签按错误类型聚合，没有对应筛选。</p>
       </Tabs>
     </SectionCard>
   )
@@ -623,6 +809,15 @@ export function OverviewPage() {
   const overview = useUsageOverview(queryParams, refreshInterval, !summary.isError)
   const series = useUsageOverviewSeries(queryParams, refreshInterval, (activeTab === 'summary' || activeTab === 'accounts') && !summary.isError)
   const rankings = useUsageOverviewRankings(rankingQueryParams, refreshInterval, activeTab === 'rankings' && !summary.isError)
+  // 延迟分位扫明细，后端限制 8 天以内：30 天 / 本月 / 过长的自定义范围不请求。
+  const latencyRangeOk = rangeKey
+    ? ['today', 'yesterday', 'last24h', 'last7d'].includes(rangeKey)
+    : !fromParam || !toParam || Date.parse(toParam) - Date.parse(fromParam) <= LATENCY_MAX_RANGE_MS
+  const latencyParams = useMemo(() => {
+    const { granularity: _granularity, ...rest } = queryParams as typeof queryParams & { granularity?: string }
+    return rest
+  }, [queryParams])
+  const latency = useUsageAccountLatency(latencyParams, refreshInterval, activeTab === 'accounts' && latencyRangeOk && !summary.isError)
   // 实时 RPM 来自进程内最近 60 秒窗口，与时间范围无关。
   const usageSummary = useUsageSummary(autoRefresh.refetchInterval || 30000)
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: getAccounts, enabled: activeTab === 'accounts', refetchInterval: refreshInterval || 30000 })
@@ -718,7 +913,13 @@ export function OverviewPage() {
     accounts.error ? `账号列表：${extractErrorMessage(accounts.error)}` : '',
     accountStatuses.error ? `账号状态：${extractErrorMessage(accountStatuses.error)}` : '',
     rankings.error ? `排行：${extractErrorMessage(rankings.error)}` : '',
+    latency.error ? `账号耗时分位：${extractErrorMessage(latency.error)}` : '',
   ].filter(Boolean)
+  const latencyUnavailable = !latencyRangeOk
+    ? '只在 8 天以内的范围计算（需要扫用量明细）'
+    : latency.error
+      ? '读取失败'
+      : ''
 
   const refetchAll = () => {
     void summary.refetch()
@@ -728,6 +929,7 @@ export function OverviewPage() {
     if (activeTab === 'accounts') {
       void accounts.refetch()
       void accountStatuses.refetch()
+      if (latencyRangeOk) void latency.refetch()
     }
     if (activeTab === 'rankings') void rankings.refetch()
   }
@@ -840,7 +1042,7 @@ export function OverviewPage() {
             <OverviewTrendCard
               title="分时趋势"
               icon={<TrendingUp />}
-              views={summaryTrendViews()}
+              views={summaryTrendViews({ hourly: seriesGranularity === 'hour' })}
               points={seriesPoints}
               hourly={seriesGranularity === 'hour'}
               partialFrom={partialFrom}
@@ -869,6 +1071,8 @@ export function OverviewPage() {
                 billing={billing}
                 accounts={accounts.data?.accounts ?? []}
                 statuses={accountStatuses.data?.accounts ?? []}
+                latency={latencyRangeOk ? latency.data?.accounts ?? [] : []}
+                latencyUnavailable={latencyUnavailable}
                 range={summaryData.range}
                 navigate={navigate}
               />
@@ -880,7 +1084,7 @@ export function OverviewPage() {
           {rankings.isLoading && !rankings.data ? (
             <LoadingState text="加载排行..." />
           ) : rankings.data ? (
-            <RankingsSection rankings={rankings.data} />
+            <RankingsSection rankings={rankings.data} range={summaryData.range} navigate={navigate} />
           ) : (
             <EmptyState title="暂无排行数据" />
           )}

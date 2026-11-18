@@ -1066,7 +1066,7 @@ fn response_holding_permit(response: Response, permit: RequestAdmissionPermit) -
     )
 }
 
-/// 429 for a key over a usage limit, or 503 when its counters cannot be read. `None` lets the
+/// 429 for a key over a usage limit, or 529 when its counters cannot be read. `None` lets the
 /// request continue; keys without limits return here without touching Redis.
 async fn usage_limit_rejection(
     state: &RequestAdmissionMiddlewareState,
@@ -1098,8 +1098,9 @@ async fn usage_limit_rejection(
         ),
         KeyLimitDecision::Unavailable(error) => {
             tracing::warn!(error = %error, "读取 Key 用量限额失败，按限额拒绝请求");
+            // 对外过载统一 529 overloaded_error。
             (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::from_u16(529).unwrap(),
                 RequestRejectionReason::KeyUsageLimitUnavailable,
                 "overloaded_error",
                 "The API key usage limit could not be checked. Please try again shortly."
@@ -1685,7 +1686,7 @@ mod tests {
             .oneshot(request("/messages", limited))
             .await
             .unwrap();
-        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.status().as_u16(), 529);
         assert_eq!(rejected.headers().get("retry-after").unwrap(), "5");
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         // The rejected key did not take a concurrency slot.

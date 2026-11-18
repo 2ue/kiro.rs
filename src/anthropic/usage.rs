@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -651,6 +651,26 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
         public_error_message: None,
         payload_breakdown: None,
         payload_guard_report: None,
+    }
+}
+
+/// 一条记录计入请求密钥限额的三个量：计费金额取估算计费，Token 取输入、输出、缓存读写之和，
+/// `credits` 槽位在 claude-pool 里没有上游积分，统一按账号成本（上游原始成本 × 账号倍率）
+/// 计数，与总览的“账号成本”口径一致。
+pub fn key_usage_delta_for_record(record: &UsageRecord) -> KeyUsageDelta {
+    let tokens = [
+        record.compat_input_tokens,
+        record.output_tokens,
+        record.cache_read_input_tokens,
+        record.cache_creation_input_tokens,
+    ]
+    .iter()
+    .map(|value| i64::from((*value).max(0)))
+    .sum::<i64>();
+    KeyUsageDelta {
+        cost_usd: record.estimated_cost_usd,
+        credits: record.account_cost_usd.max(0.0),
+        tokens: tokens as f64,
     }
 }
 
@@ -1327,7 +1347,13 @@ impl Default for UsageOverviewMetrics {
 #[serde(rename_all = "camelCase")]
 pub struct UsageOverviewSeriesMetrics {
     pub requests: usize,
+    /// 成功请求数；老缓存里没有该字段时按 0 处理。
+    #[serde(default)]
+    pub success_requests: usize,
     pub error_requests: usize,
+    /// 该时段请求的平均总耗时（毫秒），没有请求时为 0。
+    #[serde(default)]
+    pub average_duration_ms: f64,
     pub input_tokens: i64,
     #[serde(default)]
     pub uncached_input_tokens: i64,
@@ -1399,6 +1425,21 @@ pub struct UsageOverviewPoolRow {
     pub profit_usd: f64,
     pub cost_floor_delta_usd: f64,
     pub cost_floor_applied_requests: usize,
+    /// 账号成本：上游原始成本 × 账号倍率，按账号汇总。
+    #[serde(default)]
+    pub account_cost_usd: f64,
+    /// 落到该账号的全部尝试次数（含中途失败被切走的），来自 `account_attempt` 维度。
+    #[serde(default)]
+    pub attempt_requests: usize,
+    /// 尝试里失败的次数（`action != success`）。
+    #[serde(default)]
+    pub attempt_error_requests: usize,
+    /// 尝试口径错误率：失败尝试 ÷ 全部尝试。
+    #[serde(default)]
+    pub attempt_error_rate: f64,
+    /// 尝试口径平均耗时（毫秒）。
+    #[serde(default)]
+    pub attempt_average_duration_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1409,6 +1450,50 @@ pub struct UsageOverviewRankRow {
     pub requests: usize,
     pub error_requests: usize,
     pub estimated_cost_usd: f64,
+    #[serde(default)]
+    pub success_requests: usize,
+    /// 缓存命中率分子分母：缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）。
+    #[serde(default)]
+    pub cache_read_input_tokens: i64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: i64,
+    #[serde(default)]
+    pub uncached_input_tokens: i64,
+    /// 原始计费：按上游原始 usage 计价。
+    #[serde(default)]
+    pub original_cost_usd: f64,
+    /// 账号成本：上游原始成本 × 各账号成本倍率，即这一项实际花出去的钱。
+    #[serde(default)]
+    pub account_cost_usd: f64,
+    #[serde(default)]
+    pub average_duration_ms: f64,
+}
+
+/// 一个账号在时间范围内的总耗时与首字延迟分位数，直接扫明细算出。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAccountLatencyRow {
+    pub account_id: u64,
+    pub account_name: String,
+    /// 参与总耗时分位数的请求数。
+    pub samples: usize,
+    pub p50_duration_ms: f64,
+    pub p95_duration_ms: f64,
+    pub p99_duration_ms: f64,
+    /// 有首字延迟的请求数（只有流式请求记录首字）。
+    pub first_token_samples: usize,
+    pub p50_first_token_latency_ms: Option<f64>,
+    pub p95_first_token_latency_ms: Option<f64>,
+    pub p99_first_token_latency_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAccountLatencyResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub accounts: Vec<UsageAccountLatencyRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2106,6 +2191,18 @@ impl RecentUsageRecords {
         removed
     }
 
+    /// 把记录裁到 `limit` 条以内，从最旧的开始丢；返回被丢的记录，调用方在锁外释放。
+    fn truncate_to(&mut self, limit: usize) -> Vec<UsageRecord> {
+        let mut removed = Vec::new();
+        while self.records.len() > limit {
+            if let Some(evicted) = self.records.pop_front() {
+                self.ids.remove(&evicted.id);
+                removed.push(evicted);
+            }
+        }
+        removed
+    }
+
     fn retain(&mut self, mut keep: impl FnMut(&UsageRecord) -> bool) {
         let ids = &mut self.ids;
         self.records.retain(|record| {
@@ -2128,7 +2225,8 @@ impl std::ops::Deref for RecentUsageRecords {
 
 pub struct UsageRecorder {
     records: Mutex<RecentUsageRecords>,
-    limit: usize,
+    /// 内存里保留的最近记录条数；运行配置 `usageRecordLimit` 改了即时生效。
+    limit: AtomicUsize,
     postgres_store: Option<Arc<PostgresUsageStore>>,
     redis_store: Option<Arc<RedisStore>>,
     writer: Option<Arc<UsageWriterControl>>,
@@ -2383,7 +2481,7 @@ impl UsageRecorder {
         let limit = limit.max(1);
         Self {
             records: Mutex::new(RecentUsageRecords::with_capacity(limit.min(1024))),
-            limit,
+            limit: AtomicUsize::new(limit),
             postgres_store: None,
             redis_store: None,
             writer: None,
@@ -2407,6 +2505,14 @@ impl UsageRecorder {
             dropped_redis_records: Arc::new(AtomicU64::new(0)),
             key_limits: OnceLock::new(),
         }
+    }
+
+    /// 运行配置改了 `usageRecordLimit` 时调用：新上限立即用于后续写入，调小时当场裁掉多出的旧记录。
+    pub fn set_limit(&self, limit: usize) {
+        let limit = limit.max(1);
+        self.limit.store(limit, Ordering::Relaxed);
+        let evicted = self.records.lock().truncate_to(limit);
+        drop(evicted);
     }
 
     #[cfg(test)]
@@ -2485,7 +2591,7 @@ impl UsageRecorder {
         });
         Self {
             records: Mutex::new(RecentUsageRecords::with_capacity(limit.max(1).min(1024))),
-            limit: limit.max(1),
+            limit: AtomicUsize::new(limit.max(1)),
             postgres_store: Some(postgres_store),
             redis_store,
             writer,
@@ -2549,23 +2655,7 @@ impl UsageRecorder {
         else {
             return;
         };
-        let tokens = [
-            record.compat_input_tokens,
-            record.output_tokens,
-            record.cache_read_input_tokens,
-            record.cache_creation_input_tokens,
-        ]
-        .iter()
-        .map(|value| i64::from((*value).max(0)))
-        .sum::<i64>();
-        limiter.spawn_record(
-            key_id.to_string(),
-            KeyUsageDelta {
-                cost_usd: record.estimated_cost_usd,
-                credits: 0.0,
-                tokens: tokens as f64,
-            },
-        );
+        limiter.spawn_record(key_id.to_string(), key_usage_delta_for_record(record));
     }
 
     pub fn record(&self, record: UsageRecord) -> UsageRecordOutcome {
@@ -2609,7 +2699,8 @@ impl UsageRecorder {
         // Clone and drop outside the lock: every request records here, and a record carries
         // several strings and diagnostics.
         let in_memory = record.clone();
-        let evicted = self.records.lock().push_replacing(in_memory, self.limit);
+        let limit = self.limit.load(Ordering::Relaxed);
+        let evicted = self.records.lock().push_replacing(in_memory, limit);
         drop(evicted);
 
         self.record_usage_redis(record);
@@ -2744,7 +2835,7 @@ impl UsageRecorder {
             .unwrap_or((false, 0, 0));
         UsageRecorderStats {
             accepting: self.accepting.load(Ordering::Acquire),
-            in_memory_limit: self.limit,
+            in_memory_limit: self.limit.load(Ordering::Relaxed),
             in_memory_records,
             redis_enabled: self.redis_store.is_some(),
             redis_queue_enabled,
@@ -3200,6 +3291,23 @@ impl UsageRecorder {
             "PgSQL usage overview",
             USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
             async move { store.dashboard_overview(&spec).await },
+        )
+    }
+
+    /// 按账号的总耗时 / 首字延迟分位数；扫明细，走同一个 dashboard 查询闸门。
+    pub fn account_latency(
+        &self,
+        spec: UsageOverviewSpec,
+        account_id: Option<u64>,
+    ) -> anyhow::Result<UsageAccountLatencyResponse> {
+        let Some(store) = &self.postgres_store else {
+            anyhow::bail!("账号延迟分位需要 PgSQL usage 明细存储");
+        };
+        let store = store.clone();
+        self.dashboard_query(
+            "PgSQL account latency percentiles",
+            USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+            async move { store.account_latency(&spec, account_id).await },
         )
     }
 
@@ -4245,6 +4353,31 @@ mod tests {
     use serde_json::json;
     use tokio::sync::{Notify, Semaphore};
 
+    /// 请求密钥的“积分”限额按账号成本（上游原始成本 × 账号倍率）计数，不再固定写 0。
+    #[test]
+    fn key_usage_delta_counts_credits_as_account_cost() {
+        let mut record = record_with_time(
+            "key-delta",
+            30,
+            UsageSource::UpstreamMetadata,
+            Utc::now().to_rfc3339(),
+        );
+        record.estimated_cost_usd = 0.5;
+        record.account_cost_usd = 0.125;
+        record.compat_input_tokens = 10;
+        record.output_tokens = 20;
+        record.cache_read_input_tokens = 30;
+        record.cache_creation_input_tokens = 5;
+        let delta = key_usage_delta_for_record(&record);
+        assert_eq!(delta.cost_usd, 0.5);
+        assert_eq!(delta.credits, 0.125);
+        assert_eq!(delta.tokens, 65.0);
+
+        // 没有账号成本（本地/拒绝记录）时积分为 0，负数也不会倒扣。
+        record.account_cost_usd = -1.0;
+        assert_eq!(key_usage_delta_for_record(&record).credits, 0.0);
+    }
+
     #[test]
     fn latency_trace_serializes_new_backlog_fields_in_camel_case_and_omits_absent_values() {
         let trace = UsageLatencyTrace {
@@ -4438,6 +4571,41 @@ mod tests {
     }
 
     #[test]
+    fn usage_record_limit_change_applies_immediately_and_trims_down() {
+        let recorder = UsageRecorder::new(5);
+        for index in 0..5 {
+            recorder.record(record(
+                &format!("limit-{index}"),
+                0,
+                UsageSource::UpstreamMetadata,
+            ));
+        }
+        assert_eq!(recorder.records_snapshot().len(), 5);
+        // 调小：当场裁掉最旧的，保留最新的。
+        recorder.set_limit(2);
+        let kept: Vec<String> = recorder
+            .records_snapshot()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(kept, vec!["limit-3".to_string(), "limit-4".to_string()]);
+        assert_eq!(recorder.writer_stats().in_memory_limit, 2);
+        // 调大：之后的写入按新上限保留。
+        recorder.set_limit(4);
+        for index in 5..8 {
+            recorder.record(record(
+                &format!("limit-{index}"),
+                0,
+                UsageSource::UpstreamMetadata,
+            ));
+        }
+        assert_eq!(recorder.records_snapshot().len(), 4);
+        // 0 视为 1，避免把内存列表关成空。
+        recorder.set_limit(0);
+        assert_eq!(recorder.records_snapshot().len(), 1);
+    }
+
+    #[test]
     fn sampled_request_rejection_factory_preserves_bounded_contract_for_five_rounds() {
         const CASES: [(&str, &str, http::StatusCode, u64); 5] = [
             (
@@ -4618,7 +4786,7 @@ mod tests {
         });
         let recorder = Arc::new(UsageRecorder {
             records: Mutex::new(RecentUsageRecords::with_capacity(16)),
-            limit: 16,
+            limit: AtomicUsize::new(16),
             postgres_store: None,
             redis_store: None,
             writer: Some(Arc::new(UsageWriterControl::new(sender, task, progress))),
@@ -4758,7 +4926,7 @@ mod tests {
 
             let recorder = UsageRecorder {
                 records: Mutex::new(RecentUsageRecords::with_capacity(16)),
-                limit: 16,
+                limit: AtomicUsize::new(16),
                 postgres_store: None,
                 redis_store: Some(redis.clone()),
                 writer: None,

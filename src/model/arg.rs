@@ -46,7 +46,7 @@ pub enum MaintenanceCommand {
     UsageLegacyCostBackfill,
     /// 显式压缩历史 usage rollup 小桶到小时桶；必须先停止并排空所有网关实例
     UsageRollupCompression,
-    /// 从明细重建总览的路由维度（本地路由、走外部原因）；必须先停止并排空所有网关实例
+    /// 从明细重建 1.0.8 新增的汇总维度（账号尝试、请求 Key 限额拒绝）；必须先停止并排空所有网关实例
     UsageRouteDimensionBackfill,
     /// 从明细回填总览合计列（账号成本、原始 token）；启动时只对小表自动做，大表在低峰期执行这里
     UsageOverviewTotalsBackfill,

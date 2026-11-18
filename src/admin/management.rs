@@ -43,7 +43,7 @@ fn respond<T: Serialize>(result: Result<T, AdminServiceError>) -> Response {
     }
 }
 
-fn normalize_routes(
+pub(super) fn normalize_routes(
     mut routes: RoutesConfig,
     config: &Config,
 ) -> Result<RoutesConfig, AdminServiceError> {
@@ -81,6 +81,70 @@ fn normalize_routes(
         .validate_with_config(config)
         .map_err(AdminServiceError::InvalidRequest)?;
     Ok(routes)
+}
+
+/// 删路由前检查请求 Key 的 `allowedRoutes`：被删前缀仍被任一 Key 引用时拒绝，并列出 Key 名称。
+/// 两侧都按 `normalize_route_prefix` 比较，所以 policy 里写成 `/`、`/v1` 的根前缀也能对上。
+fn reject_removing_routes_referenced_by_keys(
+    before: &RoutesConfig,
+    after: &RoutesConfig,
+    policies: &[RequestApiKeyPolicy],
+) -> Result<(), AdminServiceError> {
+    let remaining: BTreeSet<String> = after
+        .routes
+        .iter()
+        .map(|route| normalize_route_prefix(&route.prefix))
+        .collect();
+    let removed: BTreeSet<String> = before
+        .routes
+        .iter()
+        .map(|route| normalize_route_prefix(&route.prefix))
+        .filter(|prefix| !remaining.contains(prefix))
+        .collect();
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let mut blocked: Vec<String> = Vec::new();
+    for policy in policies {
+        let referenced: Vec<String> = policy
+            .allowed_routes
+            .iter()
+            .map(|prefix| normalize_route_prefix(prefix))
+            .filter(|prefix| removed.contains(prefix))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if referenced.is_empty() {
+            continue;
+        }
+        let label = if policy.name.trim().is_empty() {
+            stable_request_api_key_id(&policy.api_key)
+                .chars()
+                .take(8)
+                .collect::<String>()
+        } else {
+            policy.name.trim().to_string()
+        };
+        let display = referenced
+            .iter()
+            .map(|prefix| {
+                if prefix.is_empty() {
+                    "/".to_string()
+                } else {
+                    prefix.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        blocked.push(format!("{label}（{display}）"));
+    }
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    Err(AdminServiceError::InvalidRequest(format!(
+        "以下请求 Key 的允许路由仍引用了要删除的路由，请先调整 Key：{}",
+        blocked.join("；")
+    )))
 }
 
 fn cache_value(resolved: &crate::model::config::ResolvedCacheRoutePolicy) -> Value {
@@ -294,7 +358,20 @@ impl AdminService {
         self.runtime.config().routes
     }
     pub fn update_routes(&self, routes: RoutesConfig) -> Result<RoutesConfig, AdminServiceError> {
-        let routes = normalize_routes(routes, &self.runtime.config())?;
+        let result = self.update_routes_inner(routes);
+        if let Err(err) = &result {
+            self.audit_failure("update_routes", "routes", None, err, json!({}));
+        }
+        result
+    }
+    fn update_routes_inner(&self, routes: RoutesConfig) -> Result<RoutesConfig, AdminServiceError> {
+        let config = self.runtime.config();
+        let routes = normalize_routes(routes, &config)?;
+        reject_removing_routes_referenced_by_keys(
+            &config.routes,
+            &routes,
+            &config.request_api_key_policies(),
+        )?;
         self.runtime
             .update(|config| config.routes = routes.clone())
             .map_err(invalid)?;
@@ -389,8 +466,8 @@ impl AdminService {
             }
             .into(),
         );
-        parameters["tlsBackend"] = json!(config.tls_backend);
-        sources.insert("tlsBackend".into(), "global".into());
+        // 全局 tlsBackend 只影响启动时的通用 HTTP 客户端；账号转发用的是账号自己的 TLS profile，
+        // 所以不列进账号生效参数。
         for (key, value) in [
             ("authType", json!(account.auth_type)),
             ("headerProfile", json!(account.header_profile)),
@@ -562,9 +639,64 @@ mod tests {
             .routes
             .push(crate::model::routes::RouteConfig::new("cc/"));
         assert!(normalize_routes(duplicate, &config).is_err());
-        let mut missing = normalized;
+        let mut missing = normalized.clone();
         missing.routes.retain(|r| r.prefix != "/cc");
         assert!(normalize_routes(missing, &config).is_err());
+        // 模型通配符只能在末尾；路由场景应用也走这里，不能绕过。
+        let mut wildcard = normalized;
+        wildcard.route_mut("/cc").model_rule.rules = vec!["claude-*-opus".into()];
+        let err = normalize_routes(wildcard, &config).unwrap_err();
+        assert!(err.to_string().contains("通配符"), "{err}");
+    }
+    #[test]
+    fn admin_routes_removal_is_blocked_while_a_request_key_still_allows_the_prefix() {
+        let config = Config::default();
+        let before = config.routes.clone();
+        let mut after = before.clone();
+        after.routes.retain(|route| route.prefix != "/ha");
+        let policies = vec![
+            RequestApiKeyPolicy {
+                api_key: "sk-team-a-12345678".into(),
+                name: "team-a".into(),
+                enabled: true,
+                request_admission: None,
+                usage_limits: Vec::new(),
+                allowed_routes: vec!["/ha/".into(), "/cc".into()],
+            },
+            RequestApiKeyPolicy {
+                api_key: "sk-team-b-12345678".into(),
+                name: String::new(),
+                enabled: true,
+                request_admission: None,
+                usage_limits: Vec::new(),
+                allowed_routes: vec!["/cc".into()],
+            },
+        ];
+        let err = reject_removing_routes_referenced_by_keys(&before, &after, &policies)
+            .expect_err("removing /ha must be blocked while team-a allows it");
+        let message = err.to_string();
+        assert!(message.contains("team-a"), "{message}");
+        assert!(message.contains("/ha"), "{message}");
+        assert!(
+            !message.contains("sk-team"),
+            "密钥明文不能出现在错误里: {message}"
+        );
+        // 没有 Key 引用的前缀可以删；根前缀在 policy 里写成 "/" 也能对上。
+        assert!(reject_removing_routes_referenced_by_keys(&before, &after, &policies[1..]).is_ok());
+        let mut without_root = before.clone();
+        without_root.routes.retain(|route| !route.prefix.is_empty());
+        let root_policy = vec![RequestApiKeyPolicy {
+            api_key: "sk-root-12345678".into(),
+            name: "root".into(),
+            enabled: true,
+            request_admission: None,
+            usage_limits: Vec::new(),
+            allowed_routes: vec!["/".into()],
+        }];
+        let err = reject_removing_routes_referenced_by_keys(&before, &without_root, &root_policy)
+            .expect_err("root prefix written as / must still match");
+        assert!(err.to_string().contains("root"));
+        assert!(reject_removing_routes_referenced_by_keys(&before, &before, &root_policy).is_ok());
     }
     #[test]
     fn admin_routes_effective_marks_explicit_global_and_builtin_sources() {

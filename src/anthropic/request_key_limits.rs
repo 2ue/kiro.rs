@@ -1,5 +1,6 @@
-//! Per request-API-key usage limits: billed amount (USD), 上游 credits and tokens, per day,
-//! per month or in total.
+//! Per request-API-key usage limits: billed amount (USD), account cost (upstream raw cost ×
+//! account multiplier, stored under the legacy `credits` name) and tokens, per day, per month
+//! or in total.
 //!
 //! Counters live in Redis so every instance sees the same totals. A request is checked before
 //! dispatch and rejected with 429 once any limit is reached; usage is added after the request
@@ -23,7 +24,8 @@ use crate::storage::redis_cache::RedisStore;
 pub enum KeyLimitMetric {
     /// Billed amount in USD: `estimatedCostUsd`.
     CostUsd,
-    /// 上游 credits consumed on local accounts: `upstreamMeteringUsage`.
+    /// Account cost in USD: `accountCostUsd` (upstream raw cost × account multiplier). The
+    /// wire name stays `credits` so saved limits keep working.
     Credits,
     /// Input + output + cache read + cache creation tokens.
     Tokens,
@@ -41,7 +43,7 @@ impl KeyLimitMetric {
     pub fn label(self) -> &'static str {
         match self {
             Self::CostUsd => "计费金额",
-            Self::Credits => "积分",
+            Self::Credits => "账号成本",
             Self::Tokens => "Token",
         }
     }

@@ -156,6 +156,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/usage-dashboard/account-risk",
             get(get_usage_dashboard_account_risk),
         )
+        .route(
+            "/usage-dashboard/account-latency",
+            get(get_usage_dashboard_account_latency),
+        )
+        .route(
+            "/accounts/{id}/quality-history",
+            get(get_account_quality_history),
+        )
         .route("/usage-writer-stats", get(get_usage_writer_stats))
         .route("/audit-logs", get(get_audit_logs))
         .route(

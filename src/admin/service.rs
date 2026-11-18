@@ -19,7 +19,7 @@ use super::types::*;
 use crate::account::{
     Account, AccountAuthType, AccountManager, AccountTestResponse, AccountsStatusResponse,
     CreateAccountRequest, SetAccountEnabledRequest, UpdateAccountRequest, account_messages_url,
-    account_models_url,
+    account_models_url, account_probe_headers,
 };
 use crate::anthropic::request_key_limits::{
     KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
@@ -32,8 +32,9 @@ use crate::anthropic::{
     pricing::{PricingCatalog, PricingStatus},
     request_admission::RequestAdmissionController,
     usage::{
-        UsageAccountRiskCostConfig, UsageAccountRiskQuery, UsageAccountRiskResponse,
-        UsageDashboardResponse, UsageOverviewRankingsResponse, UsageOverviewResponse,
+        USAGE_OVERVIEW_HOURLY_MAX_DAYS, UsageAccountLatencyResponse, UsageAccountRiskCostConfig,
+        UsageAccountRiskQuery, UsageAccountRiskResponse, UsageDashboardResponse,
+        UsageOverviewRankRow, UsageOverviewRankingsResponse, UsageOverviewResponse,
         UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse,
         UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
         UsageRecordsResult, UsageSummary, resolve_usage_overview_spec,
@@ -41,7 +42,7 @@ use crate::anthropic::{
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
 use crate::http_client::{
-    build_client, response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
+    response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
 use crate::model::config::{AccountsConfig, Config, RequestAdmissionConfig, RequestApiKeyPolicy};
 use crate::model::model_support::normalize_supported_models;
@@ -232,6 +233,25 @@ fn mask_secret(value: &str) -> String {
         .rev()
         .collect::<String>();
     format!("{}...{}", head, tail)
+}
+
+/// 全局代理密码只回传脱敏值；未设置或为空时返回 `None`。
+fn masked_proxy_password(value: Option<&str>) -> Option<String> {
+    value.filter(|value| !value.is_empty()).map(mask_secret)
+}
+
+/// 写入全局代理密码。读接口只回脱敏值，客户端把读到的配置原样回传时，提交值等于当前
+/// 密码的脱敏值：这时保留原密码，否则会把打码文本存成真密码、代理认证随之失败。
+fn apply_proxy_password_update(current: &mut Option<String>, submitted: Option<String>) {
+    let echoes_mask = match (submitted.as_deref(), current.as_deref()) {
+        (Some(submitted), Some(existing)) => {
+            masked_proxy_password(Some(existing)).as_deref() == Some(submitted)
+        }
+        _ => false,
+    };
+    if !echoes_mask {
+        *current = submitted;
+    }
 }
 
 fn request_api_key_items(
@@ -655,6 +675,18 @@ impl AdminService {
         let config = self.runtime.config();
         let limiter = self.request_admission.usage_limits().clone();
         let now = chrono::Utc::now();
+        // 最近 24 小时的准入拒绝次数：汇总表读失败只影响这一列，不影响限额状态。
+        let rejections = match self
+            .postgres_store
+            .request_key_rejections_since(now - ChronoDuration::hours(24))
+            .await
+        {
+            Ok(rejections) => rejections,
+            Err(err) => {
+                tracing::warn!("读取请求 Key 24 小时拒绝次数失败: {}", err);
+                HashMap::new()
+            }
+        };
         let mut items = Vec::new();
         for policy in config.request_api_key_policies() {
             if policy.usage_limits.is_empty() {
@@ -665,10 +697,12 @@ impl AdminService {
                 Ok(statuses) => (statuses.unwrap_or_default(), None),
                 Err(err) => (Vec::new(), Some(err.to_string())),
             };
+            let rejected_requests_24h = rejections.get(&key_id).copied().unwrap_or(0);
             items.push(RequestKeyUsageLimitItem {
                 key_id,
                 enabled: policy.enabled,
                 statuses,
+                rejected_requests_24h,
                 error,
             });
         }
@@ -747,6 +781,25 @@ impl AdminService {
         req: CreateRequestApiKeyRequest,
         admin_api_key: &str,
     ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let key_name = req.name.clone().unwrap_or_default();
+        let result = self.create_request_api_key_inner(req, admin_api_key);
+        if let Err(err) = &result {
+            self.audit_failure(
+                "create_request_api_key",
+                "security_keys",
+                Some("apiKeys".to_string()),
+                err,
+                json!({ "name": key_name }),
+            );
+        }
+        result
+    }
+
+    fn create_request_api_key_inner(
+        &self,
+        req: CreateRequestApiKeyRequest,
+        admin_api_key: &str,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
         let next_key = req
             .api_key
             .as_deref()
@@ -798,6 +851,25 @@ impl AdminService {
     }
 
     pub fn update_request_api_key(
+        &self,
+        key_id: &str,
+        req: UpdateRequestApiKeyRequest,
+        admin_api_key: &str,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let result = self.update_request_api_key_inner(key_id, req, admin_api_key);
+        if let Err(err) = &result {
+            self.audit_failure(
+                "update_request_api_key",
+                "security_keys",
+                Some("apiKeys".to_string()),
+                err,
+                json!({ "keyId": key_id }),
+            );
+        }
+        result
+    }
+
+    fn update_request_api_key_inner(
         &self,
         key_id: &str,
         req: UpdateRequestApiKeyRequest,
@@ -898,6 +970,24 @@ impl AdminService {
         key_id: &str,
         admin_api_key: &str,
     ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let result = self.delete_request_api_key_inner(key_id, admin_api_key);
+        if let Err(err) = &result {
+            self.audit_failure(
+                "delete_request_api_key",
+                "security_keys",
+                Some("apiKeys".to_string()),
+                err,
+                json!({ "keyId": key_id }),
+            );
+        }
+        result
+    }
+
+    fn delete_request_api_key_inner(
+        &self,
+        key_id: &str,
+        admin_api_key: &str,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
         let current_config = self.runtime.config();
         let mut keys = current_config.request_api_keys();
         let mut policies = current_config.request_api_key_policies();
@@ -935,8 +1025,23 @@ impl AdminService {
 
     pub fn create_account(
         &self,
+        request: CreateAccountRequest,
+    ) -> Result<Account, AdminServiceError> {
+        let summary = json!({ "name": request.name, "baseUrl": request.base_url });
+        let result = self.create_account_inner(request);
+        if let Err(err) = &result {
+            self.audit_failure("create_account", "account", None, err, summary);
+        }
+        result
+    }
+
+    fn create_account_inner(
+        &self,
         mut request: CreateAccountRequest,
     ) -> Result<Account, AdminServiceError> {
+        validate_account_api_key(Some(&request.api_key))?;
+        validate_account_max_concurrent_requests(Some(request.max_concurrent_requests))?;
+        validate_proxy_url_field("proxyUrl", request.proxy_url.as_deref())?;
         request.supported_models =
             Self::normalize_account_supported_models(request.supported_models);
         let store = self.postgres_store.clone();
@@ -969,6 +1074,7 @@ impl AdminService {
         let api_key = source.api_key.clone().ok_or_else(|| {
             AdminServiceError::InvalidRequest(format!("账号 #{id} 没有可复制的密钥"))
         })?;
+        validate_account_api_key(Some(&api_key))?;
         let name = request
             .name
             .map(|name| name.trim().to_string())
@@ -1022,8 +1128,32 @@ impl AdminService {
     pub fn update_account(
         &self,
         id: u64,
+        request: UpdateAccountRequest,
+    ) -> Result<Account, AdminServiceError> {
+        let result = self.update_account_inner(id, request);
+        if let Err(err) = &result {
+            self.audit_failure(
+                "update_account",
+                "account",
+                Some(id.to_string()),
+                err,
+                json!({}),
+            );
+        }
+        result
+    }
+
+    fn update_account_inner(
+        &self,
+        id: u64,
         mut request: UpdateAccountRequest,
     ) -> Result<Account, AdminServiceError> {
+        // `None` 表示不改密钥；传了就必须是非空白。
+        validate_account_api_key(request.api_key.as_deref())?;
+        validate_account_max_concurrent_requests(request.max_concurrent_requests)?;
+        if let Some(proxy_url) = request.proxy_url.as_ref() {
+            validate_proxy_url_field("proxyUrl", proxy_url.as_deref())?;
+        }
         request.supported_models = request
             .supported_models
             .map(Self::normalize_account_supported_models);
@@ -1130,6 +1260,14 @@ impl AdminService {
         {
             self.model_capabilities.load_persisted_status(status);
         }
+        self.audit(
+            "promote_account_models",
+            "account",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "name": pool.name, "promotedModels": promoted.clone() }),
+        );
         Ok(SupportedModelsResponse {
             count: promoted.len(),
             supported_models: promoted,
@@ -1194,20 +1332,20 @@ impl AdminService {
         })?;
         let config = self.runtime.config();
         let timeout_secs = config.accounts.request_timeout_secs.clamp(1, 60);
-        let client = build_client(None, timeout_secs, config.tls_backend)
+        // 和真实转发同一个客户端（代理、wire/TLS profile）和同一套请求头（header profile、
+        // 覆盖项、认证方式）；尚未保存的账号用请求里的 base_url/api_key/auth_type 拼一个临时账号。
+        let probe = probe_account(saved_pool.as_ref(), base_url, api_key, auth_type);
+        let accounts_config = accounts_config_with_transport_proxy(&config);
+        let client = self
+            .account_manager
+            .client_for_pool(&probe, &accounts_config)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-        let mut request_builder = client
+        let headers = account_probe_headers(&probe)
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        let request_builder = client
             .get(url)
-            .header("accept", "application/json")
-            .header("anthropic-version", "2023-06-01");
-        match auth_type {
-            AccountAuthType::Bearer => {
-                request_builder = request_builder.bearer_auth(api_key);
-            }
-            AccountAuthType::XApiKey => {
-                request_builder = request_builder.header("x-api-key", api_key);
-            }
-        }
+            .headers(headers)
+            .timeout(StdDuration::from_secs(timeout_secs));
         let response = send_with_response_header_timeout(request_builder, timeout_secs)
             .await
             .map_err(|err| {
@@ -1238,6 +1376,20 @@ impl AdminService {
     }
 
     pub fn delete_account(&self, id: u64) -> Result<(), AdminServiceError> {
+        let result = self.delete_account_inner(id);
+        if let Err(err) = &result {
+            self.audit_failure(
+                "delete_account",
+                "account",
+                Some(id.to_string()),
+                err,
+                json!({}),
+            );
+        }
+        result
+    }
+
+    fn delete_account_inner(&self, id: u64) -> Result<(), AdminServiceError> {
         let store = self.postgres_store.clone();
         let deleted = block_on_admin_store(async move { store.soft_delete_account(id).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
@@ -1353,6 +1505,14 @@ impl AdminService {
         let pool = block_on_admin_store(async move { store.get_account(id, false).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
+        // 测试结果要和真实转发一致：同一个客户端（代理、wire/TLS profile）、同一套请求头。
+        let accounts_config = accounts_config_with_transport_proxy(&self.runtime.config());
+        let client = self
+            .account_manager
+            .client_for_pool(&pool, &accounts_config)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let headers = account_probe_headers(&pool)
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
         block_on_admin_store(async move {
             let model = req
                 .as_ref()
@@ -1363,10 +1523,7 @@ impl AdminService {
             } else {
                 account_models_url(&pool.base_url)?
             };
-            let client = reqwest::Client::builder()
-                .timeout(StdDuration::from_secs(15))
-                .build()?;
-            let mut request = if let Some(model) = model.as_deref() {
+            let request = if let Some(model) = model.as_deref() {
                 let prompt = req
                     .as_ref()
                     .and_then(|req| req.prompt.as_deref())
@@ -1384,15 +1541,11 @@ impl AdminService {
             } else {
                 client.get(url)
             };
-            match pool.auth_type {
-                crate::account::AccountAuthType::Bearer => {
-                    request = request.bearer_auth(pool.api_key.unwrap_or_default());
-                }
-                crate::account::AccountAuthType::XApiKey => {
-                    request = request.header("x-api-key", pool.api_key.unwrap_or_default());
-                }
-            }
-            let result = request.send().await;
+            let result = request
+                .headers(headers)
+                .timeout(StdDuration::from_secs(15))
+                .send()
+                .await;
             Ok::<AccountTestResponse, anyhow::Error>(match result {
                 Ok(response) => {
                     let status = response.status();
@@ -1453,6 +1606,23 @@ impl AdminService {
     }
 
     pub fn update_admin_api_key(
+        &self,
+        req: UpdateAdminApiKeyRequest,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let result = self.update_admin_api_key_inner(req);
+        if let Err(err) = &result {
+            self.audit_failure(
+                "update_admin_api_key",
+                "security_keys",
+                Some("adminApiKey".to_string()),
+                err,
+                json!({}),
+            );
+        }
+        result
+    }
+
+    fn update_admin_api_key_inner(
         &self,
         req: UpdateAdminApiKeyRequest,
     ) -> Result<AccessKeysResponse, AdminServiceError> {
@@ -1741,6 +1911,48 @@ impl AdminService {
         error_message: Option<String>,
         detail: serde_json::Value,
     ) {
+        self.audit_as(
+            "admin-api",
+            action,
+            object_type,
+            object_id,
+            success,
+            error_message,
+            detail,
+        );
+    }
+
+    /// 变更失败时也留一条 `success=false` 的审计；`detail` 只放对象标识，不放密钥明文。
+    pub(super) fn audit_failure(
+        &self,
+        action: &'static str,
+        object_type: &'static str,
+        object_id: Option<String>,
+        error: &AdminServiceError,
+        detail: serde_json::Value,
+    ) {
+        self.audit(
+            action,
+            object_type,
+            object_id,
+            false,
+            Some(error.to_string()),
+            detail,
+        );
+    }
+
+    /// 指定操作者写审计。管理端认证失败等没有已认证身份的场景用 `anonymous`。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn audit_as(
+        &self,
+        actor: &'static str,
+        action: &'static str,
+        object_type: &'static str,
+        object_id: Option<String>,
+        success: bool,
+        error_message: Option<String>,
+        detail: serde_json::Value,
+    ) {
         let detail = Self::normalize_audit_detail(detail);
         let store = self.postgres_store.clone();
         // 和账号异动日志一样走有界、带超时的旁路写入队列；队列满时丢弃并告警，
@@ -1750,7 +1962,7 @@ impl AdminService {
             async move {
                 store
                     .record_admin_audit_log(
-                        "admin-api",
+                        actor,
                         action,
                         object_type,
                         object_id.as_deref(),
@@ -1858,16 +2070,107 @@ impl AdminService {
         spec: UsageOverviewSpec,
     ) -> Result<UsageOverviewResponse, AdminServiceError> {
         let cache_key = admin_usage_overview_cache_key(&spec);
-        if let Some(cached) = self.read_admin_cache::<UsageOverviewResponse>(&cache_key) {
+        if let Some(mut cached) = self.read_admin_cache::<UsageOverviewResponse>(&cache_key) {
+            self.label_request_key_rankings(&mut cached.top_keys);
             return Ok(cached);
         }
 
-        let overview = self
+        let mut overview = self
             .usage_recorder
             .dashboard_overview(spec)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.write_usage_admin_cache(cache_key, overview.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        self.label_request_key_rankings(&mut overview.top_keys);
         Ok(overview)
+    }
+
+    /// 排行“密钥”页签的名称：汇总表里请求密钥维度没有标签，这里按当前配置把稳定 id
+    /// 换成 Key 名称；配置里已经没有的 Key 显示 `请求 Key · 前 8 位`。缓存命中后也要做，
+    /// 这样改名立即生效。
+    fn label_request_key_rankings(&self, rows: &mut [UsageOverviewRankRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let config = self.runtime.config();
+        let names: HashMap<String, String> = config
+            .request_api_key_policies()
+            .into_iter()
+            .map(|policy| {
+                (
+                    stable_request_api_key_id(&policy.api_key),
+                    policy.name.trim().to_string(),
+                )
+            })
+            .collect();
+        for row in rows.iter_mut() {
+            if !row.label.is_empty() && row.label != row.key {
+                continue;
+            }
+            row.label = match names.get(&row.key).filter(|name| !name.is_empty()) {
+                Some(name) => name.clone(),
+                None if row.key == "unknown" => "未带请求 Key".to_string(),
+                None => format!("请求 Key · {}", row.key.chars().take(8).collect::<String>()),
+            };
+        }
+    }
+
+    /// 按账号的总耗时 / 首字延迟分位数。扫明细，范围限制在按小时总览的上限内。
+    pub fn get_usage_dashboard_account_latency(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        account_id: Option<u64>,
+    ) -> Result<UsageAccountLatencyResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            None,
+            None,
+        )?;
+        if spec.to - spec.from > ChronoDuration::days(USAGE_OVERVIEW_HOURLY_MAX_DAYS) {
+            return Err(AdminServiceError::InvalidRequest(format!(
+                "账号延迟分位需要扫描用量明细，时间范围不能超过 {USAGE_OVERVIEW_HOURLY_MAX_DAYS} 天"
+            )));
+        }
+        self.usage_recorder
+            .account_latency(spec, account_id)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    /// 一个账号最近 `hours` 小时的质量分历史（EWMA 快照），按时间升序。
+    pub fn get_account_quality_history(
+        &self,
+        account_id: u64,
+        hours: u32,
+    ) -> Result<AccountQualityHistoryResponse, AdminServiceError> {
+        let hours = hours.clamp(1, 24 * 7);
+        let since = Utc::now() - ChronoDuration::hours(i64::from(hours));
+        let store = self.postgres_store.clone();
+        let points = block_on_admin_store(async move {
+            store
+                .account_quality_history(account_id, since, 2_000)
+                .await
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        Ok(AccountQualityHistoryResponse {
+            account_id,
+            hours,
+            since: since.to_rfc3339(),
+            points: points
+                .into_iter()
+                .map(|point| AccountQualityHistoryPoint {
+                    sampled_at: point.sampled_at.to_rfc3339(),
+                    recent_error_rate: point.recent_error_rate,
+                    ttft_ewma_ms: point.ttft_ewma_ms,
+                    latency_ewma_ms: point.latency_ewma_ms,
+                    sample_count: point.sample_count,
+                })
+                .collect(),
+        })
     }
 
     fn resolve_usage_overview_spec(
@@ -2653,7 +2956,8 @@ impl AdminService {
         RuntimeConfigResponse {
             proxy_url: config.proxy_url.clone(),
             proxy_username: config.proxy_username.clone(),
-            proxy_password: config.proxy_password.clone(),
+            // 只告诉前端“已设置”，不回传明文；前端未改动时不会把脱敏值回传。
+            proxy_password: masked_proxy_password(config.proxy_password.as_deref()),
             request_admission: config.request_admission.clone(),
             stream_pre_output_hold_secs: config.stream_pre_output_hold_secs.clone(),
             inference_upstream_max_attempts: config.inference_upstream_max_attempts.clone(),
@@ -2724,6 +3028,23 @@ impl AdminService {
 
     /// 更新运行时全局配置，并写入 PgSQL。
     pub fn update_runtime_config(
+        &self,
+        req: UpdateRuntimeConfigRequest,
+    ) -> Result<RuntimeConfigResponse, AdminServiceError> {
+        let result = self.update_runtime_config_inner(req);
+        if let Err(err) = &result {
+            self.audit_failure(
+                "update_runtime_config",
+                "runtime_config",
+                Some("default".to_string()),
+                err,
+                json!({}),
+            );
+        }
+        result
+    }
+
+    fn update_runtime_config_inner(
         &self,
         req: UpdateRuntimeConfigRequest,
     ) -> Result<RuntimeConfigResponse, AdminServiceError> {
@@ -2820,7 +3141,7 @@ impl AdminService {
             candidate.proxy_username = value;
         }
         if let Some(value) = req.proxy_password {
-            candidate.proxy_password = value;
+            apply_proxy_password_update(&mut candidate.proxy_password, value);
         }
         if let Some(value) = req.tls_backend {
             candidate.tls_backend = value;
@@ -2837,6 +3158,7 @@ impl AdminService {
         self.request_admission
             .update_config(updated.request_admission);
         self.refresh_request_api_key_runtime(&updated);
+        self.usage_recorder.set_limit(updated.usage_record_limit);
         self.account_manager.invalidate_account_policy_state();
         self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
         self.audit(
@@ -2854,6 +3176,8 @@ impl AdminService {
 }
 
 fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), String> {
+    validate_proxy_url_field("proxyUrl", config.proxy_url.as_deref())
+        .map_err(|err| err.to_string())?;
     config.request_admission.validate()?;
     config.route_features.validate()?;
     config.prompt_injection.validate()?;
@@ -4218,9 +4542,8 @@ impl AdminService {
         &self,
         routes: &crate::model::routes::RoutesConfig,
     ) -> Result<(), AdminServiceError> {
-        routes
-            .validate_with_config(&self.runtime.config())
-            .map_err(AdminServiceError::InvalidCredential)?;
+        // 与手动保存路由同一套归一化与校验（含模型通配符只能在末尾），场景应用不能绕过。
+        let routes = management::normalize_routes(routes.clone(), &self.runtime.config())?;
         self.runtime
             .update(|config| config.routes = routes.clone())
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
@@ -4242,6 +4565,115 @@ impl AdminService {
             detail,
         );
     }
+}
+
+/// 转发层的 `AccountsConfig` 在请求入口会补上全局代理；管理端探测也要补，否则不走全局代理。
+fn accounts_config_with_transport_proxy(config: &Config) -> AccountsConfig {
+    let mut accounts = config.accounts.clone();
+    accounts.transport_proxy_url = config.proxy_url.clone();
+    accounts.transport_proxy_username = config.proxy_username.clone();
+    accounts.transport_proxy_password = config.proxy_password.clone();
+    accounts
+}
+
+/// 模型发现用的探测账号：已保存的账号沿用它的全部传输配置（代理、header/wire/TLS profile、
+/// 覆盖项），只替换本次请求给出的 base_url/api_key/auth_type；未保存的账号用默认传输配置。
+fn probe_account(
+    saved: Option<&Account>,
+    base_url: String,
+    api_key: String,
+    auth_type: AccountAuthType,
+) -> Account {
+    if let Some(saved) = saved {
+        let mut probe = saved.clone();
+        probe.base_url = base_url;
+        probe.api_key = Some(api_key);
+        probe.auth_type = auth_type;
+        return probe;
+    }
+    let now = Utc::now();
+    Account {
+        tags: Vec::new(),
+        proxy_url: None,
+        cost_multiplier: 1.0,
+        overrides: Default::default(),
+        id: 0,
+        revision: 0,
+        name: "probe".to_string(),
+        base_url,
+        api_key: Some(api_key),
+        masked_api_key: None,
+        auth_type,
+        header_profile: Default::default(),
+        append_beta_query: false,
+        header_overrides: HashMap::new(),
+        wire_profile: Default::default(),
+        tls_profile: Default::default(),
+        enabled: true,
+        priority: 0,
+        max_concurrent_requests: 1,
+        usage_projection_mode: Default::default(),
+        stream_response_mode: None,
+        auto_disable_policy: Default::default(),
+        pre_output_stream_retry_mode: Default::default(),
+        auto_disabled: false,
+        auto_disabled_reason: None,
+        auto_disabled_at: None,
+        auto_disabled_until: None,
+        auto_disabled_last_error: None,
+        normalize_model_version_dots: false,
+        model_mapping_mode: Default::default(),
+        model_mapping_require_match: false,
+        model_mapping_rules: Vec::new(),
+        supported_models: Vec::new(),
+        route_mode: Default::default(),
+        route_rules: Vec::new(),
+        notes: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// 账号单并发上限；`u32` 直接落库为 `i32`，超过这个值没有业务意义且会溢出。
+pub(crate) const MAX_ACCOUNT_CONCURRENT_REQUESTS: u32 = 10_000;
+
+/// 账号密钥：创建时必填，更新时 `None` 表示不改、`Some` 必须非空白。
+fn validate_account_api_key(api_key: Option<&str>) -> Result<(), AdminServiceError> {
+    match api_key {
+        Some(key) if key.trim().is_empty() => Err(AdminServiceError::InvalidRequest(
+            "账号密钥不能为空".to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_account_max_concurrent_requests(value: Option<u32>) -> Result<(), AdminServiceError> {
+    match value {
+        Some(value) if !(1..=MAX_ACCOUNT_CONCURRENT_REQUESTS).contains(&value) => {
+            Err(AdminServiceError::InvalidRequest(format!(
+                "maxConcurrentRequests 必须在 1 到 {MAX_ACCOUNT_CONCURRENT_REQUESTS} 之间"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// 代理地址：非空时必须是合法 URL 且协议为 http/https/socks5/socks5h。全局与账号级共用。
+fn validate_proxy_url_field(field: &str, proxy_url: Option<&str>) -> Result<(), AdminServiceError> {
+    let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let parsed = reqwest::Url::parse(proxy_url).map_err(|err| {
+        AdminServiceError::InvalidRequest(format!("{field} 不是合法的 URL: {err}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || parsed.host_str().is_none()
+    {
+        return Err(AdminServiceError::InvalidRequest(format!(
+            "{field} 必须使用 http/https/socks5/socks5h 协议并包含主机名"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_accounts_config(config: &AccountsConfig) -> Result<(), String> {

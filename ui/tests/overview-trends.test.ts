@@ -12,7 +12,31 @@ import {
   compareUsageTier,
   accountUsageTier,
 } from '../src/features/overview/usage-order.ts'
-import { accountCostDelta, costDeltaPercent, costMultiplier } from '../src/features/overview/overview-metrics.ts'
+import {
+  accountCostDelta,
+  averagePerMinute,
+  costDeltaPercent,
+  costMultiplier,
+  perMinute,
+  weightedAverageDuration,
+} from '../src/features/overview/overview-metrics.ts'
+
+test('average duration over buckets is weighted by requests, never averaged per bucket', () => {
+  const buckets = [
+    { requests: 10, averageDurationMs: 100 },
+    { requests: 90, averageDurationMs: 1000 },
+  ]
+  assert.equal(weightedAverageDuration(buckets, (bucket) => bucket), 910)
+  assert.equal(weightedAverageDuration([{ requests: 0, averageDurationMs: 5 }], (bucket) => bucket), null)
+  // 老缓存里没有 averageDurationMs 时按 0 处理。
+  assert.equal(weightedAverageDuration([{ requests: 4 }], (bucket) => bucket), 0)
+})
+
+test('RPM / TPM come from hour buckets divided by 60', () => {
+  assert.equal(perMinute(600), 10)
+  assert.equal(averagePerMinute([{ n: 600 }, { n: 1200 }], (bucket) => bucket.n), 15)
+  assert.equal(averagePerMinute([], (bucket: { n: number }) => bucket.n), null)
+})
 
 test('cache hit rate uses the sub2api denominator', () => {
   assert.equal(cacheHitRate({ uncachedInputTokens: 200, cacheReadInputTokens: 600, cacheCreationInputTokens: 200 }), 0.6)

@@ -1,4 +1,5 @@
-import { cancelUsageCleanup,clearUsageRecords,getAccountEventSummary,getAuditLogsPage,getUsageCleanupStatus,getUsageDashboard,getUsageDashboardAccountBilling,getUsageDashboardAccountRisk,getUsageDashboardBreakdown,getUsageDashboardSeries,getUsageDashboardTop,getUsageDashboardWindows,getUsageOverview,getUsageOverviewRankings,getUsageOverviewSeries,getUsageOverviewSummary,getUsageRecords,getUsageRecordsPage,getUsageSummary,getUsageWriterStats,previewUsageCleanup,resumeUsageCleanup,startUsageCleanup } from '@/api/usage-dashboard'
+import { cancelUsageCleanup,clearUsageRecords,getAccountEventSummary,getAuditLogsPage,getUsageAccountLatency,getUsageCleanupStatus,getUsageDashboard,getUsageDashboardAccountBilling,getUsageDashboardAccountRisk,getUsageDashboardBreakdown,getUsageDashboardSeries,getUsageDashboardTop,getUsageDashboardWindows,getUsageOverview,getUsageOverviewRankings,getUsageOverviewSeries,getUsageOverviewSummary,getUsageRecords,getUsageRecordsPage,getUsageSummary,getUsageWriterStats,previewUsageCleanup,resumeUsageCleanup,startUsageCleanup } from '@/api/usage-dashboard'
+import type { UsageAccountLatencyQuery } from '@/api/usage-dashboard'
 import type { AdminAuditLogPageQuery,UsageAccountRiskQuery,UsageCleanupRequest,UsageCleanupStatusResponse,UsageRecordsPageQuery,UsageRecordsQuery } from '@/types/api'
 import { useMutation,useQuery,useQueryClient } from '@tanstack/react-query'
 import { useEffect,useRef } from 'react'
@@ -181,6 +182,20 @@ export function useUsageDashboardAccountBilling(
   })
 }
 
+export function useUsageAccountLatency(
+  params: UsageAccountLatencyQuery,
+  refetchInterval: RefetchInterval = false,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['usage-account-latency', params],
+    queryFn: () => getUsageAccountLatency(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
 export function useUsageDashboardAccountRisk(
   query: UsageAccountRiskQuery,
   refetchInterval: RefetchInterval = false,
@@ -209,6 +224,7 @@ function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQuery
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-breakdown'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-account-billing'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-account-risk'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-account-latency'] })
   queryClient.invalidateQueries({ queryKey: ['usage-writer-stats'] })
 }
 

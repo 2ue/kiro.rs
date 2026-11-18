@@ -45,9 +45,14 @@ export function RuntimePage() {
     update = useUpdateRuntimeConfig(),
     confirm = useConfirm(),
     models = useModelCapabilities(),
-    [draft, setDraft] = useState<RuntimeConfig | null>(null);
+    [draft, setDraft] = useState<RuntimeConfig | null>(null),
+    // 后端只回传脱敏后的代理密码；用户没在输入框里改过就不把它回传，避免把脱敏值当密码存进去。
+    [proxyPasswordDirty, setProxyPasswordDirty] = useState(false);
   useEffect(() => {
-    if (query.data) setDraft(structuredClone(query.data));
+    if (query.data) {
+      setDraft(structuredClone(query.data));
+      setProxyPasswordDirty(false);
+    }
   }, [query.data]);
   useUnsavedChangesGuard(
     draft !== null && query.data !== undefined && JSON.stringify(draft) !== JSON.stringify(query.data) && !update.isPending,
@@ -69,6 +74,7 @@ export function RuntimePage() {
     value: RuntimeConfig[K],
   ) => setDraft({ ...draft, [key]: value });
   const dirty = JSON.stringify(draft) !== JSON.stringify(query.data);
+  const proxyPasswordSet = Boolean(query.data?.proxyPassword);
   const save = async () => {
     // 开启自动清理或缩短已开启的保留天数都会删数据，和审计页同一口径先确认。
     const before = query.data;
@@ -93,9 +99,10 @@ export function RuntimePage() {
         cachePolicy: _cache,
         reportedUsage: _usage,
         promptInjection: _injection,
+        proxyPassword,
         ...runtime
       } = draft;
-      await update.mutateAsync(runtime);
+      await update.mutateAsync(proxyPasswordDirty ? { ...runtime, proxyPassword } : runtime);
       toast.success("运行配置已保存");
     } catch (error) {
       toast.error(extractErrorMessage(error));
@@ -171,8 +178,18 @@ export function RuntimePage() {
               <Field label="代理用户名" htmlFor="runtime-proxy-user">
                 <Input id="runtime-proxy-user" value={draft.proxyUsername ?? ""} onChange={(e) => set("proxyUsername", e.target.value || null)} />
               </Field>
-              <Field label="代理密码" htmlFor="runtime-proxy-pass">
-                <Input id="runtime-proxy-pass" type="password" value={draft.proxyPassword ?? ""} onChange={(e) => set("proxyPassword", e.target.value || null)} />
+              <Field label="代理密码" htmlFor="runtime-proxy-pass" description={proxyPasswordSet && !proxyPasswordDirty ? "已设置；留空保持不变，输入新值则替换" : undefined}>
+                <Input
+                  id="runtime-proxy-pass"
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder={proxyPasswordSet ? "已设置，留空保持不变" : undefined}
+                  value={proxyPasswordDirty ? (draft.proxyPassword ?? "") : ""}
+                  onChange={(e) => {
+                    setProxyPasswordDirty(true);
+                    set("proxyPassword", e.target.value || null);
+                  }}
+                />
               </Field>
             </FieldGrid>
             <div className="mt-5 border-t pt-5">

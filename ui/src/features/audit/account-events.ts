@@ -13,6 +13,8 @@ export const ACCOUNT_EVENT_META: Record<string, { label: string; tone: EventTone
   manual_disabled: { label: '手动禁用', tone: 'warning' },
   manual_enabled: { label: '手动启用', tone: 'info' },
   deleted: { label: '删除账号', tone: 'neutral' },
+  cooldown_started: { label: '进入冷却', tone: 'warning' },
+  probation_started: { label: '进入观察期', tone: 'info' },
 }
 
 /** Display order of the kind filter and the summary tiles: problems first. */
@@ -21,6 +23,8 @@ export const ACCOUNT_EVENT_ORDER = [
   'auto_disabled',
   'risk_controlled',
   'overage_started',
+  'cooldown_started',
+  'probation_started',
   'quota_recovered',
   'auto_enabled',
   'manual_disabled',

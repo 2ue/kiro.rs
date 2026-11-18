@@ -23,13 +23,14 @@ use crate::anthropic::pricing::{
 };
 use crate::anthropic::usage::{
     REALTIME_USAGE_WINDOW_SECS, UsageAccountBillingByPool, UsageAccountBillingSummary,
-    UsageAccountRiskBucket, UsageAccountRiskCacheStats, UsageAccountRiskCostConfig,
-    UsageAccountRiskCostStats, UsageAccountRiskFilters, UsageAccountRiskGroup,
-    UsageAccountRiskQuery, UsageAccountRiskResponse, UsageAccountRiskSample,
-    UsageAccountRiskThresholds, UsageAccountRiskTotals, UsageAccountRiskWindow, UsageAggregate,
-    UsageBreakdownItem, UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary,
-    UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec, UsageOverviewExternal,
-    UsageOverviewMetrics, UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse,
+    UsageAccountLatencyResponse, UsageAccountLatencyRow, UsageAccountRiskBucket,
+    UsageAccountRiskCacheStats, UsageAccountRiskCostConfig, UsageAccountRiskCostStats,
+    UsageAccountRiskFilters, UsageAccountRiskGroup, UsageAccountRiskQuery,
+    UsageAccountRiskResponse, UsageAccountRiskSample, UsageAccountRiskThresholds,
+    UsageAccountRiskTotals, UsageAccountRiskWindow, UsageAggregate, UsageBreakdownItem,
+    UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop,
+    UsageDashboardWindow, UsageDashboardWindowSpec, UsageOverviewExternal, UsageOverviewMetrics,
+    UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse,
     UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup, UsageOverviewSeriesGroups,
     UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals,
     UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
@@ -2887,7 +2888,7 @@ impl PostgresStore {
             Some(since) => sqlx::query(
                 r#"
                 SELECT COALESCE(SUM(total_estimated_cost_usd), 0)::float8 AS cost_usd,
-
+                       COALESCE(SUM(account_cost_usd), 0)::float8 AS credits,
                        COALESCE(SUM(billable_input_tokens + total_cache_read_input_tokens + total_output_tokens), 0)::float8 AS tokens
                 FROM usage_rollup_time_buckets
                 WHERE dimension = 'request_api_key' AND dimension_key = $1 AND bucket_start >= $2
@@ -2900,7 +2901,7 @@ impl PostgresStore {
             None => sqlx::query(
                 r#"
                 SELECT COALESCE(SUM(total_estimated_cost_usd), 0)::float8 AS cost_usd,
-
+                       COALESCE(SUM(account_cost_usd), 0)::float8 AS credits,
                        COALESCE(SUM(billable_input_tokens + total_cache_read_input_tokens + total_output_tokens), 0)::float8 AS tokens
                 FROM usage_rollup_totals
                 WHERE dimension = 'request_api_key' AND dimension_key = $1
@@ -2916,6 +2917,140 @@ impl PostgresStore {
             tokens: row.try_get("tokens")?,
         })
     }
+
+    /// 每个请求密钥在 `since` 之后被准入拒绝的次数（限额、并发等），来自
+    /// `request_api_key_rejection` 维度的小时桶。返回 `key_id -> 次数`。
+    pub async fn request_key_rejections_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<HashMap<String, u64>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT dimension_key, COALESCE(SUM(error_requests), 0)::bigint AS rejected
+            FROM usage_rollup_time_buckets
+            WHERE dimension = $1 AND bucket_start >= $2
+            GROUP BY dimension_key
+            "#,
+        )
+        .bind(USAGE_ROLLUP_REQUEST_KEY_REJECTION_DIMENSION)
+        .bind(usage_rollup_bucket_start(since))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let key: String = row.try_get("dimension_key")?;
+                let rejected: i64 = row.try_get("rejected")?;
+                Ok((key, rejected.max(0) as u64))
+            })
+            .collect()
+    }
+
+    /// 写一条账号质量采样快照（EWMA 当前值）。调用方按账号每 60 秒节流一次。
+    pub async fn record_account_quality_sample(
+        &self,
+        sample: &AccountQualitySampleRow,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO account_quality_samples (
+                account_id, sampled_at, recent_error_rate, ttft_ewma_ms, latency_ewma_ms, sample_count
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (account_id, sampled_at) DO UPDATE SET
+                recent_error_rate = EXCLUDED.recent_error_rate,
+                ttft_ewma_ms = EXCLUDED.ttft_ewma_ms,
+                latency_ewma_ms = EXCLUDED.latency_ewma_ms,
+                sample_count = EXCLUDED.sample_count
+            "#,
+        )
+        .bind(u64_to_i64(sample.account_id))
+        .bind(sample.sampled_at)
+        .bind(sample.recent_error_rate)
+        .bind(sample.ttft_ewma_ms)
+        .bind(sample.latency_ewma_ms)
+        .bind(u64_to_i64(sample.sample_count))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 一个账号最近 `since` 之后的质量采样点，按时间升序。
+    pub async fn account_quality_history(
+        &self,
+        account_id: u64,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AccountQualitySampleRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT account_id, sampled_at, recent_error_rate, ttft_ewma_ms, latency_ewma_ms, sample_count
+            FROM (
+                SELECT account_id, sampled_at, recent_error_rate, ttft_ewma_ms, latency_ewma_ms, sample_count
+                FROM account_quality_samples
+                WHERE account_id = $1 AND sampled_at >= $2
+                ORDER BY sampled_at DESC
+                LIMIT $3
+            ) AS recent
+            ORDER BY sampled_at ASC
+            "#,
+        )
+        .bind(u64_to_i64(account_id))
+        .bind(since)
+        .bind(usize_to_i64(limit.clamp(1, 10_000)))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AccountQualitySampleRow {
+                    account_id: row_i64_to_u64(&row, "account_id")?,
+                    sampled_at: row.try_get("sampled_at")?,
+                    recent_error_rate: row.try_get("recent_error_rate")?,
+                    ttft_ewma_ms: row.try_get("ttft_ewma_ms")?,
+                    latency_ewma_ms: row.try_get("latency_ewma_ms")?,
+                    sample_count: row_i64_to_u64(&row, "sample_count")?,
+                })
+            })
+            .collect()
+    }
+
+    /// 删除早于 `retention` 的质量采样点，最多 `limit` 行；返回删除行数。
+    pub async fn delete_expired_account_quality_samples(
+        &self,
+        retention: std::time::Duration,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        let retention_secs = i64::try_from(retention.as_secs())
+            .map_err(|_| anyhow::anyhow!("质量采样保留时长超出 PgSQL 范围"))?;
+        let cutoff = Utc::now() - ChronoDuration::seconds(retention_secs);
+        let result = sqlx::query(
+            r#"
+            DELETE FROM account_quality_samples
+            WHERE (account_id, sampled_at) IN (
+                SELECT account_id, sampled_at
+                FROM account_quality_samples
+                WHERE sampled_at < $1
+                ORDER BY sampled_at ASC
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(cutoff)
+        .bind(usize_to_i64(limit.clamp(1, 10_000)))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// 一条账号质量采样快照：Redis 里的 EWMA 在某一时刻的值。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountQualitySampleRow {
+    pub account_id: u64,
+    pub sampled_at: DateTime<Utc>,
+    pub recent_error_rate: f64,
+    pub ttft_ewma_ms: Option<f64>,
+    pub latency_ewma_ms: Option<f64>,
+    pub sample_count: u64,
 }
 
 async fn execute_sql_statements(
@@ -3809,6 +3944,7 @@ impl PostgresUsageStore {
         let dimensions = vec![
             "global".to_string(),
             "account".to_string(),
+            USAGE_ROLLUP_ACCOUNT_ATTEMPT_DIMENSION.to_string(),
             "model".to_string(),
             "endpoint".to_string(),
             "request_api_key".to_string(),
@@ -3912,6 +4048,7 @@ impl PostgresUsageStore {
                     );
                     let pool = pools.entry(dimension_key.clone()).or_default();
                     pool.metrics.add(metrics);
+                    pool.account_cost_usd += row.try_get::<f64, _>("account_cost_usd")?;
                     pool.raw_cost_usd += row.try_get::<f64, _>("account_raw_cost_usd")?;
                     pool.shaped_cost_usd += row.try_get::<f64, _>("account_shaped_cost_usd")?;
                     pool.uplifted_cost_usd += row.try_get::<f64, _>("account_uplifted_cost_usd")?;
@@ -3926,6 +4063,16 @@ impl PostgresUsageStore {
                                 .max(0) as usize,
                         );
                     if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
+                        pool.label = Some(label.to_string());
+                    }
+                }
+                // 尝试口径：同一账号所有尝试（含被切走的失败），只用请求/错误/耗时三组列。
+                USAGE_ROLLUP_ACCOUNT_ATTEMPT_DIMENSION => {
+                    let pool = pools.entry(dimension_key.clone()).or_default();
+                    pool.attempts.add(metrics);
+                    if pool.label.is_none()
+                        && let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty())
+                    {
                         pool.label = Some(label.to_string());
                     }
                 }
@@ -3976,6 +4123,7 @@ impl PostgresUsageStore {
                 let Ok(pool_id) = pool_id.parse::<u64>() else {
                     return None;
                 };
+                let attempts = pool.attempts.to_metrics();
                 Some(UsageOverviewPoolRow {
                     pool_id,
                     pool_name: pool.label.unwrap_or_else(|| format!("#{}", pool_id)),
@@ -3988,6 +4136,11 @@ impl PostgresUsageStore {
                     profit_usd: pool.profit_usd,
                     cost_floor_delta_usd: pool.cost_floor_delta_usd,
                     cost_floor_applied_requests: pool.cost_floor_applied_requests,
+                    account_cost_usd: pool.account_cost_usd.max(0.0),
+                    attempt_requests: attempts.requests,
+                    attempt_error_requests: attempts.error_requests,
+                    attempt_error_rate: attempts.error_rate,
+                    attempt_average_duration_ms: attempts.average_duration_ms,
                 })
             })
             .collect::<Vec<_>>();
@@ -4009,6 +4162,13 @@ impl PostgresUsageStore {
                 requests: pool.metrics.requests,
                 error_requests: pool.metrics.error_requests,
                 estimated_cost_usd: pool.metrics.estimated_cost_usd,
+                success_requests: pool.metrics.success_requests,
+                cache_read_input_tokens: pool.metrics.cache_read_input_tokens,
+                cache_creation_input_tokens: pool.metrics.cache_creation_input_tokens,
+                uncached_input_tokens: pool.metrics.uncached_input_tokens,
+                original_cost_usd: pool.metrics.original_cost_usd,
+                account_cost_usd: pool.account_cost_usd.max(0.0),
+                average_duration_ms: pool.metrics.average_duration_ms,
             })
             .collect::<Vec<_>>();
         top_accounts.sort_by(|left, right| {
@@ -4072,6 +4232,97 @@ impl PostgresUsageStore {
             top_keys,
             top_paths,
             top_errors,
+        })
+    }
+
+    /// 按账号的总耗时与首字延迟 p50/p95/p99。直接扫 `usage_records` 明细
+    /// （`percentile_cont`），所以调用方把范围限制在 `USAGE_OVERVIEW_HOURLY_MAX_DAYS` 内。
+    /// 账号取 `data->>'accountId'`（明细表的 `account_id` 列沿用 main 存的是凭据 id），
+    /// 与风控页同一口径，走 `idx_usage_records_account_json_created`。
+    pub async fn account_latency(
+        &self,
+        spec: &UsageOverviewSpec,
+        account_id: Option<u64>,
+    ) -> anyhow::Result<UsageAccountLatencyResponse> {
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = sqlx::query(
+            r#"
+            WITH scoped AS (
+                SELECT
+                    (data->>'accountId')::bigint AS account_id,
+                    NULLIF(BTRIM(data->>'accountName'), '') AS account_label,
+                    duration_ms::double precision AS duration_ms,
+                    CASE
+                        WHEN data->>'firstTokenLatencyMs' ~ '^[0-9]+$'
+                        THEN (data->>'firstTokenLatencyMs')::double precision
+                        ELSE NULL
+                    END AS first_token_latency_ms,
+                    created_at
+                FROM usage_records
+                WHERE deleted_at IS NULL
+                  AND data->>'accountId' ~ '^[0-9]+$'
+                  AND created_at >= $1
+                  AND created_at < $2
+                  AND ($3::text IS NULL OR data->>'accountId' = $3)
+            )
+            SELECT
+                account_id,
+                (ARRAY_AGG(account_label ORDER BY created_at DESC) FILTER (WHERE account_label IS NOT NULL))[1]
+                    AS account_label,
+                COUNT(*)::bigint AS samples,
+                COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms), 0)::double precision AS p50_duration_ms,
+                COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::double precision AS p95_duration_ms,
+                COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms), 0)::double precision AS p99_duration_ms,
+                COUNT(first_token_latency_ms)::bigint AS first_token_samples,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY first_token_latency_ms)::double precision AS p50_first_token_latency_ms,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY first_token_latency_ms)::double precision AS p95_first_token_latency_ms,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY first_token_latency_ms)::double precision AS p99_first_token_latency_ms
+            FROM scoped
+            GROUP BY account_id
+            ORDER BY samples DESC, account_id ASC
+            "#,
+        )
+        .bind(spec.from)
+        .bind(spec.to)
+        .bind(account_id.map(|id| id.to_string()))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let accounts = rows
+            .into_iter()
+            .map(|row| {
+                let account_id = row_i64_to_u64(&row, "account_id")?;
+                let account_label: Option<String> = row.try_get("account_label")?;
+                Ok(UsageAccountLatencyRow {
+                    account_id,
+                    account_name: account_label.unwrap_or_else(|| format!("#{account_id}")),
+                    samples: row_i64_to_usize(&row, "samples")?,
+                    p50_duration_ms: row.try_get("p50_duration_ms")?,
+                    p95_duration_ms: row.try_get("p95_duration_ms")?,
+                    p99_duration_ms: row.try_get("p99_duration_ms")?,
+                    first_token_samples: row_i64_to_usize(&row, "first_token_samples")?,
+                    p50_first_token_latency_ms: row.try_get("p50_first_token_latency_ms")?,
+                    p95_first_token_latency_ms: row.try_get("p95_first_token_latency_ms")?,
+                    p99_first_token_latency_ms: row.try_get("p99_first_token_latency_ms")?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(UsageAccountLatencyResponse {
+            generated_at: Utc::now().to_rfc3339(),
+            timezone: spec.timezone.clone(),
+            range: crate::anthropic::usage::UsageOverviewRange {
+                key: spec.range_key.clone(),
+                requested_from: spec.requested_from.to_rfc3339(),
+                requested_to: spec.requested_to.to_rfc3339(),
+                from: spec.from.to_rfc3339(),
+                to: spec.to.to_rfc3339(),
+                data_through: spec.data_through.to_rfc3339(),
+                granularity: spec.granularity.clone(),
+            },
+            accounts,
         })
     }
 
@@ -4489,9 +4740,6 @@ impl PostgresUsageStore {
     /// rollup tables would erase fresh rollups and make the live service look empty
     /// until enough new writes accumulate. Rebuilding from active details in the
     /// same reset transaction preserves those post-cutoff records.
-    /// Rebuilds the route dimensions (`local_route`, `external_reason`) from the
-    /// active usage records. Offline maintenance only: the caller holds the
-    /// exclusive maintenance fence and the commit guard blocks writers.
     /// Recomputes the overview total columns (`account_cost_usd`, `account_raw_tokens`) of both
     /// rollup tables from active detail rows. Zeroing first keeps the command idempotent;
     /// every other rollup column is left untouched. Runs under the usage cleanup commit
@@ -4564,8 +4812,10 @@ impl PostgresUsageStore {
         Ok(removed)
     }
 
+    /// 重建上线后新增的汇总维度（账号尝试、密钥准入拒绝）并回填未缓存输入列。
+    /// 离线维护命令：先删这些维度的全部行，再从活跃明细重算，重复执行结果一致。
     pub async fn rebuild_usage_route_dimensions(&self) -> anyhow::Result<u64> {
-        let dimensions = USAGE_ROUTE_ROLLUP_DIMENSIONS
+        let dimensions = USAGE_LATE_ADDED_ROLLUP_DIMENSIONS
             .iter()
             .map(|dimension| dimension.to_string())
             .collect::<Vec<_>>();
@@ -4616,7 +4866,7 @@ impl PostgresUsageStore {
                 let value: serde_json::Value = row.try_get("data")?;
                 let mut record: UsageRecord = serde_json::from_value(value)?;
                 apply_usage_record_legacy_cost_compatibility(&mut record);
-                rollups.add_record_dimensions(&record, &USAGE_ROUTE_ROLLUP_DIMENSIONS);
+                rollups.add_record_dimensions(&record, &USAGE_LATE_ADDED_ROLLUP_DIMENSIONS);
                 compat_input.add_record(&record);
                 scanned += 1;
             }
@@ -7445,9 +7695,12 @@ impl UsageCompatInputBackfill {
     }
 }
 
-/// Rollup dimensions describing how a request was routed. They were added
-/// after launch, so history needs an explicit rebuild to fill them.
-const USAGE_ROUTE_ROLLUP_DIMENSIONS: [&str; 0] = [];
+/// 上线后新增、历史记录需要显式重建才有数据的汇总维度。
+/// `rebuild_usage_route_dimensions` 维护命令会删掉这些维度的旧行再从明细重算。
+const USAGE_LATE_ADDED_ROLLUP_DIMENSIONS: [&str; 2] = [
+    USAGE_ROLLUP_ACCOUNT_ATTEMPT_DIMENSION,
+    USAGE_ROLLUP_REQUEST_KEY_REJECTION_DIMENSION,
+];
 
 impl UsageRollupBatchDelta {
     /// Adds only the named dimensions (totals and hour buckets). Used by the
@@ -7455,9 +7708,13 @@ impl UsageRollupBatchDelta {
     fn add_record_dimensions(&mut self, record: &UsageRecord, only: &[&str]) {
         let metrics = UsageRollupMetrics::from_record(record, 1);
         let bucket_start = usage_rollup_bucket_start(parse_usage_created_at(record));
-        for dimension in usage_rollup_dimensions(record)
+        let regular = usage_rollup_dimensions(record)
             .into_iter()
-            .filter(|dimension| only.contains(&dimension.dimension))
+            .map(|dimension| (dimension, metrics));
+        let attempts = usage_rollup_attempt_entries(record, 1).into_iter();
+        for (dimension, metrics) in regular
+            .chain(attempts)
+            .filter(|(dimension, _)| only.contains(&dimension.dimension))
         {
             self.totals
                 .entry((dimension.dimension, dimension.key.clone()))
@@ -7488,6 +7745,19 @@ impl UsageRollupBatchDelta {
                     .entry((bucket_start, dimension.dimension, dimension.key))
                     .or_default()
                     .add(dimension.label, metrics);
+            }
+        }
+        // 尝试维度每个尝试一份自己的指标，与整条记录的指标无关；清理抵消走同一条路。
+        for (dimension, attempt_metrics) in usage_rollup_attempt_entries(record, direction) {
+            self.totals
+                .entry((dimension.dimension, dimension.key.clone()))
+                .or_default()
+                .add(dimension.label.clone(), attempt_metrics);
+            if dimension.include_time_bucket {
+                self.time_buckets
+                    .entry((bucket_start, dimension.dimension, dimension.key))
+                    .or_default()
+                    .add(dimension.label, attempt_metrics);
             }
         }
 
@@ -7601,6 +7871,49 @@ impl UsageRollupBatchDelta {
     }
 }
 
+/// 汇总维度名：按账号的每次尝试（含中途失败被切走的）。
+const USAGE_ROLLUP_ACCOUNT_ATTEMPT_DIMENSION: &str = "account_attempt";
+/// 汇总维度名：请求密钥的准入拒绝（限额、并发等 `request_rejection`）。
+const USAGE_ROLLUP_REQUEST_KEY_REJECTION_DIMENSION: &str = "request_api_key_rejection";
+/// 准入拒绝记录的 `error_type`，与 `usage.rs` 的 `REQUEST_REJECTION_ERROR_TYPE` 一致。
+const USAGE_REQUEST_REJECTION_ERROR_TYPE: &str = "request_rejection";
+
+/// 一条记录里每次账号尝试各自的汇总增量：每个尝试贡献一次 `requests`，
+/// `action == "success"` 计成功、否则计错误；耗时取尝试自己的耗时，token/成本列为 0。
+/// 最终成功的那次尝试也在内，所以 `account_attempt.requests >= account.requests`。
+fn usage_rollup_attempt_entries(
+    record: &UsageRecord,
+    direction: i64,
+) -> Vec<(UsageRollupDimension, UsageRollupMetrics)> {
+    let sign = if direction < 0 { -1 } else { 1 };
+    record
+        .external_attempts
+        .iter()
+        .map(|attempt| {
+            let success = attempt.action == "success";
+            let duration = attempt.duration_ms.min(i64::MAX as u64) as i64;
+            let metrics = UsageRollupMetrics {
+                requests: sign,
+                success_requests: signed_bool(success, sign),
+                error_requests: signed_bool(!success, sign),
+                duration_ms_sum: duration * sign,
+                duration_ms_count: sign,
+                duration_ms_max: if sign > 0 { duration } else { 0 },
+                ..UsageRollupMetrics::default()
+            };
+            let dimension = UsageRollupDimension {
+                dimension: USAGE_ROLLUP_ACCOUNT_ATTEMPT_DIMENSION,
+                key: attempt.pool_id.to_string(),
+                label: Some(attempt.pool_name.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                include_time_bucket: true,
+            };
+            (dimension, metrics)
+        })
+        .collect()
+}
+
 fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
     let status = usage_status_value(record.status).to_string();
     let source = usage_source_value(record.usage_source).to_string();
@@ -7707,6 +8020,21 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
                 .map(str::to_string),
             include_time_bucket: true,
         });
+        // 准入拒绝（限额、并发等）单独按请求密钥计数，安全页用它显示“24h 拒绝 N 次”。
+        if record.error_type.as_deref() == Some(USAGE_REQUEST_REJECTION_ERROR_TYPE)
+            && let Some(key_id) = record
+                .request_api_key_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            dimensions.push(UsageRollupDimension {
+                dimension: USAGE_ROLLUP_REQUEST_KEY_REJECTION_DIMENSION,
+                key: key_id.to_string(),
+                label: None,
+                include_time_bucket: true,
+            });
+        }
     }
 
     dimensions
@@ -8958,7 +9286,9 @@ impl OverviewAccumulator {
         let metrics = self.to_metrics();
         UsageOverviewSeriesMetrics {
             requests: metrics.requests,
+            success_requests: metrics.success_requests,
             error_requests: metrics.error_requests,
+            average_duration_ms: metrics.average_duration_ms,
             input_tokens: metrics.input_tokens,
             uncached_input_tokens: metrics.uncached_input_tokens,
             output_tokens: metrics.output_tokens,
@@ -9091,7 +9421,11 @@ impl OverviewSeriesGroupsAccumulator {
 #[derive(Debug, Clone, Default)]
 struct OverviewPoolAccumulator {
     metrics: OverviewAccumulator,
+    /// `account_attempt` 维度：该账号的每次尝试（含被切走的失败）。
+    attempts: OverviewAccumulator,
     label: Option<String>,
+    /// 账号成本（上游原始成本 × 账号倍率）。
+    account_cost_usd: f64,
     raw_cost_usd: f64,
     shaped_cost_usd: f64,
     uplifted_cost_usd: f64,
@@ -9106,8 +9440,16 @@ struct OverviewPoolAccumulator {
 struct OverviewRankAccumulator {
     label: String,
     requests: usize,
+    success_requests: usize,
     error_requests: usize,
     estimated_cost_usd: f64,
+    original_cost_usd: f64,
+    account_cost_usd: f64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    uncached_input_tokens: i64,
+    duration_ms_sum: i64,
+    duration_ms_count: i64,
 }
 
 impl OverviewRankAccumulator {
@@ -9115,10 +9457,28 @@ impl OverviewRankAccumulator {
         self.requests = self
             .requests
             .saturating_add(metrics.requests.max(0) as usize);
+        self.success_requests = self
+            .success_requests
+            .saturating_add(metrics.success_requests.max(0) as usize);
         self.error_requests = self
             .error_requests
             .saturating_add(metrics.error_requests.max(0) as usize);
         self.estimated_cost_usd += metrics.estimated_cost_usd.max(0.0);
+        self.original_cost_usd += metrics.original_cost_usd.max(0.0);
+        self.account_cost_usd += metrics.account_cost_usd.max(0.0);
+        self.cache_read_input_tokens += metrics.cache_read_input_tokens.max(0);
+        self.cache_creation_input_tokens += metrics.cache_creation_input_tokens.max(0);
+        self.uncached_input_tokens += metrics.uncached_input_tokens.max(0);
+        self.duration_ms_sum += metrics.duration_ms_sum.max(0);
+        self.duration_ms_count += metrics.duration_ms_count.max(0);
+    }
+
+    fn average_duration_ms(&self) -> f64 {
+        if self.duration_ms_count > 0 {
+            self.duration_ms_sum as f64 / self.duration_ms_count as f64
+        } else {
+            0.0
+        }
     }
 }
 
@@ -9221,12 +9581,19 @@ fn ranked_overview_rows(
             label: if value.label.is_empty() {
                 key.clone()
             } else {
-                value.label
+                value.label.clone()
             },
             key,
             requests: value.requests,
             error_requests: value.error_requests,
             estimated_cost_usd: value.estimated_cost_usd,
+            success_requests: value.success_requests,
+            cache_read_input_tokens: value.cache_read_input_tokens,
+            cache_creation_input_tokens: value.cache_creation_input_tokens,
+            uncached_input_tokens: value.uncached_input_tokens,
+            original_cost_usd: value.original_cost_usd,
+            account_cost_usd: value.account_cost_usd,
+            average_duration_ms: value.average_duration_ms(),
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -10427,6 +10794,19 @@ CREATE TABLE IF NOT EXISTS model_capabilities_sync_status (
 
 
 
+CREATE TABLE IF NOT EXISTS account_quality_samples (
+    account_id BIGINT NOT NULL,
+    sampled_at TIMESTAMPTZ NOT NULL,
+    recent_error_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ttft_ewma_ms DOUBLE PRECISION,
+    latency_ewma_ms DOUBLE PRECISION,
+    sample_count BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, sampled_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_quality_samples_sampled_at
+    ON account_quality_samples (sampled_at);
+
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
     id BIGSERIAL PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -10891,8 +11271,8 @@ mod tests {
 
     use super::*;
     use crate::anthropic::usage::{
-        AccountBilling, AccountUsageSnapshot, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
-        UsageSource,
+        AccountAttempt, AccountBilling, AccountUsageSnapshot, UsageRecordStatus, UsageRouteKind,
+        UsageRouteSubtype, UsageSource,
     };
     use serde_json::json;
 
@@ -11280,6 +11660,7 @@ mod tests {
     async fn clean(store: &PostgresStore) {
         for statement in [
             "TRUNCATE TABLE admin_audit_logs",
+            "TRUNCATE TABLE account_quality_samples",
             "TRUNCATE TABLE usage_cleanup_jobs",
             "TRUNCATE TABLE usage_cleanup_watermarks",
             "TRUNCATE TABLE usage_duration_rollup_time_buckets",
@@ -12476,6 +12857,464 @@ mod tests {
             (after.external.account_cost_usd - 0.25).abs() < 1e-9,
             "{after:?}"
         );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 账号尝试维度：一条记录两次尝试（一次失败被切走、一次成功）→ 尝试请求 2、尝试错误 1、
+    /// 最终成功 1；软删抵消后归零；维护命令重建后恢复。
+    #[tokio::test]
+    async fn postgres_account_attempt_dimension_counts_failed_attempts_and_reconciles() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let now = Utc::now();
+        let mut record = external_usage_record("attempt-1", 1.0, 0.8, 1.2);
+        record.created_at = now.to_rfc3339();
+        record.duration_ms = 500;
+        record.external_attempts = vec![
+            AccountAttempt {
+                attempt: 1,
+                pool_id: 7,
+                pool_name: "flaky".to_string(),
+                outbound_model: None,
+                status: Some(529),
+                action: "retry_next".to_string(),
+                duration_ms: 300,
+                error_type: Some("overloaded".to_string()),
+                error_message: Some("overloaded".to_string()),
+                raw_upstream_error: None,
+            },
+            AccountAttempt {
+                attempt: 2,
+                pool_id: 42,
+                pool_name: "backup-a".to_string(),
+                outbound_model: None,
+                status: Some(200),
+                action: "success".to_string(),
+                duration_ms: 200,
+                error_type: None,
+                error_message: None,
+                raw_upstream_error: None,
+            },
+        ];
+        usage_store.record(record).await.unwrap();
+
+        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
+            Utc::now(),
+            Some("UTC"),
+            Some("today"),
+            None,
+            None,
+            Some("hour"),
+            Some(10),
+        )
+        .unwrap();
+        let overview = usage_store.dashboard_overview(&spec).await.unwrap();
+        let pool = |id: u64| {
+            overview
+                .external
+                .pools
+                .iter()
+                .find(|pool| pool.pool_id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("pool {id} missing: {overview:?}"))
+        };
+        // 最终落到 #42：最终口径 1 请求 0 错误；尝试口径 1 次成功。
+        let winner = pool(42);
+        assert_eq!(winner.metrics.requests, 1);
+        assert_eq!(winner.metrics.error_requests, 0);
+        assert_eq!(winner.attempt_requests, 1);
+        assert_eq!(winner.attempt_error_requests, 0);
+        assert!((winner.attempt_average_duration_ms - 200.0).abs() < 1e-9);
+        assert!((winner.account_cost_usd - 0.0).abs() < 1e-9);
+        // 被切走的 #7：最终口径没有请求，尝试口径 1 次失败，错误率 100%。
+        let loser = pool(7);
+        assert_eq!(loser.pool_name, "flaky");
+        assert_eq!(loser.metrics.requests, 0);
+        assert_eq!(loser.attempt_requests, 1);
+        assert_eq!(loser.attempt_error_requests, 1);
+        assert!((loser.attempt_error_rate - 1.0).abs() < 1e-9);
+        assert!((loser.attempt_average_duration_ms - 300.0).abs() < 1e-9);
+        // 排行里的账号只看最终口径：#7 没有请求不进排行。
+        assert_eq!(overview.top_accounts.len(), 1);
+        assert_eq!(overview.top_accounts[0].key, "42");
+
+        let attempt_rows = |table: &str| {
+            let store = store.clone();
+            let sql = format!(
+                "SELECT COALESCE(SUM(requests), 0)::bigint, COALESCE(SUM(error_requests), 0)::bigint \
+                 FROM {table} WHERE dimension = 'account_attempt'"
+            );
+            async move {
+                sqlx::query_as::<_, (i64, i64)>(&sql)
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(attempt_rows("usage_rollup_totals").await, (2, 1));
+        assert_eq!(attempt_rows("usage_rollup_time_buckets").await, (2, 1));
+
+        // 维护命令：删掉尝试维度再从明细重建，结果一致。
+        let scanned = usage_store.rebuild_usage_route_dimensions().await.unwrap();
+        assert_eq!(scanned, 1);
+        assert_eq!(attempt_rows("usage_rollup_totals").await, (2, 1));
+        assert_eq!(attempt_rows("usage_rollup_time_buckets").await, (2, 1));
+
+        // 软删抵消：负向增量同样走尝试维度，空行被回收。
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let result = usage_store
+            .soft_delete_cleanup_batch(Utc::now(), 10)
+            .await
+            .unwrap();
+        assert_eq!(result.processed_rows, 1);
+        assert_eq!(attempt_rows("usage_rollup_totals").await, (0, 0));
+        assert_eq!(attempt_rows("usage_rollup_time_buckets").await, (0, 0));
+        let after = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert!(after.external.pools.is_empty(), "{after:?}");
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 排行行带完整指标（成功数、缓存命中率分子分母、原始计费、平均耗时）；
+    /// 账号成本按账号拆到总览账号表；密钥积分限额按账号成本计数。
+    #[tokio::test]
+    async fn postgres_overview_rank_rows_and_pool_rows_carry_full_metrics() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let now = Utc::now();
+        let mut ok = external_usage_record("rank-ok", 1.0, 0.8, 1.2);
+        ok.created_at = now.to_rfc3339();
+        ok.duration_ms = 100;
+        ok.account_cost_usd = 1.5;
+        let mut failed = external_usage_record("rank-fail", 0.5, 0.4, 0.6);
+        failed.created_at = now.to_rfc3339();
+        failed.duration_ms = 300;
+        failed.status = UsageRecordStatus::Error;
+        failed.error_type = Some("overloaded".to_string());
+        failed.account_cost_usd = 0.5;
+        usage_store
+            .record_batch(vec![ok.clone(), failed.clone()])
+            .await
+            .unwrap();
+
+        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
+            Utc::now(),
+            Some("UTC"),
+            Some("today"),
+            None,
+            None,
+            Some("hour"),
+            Some(10),
+        )
+        .unwrap();
+        let overview = usage_store.dashboard_overview(&spec).await.unwrap();
+
+        let path = overview
+            .top_paths
+            .iter()
+            .find(|row| row.key == "/cc/v1/messages")
+            .expect("path rank row");
+        assert_eq!(path.requests, 2);
+        assert_eq!(path.success_requests, 1);
+        assert_eq!(path.error_requests, 1);
+        assert!((path.average_duration_ms - 200.0).abs() < 1e-9);
+        assert!((path.original_cost_usd - 1.5).abs() < 1e-9, "{path:?}");
+        assert!((path.estimated_cost_usd - 1.8).abs() < 1e-9, "{path:?}");
+        // 账号成本（原始成本 × 账号倍率）也按排行维度拆出，用来对照估算计费看差额。
+        assert!((path.account_cost_usd - 2.0).abs() < 1e-9, "{path:?}");
+        assert_eq!(
+            path.uncached_input_tokens,
+            i64::from(ok.compat_input_tokens) + i64::from(failed.compat_input_tokens)
+        );
+        assert_eq!(
+            path.cache_read_input_tokens,
+            i64::from(ok.cache_read_input_tokens) + i64::from(failed.cache_read_input_tokens)
+        );
+        assert_eq!(
+            path.cache_creation_input_tokens,
+            i64::from(ok.cache_creation_input_tokens)
+                + i64::from(failed.cache_creation_input_tokens)
+        );
+        // 模型 / 密钥页签同一套列。
+        let model = overview.top_models.first().expect("model row");
+        assert_eq!(model.success_requests, 1);
+        assert!((model.original_cost_usd - 1.5).abs() < 1e-9);
+        assert!((model.account_cost_usd - 2.0).abs() < 1e-9, "{model:?}");
+        let key = overview
+            .top_keys
+            .iter()
+            .find(|row| row.key == "request-key-external")
+            .expect("key row");
+        assert_eq!(key.requests, 2);
+        assert!((key.average_duration_ms - 200.0).abs() < 1e-9);
+        assert!((key.account_cost_usd - 2.0).abs() < 1e-9, "{key:?}");
+        let account_rank = overview
+            .top_accounts
+            .iter()
+            .find(|row| row.key == "42")
+            .expect("account rank row");
+        assert!(
+            (account_rank.account_cost_usd - 2.0).abs() < 1e-9,
+            "{account_rank:?}"
+        );
+        // 账号表：账号成本按账号拆出。
+        let pool = overview
+            .external
+            .pools
+            .iter()
+            .find(|pool| pool.pool_id == 42)
+            .expect("pool row");
+        assert!((pool.account_cost_usd - 2.0).abs() < 1e-9, "{pool:?}");
+        // 时序：成功数与平均耗时。
+        let point = overview
+            .series
+            .iter()
+            .find(|point| point.all.requests > 0)
+            .expect("series point");
+        assert_eq!(point.all.success_requests, 1);
+        assert!((point.all.average_duration_ms - 200.0).abs() < 1e-9);
+
+        // 密钥限额的积分槽位 = 账号成本之和。
+        let totals = store
+            .request_key_usage_since("request-key-external", None)
+            .await
+            .unwrap();
+        assert!((totals.credits - 2.0).abs() < 1e-9, "{totals:?}");
+        assert!((totals.cost_usd - 1.8).abs() < 1e-9, "{totals:?}");
+        let since_now = store
+            .request_key_usage_since("request-key-external", Some(now - ChronoDuration::hours(2)))
+            .await
+            .unwrap();
+        assert!((since_now.credits - 2.0).abs() < 1e-9, "{since_now:?}");
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 准入拒绝按请求密钥单独计数；普通错误不算；软删抵消后归零。
+    #[tokio::test]
+    async fn postgres_request_key_rejection_dimension_counts_only_rejections() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let now = Utc::now();
+        let rejection = |id: &str| {
+            let mut record = usage_record(id, 0);
+            record.created_at = now.to_rfc3339();
+            record.status = UsageRecordStatus::Error;
+            record.error_type = Some("request_rejection".to_string());
+            record.request_api_key_id = Some("key-limited".to_string());
+            record
+        };
+        let mut plain_error = usage_record("plain-error", 0);
+        plain_error.created_at = now.to_rfc3339();
+        plain_error.status = UsageRecordStatus::Error;
+        plain_error.error_type = Some("overloaded".to_string());
+        plain_error.request_api_key_id = Some("key-limited".to_string());
+        let mut other_key = rejection("rejected-other");
+        other_key.request_api_key_id = Some("key-other".to_string());
+        usage_store
+            .record_batch(vec![
+                rejection("rejected-1"),
+                rejection("rejected-2"),
+                plain_error,
+                other_key,
+            ])
+            .await
+            .unwrap();
+
+        let rejections = store
+            .request_key_rejections_since(now - ChronoDuration::hours(24))
+            .await
+            .unwrap();
+        assert_eq!(rejections.get("key-limited").copied(), Some(2));
+        assert_eq!(rejections.get("key-other").copied(), Some(1));
+        assert_eq!(rejections.len(), 2);
+
+        // 时间窗之外不算。
+        let future = store
+            .request_key_rejections_since(now + ChronoDuration::hours(2))
+            .await
+            .unwrap();
+        assert!(future.is_empty());
+
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let result = usage_store
+            .soft_delete_cleanup_batch(Utc::now(), 10)
+            .await
+            .unwrap();
+        assert_eq!(result.processed_rows, 4);
+        let after = store
+            .request_key_rejections_since(now - ChronoDuration::hours(24))
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "{after:?}");
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 按账号的耗时 / 首字分位数直接扫明细；没有首字延迟的账号对应列为空。
+    #[tokio::test]
+    async fn postgres_account_latency_percentiles_come_from_detail_rows() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let now = Utc::now();
+        let mut records = Vec::new();
+        for (index, duration) in [100_u64, 200, 300, 400, 500].into_iter().enumerate() {
+            let mut record = external_usage_record(&format!("latency-{index}"), 1.0, 0.8, 1.2);
+            record.created_at = now.to_rfc3339();
+            record.duration_ms = duration;
+            record.first_token_latency_ms = Some(duration / 2);
+            records.push(record);
+        }
+        // 另一个账号：没有首字延迟。
+        let mut other = external_usage_record("latency-other", 1.0, 0.8, 1.2);
+        other.created_at = now.to_rfc3339();
+        other.account_id = Some(9);
+        other.account_name = Some("quiet".to_string());
+        other.duration_ms = 1_000;
+        other.first_token_latency_ms = None;
+        records.push(other);
+        // 本地记录没有账号，不参与。
+        let mut local = usage_record("latency-local", 10);
+        local.created_at = now.to_rfc3339();
+        records.push(local);
+        usage_store.record_batch(records).await.unwrap();
+
+        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
+            Utc::now(),
+            Some("UTC"),
+            Some("today"),
+            None,
+            None,
+            Some("hour"),
+            Some(10),
+        )
+        .unwrap();
+        let response = usage_store.account_latency(&spec, None).await.unwrap();
+        assert_eq!(response.accounts.len(), 2, "{response:?}");
+        let main = response
+            .accounts
+            .iter()
+            .find(|row| row.account_id == 42)
+            .expect("account 42");
+        assert_eq!(main.account_name, "backup-a");
+        assert_eq!(main.samples, 5);
+        assert!((main.p50_duration_ms - 300.0).abs() < 1e-9, "{main:?}");
+        assert!((main.p95_duration_ms - 480.0).abs() < 1e-6, "{main:?}");
+        assert!((main.p99_duration_ms - 496.0).abs() < 1e-6, "{main:?}");
+        assert_eq!(main.first_token_samples, 5);
+        assert!((main.p50_first_token_latency_ms.unwrap() - 150.0).abs() < 1e-9);
+        let quiet = response
+            .accounts
+            .iter()
+            .find(|row| row.account_id == 9)
+            .expect("account 9");
+        assert_eq!(quiet.samples, 1);
+        assert_eq!(quiet.first_token_samples, 0);
+        assert!(quiet.p95_first_token_latency_ms.is_none());
+        assert!((quiet.p50_duration_ms - 1_000.0).abs() < 1e-9);
+
+        // 按账号过滤。
+        let filtered = usage_store.account_latency(&spec, Some(9)).await.unwrap();
+        assert_eq!(filtered.accounts.len(), 1);
+        assert_eq!(filtered.accounts[0].account_id, 9);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 质量采样快照：写入、按账号读取（升序）、过期清理。
+    #[tokio::test]
+    async fn postgres_account_quality_samples_round_trip_and_expire() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+
+        let now = Utc::now();
+        let sample = |minutes_ago: i64, error_rate: f64| AccountQualitySampleRow {
+            account_id: 42,
+            sampled_at: now - ChronoDuration::minutes(minutes_ago),
+            recent_error_rate: error_rate,
+            ttft_ewma_ms: Some(120.0),
+            latency_ewma_ms: Some(900.0),
+            sample_count: 10,
+        };
+        store
+            .record_account_quality_sample(&sample(10, 0.2))
+            .await
+            .unwrap();
+        store
+            .record_account_quality_sample(&sample(5, 0.1))
+            .await
+            .unwrap();
+        // 过期点（8 天前）与其它账号的点。
+        let mut old = sample(8 * 24 * 60, 0.9);
+        old.ttft_ewma_ms = None;
+        store.record_account_quality_sample(&old).await.unwrap();
+        let mut other = sample(1, 0.0);
+        other.account_id = 7;
+        store.record_account_quality_sample(&other).await.unwrap();
+
+        let history = store
+            .account_quality_history(42, now - ChronoDuration::hours(24), 100)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert!(history[0].sampled_at < history[1].sampled_at, "ascending");
+        assert!((history[0].recent_error_rate - 0.2).abs() < 1e-9);
+        assert!((history[1].recent_error_rate - 0.1).abs() < 1e-9);
+        assert_eq!(history[1].ttft_ewma_ms, Some(120.0));
+
+        // 同一时刻重复写入是更新不是报错。
+        let mut updated = sample(5, 0.3);
+        updated.sample_count = 11;
+        store.record_account_quality_sample(&updated).await.unwrap();
+        let history = store
+            .account_quality_history(42, now - ChronoDuration::hours(24), 100)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].sample_count, 11);
+
+        let removed = store
+            .delete_expired_account_quality_samples(
+                std::time::Duration::from_secs(7 * 24 * 60 * 60),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        let all: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_quality_samples")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(all, 3);
 
         store.drop_test_schema().await.unwrap();
     }

@@ -475,6 +475,32 @@ pub async fn export_config(
         )
     }
     .await;
+    // 带密钥导出会把账号密钥与请求 Key 明文打进包里，成败都要留痕并记录 includeSecrets。
+    let (success, error_message, detail) = match &result {
+        Ok(package) => (
+            true,
+            None,
+            json!({
+                "includeSecrets": query.include_secrets,
+                "accounts": package.accounts.len(),
+                "routeScenarios": package.route_scenarios.len(),
+                "requestApiKeys": package.request_api_keys.len(),
+            }),
+        ),
+        Err(error) => (
+            false,
+            Some(error.to_string()),
+            json!({ "includeSecrets": query.include_secrets }),
+        ),
+    };
+    state.service.audit(
+        "export_config",
+        "config",
+        None,
+        success,
+        error_message,
+        detail,
+    );
     respond(result)
 }
 pub async fn import_config(

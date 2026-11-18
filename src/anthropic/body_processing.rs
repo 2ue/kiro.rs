@@ -23,7 +23,7 @@ const MAX_REMOTE_MULTIMODAL_REDIRECTS: usize = 5;
 const MAX_CONCURRENT_REMOTE_MULTIMODAL_WORKFLOWS: usize = 4;
 const REMOTE_MULTIMODAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 const REMOTE_MULTIMODAL_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(45);
-const REMOTE_MULTIMODAL_CAPACITY_ERROR: &str =
+pub(crate) const REMOTE_MULTIMODAL_CAPACITY_ERROR: &str =
     "remote image/document materialization is temporarily at capacity";
 
 #[derive(Debug, Default)]
@@ -282,7 +282,11 @@ pub(crate) async fn prepare_multimodal_message_sources(
         .await
         {
             Ok(result) => result,
-            Err(err) => return Err(format!("image resize task failed: {err}")),
+            Err(err) => {
+                // 任务错误里可能带线程/panic 细节，只进日志，对外固定文案。
+                tracing::warn!(error = %err, "image resize task failed");
+                return Err("image resize failed".to_string());
+            }
         };
         *messages = owned;
         report.resized_images = resize.resized;
@@ -447,9 +451,10 @@ fn build_remote_multimodal_client(
             builder = builder.user_agent(ua);
         }
     }
-    builder
-        .build()
-        .map_err(|e| format!("failed to create remote source client: {}", e))
+    builder.build().map_err(|e| {
+        tracing::warn!(error = %e, "failed to create remote source client");
+        "failed to prepare remote source client".to_string()
+    })
 }
 
 fn count_remote_multimodal_sources(messages: &[Message]) -> usize {
@@ -663,11 +668,15 @@ async fn download_remote_multimodal_source(
             .map_err(|reason| format!("{} URL rejected: {}", block_type, reason))?;
 
         budget.reserve_http_attempt()?;
-        let candidate = client
-            .get(&current_url)
-            .send()
-            .await
-            .map_err(|e| format!("failed to download {} URL source: {}", block_type, e))?;
+        // reqwest 错误会带上 URL、DNS 和连接细节，这些不能回给下游；原始错误只进日志。
+        let candidate = client.get(&current_url).send().await.map_err(|e| {
+            tracing::warn!(
+                block_type,
+                error = %e,
+                "failed to fetch remote multimodal URL source"
+            );
+            format!("failed to fetch {} URL source", block_type)
+        })?;
 
         if candidate.status().is_redirection() {
             if redirect_count >= MAX_REMOTE_MULTIMODAL_REDIRECTS {
@@ -769,8 +778,14 @@ async fn read_limited_response_body(
     let mut bytes = Vec::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| format!("failed to read {} URL source: {}", block_type, e))?;
+        let chunk = chunk.map_err(|e| {
+            tracing::warn!(
+                block_type,
+                error = %e,
+                "failed to read remote multimodal URL source body"
+            );
+            format!("failed to read {} URL source", block_type)
+        })?;
         if bytes
             .len()
             .checked_add(chunk.len())
@@ -1605,6 +1620,32 @@ mod tests {
             );
             assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn remote_download_transport_errors_do_not_leak_url_or_connection_details() {
+        // 先占一个端口再释放，让连接被拒绝；错误文案里不能出现主机名、端口或 reqwest 细节。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let address = listener.local_addr().expect("probe address");
+        drop(listener);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("media.test", address)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("local media client");
+        let url = format!("http://media.test:{}/png", address.port());
+        let mut budget = RemoteMaterializationBudget::default();
+        let error = download_remote_multimodal_source(&client, "image", &url, None, &mut budget)
+            .await
+            .expect_err("connection refused must fail the fetch");
+        assert_eq!(error, "failed to fetch image URL source");
+        assert!(!error.contains("media.test"), "{error}");
+        assert!(!error.contains(&address.port().to_string()), "{error}");
+        assert_eq!(budget.http_attempts, 1);
     }
 
     #[tokio::test]

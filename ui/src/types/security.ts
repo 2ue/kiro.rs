@@ -8,6 +8,10 @@ export interface AccessKeysResponse {
   maskedAdminApiKey: string;
 }
 
+/**
+ * 限额计量项。`credits` 是历史叫法，claude-pool 里按账号成本（上游原始成本 × 账号倍率，USD）计数，
+ * 线上字段名保持不变以兼容已存配置。
+ */
 export type KeyLimitMetric = "cost_usd" | "credits" | "tokens";
 
 export type KeyLimitPeriod = "daily" | "monthly" | "total";
@@ -44,6 +48,8 @@ export interface RequestKeyUsageLimitItem {
   keyId: string;
   enabled: boolean;
   statuses: KeyLimitStatus[];
+  /** 最近 24 小时该 Key 被准入拒绝（限额、并发等）的请求数 */
+  rejectedRequests24h: number;
   /** Counters could not be read; requests with this key are rejected. */
   error?: string;
 }

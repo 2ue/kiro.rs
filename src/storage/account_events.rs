@@ -31,6 +31,11 @@ pub enum AccountEventKind {
     ManualEnabled,
     /// Deleted by an operator.
     Deleted,
+    /// The scheduler put the account (or some of its models) into cooldown after an upstream
+    /// failure; it is skipped until the cooldown expires.
+    CooldownStarted,
+    /// Relative quality degradation put the account into probation (scored down for a while).
+    ProbationStarted,
 }
 
 impl AccountEventKind {
@@ -42,7 +47,60 @@ impl AccountEventKind {
             Self::ManualDisabled => "manual_disabled",
             Self::ManualEnabled => "manual_enabled",
             Self::Deleted => "deleted",
+            Self::CooldownStarted => "cooldown_started",
+            Self::ProbationStarted => "probation_started",
         }
+    }
+}
+
+/// Per-process throttle for high-frequency account events (cooldowns fire on every failed
+/// attempt): the same account + reason is recorded at most once per window. Bounded; when
+/// full it is cleared rather than grown.
+pub struct AccountEventThrottle {
+    recent: parking_lot::Mutex<std::collections::HashMap<(u64, String), std::time::Instant>>,
+    window: Duration,
+    capacity: usize,
+}
+
+pub const ACCOUNT_EVENT_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
+pub const ACCOUNT_EVENT_THROTTLE_CAPACITY: usize = 4096;
+
+impl Default for AccountEventThrottle {
+    fn default() -> Self {
+        Self::new(
+            ACCOUNT_EVENT_THROTTLE_WINDOW,
+            ACCOUNT_EVENT_THROTTLE_CAPACITY,
+        )
+    }
+}
+
+impl AccountEventThrottle {
+    pub fn new(window: Duration, capacity: usize) -> Self {
+        Self {
+            recent: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            window,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// `true` when this account + reason has not been recorded within the window; marks it.
+    pub fn should_record(&self, account_id: u64, reason: &str) -> bool {
+        self.should_record_at(account_id, reason, std::time::Instant::now())
+    }
+
+    pub fn should_record_at(&self, account_id: u64, reason: &str, now: std::time::Instant) -> bool {
+        let mut recent = self.recent.lock();
+        let key = (account_id, reason.to_string());
+        if let Some(last) = recent.get(&key)
+            && now.saturating_duration_since(*last) < self.window
+        {
+            return false;
+        }
+        if recent.len() >= self.capacity && !recent.contains_key(&key) {
+            recent.clear();
+        }
+        recent.insert(key, now);
+        true
     }
 }
 
@@ -145,6 +203,53 @@ pub fn account_disable_event(reason: &str) -> (AccountEventKind, &'static str) {
         "channel_disabled" => (AccountEventKind::AutoDisabled, "上游渠道已禁用"),
         _ => (AccountEventKind::AutoDisabled, "连续失败"),
     }
+}
+
+/// Derived data: EWMA snapshots of account quality, kept for a fixed week regardless of the
+/// usage retention switch (nothing in it is a record of a real request).
+pub const ACCOUNT_QUALITY_SAMPLE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const ACCOUNT_QUALITY_SAMPLE_RETENTION_BATCH: usize = 2_000;
+
+/// Hourly cleanup of `account_quality_samples` older than a week. Own task, bounded per run.
+pub fn spawn_account_quality_sample_retention_worker(
+    store: Arc<PostgresStore>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(AUDIT_RETENTION_FIRST_RUN_DELAY).await;
+        let mut interval = tokio::time::interval(AUDIT_RETENTION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let result = run_audit_retention_once(
+                |limit| {
+                    let store = store.clone();
+                    async move {
+                        store
+                            .delete_expired_account_quality_samples(
+                                ACCOUNT_QUALITY_SAMPLE_RETENTION,
+                                limit,
+                            )
+                            .await
+                    }
+                },
+                ACCOUNT_QUALITY_SAMPLE_RETENTION_BATCH,
+                AUDIT_RETENTION_MAX_BATCHES,
+                AUDIT_RETENTION_RUN_BUDGET,
+                AUDIT_RETENTION_BATCH_PAUSE,
+            )
+            .await;
+            match result {
+                Ok(report) if report.removed > 0 || report.saturated => tracing::info!(
+                    removed = report.removed,
+                    batches = report.batches,
+                    saturated = report.saturated,
+                    "已清理过期账号质量采样"
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!("清理过期账号质量采样失败，下次再试: {}", err),
+            }
+        }
+    })
 }
 
 /// How often the retention job wakes up. The first run waits a few minutes after startup.
@@ -355,6 +460,33 @@ mod tests {
         assert_eq!(action, "account_account_event");
         assert_eq!(object_type, "account");
         assert_eq!(detail["accountSource"], "external");
+    }
+
+    #[test]
+    fn throttle_records_same_account_and_reason_once_per_window() {
+        let throttle = AccountEventThrottle::new(Duration::from_secs(60), 16);
+        let start = std::time::Instant::now();
+        assert!(throttle.should_record_at(7, "rate_limit", start));
+        assert!(!throttle.should_record_at(7, "rate_limit", start + Duration::from_secs(30)));
+        // 另一个原因、另一个账号互不影响。
+        assert!(throttle.should_record_at(7, "overloaded", start + Duration::from_secs(30)));
+        assert!(throttle.should_record_at(8, "rate_limit", start + Duration::from_secs(30)));
+        // 窗口过后再次记录。
+        assert!(throttle.should_record_at(7, "rate_limit", start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn throttle_clears_when_full_instead_of_growing() {
+        let throttle = AccountEventThrottle::new(Duration::from_secs(60), 2);
+        let now = std::time::Instant::now();
+        assert!(throttle.should_record_at(1, "a", now));
+        assert!(throttle.should_record_at(2, "a", now));
+        assert_eq!(throttle.recent.lock().len(), 2);
+        // 第三个键触发清空，之后只剩它自己。
+        assert!(throttle.should_record_at(3, "a", now));
+        assert_eq!(throttle.recent.lock().len(), 1);
+        // 被清掉的键会再次放行（容量上限优先于精确去重）。
+        assert!(throttle.should_record_at(1, "a", now));
     }
 
     #[test]

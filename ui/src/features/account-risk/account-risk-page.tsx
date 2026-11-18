@@ -1,18 +1,28 @@
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
+  Activity,
   AlertTriangle,
   BarChart3,
   Boxes,
+  Copy,
   DollarSign,
+  ExternalLink,
+  FileClock,
   Filter,
   Gauge,
   RefreshCw,
   Search,
 } from 'lucide-react'
-import { useUsageDashboardAccountRisk } from '@/hooks/use-usage'
+import { toast } from 'sonner'
+import { useAccountEventSummary, useAuditLogsPage, useUsageDashboardAccountRisk } from '@/hooks/use-usage'
+import { useAccountQualityHistory } from '@/hooks/use-accounts'
+import { ACTOR_LABELS, accountEventView, summaryTiles } from '@/features/audit/account-events'
+import { TrendAreaChart } from '@/components/charts'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
+  AccountQualityHistoryPoint,
   UsageAccountRiskBucket,
   UsageAccountRiskCacheStats,
   UsageAccountRiskGroup,
@@ -129,7 +139,34 @@ function toneForRisk(criticalCount: number, warningCount: number): 'default' | '
   return 'success'
 }
 
+/** 把风控窗口换算成账号异动汇总接口要的小时数（1~720）。 */
+function windowHours(from: string, to: string): number {
+  const span = Date.parse(to) - Date.parse(from)
+  if (!Number.isFinite(span) || span <= 0) return 24
+  return Math.min(720, Math.max(1, Math.ceil(span / 3_600_000)))
+}
+
+/** 用量页的请求明细链接；用量页已支持 requestId 参数。 */
+function usageRecordLink(requestId: string): string {
+  return `/usage?${new URLSearchParams({ requestId }).toString()}`
+}
+
+async function copyRequestId(id: string) {
+  try {
+    await navigator.clipboard.writeText(id)
+    toast.success('请求 ID 已复制')
+  } catch (error) {
+    toast.error(`复制失败: ${extractErrorMessage(error)}`)
+  }
+}
+
+function formatMs(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '-'
+  return `${formatNumber(Math.round(value))} ms`
+}
+
 export function AccountRiskPage() {
+  const navigate = useNavigate()
   const [windowKey, setWindowKey] = useState('last24h')
   const [warningInput, setWarningInput] = useState(String(DEFAULT_WARNING_TOKENS))
   const [criticalInput, setCriticalInput] = useState(String(DEFAULT_CRITICAL_TOKENS))
@@ -324,11 +361,21 @@ export function AccountRiskPage() {
 
           <SectionCard
             title="风险样本"
-            description="按严重程度、成本差额、缓存峰值排序，只返回有限样本，复制请求 ID 可去用量明细继续查。"
+            description="按严重程度、成本差额、缓存峰值排序，只返回有限样本，复制请求 ID 或直接去用量明细继续查。"
             icon={<AlertTriangle />}
           >
-            <SamplesTable samples={data.samples} />
+            <SamplesTable samples={data.samples} onOpenRecord={(id) => navigate(usageRecordLink(id))} />
           </SectionCard>
+
+          {submitted.accountId && (
+            <QualityHistoryCard accountId={submitted.accountId} hours={windowHours(data.window.from, data.window.to)} />
+          )}
+
+          <AccountEventsTimeline
+            since={data.window.from}
+            until={data.window.to}
+            accountId={submitted.accountId}
+          />
 
           {data.totals.missingAccountBillingRecords > 0 && (
             <Callout tone="warning">
@@ -463,7 +510,7 @@ function GroupTable({ title, groups }: { title: string; groups: UsageAccountRisk
   )
 }
 
-function SamplesTable({ samples }: { samples: UsageAccountRiskSample[] }) {
+function SamplesTable({ samples, onOpenRecord }: { samples: UsageAccountRiskSample[]; onOpenRecord: (id: string) => void }) {
   if (!samples.length) return <EmptyState title="暂无风险样本" description="当前查询窗口没有命中缓存或成本风险样本。" />
   return (
     <div className="overflow-x-auto">
@@ -486,7 +533,31 @@ function SamplesTable({ samples }: { samples: UsageAccountRiskSample[] }) {
             <TableRow key={sample.id}>
               <TableCell>
                 <div className="whitespace-nowrap text-xs text-muted-foreground">{formatDate(sample.createdAt)}</div>
-                <div className="max-w-[12rem] truncate font-mono text-xs" title={sample.id}>{sample.id}</div>
+                <div className="flex items-center gap-1">
+                  <span className="max-w-[12rem] truncate font-mono text-xs" title={sample.id}>{sample.id}</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    title="复制请求 ID"
+                    aria-label="复制请求 ID"
+                    onClick={() => void copyRequestId(sample.id)}
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    title="去用量明细查看这条请求"
+                    aria-label="去用量明细"
+                    onClick={() => onOpenRecord(sample.id)}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
               </TableCell>
               <TableCell>
                 <div className="max-w-[11rem] truncate" title={poolLabel(sample.accountId, sample.accountName)}>
@@ -532,5 +603,169 @@ function TokenPairCell({ left, right }: { left: number; right: number }) {
     <TableCell className="text-right tabular-nums">
       <span title={`${formatNumber(left)} / ${formatNumber(right)}`}>{formatCompact(left)} / {formatCompact(right)}</span>
     </TableCell>
+  )
+}
+
+// ─── 账号异动时间线 ─────────────────────────────────────────────────────────────
+
+/** 当前窗口内的账号异动（冷却、观察期、自动禁用、额度耗尽等），复用审计接口。 */
+function AccountEventsTimeline({ since, until, accountId }: { since: string; until: string; accountId?: number }) {
+  const hours = windowHours(since, until)
+  const query = useMemo(
+    () => ({
+      page: 1,
+      limit: 50,
+      accountEvents: true,
+      since,
+      until,
+      account: accountId ? `#${accountId}` : undefined,
+    }),
+    [accountId, since, until],
+  )
+  const events = useAuditLogsPage(query)
+  const summary = useAccountEventSummary(hours)
+  const tiles = summaryTiles(summary.data?.items ?? [])
+  const rows = (events.data?.records ?? [])
+    .map((record) => ({ record, event: accountEventView(record) }))
+    .filter((item): item is { record: typeof item.record; event: NonNullable<typeof item.event> } => item.event !== null)
+
+  return (
+    <SectionCard
+      title="账号异动时间线"
+      description={`当前窗口内最近 50 条账号异动：进入冷却、进入观察期、自动禁用、额度耗尽等${accountId ? `，只看账号 #${accountId}` : ''}。`}
+      icon={<FileClock />}
+    >
+      <div className="mb-3">
+        <div className="mb-1.5 text-xs text-muted-foreground">按事件类型计数（最近 {hours} 小时，全部账号）</div>
+        {summary.isError ? (
+          <div className="text-xs text-destructive">读取失败：{extractErrorMessage(summary.error)}</div>
+        ) : tiles.length === 0 ? (
+          <div className="text-xs text-muted-foreground">没有账号异动。</div>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {tiles.map((tile) => (
+              <div key={tile.kind} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs">
+                <Badge tone={tile.tone} size="xs">{tile.label}</Badge>
+                <span className="font-mono tabular-nums">{formatNumber(tile.events)} 次</span>
+                <span className="text-muted-foreground">· {formatNumber(tile.accounts)} 个账号</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {events.isLoading && !events.data ? (
+        <LoadingState text="加载账号异动..." className="py-6" />
+      ) : events.isError ? (
+        <div className="text-xs text-destructive">读取失败：{extractErrorMessage(events.error)}</div>
+      ) : rows.length === 0 ? (
+        <EmptyState title="当前窗口没有账号异动" />
+      ) : (
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>时间</TableHead>
+                <TableHead>账号</TableHead>
+                <TableHead>事件</TableHead>
+                <TableHead>原因</TableHead>
+                <TableHead>执行者</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map(({ record, event }) => (
+                <TableRow key={record.id}>
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums text-muted-foreground">{formatDate(record.createdAt)}</TableCell>
+                  <TableCell className="max-w-56 truncate text-xs font-medium" title={event.accountLabel}>
+                    {event.accountLabel}
+                    <span className="ml-1 text-[0.62rem] font-normal text-muted-foreground/70">#{event.accountId}</span>
+                  </TableCell>
+                  <TableCell><Badge tone={event.tone} size="xs">{event.label}</Badge></TableCell>
+                  <TableCell className="max-w-72 truncate text-xs" title={event.reason}>{event.reason || '—'}</TableCell>
+                  <TableCell className="whitespace-nowrap text-xs text-muted-foreground" title={record.actor}>{ACTOR_LABELS[record.actor] ?? record.actor}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          {events.data?.hasNext && (
+            <p className="mt-2 text-[0.68rem] text-muted-foreground">只显示最近 50 条，更早的到审计页查看。</p>
+          )}
+        </div>
+      )}
+    </SectionCard>
+  )
+}
+
+// ─── 质量分趋势 ─────────────────────────────────────────────────────────────────
+
+type QualityChartRow = { label: string; errorRate: number; ttft: number; latency: number }
+
+function qualityChartRows(points: AccountQualityHistoryPoint[]): QualityChartRow[] {
+  return points.map((point) => ({
+    label: formatDate(point.sampledAt),
+    errorRate: point.recentErrorRate,
+    ttft: point.ttftEwmaMs ?? Number.NaN,
+    latency: point.latencyEwmaMs ?? Number.NaN,
+  }))
+}
+
+/** 单个账号的调度质量分历史：失败率 EWMA、首字 / 耗时 EWMA，每账号每分钟一个快照。 */
+function QualityHistoryCard({ accountId, hours }: { accountId: number; hours: number }) {
+  const history = useAccountQualityHistory(accountId, Math.min(hours, 24 * 7))
+  const points = history.data?.points ?? []
+  const rows = useMemo(() => qualityChartRows(points), [points])
+  const latest = points[points.length - 1]
+  const hasTtft = points.some((point) => point.ttftEwmaMs != null)
+  const timeTick = (value: string | number) => {
+    const text = String(value)
+    return text.length > 5 ? text.slice(-5) : text
+  }
+  return (
+    <SectionCard
+      title={`质量分趋势 · 账号 #${accountId}`}
+      description="调度器被动采样的 EWMA 快照（每账号每分钟最多一个点，保留 7 天）；错误率越高、首字越慢，相对同批候选越容易进入观察期。"
+      icon={<Activity />}
+    >
+      {history.isLoading && !history.data ? (
+        <LoadingState text="加载质量分历史..." className="py-6" />
+      ) : history.isError ? (
+        <div className="text-xs text-destructive">读取失败：{extractErrorMessage(history.error)}</div>
+      ) : points.length === 0 ? (
+        <EmptyState title="窗口内没有质量采样" description="质量感知调度关闭或该账号在窗口内没有流量时不会有采样。" />
+      ) : (
+        <>
+          <div className="mb-3 grid gap-3 sm:grid-cols-3">
+            <Metric label="最新失败率 EWMA" value={formatPercent(latest?.recentErrorRate ?? 0)} tone={(latest?.recentErrorRate ?? 0) > 0.05 ? 'bad' : 'good'} />
+            <Metric label="最新首字 EWMA" value={formatMs(latest?.ttftEwmaMs)} />
+            <Metric label="最新耗时 EWMA" value={formatMs(latest?.latencyEwmaMs)} />
+          </div>
+          <div className="grid gap-4 xl:grid-cols-2">
+            <div>
+              <div className="mb-1 text-xs text-muted-foreground">失败率 EWMA</div>
+              <TrendAreaChart
+                data={rows}
+                xKey="label"
+                height={200}
+                series={[{ key: 'errorRate', name: '失败率 EWMA' }]}
+                xTickFormatter={timeTick}
+                valueFormatter={(value) => formatPercent(Number(value))}
+              />
+            </div>
+            <div>
+              <div className="mb-1 text-xs text-muted-foreground">{hasTtft ? '首字 / 耗时 EWMA（毫秒）' : '耗时 EWMA（毫秒，该账号没有流式首字采样）'}</div>
+              <TrendAreaChart
+                data={rows}
+                xKey="label"
+                height={200}
+                series={hasTtft
+                  ? [{ key: 'ttft', name: '首字 EWMA' }, { key: 'latency', name: '耗时 EWMA' }]
+                  : [{ key: 'latency', name: '耗时 EWMA' }]}
+                xTickFormatter={timeTick}
+                valueFormatter={(value) => formatMs(Number(value))}
+              />
+            </div>
+          </div>
+        </>
+      )}
+    </SectionCard>
   )
 }

@@ -31,7 +31,7 @@ Switch,
 Tooltip,
 } from '@/components/ui'
 import { useRoutes } from '@/hooks/use-routes'
-import { formatDate } from '@/lib/format'
+import { formatDate, formatNumber } from '@/lib/format'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
@@ -250,7 +250,7 @@ function RequestApiKeyDialog({
             <div className="flex items-center justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold">用量限额</div>
-                <div className="text-xs text-muted-foreground">按计费金额、积分或 Token 限制，达到后返回 429，到期后自动恢复。</div>
+                <div className="text-xs text-muted-foreground">按计费金额、账号成本或 Token 限制，达到后返回 429，到期后自动恢复。</div>
               </div>
               <Button type="button" variant="outline" size="xs" disabled={saving || !nextDraft(limitDrafts)} onClick={addLimit}>
                 <Plus className="h-3.5 w-3.5" />添加限额
@@ -297,7 +297,7 @@ function RequestApiKeyDialog({
             )}
             {parsedLimits.error && <p className="text-xs text-destructive">{parsedLimits.error}</p>}
             <p className="text-xs leading-5 text-muted-foreground">
-              计费金额取用量记录里的计费金额，积分取本地账号消耗的积分，Token 为输入、输出和缓存读写之和。每天、每月按北京时间零点重置。
+              计费金额取用量记录里的估算计费，账号成本取上游原始成本乘以账号倍率，Token 为输入、输出和缓存读写之和。每天、每月按北京时间零点重置。
               用量在请求结束后计入，并发请求可能让用量略超上限；计数服务不可用时，设置了限额的 Key 会被拒绝。
             </p>
           </div>
@@ -480,6 +480,14 @@ function RequestKeysSection({
                   <span className="px-2 py-1">队列 {admission.maxQueuedRequests || 0}</span>
                   {item.usageLimits.length > 0 && (
                     <span className="rounded border border-primary/30 bg-primary/5 px-2 py-1 text-primary">限额 {item.usageLimits.length} 项</span>
+                  )}
+                  {(usageByKey.get(item.id)?.rejectedRequests24h ?? 0) > 0 && (
+                    <span
+                      className="rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-destructive"
+                      title="最近 24 小时被准入拒绝（限额、并发等）的请求数"
+                    >
+                      24h 拒绝 {formatNumber(usageByKey.get(item.id)?.rejectedRequests24h ?? 0)} 次
+                    </span>
                   )}
                 </div>
                 <div className="flex flex-wrap justify-start gap-1.5 md:justify-end">

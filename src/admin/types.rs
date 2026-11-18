@@ -280,6 +280,9 @@ pub struct RequestKeyUsageLimitItem {
     pub key_id: String,
     pub enabled: bool,
     pub statuses: Vec<crate::anthropic::request_key_limits::KeyLimitStatus>,
+    /// 最近 24 小时该 Key 被准入拒绝（限额、并发等）的请求数，来自汇总表。
+    #[serde(default)]
+    pub rejected_requests_24h: u64,
     /// Set when the counters could not be read (requests for this key are then rejected).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -291,6 +294,26 @@ pub struct RequestKeyUsageLimitsResponse {
     /// Day and month windows reset at midnight in this timezone.
     pub timezone: String,
     pub items: Vec<RequestKeyUsageLimitItem>,
+}
+
+/// 账号质量分历史的一个点：Redis EWMA 在该时刻的快照。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQualityHistoryPoint {
+    pub sampled_at: String,
+    pub recent_error_rate: f64,
+    pub ttft_ewma_ms: Option<f64>,
+    pub latency_ewma_ms: Option<f64>,
+    pub sample_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQualityHistoryResponse {
+    pub account_id: u64,
+    pub hours: u32,
+    pub since: String,
+    pub points: Vec<AccountQualityHistoryPoint>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

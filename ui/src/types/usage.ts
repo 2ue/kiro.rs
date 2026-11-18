@@ -330,7 +330,11 @@ export interface UsageOverviewMetrics {
 
 export interface UsageOverviewSeriesMetrics {
   requests: number;
+  /** 成功请求数 */
+  successRequests: number;
   errorRequests: number;
+  /** 平均总耗时（毫秒），没有请求时为 0 */
+  averageDurationMs: number;
   inputTokens: number;
   uncachedInputTokens: number;
   outputTokens: number;
@@ -384,6 +388,16 @@ export interface UsageOverviewPoolRow {
   profitUsd: number;
   costFloorDeltaUsd: number;
   costFloorAppliedRequests: number;
+  /** 账号成本：上游原始成本 × 账号倍率 */
+  accountCostUsd: number;
+  /** 落到该账号的全部尝试次数（含中途失败被切走的） */
+  attemptRequests: number;
+  /** 失败的尝试次数 */
+  attemptErrorRequests: number;
+  /** 失败尝试 ÷ 全部尝试 */
+  attemptErrorRate: number;
+  /** 尝试口径平均耗时（毫秒） */
+  attemptAverageDurationMs: number;
 }
 
 export interface UsageOverviewRankRow {
@@ -392,6 +406,38 @@ export interface UsageOverviewRankRow {
   requests: number;
   errorRequests: number;
   estimatedCostUsd: number;
+  successRequests: number;
+  /** 缓存命中率 = 缓存读 ÷（未缓存输入 + 缓存读 + 缓存写） */
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  uncachedInputTokens: number;
+  /** 原始计费：按上游原始 usage 计价 */
+  originalCostUsd: number;
+  /** 账号成本：上游原始成本 × 各账号成本倍率；旧版本后端不返回 */
+  accountCostUsd?: number;
+  averageDurationMs: number;
+}
+
+/** 一个账号在范围内的总耗时与首字延迟分位数（扫明细，范围最长 8 天） */
+export interface UsageAccountLatencyRow {
+  accountId: number;
+  accountName: string;
+  samples: number;
+  p50DurationMs: number;
+  p95DurationMs: number;
+  p99DurationMs: number;
+  /** 有首字延迟的请求数（只有流式请求记录首字） */
+  firstTokenSamples: number;
+  p50FirstTokenLatencyMs?: number | null;
+  p95FirstTokenLatencyMs?: number | null;
+  p99FirstTokenLatencyMs?: number | null;
+}
+
+export interface UsageAccountLatencyResponse {
+  generatedAt: string;
+  timezone: string;
+  range: UsageOverviewResponse["range"];
+  accounts: UsageAccountLatencyRow[];
 }
 
 export interface UsageOverviewResponse {

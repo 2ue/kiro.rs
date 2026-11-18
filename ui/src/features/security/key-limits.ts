@@ -3,7 +3,8 @@ import type { KeyLimitMetric, KeyLimitPeriod, KeyLimitStatus, KeyUsageLimit } fr
 
 export const METRIC_OPTIONS: { value: KeyLimitMetric; label: string; unit: string }[] = [
   { value: 'cost_usd', label: '计费金额', unit: 'USD' },
-  { value: 'credits', label: '积分', unit: '积分' },
+  // `credits` 是历史叫法：claude-pool 按账号成本（上游原始成本 × 账号倍率）计数。
+  { value: 'credits', label: '账号成本', unit: 'USD' },
   { value: 'tokens', label: 'Token', unit: 'Token' },
 ]
 
@@ -28,7 +29,7 @@ export function formatLimitValue(metric: KeyLimitMetric, value: number): string 
   if (!Number.isFinite(value)) return '-'
   const digits = metric === 'tokens' ? 0 : 6
   const text = new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: digits, useGrouping: true }).format(value)
-  return metric === 'cost_usd' ? `$${text}` : text
+  return metric === 'tokens' ? text : `$${text}`
 }
 
 /** Short label of one limit, e.g. "每天 计费金额 $5". */

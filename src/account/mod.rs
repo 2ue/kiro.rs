@@ -60,7 +60,7 @@ use crate::{
             UsageSource,
         },
     },
-    common::storage_task::spawn_critical_storage_task,
+    common::storage_task::{spawn_best_effort_storage_task, spawn_critical_storage_task},
     common::{
         capacity_signal::{CapacitySignal, CapacityWaiter},
         upstream_error::RawUpstreamError,
@@ -79,9 +79,10 @@ use crate::{
     model::model_support::{expand_claude_supported_model_variants, normalize_model_id},
     storage::{
         account_events::{
-            AccountEvent, AccountSource, account_disable_event, record_account_event,
+            AccountEvent, AccountEventKind, AccountEventThrottle, AccountSource,
+            account_disable_event, record_account_event,
         },
-        postgres::PostgresStore,
+        postgres::{AccountQualitySampleRow, PostgresStore},
         redis_cache::{
             AccountCoordinatorGuardError, AccountCoordinatorGuardState, AccountCoordinatorSnapshot,
             AccountCoordinatorSnapshotRequest,
@@ -3596,6 +3597,10 @@ pub struct AccountManager {
     success_reset_recent: Arc<SyncMutex<HashMap<u64, Instant>>>,
     success_reset_semaphore: Arc<Semaphore>,
     quality_sample_semaphore: Arc<Semaphore>,
+    /// 冷却 / 观察期落审计的节流：同一账号同一原因 60 秒内只记一次。
+    account_event_throttle: Arc<AccountEventThrottle>,
+    /// 质量采样快照落库的节流：每账号每 60 秒最多一行。
+    quality_history_throttle: Arc<AccountEventThrottle>,
     #[cfg(test)]
     success_reset_tasks_started: Arc<AtomicU64>,
     #[cfg(test)]
@@ -4916,6 +4921,8 @@ impl AccountManager {
             success_reset_recent: Arc::new(SyncMutex::new(HashMap::new())),
             success_reset_semaphore: Arc::new(Semaphore::new(ACCOUNT_SUCCESS_RESET_MAX_TASKS)),
             quality_sample_semaphore: Arc::new(Semaphore::new(ACCOUNT_QUALITY_SAMPLE_MAX_TASKS)),
+            account_event_throttle: Arc::new(AccountEventThrottle::default()),
+            quality_history_throttle: Arc::new(AccountEventThrottle::default()),
             #[cfg(test)]
             success_reset_tasks_started: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -7346,7 +7353,9 @@ impl AccountManager {
         })
     }
 
-    fn client_for_pool(
+    /// 账号转发使用的 HTTP 客户端：按账号的 wire/TLS profile 与代理（账号级优先，否则全局
+    /// `transport_proxy_*`）选择或构建。管理端的模型发现与账号测试也走这里，保证和真实转发一致。
+    pub(crate) fn client_for_pool(
         &self,
         pool: &Account,
         config: &AccountsConfig,
@@ -9487,7 +9496,9 @@ impl AccountManager {
         )
         .await
         {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                self.record_cooldown_event(pool_id, &reason, duration, None);
+            }
             Ok(Err(err)) => tracing::warn!(pool_id, "写入账号 Redis cooldown 失败: {}", err),
             Err(_) => tracing::warn!(
                 pool_id,
@@ -9497,6 +9508,52 @@ impl AccountManager {
         }
         self.invalidate_account_runtime_capacity_state();
         self.capacity_signal.notify_state_changed();
+    }
+
+    /// 账号名：优先权威快照里的名字，拿不到就用 `#id`。只读缓存，不触发加载。
+    fn cached_pool_label(&self, pool_id: u64) -> String {
+        let snapshot = self.authoritative_pool_snapshot.lock();
+        snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.result.as_ref().ok())
+            .and_then(|pools| pools.iter().find(|pool| pool.id == pool_id))
+            .map(|pool| pool.name.clone())
+            .unwrap_or_else(|| format!("#{pool_id}"))
+    }
+
+    /// 冷却落账号异动审计（进入冷却）。冷却可能很频繁，同账号同原因 60 秒内只记一次。
+    fn record_cooldown_event(
+        &self,
+        pool_id: u64,
+        reason: &str,
+        duration: Duration,
+        models: Option<&[String]>,
+    ) {
+        if !self.account_event_throttle.should_record(pool_id, reason) {
+            return;
+        }
+        let mut detail = json!({
+            "reason": reason,
+            "durationSecs": duration.as_secs(),
+            "untilMs": (Utc::now() + chrono::Duration::from_std(duration).unwrap_or_default())
+                .timestamp_millis(),
+        });
+        if let Some(models) = models {
+            detail["models"] = json!(models);
+        }
+        record_account_event(
+            self.postgres.clone(),
+            "system-scheduler",
+            AccountEvent {
+                kind: AccountEventKind::CooldownStarted,
+                source: AccountSource::External,
+                account_id: pool_id,
+                account_label: self.cached_pool_label(pool_id),
+                reason: reason.to_string(),
+                reason_label: account_cooldown_reason_label(reason).to_string(),
+                detail,
+            },
+        );
     }
 
     async fn mark_pool_model_cooldowns(
@@ -9514,6 +9571,7 @@ impl AccountManager {
         // One deadline for the whole list: a request may name several models, and a slow Redis
         // must cost the failover at most one timeout, not one per model.
         let deadline = tokio::time::Instant::now() + ACCOUNT_COOLDOWN_REDIS_TIMEOUT;
+        let mut written = Vec::with_capacity(models.len());
         for model in models {
             let key = account_model_cooldown_key(pool_id, model);
             match tokio::time::timeout_at(
@@ -9530,7 +9588,7 @@ impl AccountManager {
             )
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => written.push(model.clone()),
                 Ok(Err(err)) => tracing::warn!(
                     pool_id,
                     model = %model,
@@ -9547,6 +9605,9 @@ impl AccountManager {
                     break;
                 }
             }
+        }
+        if !written.is_empty() {
+            self.record_cooldown_event(pool_id, &reason, duration, Some(&written));
         }
         self.invalidate_account_runtime_capacity_state();
         self.capacity_signal.notify_state_changed();
@@ -10016,6 +10077,8 @@ impl AccountManager {
             return;
         };
         let redis = self.redis.clone();
+        let postgres = self.postgres.clone();
+        let history_throttle = self.quality_history_throttle.clone();
         let alpha = config.quality_ewma_alpha;
         let ttl = Duration::from_secs(config.quality_sample_ttl_secs.max(1));
         let degrade_window = Duration::from_secs(config.degrade_window_secs.max(1));
@@ -10037,7 +10100,23 @@ impl AccountManager {
             )
             .await;
             match result {
-                Ok(Ok(_quality)) => {}
+                Ok(Ok(quality)) => {
+                    // 质量分历史：每账号每 60 秒落一行 EWMA 快照，风控页画趋势用。
+                    // 写入走尽力而为队列，失败只记日志。
+                    if history_throttle.should_record(pool_id, "") {
+                        let sample = AccountQualitySampleRow {
+                            account_id: pool_id,
+                            sampled_at: Utc::now(),
+                            recent_error_rate: quality.recent_error_rate,
+                            ttft_ewma_ms: quality.ttft_ewma_ms,
+                            latency_ewma_ms: quality.latency_ewma_ms,
+                            sample_count: quality.sample_count,
+                        };
+                        spawn_best_effort_storage_task("记录账号质量采样快照", async move {
+                            postgres.record_account_quality_sample(&sample).await
+                        });
+                    }
+                }
                 Ok(Err(err)) => {
                     tracing::debug!(
                         pool_id,
@@ -10105,6 +10184,9 @@ impl AccountManager {
             };
             let redis = self.redis.clone();
             let pool_id = candidate.pool.id;
+            let pool_name = candidate.pool.name.clone();
+            let postgres = self.postgres.clone();
+            let event_throttle = self.account_event_throttle.clone();
             tokio::spawn(async move {
                 let _task_permit = task_permit;
                 let marked = timeout(
@@ -10119,7 +10201,29 @@ impl AccountManager {
                 )
                 .await;
                 match marked {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        // 观察期落账号异动审计；同账号 60 秒内只记一次。
+                        if event_throttle.should_record(pool_id, "relative_quality") {
+                            record_account_event(
+                                postgres,
+                                "system-scheduler",
+                                AccountEvent {
+                                    kind: AccountEventKind::ProbationStarted,
+                                    source: AccountSource::External,
+                                    account_id: pool_id,
+                                    account_label: pool_name,
+                                    reason: "relative_quality".to_string(),
+                                    reason_label: "相对质量劣化".to_string(),
+                                    detail: json!({
+                                        "level": level,
+                                        "untilMs": until_ms,
+                                        "ttlSecs": ttl_secs,
+                                        "resetLevel": reset_level,
+                                    }),
+                                },
+                            );
+                        }
+                    }
                     Ok(Err(err)) => tracing::debug!(
                         pool_id,
                         error = %err,
@@ -12277,6 +12381,23 @@ fn append_or_replace_query_pair(url: &mut Url, name: &str, value: &str) {
     }
 }
 
+/// 管理端探测（模型发现、账号测试）用的上游请求头：和真实转发一样按账号的
+/// `header_profile` / `auth_type` / `header_overrides` 构造，只是没有下游请求头可继承。
+pub(crate) fn account_probe_headers(pool: &Account) -> anyhow::Result<HeaderMap> {
+    let mut headers = forward_headers(&HeaderMap::new(), pool, false)
+        .map_err(|err| anyhow::anyhow!("{}", err.message))?;
+    if !headers.contains_key(header::ACCEPT) {
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+    }
+    if !headers.contains_key(header::CONTENT_TYPE) {
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    Ok(headers)
+}
+
 #[allow(clippy::result_large_err)]
 fn forward_headers(
     headers: &HeaderMap,
@@ -13176,14 +13297,15 @@ fn extract_session_id_from_metadata_user_id(user_id: &str) -> Option<String> {
 ///
 /// This is an allowlist: provider-specific headers (`server`, `cf-ray`, `x-amzn-*`, upstream
 /// request ids, organization ids, ...) would fingerprint the serving channel, so only the content
-/// headers needed to read the body and the standard Anthropic retry / rate-limit headers pass.
-/// Request ids are always replaced with this proxy's own ids afterwards.
+/// headers needed to read the body and the standard retry hint pass. Upstream
+/// `anthropic-ratelimit-*` headers describe the account's own quota, not this gateway's, so they
+/// are dropped as well. Request ids are always replaced with this proxy's own ids afterwards.
 fn should_forward_response_header(name: &HeaderName) -> bool {
     let lower = name.as_str().to_ascii_lowercase();
     matches!(
         lower.as_str(),
         "content-type" | "content-encoding" | "cache-control" | "retry-after" | "x-should-retry"
-    ) || lower.starts_with("anthropic-ratelimit-")
+    )
 }
 
 fn success_response_headers_look_like_html(headers: &HeaderMap) -> bool {
@@ -13749,6 +13871,21 @@ fn external_error_affects_pool_quality(err: &AccountError) -> bool {
 
 fn should_mark_account_hard_cooldown(reason: &str) -> bool {
     matches!(reason, "misconfigured_endpoint")
+}
+
+/// 冷却原因的控制台文案；未知原因原样显示。
+fn account_cooldown_reason_label(reason: &str) -> &str {
+    match reason {
+        "rate_limit" | "rate_limited" => "上游限流",
+        "overloaded" => "上游过载",
+        "upstream_timeout" => "上游超时",
+        "model_unavailable" => "模型不可用",
+        "misconfigured_endpoint" => "端点配置错误",
+        "quota_exhausted" => "额度耗尽",
+        "auth_error" => "鉴权失败",
+        "server_error" => "上游服务错误",
+        other => other,
+    }
 }
 
 fn classify_external_error(

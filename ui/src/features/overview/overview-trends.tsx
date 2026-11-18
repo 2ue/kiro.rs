@@ -18,6 +18,7 @@ import {
   sumCacheTokens,
   type CacheTokenMetrics,
 } from './cache-hit-rate'
+import { averagePerMinute, perMinute, weightedAverageDuration } from './overview-metrics'
 import { cn } from '@/lib/utils'
 import { EmptyState, LoadingState, SectionCard } from '@/components/patterns'
 import {
@@ -48,7 +49,7 @@ const INK_COLOR = 'var(--trend-line)'
 const SURFACE = 'hsl(var(--card))'
 const MAX_STACK_MEMBERS = 5
 
-type ValueFormat = 'count' | 'usd' | 'percent'
+type ValueFormat = 'count' | 'usd' | 'percent' | 'ms'
 
 type TrendSeries = {
   key: string
@@ -95,12 +96,14 @@ function formatValue(value: number, format: ValueFormat): string {
   if (!Number.isFinite(value)) return '-'
   if (format === 'usd') return formatUsdFixed2(value)
   if (format === 'percent') return formatPercent(value)
+  if (format === 'ms') return `${formatNumber(Math.round(value))} ms`
   return formatNumber(value)
 }
 
 function formatAxisValue(value: number, format: ValueFormat): string {
   if (format === 'usd') return `$${formatCompact(value)}`
   if (format === 'percent') return `${Math.round(value * 100)}%`
+  if (format === 'ms') return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`
   return formatCompact(value)
 }
 
@@ -111,6 +114,7 @@ function formatSummaryValue(value: number | null, format: ValueFormat): string {
   if (format === 'count') return formatCompact(value)
   return formatValue(value, format)
 }
+
 
 function sumOver(points: UsageOverviewSeriesPoint[], value: (point: UsageOverviewSeriesPoint) => number | null): number {
   return points.reduce((sum, point) => sum + (value(point) ?? 0), 0)
@@ -188,23 +192,44 @@ function hitRateLines(
   }))
 }
 
-/** 汇总分区：整体请求、对外计费、Token、缓存命中率。 */
-export function summaryTrendViews(): TrendView[] {
+/** 汇总分区：整体请求、对外计费、Token、缓存命中率、耗时；小时粒度再加 RPM / TPM。 */
+export function summaryTrendViews(options: { hourly?: boolean } = {}): TrendView[] {
   const errorRow: TrendExtraRow = { label: '错误率', value: (point) => errorRate(point.all) }
-  return [
+  const views: TrendView[] = [
     {
       key: 'requests',
       label: '请求',
       format: 'count',
-      bars: [{ key: 'requests', name: '请求', color: SLOT_COLORS[0], value: (point) => point.all.requests }],
+      bars: [
+        { key: 'success', name: '成功', color: SLOT_COLORS[2], value: (point) => point.all.successRequests ?? 0 },
+        { key: 'errors', name: '错误', color: SLOT_COLORS[3], value: (point) => point.all.errorRequests },
+      ],
       lines: [{
-        key: 'errors',
-        name: '错误',
-        color: SLOT_COLORS[3],
-        value: (point) => point.all.errorRequests,
-        aggregate: (points) => sumOver(points, (point) => point.all.errorRequests),
+        key: 'requests',
+        name: '请求合计',
+        color: INK_COLOR,
+        reference: true,
+        value: (point) => point.all.requests,
+        aggregate: (points) => sumOver(points, (point) => point.all.requests),
       }],
       extraRows: [errorRow],
+      headline: { label: '请求合计', value: (points) => sumOver(points, (point) => point.all.requests) },
+      footnote: '柱子按成功 / 错误堆叠，虚线是请求合计（含状态未知的请求时会高于两者之和）。',
+    },
+    {
+      key: 'duration',
+      label: '耗时',
+      format: 'ms',
+      bars: [],
+      lines: [{
+        key: 'avgDuration',
+        name: '平均耗时',
+        color: SLOT_COLORS[1],
+        value: (point) => (point.all.requests > 0 ? point.all.averageDurationMs ?? 0 : null),
+        aggregate: (points) => weightedAverageDuration(points, (point) => point.all),
+      }],
+      headline: { label: '平均耗时', value: (points) => weightedAverageDuration(points, (point) => point.all) },
+      footnote: '每个时段内请求的平均总耗时（从收到请求到响应结束），汇总按请求数加权。',
     },
     {
       key: 'revenue',
@@ -247,6 +272,47 @@ export function summaryTrendViews(): TrendView[] {
       footnote: HIT_RATE_FOOTNOTE,
     },
   ]
+  if (options.hourly) {
+    views.push(
+      {
+        key: 'rpm',
+        label: 'RPM',
+        format: 'count',
+        bars: [],
+        lines: [{
+          key: 'rpm',
+          name: '每分钟请求',
+          color: SLOT_COLORS[0],
+          value: (point) => perMinute(point.all.requests),
+          aggregate: (points) => averagePerMinute(points, (point) => point.all.requests),
+        }],
+        headline: {
+          label: '平均 RPM',
+          value: (points) => averagePerMinute(points, (point) => point.all.requests),
+        },
+        footnote: '每个小时桶的请求数 ÷ 60，是该小时的平均每分钟请求；进行中的小时偏低，折线在那里断开。',
+      },
+      {
+        key: 'tpm',
+        label: 'TPM',
+        format: 'count',
+        bars: [],
+        lines: [{
+          key: 'tpm',
+          name: '每分钟 Token',
+          color: SLOT_COLORS[4],
+          value: (point) => perMinute(point.all.inputTokens + point.all.outputTokens),
+          aggregate: (points) => averagePerMinute(points, (point) => point.all.inputTokens + point.all.outputTokens),
+        }],
+        headline: {
+          label: '平均 TPM',
+          value: (points) => averagePerMinute(points, (point) => point.all.inputTokens + point.all.outputTokens),
+        },
+        footnote: '每个小时桶的（输入 + 输出）token ÷ 60；缓存读写不计入。',
+      },
+    )
+  }
+  return views
 }
 
 /** 账号分区：按账号堆叠的上游成本、毛利、请求与命中率。 */

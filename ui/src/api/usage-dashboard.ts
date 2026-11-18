@@ -3,6 +3,7 @@ import type {
 AccountEventSummaryResponse,
 AdminAuditLogPage,
 AdminAuditLogPageQuery,
+UsageAccountLatencyResponse,
 UsageAccountRiskQuery,
 UsageAccountRiskResponse,
 UsageCleanupPreviewResponse,
@@ -149,6 +150,22 @@ export async function getUsageDashboardAccountBilling(
 ): Promise<UsageDashboardAccountBillingResponse> {
   const { data } = await api.get<UsageDashboardAccountBillingResponse>('/usage-dashboard/account-billing', {
     params: { timezone, windowKey },
+  })
+  return data
+}
+
+export type UsageAccountLatencyQuery = {
+  timezone?: string
+  range?: string
+  from?: string
+  to?: string
+  accountId?: number
+}
+
+/** 按账号的总耗时 / 首字延迟 p50 / p95 / p99；扫明细，范围最长 8 天。 */
+export async function getUsageAccountLatency(params: UsageAccountLatencyQuery = {}): Promise<UsageAccountLatencyResponse> {
+  const { data } = await api.get<UsageAccountLatencyResponse>('/usage-dashboard/account-latency', {
+    params: { timezone: 'Asia/Shanghai', range: 'today', ...params },
   })
   return data
 }

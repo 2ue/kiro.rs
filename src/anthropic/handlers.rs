@@ -670,9 +670,10 @@ pub async fn count_tokens_cc(
 
 fn multimodal_preprocessing_error_response(message: String) -> Response {
     if body_processing::is_remote_multimodal_capacity_error(&message) {
+        // 过载对外统一 529 overloaded_error；api_error 只留给真正的上游 5xx/未知错误。
         let mut response = envelope::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "api_error",
+            StatusCode::from_u16(529).unwrap(),
+            "overloaded_error",
             "Remote media processing is temporarily at capacity. Retry shortly.",
         );
         response.headers_mut().insert(

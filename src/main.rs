@@ -473,6 +473,11 @@ async fn async_main() {
             },
         )
     };
+    // 账号质量采样快照是派生数据，固定保留 7 天，不受用量保留开关控制。
+    let quality_sample_retention_task =
+        storage::account_events::spawn_account_quality_sample_retention_worker(
+            postgres_store.clone(),
+        );
     let startup_pricing_sync_task = {
         let postgres_store = postgres_store.clone();
         let pricing_catalog = pricing_catalog.clone();
@@ -607,6 +612,10 @@ async fn async_main() {
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
         abort_task_with_timeout("audit log retention", audit_retention_task),
         abort_task_with_timeout("usage record retention", usage_retention_task),
+        abort_task_with_timeout(
+            "account quality sample retention",
+            quality_sample_retention_task
+        ),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 

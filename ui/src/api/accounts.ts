@@ -1,5 +1,6 @@
 import type {
   Account,
+  AccountQualityHistoryResponse,
   AccountsListResponse,
   AccountsStatusResponse,
   AccountTestRequest,
@@ -136,4 +137,16 @@ export async function promoteAccountModels(
   id: number,
 ): Promise<SupportedModelsResponse> {
   return (await api.post(`/accounts/${id}/models/promote`)).data;
+}
+
+/** 账号质量分历史（错误率 / 首字 / 耗时 EWMA 快照），最近 `hours` 小时，按时间升序。 */
+export async function getAccountQualityHistory(
+  id: number,
+  hours = 24,
+): Promise<AccountQualityHistoryResponse> {
+  const { data } = await api.get<AccountQualityHistoryResponse>(
+    `/accounts/${id}/quality-history`,
+    { params: { hours } },
+  );
+  return data;
 }

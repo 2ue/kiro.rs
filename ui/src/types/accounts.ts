@@ -61,7 +61,9 @@ export type AccountEventKind =
   | "auto_enabled"
   | "manual_disabled"
   | "manual_enabled"
-  | "deleted";
+  | "deleted"
+  | "cooldown_started"
+  | "probation_started";
 
 export interface AccountEventSummaryRow {
   event: AccountEventKind | string;
@@ -74,6 +76,25 @@ export interface AccountEventSummaryResponse {
   since: string;
   accountSource?: string | null;
   items: AccountEventSummaryRow[];
+}
+
+/** 账号质量分历史的一个点：调度用的 EWMA 在该时刻的快照 */
+export interface AccountQualityHistoryPoint {
+  sampledAt: string;
+  /** 失败率 EWMA，0~1 */
+  recentErrorRate: number;
+  /** 首字延迟 EWMA（毫秒），只有流式请求有值 */
+  ttftEwmaMs?: number | null;
+  /** 总耗时 EWMA（毫秒） */
+  latencyEwmaMs?: number | null;
+  sampleCount: number;
+}
+
+export interface AccountQualityHistoryResponse {
+  accountId: number;
+  hours: number;
+  since: string;
+  points: AccountQualityHistoryPoint[];
 }
 
 export type AccountAuthType = "bearer" | "x_api_key";

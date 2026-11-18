@@ -780,3 +780,505 @@ fn runtime_config_normalizes_custom_routes_and_installs_defaults() {
         .push(crate::model::routes::RouteConfig::new("/dfcache/example"));
     assert!(normalize_and_validate_runtime_config(&mut config).is_err());
 }
+
+// ============ 批次 E：校验、脱敏与审计 ============
+
+#[test]
+fn proxy_password_update_keeps_secret_when_client_echoes_the_mask() {
+    let secret = "super-secret-proxy-pass".to_string();
+    let masked = masked_proxy_password(Some(&secret)).unwrap();
+
+    // 原样回传读接口给的脱敏值：保留原密码。
+    let mut current = Some(secret.clone());
+    apply_proxy_password_update(&mut current, Some(masked.clone()));
+    assert_eq!(current.as_deref(), Some(secret.as_str()));
+
+    // 真正改密码、清空密码照常生效。
+    apply_proxy_password_update(&mut current, Some("new-pass".to_string()));
+    assert_eq!(current.as_deref(), Some("new-pass"));
+    apply_proxy_password_update(&mut current, None);
+    assert_eq!(current, None);
+
+    // 没有旧密码时，提交什么就存什么（包括恰好长得像脱敏值的字符串）。
+    let mut empty = None;
+    apply_proxy_password_update(&mut empty, Some(masked.clone()));
+    assert_eq!(empty.as_deref(), Some(masked.as_str()));
+}
+
+#[test]
+fn runtime_config_masks_proxy_password_and_rejects_bad_proxy_urls() {
+    assert_eq!(masked_proxy_password(None), None);
+    assert_eq!(masked_proxy_password(Some("")), None);
+    let masked = masked_proxy_password(Some("super-secret-proxy-pass")).unwrap();
+    assert!(!masked.contains("secret"), "{masked}");
+    assert!(masked.contains("..."), "{masked}");
+
+    for valid in [
+        None,
+        Some("http://127.0.0.1:7890"),
+        Some("https://proxy.example:8443"),
+        Some("socks5://user:pass@10.0.0.1:1080"),
+        Some("socks5h://proxy.example:1080"),
+        Some("   "),
+    ] {
+        validate_proxy_url_field("proxyUrl", valid).expect("合法代理地址必须被接受");
+        let mut config = Config::default();
+        config.proxy_url = valid.map(str::to_string);
+        normalize_and_validate_runtime_config(&mut config).expect("全局代理校验必须放行合法地址");
+    }
+    for invalid in [
+        "127.0.0.1:7890",
+        "ftp://proxy.example",
+        "http://",
+        "not a url",
+    ] {
+        let err = validate_proxy_url_field("proxyUrl", Some(invalid)).unwrap_err();
+        assert!(err.to_string().contains("proxyUrl"), "{invalid}: {err}");
+        let mut config = Config::default();
+        config.proxy_url = Some(invalid.to_string());
+        assert!(
+            normalize_and_validate_runtime_config(&mut config).is_err(),
+            "全局代理 {invalid} 必须被拒绝"
+        );
+    }
+}
+
+#[test]
+fn account_request_validation_rejects_blank_key_and_out_of_range_concurrency() {
+    validate_account_api_key(None).expect("None 表示不改密钥");
+    validate_account_api_key(Some("sk-ok")).expect("非空密钥合法");
+    for blank in ["", "   ", "\t"] {
+        let err = validate_account_api_key(Some(blank)).unwrap_err();
+        assert!(matches!(err, AdminServiceError::InvalidRequest(_)));
+        assert!(err.to_string().contains("账号密钥不能为空"));
+    }
+    validate_account_max_concurrent_requests(None).unwrap();
+    validate_account_max_concurrent_requests(Some(1)).unwrap();
+    validate_account_max_concurrent_requests(Some(MAX_ACCOUNT_CONCURRENT_REQUESTS)).unwrap();
+    for invalid in [0, MAX_ACCOUNT_CONCURRENT_REQUESTS + 1, u32::MAX] {
+        let err = validate_account_max_concurrent_requests(Some(invalid)).unwrap_err();
+        assert!(matches!(err, AdminServiceError::InvalidRequest(_)));
+        assert!(err.to_string().contains("maxConcurrentRequests"), "{err}");
+    }
+}
+
+#[test]
+fn account_usage_projection_bounds_are_already_enforced() {
+    // 四个字段：三个 u32 已有 ≤200 上限，min_tokens 是 i32 已有 ≥0 下限；这里只确认不回退。
+    for config in [
+        AccountsConfig {
+            usage_projection_uplift_percent: 201,
+            ..AccountsConfig::default()
+        },
+        AccountsConfig {
+            usage_projection_output_uplift_percent: 201,
+            ..AccountsConfig::default()
+        },
+        AccountsConfig {
+            usage_projection_output_uplift_min_tokens: -1,
+            ..AccountsConfig::default()
+        },
+    ] {
+        assert!(validate_accounts_config(&config).is_err());
+    }
+}
+
+#[test]
+fn probe_account_keeps_saved_transport_settings_and_defaults_for_unsaved() {
+    let mut saved = crate::account::tests::test_pool("https://old.example/v1", true);
+    saved.proxy_url = Some("socks5://10.0.0.1:1080".into());
+    saved.header_profile = crate::account::AccountHeaderProfile::ClaudeCodeMimic;
+    saved.tls_profile = crate::account::AccountTlsProfile::NativeTls;
+    saved
+        .header_overrides
+        .insert("x-tenant".into(), "team".into());
+    let probe = probe_account(
+        Some(&saved),
+        "https://new.example/v1".into(),
+        "sk-new".into(),
+        AccountAuthType::XApiKey,
+    );
+    assert_eq!(probe.base_url, "https://new.example/v1");
+    assert_eq!(probe.api_key.as_deref(), Some("sk-new"));
+    assert_eq!(probe.auth_type, AccountAuthType::XApiKey);
+    assert_eq!(probe.proxy_url.as_deref(), Some("socks5://10.0.0.1:1080"));
+    assert_eq!(
+        probe.header_profile,
+        crate::account::AccountHeaderProfile::ClaudeCodeMimic
+    );
+    assert_eq!(
+        probe.tls_profile,
+        crate::account::AccountTlsProfile::NativeTls
+    );
+    assert_eq!(
+        probe.header_overrides.get("x-tenant").map(String::as_str),
+        Some("team")
+    );
+
+    let fresh = probe_account(
+        None,
+        "https://fresh.example".into(),
+        "sk-fresh".into(),
+        AccountAuthType::Bearer,
+    );
+    assert_eq!(fresh.id, 0);
+    assert_eq!(fresh.proxy_url, None);
+    assert_eq!(fresh.header_profile, Default::default());
+    assert_eq!(fresh.api_key.as_deref(), Some("sk-fresh"));
+}
+
+#[test]
+fn accounts_config_with_transport_proxy_copies_global_proxy_settings() {
+    let mut config = Config::default();
+    config.proxy_url = Some("http://127.0.0.1:7890".into());
+    config.proxy_username = Some("alice".into());
+    config.proxy_password = Some("secret".into());
+    let accounts = accounts_config_with_transport_proxy(&config);
+    assert_eq!(
+        accounts.transport_proxy_url.as_deref(),
+        Some("http://127.0.0.1:7890")
+    );
+    assert_eq!(accounts.transport_proxy_username.as_deref(), Some("alice"));
+    assert_eq!(accounts.transport_proxy_password.as_deref(), Some("secret"));
+}
+
+/// 处理器级审计测试：真实 PG/Redis，覆盖失败留痕、认证失败、采集与导出审计、模型提升审计。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_audit_records_failed_changes_auth_failures_capture_and_export() {
+    use crate::admin::middleware::AdminState;
+    use crate::storage::postgres::AdminAuditLogFilter;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let Some(postgres_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL")
+    else {
+        eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+        return;
+    };
+    let Some(redis_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL") else {
+        eprintln!("跳过 Redis 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
+        return;
+    };
+    let mut config = Config::default();
+    config.postgres.url = Some(postgres_url);
+    config.postgres.max_connections = 3;
+    config.redis.url = Some(redis_url);
+    config.redis.key_prefix = format!("claude_pool:test:admin_audit:{}", uuid::Uuid::new_v4());
+    let postgres = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+    let redis = Arc::new(
+        crate::storage::redis_cache::RedisStore::connect(&config)
+            .await
+            .unwrap(),
+    );
+    let runtime = crate::model::runtime::RuntimeConfigStore::new(Config::default(), None);
+    let request_admission = Arc::new(RequestAdmissionController::new(
+        RequestAdmissionConfig::disabled(),
+    ));
+    let service = AdminService::new(AdminServiceDependencies {
+        runtime: runtime.clone(),
+        usage_recorder: Arc::new(UsageRecorder::new(10)),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+        postgres_store: postgres.clone(),
+        observability_redis_store: None,
+        request_api_key_store: Arc::new(RequestApiKeyStore::new(["sk-primary-12345678"])),
+        request_admission,
+        account_manager: Arc::new(AccountManager::new(postgres.clone(), redis)),
+    });
+    let since = Utc::now() - ChronoDuration::seconds(5);
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+
+    // 准备：一条自定义路由和一个引用它的请求 Key，用于删路由检查（内置路由本来就不可删）。
+    let team_prefix = format!("/dfcache/team-{marker}");
+    runtime
+        .update(|config| {
+            config
+                .routes
+                .routes
+                .push(crate::model::routes::RouteConfig::new(team_prefix.clone()));
+            config.routes = config.routes.clone().assign_route_ids();
+            config.set_request_api_keys(["sk-primary-12345678", "sk-team-a-12345678"]);
+            config.set_request_api_key_policies(vec![RequestApiKeyPolicy {
+                api_key: "sk-team-a-12345678".into(),
+                name: format!("team-{marker}"),
+                enabled: true,
+                request_admission: None,
+                usage_limits: Vec::new(),
+                allowed_routes: vec![format!("{team_prefix}/")],
+            }]);
+        })
+        .unwrap();
+
+    // 失败变更：每一条都应落 success=false 的审计。
+    let create = CreateAccountRequest {
+        tags: Vec::new(),
+        proxy_url: None,
+        cost_multiplier: 1.0,
+        overrides: Default::default(),
+        name: format!("blank-key-{marker}"),
+        base_url: "https://example.com/v1".into(),
+        api_key: "   ".into(),
+        auth_type: AccountAuthType::Bearer,
+        header_profile: Default::default(),
+        append_beta_query: false,
+        header_overrides: Default::default(),
+        wire_profile: Default::default(),
+        tls_profile: Default::default(),
+        enabled: true,
+        priority: 100,
+        max_concurrent_requests: 5,
+        usage_projection_mode: Default::default(),
+        stream_response_mode: None,
+        auto_disable_policy: Default::default(),
+        pre_output_stream_retry_mode: Default::default(),
+        normalize_model_version_dots: false,
+        model_mapping_mode: Default::default(),
+        model_mapping_require_match: false,
+        model_mapping_rules: Vec::new(),
+        supported_models: Vec::new(),
+        route_mode: Default::default(),
+        route_rules: Vec::new(),
+        notes: None,
+    };
+    let err = service.create_account(create.clone()).unwrap_err();
+    assert!(err.to_string().contains("账号密钥不能为空"), "{err}");
+    let err = service
+        .create_account(CreateAccountRequest {
+            api_key: "sk-valid-key".into(),
+            max_concurrent_requests: 0,
+            ..create.clone()
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("maxConcurrentRequests"), "{err}");
+    let err = service
+        .create_account(CreateAccountRequest {
+            api_key: "sk-valid-key".into(),
+            proxy_url: Some("ftp://bad".into()),
+            ..create.clone()
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("proxyUrl"), "{err}");
+    assert!(
+        service
+            .update_account(
+                999_999_999,
+                UpdateAccountRequest {
+                    api_key: Some(String::new()),
+                    ..UpdateAccountRequest::default()
+                },
+            )
+            .is_err()
+    );
+    assert!(service.delete_account(999_999_999).is_err());
+    assert!(
+        service
+            .update_runtime_config(UpdateRuntimeConfigRequest {
+                proxy_url: Some(Some("not a url".into())),
+                ..serde_json::from_value(json!({})).unwrap()
+            })
+            .is_err()
+    );
+    assert!(
+        service
+            .update_admin_api_key(UpdateAdminApiKeyRequest {
+                admin_api_key: "short".into(),
+            })
+            .is_err()
+    );
+    assert!(
+        service
+            .create_request_api_key(
+                CreateRequestApiKeyRequest {
+                    api_key: Some("short".into()),
+                    ..serde_json::from_value(json!({})).unwrap()
+                },
+                "sk-admin",
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .update_request_api_key(
+                "missing-key-id",
+                serde_json::from_value(json!({ "name": "x" })).unwrap(),
+                "sk-admin",
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .delete_request_api_key("missing-key-id", "sk-admin")
+            .is_err()
+    );
+    let mut routes = runtime.config().routes;
+    routes.routes.retain(|route| route.prefix != team_prefix);
+    let err = service.update_routes(routes).unwrap_err();
+    assert!(err.to_string().contains(&format!("team-{marker}")), "{err}");
+    assert!(err.to_string().contains(&team_prefix), "{err}");
+
+    // 成功路径：创建账号 → 提升模型 → 删除，promote 要有审计。
+    let created = service
+        .create_account(CreateAccountRequest {
+            api_key: "sk-valid-key".into(),
+            supported_models: vec!["claude-sonnet-4-5".into()],
+            ..create
+        })
+        .expect("合法账号必须能创建");
+    service
+        .promote_account_models(created.id)
+        .await
+        .expect("提升模型");
+    service.delete_account(created.id).expect("删除测试账号");
+
+    // 处理器层：认证失败、采集未初始化、带密钥导出。
+    let state = AdminState::new("admin-secret-12345678", service);
+    let router = crate::admin::create_admin_router(state);
+    let source_ip = format!("203.0.113.{}", fastrand::u8(1..=254));
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/accounts")
+                .header("x-api-key", "wrong-key")
+                .header("x-forwarded-for", format!("{source_ip}, 10.0.0.1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/diagnostics/capture/start")
+                .header("x-api-key", "admin-secret-12345678")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/config/export?include_secrets=true")
+                .header("x-api-key", "admin-secret-12345678")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 审计是旁路异步写入，轮询等待落库。
+    let expected_failures = [
+        ("create_account", 3usize),
+        ("update_account", 1),
+        ("delete_account", 1),
+        ("update_runtime_config", 1),
+        ("update_admin_api_key", 1),
+        ("create_request_api_key", 1),
+        ("update_request_api_key", 1),
+        ("delete_request_api_key", 1),
+        ("update_routes", 1),
+        ("start_capture", 1),
+    ];
+    let query = |action: &str, success: Option<bool>, actor: Option<&str>| {
+        let filter = AdminAuditLogFilter {
+            action: Some(action.to_string()),
+            success,
+            actor: actor.map(str::to_string),
+            since: Some(since),
+            ..AdminAuditLogFilter::default()
+        };
+        let postgres = postgres.clone();
+        async move {
+            postgres
+                .query_admin_audit_logs_filtered(1, 200, &filter)
+                .await
+                .unwrap()
+                .records
+        }
+    };
+    for attempt in 0..100 {
+        let mut all_ready = true;
+        for (action, minimum) in expected_failures {
+            if query(action, Some(false), None).await.len() < minimum {
+                all_ready = false;
+                break;
+            }
+        }
+        if all_ready
+            && !query("promote_account_models", Some(true), None)
+                .await
+                .is_empty()
+            && !query("export_config", Some(true), None).await.is_empty()
+            && !query("admin_auth_failed", Some(false), Some("anonymous"))
+                .await
+                .is_empty()
+        {
+            break;
+        }
+        assert!(attempt < 99, "审计日志在 10 秒内没有全部落库");
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+
+    let rows = query("create_account", Some(false), None).await;
+    let failures: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.detail["name"] == json!(format!("blank-key-{marker}")))
+        .filter_map(|row| row.error_message.as_deref())
+        .collect();
+    for expected in ["账号密钥不能为空", "maxConcurrentRequests", "proxyUrl"] {
+        assert!(
+            failures.iter().any(|message| message.contains(expected)),
+            "创建失败审计缺少 {expected}: {failures:?}"
+        );
+    }
+    assert!(
+        rows.iter()
+            .all(|row| !row.detail.to_string().contains("sk-valid-key")),
+        "失败审计 detail 不能带密钥"
+    );
+    let routes_failure = query("update_routes", Some(false), None)
+        .await
+        .into_iter()
+        .find(|row| {
+            row.error_message
+                .as_deref()
+                .is_some_and(|message| message.contains(&format!("team-{marker}")))
+        })
+        .expect("删路由被 Key 引用阻止必须留痕");
+    assert!(
+        !routes_failure
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sk-team-a")
+    );
+    let promote = query("promote_account_models", Some(true), None).await;
+    assert!(promote.iter().any(
+        |row| row.object_id.as_deref() == Some(&created.id.to_string())
+            && row.object_type == "account"
+    ));
+    let export = query("export_config", Some(true), None).await;
+    assert!(
+        export
+            .iter()
+            .any(|row| row.object_type == "config" && row.detail["includeSecrets"] == json!(true))
+    );
+    let capture = query("start_capture", Some(false), None).await;
+    assert!(capture.iter().any(|row| row.object_type == "capture"));
+    let auth = query("admin_auth_failed", Some(false), Some("anonymous")).await;
+    let auth = auth
+        .iter()
+        .find(|row| row.detail["sourceIp"] == json!(source_ip))
+        .expect("认证失败审计必须带来源 IP");
+    assert_eq!(auth.detail["path"], json!("/accounts"));
+    assert_eq!(auth.object_type, "admin_auth");
+    assert!(!auth.detail.to_string().contains("wrong-key"));
+}

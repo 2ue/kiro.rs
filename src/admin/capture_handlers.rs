@@ -8,11 +8,13 @@
 use axum::{
     Json,
     body::Body,
-    extract::Path,
+    extract::{Path, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
+use serde_json::json;
 
+use super::middleware::AdminState;
 use super::types::AdminErrorResponse;
 use crate::diagnostics::capture::{self, CaptureError, CaptureLimits, CaptureManager};
 
@@ -49,41 +51,149 @@ pub async fn get_capture_overview() -> Response {
     }
 }
 
-pub async fn start_capture(payload: Option<Json<CaptureLimits>>) -> Response {
+/// 明文采集会落盘真实请求内容，启动/停止/下载都要留审计。
+fn audit_capture(
+    state: &AdminState,
+    action: &'static str,
+    session_id: Option<String>,
+    result: Result<(), String>,
+    detail: serde_json::Value,
+) {
+    let (success, error_message) = match result {
+        Ok(()) => (true, None),
+        Err(message) => (false, Some(message)),
+    };
+    state.service.audit(
+        action,
+        "capture",
+        session_id,
+        success,
+        error_message,
+        detail,
+    );
+}
+
+pub async fn start_capture(
+    State(state): State<AdminState>,
+    payload: Option<Json<CaptureLimits>>,
+) -> Response {
     let manager = match manager() {
         Some(manager) => manager,
-        None => return not_initialized(),
+        None => {
+            audit_capture(
+                &state,
+                "start_capture",
+                None,
+                Err("LLM capture is not initialized".to_string()),
+                json!({}),
+            );
+            return not_initialized();
+        }
     };
     let limits = payload.map(|Json(limits)| limits).unwrap_or_default();
+    let limits_detail = serde_json::to_value(limits).unwrap_or_else(|_| json!({}));
     match manager.start(limits) {
-        Ok(status) => Json(status).into_response(),
-        Err(error) => capture_error_response(error),
+        Ok(status) => {
+            audit_capture(
+                &state,
+                "start_capture",
+                status.session_id.clone(),
+                Ok(()),
+                json!({ "limits": limits_detail }),
+            );
+            Json(status).into_response()
+        }
+        Err(error) => {
+            audit_capture(
+                &state,
+                "start_capture",
+                None,
+                Err(error.to_string()),
+                json!({ "limits": limits_detail }),
+            );
+            capture_error_response(error)
+        }
     }
 }
 
-pub async fn stop_capture() -> Response {
+pub async fn stop_capture(State(state): State<AdminState>) -> Response {
     let manager = match manager() {
         Some(manager) => std::sync::Arc::clone(manager),
-        None => return not_initialized(),
+        None => {
+            audit_capture(
+                &state,
+                "stop_capture",
+                None,
+                Err("LLM capture is not initialized".to_string()),
+                json!({}),
+            );
+            return not_initialized();
+        }
     };
     // 停止需要等待写线程落盘并打包 ZIP，放到阻塞线程池。
     match tokio::task::spawn_blocking(move || manager.stop("admin_stop")).await {
-        Ok(Ok(status)) => Json(status).into_response(),
-        Ok(Err(error)) => capture_error_response(error),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AdminErrorResponse::internal_error(error.to_string())),
-        )
-            .into_response(),
+        Ok(Ok(status)) => {
+            audit_capture(
+                &state,
+                "stop_capture",
+                status.session_id.clone(),
+                Ok(()),
+                json!({ "reason": "admin_stop" }),
+            );
+            Json(status).into_response()
+        }
+        Ok(Err(error)) => {
+            audit_capture(
+                &state,
+                "stop_capture",
+                None,
+                Err(error.to_string()),
+                json!({}),
+            );
+            capture_error_response(error)
+        }
+        Err(error) => {
+            audit_capture(
+                &state,
+                "stop_capture",
+                None,
+                Err(error.to_string()),
+                json!({}),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminErrorResponse::internal_error(error.to_string())),
+            )
+                .into_response()
+        }
     }
 }
 
-pub async fn download_capture(Path(session_id): Path<String>) -> Response {
+pub async fn download_capture(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> Response {
     let manager = match manager() {
         Some(manager) => manager,
-        None => return not_initialized(),
+        None => {
+            audit_capture(
+                &state,
+                "download_capture",
+                Some(session_id),
+                Err("LLM capture is not initialized".to_string()),
+                json!({}),
+            );
+            return not_initialized();
+        }
     };
     let Some(path) = manager.archive_path(&session_id) else {
+        audit_capture(
+            &state,
+            "download_capture",
+            Some(session_id.clone()),
+            Err("capture archive not found".to_string()),
+            json!({}),
+        );
         return (
             StatusCode::NOT_FOUND,
             Json(AdminErrorResponse::not_found("capture archive not found")),
@@ -93,6 +203,13 @@ pub async fn download_capture(Path(session_id): Path<String>) -> Response {
     let file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(error) => {
+            audit_capture(
+                &state,
+                "download_capture",
+                Some(session_id.clone()),
+                Err(error.to_string()),
+                json!({}),
+            );
             return (
                 StatusCode::NOT_FOUND,
                 Json(AdminErrorResponse::not_found(error.to_string())),
@@ -101,6 +218,13 @@ pub async fn download_capture(Path(session_id): Path<String>) -> Response {
         }
     };
     let length = file.metadata().await.map(|meta| meta.len()).ok();
+    audit_capture(
+        &state,
+        "download_capture",
+        Some(session_id.clone()),
+        Ok(()),
+        json!({ "archiveBytes": length }),
+    );
     let stream = file_stream(file);
     let mut builder = Response::builder()
         .status(StatusCode::OK)

@@ -46,7 +46,8 @@ test('add-limit offers each metric + period pair once, then stops', () => {
 test('values format per metric', () => {
   assert.equal(formatLimitValue('cost_usd', 12.5), '$12.5')
   assert.equal(formatLimitValue('cost_usd', 0.000123), '$0.000123')
-  assert.equal(formatLimitValue('credits', 1234.5), '1,234.5')
+  // credits 槽位在 claude-pool 里是账号成本（USD），和计费金额一样带美元符号。
+  assert.equal(formatLimitValue('credits', 1234.5), '$1,234.5')
   assert.equal(formatLimitValue('tokens', 1500000), '1,500,000')
   assert.equal(formatLimitValue('tokens', Number.NaN), '-')
   assert.equal(limitSummary({ metric: 'cost_usd', period: 'daily', limit: 5 }), '每天 计费金额 $5')

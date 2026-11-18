@@ -829,6 +829,25 @@ fn thinking_trigger_real_request_uses_claude_code_ultrathink_signal() {
 }
 
 #[tokio::test]
+async fn multimodal_capacity_rejection_is_529_overloaded_like_every_other_overload() {
+    let response = multimodal_preprocessing_error_response(
+        body_processing::REMOTE_MULTIMODAL_CAPACITY_ERROR.to_string(),
+    );
+    assert_eq!(response.status().as_u16(), 529);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+    let body = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "overloaded_error");
+
+    // 其它预处理错误仍是 400 invalid_request_error。
+    let response =
+        multimodal_preprocessing_error_response("failed to fetch image URL source".to_string());
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn messages_without_external_manager_return_529() {
     {
         let state = AppState::new(
