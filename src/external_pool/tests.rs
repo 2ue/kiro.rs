@@ -21422,6 +21422,68 @@ async fn external_stream_client_closing_after_message_stop_records_success() {
     postgres.drop_test_schema().await.unwrap();
 }
 
+/// 有的 OpenAI 兼容上游每个分块都带 `"finish_reason": ""`。下游读到一半就断开时，
+/// 这仍是客户端中途断开，不能因为空的 finish_reason 被当成已经收到终止事件而按成功计费。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_stream_empty_finish_reason_drop_mid_stream_records_client_dropped() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let chunk = |content: &str| {
+        ExternalStreamFakeStep::chunk(format!(
+            "data: {{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}},\"finish_reason\":\"\"}}]}}\n\n"
+        ))
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        chunk("hello "),
+        chunk("from "),
+        ExternalStreamFakeStep::delay(Duration::from_secs(30)),
+    ])
+    .await;
+    create_messages_pool(&postgres, "empty-finish-reason", 1, &upstream.base_url).await;
+
+    let request_id = "req_empty_finish_reason_drop";
+    let (route, recorder) = external_stream_route(request_id, "err_empty_finish_reason_drop");
+    let mut config = external_stream_config_for_test();
+    config.external_pool_stream_idle_timeout_secs = 30;
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("stream response headers")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => panic!("unexpected error: {error:?}"),
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stream = response.into_body().into_data_stream();
+    let first = timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("first chunk")
+        .expect("stream must not end before the first chunk")
+        .expect("chunk ok");
+    assert!(String::from_utf8_lossy(&first).contains("\"finish_reason\":\"\""));
+    drop(stream);
+
+    let record = timeout(
+        Duration::from_secs(5),
+        wait_for_usage_record(&recorder, request_id),
+    )
+    .await
+    .expect("dropping the body mid-stream must settle the record promptly");
+    assert_eq!(
+        record.status,
+        UsageRecordStatus::ClientDropped,
+        "{record:?}"
+    );
+    assert_eq!(record.error_type.as_deref(), Some("client_dropped"));
+    assert_eq!(record.output_tokens, 0);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_commit_client_disconnect_stops_failover_and_records_client_dropped() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
