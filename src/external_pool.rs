@@ -10044,6 +10044,7 @@ impl ExternalPoolManager {
             downstream_chunks_forwarded: 0,
             downstream_bytes_forwarded: 0,
             estimated_output_tokens: 0,
+            terminal_event_forwarded: false,
             completed: false,
         };
         let stream = futures::stream::unfold(
@@ -10335,6 +10336,9 @@ struct ExternalStreamUsageGuard {
     downstream_chunks_forwarded: u64,
     downstream_bytes_forwarded: u64,
     estimated_output_tokens: i32,
+    /// 已经把终止事件（`message_stop`、带 `stop_reason` 的 `message_delta`、`[DONE]`）
+    /// 转发给下游。此后下游关连接是"读完即走"，不是中途断开。
+    terminal_event_forwarded: bool,
     completed: bool,
 }
 
@@ -10373,6 +10377,9 @@ impl ExternalStreamUsageGuard {
         self.downstream_bytes_forwarded = self
             .downstream_bytes_forwarded
             .saturating_add(chunk.len() as u64);
+        if !self.terminal_event_forwarded && external_stream_chunk_has_terminal_event(chunk) {
+            self.terminal_event_forwarded = true;
+        }
     }
 
     fn mark_first_token_if_output(&mut self, chunk: &Bytes) {
@@ -10860,8 +10867,79 @@ fn external_sse_data_has_first_output(value: &serde_json::Value) -> bool {
 
 impl Drop for ExternalStreamUsageGuard {
     fn drop(&mut self) {
+        // 下游已经收到终止事件后才关连接（例如 sub2api 读到 message_stop 就 Close，不等上游 EOF），
+        // 这次响应是完整的：按成功落账并保留 usage，只是比上游 EOF 早了一步。
+        if !self.completed && self.terminal_event_forwarded {
+            self.record_success();
+            return;
+        }
         self.record_client_dropped();
     }
+}
+
+/// 这段下游 chunk 里是否含有流的终止事件。按完整 SSE 事件切分后逐个判断，
+/// 识别 Anthropic 的 `message_stop`、带 `stop_reason` 的 `message_delta`，以及
+/// OpenAI 风格的 `data: [DONE]` / 非空 `finish_reason`。
+fn external_stream_chunk_has_terminal_event(chunk: &Bytes) -> bool {
+    let bytes = chunk.as_ref();
+    let mut offset = 0usize;
+    while let Some((idx, delimiter_len)) = find_sse_event_delimiter(&bytes[offset..]) {
+        let event_end = offset + idx + delimiter_len;
+        if external_sse_event_is_terminal(&bytes[offset..event_end]) {
+            return true;
+        }
+        offset = event_end;
+    }
+    false
+}
+
+fn external_sse_event_is_terminal(event: &[u8]) -> bool {
+    if external_sse_event_name(event).as_deref() == Some("message_stop") {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(event) else {
+        return false;
+    };
+    for line in text.split_inclusive('\n') {
+        let Some(data) = line.trim_end_matches(['\r', '\n']).strip_prefix("data:") else {
+            continue;
+        };
+        let data_json = data.trim();
+        if data_json.is_empty() {
+            continue;
+        }
+        if data_json == "[DONE]" {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data_json) else {
+            continue;
+        };
+        match value.get("type").and_then(|value| value.as_str()) {
+            Some("message_stop") => return true,
+            Some("message_delta")
+                if value
+                    .pointer("/delta/stop_reason")
+                    .is_some_and(|reason| !reason.is_null()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        if value
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .is_some_and(|value| !value.is_null())
+                })
+            })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn pool_auto_disable_policy_enabled(
@@ -16763,6 +16841,85 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
         .and_then(|value| value.as_i64())
         .unwrap_or(0)
         .clamp(0, i32::MAX as i64) as i32
+}
+
+#[cfg(test)]
+mod terminal_event_tests {
+    use super::*;
+
+    fn sse(name: &str, data: &str) -> Bytes {
+        Bytes::from(format!("event: {name}\ndata: {data}\n\n"))
+    }
+
+    #[test]
+    fn message_stop_and_stop_reason_delta_are_terminal() {
+        assert!(external_stream_chunk_has_terminal_event(&sse(
+            "message_stop",
+            r#"{"type":"message_stop"}"#
+        )));
+        assert!(external_stream_chunk_has_terminal_event(&sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#
+        )));
+        assert!(external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(b"data: [DONE]\n\n")
+        ));
+        assert!(external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(
+                b"data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"
+            )
+        ));
+    }
+
+    #[test]
+    fn content_events_and_null_stop_reason_are_not_terminal() {
+        for (name, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"m"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":1}}"#,
+            ),
+            ("ping", r#"{"type":"ping"}"#),
+        ] {
+            assert!(
+                !external_stream_chunk_has_terminal_event(&sse(name, data)),
+                "{name} must not count as terminal"
+            );
+        }
+        assert!(!external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(
+                b"data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"x\"}}]}\n\n"
+            )
+        ));
+    }
+
+    #[test]
+    fn terminal_event_is_found_inside_a_multi_event_chunk() {
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&sse(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ));
+        chunk.extend_from_slice(&sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+        ));
+        chunk.extend_from_slice(&sse("message_stop", r#"{"type":"message_stop"}"#));
+        assert!(external_stream_chunk_has_terminal_event(&Bytes::from(
+            chunk
+        )));
+        // 不完整的尾事件（没有空行分隔）不算。
+        assert!(!external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}")
+        ));
+    }
 }
 
 #[cfg(test)]

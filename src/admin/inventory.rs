@@ -29,9 +29,9 @@ use crate::kiro::token_manager::{
     KeepThenDeleteError, MultiTokenManager, RefreshFailure, RefreshFailureKind,
 };
 use crate::storage::credential_inventory::{
-    GroupFilter, InventoryListFilter, InventoryRow, InventoryStore, MAX_GROUP_NAME_CHARS,
-    MovedInventoryRow, NewInventoryRow, OriginFilter, RenewOutcome, STATUS_INVALID, STATUS_PUSHED,
-    STATUS_PUSHING, STATUS_STORED, UNGROUPED_FILTER,
+    GroupFilter, HeldMoveKeys, InventoryListFilter, InventoryRow, InventoryStore,
+    MAX_GROUP_NAME_CHARS, MovedInventoryRow, NewInventoryRow, OriginFilter, RenewOutcome,
+    STATUS_INVALID, STATUS_PUSHED, STATUS_PUSHING, STATUS_STORED, UNGROUPED_FILTER,
 };
 
 const MAX_IMPORT: usize = 500;
@@ -392,24 +392,20 @@ impl OriginSnapshot {
         Some(snapshot)
     }
 
-    /// Puts the account's own scheduling settings back on a push request. Push defaults only
-    /// fill what is still unset afterwards.
+    /// Puts the account's scheduling settings and tags back on a push request exactly as they
+    /// were in the pool, over the push defaults: priority 0 stays 0 and an RPM or concurrency
+    /// that followed the global setting keeps following it. Rows without a recorded snapshot
+    /// keep the push defaults.
     fn restore_settings(&self, request: &mut AddCredentialRequest) {
-        if self.priority > 0 {
-            request.priority = self.priority;
+        if self.moved_at.is_none() {
+            return;
         }
-        if self.fast > 0 {
-            request.fast = self.fast;
-        }
-        if self.rpm.is_some() {
-            request.rpm = self.rpm;
-        }
-        if self.max_concurrent_requests.is_some() {
-            request.max_concurrent_requests = self.max_concurrent_requests;
-        }
-        if request.supported_models.is_empty() && !self.supported_models.is_empty() {
-            request.supported_models = self.supported_models.clone();
-        }
+        request.priority = self.priority;
+        request.fast = self.fast;
+        request.rpm = self.rpm;
+        request.max_concurrent_requests = self.max_concurrent_requests;
+        request.supported_models = self.supported_models.clone();
+        request.tags = self.tags.clone();
     }
 }
 
@@ -611,6 +607,9 @@ pub struct MovePreviewReason {
     pub abnormal: usize,
     /// How many are moved with the current options.
     pub moving: usize,
+    /// Selected, but skipped: the inventory or an account earlier in the move already holds
+    /// the same account. They stay in the pool.
+    pub duplicates: usize,
     /// Selected by default: quota exhaustion, manual disabling and no reason. The others
     /// (rejected tokens, suspensions, failure streaks) are left to the operator.
     pub suggested: bool,
@@ -622,6 +621,8 @@ pub struct MoveToInventoryPreview {
     /// Disabled accounts in scope.
     pub disabled: usize,
     pub moving: usize,
+    /// Selected but skipped as the same account as one the inventory holds or moves first.
+    pub duplicates: usize,
     /// Left out: a reason not selected, or an account error.
     pub excluded: usize,
     /// Selected accounts that are not disabled; they are never moved.
@@ -1339,17 +1340,17 @@ impl AdminService {
                         AdminServiceError::InternalError(format!("转换库存账号失败: {e}"))
                     })?;
                 request.disabled = None;
+                let round_robin = rotation.get(index % rotation.len().max(1)).copied();
+                let mut request = super::service::apply_batch_import_defaults_public(
+                    request,
+                    &req.defaults,
+                    round_robin,
+                );
                 if req.restore_origin_settings
                     && let Some(origin) = OriginSnapshot::of_row(&row)
                 {
                     origin.restore_settings(&mut request);
                 }
-                let round_robin = rotation.get(index % rotation.len().max(1)).copied();
-                let request = super::service::apply_batch_import_defaults_public(
-                    request,
-                    &req.defaults,
-                    round_robin,
-                );
                 self.add_credential_for_inventory(request, req.auto_discover_supported_models)
                     .await
             }
@@ -1630,12 +1631,29 @@ impl AdminService {
         req: MoveToInventoryRequest,
     ) -> Result<MoveToInventoryPreview, AdminServiceError> {
         let (disabled, not_disabled) = self.move_candidates(&req.ids);
+        let store = self.inventory_store();
+        let mut held = super::service::block_on_admin_store_public(store.held_move_keys())
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let credentials: std::collections::HashMap<u64, KiroCredentials> = self
+            .inventory_token_manager()
+            .export_credentials()
+            .into_iter()
+            .filter_map(|credential| Some((credential.id?, credential)))
+            .collect();
+        let duplicates = move_duplicates(
+            disabled
+                .iter()
+                .filter(|item| is_moved(item, &req))
+                .filter_map(|item| credentials.get(&item.id)),
+            &mut held,
+        );
         let mut reasons: std::collections::HashMap<Option<String>, MovePreviewReason> =
             std::collections::HashMap::new();
         let mut moving = 0;
         for item in &disabled {
             let abnormal = is_abnormal(item);
-            let moved = is_moved(item, &req);
+            let duplicate = duplicates.contains(&item.id);
+            let moved = is_moved(item, &req) && !duplicate;
             let reason = item
                 .disabled_reason
                 .clone()
@@ -1648,10 +1666,12 @@ impl AdminService {
                     count: 0,
                     abnormal: 0,
                     moving: 0,
+                    duplicates: 0,
                 });
             entry.count += 1;
             entry.abnormal += usize::from(abnormal);
             entry.moving += usize::from(moved);
+            entry.duplicates += usize::from(duplicate);
             moving += usize::from(moved);
         }
         let mut reasons: Vec<MovePreviewReason> = reasons.into_values().collect();
@@ -1659,7 +1679,8 @@ impl AdminService {
         Ok(MoveToInventoryPreview {
             disabled: disabled.len(),
             moving,
-            excluded: disabled.len() - moving,
+            duplicates: duplicates.len(),
+            excluded: disabled.len() - moving - duplicates.len(),
             not_disabled,
             reasons,
             groups: self.inventory_group_names(),
@@ -1932,6 +1953,42 @@ const NO_REASON: &str = "__none__";
 /// Reasons selected by default; for every other reason the operator decides.
 fn reason_suggested(reason: Option<&str>) -> bool {
     matches!(reason, None | Some("QuotaExceeded") | Some("Manual"))
+}
+
+/// The accounts a move skips as duplicates, walking them in move order: the inventory still
+/// holds the same account (same secret, same login, or the row it was pushed from), or an
+/// account earlier in the same move is the same login. Mirrors the check in
+/// `move_one_to_inventory`, so a preview counts what the move will do.
+fn move_duplicates<'a>(
+    accounts: impl IntoIterator<Item = &'a KiroCredentials>,
+    held: &mut HeldMoveKeys,
+) -> HashSet<u64> {
+    let mut duplicates = HashSet::new();
+    for credential in accounts {
+        let Some(id) = credential.id else {
+            continue;
+        };
+        let (_, api_key_hash, refresh_token_hash) = secret_hashes(credential);
+        let identity = identity_key(credential);
+        let held_already = held.pushed_credential_ids.contains(&id)
+            || refresh_token_hash
+                .as_ref()
+                .is_some_and(|hash| held.refresh_token_hashes.contains(hash))
+            || api_key_hash
+                .as_ref()
+                .is_some_and(|hash| held.api_key_hashes.contains(hash))
+            || identity
+                .as_ref()
+                .is_some_and(|identity| held.identity_keys.contains(identity));
+        if held_already {
+            duplicates.insert(id);
+            continue;
+        }
+        held.refresh_token_hashes.extend(refresh_token_hash);
+        held.api_key_hashes.extend(api_key_hash);
+        held.identity_keys.extend(identity);
+    }
+    duplicates
 }
 
 /// Whether a disabled account is moved with these options.
@@ -2396,6 +2453,31 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_skips_the_duplicates_a_move_skips() {
+        let account = |id: u64, email: Option<&str>, refresh: &str| KiroCredentials {
+            id: Some(id),
+            ..credential(email, Some(refresh))
+        };
+        let held_account = account(1, Some("held@example.com"), "rt-held");
+        let mut held = HeldMoveKeys::default();
+        held.identity_keys.extend(identity_key(&held_account));
+        held.pushed_credential_ids.insert(7);
+        let (_, _, held_refresh) = secret_hashes(&account(99, None, "rt-same-secret"));
+        held.refresh_token_hashes.extend(held_refresh);
+
+        let accounts = [
+            account(2, Some("Held@Example.com"), "rt-2"), // same login as an inventory row
+            account(3, Some("a@example.com"), "rt-3"),
+            account(4, Some("a@example.com "), "rt-4"), // same login as #3, moved first
+            account(5, Some("b@example.com"), "rt-5"),
+            account(7, Some("c@example.com"), "rt-7"), // its inventory row is still held
+            account(8, None, "rt-same-secret"),        // same refresh token as an inventory row
+        ];
+        let duplicates = move_duplicates(accounts.iter(), &mut held);
+        assert_eq!(duplicates, HashSet::from([2, 4, 7, 8]));
+    }
+
+    #[test]
     fn identity_key_survives_refresh_token_rotation() {
         let before = credential(Some("User@Example.com"), Some("rt-1"));
         let after = credential(Some("user@example.com "), Some("rt-2"));
@@ -2625,6 +2707,8 @@ mod tests {
             rpm: Some(30),
             max_concurrent_requests: Some(4),
             supported_models: vec!["claude-sonnet-4-5".to_string()],
+            tags: vec!["vip".to_string()],
+            moved_at: Some(Utc::now()),
             ..OriginSnapshot::default()
         };
         let mut request: AddCredentialRequest =
@@ -2637,13 +2721,48 @@ mod tests {
             request.supported_models,
             vec!["claude-sonnet-4-5".to_string()]
         );
+        assert_eq!(request.tags, vec!["vip".to_string()]);
+    }
 
-        // Settings the account did not have stay unset, for the push defaults to fill.
-        let mut bare: AddCredentialRequest =
+    #[test]
+    fn a_restored_push_keeps_default_settings_over_the_push_defaults() {
+        // Priority 0, no fast level, RPM and concurrency following the global settings: what
+        // most pool accounts have. The push defaults must not replace them.
+        let origin = OriginSnapshot {
+            credential_id: 12,
+            moved_at: Some(Utc::now()),
+            ..OriginSnapshot::default()
+        };
+        let defaults: BatchCredentialImportDefaults = serde_json::from_value(json!({
+            "priority": 99,
+            "fast": 5,
+            "rpm": 50,
+            "maxConcurrentRequests": 2,
+            "supportedModels": ["claude-haiku-4-5"],
+            "tags": ["imported"],
+        }))
+        .unwrap();
+        let request: AddCredentialRequest =
             serde_json::from_value(json!({ "refreshToken": "rt" })).unwrap();
-        OriginSnapshot::default().restore_settings(&mut bare);
-        assert_eq!(bare.priority, 0);
-        assert_eq!(bare.rpm, None);
+        let mut request =
+            super::super::service::apply_batch_import_defaults_public(request, &defaults, None);
+        assert_eq!(request.priority, 99, "the defaults apply first");
+        origin.restore_settings(&mut request);
+        assert_eq!((request.priority, request.fast), (0, 0));
+        assert_eq!(request.rpm, None);
+        assert_eq!(request.max_concurrent_requests, None);
+        assert!(request.supported_models.is_empty());
+        assert!(request.tags.is_empty());
+
+        // A row without a recorded snapshot keeps the push defaults.
+        let mut bare = request.clone();
+        bare.priority = 99;
+        OriginSnapshot {
+            credential_id: 12,
+            ..OriginSnapshot::default()
+        }
+        .restore_settings(&mut bare);
+        assert_eq!(bare.priority, 99);
     }
 
     #[test]

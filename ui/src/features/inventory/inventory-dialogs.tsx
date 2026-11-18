@@ -333,7 +333,7 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
                 <Checkbox checked={restoreOrigin} onCheckedChange={(value) => setRestoreOrigin(value === true)} className="mt-0.5" />
                 <span>
                   恢复移入前的调度参数
-                  <span className="ml-1 text-xs text-muted-foreground">（{fromPool} 个账号是从账号池移入的：沿用它们原来的优先级、RPM、并发和模型列表，上面的默认值只补它们没有的项）</span>
+                  <span className="ml-1 text-xs text-muted-foreground">（{fromPool} 个账号是从账号池移入的：优先级、Fast、RPM、并发、模型列表和标签按移入前原样恢复，上面这几项默认值对它们不生效；不勾选则按上面的默认值推送）</span>
                 </span>
               </label>
             )}
