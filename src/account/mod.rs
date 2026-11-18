@@ -171,6 +171,10 @@ const ACCOUNT_AUTO_DISABLE_POSTGRES_TIMEOUT: Duration = Duration::from_millis(50
 const ACCOUNT_AUTO_DISABLE_TRANSITION_CLAIM_TTL_SECS: usize = 5;
 const ACCOUNT_SUCCESS_RESET_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const ACCOUNT_SUCCESS_RESET_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
+/// Cooldown markers are written on the failover path, between one account failing and the
+/// next being tried. They are a ranking hint, not a correctness requirement, so a slow Redis
+/// must not hold the request: give up after this and move on to the next account.
+const ACCOUNT_COOLDOWN_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
 /// 质量样本写入超时。质量数据是调度优化项，写入慢时直接放弃本次样本，
 /// 绝不允许拖住后台任务或影响主请求。
 const ACCOUNT_QUALITY_SAMPLE_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
@@ -9401,16 +9405,23 @@ impl AccountManager {
 
     async fn mark_pool_cooldown(&self, pool_id: u64, duration: Duration, reason: String) {
         let until = Utc::now() + chrono::Duration::from_std(duration).unwrap_or_default();
-        if let Err(err) = self
-            .redis
-            .set_json(
+        match timeout(
+            ACCOUNT_COOLDOWN_REDIS_TIMEOUT,
+            self.redis.set_json(
                 format!("account:{}:cooldown", pool_id),
                 &json!({ "until": until.to_rfc3339(), "reason": reason }),
                 duration.as_secs().max(1) as usize,
-            )
-            .await
+            ),
+        )
+        .await
         {
-            tracing::warn!(pool_id, "写入账号 Redis cooldown 失败: {}", err);
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(pool_id, "写入账号 Redis cooldown 失败: {}", err),
+            Err(_) => tracing::warn!(
+                pool_id,
+                timeout_ms = ACCOUNT_COOLDOWN_REDIS_TIMEOUT.as_millis(),
+                "写入账号 Redis cooldown 超时，继续换号"
+            ),
         }
         self.invalidate_account_runtime_capacity_state();
         self.capacity_signal.notify_state_changed();
@@ -9428,11 +9439,14 @@ impl AccountManager {
         }
         let until = Utc::now() + chrono::Duration::from_std(duration).unwrap_or_default();
         let ttl = duration.as_secs().max(1) as usize;
+        // One deadline for the whole list: a request may name several models, and a slow Redis
+        // must cost the failover at most one timeout, not one per model.
+        let deadline = tokio::time::Instant::now() + ACCOUNT_COOLDOWN_REDIS_TIMEOUT;
         for model in models {
             let key = account_model_cooldown_key(pool_id, model);
-            if let Err(err) = self
-                .redis
-                .set_json(
+            match tokio::time::timeout_at(
+                deadline,
+                self.redis.set_json(
                     key,
                     &json!({
                         "until": until.to_rfc3339(),
@@ -9440,15 +9454,26 @@ impl AccountManager {
                         "model": model,
                     }),
                     ttl,
-                )
-                .await
+                ),
+            )
+            .await
             {
-                tracing::warn!(
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!(
                     pool_id,
                     model = %model,
                     "写入账号模型级 Redis cooldown 失败: {}",
                     err
-                );
+                ),
+                Err(_) => {
+                    tracing::warn!(
+                        pool_id,
+                        model = %model,
+                        timeout_ms = ACCOUNT_COOLDOWN_REDIS_TIMEOUT.as_millis(),
+                        "写入账号模型级 Redis cooldown 超时，跳过剩余模型并继续换号"
+                    );
+                    break;
+                }
             }
         }
         self.invalidate_account_runtime_capacity_state();

@@ -21270,3 +21270,131 @@ fn account_proxy_cost_and_override_validation() {
     assert!(inherited.proxy_url.is_none());
     assert_eq!(cleared.proxy_url, Some(None));
 }
+
+/// A TCP relay to the real test Redis that can be told to stop forwarding. The redis client
+/// completes its connection handshake through the relay; once `stalled` is set every command
+/// hangs, which is what a Redis that stopped answering looks like to the account manager.
+async fn spawn_stalling_redis_relay(
+    upstream: String,
+) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let relay_stalled = stalled.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await else {
+                return;
+            };
+            let stalled = relay_stalled.clone();
+            tokio::spawn(async move {
+                let (mut client_read, mut client_write) = client.split();
+                let (mut server_read, mut server_write) = server.split();
+                let mut client_buf = [0u8; 8192];
+                let mut server_buf = [0u8; 8192];
+                loop {
+                    tokio::select! {
+                        read = client_read.read(&mut client_buf) => {
+                            let Ok(n) = read else { return };
+                            if n == 0 { return }
+                            if stalled.load(Ordering::Relaxed) {
+                                // Swallow the command: no reply ever comes back.
+                                std::future::pending::<()>().await;
+                            }
+                            if server_write.write_all(&client_buf[..n]).await.is_err() { return }
+                        }
+                        read = server_read.read(&mut server_buf) => {
+                            let Ok(n) = read else { return };
+                            if n == 0 { return }
+                            if client_write.write_all(&server_buf[..n]).await.is_err() { return }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (format!("redis://{address}/0"), stalled)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cooldown_markers_give_up_on_a_stalled_redis_instead_of_holding_the_failover() {
+    let Some(postgres_config) = test_postgres_config() else {
+        eprintln!("跳过外部备用池集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+        return;
+    };
+    let Some(mut redis_config) = test_redis_config() else {
+        eprintln!("跳过外部备用池集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
+        return;
+    };
+    let upstream_url = redis_config.redis.url.clone().unwrap();
+    let upstream = url::Url::parse(&upstream_url).unwrap();
+    let upstream_addr = format!(
+        "{}:{}",
+        upstream.host_str().unwrap_or("127.0.0.1"),
+        upstream.port().unwrap_or(6379)
+    );
+    let (relay_url, stalled) = spawn_stalling_redis_relay(upstream_addr).await;
+    redis_config.redis.url = Some(relay_url);
+
+    let postgres = Arc::new(PostgresStore::connect_test(&postgres_config).await.unwrap());
+    let redis = Arc::new(RedisStore::connect(&redis_config).await.unwrap());
+    let manager = AccountManager::new(postgres.clone(), redis);
+    let pool = postgres
+        .create_account(create_pool_request("stalled-redis-cooldown", 1, true))
+        .await
+        .unwrap();
+
+    // Sanity: through a healthy relay the markers land.
+    manager
+        .mark_pool_cooldown(pool.id, Duration::from_secs(30), "rate_limit".to_string())
+        .await;
+    let snapshot = manager
+        .load_pool_runtime_snapshot(pool.id, &[])
+        .await
+        .unwrap();
+    assert!(
+        snapshot.pool_cooldown_remaining_secs > 0,
+        "healthy Redis must record the cooldown"
+    );
+
+    stalled.store(true, Ordering::Relaxed);
+    let models = vec![
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6".to_string(),
+        "claude-haiku-4-5".to_string(),
+    ];
+    let started = Instant::now();
+    manager
+        .mark_pool_cooldown(pool.id, Duration::from_secs(30), "rate_limit".to_string())
+        .await;
+    let pool_elapsed = started.elapsed();
+    let started = Instant::now();
+    manager
+        .mark_pool_model_cooldowns(
+            pool.id,
+            Duration::from_secs(30),
+            "model_unavailable".to_string(),
+            &models,
+        )
+        .await;
+    let models_elapsed = started.elapsed();
+
+    // Each marker is one bounded attempt; the model list shares a single deadline rather than
+    // paying the timeout once per model. Generous upper bounds: the point is "returns", not
+    // "returns in exactly 500 ms".
+    assert!(
+        pool_elapsed >= ACCOUNT_COOLDOWN_REDIS_TIMEOUT && pool_elapsed < Duration::from_secs(3),
+        "pool cooldown must return after the Redis timeout: {pool_elapsed:?}"
+    );
+    assert!(
+        models_elapsed >= ACCOUNT_COOLDOWN_REDIS_TIMEOUT && models_elapsed < Duration::from_secs(3),
+        "model cooldowns must share one Redis deadline for the whole list: {models_elapsed:?}"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
