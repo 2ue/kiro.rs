@@ -40,7 +40,7 @@ import { defaultAccountsConfig } from "@/lib/runtime-config-defaults";
 import { extractErrorMessage } from "@/lib/utils";
 import type { Account, AccountQualityView, AccountStatus, CreateAccountRequest } from "@/types/api";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, FlaskConical, Pencil, Plus, Power, RefreshCw, RotateCcw, Sparkles, Trash2, Users } from "lucide-react";
+import { CopyPlus, Eye, FlaskConical, Pencil, Plus, Power, RefreshCw, RotateCcw, Sparkles, Trash2, Users } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { AccountFormModal } from "./account-form-modal";
@@ -94,7 +94,7 @@ export function AccountsPage() {
   const [search, setSearch] = useState("");
   const [tag, setTag] = useState("_all");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [editor, setEditor] = useState<{ account: Account | null; draft: AccountFormDraft } | null>(null);
+  const [editor, setEditor] = useState<{ mode: "create" | "edit" | "copy"; account: Account | null; draft: AccountFormDraft } | null>(null);
   const [testing, setTesting] = useState<Account | null>(null);
   const [effectiveId, setEffectiveId] = useState<number | null>(null);
   const effective = useAccountEffective(effectiveId);
@@ -156,7 +156,7 @@ export function AccountsPage() {
         supportedModels: parseSupportedModelsText(supportedModelsText),
         streamResponseMode: streamResponseMode === "inherit" ? null : streamResponseMode,
       };
-      if (editor.account) {
+      if (editor.mode === "edit" && editor.account) {
         const { apiKey, proxyUrl: nextProxy, ...rest } = request;
         await updateAccount(editor.account.id, {
           ...rest,
@@ -165,8 +165,9 @@ export function AccountsPage() {
         });
         toast.success("账号已更新");
       } else {
+        if (editor.mode === "copy" && !request.apiKey) throw new Error("复制账号需要填写新密钥");
         await createAccount(request);
-        toast.success("账号已添加");
+        toast.success(editor.mode === "copy" ? `已复制为新账号「${request.name}」` : "账号已添加");
       }
       setEditor(null);
     });
@@ -176,7 +177,7 @@ export function AccountsPage() {
     <PageContainer>
       <PageHeader
         actions={
-          <Button onClick={() => setEditor({ account: null, draft: defaultAccountForm() })}>
+          <Button onClick={() => setEditor({ mode: "create", account: null, draft: defaultAccountForm() })}>
             <Plus />
             添加账号
           </Button>
@@ -235,7 +236,7 @@ export function AccountsPage() {
         </Toolbar>
 
         {accounts.length === 0 ? (
-          <EmptyState icon={<Users />} title="还没有账号" description="添加第一个账号后，请求才会有地方可去。" action={<Button onClick={() => setEditor({ account: null, draft: defaultAccountForm() })}><Plus />添加账号</Button>} />
+          <EmptyState icon={<Users />} title="还没有账号" description="添加第一个账号后，请求才会有地方可去。" action={<Button onClick={() => setEditor({ mode: "create", account: null, draft: defaultAccountForm() })}><Plus />添加账号</Button>} />
         ) : visible.length === 0 ? (
           <EmptyState title="没有匹配的账号" description="换个关键字或筛选条件。" />
         ) : (
@@ -282,7 +283,15 @@ export function AccountsPage() {
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-1.5 lg:shrink-0 lg:justify-end">
-                      <Button variant="ghost" size="xs" onClick={() => setEditor({ account, draft: accountFormFromAccount(account) })}><Pencil className="h-3.5 w-3.5" />编辑</Button>
+                      <Button variant="ghost" size="xs" onClick={() => setEditor({ mode: "edit", account, draft: accountFormFromAccount(account) })}><Pencil className="h-3.5 w-3.5" />编辑</Button>
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        title="以此账号的配置新建一个账号，密钥需重新填写"
+                        onClick={() => setEditor({ mode: "copy", account, draft: { ...accountFormFromAccount(account), name: `${account.name} 副本`, apiKey: "", enabled: false } })}
+                      >
+                        <CopyPlus className="h-3.5 w-3.5" />复制
+                      </Button>
                       <Button variant="ghost" size="xs" onClick={() => setTesting(account)}><FlaskConical className="h-3.5 w-3.5" />测试</Button>
                       <Button variant="ghost" size="xs" onClick={() => setEffectiveId(account.id)}><Eye className="h-3.5 w-3.5" />生效参数</Button>
                       <Button variant="ghost" size="xs" disabled={mutation.isPending} onClick={() => run(() => setAccountEnabled(account.id, !account.enabled), account.enabled ? "已停用" : "已启用")}>
@@ -349,7 +358,7 @@ export function AccountsPage() {
 
       {editor && (
         <AccountFormModal
-          mode={editor.account ? "edit" : "create"}
+          mode={editor.mode}
           account={editor.account}
           open
           draft={editor.draft}
@@ -360,7 +369,7 @@ export function AccountsPage() {
           onDiscoverSupportedModels={async () => {
             try {
               const result =
-                editor.account && !editor.draft.apiKey
+                editor.mode === "edit" && editor.account && !editor.draft.apiKey
                   ? await discoverStoredAccountSupportedModels(editor.account.id)
                   : await discoverAccountSupportedModels({ baseUrl: editor.draft.baseUrl, apiKey: editor.draft.apiKey || undefined, authType: editor.draft.authType });
               return result.supportedModels;
