@@ -95,7 +95,7 @@ export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   routes: {title:'路由',subtitle:'入口前缀、策略、功能与账号和模型规则'},
   policyTemplates: {title:'策略模板',subtitle:'全局缓存模板、usage 默认值与注入文案'},
   configTransfer: {title:'配置迁移',subtitle:'导出配置并预览全量覆盖差异'},
-  routeScenarios: { title: '路由场景', subtitle: '保存路由定义与账号规则快照，一键切换' },
+  routeScenarios: { title: '路由场景', subtitle: '保存多套路由与账号规则，按需一键切换' },
   models: { title: '模型', subtitle: '模型能力与价格目录,支持发现与手动维护' },
   security: { title: '安全', subtitle: 'Admin Key 与客户端接入 Key 管理' },
 }
