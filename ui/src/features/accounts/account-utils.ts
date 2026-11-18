@@ -330,27 +330,27 @@ export function usageProjectionDescription(mode: Account['usageProjectionMode'] 
   if (mode === 'current_path_policy') {
     return '返回给下游的 usage 按当前入口路径的缓存策略整理；该路径是 no-cache、非流式缓存选了强制不缓存，或路径开了官方条件严格检查而请求不满足时，保持上游原始 usage。'
   }
-  return '返回给下游的 usage 保持外部账号上游原始值；不按当前入口路径整理。'
+  return '返回给下游的 usage 保持账号上游原始值；不按当前入口路径整理。'
 }
 
 export function streamResponseDescription(mode: AccountStreamResponseDraft): string {
   if (mode === 'event_passthrough') {
     return '仅控制 stream=true 的 SSE 事件转发方式。文本、thinking、tool 等普通事件按上游事件级转发；usage 是否透传上游或按路径整理，由上面的下游 usage 口径决定。'
   }
-  return '当前外部账号不单独指定流式 SSE 转发方式，使用账号全局默认值；usage 口径仍由上面的下游 usage 口径决定。'
+  return '当前账号不单独指定流式 SSE 转发方式，使用账号全局默认值；usage 口径仍由上面的下游 usage 口径决定。'
 }
 
 export function streamRetryDescription(mode: AccountStreamRetryDraft): string {
   if (mode === 'enabled') {
-    return '当前外部账号强制启用：stream 在 message_start、ping 等协议前缀后遇到 error、断流、EOF 或空闲超时时，可在未提交内容前换其他外部账号。'
+    return '当前账号强制启用：stream 在 message_start、ping 等协议前缀后遇到 error、断流、EOF 或空闲超时时，可在未提交内容前换其他账号。'
   }
   if (mode === 'disabled') {
-    return '当前外部账号强制关闭：stream body 内错误保持现有流错误行为，不把本次请求重放到其他外部账号。'
+    return '当前账号强制关闭：stream body 内错误保持现有流错误行为，不把本次请求重放到其他账号。'
   }
   if (mode === 'early_commit') {
-    return '收到上游 message_start 后立即转发（usage 置 0）并持续发送 ping；首个内容前出错仍可换账号重试，下游只收到一次 message_start。此模式取消首个输出超时，保留空闲超时。首包前全部失败仍返回 HTTP 错误；首包后全部失败发送 SSE error，用量保持 0。成功时在 message_delta 返回完整用量。仅当本次请求所有可选外部账号都设为此模式时生效。'
+    return '收到上游 message_start 后立即转发（usage 置 0）并持续发送 ping；首个内容前出错仍可换账号重试，下游只收到一次 message_start。此模式取消首个输出超时，保留空闲超时。首包前全部失败仍返回 HTTP 错误；首包后全部失败发送 SSE error，用量保持 0。成功时在 message_delta 返回完整用量。仅当本次请求所有可选账号都设为此模式时生效。'
   }
-  return '当前外部账号继承全局“流式首输出前错误换池”开关。'
+  return '当前账号继承全局“流式首输出前错误换池”开关。'
 }
 
 export function streamRetrySummary(account: Account, config: AccountsConfig): string {

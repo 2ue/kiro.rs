@@ -82,7 +82,7 @@ export function formatExternalAttemptChain(record: UsageRecord): string {
   return (record.externalAttempts || [])
     .map(
       (attempt) =>
-        `外部账号 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`
+        `账号 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`
     )
     .join(' > ')
 }

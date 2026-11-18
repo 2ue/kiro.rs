@@ -339,9 +339,6 @@ export function UsageDetailModal({
               </div>
             )}
             <DetailField label="账号" value={record.accountId != null ? `#${record.accountId}${record.accountName ? ' ' + record.accountName : ''}` : '-'} />
-            {record.routeKind === 'account' && (
-              <DetailField label="外部账号" value={`#${record.accountId ?? '-'}${record.accountName ? ' ' + record.accountName : ''}`} />
-            )}
             <DetailField
               label="路由"
               value={`${routeLabel(record)} · ${record.routeKind || '-'}${record.routeSubtype ? ` · ${record.routeSubtype}` : ''}`}
@@ -357,8 +354,6 @@ export function UsageDetailModal({
             <Badge tone={routeTone(record)}>{routeLabel(record)}</Badge>
             <Badge tone={record.stream ? 'info' : 'neutral'}>{record.stream ? 'stream' : 'non-stream'}</Badge>
             {record.simulated && <Badge tone="warning">模拟</Badge>}
-            {record.stickyBound && <Badge tone="primary">Sticky</Badge>}
-            {record.fallbackFromSticky && <Badge tone="warning">Sticky 回退</Badge>}
             <Badge tone="neutral">{sourceLabel(record.usageSource)}</Badge>
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
@@ -573,8 +568,7 @@ export function UsageDetailModal({
           </div>
         </div>
 
-        {/* 本地调用链路 Table */}
-        {/* 账号链路 Table */}
+                {/* 账号链路 Table */}
         {hasExternalAttempts && (
           <div>
             <SectionTitle>账号链路</SectionTitle>
@@ -586,7 +580,7 @@ export function UsageDetailModal({
                 <TableHeader>
                   <TableRow>
                     <TableHead>顺序</TableHead>
-                    <TableHead>外部账号</TableHead>
+                    <TableHead>账号</TableHead>
                     <TableHead>请求模型</TableHead>
                     <TableHead>状态</TableHead>
                     <TableHead>动作</TableHead>

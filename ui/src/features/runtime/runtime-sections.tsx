@@ -651,7 +651,7 @@ function CacheTtlPolicyForm({
         />
         <CacheTtlModeSelect
           label="账号账号"
-          desc="账号按本路径策略整形 usage 时的缓存写入时长；外部账号透传 usage 时不改。"
+          desc="账号按本路径策略整形 usage 时的缓存写入时长；账号透传 usage 时不改。"
           value={value?.account}
           external
           onChange={(account) => onChange({ ...value, account })}

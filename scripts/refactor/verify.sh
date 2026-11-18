@@ -18,24 +18,24 @@ case "$TASK_ID" in
     n=$(ls tests/golden/usage/*.json 2>/dev/null | wc -l | tr -d ' ')
     echo "用例数: $n"; [ "$n" -ge 48 ] || { echo "!! 不足 48"; fail=1; }
     step "golden 测试（跑两遍确认确定性）"
-    run cargo test --bin kiro-rs -q -- golden_usage
-    run cargo test --bin kiro-rs -q -- golden_usage
+    run cargo test --bin claude-pool -q -- golden_usage
+    run cargo test --bin claude-pool -q -- golden_usage
     step "外部池 usage 投影回归"
-    run cargo test --bin kiro-rs -q -- external_pool::tests::usage_projection
+    run cargo test --bin claude-pool -q -- external_pool::tests::usage_projection
     step "不得改动既有源码（只允许新增）"
     changed=$(git diff --name-only HEAD -- src | grep -v '^src/external_pool/golden_tests.rs$' | grep -v '^src/external_pool/tests.rs$' | grep -v '^src/external_pool.rs$' | grep -v '^src/external_pool/usage_projection.rs$' || true)
     [ -z "$changed" ] || { echo "!! 改动了不该改的文件:"; echo "$changed"; fail=1; }
     ;;
   s1-runtime-store)
     step "编译"
-    run cargo build -q --bin kiro-rs
+    run cargo build -q --bin claude-pool
     step "配置读写不再经过 token_manager（handlers/admin/main）"
     hits=$(grep -n "token_manager\.runtime_config\|provider\.runtime_config_snapshot\|kiro_provider.*runtime_config" src/anthropic/handlers.rs src/anthropic/handlers/*.rs src/admin/*.rs src/main.rs | grep -v "^.*//" || true)
     [ -z "$hits" ] || { echo "!! 仍有直接经 Kiro 组件读配置的调用:"; echo "$hits"; fail=1; }
     step "新模块存在"
     [ -f src/model/runtime.rs ] || { echo "!! 缺 src/model/runtime.rs"; fail=1; }
     step "全量单测（非集成）"
-    run cargo test --bin kiro-rs -q
+    run cargo test --bin claude-pool -q
     ;;
   s2-delete-kiro)
     step "编译（含 bins）"
@@ -51,11 +51,11 @@ case "$TASK_ID" in
     step "handlers.rs 行数 ≤ 3000"
     n=$(wc -l < src/anthropic/handlers.rs | tr -d ' '); echo "行数: $n"; [ "$n" -le 3000 ] || { echo "!! 超过 3000"; fail=1; }
     step "golden"
-    run cargo test --bin kiro-rs -q -- golden_usage
+    run cargo test --bin claude-pool -q -- golden_usage
     step "外部池 usage 投影"
-    run cargo test --bin kiro-rs -q -- external_pool::tests::usage_projection
+    run cargo test --bin claude-pool -q -- external_pool::tests::usage_projection
     step "全量单测"
-    run cargo test --bin kiro-rs -q
+    run cargo test --bin claude-pool -q
     ;;
   s2b-restore-tests)
     step "编译"
@@ -66,9 +66,9 @@ case "$TASK_ID" in
     [ "$n1" -ge 380 ] || { echo "!! external_pool 测试数不足 380"; fail=1; }
     [ "$n2" -ge 40 ] || { echo "!! handlers 测试数不足 40"; fail=1; }
     step "golden"
-    run cargo test --bin kiro-rs -q -- golden_usage
+    run cargo test --bin claude-pool -q -- golden_usage
     step "全量单测"
-    run cargo test --bin kiro-rs -q
+    run cargo test --bin claude-pool -q
     ;;
   s3-passthrough-features)
     step "编译"
@@ -81,13 +81,13 @@ case "$TASK_ID" in
     step "serde_json preserve_order"
     grep -q 'preserve_order' Cargo.toml || { echo "!! Cargo.toml 未启用 preserve_order"; fail=1; }
     step "golden"
-    run cargo test --bin kiro-rs -q -- golden_usage
+    run cargo test --bin claude-pool -q -- golden_usage
     step "usage 投影"
-    run cargo test --bin kiro-rs -q -- external_pool::tests::usage_projection
+    run cargo test --bin claude-pool -q -- external_pool::tests::usage_projection
     step "passthrough 测试"
-    run cargo test --bin kiro-rs -q -- passthrough
+    run cargo test --bin claude-pool -q -- passthrough
     step "全量单测"
-    run cargo test --bin kiro-rs -q
+    run cargo test --bin claude-pool -q
     ;;
   s4-routes-and-overrides)
     step "编译"
@@ -97,13 +97,13 @@ case "$TASK_ID" in
     [ -z "$hits" ] || { echo "!! 仍有残留:"; echo "$hits" | head -30; fail=1; }
     [ -f src/model/routes.rs ] || { echo "!! 缺 src/model/routes.rs"; fail=1; }
     step "golden"
-    run cargo test --bin kiro-rs -q -- golden_usage
+    run cargo test --bin claude-pool -q -- golden_usage
     step "usage 投影"
-    run cargo test --bin kiro-rs -q -- external_pool::tests::usage_projection
+    run cargo test --bin claude-pool -q -- external_pool::tests::usage_projection
     step "routes 单测"
-    run cargo test --bin kiro-rs -q -- model::routes
+    run cargo test --bin claude-pool -q -- model::routes
     step "全量单测"
-    run cargo test --bin kiro-rs -q
+    run cargo test --bin claude-pool -q
     ;;
   s5-rename)
     step "编译"

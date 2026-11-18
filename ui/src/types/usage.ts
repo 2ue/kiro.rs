@@ -183,8 +183,6 @@ export interface UsageRecord {
   responseLatencyMs?: number;
   latencyTrace?: UsageLatencyTrace;
   simulated: boolean;
-  stickyBound: boolean;
-  fallbackFromSticky: boolean;
   routeKind?: "account";
   routeSubtype?: "account";
   fallbackReason?: string;
@@ -697,8 +695,6 @@ export interface UsageDashboardSummary {
   unpricedRequests: number;
   averageDurationMs: number;
   p95DurationMs: number;
-  stickyBoundRequests: number;
-  fallbackFromStickyRequests: number;
   simulatedRequests: number;
   upstreamMetadataRequests: number;
   accountBilling?: UsageAccountBillingSummary;
