@@ -108,6 +108,14 @@ export async function discoverStoredAccountSupportedModels(
   return data;
 }
 
+export async function copyAccount(
+  id: number,
+  req: { name?: string; enabled?: boolean } = {},
+): Promise<Account> {
+  const { data } = await api.post<Account>(`/accounts/${id}/copy`, req);
+  return data;
+}
+
 export async function testAccount(
   id: number,
   req?: AccountTestRequest,

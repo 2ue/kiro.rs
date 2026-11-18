@@ -955,6 +955,70 @@ impl AdminService {
         Ok(management::mask_account(pool.masked_for_admin_response()))
     }
 
+    /// 复制账号。密钥不下发给浏览器，所以复制在服务端完成：读未脱敏的来源账号，
+    /// 原样带上密钥与全部配置新建一条，再按正常的创建路径审计与刷新缓存。
+    pub fn copy_account(
+        &self,
+        id: u64,
+        request: CopyAccountRequest,
+    ) -> Result<Account, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let source = block_on_admin_store(async move { store.get_account(id, false).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+        let api_key = source.api_key.clone().ok_or_else(|| {
+            AdminServiceError::InvalidRequest(format!("账号 #{id} 没有可复制的密钥"))
+        })?;
+        let name = request
+            .name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("{} 副本", source.name));
+        let create = CreateAccountRequest {
+            tags: source.tags.clone(),
+            proxy_url: source.proxy_url.clone(),
+            cost_multiplier: source.cost_multiplier,
+            overrides: source.overrides.clone(),
+            name,
+            base_url: source.base_url.clone(),
+            api_key,
+            auth_type: source.auth_type,
+            header_profile: source.header_profile,
+            append_beta_query: source.append_beta_query,
+            header_overrides: source.header_overrides.clone(),
+            wire_profile: source.wire_profile,
+            tls_profile: source.tls_profile,
+            enabled: request.enabled,
+            priority: source.priority,
+            max_concurrent_requests: source.max_concurrent_requests,
+            usage_projection_mode: source.usage_projection_mode,
+            stream_response_mode: source.stream_response_mode,
+            auto_disable_policy: source.auto_disable_policy,
+            pre_output_stream_retry_mode: source.pre_output_stream_retry_mode,
+            normalize_model_version_dots: source.normalize_model_version_dots,
+            model_mapping_mode: source.model_mapping_mode,
+            model_mapping_require_match: source.model_mapping_require_match,
+            model_mapping_rules: source.model_mapping_rules.clone(),
+            supported_models: source.supported_models.clone(),
+            route_mode: source.route_mode,
+            route_rules: source.route_rules.clone(),
+            notes: source.notes.clone(),
+        };
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move { store.create_account_unmasked(create).await })
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        self.audit(
+            "copy_account",
+            "account",
+            Some(pool.id.to_string()),
+            true,
+            None,
+            json!({ "name": pool.name, "baseUrl": pool.base_url, "sourceId": id }),
+        );
+        self.invalidate_account_admin_cache_with_pool("create", &pool);
+        Ok(management::mask_account(pool.masked_for_admin_response()))
+    }
+
     pub fn update_account(
         &self,
         id: u64,

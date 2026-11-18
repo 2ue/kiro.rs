@@ -108,6 +108,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(clear_account_cooldown),
         )
         .route("/accounts/{id}/test", post(test_account))
+        .route("/accounts/{id}/copy", post(copy_account))
         .route("/usage-records", get(get_usage_records))
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))

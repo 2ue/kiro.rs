@@ -505,6 +505,31 @@ pub async fn create_account(
     }
 }
 
+pub async fn copy_account(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    // 请求体可省略：无 body、空 body 都按默认参数处理；有内容则必须是合法 JSON。
+    let payload = if body.iter().all(u8::is_ascii_whitespace) {
+        CopyAccountRequest::default()
+    } else {
+        match serde_json::from_slice::<CopyAccountRequest>(&body) {
+            Ok(payload) => payload,
+            Err(err) => {
+                let err = super::error::AdminServiceError::InvalidRequest(format!(
+                    "请求体不是合法 JSON: {err}"
+                ));
+                return (err.status_code(), Json(err.into_response())).into_response();
+            }
+        }
+    };
+    match state.service.copy_account(id, payload) {
+        Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
 pub async fn update_account(
     State(state): State<AdminState>,
     Path(id): Path<u64>,

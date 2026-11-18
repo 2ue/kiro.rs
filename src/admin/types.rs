@@ -163,6 +163,18 @@ pub struct UsageCleanupStatusResponse {
 
 // ============ 代理/家宽资源 ============
 
+/// 复制账号：新账号沿用来源账号的全部配置（含密钥），只改名字，并默认停用等人工确认。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyAccountRequest {
+    /// 新账号名称；留空则为“{来源名} 副本”。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 复制后是否直接启用；默认 false，避免同一上游密钥立即双倍并发。
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountTestRequest {

@@ -72,7 +72,7 @@ export function AccountFormModal({
   onSubmit,
   onDiscoverSupportedModels,
 }: {
-  mode: "create" | "edit" | "copy";
+  mode: "create" | "edit";
   account?: Account | null;
   open: boolean;
   draft: AccountFormDraft;
@@ -156,8 +156,8 @@ export function AccountFormModal({
     <ModalShell
       open={open}
       onClose={onClose}
-      title={mode === "edit" ? `编辑账号 #${account?.id}` : mode === "copy" ? `复制账号 · 来自 #${account?.id} ${account?.name ?? ""}` : "新增账号"}
-      description={mode === "copy" ? "已带入来源账号的全部配置；密钥不会复制，请填写新密钥。" : "上游地址与密钥是必填项，其余保持默认即可开始使用。"}
+      title={mode === "edit" ? `编辑账号 #${account?.id}` : "新增账号"}
+      description="上游地址与密钥是必填项，其余保持默认即可开始使用。"
       width="max-w-4xl"
       footer={
         <>
@@ -175,9 +175,9 @@ export function AccountFormModal({
             {text("name", "名称", { required: true })}
             {text("baseUrl", "服务地址", { required: true, placeholder: "https://api.example.com", description: "填写服务地址即可，通常不需要带具体请求路径" })}
             {text("apiKey", "密钥", {
-              required: mode !== "edit",
+              required: mode === "create",
               password: true,
-              placeholder: mode === "edit" ? "留空保留现有密钥" : mode === "copy" ? "来源账号的密钥不会复制" : undefined,
+              placeholder: mode === "edit" ? "留空保留现有密钥" : undefined,
             })}
             {choice("authType", "认证方式", ACCOUNT_AUTH_TYPE_OPTIONS)}
             {text("proxyUrl", "代理地址", { placeholder: "留空继承全局" })}

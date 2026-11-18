@@ -1,3 +1,4 @@
+import * as React from 'react'
 import { Button,Input,Select,SelectContent,SelectItem,SelectTrigger,SelectValue,Switch,Textarea } from '@/components/ui'
 import { defaultCacheHitShaping,defaultPromptCacheCreationControl,inputSamplePolicy,pathPolicy,preserveFieldPolicy,writerSamplePolicy } from '@/lib/runtime-config-defaults'
 import type {
@@ -29,11 +30,12 @@ export function NumField({
   label: string; desc?: string; value: number; min?: number; max?: number; step?: number
   suffix?: string; disabled?: boolean; onChange: (v: number) => void
 }) {
+  const id = React.useId()
   return (
     <div className="min-w-0 space-y-1.5">
-      <label className="block text-[13px] font-medium leading-5 text-foreground">{label}</label>
+      <label htmlFor={id} className="block text-[13px] font-medium leading-5 text-foreground">{label}</label>
       <div className="flex min-h-8 items-center gap-2">
-        <Input type="number" className="h-8 w-24 shrink-0 px-2 text-sm tabular-nums" value={value} min={min} max={max} step={step}
+        <Input id={id} type="number" className="h-8 w-28 shrink-0 px-2 text-sm tabular-nums" value={value} min={min} max={max} step={step}
           inputMode={step && step < 1 ? 'decimal' : 'numeric'} disabled={disabled}
           onChange={(e) => onChange(numberValue(e.target.value, min ?? 0))} />
         {suffix && <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">{suffix}</span>}
@@ -52,19 +54,20 @@ export function TogField({
     <div className="min-w-0 space-y-1.5">
       <div className="flex min-h-8 items-center justify-between gap-4">
         <div className="min-w-0 text-[13px] font-medium leading-5 text-foreground">{label}</div>
-        <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} className="shrink-0" />
+        <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} className="shrink-0" aria-label={label} />
       </div>
       {desc && <div className="text-xs leading-5 text-muted-foreground">{desc}</div>}
     </div>
   )
 }
 
+/** 参数网格：列宽 15rem 起自适应，一行最多三格，跟 ConfigFields / 账号表单同一套排版。 */
 function TwoCol({ children }: { children: React.ReactNode }) {
-  return <div className="grid gap-x-6 gap-y-5 md:grid-cols-2">{children}</div>
+  return <div className="grid gap-x-8 gap-y-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(15rem, 100%), 1fr))' }}>{children}</div>
 }
 
 function FieldGrid({ children }: { children: React.ReactNode }) {
-  return <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">{children}</div>
+  return <div className="grid gap-x-8 gap-y-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(15rem, 100%), 1fr))' }}>{children}</div>
 }
 
 /**
@@ -399,7 +402,7 @@ export function StrategyChoice({
   onChange: (next: CacheStrategyType) => void
 }) {
   return (
-    <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="缓存策略">
+    <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3" role="radiogroup" aria-label="缓存策略">
       {CACHE_STRATEGY_OPTIONS.map((option) => {
         const selected = option.value === value
         return (
@@ -409,7 +412,7 @@ export function StrategyChoice({
             role="radio"
             aria-checked={selected}
             onClick={() => onChange(option.value)}
-            className={`min-w-0 rounded-lg border px-3.5 py-3 text-left transition-colors ${selected
+            className={`block h-auto min-h-[4.25rem] w-full min-w-0 justify-start whitespace-normal rounded-lg border px-3.5 py-3 text-left transition-colors ${selected
               ? 'border-primary bg-primary/[0.04] shadow-[0_0_0_1px_hsl(var(--primary)/0.16)]'
               : 'border-border/80 hover:border-foreground/30 hover:bg-muted/25'
             }`}
@@ -1682,7 +1685,7 @@ function NonStreamCacheToggle({
 }) {
   const policy = value ?? defaultUsagePatch(fallbackPrefix)
   return (
-    <div className="grid gap-x-8 gap-y-5 lg:grid-cols-2">
+    <div className="grid gap-x-8 gap-y-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(18rem, 100%), 1fr))' }}>
       <NonStreamCacheSelect
         checked={policy.skipNonStreamUsageProjection}
         onChange={(skipNonStreamUsageProjection) => onChange({ ...policy, skipNonStreamUsageProjection })}
@@ -2630,7 +2633,7 @@ export function PathPolicyEditor({
   return (
     <div className="space-y-8">
       <ParameterGroup title="Usage 总开关" desc="先决定这条路径是否参与展示用量整理，以及非流式请求按什么规则处理缓存。">
-        <div className="grid gap-x-8 gap-y-5 lg:grid-cols-2">
+        <div className="grid gap-x-8 gap-y-5" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(18rem, 100%), 1fr))' }}>
           <TogField
             label="启用本规则"
             desc="控制最终返回给客户端和后台记录的用量数字；关闭后尽量保留原始数字。"

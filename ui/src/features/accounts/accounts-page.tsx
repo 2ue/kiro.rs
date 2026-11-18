@@ -1,6 +1,7 @@
 import {
   clearAccountAutoDisabled,
   clearAccountCooldown,
+  copyAccount,
   createAccount,
   deleteAccount,
   discoverAccountSupportedModels,
@@ -94,7 +95,7 @@ export function AccountsPage() {
   const [search, setSearch] = useState("");
   const [tag, setTag] = useState("_all");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [editor, setEditor] = useState<{ mode: "create" | "edit" | "copy"; account: Account | null; draft: AccountFormDraft } | null>(null);
+  const [editor, setEditor] = useState<{ mode: "create" | "edit"; account: Account | null; draft: AccountFormDraft } | null>(null);
   const [testing, setTesting] = useState<Account | null>(null);
   const [effectiveId, setEffectiveId] = useState<number | null>(null);
   const effective = useAccountEffective(effectiveId);
@@ -165,9 +166,8 @@ export function AccountsPage() {
         });
         toast.success("账号已更新");
       } else {
-        if (editor.mode === "copy" && !request.apiKey) throw new Error("复制账号需要填写新密钥");
         await createAccount(request);
-        toast.success(editor.mode === "copy" ? `已复制为新账号「${request.name}」` : "账号已添加");
+        toast.success("账号已添加");
       }
       setEditor(null);
     });
@@ -287,8 +287,15 @@ export function AccountsPage() {
                       <Button
                         variant="ghost"
                         size="xs"
-                        title="以此账号的配置新建一个账号，密钥需重新填写"
-                        onClick={() => setEditor({ mode: "copy", account, draft: { ...accountFormFromAccount(account), name: `${account.name} 副本`, apiKey: "", enabled: false } })}
+                        title="复制全部配置（含密钥）为一个新账号，默认停用，复制后打开编辑"
+                        disabled={mutation.isPending}
+                        onClick={() =>
+                          mutation.mutate(async () => {
+                            const created = await copyAccount(account.id);
+                            toast.success(`已复制为新账号 #${created.id}「${created.name}」，默认停用`);
+                            setEditor({ mode: "edit", account: created, draft: accountFormFromAccount(created) });
+                          })
+                        }
                       >
                         <CopyPlus className="h-3.5 w-3.5" />复制
                       </Button>
@@ -369,7 +376,7 @@ export function AccountsPage() {
           onDiscoverSupportedModels={async () => {
             try {
               const result =
-                editor.mode === "edit" && editor.account && !editor.draft.apiKey
+                editor.account && !editor.draft.apiKey
                   ? await discoverStoredAccountSupportedModels(editor.account.id)
                   : await discoverAccountSupportedModels({ baseUrl: editor.draft.baseUrl, apiKey: editor.draft.apiKey || undefined, authType: editor.draft.authType });
               return result.supportedModels;

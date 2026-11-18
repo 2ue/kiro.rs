@@ -59,6 +59,7 @@ import { AuditChangeSummary,AuditDetailSummary } from './audit-detail'
 const ACTION_LABELS: Record<string, string> = {
   account_account_event: '账号异动',
   create_account: '新增账号',
+  copy_account: '复制账号',
   update_account: '更新账号',
   delete_account: '删除账号',
   set_account_enabled: '设置账号启用状态',
@@ -136,6 +137,7 @@ const ACTION_TO_CATEGORY: Record<string, string> = {
   resume_usage_cleanup: 'usage',
   finish_usage_cleanup: 'usage',
   create_account: 'account',
+  copy_account: 'account',
   update_account: 'account',
   delete_account: 'account',
   set_account_enabled: 'account',
