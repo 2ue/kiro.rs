@@ -95,6 +95,11 @@ impl Default for RoutesConfig {
     }
 }
 
+pub const BUILTIN_ROUTE_PREFIXES: [&str; 4] = ["", "/cc", "/ha", "/na"];
+/// 自定义路由只能挂在这个专有前缀下，和内置入口、管理端 `/api`、控制台 `/ui`
+/// 以及将来新增的内置路径隔离，避免任意前缀污染已有路由。
+pub const CUSTOM_ROUTE_PREFIX: &str = "/dfcache/";
+
 pub fn normalize_route_prefix(prefix: &str) -> String {
     let prefix = prefix.trim();
     if prefix.is_empty() || prefix.trim_matches('/').is_empty() {
@@ -110,6 +115,24 @@ pub fn normalize_route_prefix(prefix: &str) -> String {
         prefix
     }
 }
+
+pub fn is_builtin_route_prefix(prefix: &str) -> bool {
+    BUILTIN_ROUTE_PREFIXES.contains(&prefix)
+}
+
+/// 自定义路由前缀合法性：`/dfcache/{name}`，name 为 1–64 个小写字母、数字、`.`、`_`、`-`。
+/// 返回归一化后的前缀；内置前缀原样返回。
+pub fn validate_route_prefix(prefix: &str) -> Result<String, String> {
+    let normalized = normalize_route_prefix(prefix);
+    if is_builtin_route_prefix(&normalized) {
+        return Ok(normalized);
+    }
+    super::config::normalize_defined_cache_route(&normalized).ok_or_else(|| {
+        format!(
+            "自定义路由前缀必须是 {CUSTOM_ROUTE_PREFIX}{{name}}，name 只允许小写字母、数字、点、下划线或短横线（1–64 个字符）：{prefix}"
+        )
+    })
+}
 fn prefix_matches(prefix: &str, endpoint: &str) -> bool {
     prefix.is_empty()
         || endpoint == prefix
@@ -119,7 +142,7 @@ fn prefix_matches(prefix: &str, endpoint: &str) -> bool {
 }
 impl RoutesConfig {
     pub fn with_builtin_path_defaults(mut self) -> Self {
-        for prefix in ["", "/cc", "/ha", "/na"] {
+        for prefix in BUILTIN_ROUTE_PREFIXES {
             if self
                 .routes
                 .iter()
@@ -152,15 +175,9 @@ impl RoutesConfig {
     pub fn validate(&self) -> Result<(), String> {
         let mut seen = BTreeSet::new();
         for route in &self.routes {
-            let prefix = normalize_route_prefix(&route.prefix);
+            let prefix = validate_route_prefix(&route.prefix)?;
             if !seen.insert(prefix.clone()) {
                 return Err(format!("重复路由前缀: {prefix}"));
-            }
-            if prefix.contains(['?', '#', '{', '}'])
-                || prefix.contains("//")
-                || prefix.split('/').any(|s| matches!(s, "." | ".."))
-            {
-                return Err(format!("无效路由前缀: {prefix}"));
             }
             if route
                 .account_rule
@@ -171,7 +188,7 @@ impl RoutesConfig {
                 return Err(format!("路由 {prefix} 的账号规则必须为账号 id 或 *"));
             }
         }
-        for prefix in ["", "/cc", "/ha", "/na"] {
+        for prefix in BUILTIN_ROUTE_PREFIXES {
             if !seen.contains(prefix) {
                 return Err(format!("内置路由不可删除: {prefix}"));
             }
@@ -195,6 +212,7 @@ impl RoutesConfig {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub fn compile(&self) -> CompiledRoutes {
         self.compile_with_config(&Config::default())
     }
@@ -240,6 +258,7 @@ impl RoutesConfig {
         routes.sort_by_key(|route| std::cmp::Reverse(route.config.prefix.len()));
         CompiledRoutes { routes }
     }
+    #[cfg(test)]
     pub fn route_mut(&mut self, prefix: &str) -> &mut RouteConfig {
         let prefix = normalize_route_prefix(prefix);
         let index = self
@@ -336,6 +355,19 @@ pub fn migrate_path_overrides_to_routes(value: &mut Value) -> bool {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // 旧缓存覆盖表的全部键（含 /dfcache、/cc/v1 这类不是入口的片段）都保留为最长前缀匹配的
+    // 来源：它们在旧系统里就是"按路径前缀继承"的语义，新路由仍按同样方式继承。
+    let legacy_cache_overrides = value
+        .pointer("/cachePolicy/pathOverrides")
+        .and_then(Value::as_object)
+        .map(|overrides| {
+            overrides
+                .iter()
+                .filter(|(_, policy)| policy.as_object().is_some_and(|fields| !fields.is_empty()))
+                .map(|(prefix, policy)| (normalize_route_prefix(prefix), policy.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     for (key, target) in keys {
         if let Some(overrides) = value
             .get_mut(key)
@@ -344,7 +376,11 @@ pub fn migrate_path_overrides_to_routes(value: &mut Value) -> bool {
             .and_then(|v| v.as_object().cloned())
         {
             for (prefix, policy) in overrides {
-                let prefix = normalize_route_prefix(&prefix);
+                // 旧表的键可以是任意路径片段（/cc/v1、/dfcache、/new ...）。只有内置前缀和
+                // /dfcache/{name} 才是可访问入口；其余键只作为下方最长前缀匹配的来源，不生成路由。
+                let Ok(prefix) = validate_route_prefix(&prefix) else {
+                    continue;
+                };
                 let route = routes
                     .entry(prefix.clone())
                     .or_insert_with(|| json!({"prefix": prefix, "name": prefix, "enabled": true}));
@@ -374,15 +410,15 @@ pub fn migrate_path_overrides_to_routes(value: &mut Value) -> bool {
             }
         }
     }
-    let legacy_cache = routes
-        .iter()
-        .filter_map(|(prefix, route)| {
-            route
-                .get("cachePolicy")
-                .filter(|policy| policy.is_object() && !policy.as_object().unwrap().is_empty())
-                .map(|policy| (prefix.clone(), policy.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut legacy_cache = legacy_cache_overrides;
+    for (prefix, route) in &routes {
+        if let Some(policy) = route
+            .get("cachePolicy")
+            .filter(|policy| policy.is_object() && !policy.as_object().unwrap().is_empty())
+        {
+            legacy_cache.insert(prefix.clone(), policy.clone());
+        }
+    }
     for (prefix, route) in &mut routes {
         let endpoint = if prefix.ends_with("/v1") {
             format!("{prefix}/messages")
@@ -497,15 +533,16 @@ mod tests {
             assert_eq!(normalize_route_prefix(raw), expected);
         }
         let mut routes = RoutesConfig::default();
-        routes.route_mut("/cc/team");
+        routes.route_mut("/dfcache/team");
         routes.route_mut("/dfcache/foo");
         let compiled = routes.compile();
         for (endpoint, prefix) in [
             ("/v1/messages", ""),
             ("/unknown", ""),
             ("/cc/v1/messages", "/cc"),
-            ("/cc/team/v1/messages", "/cc/team"),
+            ("/cc/team/v1/messages", "/cc"),
             ("/cc/teams", "/cc"),
+            ("/dfcache/team/v1/messages", "/dfcache/team"),
             ("/dfcache/foo/v1/messages", "/dfcache/foo"),
             ("/dfcache/foobar/v1/messages", ""),
         ] {
@@ -538,6 +575,38 @@ mod tests {
             routes.routes.push(RouteConfig::new(duplicate));
             assert!(routes.validate().is_err(), "{duplicate}");
         }
+    }
+
+    /// 自定义路由只接受 /dfcache/{name}：任意根级前缀会和内置入口、/api、/ui 抢路径，必须拒绝。
+    #[test]
+    fn custom_prefixes_must_live_under_dfcache() {
+        for (raw, expected) in [
+            ("/dfcache/team-a", Some("/dfcache/team-a")),
+            (" dfcache/Team.B_1/ ", Some("/dfcache/team.b_1")),
+            ("/cc", Some("/cc")),
+            ("v1", Some("")),
+            ("/team", None),
+            ("/cc/team", None),
+            ("/api", None),
+            ("/ui", None),
+            ("/dfcache", None),
+            ("/dfcache/", None),
+            ("/dfcache/a/b", None),
+            ("/dfcache/has space", None),
+            ("/dfcachex/a", None),
+        ] {
+            assert_eq!(
+                validate_route_prefix(raw).ok().as_deref(),
+                expected,
+                "{raw:?}"
+            );
+        }
+        let mut routes = RoutesConfig::default();
+        routes.routes.push(RouteConfig::new("/team"));
+        assert!(routes.validate().is_err());
+        let mut routes = RoutesConfig::default();
+        routes.routes.push(RouteConfig::new("/dfcache/team"));
+        assert!(routes.validate().is_ok());
     }
 
     #[test]
@@ -703,18 +772,7 @@ mod tests {
         assert!(migrate_path_overrides_to_routes(&mut value));
         let config: Config = serde_json::from_value(value.clone()).unwrap();
         config.routes.validate().unwrap();
-        for prefix in [
-            "",
-            "/cc",
-            "/ha",
-            "/na",
-            "/cache",
-            "/report",
-            "/inject",
-            "/feature",
-            "/dfcache/foo",
-            "/dfcache/bar",
-        ] {
+        for prefix in ["", "/cc", "/ha", "/na", "/dfcache/foo", "/dfcache/bar"] {
             assert!(
                 config
                     .routes
@@ -722,6 +780,17 @@ mod tests {
                     .iter()
                     .any(|route| route.prefix == prefix),
                 "{prefix}"
+            );
+        }
+        // 旧表里的根级键不是合法入口，不能变成可访问路由。
+        for prefix in ["/cache", "/report", "/inject", "/feature"] {
+            assert!(
+                !config
+                    .routes
+                    .routes
+                    .iter()
+                    .any(|route| route.prefix == prefix),
+                "{prefix} must not become a route"
             );
         }
         let cc = config.routes.match_endpoint("/cc/v1/messages").unwrap();
@@ -755,8 +824,12 @@ mod tests {
             "cachePolicy":{"pathOverrides":{"/dfcache":{"cacheType":"bounded_high_cache"}}},
             "routeFeatures":{"pathOverrides":{"/new":{"historySanitize":true}, "/dfcache/team":{"thinkingModelName":true}, "/cc/team":{"historySanitize":true}}}
         })).unwrap();
+        // 旧表里的 /new、/cc/team 不是合法入口（不在 /dfcache 下），迁移时丢弃，请求落回内置路由。
         for (endpoint, expected) in [
-            ("/new/v1/messages", PromptCacheStrategyType::NoCache),
+            (
+                "/new/v1/messages",
+                PromptCacheStrategyType::CurrentHighCache,
+            ),
             (
                 "/dfcache/team/v1/messages",
                 PromptCacheStrategyType::BoundedHighCache,

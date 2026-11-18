@@ -34,7 +34,7 @@ import {
 } from "@/hooks/use-runtime-config";
 import { extractErrorMessage } from "@/lib/utils";
 import type { RouteConfig, RouteRule } from "@/types/routes";
-import { ArrowLeft, Eye, Save } from "lucide-react";
+import { ArrowLeft, Copy, Eye, Link2, Save } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
@@ -43,8 +43,13 @@ import { RouteFeaturesEditor } from "./route-features-editor";
 import {
   accountAllowsRoute,
   displayRoutePrefix,
+  isBuiltinRoute,
+  routeBaseUrl,
   ruleSummary,
 } from "./route-utils";
+import { Badge } from "@/components/ui";
+import { Field } from "@/components/patterns";
+import { RULE_MODE_OPTIONS } from "@/lib/enum-labels";
 function RuleMode({
   value,
   onChange,
@@ -64,9 +69,9 @@ function RuleMode({
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="allow_all">允许全部</SelectItem>
-          <SelectItem value="allow_list">只允许列表</SelectItem>
-          <SelectItem value="deny_list">拒绝列表</SelectItem>
+          {RULE_MODE_OPTIONS.map((option) => (
+            <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+          ))}
         </SelectContent>
       </Select>
       <p className="text-sm text-muted-foreground">
@@ -168,21 +173,43 @@ export function RouteEditPage() {
           </>
         }
       />
-      <div className="flex flex-wrap items-center gap-4">
-        <h2 className="font-mono text-lg">{displayRoutePrefix(prefix)}</h2>
-        <Input
-          className="max-w-sm"
-          aria-label="路由名称"
-          value={draft.name}
-          onChange={(e) => set("name", e.target.value)}
-        />
-        <label className="flex gap-2">
-          <Switch
-            checked={draft.enabled}
-            onCheckedChange={(v) => set("enabled", v)}
-          />
-          启用
-        </label>
+      <div className="rounded-xl border bg-card p-4 shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0 space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="font-mono text-lg font-semibold">{displayRoutePrefix(prefix)}</h2>
+              {isBuiltinRoute(prefix) ? <Badge size="xs" tone="secondary">内置</Badge> : <Badge size="xs" tone="info">自定义</Badge>}
+              {!draft.enabled && <Badge size="xs" tone="warning">已停用</Badge>}
+            </div>
+            <div className="flex min-w-0 items-center gap-1 rounded-md border border-border/70 bg-muted/40 py-1 pl-2.5 pr-1 text-xs">
+              <Link2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+              <span className="min-w-0 flex-1 truncate font-mono" title={routeBaseUrl(prefix)}>{routeBaseUrl(prefix)}</span>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                title="复制路由地址"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(routeBaseUrl(prefix));
+                    toast.success("路由地址已复制");
+                  } catch (error) {
+                    toast.error(extractErrorMessage(error));
+                  }
+                }}
+              >
+                <Copy />
+              </Button>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-end gap-4">
+            <Field label="名称" htmlFor="route-name" className="w-64">
+              <Input id="route-name" value={draft.name} onChange={(e) => set("name", e.target.value)} />
+            </Field>
+            <Field label="启用" htmlFor="route-enabled" inline className="py-0">
+              <Switch id="route-enabled" checked={draft.enabled} onCheckedChange={(v) => set("enabled", v)} />
+            </Field>
+          </div>
+        </div>
       </div>
       <Tabs defaultValue="cache">
         <TabsList>

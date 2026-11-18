@@ -76,7 +76,9 @@ fn normalize_routes(
             return Err(invalid("模型通配符只允许出现在末尾"));
         }
     }
-    routes.validate_with_config(config).map_err(invalid)?;
+    routes
+        .validate_with_config(config)
+        .map_err(AdminServiceError::InvalidRequest)?;
     Ok(routes)
 }
 
@@ -528,14 +530,20 @@ mod tests {
     fn admin_routes_normalize_validate_and_preserve_disabled_routes() {
         let config = Config::default();
         let mut routes = config.routes.clone();
-        routes.route_mut(" /team/// ").enabled = false;
+        routes.route_mut(" /dfcache/team/// ").enabled = false;
         let normalized = normalize_routes(routes, &config).unwrap();
         assert!(
             normalized
                 .routes
                 .iter()
-                .any(|r| r.prefix == "/team" && !r.enabled)
+                .any(|r| r.prefix == "/dfcache/team" && !r.enabled)
         );
+        // 根级自定义前缀会和内置入口、/api、/ui 抢路径，管理端保存必须拒绝。
+        let mut rooted = normalized.clone();
+        rooted
+            .routes
+            .push(crate::model::routes::RouteConfig::new("/team"));
+        assert!(normalize_routes(rooted, &config).is_err());
         let mut duplicate = normalized.clone();
         duplicate
             .routes

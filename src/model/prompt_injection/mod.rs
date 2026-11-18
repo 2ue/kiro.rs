@@ -642,7 +642,7 @@ mod passthrough_route_tests {
                 "defaults":{"reasoningCompat":{},"imageProcessing":{},"missingMaxTokens":{}},
                 "pathOverrides":{
                     "/cc":{"reasoningCompat":null,"historySanitize":true},
-                    "/cc/nested":{"historySanitize":false,"imageProcessing":null}
+                    "/dfcache/nested":{"historySanitize":false,"imageProcessing":null}
                 }
             }
         }))
@@ -655,11 +655,12 @@ mod passthrough_route_tests {
         assert!(broad.reasoning_compat.is_none());
         assert!(broad.image_processing.is_some());
         assert!(broad.history_sanitize);
+        // 自定义路由挂在 /dfcache 下，不再嵌套在 /cc 之内：它只继承全局默认，不继承 /cc 的覆盖。
         let nested = compiled
-            .match_endpoint("/cc/nested/v1/messages")
+            .match_endpoint("/dfcache/nested/v1/messages")
             .unwrap()
             .features;
-        assert!(nested.reasoning_compat.is_none());
+        assert!(nested.reasoning_compat.is_some());
         assert!(nested.image_processing.is_none());
         assert!(!nested.history_sanitize);
         assert!(nested.missing_max_tokens.is_some());

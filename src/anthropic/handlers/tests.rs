@@ -2183,17 +2183,17 @@ async fn account_enabled_for_endpoint(
 #[tokio::test]
 async fn custom_route_http_entrypoints_enforce_definition_and_enabled_state() {
     let mut config = Config::default();
-    config.routes.route_mut("/team");
     config.routes.route_mut("/dfcache/team");
-    config.routes.route_mut("/disabled").enabled = false;
+    config.routes.route_mut("/dfcache/disabled").enabled = false;
     config.routes.route_mut("/cc").enabled = false;
     let (app, _) = handler_test_router(config, None);
     for (prefix, enabled) in [
-        ("/team", true),
         ("/dfcache/team", true),
+        // 根级前缀从来不是入口：即使想定义也会被校验拒绝，这里只能是 404。
+        ("/team", false),
         ("/missing", false),
         ("/dfcache/missing", false),
-        ("/disabled", false),
+        ("/dfcache/disabled", false),
         ("/cc", false),
     ] {
         for (method, suffix) in [
@@ -2232,12 +2232,18 @@ async fn custom_route_http_entrypoints_enforce_definition_and_enabled_state() {
             if !enabled {
                 assert_eq!(status, StatusCode::NOT_FOUND, "{prefix}/{suffix}");
                 assert_eq!(value["error"]["type"], "not_found_error");
-                assert!(
-                    value["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("route is not configured")
-                );
+                // /dfcache 下未定义或已停用的名字走路由层，报“未配置或已停用”；根级未知前缀
+                // 根本不进路由层，是普通 404。
+                if prefix.starts_with("/dfcache/") || prefix == "/cc" {
+                    assert!(
+                        value["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("route is not configured"),
+                        "{prefix}/{suffix}: {}",
+                        value["error"]["message"]
+                    );
+                }
             } else if suffix == "models" {
                 assert_eq!(status, StatusCode::OK, "{prefix}");
                 assert_eq!(value["data"], json!([]));

@@ -193,8 +193,8 @@ pub fn create_router(dependencies: AnthropicRouterDependencies) -> Router {
         ))
         .with_state(ha_v1_state);
 
-    // 自定义入口与兼容的 /dfcache/{route}/v1 入口共用处理器。
-    // 前缀必须在 routes 中显式定义。
+    // 自定义入口只挂在 /dfcache/{name}/v1 下：专有前缀把自定义路由和内置入口、/api、/ui 隔开，
+    // 任意根级前缀不会被当成入口。name 必须在 routes 中显式定义，否则 404。
     let dfcache_routes = Router::new()
         .route("/{route}/v1/models", get(get_models))
         .route("/{route}/v1/models/{model_id}", get(get_model))
@@ -230,8 +230,7 @@ pub fn create_router(dependencies: AnthropicRouterDependencies) -> Router {
         .nest("/na/v1", na_v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .nest("/ha/v1", ha_v1_routes)
-        .nest("/dfcache", dfcache_routes.clone())
-        .merge(dfcache_routes)
+        .nest("/dfcache", dfcache_routes)
         .fallback(route_not_found)
         .layer(middleware::map_response(mark_non_retryable_client_errors))
         .layer(cors_layer())

@@ -6499,8 +6499,8 @@ mod tests {
                     }
                 },
                 "pathOverrides": {
-                    "/plus": { "cacheType": "prefix_tool_plus" },
-                    "/plus-custom": {
+                    "/dfcache/plus": { "cacheType": "prefix_tool_plus" },
+                    "/dfcache/plus-custom": {
                         "cacheType": "prefix_tool_plus",
                         "prefixToolPlus": {
                             "creationFrequency": { "enabled": true, "minSuccessfulRequestsBetweenCreation": 5 },
@@ -6520,8 +6520,8 @@ mod tests {
             .validate_with_config(&config)
             .expect("valid plus policy");
 
-        let template = config.cache_policy_for_path("/plus/v1/messages");
-        assert_eq!(template.namespace.as_deref(), Some("/plus"));
+        let template = config.cache_policy_for_path("/dfcache/plus/v1/messages");
+        assert_eq!(template.namespace.as_deref(), Some("/dfcache/plus"));
         assert_eq!(
             template.policy.cache_type,
             PromptCacheStrategyType::PrefixToolPlus
@@ -6540,7 +6540,7 @@ mod tests {
         assert!(!template.policy.hit_shaping.enabled);
         assert!(!template.policy.reported_usage.enabled);
 
-        let custom = config.cache_policy_for_path("/plus-custom/v1/messages");
+        let custom = config.cache_policy_for_path("/dfcache/plus-custom/v1/messages");
         let plus = custom.policy.prefix_tool_plus;
         assert!(plus.creation_frequency.enabled);
         assert_eq!(
@@ -6575,15 +6575,15 @@ mod tests {
                     "hitShaping": { "enabled": true, "targetHitRatio": 0.95, "minCostRatio": 0.3 }
                 },
                 "pathOverrides": {
-                    "/bounded": { "cacheType": "bounded_high_cache" },
-                    "/bounded-custom": {
+                    "/dfcache/bounded": { "cacheType": "bounded_high_cache" },
+                    "/dfcache/bounded-custom": {
                         "cacheType": "bounded_high_cache",
                         "hitShaping": { "maxReadMultiplier": 5.0 },
                         "reportedUsage": {
                             "input": { "mode": "sample-max", "maxTokens": 500 }
                         }
                     },
-                    "/current": { "cacheType": "current_high_cache" }
+                    "/dfcache/current": { "cacheType": "current_high_cache" }
                 }
             }
         }))
@@ -6594,7 +6594,7 @@ mod tests {
             .validate_with_config(&config)
             .expect("valid bounded policy");
 
-        let template = config.cache_policy_for_path("/bounded/v1/messages");
+        let template = config.cache_policy_for_path("/dfcache/bounded/v1/messages");
         assert_eq!(
             template.policy.cache_type,
             PromptCacheStrategyType::BoundedHighCache
@@ -6605,14 +6605,14 @@ mod tests {
         assert_eq!(template.policy.hit_shaping.min_cost_ratio, 0.3);
         assert_eq!(template.policy.simulation.token_scale, 2.0);
 
-        let custom = config.cache_policy_for_path("/bounded-custom/v1/messages");
-        assert_eq!(custom.namespace.as_deref(), Some("/bounded-custom"));
+        let custom = config.cache_policy_for_path("/dfcache/bounded-custom/v1/messages");
+        assert_eq!(custom.namespace.as_deref(), Some("/dfcache/bounded-custom"));
         assert_eq!(custom.policy.hit_shaping.max_read_multiplier, 5.0);
         assert_eq!(custom.policy.hit_shaping.target_hit_ratio, 0.95);
         assert_eq!(custom.policy.reported_usage.input.max_tokens, 500);
 
         // current_high_cache 不受新模板影响。
-        let current = config.cache_policy_for_path("/current/v1/messages");
+        let current = config.cache_policy_for_path("/dfcache/current/v1/messages");
         assert_eq!(
             current.policy.cache_type,
             PromptCacheStrategyType::CurrentHighCache
@@ -6630,7 +6630,7 @@ mod tests {
         let config: Config = Config::from_json_value(serde_json::json!({
             "cachePolicy": {
                 "pathOverrides": {
-                    "/plus": {
+                    "/dfcache/plus": {
                         "cacheType": "prefix_tool_plus",
                         "prefixToolPlus": {
                             "shaping": { "output": { "minTokens": 10, "maxTokens": 5 } }

@@ -18,6 +18,9 @@ pub enum AdminServiceError {
     /// 凭据无效（验证失败）
     InvalidCredential(String),
 
+    /// 请求参数无效（路由、运行配置等非凭据对象的校验失败）
+    InvalidRequest(String),
+
     /// 资源仍被使用，不能直接删除或变更
     Conflict(String),
 }
@@ -30,6 +33,7 @@ impl fmt::Display for AdminServiceError {
             }
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::InvalidRequest(msg) => write!(f, "{}", msg),
             AdminServiceError::Conflict(msg) => write!(f, "资源冲突: {}", msg),
         }
     }
@@ -44,6 +48,7 @@ impl AdminServiceError {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             AdminServiceError::Conflict(_) => StatusCode::CONFLICT,
         }
     }
@@ -56,7 +61,7 @@ impl AdminServiceError {
             AdminServiceError::InternalError(_) => {
                 AdminErrorResponse::internal_error(error.to_string())
             }
-            AdminServiceError::InvalidCredential(_) => {
+            AdminServiceError::InvalidCredential(_) | AdminServiceError::InvalidRequest(_) => {
                 AdminErrorResponse::invalid_request(error.to_string())
             }
             AdminServiceError::Conflict(_) => {
