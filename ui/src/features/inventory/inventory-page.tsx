@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowUpRight, Archive, Pencil, RefreshCw, Search, Send, Trash2, Upload, X } from 'lucide-react'
+import { ArrowUpRight, Archive, Download, FolderCog, FolderInput, Pencil, RefreshCw, Search, Send, Trash2, Upload, X } from 'lucide-react'
 import { toast } from 'sonner'
-import { Badge, Button, Checkbox, Input, Spinner } from '@/components/ui'
+import { Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue, Spinner } from '@/components/ui'
 import {
   EmptyState,
   ErrorState,
@@ -17,14 +17,25 @@ import {
   PAGE_SIZE_OPTIONS,
 } from '@/components/patterns'
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
-import { useCheckInventory, useDeleteInventory, useInventory } from '@/hooks/use-inventory'
+import { useCheckInventory, useDeleteInventory, useInventory, useInventoryGroups } from '@/hooks/use-inventory'
 import { formatFullDate, formatLastUsed } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import type { InventoryItem, InventoryStatus } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import { QuotaBar } from '@/features/credentials/credential-card'
 import { authLabel, credentialSubscriptionLabel, disabledReasonLabel, quotaBarModel } from '@/features/credentials/credential-utils'
-import { InventoryEditModal, InventoryImportModal, InventoryPushModal } from './inventory-dialogs'
+import {
+  InventoryEditModal,
+  InventoryExportModal,
+  InventoryGroupsModal,
+  InventoryImportModal,
+  InventoryPushModal,
+  InventorySetGroupModal,
+} from './inventory-dialogs'
+
+/** 分组筛选：全部、某个分组、未分组（后端用 `__none__`）。 */
+const ALL_GROUPS = '__all__'
+const UNGROUPED = '__none__'
 
 
 const STATUS_META: Record<InventoryStatus, { label: string; tone: 'success' | 'error' | 'warning' | 'info'; dot: string }> = {
@@ -58,6 +69,7 @@ function InventoryCard({ item, selected, onToggle, onEdit }: {
             <Badge>{authLabel(item.authMethod)}</Badge>
             {item.accountInfo?.subscriptionTitle && <Badge tone="primary">{credentialSubscriptionLabel(item.accountInfo.subscriptionTitle)}</Badge>}
             {item.authRegion && <Badge tone="secondary">{item.authRegion}</Badge>}
+            {item.group && <Badge tone="primary" title="分组">{item.group}</Badge>}
             {item.hasProxy ? (
               <Badge tone={item.proxyUsable === false ? 'error' : 'info'} title={item.proxyUrl}>
                 {item.proxyResourceName || (item.proxyResourceId ? `代理 #${item.proxyResourceId}` : '直连代理')}
@@ -113,6 +125,11 @@ function InventoryCard({ item, selected, onToggle, onEdit }: {
           </>
         )}
         {error && item.status !== 'pushed' && <p className="line-clamp-2 text-[11px] leading-4 text-destructive" title={error}>{error}</p>}
+        {item.origin && (
+          <p className="truncate text-[11px] text-muted-foreground">
+            来自账号池 #{item.origin.credentialId}{item.origin.disabledReason ? ` · ${disabledReasonLabel(item.origin.disabledReason)}` : ''}
+          </p>
+        )}
         {(item.source || item.note) && (
           <p className="truncate text-[11px] text-muted-foreground" title={[item.source, item.note].filter(Boolean).join(' · ')}>
             {[item.source, item.note].filter(Boolean).join(' · ')}
@@ -127,12 +144,17 @@ export function InventoryPage() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [statusFilter, setStatusFilter] = useState<'__all__' | InventoryStatus>('__all__')
+  const [groupFilter, setGroupFilter] = useState<string>(ALL_GROUPS)
   const [queryText, setQueryText] = useState('')
   const query = useDebouncedValue(queryText.trim(), 300)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [importOpen, setImportOpen] = useState(false)
   const [pushOpen, setPushOpen] = useState(false)
   const [editing, setEditing] = useState<InventoryItem | null>(null)
+  const [setGroupOpen, setSetGroupOpen] = useState(false)
+  const [groupsOpen, setGroupsOpen] = useState(false)
+  const [exportOpen, setExportOpen] = useState(false)
+  const groups = useInventoryGroups()
   const listTopRef = useRef<HTMLDivElement | null>(null)
   const confirm = useConfirm()
 
@@ -141,12 +163,18 @@ export function InventoryPage() {
     limit: pageSize,
     status: statusFilter === '__all__' ? undefined : statusFilter,
     q: query || undefined,
-  }), [page, pageSize, statusFilter, query])
+    group: groupFilter === ALL_GROUPS ? undefined : groupFilter,
+  }), [page, pageSize, statusFilter, query, groupFilter])
   const inventory = useInventory(listQuery)
   const check = useCheckInventory()
   const remove = useDeleteInventory()
 
-  useEffect(() => { setPage(1) }, [statusFilter, query, pageSize])
+  useEffect(() => { setPage(1) }, [statusFilter, query, pageSize, groupFilter])
+  // A dissolved or renamed group is no longer a valid filter.
+  useEffect(() => {
+    if (groupFilter === ALL_GROUPS || groupFilter === UNGROUPED || !groups.data) return
+    if (!groups.data.groups.some((group) => group.name === groupFilter)) setGroupFilter(ALL_GROUPS)
+  }, [groups.data, groupFilter])
   useEffect(() => { setSelectedIds(new Set()) }, [listQuery])
   useEffect(() => {
     const top = listTopRef.current
@@ -191,6 +219,20 @@ export function InventoryPage() {
     }
   }
 
+  const groupItems = groups.data?.groups ?? []
+  const namedGroupItems = groupItems.filter((group) => group.name)
+  const ungroupedItem = groupItems.find((group) => !group.name)
+  const exportFilter = {
+    status: statusFilter === '__all__' ? undefined : statusFilter,
+    group: groupFilter === ALL_GROUPS ? undefined : groupFilter,
+    q: query || undefined,
+  }
+  const exportFilterLabel = [
+    statusFilter !== '__all__' ? STATUS_META[statusFilter].label : null,
+    groupFilter === UNGROUPED ? '未分组' : groupFilter !== ALL_GROUPS ? `分组「${groupFilter}」` : null,
+    query ? `搜索“${query}”` : null,
+  ].filter(Boolean).join(' · ')
+
   const meta = pageMeta.inventory
   if (inventory.isLoading && !inventory.data) return <LoadingState text="加载库存..." />
   if (inventory.error) return <ErrorState message={extractErrorMessage(inventory.error)} />
@@ -205,6 +247,8 @@ export function InventoryPage() {
             <Button variant="outline" size="sm" onClick={() => void inventory.refetch()} disabled={inventory.isFetching} aria-label="刷新">
               <RefreshCw className={inventory.isFetching ? 'animate-spin' : ''} />
             </Button>
+            <Button variant="outline" size="sm" onClick={() => setGroupsOpen(true)}><FolderCog /><span className="hidden sm:inline">管理分组</span></Button>
+            <Button variant="outline" size="sm" onClick={() => setExportOpen(true)} disabled={(counts?.total ?? 0) === 0}><Download /><span className="hidden sm:inline">导出</span></Button>
             <Button size="sm" onClick={() => setImportOpen(true)}><Upload />导入到库存</Button>
           </>
         }
@@ -243,9 +287,21 @@ export function InventoryPage() {
                 )
               })}
             </div>
+            <Select value={groupFilter} onValueChange={setGroupFilter}>
+              <SelectTrigger size="sm" className="w-44" aria-label="按分组筛选"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_GROUPS}>全部分组</SelectItem>
+                {namedGroupItems.length > 0 && <SelectSeparator />}
+                {namedGroupItems.map((group) => (
+                  <SelectItem key={group.name!} value={group.name!}>{group.name}（{group.total}）</SelectItem>
+                ))}
+                {ungroupedItem && <SelectSeparator />}
+                {ungroupedItem && <SelectItem value={UNGROUPED}>未分组（{ungroupedItem.total}）</SelectItem>}
+              </SelectContent>
+            </Select>
             <div className="relative min-w-[220px] flex-1 sm:max-w-sm">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
-              <Input value={queryText} onChange={(e) => setQueryText(e.target.value)} placeholder="邮箱 / #ID / 来源 / 备注" className="h-8 pl-8 text-xs" aria-label="搜索库存" />
+              <Input value={queryText} onChange={(e) => setQueryText(e.target.value)} placeholder="邮箱 / #ID / 来源 / 备注 / 分组" className="h-8 pl-8 text-xs" aria-label="搜索库存" />
               {queryText && (
                 <button type="button" className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" onClick={() => setQueryText('')} aria-label="清除搜索">
                   <X className="size-3.5" />
@@ -267,6 +323,7 @@ export function InventoryPage() {
             {selectedItems.length > 0 && (
               <div className="flex flex-wrap items-center gap-1.5">
                 <Button size="xs" onClick={() => setPushOpen(true)}><Send />推送到账号池</Button>
+                <Button variant="outline" size="xs" onClick={() => setSetGroupOpen(true)}><FolderInput />设置分组</Button>
                 <Button variant="outline" size="xs" onClick={() => void runCheck()} disabled={check.isPending}>
                   {check.isPending ? <Spinner size="sm" /> : <RefreshCw />}查询额度
                 </Button>
@@ -283,8 +340,8 @@ export function InventoryPage() {
           {items.length === 0 ? (
             <EmptyState
               icon={<Archive className="h-12 w-12" />}
-              title={statusFilter !== '__all__' || query ? '没有符合条件的账号' : '库存是空的'}
-              description="库存用来保管暂不使用的账号：自动续期，不参与调度，需要时推送到账号池。"
+              title={statusFilter !== '__all__' || query || groupFilter !== ALL_GROUPS ? '没有符合条件的账号' : '库存是空的'}
+              description="库存用来保管暂不使用的账号：自动续期，不参与调度，需要时推送到账号池。账号页的禁用账号也可以一键移入库存。"
               action={<Button size="sm" onClick={() => setImportOpen(true)}><Upload />导入到库存</Button>}
             />
           ) : (
@@ -315,6 +372,16 @@ export function InventoryPage() {
       <InventoryImportModal open={importOpen} onClose={() => setImportOpen(false)} />
       <InventoryPushModal open={pushOpen} items={selectedItems} onClose={() => setPushOpen(false)} onDone={() => setSelectedIds(new Set())} />
       <InventoryEditModal item={editing} onClose={() => setEditing(null)} />
+      <InventorySetGroupModal open={setGroupOpen} ids={selectedItems.map((item) => item.id)} onClose={() => setSetGroupOpen(false)} onDone={() => setSelectedIds(new Set())} />
+      <InventoryGroupsModal open={groupsOpen} onClose={() => setGroupsOpen(false)} />
+      <InventoryExportModal
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        selectedIds={selectedItems.map((item) => item.id)}
+        filter={exportFilter}
+        filterLabel={exportFilterLabel}
+        filteredCount={inventory.data?.total ?? 0}
+      />
     </PageContainer>
   )
 }

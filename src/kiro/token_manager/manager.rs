@@ -383,6 +383,23 @@ fn merge_json_object(base: &mut serde_json::Value, extra: serde_json::Value) {
     }
 }
 
+/// Failure of [`MultiTokenManager::delete_credential_after_keeping`].
+#[derive(Debug)]
+pub enum KeepThenDeleteError<T> {
+    /// Nothing was kept and nothing was deleted.
+    NotKept(anyhow::Error),
+    /// The copy was kept but the credential is still in the pool; `kept` must be undone.
+    DeleteFailed { kept: T, error: anyhow::Error },
+}
+
+impl<T> KeepThenDeleteError<T> {
+    pub fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NotKept(error) | Self::DeleteFailed { error, .. } => error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StatsFlushShutdownReport {
     pub signal_sent: bool,
@@ -15681,35 +15698,71 @@ impl MultiTokenManager {
     /// - `Ok(())` - 删除成功
     /// - `Err(_)` - 凭据不存在、未禁用或持久化失败
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
+        self.delete_credential_after_keeping(id, |_| Ok(()))
+            .map_err(KeepThenDeleteError::into_error)
+    }
+
+    /// Deletes a disabled credential after `keep` stored its latest copy somewhere else (the
+    /// account inventory). `keep` runs after the same checks as a plain delete and while the
+    /// token refresh gate is held, so the copy has the refresh token that is being deleted and no
+    /// refresh can rotate it in between. Nothing is deleted when `keep` fails; when the delete
+    /// fails after `keep` succeeded, the error hands `keep`'s result back so it can be undone.
+    pub fn delete_credential_after_keeping<T>(
+        &self,
+        id: u64,
+        keep: impl FnOnce(&KiroCredentials) -> anyhow::Result<T>,
+    ) -> Result<T, KeepThenDeleteError<T>> {
         {
             let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let entry = entries.iter().find(|e| e.id == id).ok_or_else(|| {
+                KeepThenDeleteError::NotKept(anyhow::anyhow!("凭据不存在: {}", id))
+            })?;
 
             if !entry.disabled {
-                anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
+                return Err(KeepThenDeleteError::NotKept(anyhow::anyhow!(
+                    "只能删除已禁用的凭据（请先禁用凭据 #{}）",
+                    id
+                )));
             }
         }
 
-        self.set_scheduler_dispatch_block_for_credential(id)?;
-        let in_flight_requests = self.in_flight_requests_for_credential(id)?;
+        self.set_scheduler_dispatch_block_for_credential(id)
+            .map_err(KeepThenDeleteError::NotKept)?;
+        let in_flight_requests = self
+            .in_flight_requests_for_credential(id)
+            .map_err(KeepThenDeleteError::NotKept)?;
         if in_flight_requests > 0 {
-            anyhow::bail!(
+            return Err(KeepThenDeleteError::NotKept(anyhow::anyhow!(
                 "凭据 #{} 仍有 {} 个请求正在执行，请等待请求完成后再删除",
                 id,
                 in_flight_requests
-            );
+            )));
         }
 
         // 行级软删除，并清理该凭据的统计/运行态残留。成功后再更新本进程快照。
         let refresh_state = self.refresh_state_for_credential(id);
-        let _refresh_guard = refresh_state
-            .gate
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("凭据 #{} 正在刷新 Token，请稍后再删除", id))?;
-        self.delete_persisted_credential_state(id)?;
+        let _refresh_guard = refresh_state.gate.try_lock().map_err(|_| {
+            KeepThenDeleteError::NotKept(anyhow::anyhow!(
+                "凭据 #{} 正在刷新 Token，请稍后再删除",
+                id
+            ))
+        })?;
+        let latest = {
+            let entries = self.entries.lock();
+            let entry = entries.iter().find(|e| e.id == id).ok_or_else(|| {
+                KeepThenDeleteError::NotKept(anyhow::anyhow!("凭据不存在: {}", id))
+            })?;
+            let mut credentials = entry.credentials.clone();
+            credentials.canonicalize_auth_method();
+            credentials.normalize_api_key_defaults();
+            credentials.normalize_external_idp_defaults();
+            credentials.disabled = entry.disabled;
+            credentials
+        };
+        let kept = keep(&latest).map_err(KeepThenDeleteError::NotKept)?;
+        if let Err(error) = self.delete_persisted_credential_state(id) {
+            return Err(KeepThenDeleteError::DeleteFailed { kept, error });
+        }
 
         let was_current = {
             let mut entries = self.entries.lock();
@@ -15746,7 +15799,7 @@ impl MultiTokenManager {
         self.publish_credentials_changed("credential_deleted");
 
         tracing::info!("已删除凭据 #{}", id);
-        Ok(())
+        Ok(kept)
     }
 
     /// 强制刷新指定凭据的 Token（Admin API）

@@ -1,13 +1,32 @@
 import { useEffect, useMemo, useState } from 'react'
-import { FileUp } from 'lucide-react'
+import { Check, Download, FileUp, Pencil, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
-import { Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/components/ui'
-import { Callout, Field, FieldGrid, ModalShell } from '@/components/patterns'
+import { Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Spinner, Textarea } from '@/components/ui'
+import { Callout, Field, FieldGrid, ModalShell, useConfirm } from '@/components/patterns'
+import { exportInventory } from '@/api/inventory'
 import { useProxyResources } from '@/hooks/use-credentials'
-import { useImportInventory, usePushInventory, useUpdateInventory } from '@/hooks/use-inventory'
+import {
+  useDeleteInventoryGroup,
+  useImportInventory,
+  useInventoryGroups,
+  usePushInventory,
+  useRenameInventoryGroup,
+  useSetInventoryGroup,
+  useUpdateInventory,
+} from '@/hooks/use-inventory'
 import { parseImportInputs, readImportFiles, type ParsedImportAccount } from '@/lib/credential-import/sources'
+import { downloadBlob, timestampedFilename } from '@/lib/download'
 import { extractErrorMessage } from '@/lib/utils'
-import type { AddCredentialRequest, InventoryActionResponse, InventoryImportResponse, InventoryItem } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  InventoryActionResponse,
+  InventoryExportFormat,
+  InventoryExportScope,
+  InventoryGroupItem,
+  InventoryImportResponse,
+  InventoryItem,
+} from '@/types/api'
+import { InventoryGroupPicker, INVENTORY_GROUP_NAME_MAX } from './inventory-group-picker'
 import {
   CredentialParameterDefaultsPanel,
   FormSection,
@@ -22,6 +41,10 @@ import {
   type ProxyAssignmentValue,
 } from '@/features/proxies/proxy-assignment-field'
 
+/** 已有分组名（不含"未分组"）。 */
+export function namedGroups(groups: InventoryGroupItem[] | undefined): string[] {
+  return (groups ?? []).flatMap((group) => (group.name ? [group.name] : []))
+}
 
 // ============================================================================
 // Import into the inventory: region and proxy only, no scheduling parameters.
@@ -35,15 +58,17 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
   const [check, setCheck] = useState(true)
   const [importProxy, setImportProxy] = useState(false)
   const [source, setSource] = useState('')
+  const [group, setGroup] = useState('')
   const [result, setResult] = useState<InventoryImportResponse | null>(null)
   const [error, setError] = useState('')
   const proxyResources = useProxyResources()
   const proxies = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
   const importInventory = useImportInventory()
+  const groups = useInventoryGroups(open)
 
   useEffect(() => {
     if (!open) {
-      setText(''); setResult(null); setError(''); setSource('')
+      setText(''); setResult(null); setError(''); setSource(''); setGroup('')
       setProxy(initialProxyAssignment('single')); setCheck(true); setImportProxy(false)
     }
   }, [open])
@@ -91,6 +116,7 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
         credentials: parsed,
         check,
         source: source.trim() || undefined,
+        group: group.trim() || undefined,
         defaults: {
           authRegion: authRegion.trim(),
           apiRegion: apiRegion.trim() || undefined,
@@ -203,6 +229,9 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
             </label>
             <Field label="来源备注" description="可选，例如批次号、渠道">
               <Input value={source} onChange={(e) => setSource(e.target.value)} placeholder="例如 2026-10 批次" />
+            </Field>
+            <Field label="分组" description="可选；选已有分组或新建一个，库存页可按分组筛选">
+              <InventoryGroupPicker value={group} groups={namedGroups(groups.data?.groups)} onChange={setGroup} className="w-full" />
             </Field>
             </div>
           </FormSection>
@@ -317,9 +346,11 @@ export function InventoryEditModal({ item, onClose }: { item: InventoryItem | nu
   const [apiRegion, setApiRegion] = useState('')
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [note, setNote] = useState('')
+  const [group, setGroup] = useState('')
   const proxyResources = useProxyResources()
   const proxies = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
   const update = useUpdateInventory()
+  const groups = useInventoryGroups(Boolean(item))
 
   useEffect(() => {
     if (item) {
@@ -327,6 +358,7 @@ export function InventoryEditModal({ item, onClose }: { item: InventoryItem | nu
       setApiRegion(item.apiRegion || '')
       setProxyResourceId(item.proxyResourceId ? String(item.proxyResourceId) : '')
       setNote(item.note || '')
+      setGroup(item.group || '')
     }
   }, [item])
 
@@ -340,6 +372,7 @@ export function InventoryEditModal({ item, onClose }: { item: InventoryItem | nu
           apiRegion,
           proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
           note,
+          group: group.trim() || null,
         },
       })
       toast.success('已保存')
@@ -375,7 +408,239 @@ export function InventoryEditModal({ item, onClose }: { item: InventoryItem | nu
           </Select>
         </Field>
         <Field label="备注"><Input value={note} onChange={(e) => setNote(e.target.value)} /></Field>
+        <Field label="分组">
+          <InventoryGroupPicker value={group} groups={namedGroups(groups.data?.groups)} onChange={setGroup} className="w-full" />
+        </Field>
       </FieldGrid>
+    </ModalShell>
+  )
+}
+
+// ============================================================================
+// Set or clear the group of the selected accounts.
+// ============================================================================
+
+export function InventorySetGroupModal({ open, ids, onClose, onDone }: {
+  open: boolean
+  ids: number[]
+  onClose: () => void
+  onDone: () => void
+}) {
+  const [group, setGroup] = useState('')
+  const groups = useInventoryGroups(open)
+  const setInventoryGroup = useSetInventoryGroup()
+
+  useEffect(() => { if (!open) setGroup('') }, [open])
+
+  const save = async () => {
+    const name = group.trim()
+    try {
+      const result = await setInventoryGroup.mutateAsync({ ids, group: name || null })
+      toast.success(name ? `已把 ${result.updated} 个账号移到分组「${name}」` : `已清除 ${result.updated} 个账号的分组`)
+      onDone()
+      onClose()
+    } catch (e) {
+      toast.error(`设置分组失败：${extractErrorMessage(e)}`)
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="设置分组"
+      description={`选中的 ${ids.length} 个库存账号`}
+      width="max-w-md"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose} disabled={setInventoryGroup.isPending}>取消</Button>
+          <Button onClick={() => void save()} disabled={setInventoryGroup.isPending}>
+            {setInventoryGroup.isPending && <Spinner size="sm" />}{group.trim() ? '移到该分组' : '清除分组'}
+          </Button>
+        </>
+      }
+    >
+      <Field label="分组" description="选已有分组、新建一个，或选“不分组”清除分组">
+        <InventoryGroupPicker value={group} groups={namedGroups(groups.data?.groups)} onChange={setGroup} className="w-full" />
+      </Field>
+    </ModalShell>
+  )
+}
+
+// ============================================================================
+// Rename or dissolve groups.
+// ============================================================================
+
+function GroupRow({ group }: { group: InventoryGroupItem & { name: string } }) {
+  const [editing, setEditing] = useState(false)
+  const [name, setName] = useState(group.name)
+  const rename = useRenameInventoryGroup()
+  const dissolve = useDeleteInventoryGroup()
+  const confirm = useConfirm()
+
+  const save = async () => {
+    const next = name.trim()
+    if (!next || next === group.name) { setEditing(false); setName(group.name); return }
+    try {
+      await rename.mutateAsync({ name: group.name, newName: next })
+      toast.success(`已重命名为「${next}」`)
+      setEditing(false)
+    } catch (e) {
+      toast.error(`重命名失败：${extractErrorMessage(e)}`)
+    }
+  }
+
+  const remove = async () => {
+    const ok = await confirm({
+      title: '解散分组',
+      message: `分组「${group.name}」里的 ${group.total} 个账号会保留，变成未分组。`,
+      confirmText: '解散',
+    })
+    if (!ok) return
+    try {
+      await dissolve.mutateAsync(group.name)
+      toast.success(`已解散分组「${group.name}」`)
+    } catch (e) {
+      toast.error(`解散失败：${extractErrorMessage(e)}`)
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+      {editing ? (
+        <Input
+          autoFocus
+          value={name}
+          maxLength={INVENTORY_GROUP_NAME_MAX}
+          className="h-7 text-xs"
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') void save(); if (e.key === 'Escape') { setEditing(false); setName(group.name) } }}
+          aria-label="分组名"
+        />
+      ) : (
+        <span className="min-w-0 truncate font-medium" title={group.name}>{group.name}</span>
+      )}
+      <div className="flex shrink-0 items-center gap-1">
+        <span className="tabular-nums text-muted-foreground">在库 {group.stored} · 已入池 {group.pushed}{group.invalid ? ` · 失效 ${group.invalid}` : ''}</span>
+        {editing ? (
+          <>
+            <Button variant="ghost" size="icon-xs" onClick={() => void save()} disabled={rename.isPending} aria-label="保存"><Check /></Button>
+            <Button variant="ghost" size="icon-xs" onClick={() => { setEditing(false); setName(group.name) }} aria-label="取消"><X /></Button>
+          </>
+        ) : (
+          <>
+            <Button variant="ghost" size="icon-xs" onClick={() => setEditing(true)} aria-label={`重命名分组 ${group.name}`}><Pencil /></Button>
+            <Button variant="ghost" size="icon-xs" className="text-destructive" onClick={() => void remove()} disabled={dissolve.isPending} aria-label={`解散分组 ${group.name}`}><Trash2 /></Button>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function InventoryGroupsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const groups = useInventoryGroups(open)
+  const named = (groups.data?.groups ?? []).filter((group): group is InventoryGroupItem & { name: string } => Boolean(group.name))
+  const ungrouped = groups.data?.groups.find((group) => !group.name)
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="管理分组"
+      description="重命名会作用到组内全部账号；解散分组不会删除账号。新分组在导入、编辑或设置分组时直接输入即可。"
+      width="max-w-lg"
+      footer={<Button onClick={onClose}>完成</Button>}
+    >
+      {groups.isLoading ? (
+        <div className="flex justify-center py-6"><Spinner /></div>
+      ) : named.length === 0 ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">还没有分组</p>
+      ) : (
+        <div className="max-h-[50vh] divide-y overflow-y-auto rounded-lg border">
+          {named.map((group) => <GroupRow key={group.name} group={group} />)}
+        </div>
+      )}
+      {ungrouped && <p className="mt-3 text-xs text-muted-foreground">未分组 {ungrouped.total} 个</p>}
+    </ModalShell>
+  )
+}
+
+// ============================================================================
+// Export stored accounts in the pool's credential format.
+// ============================================================================
+
+export function InventoryExportModal({ open, onClose, selectedIds, filter, filterLabel, filteredCount }: {
+  open: boolean
+  onClose: () => void
+  selectedIds: number[]
+  /** 库存页当前的筛选条件。 */
+  filter: { status?: string; group?: string; q?: string }
+  filterLabel: string
+  filteredCount: number
+}) {
+  const [format, setFormat] = useState<InventoryExportFormat>('json')
+  const [scope, setScope] = useState<'selected' | 'filtered' | 'all'>('filtered')
+  const [loading, setLoading] = useState(false)
+  const filtered = Boolean(filter.status || filter.group || filter.q)
+
+  useEffect(() => {
+    if (open) setScope(selectedIds.length > 0 ? 'selected' : filtered ? 'filtered' : 'all')
+  }, [open, selectedIds.length, filtered])
+
+  const handleExport = async () => {
+    setLoading(true)
+    try {
+      const exportScope: InventoryExportScope = scope === 'selected'
+        ? { ids: selectedIds }
+        : { filter: scope === 'filtered' ? filter : {} }
+      const { blob, count, skipped } = await exportInventory(format, exportScope)
+      downloadBlob(blob, timestampedFilename('kiro-inventory', format))
+      toast.success(`已导出 ${count ?? ''} 个账号${skipped ? `，跳过已入池 ${skipped} 个（不含密钥）` : ''}`)
+      onClose()
+    } catch (e) {
+      toast.error(`导出失败：${extractErrorMessage(e)}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="导出库存账号"
+      width="max-w-md"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose} disabled={loading}>取消</Button>
+          <Button onClick={() => void handleExport()} disabled={loading}>
+            {loading ? <Spinner size="sm" /> : <Download />}导出
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <Field label="导出格式" description="和账号页导出的格式一致，可以直接导回账号池或库存。">
+          <Select value={format} onValueChange={(value) => setFormat(value as InventoryExportFormat)} disabled={loading}>
+            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="json">JSON 数组</SelectItem>
+              <SelectItem value="jsonl">JSONL（每行一个）</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field label="导出范围" description="只导出在库和失效的账号；已入池的账号由账号池保管，库存里不含密钥。">
+          <Select value={scope} onValueChange={(value) => setScope(value as typeof scope)} disabled={loading}>
+            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {selectedIds.length > 0 && <SelectItem value="selected">选中账号（{selectedIds.length} 个）</SelectItem>}
+              {filtered && <SelectItem value="filtered">当前筛选：{filterLabel}（{filteredCount} 个）</SelectItem>}
+              <SelectItem value="all">全部库存账号</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        <Callout tone="warning">导出文件包含 refreshToken 等密钥，请妥善保管。</Callout>
+      </div>
     </ModalShell>
   )
 }

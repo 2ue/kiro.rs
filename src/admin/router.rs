@@ -104,6 +104,25 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/inventory/check", post(inventory_http::check))
         .route("/inventory/push", post(inventory_http::push))
         .route("/inventory/delete", post(inventory_http::delete))
+        .route("/inventory/groups", get(inventory_http::groups))
+        .route("/inventory/group", post(inventory_http::set_group))
+        .route(
+            "/inventory/groups/rename",
+            post(inventory_http::rename_group),
+        )
+        .route(
+            "/inventory/groups/delete",
+            post(inventory_http::delete_group),
+        )
+        .route("/inventory/export", get(inventory_http::export))
+        .route(
+            "/credentials/move-to-inventory/preview",
+            post(inventory_http::move_preview),
+        )
+        .route(
+            "/credentials/move-to-inventory",
+            post(inventory_http::move_from_pool),
+        )
         .route("/inventory/{id}", put(inventory_http::update))
         .route(
             "/route-scenarios",

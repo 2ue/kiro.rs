@@ -3014,6 +3014,7 @@ export interface InventoryImportRequest {
   defaults?: InventoryImportDefaults
   check?: boolean
   source?: string
+  group?: string
 }
 
 export interface InventoryImportItem {
@@ -3066,8 +3067,16 @@ export interface InventoryItem {
   note?: string
   pool?: InventoryPoolLink
   pushedAt?: string
+  group?: string
+  /** 从账号池移入时的原账号和禁用原因。 */
+  origin?: InventoryOrigin
   createdAt: string
   updatedAt: string
+}
+
+export interface InventoryOrigin {
+  credentialId: number
+  disabledReason?: string
 }
 
 export interface InventoryCounts {
@@ -3092,6 +3101,8 @@ export interface InventoryListQuery {
   limit?: number
   status?: string
   q?: string
+  /** 分组名；`__none__` 表示未分组。 */
+  group?: string
 }
 
 export interface InventoryUpdateRequest {
@@ -3102,6 +3113,8 @@ export interface InventoryUpdateRequest {
   proxyUsername?: string
   proxyPassword?: string
   note?: string
+  /** 不传保持不变，传 null 清除分组。 */
+  group?: string | null
 }
 
 export interface InventoryPushRequest {
@@ -3122,6 +3135,74 @@ export interface InventoryActionResponse {
   succeeded: number
   failed: number
   items: InventoryActionItem[]
+}
+
+/** 库存分组；name 为空表示未分组的账号。 */
+export interface InventoryGroupItem {
+  name?: string | null
+  total: number
+  stored: number
+  invalid: number
+  pushing: number
+  pushed: number
+}
+
+export interface InventoryGroupsResponse {
+  groups: InventoryGroupItem[]
+}
+
+export interface InventoryGroupChangeResponse {
+  updated: number
+}
+
+export type InventoryExportFormat = 'json' | 'jsonl'
+
+/** 导出范围：选中的库存账号，或列表筛选条件。 */
+export type InventoryExportScope =
+  | { ids: number[] }
+  | { filter: { status?: string; group?: string; q?: string } }
+
+export interface MoveToInventoryRequest {
+  /** 只处理这些账号（其中已禁用的）；不传处理全部已禁用账号。 */
+  ids?: number[]
+  excludeAbnormal: boolean
+  keepProxy: boolean
+  group?: string
+  check: boolean
+}
+
+export interface MovePreviewReason {
+  reason?: string | null
+  count: number
+  abnormal: number
+  moving: number
+}
+
+export interface MoveToInventoryPreview {
+  disabled: number
+  moving: number
+  excluded: number
+  notDisabled: number
+  reasons: MovePreviewReason[]
+  groups: string[]
+}
+
+export interface MoveToInventoryItem {
+  credentialId: number
+  ok: boolean
+  skipped: boolean
+  inventoryId?: number
+  email?: string
+  message?: string
+}
+
+export interface MoveToInventoryResponse {
+  total: number
+  moved: number
+  skipped: number
+  failed: number
+  excluded: number
+  items: MoveToInventoryItem[]
 }
 
 // ============ 只读号池（免登录） ============

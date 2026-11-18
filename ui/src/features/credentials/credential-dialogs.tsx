@@ -48,6 +48,7 @@ import {
   testModelLabel,
 } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
+import { downloadBlob, timestampedFilename } from '@/lib/download'
 import { useAddCredential, useBatchUpdateCredentials, useCredentials, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
@@ -284,16 +285,7 @@ function proxyAssignmentToDefaults(defaults: CredentialParameterDefaults, value:
 }
 
 function exportFilename(format: CredentialExportFormat): string {
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  return `kiro-credentials-${stamp}.${format === 'jsonl' ? 'jsonl' : 'json'}`
-}
-
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url; a.download = filename
-  document.body.appendChild(a); a.click(); a.remove()
-  URL.revokeObjectURL(url)
+  return timestampedFilename('kiro-credentials', format === 'jsonl' ? 'jsonl' : 'json')
 }
 
 // ============================================================================
