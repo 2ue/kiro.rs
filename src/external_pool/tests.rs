@@ -21357,6 +21357,69 @@ async fn early_commit_backfills_input_usage_missing_from_message_delta() {
     postgres.drop_test_schema().await.unwrap();
 }
 
+/// 下游读到 message_stop 就关连接（sub2api 账号测试、部分 SDK 的行为）：这是一次完整的响应，
+/// 必须按成功落账并保留 usage，不能因为比上游 EOF 早一步而记成客户端断开。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_stream_client_closing_after_message_stop_records_success() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    // 上游发完 message_stop 后把连接挂住很久，模拟 chunked 终止块/EOF 迟到。
+    let mut steps = external_stream_success_steps("msg_close_after_stop", "done", 321, 42);
+    steps.push(ExternalStreamFakeStep::delay(Duration::from_secs(30)));
+    let upstream = ExternalStreamFakeServer::start(steps).await;
+    create_messages_pool(&postgres, "close-after-stop", 1, &upstream.base_url).await;
+
+    let request_id = "req_close_after_stop";
+    let (route, recorder) = external_stream_route(request_id, "err_close_after_stop");
+    let mut config = external_stream_config_for_test();
+    config.external_pool_stream_idle_timeout_secs = 30;
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("stream response headers")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => panic!("unexpected error: {error:?}"),
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stream = response.into_body().into_data_stream();
+    let mut body = Vec::new();
+    loop {
+        let chunk = timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("chunk before message_stop")
+            .expect("stream must not end before message_stop")
+            .expect("chunk ok");
+        body.extend_from_slice(&chunk);
+        if String::from_utf8_lossy(&body).contains("message_stop") {
+            break;
+        }
+    }
+    // 像 Go 的 resp.Body.Close() 一样：读到 message_stop 立即丢掉连接，不等 EOF。
+    drop(stream);
+
+    let record = timeout(
+        Duration::from_secs(5),
+        wait_for_usage_record(&recorder, request_id),
+    )
+    .await
+    .expect("dropping the body after message_stop must settle the record promptly");
+    assert_eq!(record.status, UsageRecordStatus::Success, "{record:?}");
+    assert_eq!(record.error_type, None);
+    assert_eq!(
+        record.output_tokens, 42,
+        "usage must survive the early close"
+    );
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_commit_client_disconnect_stops_failover_and_records_client_dropped() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
