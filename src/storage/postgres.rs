@@ -111,6 +111,10 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
         column_name: "pushed_credential_id",
     },
     RequiredPostgresColumn {
+        table_name: "credential_inventory",
+        column_name: "origin_reason",
+    },
+    RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
         column_name: "total_compat_input_tokens",
     },
@@ -14509,6 +14513,11 @@ CREATE INDEX IF NOT EXISTS idx_credential_inventory_identity
     ON credential_inventory (identity_key) WHERE identity_key IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_credential_inventory_status
     ON credential_inventory (status, id DESC) WHERE deleted_at IS NULL;
+ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS group_name TEXT;
+ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS origin_credential_id BIGINT;
+ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS origin_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_credential_inventory_group
+    ON credential_inventory (group_name, id DESC) WHERE deleted_at IS NULL;
 "#;
 
 // Explicit maintenance-only backfill. Do not call this from the default startup
@@ -15009,6 +15018,7 @@ mod tests {
             ("credential_runtime_state", "generation"),
             ("credential_runtime_mutations", "operation_id"),
             ("credential_stats_delta_batches", "operation_id"),
+            ("credential_inventory", "origin_reason"),
         ] {
             assert!(
                 required.contains(&pair),

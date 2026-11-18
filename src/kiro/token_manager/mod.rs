@@ -36,8 +36,8 @@ pub(crate) use manager::UPSTREAM_FAULT_STREAK_COOLDOWN;
 #[allow(unused_imports)]
 pub use manager::{
     BackgroundTokenRefreshPassReport, BackgroundTokenRefreshShutdownReport,
-    BackgroundTokenRefreshWorkerHandle, DispatchProgressStatus, MultiTokenManager,
-    StatsFlushShutdownReport, StatsFlushWorkerHandle,
+    BackgroundTokenRefreshWorkerHandle, DispatchProgressStatus, KeepThenDeleteError,
+    MultiTokenManager, StatsFlushShutdownReport, StatsFlushWorkerHandle,
 };
 pub(crate) use redis_runtime::token_refreshed_event_credential_id;
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};

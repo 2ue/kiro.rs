@@ -1,4 +1,5 @@
 import {
+  Archive,
   CheckCircle2,
   ChevronRight,
   Download,
@@ -106,6 +107,7 @@ import {
   CredentialTestModal,
   type VerifyResult,
 } from './credential-dialogs'
+import { CredentialMoveToInventoryModal } from './credential-move-to-inventory-dialog'
 import {
   CREDENTIAL_SUBSCRIPTION_OPTIONS,
   credentialCreditStatus,
@@ -251,6 +253,8 @@ export function CredentialsPage() {
   const [batchOpen, setBatchOpen] = useState(false)
   const [batchEditOpen, setBatchEditOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
+  /** 禁用账号入库弹窗：ids 为空表示全部已禁用账号。 */
+  const [moveToInventory, setMoveToInventory] = useState<{ ids?: number[] } | null>(null)
   const [kiroApiKeyOpen, setKiroApiKeyOpen] = useState(false)
   const [verifyOpen, setVerifyOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -1322,6 +1326,14 @@ export function CredentialsPage() {
             </Button>
             <Button
               variant="outline" size="xs"
+              onClick={() => setMoveToInventory({ ids: selectedCredentials.filter((c) => c.disabled).map((c) => c.id) })}
+              disabled={selectedDisabledCount === 0 || batchRefreshing}
+              title="只处理选中项里已禁用的账号"
+            >
+              <Archive className="h-3.5 w-3.5" />移入库存 ({selectedDisabledCount})
+            </Button>
+            <Button
+              variant="outline" size="xs"
               className="text-destructive hover:bg-destructive/10"
               onClick={batchDelete}
               disabled={selectedDisabledCount === 0 || batchRefreshing || batchDeleteCredentials.isPending}
@@ -1346,6 +1358,15 @@ export function CredentialsPage() {
             {credentials.isFetching && !credentials.isLoading && <Spinner size="sm" />}
           </div>
           <div className="flex items-center gap-2">
+            {disabledCount > 0 && (
+              <Button
+                variant="outline" size="xs"
+                onClick={() => setMoveToInventory({})}
+                title="把已禁用账号移到库存保管，需要时再推回账号池"
+              >
+                <Archive className="h-3.5 w-3.5" />禁用账号入库 ({disabledCount})
+              </Button>
+            )}
             {disabledCount > 0 && (
               <Button
                 variant="destructive" size="xs"
@@ -1537,6 +1558,12 @@ export function CredentialsPage() {
           cooling: credentialSummary.data?.cooling ?? credentialSummary.data?.coolingDown,
           disabled: credentialSummary.data ? disabledCount : undefined,
         }}
+      />
+      <CredentialMoveToInventoryModal
+        open={moveToInventory !== null}
+        ids={moveToInventory?.ids}
+        onClose={() => setMoveToInventory(null)}
+        onDone={() => setSelectedIds(new Set())}
       />
       <KiroApiKeyModal
         open={kiroApiKeyOpen}

@@ -94,8 +94,8 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
-    CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
-    RefreshFailure, RefreshFailureKind, RefreshFailureStage,
+    CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, KeepThenDeleteError,
+    MultiTokenManager, RefreshFailure, RefreshFailureKind, RefreshFailureStage,
 };
 use crate::model::config::{
     Config, ExternalPoolsConfig, MAX_LOCAL_BERSERK_ROUND_DELAY_MS, MAX_LOCAL_BERSERK_ROUNDS,
@@ -5297,11 +5297,7 @@ impl AdminService {
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
-        self.prompt_cache.clear_credential(id);
-        self.prompt_cache_creation_controller.clear_credential(id);
-
-        // 清理已删除凭据的账号信息缓存
-        self.invalidate_balance_cache(id);
+        self.clear_removed_credential_caches(id);
         self.audit_account_change(
             "delete_credential",
             AccountEventKind::Deleted,
@@ -5313,6 +5309,14 @@ impl AdminService {
         );
 
         Ok(())
+    }
+
+    /// Caches keyed by a credential that left the pool.
+    fn clear_removed_credential_caches(&self, id: u64) {
+        self.prompt_cache.clear_credential(id);
+        self.prompt_cache_creation_controller.clear_credential(id);
+        // 清理已删除凭据的账号信息缓存
+        self.invalidate_balance_cache(id);
     }
 
     /// 服务端一次性删除全部已禁用凭据，避免前端为确认弹窗加载完整重列表。
@@ -12039,6 +12043,50 @@ impl AdminService {
         self.credential_from_request(req, false)
     }
 
+    /// Every pool account with its quota snapshot, for choosing the disabled accounts to move into
+    /// the inventory.
+    pub(super) fn inventory_credential_items(&self) -> Vec<CredentialStatusItem> {
+        self.credential_status_items(CredentialStatusBuildOptions {
+            include_account_info: true,
+            include_cost_summary: false,
+        })
+        .7
+    }
+
+    /// Removes a disabled pool account after `keep` stored its latest copy in the inventory, with
+    /// the clean-up of a delete. The account event records the move, not a deletion reason.
+    pub(super) fn remove_credential_into_inventory<T>(
+        &self,
+        id: u64,
+        inventory_id: impl Fn(&T) -> u64,
+        keep: impl FnOnce(&KiroCredentials) -> anyhow::Result<T>,
+    ) -> Result<T, KeepThenDeleteError<T>> {
+        let label = self.token_manager.credential_label_for_audit(id);
+        let kept = self
+            .token_manager
+            .delete_credential_after_keeping(id, keep)?;
+        self.clear_removed_credential_caches(id);
+        self.audit_account_change(
+            "move_credential_to_inventory",
+            AccountEventKind::Deleted,
+            AccountSource::Local,
+            id,
+            label,
+            "移入库存",
+            json!({ "inventoryId": inventory_id(&kept) }),
+        );
+        Ok(kept)
+    }
+
+    /// Delete errors in the admin API's terms (conflict for in-flight requests or a refresh).
+    pub(super) fn inventory_delete_error(
+        &self,
+        error: anyhow::Error,
+        id: u64,
+    ) -> AdminServiceError {
+        self.classify_delete_error(error, id)
+    }
+
     /// The pool import used when an inventory account is pushed.
     pub(super) async fn add_credential_for_inventory(
         &self,
@@ -12132,6 +12180,12 @@ impl AdminService {
             })
             .collect()
     }
+}
+
+/// The account page's health classification (`account_error`, `quota_exhausted`, `unknown`,
+/// `normal`), shared with the inventory move.
+pub(super) fn credential_health_status_public(credential: &CredentialStatusItem) -> &'static str {
+    credential_health_status(credential)
 }
 
 /// 公开账号池保留单层分类的正常口径，管理页的健康维度独立于启用和运行状态。
