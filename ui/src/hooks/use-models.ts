@@ -1,5 +1,7 @@
 import {
+  adoptModelCatalog,
   deleteManualModel,
+  discoverModelCatalog,
   getModelCapabilities,
   getModelPricing,
   setModelListed,
@@ -62,5 +64,18 @@ export function useSetModelListed() {
       setModelListed(model, listed),
     onSuccess: () =>
       client.invalidateQueries({ queryKey: ["model-capabilities"] }),
+  });
+}
+export function useDiscoverModelCatalog() {
+  return useMutation({ mutationFn: discoverModelCatalog });
+}
+export function useAdoptModelCatalog() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ models, listed }: { models: string[]; listed?: boolean }) => adoptModelCatalog(models, listed),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["model-capabilities"] });
+      client.invalidateQueries({ queryKey: ["model-pricing"] });
+    },
   });
 }

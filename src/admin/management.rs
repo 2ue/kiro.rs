@@ -76,6 +76,7 @@ fn normalize_routes(
             return Err(invalid("模型通配符只允许出现在末尾"));
         }
     }
+    let routes = routes.assign_route_ids();
     routes
         .validate_with_config(config)
         .map_err(AdminServiceError::InvalidRequest)?;
@@ -447,7 +448,10 @@ impl AdminService {
 
 #[derive(Deserialize)]
 pub struct PrefixQuery {
-    pub prefix: String,
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct ListedRequest {
@@ -466,10 +470,16 @@ pub async fn route_effective(
     State(state): State<AdminState>,
     Query(query): Query<PrefixQuery>,
 ) -> Response {
-    respond(effective_route(
-        &state.service.runtime.config(),
-        &query.prefix,
-    ))
+    let config = state.service.runtime.config();
+    // 优先按 id 定位；没有 id 时沿用前缀（兼容旧调用）。
+    let prefix = match query.id {
+        Some(id) => match config.routes.route_by_id(id) {
+            Some(route) => route.prefix.clone(),
+            None => return respond::<Value>(Err(AdminServiceError::NotFound { id })),
+        },
+        None => query.prefix.clone().unwrap_or_default(),
+    };
+    respond(effective_route(&config, &prefix))
 }
 pub async fn account_effective(State(state): State<AdminState>, Path(id): Path<u64>) -> Response {
     respond(state.service.account_effective(id).await)

@@ -1,4 +1,6 @@
 import type {
+  ModelCatalogAdoptResponse,
+  ModelCatalogDiscoverResponse,
   ManualModelResponse,
   ModelCapabilitiesStatus,
   ModelPricingStatus,
@@ -47,4 +49,13 @@ export async function setModelListed(model: string, listed: boolean) {
       { listed },
     )
   ).data;
+}
+
+export async function discoverModelCatalog(): Promise<ModelCatalogDiscoverResponse> {
+  const { data } = await api.post<ModelCatalogDiscoverResponse>("/model-capabilities/discover");
+  return data;
+}
+export async function adoptModelCatalog(models: string[], listed = true): Promise<ModelCatalogAdoptResponse> {
+  const { data } = await api.post<ModelCatalogAdoptResponse>("/model-capabilities/adopt", { models, listed });
+  return data;
 }

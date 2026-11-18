@@ -8,10 +8,6 @@ export async function updateRoutes(
 ): Promise<RouteConfig[]> {
   return (await api.put("/routes", routes)).data;
 }
-export async function getRouteEffective(
-  prefix: string,
-): Promise<RouteEffective> {
-  return (
-    await api.get("/routes/effective", { params: { prefix: prefix || "/" } })
-  ).data;
+export async function getRouteEffective(id: number): Promise<RouteEffective> {
+  return (await api.get("/routes/effective", { params: { id } })).data;
 }

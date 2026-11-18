@@ -199,6 +199,7 @@ export function RoutesPage() {
   };
 
   const emptyRoute = (): RouteConfig => ({
+    id: 0,
     prefix: "",
     name: "",
     enabled: true,
@@ -219,12 +220,13 @@ export function RoutesPage() {
   const create = async () => {
     if (!creator || !normalizedNewPrefix || duplicate) return;
     const base = creator.source ? structuredClone(creator.source) : emptyRoute();
-    const next: RouteConfig = { ...base, prefix: normalizedNewPrefix, name: creator.routeName.trim() || normalizedNewPrefix, enabled: true };
+    const next: RouteConfig = { ...base, id: 0, prefix: normalizedNewPrefix, name: creator.routeName.trim() || normalizedNewPrefix, enabled: true };
     try {
-      await update.mutateAsync([...routes, next]);
+      const saved = await update.mutateAsync([...routes, next]);
+      const created = saved.find((r) => normalizeRoutePrefix(r.prefix) === normalizedNewPrefix);
       toast.success(`路由 ${normalizedNewPrefix} 已创建`);
       setCreator(null);
-      navigate(routeEditorPath(normalizedNewPrefix));
+      if (created) navigate(routeEditorPath(created.id));
     } catch (error) {
       toast.error(extractErrorMessage(error));
     }
@@ -258,18 +260,18 @@ export function RoutesPage() {
           <div className="grid gap-4 xl:grid-cols-2">
             {sorted.map((route) => (
               <RouteCard
-                key={route.prefix}
+                key={route.id}
                 route={route}
                 runtime={runtime.data}
                 accountCount={accountCountFor(route)}
                 busy={update.isPending}
                 onToggle={(enabled) =>
                   save(
-                    routes.map((item) => (item.prefix === route.prefix ? { ...item, enabled } : item)),
+                    routes.map((item) => (item.id === route.id ? { ...item, enabled } : item)),
                     enabled ? `${displayRoutePrefix(route.prefix)} 已启用` : `${displayRoutePrefix(route.prefix)} 已停用`,
                   )
                 }
-                onEdit={() => navigate(routeEditorPath(route.prefix))}
+                onEdit={() => navigate(routeEditorPath(route.id))}
                 onCopy={() => openCreator(route)}
                 onDelete={async () => {
                   if (
@@ -280,7 +282,7 @@ export function RoutesPage() {
                       tone: "danger",
                     })
                   )
-                    save(routes.filter((item) => item.prefix !== route.prefix), `路由 ${displayRoutePrefix(route.prefix)} 已删除`);
+                    save(routes.filter((item) => item.id !== route.id), `路由 ${displayRoutePrefix(route.prefix)} 已删除`);
                 }}
               />
             ))}

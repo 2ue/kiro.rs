@@ -2668,6 +2668,24 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// 启动对齐种子时使用：删掉被判定为过期的种子派生条目，再 upsert 全部条目。
+    pub async fn replace_seed_model_capabilities(
+        &self,
+        status: &ModelCapabilitiesStatus,
+        removed: &[String],
+    ) -> anyhow::Result<()> {
+        if !removed.is_empty() {
+            sqlx::query(
+                "DELETE FROM model_capabilities WHERE source = $1 AND model = ANY($2::text[])",
+            )
+            .bind(crate::anthropic::model_capabilities::SEED_SOURCE)
+            .bind(removed)
+            .execute(&self.pool)
+            .await?;
+        }
+        self.save_model_capabilities_status(status).await
+    }
+
     pub async fn delete_manual_model(&self, model: &str) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM model_capabilities WHERE model = $1 AND source = $2")

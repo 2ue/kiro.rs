@@ -374,6 +374,17 @@ async fn async_main() {
                     );
                 }
             } else {
+                let mut status = status;
+                let (added, removed) = status.merge_missing_seed_models();
+                if !added.is_empty() || !removed.is_empty() {
+                    tracing::info!(added = ?added, removed = ?removed, "按当前内置种子对齐模型目录");
+                    if let Err(err) = postgres_store
+                        .replace_seed_model_capabilities(&status, &removed)
+                        .await
+                    {
+                        tracing::warn!("把对齐后的目录写回 PgSQL 失败，仅内存生效: {}", err);
+                    }
+                }
                 model_capabilities.load_persisted_status(status);
                 tracing::info!("已从 PgSQL 加载模型能力目录");
             }

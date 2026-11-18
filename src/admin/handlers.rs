@@ -684,6 +684,27 @@ pub async fn upsert_manual_model(
     }
 }
 
+/// POST /api/admin/model-capabilities/discover
+/// 从公信力来源拉取候选模型（不写入）
+pub async fn discover_model_catalog(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.discover_model_catalog().await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/model-capabilities/adopt
+/// 把用户确认的候选加入目录
+pub async fn adopt_model_catalog(
+    State(state): State<AdminState>,
+    Json(payload): Json<ModelCatalogAdoptRequest>,
+) -> impl IntoResponse {
+    match state.service.adopt_model_catalog(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// DELETE /api/admin/model-capabilities/manual/:model
 /// 删除手动模型补充
 pub async fn delete_manual_model(

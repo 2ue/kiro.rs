@@ -305,6 +305,11 @@ async fn deadline_first_timeout_at<F>(deadline: Instant, future: F) -> Result<F:
 where
     F: Future,
 {
+    // 已过期的 deadline 必须直接拒绝：tokio 定时器驱动的时钟最多落后真实时间约 1ms，
+    // 只靠 sleep_until 会让刚过期的 deadline 在首次 poll 时还"没到"，被立即就绪的 future 抢先。
+    if Instant::now() >= deadline {
+        return Err(());
+    }
     let timer = tokio::time::sleep_until(deadline);
     tokio::pin!(timer);
     tokio::pin!(future);

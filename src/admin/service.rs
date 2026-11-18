@@ -2127,6 +2127,125 @@ impl AdminService {
         Ok(ManualModelResponse::new(item.model, "手动模型已保存"))
     }
 
+    /// 从公信力来源拉取 Claude 模型候选，标出已在目录里的，供弹层勾选。不写任何数据。
+    pub async fn discover_model_catalog(
+        &self,
+    ) -> Result<ModelCatalogDiscoverResponse, AdminServiceError> {
+        let remote = self
+            .pricing_catalog
+            .fetch_remote_model_candidates()
+            .await
+            .map_err(|err| AdminServiceError::InternalError(format!("拉取模型来源失败: {err}")))?;
+        let existing = self
+            .model_capabilities
+            .status()
+            .models
+            .into_iter()
+            .map(|item| item.model)
+            .collect::<std::collections::HashSet<_>>();
+        let candidates = remote
+            .into_iter()
+            .map(|c| {
+                let mut types = vec!["TEXT".to_string()];
+                if c.supports_vision {
+                    types.push("IMAGE".to_string());
+                }
+                ModelCatalogCandidate {
+                    display_name: display_name_for_model(&c.model),
+                    in_catalog: existing.contains(&c.model),
+                    has_pricing: c.has_pricing,
+                    max_input_tokens: c.max_input_tokens,
+                    max_output_tokens: c.max_output_tokens,
+                    supports_prompt_caching: c.supports_prompt_caching,
+                    supported_input_types: types,
+                    model: c.model,
+                }
+            })
+            .collect();
+        Ok(ModelCatalogDiscoverResponse {
+            source: "litellm".to_string(),
+            source_url: crate::anthropic::pricing::remote_model_source_url().to_string(),
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            candidates,
+        })
+    }
+
+    /// 把用户确认的候选加入目录（来源记为 synced）。已存在的跳过，不覆盖手动与种子条目。
+    pub async fn adopt_model_catalog(
+        &self,
+        request: ModelCatalogAdoptRequest,
+    ) -> Result<ModelCatalogAdoptResponse, AdminServiceError> {
+        if request.models.is_empty() {
+            return Err(AdminServiceError::InvalidRequest(
+                "没有选择任何模型".to_string(),
+            ));
+        }
+        let remote = self
+            .pricing_catalog
+            .fetch_remote_model_candidates()
+            .await
+            .map_err(|err| AdminServiceError::InternalError(format!("拉取模型来源失败: {err}")))?
+            .into_iter()
+            .map(|c| (c.model.clone(), c))
+            .collect::<std::collections::HashMap<_, _>>();
+        let existing = self
+            .model_capabilities
+            .status()
+            .models
+            .into_iter()
+            .map(|item| item.model)
+            .collect::<std::collections::HashSet<_>>();
+        let mut added = Vec::new();
+        let mut skipped = Vec::new();
+        for raw in request.models {
+            let model = normalize_model_id(&raw);
+            if existing.contains(&model) {
+                skipped.push(model);
+                continue;
+            }
+            let Some(c) = remote.get(&model) else {
+                skipped.push(model);
+                continue;
+            };
+            let mut types = vec!["TEXT".to_string()];
+            if c.supports_vision {
+                types.push("IMAGE".to_string());
+            }
+            let item = ModelCapabilityItem {
+                listed: request.listed,
+                model: model.clone(),
+                display_name: display_name_for_model(&model),
+                description: None,
+                max_input_tokens: c.max_input_tokens,
+                max_output_tokens: c.max_output_tokens,
+                supports_prompt_caching: c.supports_prompt_caching,
+                supported_input_types: types,
+                source: Some(crate::anthropic::model_capabilities::SYNCED_SOURCE.to_string()),
+            };
+            self.postgres_store
+                .save_manual_model(&item, None, false)
+                .await
+                .map_err(|err| AdminServiceError::InternalError(format!("保存模型失败: {err}")))?;
+            self.model_capabilities.upsert_catalog_item(item);
+            added.push(model);
+        }
+        if !added.is_empty() {
+            self.audit(
+                "adopt_model_catalog",
+                "model_capabilities",
+                None,
+                true,
+                None,
+                json!({ "added": added, "skipped": skipped, "listed": request.listed }),
+            );
+        }
+        Ok(ModelCatalogAdoptResponse {
+            added,
+            skipped,
+            status: self.model_capabilities.status(),
+        })
+    }
+
     /// 删除手动模型补充。只允许删除 source=manual 的模型，避免误删上游同步模型。
     pub async fn delete_manual_model(
         &self,
@@ -4251,4 +4370,39 @@ pub(crate) fn validate_accounts_config(config: &AccountsConfig) -> Result<(), St
         return Err("wireDebugMaxFiles 不能大于 100000".to_string());
     }
     Ok(())
+}
+
+/// 由模型 id 推导展示名：`claude-fable-5-1` → `Claude Fable 5.1`，`claude-opus-4-5-20251101` → `Claude Opus 4.5 (2025-11-01)`。
+pub(crate) fn display_name_for_model(model: &str) -> String {
+    let mut parts: Vec<&str> = model.split('-').collect();
+    let date = parts
+        .last()
+        .filter(|p| p.len() == 8 && p.bytes().all(|b| b.is_ascii_digit()))
+        .map(|p| format!("{}-{}-{}", &p[..4], &p[4..6], &p[6..8]));
+    if date.is_some() {
+        parts.pop();
+    }
+    let mut words = Vec::new();
+    let mut version = Vec::new();
+    for part in parts {
+        if part.bytes().all(|b| b.is_ascii_digit()) {
+            version.push(part);
+        } else {
+            let mut chars = part.chars();
+            let word = match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            };
+            words.push(word);
+        }
+    }
+    let mut name = words.join(" ");
+    if !version.is_empty() {
+        name.push(' ');
+        name.push_str(&version.join("."));
+    }
+    if let Some(date) = date {
+        name.push_str(&format!(" ({date})"));
+    }
+    name
 }

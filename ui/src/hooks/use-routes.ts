@@ -3,11 +3,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 export function useRoutes() {
   return useQuery({ queryKey: ["routes"], queryFn: getRoutes });
 }
-export function useRouteEffective(prefix: string, enabled: boolean) {
+export function useRouteEffective(id: number, enabled: boolean) {
   return useQuery({
-    queryKey: ["route-effective", prefix],
-    queryFn: () => getRouteEffective(prefix),
-    enabled,
+    queryKey: ["route-effective", id],
+    queryFn: () => getRouteEffective(id),
+    enabled: enabled && id > 0,
   });
 }
 export function useUpdateRoutes() {

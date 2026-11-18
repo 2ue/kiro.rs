@@ -48,6 +48,10 @@ impl RouteRule {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteConfig {
+    /// 稳定标识。控制台用它拼 URL、做引用；前缀只是入口路径，可能重命名。
+    /// 旧配置没有这个字段时为 0，加载与保存时由 `assign_route_ids` 补齐。
+    #[serde(default)]
+    pub id: u64,
     pub prefix: String,
     #[serde(default)]
     pub name: String,
@@ -70,6 +74,7 @@ impl RouteConfig {
     pub fn new(prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
         Self {
+            id: 0,
             name: prefix.clone(),
             prefix,
             enabled: true,
@@ -141,6 +146,20 @@ fn prefix_matches(prefix: &str, endpoint: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 impl RoutesConfig {
+    /// 给没有 id 的路由分配 id：取现有最大 id 顺延，保证已有 id 不变。重复 id 视为无效。
+    pub fn assign_route_ids(mut self) -> Self {
+        let mut next = self.routes.iter().map(|route| route.id).max().unwrap_or(0) + 1;
+        for route in &mut self.routes {
+            if route.id == 0 {
+                route.id = next;
+                next += 1;
+            }
+        }
+        self
+    }
+    pub fn route_by_id(&self, id: u64) -> Option<&RouteConfig> {
+        self.routes.iter().find(|route| route.id == id)
+    }
     pub fn with_builtin_path_defaults(mut self) -> Self {
         for prefix in BUILTIN_ROUTE_PREFIXES {
             if self
@@ -170,14 +189,18 @@ impl RoutesConfig {
             }
             self.routes.push(route);
         }
-        self
+        self.assign_route_ids()
     }
     pub fn validate(&self) -> Result<(), String> {
         let mut seen = BTreeSet::new();
+        let mut seen_ids = BTreeSet::new();
         for route in &self.routes {
             let prefix = validate_route_prefix(&route.prefix)?;
             if !seen.insert(prefix.clone()) {
                 return Err(format!("重复路由前缀: {prefix}"));
+            }
+            if route.id != 0 && !seen_ids.insert(route.id) {
+                return Err(format!("重复路由 id: {}", route.id));
             }
             if route
                 .account_rule
@@ -575,6 +598,32 @@ mod tests {
             routes.routes.push(RouteConfig::new(duplicate));
             assert!(routes.validate().is_err(), "{duplicate}");
         }
+    }
+
+    #[test]
+    fn route_ids_are_assigned_once_and_kept_stable() {
+        let routes = RoutesConfig::default();
+        let ids = routes.routes.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4], "内置四条按顺序拿到 1..4");
+        let mut routes = routes;
+        routes.routes.push(RouteConfig::new("/dfcache/team"));
+        let routes = routes.assign_route_ids();
+        assert_eq!(routes.route_by_id(5).unwrap().prefix, "/dfcache/team");
+        // 删掉中间一条再补，不复用旧 id
+        let mut routes = routes;
+        routes.routes.retain(|r| r.id != 2);
+        routes.routes.push(RouteConfig::new("/dfcache/other"));
+        let routes = routes.assign_route_ids();
+        assert_eq!(routes.route_by_id(6).unwrap().prefix, "/dfcache/other");
+        assert!(routes.route_by_id(2).is_none());
+        // 旧 JSON 没有 id 字段也能解析并补齐
+        let parsed: RoutesConfig =
+            serde_json::from_str(r#"[{"prefix":"/cc"},{"prefix":"/dfcache/x"}]"#).unwrap();
+        let parsed = parsed.with_builtin_path_defaults();
+        assert!(parsed.routes.iter().all(|r| r.id > 0));
+        let mut dup = RoutesConfig::default();
+        dup.routes[1].id = dup.routes[0].id;
+        assert!(dup.validate().is_err());
     }
 
     /// 自定义路由只接受 /dfcache/{name}：任意根级前缀会和内置入口、/api、/ui 抢路径，必须拒绝。

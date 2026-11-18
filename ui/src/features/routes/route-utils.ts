@@ -12,8 +12,9 @@ export function normalizeRoutePrefix(prefix: string): string {
 export function displayRoutePrefix(prefix: string): string {
   return normalizeRoutePrefix(prefix) || "/";
 }
-export function routeEditorPath(prefix: string): string {
-  return `/routes/${prefix ? encodeURIComponent(prefix) : "_root"}`;
+/** 编辑页地址只放 id，前缀不进 URL。 */
+export function routeEditorPath(id: number): string {
+  return `/routes/${id}`;
 }
 export function isBuiltinRoute(prefix: string): boolean {
   return (BUILTIN_ROUTE_PREFIXES as readonly string[]).includes(normalizeRoutePrefix(prefix));

@@ -195,6 +195,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/model-pricing/sync", post(sync_model_pricing))
         .route("/model-capabilities", get(get_model_capabilities))
         .route("/model-capabilities/manual", post(upsert_manual_model))
+        .route("/model-capabilities/discover", post(discover_model_catalog))
+        .route("/model-capabilities/adopt", post(adopt_model_catalog))
         .route(
             "/model-capabilities/manual/{model}",
             delete(delete_manual_model),

@@ -1,24 +1,23 @@
 import {
 EmptyState,
 ErrorState,
+Field,
+FieldGrid,
 LoadingState,
+ModalShell,
 PageContainer,
 PageHeader,
 SectionCard,
+Toolbar,
+ToolbarActions,
+ToolbarSearch,
 useConfirm,
 } from '@/components/patterns'
 import {
 Badge,
 Button,
 Checkbox,
-Dialog,
-DialogBody,
-DialogContent,
-DialogFooter,
-DialogHeader,
-DialogTitle,
 Input,
-Label,
 Spinner,
 Switch,
 Table,
@@ -29,7 +28,7 @@ TableHeader,
 TableRow,
 Textarea,
 } from '@/components/ui'
-import { useSetModelListed } from '@/hooks/use-models'
+import { useAdoptModelCatalog, useDiscoverModelCatalog, useSetModelListed } from '@/hooks/use-models'
 import {
 useDeleteManualModel,
 useModelCapabilities,
@@ -37,16 +36,17 @@ useModelPricing,
 useSyncModelPricing,
 useUpsertManualModel,
 } from '@/hooks/use-usage'
-import { formatNumber } from '@/lib/format'
+import { formatDate, formatNumber } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
-import type { ModelCapabilityItem,ModelPriceItem,ModelPricing,UpsertManualModelRequest } from '@/types/api'
+import type { ModelCapabilityItem,ModelCatalogCandidate,ModelCatalogDiscoverResponse,ModelPriceItem,ModelPricing,UpsertManualModelRequest } from '@/types/api'
 import {
+CloudDownload,
+Pencil,
 Plus,
 RefreshCw,
 Trash2,
 } from 'lucide-react'
 import { useEffect,useMemo,useState } from 'react'
-import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
@@ -68,16 +68,21 @@ function formatUsdPerM(perToken?: number): string {
 }
 
 function sourceLabel(source?: string): string {
-  if (!source) return '同步'
-  if (source === 'manual') return '手动'
-  if (source === 'built-in') return '内置'
-  if (source === 'litellm') return '价格源'
-  return source
+  switch (source) {
+    case 'manual': return '手动添加'
+    case 'synced': return '同步加入'
+    case 'anthropic-seed':
+    case 'built-in': return '内置'
+    case 'litellm': return '价格源'
+    case undefined: return '同步'
+    default: return source
+  }
 }
 
 function sourceTone(source?: string): 'neutral' | 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info' {
   if (source === 'manual') return 'primary'
-  if (source === 'built-in') return 'secondary'
+  if (source === 'synced') return 'info'
+  if (source === 'built-in' || source === 'anthropic-seed') return 'secondary'
   if (source === 'litellm') return 'success'
   return 'neutral'
 }
@@ -261,18 +266,27 @@ export function ModelsPage() {
   const pricing = useModelPricing()
   const syncPrice = useSyncModelPricing()
   const deleteModel = useDeleteManualModel()
+  const discover = useDiscoverModelCatalog()
   const confirm = useConfirm()
 
   const [editTarget, setEditTarget] = useState<ModelCapabilityItem | null>(null)
   const [addOpen, setAddOpen] = useState(false)
+  const [discovered, setDiscovered] = useState<ModelCatalogDiscoverResponse | null>(null)
+  const [search, setSearch] = useState('')
+  const [onlyListed, setOnlyListed] = useState(false)
 
   const models = capabilities.data?.models ?? []
   const priceIndex = useMemo(() => pricingIndex(pricing.data?.models ?? []), [pricing.data?.models])
+  const keyword = search.trim().toLowerCase()
+  const visible = models.filter((m) =>
+    (!keyword || `${m.model} ${m.displayName}`.toLowerCase().includes(keyword)) && (!onlyListed || m.listed),
+  )
+  const listedCount = models.filter((m) => m.listed).length
 
   const handleDelete = async (item: ModelCapabilityItem) => {
     const ok = await confirm({
-      title: '删除手动模型',
-      message: `确定删除手动添加的模型 "${item.model}"？此操作无法撤销。`,
+      title: '删除模型',
+      message: `确定删除「${item.model}」？此操作无法撤销。`,
       confirmText: '删除',
       tone: 'danger',
     })
@@ -283,24 +297,22 @@ export function ModelsPage() {
     })
   }
 
-  const capLastSync = capabilities.data?.lastSyncedAt
-    ? new Date(capabilities.data.lastSyncedAt).toLocaleString('zh-CN')
-    : '—'
-  const priceLastSync = pricing.data?.lastSyncedAt
-    ? new Date(pricing.data.lastSyncedAt).toLocaleString('zh-CN')
-    : '—'
+  const startDiscover = () =>
+    discover.mutate(undefined, {
+      onSuccess: (data) => setDiscovered(data),
+      onError: (e) => toast.error(`拉取模型来源失败: ${extractErrorMessage(e)}`),
+    })
+
+  const capLastSync = capabilities.data?.lastSyncedAt ? formatDate(capabilities.data.lastSyncedAt) : '—'
+  const priceLastSync = pricing.data?.lastSyncedAt ? formatDate(pricing.data.lastSyncedAt) : '—'
 
   return (
     <PageContainer>
-      <Button variant="outline" asChild><Link to="/accounts">从账号发现加入目录</Link></Button>
       <PageHeader
-        title="模型能力"
-        subtitle="查看同步来的模型列表、手动维护能力参数；价格会用于用量页的成本估算和明细分析"
         actions={
           <div className="flex items-center gap-2">
             <Button
               variant="outline"
-              size="sm"
               disabled={syncPrice.isPending}
               onClick={() =>
                 syncPrice.mutate(undefined, {
@@ -309,59 +321,139 @@ export function ModelsPage() {
                 })
               }
             >
-              {syncPrice.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
+              {syncPrice.isPending ? <Spinner size="sm" /> : <RefreshCw />}
               同步价格
             </Button>
-            <Button size="sm" onClick={() => setAddOpen(true)}>
-              <Plus className="h-4 w-4" />
+            <Button variant="outline" disabled={discover.isPending} onClick={startDiscover}>
+              {discover.isPending ? <Spinner size="sm" /> : <CloudDownload />}
+              从来源同步模型
+            </Button>
+            <Button onClick={() => setAddOpen(true)}>
+              <Plus />
               手动添加
             </Button>
           </div>
         }
       />
 
-      {/* 同步状态摘要 */}
       <div className="grid gap-3 sm:grid-cols-2">
-        <SectionCard title="能力目录" description={`来源: ${capabilities.data?.source ?? '—'} · 最后同步: ${capLastSync}`}>
+        <SectionCard title="模型目录" description={`来源: ${sourceLabel(capabilities.data?.source)} · 最后同步: ${capLastSync}`}>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Badge tone={capabilities.data?.available ? 'success' : 'error'}>
-                {capabilities.data?.available ? '可用' : '不可用'}
-              </Badge>
-              <span className="text-sm text-muted-foreground">
-                共 {formatNumber(capabilities.data?.modelCount ?? 0)} 个模型
-              </span>
+              <Badge tone={capabilities.data?.available ? 'success' : 'error'}>{capabilities.data?.available ? '可用' : '不可用'}</Badge>
+              <span className="text-sm text-muted-foreground">共 {formatNumber(models.length)} 个模型，对外列出 {formatNumber(listedCount)} 个</span>
             </div>
             {capabilities.data?.lastError && (
-              <div className="whitespace-pre-wrap break-words rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
-                {capabilities.data.lastError}
-              </div>
+              <div className="whitespace-pre-wrap break-words rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">{capabilities.data.lastError}</div>
             )}
           </div>
         </SectionCard>
-        <SectionCard title="价格目录" description={`来源: ${pricing.data?.source ?? '—'} · 最后同步: ${priceLastSync}`}>
+        <SectionCard title="价格目录" description={`来源: ${sourceLabel(pricing.data?.source)} · 最后同步: ${priceLastSync}`}>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Badge tone={pricing.data?.available ? 'success' : 'error'}>
-                {pricing.data?.available ? '可用' : '不可用'}
-              </Badge>
-              <span className="text-sm text-muted-foreground">
-                共 {formatNumber(pricing.data?.modelCount ?? 0)} 个模型
-              </span>
+              <Badge tone={pricing.data?.available ? 'success' : 'error'}>{pricing.data?.available ? '可用' : '不可用'}</Badge>
+              <span className="text-sm text-muted-foreground">共 {formatNumber(pricing.data?.modelCount ?? 0)} 个模型有价格</span>
             </div>
             {pricing.data?.lastError && (
-              <div className="whitespace-pre-wrap break-words rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
-                {pricing.data.lastError}
-              </div>
+              <div className="whitespace-pre-wrap break-words rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">{pricing.data.lastError}</div>
             )}
           </div>
         </SectionCard>
       </div>
 
-      {/* 模型能力清单 */}
       <SectionCard
-        title="模型价格目录"
-        description={pricing.data?.sourceUrl || '同步后展示当前可用于计费和成本估算的模型价格'}
+        title="模型清单"
+        description="对外 /v1/models 只返回“列出”打开的模型。内置与同步加入的模型不可删除；手动添加的可编辑或删除。价格按模型名匹配价格目录。"
+        noPadding
+      >
+        <div className="border-b px-4 py-3">
+          <Toolbar>
+            <ToolbarSearch value={search} onChange={setSearch} placeholder="搜索模型 ID 或显示名" />
+            <ToolbarActions>
+              <label className="flex items-center gap-2 text-sm">
+                <Switch checked={onlyListed} onCheckedChange={setOnlyListed} aria-label="只看已列出" />
+                只看已列出
+              </label>
+              <span className="text-xs text-muted-foreground">{visible.length} / {models.length}</span>
+            </ToolbarActions>
+          </Toolbar>
+        </div>
+        {capabilities.isLoading ? (
+          <LoadingState text="加载模型列表..." className="py-8" />
+        ) : capabilities.error ? (
+          <ErrorState message={extractErrorMessage(capabilities.error)} />
+        ) : models.length === 0 ? (
+          <EmptyState title="暂无模型" description="从来源同步，或手动添加" action={<Button size="sm" onClick={startDiscover}><CloudDownload />从来源同步模型</Button>} />
+        ) : visible.length === 0 ? (
+          <EmptyState title="没有匹配的模型" description="换个关键字或取消筛选。" />
+        ) : (
+          <div className="scrollbar-thin overflow-x-auto">
+            <Table className="min-w-[960px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-10 text-right">#</TableHead>
+                  <TableHead>模型 ID</TableHead>
+                  <TableHead>显示名称</TableHead>
+                  <TableHead className="text-right">最大输入</TableHead>
+                  <TableHead className="text-right">最大输出</TableHead>
+                  <TableHead>缓存</TableHead>
+                  <TableHead className="text-right">输入 $/M</TableHead>
+                  <TableHead className="text-right">输出 $/M</TableHead>
+                  <TableHead className="text-right">缓存读 $/M</TableHead>
+                  <TableHead>列出</TableHead>
+                  <TableHead>来源</TableHead>
+                  <TableHead className="w-20" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {visible.map((item, index) => {
+                  const price = findPricing(priceIndex, item.model)?.pricing
+                  const manual = isManual(item)
+                  return (
+                    <TableRow key={item.model} className={item.listed ? undefined : 'opacity-60'}>
+                      <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">{index + 1}</TableCell>
+                      <TableCell className="font-mono text-xs max-w-[220px]"><div className="truncate" title={item.model}>{item.model}</div></TableCell>
+                      <TableCell className="text-sm text-muted-foreground max-w-[160px]"><div className="truncate">{item.displayName || '—'}</div></TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{formatTokens(item.maxInputTokens)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{formatTokens(item.maxOutputTokens)}</TableCell>
+                      <TableCell>{item.supportsPromptCaching ? <Badge size="xs" tone="success">支持</Badge> : <span className="text-xs text-muted-foreground/50">—</span>}</TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(price?.inputCostPerToken)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(price?.outputCostPerToken)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(price?.cacheReadInputTokenCost)}</TableCell>
+                      <TableCell>
+                        <Switch
+                          checked={item.listed}
+                          disabled={listedMutation.isPending}
+                          aria-label={`对外列出 ${item.model}`}
+                          onCheckedChange={(listed) =>
+                            listedMutation.mutate({ model: item.model, listed }, {
+                              onSuccess: () => toast.success(listed ? `${item.model} 已对外列出` : `${item.model} 已隐藏`),
+                              onError: (error) => toast.error(extractErrorMessage(error)),
+                            })
+                          }
+                        />
+                      </TableCell>
+                      <TableCell><Badge size="xs" tone={sourceTone(manual ? 'manual' : item.source)}>{sourceLabel(manual ? 'manual' : item.source)}</Badge></TableCell>
+                      <TableCell>
+                        {manual && (
+                          <div className="flex items-center gap-1">
+                            <Button variant="ghost" size="icon-xs" title="编辑" aria-label={`编辑 ${item.model}`} onClick={() => setEditTarget(item)}><Pencil /></Button>
+                            <Button variant="ghost" size="icon-xs" className="text-destructive hover:text-destructive" title="删除" aria-label={`删除 ${item.model}`} onClick={() => handleDelete(item)}><Trash2 /></Button>
+                          </div>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="价格目录"
+        description={pricing.data?.sourceUrl || '同步后展示用于计费和成本估算的模型价格'}
         noPadding
       >
         {pricing.isLoading ? (
@@ -372,28 +464,25 @@ export function ModelsPage() {
           <EmptyState title="暂无价格数据" description="点击「同步价格」获取模型价格目录" />
         ) : (
           <div className="scrollbar-thin overflow-x-auto">
-            <Table className="min-w-[960px]">
+            <Table className="min-w-[860px]">
               <TableHeader>
                 <TableRow>
+                  <TableHead className="w-10 text-right">#</TableHead>
                   <TableHead>模型 ID</TableHead>
-                  <TableHead>listed</TableHead>
                   <TableHead>来源</TableHead>
-                  <TableHead className="text-right">输入价格/M</TableHead>
-                  <TableHead className="text-right">输出价格/M</TableHead>
-                  <TableHead className="text-right">缓存写入 5 分钟/M</TableHead>
-                  <TableHead className="text-right">缓存写入 1 小时/M</TableHead>
-                  <TableHead className="text-right">缓存读取/M</TableHead>
+                  <TableHead className="text-right">输入 $/M</TableHead>
+                  <TableHead className="text-right">输出 $/M</TableHead>
+                  <TableHead className="text-right">缓存写 5 分钟 $/M</TableHead>
+                  <TableHead className="text-right">缓存写 1 小时 $/M</TableHead>
+                  <TableHead className="text-right">缓存读 $/M</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {pricing.data.models.map((item) => (
+                {pricing.data.models.map((item, index) => (
                   <TableRow key={item.model}>
-                    <TableCell className="font-mono text-xs max-w-[260px]">
-                      <div className="truncate" title={item.model}>{item.model}</div>
-                    </TableCell>
-                    <TableCell>
-                      <Badge tone={sourceTone(item.source)}>{sourceLabel(item.source)}</Badge>
-                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">{index + 1}</TableCell>
+                    <TableCell className="font-mono text-xs max-w-[260px]"><div className="truncate" title={item.model}>{item.model}</div></TableCell>
+                    <TableCell><Badge size="xs" tone={sourceTone(item.source)}>{sourceLabel(item.source)}</Badge></TableCell>
                     <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.inputCostPerToken)}</TableCell>
                     <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.outputCostPerToken)}</TableCell>
                     <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.cacheCreationInputTokenCost)}</TableCell>
@@ -407,144 +496,101 @@ export function ModelsPage() {
         )}
       </SectionCard>
 
-
-
-      <SectionCard
-        title="模型清单"
-        description="系统同步的模型不可删除，手动添加的可编辑或删除；价格列会按模型名兼容匹配当前价格目录"
-        noPadding
-      >
-        {capabilities.isLoading ? (
-          <LoadingState text="加载模型列表..." className="py-8" />
-        ) : capabilities.error ? (
-          <ErrorState message={extractErrorMessage(capabilities.error)} />
-        ) : models.length === 0 ? (
-          <EmptyState
-            title="暂无模型"
-            description="点击「同步能力」获取最新模型列表，或手动添加"
-            action={
-              <Button size="sm" onClick={() => setAddOpen(true)}>
-                <Plus className="h-4 w-4" />手动添加
-              </Button>
-            }
-          />
-        ) : (
-          <div className="scrollbar-thin overflow-x-auto">
-            <Table className="min-w-[1100px]">
-              <TableHeader>
-                <TableRow>
-                  <TableHead>模型 ID</TableHead>
-                  <TableHead>显示名称</TableHead>
-                  <TableHead className="text-right">最大输入</TableHead>
-                  <TableHead className="text-right">最大输出</TableHead>
-                  <TableHead>缓存支持</TableHead>
-                  <TableHead>输入类型</TableHead>
-                  <TableHead className="text-right">输入价格/M</TableHead>
-                  <TableHead className="text-right">输出价格/M</TableHead>
-                  <TableHead className="text-right">缓存写入 5 分钟/M</TableHead>
-                  <TableHead className="text-right">缓存写入 1 小时/M</TableHead>
-                  <TableHead className="text-right">缓存读取/M</TableHead>
-                  <TableHead>listed</TableHead>
-                  <TableHead>来源</TableHead>
-                  <TableHead className="w-20" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {models.map((item) => {
-                  const priceItem = findPricing(priceIndex, item.model)
-                  const price = priceItem?.pricing
-                  const manual = isManual(item)
-                  return (
-                    <TableRow key={item.model}>
-                      <TableCell className="font-mono text-xs max-w-[180px]">
-                        <div className="truncate" title={item.model}>{item.model}</div>
-                      </TableCell>
-                      <TableCell className="text-sm text-muted-foreground max-w-[140px]">
-                        <div className="truncate">{item.displayName || '—'}</div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
-                        {formatTokens(item.maxInputTokens)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
-                        {formatTokens(item.maxOutputTokens)}
-                      </TableCell>
-                      <TableCell>
-                        {item.supportsPromptCaching ? (
-                          <Badge tone="success">支持</Badge>
-                        ) : (
-                          <span className="text-xs text-muted-foreground/50">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="max-w-[140px] text-xs text-muted-foreground">
-                        <div className="truncate" title={item.supportedInputTypes?.join(', ') || ''}>
-                          {item.supportedInputTypes?.length ? item.supportedInputTypes.join(', ') : '—'}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
-                        {formatUsdPerM(price?.inputCostPerToken)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
-                        {formatUsdPerM(price?.outputCostPerToken)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
-                        {formatUsdPerM(price?.cacheCreationInputTokenCost)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
-                        {formatUsdPerM(price?.cacheCreation1hInputTokenCost)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs tabular-nums">
-                        {formatUsdPerM(price?.cacheReadInputTokenCost)}
-                      </TableCell>
-                      <TableCell><Switch checked={item.listed} disabled={listedMutation.isPending} onCheckedChange={listed => listedMutation.mutate({model:item.model,listed}, {onError:error=>toast.error(extractErrorMessage(error))})}/></TableCell>
-                      <TableCell>
-                        <Badge tone={sourceTone(item.source)}>
-                          {sourceLabel(manual ? 'manual' : item.source)}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        {manual && (
-                          <div className="flex items-center gap-1">
-                            <Button
-                              variant="ghost"
-                              size="xs"
-                              onClick={() => setEditTarget(item)}
-                            >
-                              编辑
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="xs"
-                              className="text-destructive hover:text-destructive"
-                              onClick={() => handleDelete(item)}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </Button>
-                          </div>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-      </SectionCard>
-
-      {/* 弹窗 */}
-      <EditModelDialog
-        open={addOpen}
-        onClose={() => setAddOpen(false)}
-      />
+      <EditModelDialog open={addOpen} onClose={() => setAddOpen(false)} />
       {editTarget && (
-        <EditModelDialog
-          open
-          initial={editTarget}
-          initialPricing={findPricing(priceIndex, editTarget.model)?.pricing}
-          onClose={() => setEditTarget(null)}
-        />
+        <EditModelDialog open initial={editTarget} initialPricing={findPricing(priceIndex, editTarget.model)?.pricing} onClose={() => setEditTarget(null)} />
       )}
+      {discovered && <DiscoverDialog data={discovered} onClose={() => setDiscovered(null)} />}
     </PageContainer>
+  )
+}
+
+// ─── 从来源同步：弹层确认 ────────────────────────────────────────────────────
+
+function DiscoverDialog({ data, onClose }: { data: ModelCatalogDiscoverResponse; onClose: () => void }) {
+  const adopt = useAdoptModelCatalog()
+  const fresh = data.candidates.filter((c) => !c.inCatalog)
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(fresh.map((c) => c.model)))
+  const [listed, setListed] = useState(true)
+  const toggle = (model: string, on: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (on) next.add(model)
+      else next.delete(model)
+      return next
+    })
+  const row = (c: ModelCatalogCandidate) => (
+    <div key={c.model} className={`flex items-center gap-3 px-3 py-2 ${c.inCatalog ? 'opacity-60' : 'hover:bg-muted/30'}`}>
+      <Checkbox checked={c.inCatalog || selected.has(c.model)} disabled={c.inCatalog} onCheckedChange={(v) => toggle(c.model, v === true)} aria-label={`选择 ${c.model}`} />
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-mono text-sm">{c.model}</span>
+          <span className="text-xs text-muted-foreground">{c.displayName}</span>
+          {c.inCatalog && <Badge size="xs" tone="neutral">已在目录</Badge>}
+          {!c.hasPricing && <Badge size="xs" tone="warning">无价格</Badge>}
+        </div>
+      </div>
+      <span className="shrink-0 font-mono text-xs text-muted-foreground">{formatTokens(c.maxInputTokens)} / {formatTokens(c.maxOutputTokens)}</span>
+    </div>
+  )
+  return (
+    <ModalShell
+      open
+      onClose={onClose}
+      title="从来源同步模型"
+      description={`来源 ${data.source}，${formatDate(data.fetchedAt)} 拉取。勾选要加入目录的模型，确认后才会写入；已在目录里的不会被改动。`}
+      width="max-w-3xl"
+      footer={
+        <>
+          <label className="mr-auto flex items-center gap-2 text-sm">
+            <Switch checked={listed} onCheckedChange={setListed} aria-label="加入后对外列出" />
+            加入后对外列出
+          </label>
+          <Button variant="outline" onClick={onClose} disabled={adopt.isPending}>取消</Button>
+          <Button
+            disabled={adopt.isPending || selected.size === 0}
+            onClick={() =>
+              adopt.mutate({ models: Array.from(selected), listed }, {
+                onSuccess: (res) => {
+                  toast.success(`已加入 ${res.added.length} 个模型${res.skipped.length ? `，跳过 ${res.skipped.length} 个` : ''}`)
+                  onClose()
+                },
+                onError: (e) => toast.error(`加入失败: ${extractErrorMessage(e)}`),
+              })
+            }
+          >
+            {adopt.isPending ? <Spinner size="sm" /> : <Plus />}
+            加入所选（{selected.size}）
+          </Button>
+        </>
+      }
+    >
+      {data.candidates.length === 0 ? (
+        <EmptyState title="来源里没有可用的 Claude 模型" />
+      ) : (
+        <div className="space-y-4">
+          {fresh.length > 0 && (
+            <div>
+              <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
+                <span>可加入（{fresh.length}）</span>
+                <span className="flex gap-2">
+                  <Button size="xs" variant="ghost" onClick={() => setSelected(new Set(fresh.map((c) => c.model)))}>全选</Button>
+                  <Button size="xs" variant="ghost" onClick={() => setSelected(new Set())}>清空</Button>
+                </span>
+              </div>
+              <div className="divide-y rounded-md border">{fresh.map(row)}</div>
+            </div>
+          )}
+          {data.candidates.some((c) => c.inCatalog) && (
+            <div>
+              <div className="mb-2 text-xs text-muted-foreground">已在目录（{data.candidates.filter((c) => c.inCatalog).length}）</div>
+              <div className="divide-y rounded-md border">{data.candidates.filter((c) => c.inCatalog).map(row)}</div>
+            </div>
+          )}
+          <p className="text-xs text-muted-foreground">来源地址：<span className="break-all font-mono">{data.sourceUrl}</span></p>
+        </div>
+      )}
+    </ModalShell>
   )
 }
 
@@ -592,172 +638,80 @@ function EditModelDialog({ open, initial, initialPricing, onClose }: EditModelDi
     })
   }
 
+  const num = (key: 'maxInputTokens' | 'maxOutputTokens' | 'inputCostPerMillion' | 'outputCostPerMillion' | 'cacheCreationInputCostPerMillion' | 'cacheCreation1hInputCostPerMillion' | 'cacheReadInputCostPerMillion', label: string, unit: string, extra?: { placeholder?: string; description?: string; step?: string }) => (
+    <Field label={label} htmlFor={`model-${key}`} description={extra?.description}>
+      <div className="flex min-h-9 items-center gap-2">
+        <Input id={`model-${key}`} type="number" inputMode="decimal" className="w-36 shrink-0 tabular-nums" min={0} step={extra?.step ?? '1'} value={form[key]} placeholder={extra?.placeholder} disabled={upsert.isPending} onChange={(e) => update(key, e.target.value)} />
+        <span className="shrink-0 text-xs text-muted-foreground">{unit}</span>
+      </div>
+    </Field>
+  )
   return (
-    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent width="max-w-4xl">
-        <DialogHeader>
-          <DialogTitle>{initial ? '编辑模型能力' : '手动添加模型'}</DialogTitle>
-        </DialogHeader>
-        <DialogBody className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-2">
-            <div className="space-y-1.5">
-              <Label>模型 ID</Label>
-              <Input
-                value={form.model}
-                placeholder="claude-opus-4-5"
-                disabled={!!initial || upsert.isPending}
-                onChange={(e) => update('model', e.target.value)}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label>显示名称（可选）</Label>
-              <Input
-                value={form.displayName}
-                placeholder="Claude Opus 4.5"
-                disabled={upsert.isPending}
-                onChange={(e) => update('displayName', e.target.value)}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label>最大输入 Token</Label>
-              <Input
-                type="number"
-                min={1}
-                value={form.maxInputTokens}
-                placeholder="200000"
-                disabled={upsert.isPending}
-                onChange={(e) => update('maxInputTokens', e.target.value)}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label>最大输出 Token</Label>
-              <Input
-                type="number"
-                min={1}
-                value={form.maxOutputTokens}
-                placeholder="64000"
-                disabled={upsert.isPending}
-                onChange={(e) => update('maxOutputTokens', e.target.value)}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label>输入类型</Label>
-              <div className="flex h-9 items-center gap-4">
-                {(['TEXT', 'IMAGE'] as const).map((type) => (
-                  <label key={type} className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      checked={form.supportedInputTypes[type]}
-                      disabled={upsert.isPending}
-                      onCheckedChange={(checked) => updateInputType(type, checked === true)}
-                    />
-                    {type}
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div className="flex items-center gap-3">
-              <Switch
-                checked={form.supportsPromptCaching}
-                disabled={upsert.isPending}
-                onCheckedChange={(checked) => update('supportsPromptCaching', checked)}
-              />
-              <span className="text-sm">支持 Prompt Caching</span>
-            </div>
-            <div className="space-y-1.5 md:col-span-2">
-              <Label>描述（可选）</Label>
-              <Textarea
-                rows={3}
-                value={form.description}
-                disabled={upsert.isPending}
-                placeholder="用于说明模型能力或适用场景"
-                onChange={(e) => update('description', e.target.value)}
-              />
-            </div>
-          </div>
-
-          <div className="rounded-lg bg-muted/30 p-3">
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <Checkbox
-                checked={form.includePricing}
-                disabled={upsert.isPending}
-                onCheckedChange={(checked) => update('includePricing', checked === true)}
-              />
-              同时维护价格
-            </label>
-            <p className="mt-1 text-xs text-muted-foreground">
-              关闭后保存会清除该手动模型的价格；开启后按每百万 Token 填写，缓存价格留空时使用后端默认规则。
-            </p>
-            {form.includePricing && (
-              <div className="mt-3 grid gap-3 md:grid-cols-4">
-                <div className="space-y-1.5">
-                  <Label>输入 $/M</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    step="0.000001"
-                    value={form.inputCostPerMillion}
-                    disabled={upsert.isPending}
-                    onChange={(e) => update('inputCostPerMillion', e.target.value)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label>输出 $/M</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    step="0.000001"
-                    value={form.outputCostPerMillion}
-                    disabled={upsert.isPending}
-                    onChange={(e) => update('outputCostPerMillion', e.target.value)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label>缓存写入 5 分钟 $/M</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    step="0.000001"
-                    value={form.cacheCreationInputCostPerMillion}
-                    disabled={upsert.isPending}
-                    placeholder="留空按输入 × 1.25"
-                    onChange={(e) => update('cacheCreationInputCostPerMillion', e.target.value)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label>缓存写入 1 小时 $/M</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    step="0.000001"
-                    value={form.cacheCreation1hInputCostPerMillion}
-                    disabled={upsert.isPending}
-                    placeholder="留空按输入 × 2"
-                    onChange={(e) => update('cacheCreation1hInputCostPerMillion', e.target.value)}
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label>缓存读取 $/M</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    step="0.000001"
-                    value={form.cacheReadInputCostPerMillion}
-                    disabled={upsert.isPending}
-                    onChange={(e) => update('cacheReadInputCostPerMillion', e.target.value)}
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-        </DialogBody>
-        <DialogFooter>
-          <Button variant="outline" size="sm" onClick={onClose}>取消</Button>
-          <Button size="sm" disabled={upsert.isPending} onClick={handleSave}>
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title={initial ? `编辑模型 · ${initial.model}` : '手动添加模型'}
+      description={initial ? '只能修改能力参数与价格；模型 ID 不可改。' : '手动添加的模型可随时编辑或删除；价格可选。'}
+      width="max-w-3xl"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose} disabled={upsert.isPending}>取消</Button>
+          <Button disabled={upsert.isPending || !form.model.trim()} onClick={handleSave}>
             {upsert.isPending ? <Spinner size="sm" /> : null}
             保存
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </>
+      }
+    >
+      <div className="space-y-6">
+        <FieldGrid min="16rem">
+          <Field label="模型 ID" htmlFor="model-id" required description="小写，横杠分隔，例如 claude-opus-4-5">
+            <Input id="model-id" value={form.model} placeholder="claude-opus-4-5" disabled={!!initial || upsert.isPending} onChange={(e) => update('model', e.target.value)} />
+          </Field>
+          <Field label="显示名称" htmlFor="model-display" description="留空按模型 ID 推导">
+            <Input id="model-display" value={form.displayName} placeholder="Claude Opus 4.5" disabled={upsert.isPending} onChange={(e) => update('displayName', e.target.value)} />
+          </Field>
+          {num('maxInputTokens', '最大输入', 'Token', { placeholder: '200000' })}
+          {num('maxOutputTokens', '最大输出', 'Token', { placeholder: '64000' })}
+          <Field label="输入类型">
+            <div className="flex min-h-9 items-center gap-4">
+              {(['TEXT', 'IMAGE'] as const).map((type) => (
+                <label key={type} className="flex items-center gap-2 text-sm">
+                  <Checkbox checked={form.supportedInputTypes[type]} disabled={upsert.isPending} onCheckedChange={(checked) => updateInputType(type, checked === true)} />
+                  {type === 'TEXT' ? '文本' : '图片'}
+                </label>
+              ))}
+            </div>
+          </Field>
+          <Field label="Prompt Caching" htmlFor="model-caching">
+            <div className="flex min-h-9 items-center gap-2">
+              <Switch id="model-caching" checked={form.supportsPromptCaching} disabled={upsert.isPending} onCheckedChange={(checked) => update('supportsPromptCaching', checked)} />
+              <span className="text-xs text-muted-foreground">{form.supportsPromptCaching ? '支持' : '不支持'}</span>
+            </div>
+          </Field>
+        </FieldGrid>
+        <Field label="描述" htmlFor="model-desc">
+          <Textarea id="model-desc" rows={2} value={form.description} disabled={upsert.isPending} placeholder="用于说明模型能力或适用场景" onChange={(e) => update('description', e.target.value)} />
+        </Field>
+
+        <section className="space-y-4 rounded-lg border bg-muted/20 p-4">
+          <Field label="同时维护价格" htmlFor="model-pricing-toggle" description="关闭后保存会清除该模型的手动价格；开启后按每百万 Token 填写，缓存价格留空时按后端默认规则推导。">
+            <div className="flex min-h-9 items-center gap-2">
+              <Switch id="model-pricing-toggle" checked={form.includePricing} disabled={upsert.isPending} onCheckedChange={(checked) => update('includePricing', checked)} />
+              <span className="text-xs text-muted-foreground">{form.includePricing ? '维护' : '不维护'}</span>
+            </div>
+          </Field>
+          {form.includePricing && (
+            <FieldGrid min="14rem">
+              {num('inputCostPerMillion', '输入', '$/M', { step: '0.000001' })}
+              {num('outputCostPerMillion', '输出', '$/M', { step: '0.000001' })}
+              {num('cacheCreationInputCostPerMillion', '缓存写 5 分钟', '$/M', { step: '0.000001', placeholder: '输入 × 1.25' })}
+              {num('cacheCreation1hInputCostPerMillion', '缓存写 1 小时', '$/M', { step: '0.000001', placeholder: '输入 × 2' })}
+              {num('cacheReadInputCostPerMillion', '缓存读', '$/M', { step: '0.000001' })}
+            </FieldGrid>
+          )}
+        </section>
+      </div>
+    </ModalShell>
   )
 }

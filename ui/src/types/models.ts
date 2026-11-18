@@ -79,3 +79,25 @@ export interface ManualModelResponse {
   message: string;
   model: string;
 }
+
+export interface ModelCatalogCandidate {
+  model: string;
+  displayName: string;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  supportsPromptCaching?: boolean;
+  supportedInputTypes: string[];
+  inCatalog: boolean;
+  hasPricing: boolean;
+}
+export interface ModelCatalogDiscoverResponse {
+  source: string;
+  sourceUrl: string;
+  fetchedAt: string;
+  candidates: ModelCatalogCandidate[];
+}
+export interface ModelCatalogAdoptResponse {
+  added: string[];
+  skipped: string[];
+  status: ModelCapabilitiesStatus;
+}

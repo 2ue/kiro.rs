@@ -38,6 +38,8 @@ fn next_config_generation() -> u64 {
 
 impl RuntimeConfigStore {
     pub fn new(mut initial: Config, postgres: Option<Arc<PostgresStore>>) -> Arc<Self> {
+        // 旧配置的路由没有 id：首次加载就补齐，保证控制台拿到的每条路由都有稳定标识。
+        initial.routes = initial.routes.clone().assign_route_ids();
         initial.compiled_routes = Some(Arc::new(initial.routes.compile_with_config(&initial)));
         Arc::new(Self {
             config: RwLock::new(Arc::new(initial)),
@@ -141,6 +143,7 @@ impl RuntimeConfigStore {
         mut config: Config,
         reason: RuntimeConfigChangeReason,
     ) {
+        config.routes = config.routes.clone().assign_route_ids();
         config.compiled_routes = Some(Arc::new(config.routes.compile_with_config(&config)));
         let current = Arc::new(config);
         {

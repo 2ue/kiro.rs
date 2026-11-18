@@ -175,6 +175,53 @@ pub struct CopyAccountRequest {
     pub enabled: bool,
 }
 
+/// 从公信力来源拉到的模型候选：目录里已有的标出来，让用户勾选新增项。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogCandidate {
+    pub model: String,
+    pub display_name: String,
+    pub max_input_tokens: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+    pub supports_prompt_caching: Option<bool>,
+    pub supported_input_types: Vec<String>,
+    /// 已在目录里（含手动与种子）。
+    pub in_catalog: bool,
+    /// 有价格数据。
+    pub has_pricing: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogDiscoverResponse {
+    pub source: String,
+    pub source_url: String,
+    pub fetched_at: String,
+    pub candidates: Vec<ModelCatalogCandidate>,
+}
+
+/// 用户在弹层里确认后批量加入目录。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogAdoptRequest {
+    pub models: Vec<String>,
+    /// 加入后是否对外列出；默认 true。
+    #[serde(default = "default_true_flag")]
+    pub listed: bool,
+}
+
+fn default_true_flag() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogAdoptResponse {
+    pub added: Vec<String>,
+    pub skipped: Vec<String>,
+    pub status: crate::anthropic::model_capabilities::ModelCapabilitiesStatus,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountTestRequest {

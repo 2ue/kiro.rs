@@ -5,7 +5,7 @@ test('前缀归一化、根入口与显示排序', () => {
   for (const prefix of ['', '/', ' /v1/// ']) assert.equal(normalizeRoutePrefix(prefix), '')
   assert.equal(normalizeRoutePrefix(' team/// '), '/team')
   assert.equal(displayRoutePrefix(''), '/')
-  assert.equal(routeEditorPath(''), '/routes/_root')
+  assert.equal(routeEditorPath(3), '/routes/3')
   assert.deepEqual(sortRoutes(['/z','/ha','','/a','/na','/cc'].map(prefix=>({prefix}))).map(r=>r.prefix), ['', '/cc', '/ha', '/na', '/a', '/z'])
 })
 test('账号规则三态的空列表有明确文案', () => {

@@ -52,7 +52,7 @@ import { Field } from "@/components/patterns";
 import { RULE_MODE_OPTIONS } from "@/lib/enum-labels";
 export function RouteEditPage() {
   const params = useParams(),
-    prefix = params.prefix === "_root" ? "" : (params.prefix ?? ""),
+    routeId = Number(params.id ?? 0),
     navigate = useNavigate();
   const routes = useRoutes(),
     runtime = useRuntimeConfig(),
@@ -61,13 +61,22 @@ export function RouteEditPage() {
     update = useUpdateRoutes();
   const [draft, setDraft] = useState<RouteConfig | null>(null),
     [showEffective, setShowEffective] = useState(false);
-  const effective = useRouteEffective(prefix, showEffective);
+  const effective = useRouteEffective(routeId, showEffective);
   useEffect(() => {
-    const route = routes.data?.find((r) => r.prefix === prefix);
+    const route = routes.data?.find((r) => r.id === routeId);
     if (route) setDraft(structuredClone(route));
-  }, [routes.data, prefix]);
+  }, [routes.data, routeId]);
+  const prefix = draft?.prefix ?? "";
   if (routes.isLoading || runtime.isLoading || catalog.isLoading)
     return <LoadingState />;
+  if (!routes.isLoading && routes.data && !routes.data.some((r) => r.id === routeId))
+    return (
+      <ErrorState
+        title={`路由 #${routeId} 不存在`}
+        message="可能已被删除，或链接已过期。"
+        action={<Button variant="outline" onClick={() => navigate("/routes")}><ArrowLeft />返回路由</Button>}
+      />
+    );
   if (routes.error || runtime.error || catalog.error || !draft || !runtime.data)
     return (
       <ErrorState
@@ -127,9 +136,7 @@ export function RouteEditPage() {
               onClick={async () => {
                 try {
                   await update.mutateAsync(
-                    (routes.data ?? []).map((r) =>
-                      r.prefix === prefix ? draft : r,
-                    ),
+                    (routes.data ?? []).map((r) => (r.id === routeId ? draft : r)),
                   );
                   toast.success("路由已保存");
                 } catch (error) {

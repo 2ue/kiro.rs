@@ -359,7 +359,7 @@ function RoutesSnapshot({ routes }: { routes: RouteScenarioContent["routes"] }) 
   return (
     <div className="divide-y rounded-md border text-sm">
       {list.map((route) => (
-        <div key={route.prefix} className="flex flex-wrap items-center gap-2 px-3 py-2">
+        <div key={route.id || route.prefix} className="flex flex-wrap items-center gap-2 px-3 py-2">
           <span className="font-mono">{displayRoutePrefix(route.prefix)}</span>
           {isBuiltinRoute(route.prefix) && <Badge size="xs" tone="secondary">内置</Badge>}
           {!route.enabled && <Badge size="xs" tone="warning">停用</Badge>}
@@ -790,7 +790,7 @@ export function RouteScenariosPage() {
                 <div className="space-y-2 text-sm">
                   <div className="flex flex-wrap gap-1.5">
                     {sortRoutes(scenario.content.routes).map((route) => (
-                      <Badge key={route.prefix} size="xs" tone={route.enabled ? "neutral" : "warning"} className="font-mono">
+                      <Badge key={route.id || route.prefix} size="xs" tone={route.enabled ? "neutral" : "warning"} className="font-mono">
                         {displayRoutePrefix(route.prefix)}{route.enabled ? "" : "（停用）"}
                       </Badge>
                     ))}

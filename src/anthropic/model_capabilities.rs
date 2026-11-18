@@ -13,6 +13,8 @@ fn default_listed() -> bool {
 
 pub const SEED_SOURCE: &str = "anthropic-seed";
 pub const MANUAL_SOURCE: &str = "manual";
+/// 从公信力来源同步并经用户确认加入的模型。
+pub const SYNCED_SOURCE: &str = "synced";
 const SEED_JSON: &str = include_str!("../../data/anthropic-models.seed.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,48 @@ pub struct ModelCapabilitiesStatus {
 impl ModelCapabilitiesStatus {
     pub fn should_refresh_from_seed(&self) -> bool {
         self.source == "built-in"
+    }
+
+    /// 用当前种子对齐已持久化的目录：
+    /// - 种子里有、目录里没有的真实模型补进去；
+    /// - 来源仍是 `anthropic-seed`、但当前种子已不再提供的派生条目（`-thinking` 变体、点号写法）删掉；
+    /// - 手动项、同步加入项、用户改过 listed 的种子项一律不动。
+    ///
+    /// 返回 (新增, 删除) 的模型 id。
+    pub fn merge_missing_seed_models(&mut self) -> (Vec<String>, Vec<String>) {
+        let seed = seed_model_capabilities();
+        let seed_ids = seed
+            .iter()
+            .map(|item| item.model.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut removed = Vec::new();
+        self.models.retain(|item| {
+            let stale_seed_derivative = item.source.as_deref() == Some(SEED_SOURCE)
+                && !seed_ids.contains(&item.model)
+                && (item.model.ends_with("-thinking") || item.model.contains('.'));
+            if stale_seed_derivative {
+                removed.push(item.model.clone());
+            }
+            !stale_seed_derivative
+        });
+        let existing = self
+            .models
+            .iter()
+            .map(|item| item.model.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut added = Vec::new();
+        for item in seed {
+            if existing.contains(&item.model) {
+                continue;
+            }
+            added.push(item.model.clone());
+            self.models.push(item);
+        }
+        if !added.is_empty() || !removed.is_empty() {
+            self.model_count = self.models.len();
+            self.available = !self.models.is_empty();
+        }
+        (added, removed)
     }
 }
 
@@ -131,20 +175,6 @@ impl ModelCapabilitiesCatalog {
 
     pub fn anthropic_models(&self) -> Vec<Model> {
         let status = self.status();
-        let max_input_by_model = status
-            .models
-            .iter()
-            .filter_map(|item| {
-                item.max_input_tokens
-                    .filter(|tokens| *tokens > 0)
-                    .map(|tokens| (item.model.clone(), tokens))
-            })
-            .collect::<HashMap<_, _>>();
-        let upstream_ids = status
-            .models
-            .iter()
-            .map(|item| item.model.clone())
-            .collect::<Vec<_>>();
         let mut models = HashMap::new();
         for item in status.models {
             let created = model_created_at(&item.model);
@@ -166,34 +196,6 @@ impl ModelCapabilitiesCatalog {
                     context_window: max_input_tokens,
                 },
             );
-        }
-        for mut model in static_anthropic_models() {
-            if models.contains_key(&model.id) {
-                continue;
-            }
-            let resolution = resolve_model_with_catalog(&model.id, &upstream_ids);
-            if resolution
-                .upstream_model
-                .as_ref()
-                .and_then(|id| models.get(id))
-                .is_some_and(|entry| !entry.listed)
-            {
-                continue;
-            }
-            if !matches!(
-                resolution.source,
-                ModelResolutionSource::Unsupported | ModelResolutionSource::PassThrough
-            ) {
-                if let Some(max_input_tokens) = resolution
-                    .upstream_model
-                    .as_deref()
-                    .and_then(|model| max_input_by_model.get(model).copied())
-                {
-                    model.max_input_tokens = Some(max_input_tokens);
-                    model.context_window = Some(max_input_tokens);
-                }
-                models.insert(model.id.clone(), model);
-            }
         }
         let mut models: Vec<Model> = models.into_values().collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -329,6 +331,20 @@ impl ModelCapabilitiesCatalog {
 
     pub fn upsert_manual_model(&self, item: ModelCapabilityItem) -> ModelCapabilitiesStatus {
         let Some(item) = sanitize_capability_item(item, MANUAL_SOURCE) else {
+            return self.status();
+        };
+        let mut inner = self.inner.write();
+        inner.models.insert(item.model.clone(), item);
+        inner.status()
+    }
+
+    /// 写入一条带明确来源的目录项（同步确认加入用）。
+    pub fn upsert_catalog_item(&self, item: ModelCapabilityItem) -> ModelCapabilitiesStatus {
+        let source = item
+            .source
+            .clone()
+            .unwrap_or_else(|| SYNCED_SOURCE.to_string());
+        let Some(item) = sanitize_capability_item(item, &source) else {
             return self.status();
         };
         let mut inner = self.inner.write();
@@ -1166,14 +1182,8 @@ fn claude_listing_id(model: &str) -> String {
 /// Listing id for a catalog entry, or `None` for aliases and compatibility variants.
 fn standard_listing_id(model: &str) -> Option<String> {
     let model = normalize_model_id(model);
-    if MODEL_LISTING_ALIASES.contains(&model.as_str()) {
+    if MODEL_LISTING_ALIASES.contains(&model.as_str()) || model == "sonnet-thinking" {
         return None;
-    }
-    // Claude Code 2.1.x validates this explicit thinking alias against `/v1/models`
-    // before sending a request. Keep it discoverable while retaining the older
-    // request-side alias behavior for the other shorthand names.
-    if model == "sonnet-thinking" {
-        return Some(model);
     }
     let (base, thinking) = strip_model_compat_suffixes(&model);
     if thinking || base != model {
@@ -1205,76 +1215,20 @@ fn standardize_model_listing(models: Vec<Model>) -> Vec<Model> {
 }
 
 pub fn static_anthropic_models() -> Vec<Model> {
+    // 仅作 seed JSON 解析失败时的兜底，与 data/anthropic-models.seed.json 保持同一口径：真实模型，不含别名与 thinking 变体。
     let specs = [
-        ("opus", "Claude Code Alias: Opus", 1_776_276_000, 64_000),
-        (
-            "opusplan",
-            "Claude Code Alias: Opus Plan",
-            1_776_276_000,
-            64_000,
-        ),
-        (
-            "best",
-            "Claude Code Alias: Best Available",
-            1_776_276_000,
-            64_000,
-        ),
-        (
-            "default",
-            "Claude Code Alias: Default",
-            1_776_276_000,
-            64_000,
-        ),
-        ("sonnet", "Claude Code Alias: Sonnet", 1_771_286_400, 64_000),
-        (
-            "sonnet-thinking",
-            "Claude Code Alias: Sonnet (Thinking)",
-            1_771_286_400,
-            64_000,
-        ),
-        ("haiku", "Claude Code Alias: Haiku", 1_760_486_400, 64_000),
-        ("claude-opus-4.8", "Claude Opus 4.8", 1_779_926_400, 128_000),
-        (
-            "claude-opus-4.8-thinking",
-            "Claude Opus 4.8 (Thinking)",
-            1_779_926_400,
-            128_000,
-        ),
-        ("claude-opus-4-7", "Claude Opus 4.7", 1_776_276_000, 64_000),
-        (
-            "claude-opus-4-7-thinking",
-            "Claude Opus 4.7 (Thinking)",
-            1_776_276_000,
-            64_000,
-        ),
-        ("claude-opus-4-6", "Claude Opus 4.6", 1_770_163_200, 64_000),
-        (
-            "claude-opus-4-6-thinking",
-            "Claude Opus 4.6 (Thinking)",
-            1_770_163_200,
-            64_000,
-        ),
+        ("claude-opus-4-8", "Claude Opus 4.8", 1_779_926_400, 128_000),
+        ("claude-opus-4-7", "Claude Opus 4.7", 1_776_276_000, 128_000),
+        ("claude-opus-4-6", "Claude Opus 4.6", 1_770_163_200, 128_000),
         (
             "claude-sonnet-4-6",
             "Claude Sonnet 4.6",
             1_771_286_400,
-            64_000,
-        ),
-        (
-            "claude-sonnet-4-6-thinking",
-            "Claude Sonnet 4.6 (Thinking)",
-            1_771_286_400,
-            64_000,
+            128_000,
         ),
         (
             "claude-opus-4-5-20251101",
             "Claude Opus 4.5",
-            1_763_942_400,
-            64_000,
-        ),
-        (
-            "claude-opus-4-5-20251101-thinking",
-            "Claude Opus 4.5 (Thinking)",
             1_763_942_400,
             64_000,
         ),
@@ -1285,20 +1239,8 @@ pub fn static_anthropic_models() -> Vec<Model> {
             64_000,
         ),
         (
-            "claude-sonnet-4-5-20250929-thinking",
-            "Claude Sonnet 4.5 (Thinking)",
-            1_759_104_000,
-            64_000,
-        ),
-        (
             "claude-haiku-4-5-20251001",
             "Claude Haiku 4.5",
-            1_760_486_400,
-            64_000,
-        ),
-        (
-            "claude-haiku-4-5-20251001-thinking",
-            "Claude Haiku 4.5 (Thinking)",
             1_760_486_400,
             64_000,
         ),
@@ -1323,12 +1265,31 @@ pub fn static_anthropic_models() -> Vec<Model> {
 }
 
 fn model_created_at(model: &str) -> i64 {
-    static_anthropic_models()
-        .into_iter()
-        .find(|item| item.id == model)
-        .map(|item| item.created)
-        // Stable fallback so repeated /v1/models calls return identical metadata.
-        .unwrap_or(UNKNOWN_MODEL_CREATED_AT)
+    // 稳定即可：同一模型每次 /v1/models 返回相同元数据。带日期后缀的用日期，否则按版本号排序给一个单调时间。
+    let normalized = normalize_model_id(model);
+    if let Some(date) = normalized
+        .rsplit('-')
+        .next()
+        .filter(|seg| seg.len() == 8 && seg.bytes().all(|b| b.is_ascii_digit()))
+    {
+        let (y, m, d) = (&date[..4], &date[4..6], &date[6..8]);
+        if let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i32>(), m.parse::<u32>(), d.parse::<u32>())
+            && let Some(dt) = chrono::NaiveDate::from_ymd_opt(y, m, d)
+        {
+            return dt
+                .and_hms_opt(0, 0, 0)
+                .map(|t| t.and_utc().timestamp())
+                .unwrap_or(UNKNOWN_MODEL_CREATED_AT);
+        }
+    }
+    let versions = model_version_numbers(&normalized);
+    if versions.is_empty() {
+        return UNKNOWN_MODEL_CREATED_AT;
+    }
+    // 4.5 -> 2025-09, 4.6 -> 2026-02, 5.x -> 2026-06 起；只求单调，不求精确。
+    let major = versions[0] as i64;
+    let minor = versions.get(1).copied().unwrap_or(0) as i64;
+    UNKNOWN_MODEL_CREATED_AT + (major * 12 + minor) * 30 * 86_400
 }
 
 /// 2025-01-01T00:00:00Z，用于上游目录中没有发布时间的模型。
@@ -1339,14 +1300,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn seed_alignment_adds_missing_and_drops_stale_seed_derivatives_only() {
+        let mut status = ModelCapabilitiesStatus {
+            available: true,
+            source: SEED_SOURCE.to_string(),
+            model_count: 0,
+            last_synced_at: None,
+            last_error: None,
+            models: vec![
+                // 旧种子派生条目：应删
+                ModelCapabilityItem {
+                    listed: true,
+                    model: "claude-opus-4-6-thinking".into(),
+                    display_name: "x".into(),
+                    description: None,
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    supports_prompt_caching: None,
+                    supported_input_types: vec![],
+                    source: Some(SEED_SOURCE.into()),
+                },
+                ModelCapabilityItem {
+                    listed: true,
+                    model: "claude-opus-4.6".into(),
+                    display_name: "x".into(),
+                    description: None,
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    supports_prompt_caching: None,
+                    supported_input_types: vec![],
+                    source: Some(SEED_SOURCE.into()),
+                },
+                // 手动加的 thinking 变体：不动
+                ModelCapabilityItem {
+                    listed: true,
+                    model: "claude-opus-4-6-thinking-custom".into(),
+                    display_name: "x".into(),
+                    description: None,
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    supports_prompt_caching: None,
+                    supported_input_types: vec![],
+                    source: Some(MANUAL_SOURCE.into()),
+                },
+                // 用户把 listed 关掉的种子项：保留且不覆盖
+                ModelCapabilityItem {
+                    listed: false,
+                    model: "claude-opus-4-8".into(),
+                    display_name: "Claude Opus 4.8".into(),
+                    description: None,
+                    max_input_tokens: Some(1),
+                    max_output_tokens: Some(1),
+                    supports_prompt_caching: None,
+                    supported_input_types: vec![],
+                    source: Some(SEED_SOURCE.into()),
+                },
+            ],
+        };
+        let (added, removed) = status.merge_missing_seed_models();
+        assert_eq!(
+            removed,
+            vec![
+                "claude-opus-4-6-thinking".to_string(),
+                "claude-opus-4.6".to_string()
+            ]
+        );
+        assert!(added.contains(&"claude-fable-5-1".to_string()));
+        assert!(!added.contains(&"claude-opus-4-8".to_string()));
+        let opus = status
+            .models
+            .iter()
+            .find(|m| m.model == "claude-opus-4-8")
+            .unwrap();
+        assert!(!opus.listed, "用户关掉的 listed 不能被种子覆盖");
+        assert_eq!(opus.max_input_tokens, Some(1));
+        assert!(
+            status
+                .models
+                .iter()
+                .any(|m| m.model == "claude-opus-4-6-thinking-custom")
+        );
+        assert_eq!(status.model_count, status.models.len());
+        // 幂等
+        let (added2, removed2) = status.merge_missing_seed_models();
+        assert!(added2.is_empty() && removed2.is_empty());
+    }
+
+    #[test]
     fn seed_includes_opus_4_8_as_one_m_context_model() {
         let catalog = ModelCapabilitiesCatalog::new();
         let opus = catalog
             .status()
             .models
             .into_iter()
-            .find(|model| model.model == "claude-opus-4.8")
-            .expect("seed should include claude-opus-4.8");
+            .find(|model| model.model == "claude-opus-4-8")
+            .expect("seed should include claude-opus-4-8");
 
         assert_eq!(opus.max_input_tokens, Some(1_000_000));
         assert_eq!(opus.max_output_tokens, Some(128_000));
@@ -1354,8 +1402,8 @@ mod tests {
         let exposed = catalog
             .anthropic_models()
             .into_iter()
-            .find(|model| model.id == "claude-opus-4.8")
-            .expect("models endpoint should expose claude-opus-4.8");
+            .find(|model| model.id == "claude-opus-4-8")
+            .expect("models endpoint should expose claude-opus-4-8");
         assert_eq!(exposed.max_input_tokens, Some(1_000_000));
         assert_eq!(exposed.context_window, Some(1_000_000));
     }
@@ -1382,18 +1430,20 @@ mod tests {
             .map(|item| item.model)
             .collect::<Vec<_>>();
 
+        // 家族归一取同大版本里最接近的小版本：sonnet-4 的旧日期 id 落到 4-5（种子横杠写法）。
         let sonnet = resolve_model_with_catalog("claude-sonnet-4-20250514", &models);
-        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(sonnet.source, ModelResolutionSource::FamilyNormalized);
 
+        // 3.x 没有同大版本候选，按最接近版本落到 4-5。
         let old_sonnet = resolve_model_with_catalog("claude-3-5-sonnet-20241022", &models);
         assert_eq!(
             old_sonnet.upstream_model.as_deref(),
-            Some("claude-sonnet-4.5")
+            Some("claude-sonnet-4-5")
         );
 
         let opus = resolve_model_with_catalog("claude-opus-4-1-20250805", &models);
-        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4.5"));
+        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4-5"));
     }
 
     #[test]
@@ -1415,23 +1465,15 @@ mod tests {
             .map(|item| item.model)
             .collect::<Vec<_>>();
 
+        // 种子不再列 -thinking 变体：带后缀的请求解析到基础模型，thinking 由请求参数承载。
         let result = resolve_model_with_catalog("claude-opus-4-7-thinking[1m]", &models);
-        assert_eq!(
-            result.upstream_model.as_deref(),
-            Some("claude-opus-4-7-thinking")
-        );
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4-7"));
 
         let alternate = resolve_model_with_catalog("claude-opus-4-7[1m]-thinking", &models);
-        assert_eq!(
-            alternate.upstream_model.as_deref(),
-            Some("claude-opus-4-7-thinking")
-        );
+        assert_eq!(alternate.upstream_model.as_deref(), Some("claude-opus-4-7"));
 
         let sonnet = resolve_model_with_catalog("claude-sonnet-4-6-thinking", &models);
-        assert_eq!(
-            sonnet.upstream_model.as_deref(),
-            Some("claude-sonnet-4-6-thinking")
-        );
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4-6"));
     }
 
     #[test]

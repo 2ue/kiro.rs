@@ -72,7 +72,7 @@ const router = createBrowserRouter(
         // 设置域
         { path: 'runtime', element: <Lazy><RuntimePage /></Lazy> },
         { path: 'routes', element: <Lazy><RoutesPage /></Lazy> },
-        { path: 'routes/:prefix', element: <Lazy><RouteEditPage /></Lazy> },
+        { path: 'routes/:id', element: <Lazy><RouteEditPage /></Lazy> },
         { path: 'policy-templates', element: <Lazy><PolicyTemplatesPage /></Lazy> },
         { path: 'settings/transfer', element: <Lazy><ConfigTransferPage /></Lazy> },
         { path: 'route-scenarios', element: <Lazy><RouteScenariosPage /></Lazy> },

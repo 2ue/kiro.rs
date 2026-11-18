@@ -88,6 +88,8 @@ export interface RouteRule {
   rules: string[];
 }
 export interface RouteConfig {
+  /** 稳定标识；新建时为 0，由后端分配。 */
+  id: number;
   prefix: string;
   name: string;
   enabled: boolean;

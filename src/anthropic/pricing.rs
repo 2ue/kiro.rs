@@ -355,6 +355,84 @@ impl PricingCatalog {
     }
 }
 
+/// 从公信力来源（litellm 的 model_prices_and_context_window.json）解析 Anthropic 直供的 Claude 模型。
+/// 只收 `litellm_provider == "anthropic"` 且 `mode == "chat"` 的条目，排除云厂商转售、`-latest` 别名与带日期后缀的重复项以外的所有变体。
+#[derive(Debug, Clone)]
+pub struct RemoteModelCandidate {
+    pub model: String,
+    pub max_input_tokens: Option<i32>,
+    pub max_output_tokens: Option<i32>,
+    pub supports_prompt_caching: Option<bool>,
+    pub supports_vision: bool,
+    pub has_pricing: bool,
+}
+
+pub fn remote_model_source_url() -> &'static str {
+    DEFAULT_PRICING_SOURCE_URL
+}
+
+pub fn parse_remote_model_candidates(value: &serde_json::Value) -> Vec<RemoteModelCandidate> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, entry) in object {
+        let key_lower = key.to_ascii_lowercase();
+        if !key_lower.starts_with("claude-")
+            || key_lower.contains('/')
+            || key_lower.ends_with("-latest")
+        {
+            continue;
+        }
+        let provider = entry
+            .get("litellm_provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mode = entry.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+        if provider != "anthropic" || mode != "chat" {
+            continue;
+        }
+        let as_i32 = |k: &str| {
+            entry
+                .get(k)
+                .and_then(|v| v.as_i64())
+                .filter(|v| *v > 0)
+                .map(|v| v as i32)
+        };
+        let as_bool = |k: &str| entry.get(k).and_then(|v| v.as_bool());
+        out.push(RemoteModelCandidate {
+            model: key_lower.replace('.', "-"),
+            max_input_tokens: as_i32("max_input_tokens"),
+            max_output_tokens: as_i32("max_output_tokens"),
+            supports_prompt_caching: as_bool("supports_prompt_caching"),
+            supports_vision: as_bool("supports_vision").unwrap_or(false),
+            has_pricing: entry
+                .get("input_cost_per_token")
+                .and_then(|v| v.as_f64())
+                .is_some(),
+        });
+    }
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    out.dedup_by(|a, b| a.model == b.model);
+    out
+}
+
+impl PricingCatalog {
+    pub async fn fetch_remote_model_candidates(&self) -> anyhow::Result<Vec<RemoteModelCandidate>> {
+        let value: serde_json::Value = self
+            .client
+            .get_or_init(reqwest::Client::new)
+            .get(DEFAULT_PRICING_SOURCE_URL)
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_remote_model_candidates(&value))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PricingEstimate {
     pub model: String,
