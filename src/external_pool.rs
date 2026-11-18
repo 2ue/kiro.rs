@@ -10917,9 +10917,7 @@ fn external_sse_event_is_terminal(event: &[u8]) -> bool {
         match value.get("type").and_then(|value| value.as_str()) {
             Some("message_stop") => return true,
             Some("message_delta")
-                if value
-                    .pointer("/delta/stop_reason")
-                    .is_some_and(|reason| !reason.is_null()) =>
+                if external_sse_stop_reason_is_set(value.pointer("/delta/stop_reason")) =>
             {
                 return true;
             }
@@ -10929,17 +10927,24 @@ fn external_sse_event_is_terminal(event: &[u8]) -> bool {
             .get("choices")
             .and_then(|value| value.as_array())
             .is_some_and(|choices| {
-                choices.iter().any(|choice| {
-                    choice
-                        .get("finish_reason")
-                        .is_some_and(|value| !value.is_null())
-                })
+                choices
+                    .iter()
+                    .any(|choice| external_sse_stop_reason_is_set(choice.get("finish_reason")))
             })
         {
             return true;
         }
     }
     false
+}
+
+/// A stop reason ends the stream only when it is a non-empty string, as
+/// `normalize_external_stop_reason` reads it: OpenAI-compatible upstreams that send
+/// `"finish_reason": ""` on every chunk must not turn a drop mid-stream into a success.
+fn external_sse_stop_reason_is_set(reason: Option<&serde_json::Value>) -> bool {
+    reason
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|reason| !reason.trim().is_empty())
 }
 
 fn pool_auto_disable_policy_enabled(
@@ -16898,6 +16903,20 @@ mod terminal_event_tests {
                 b"data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"x\"}}]}\n\n"
             )
         ));
+        // Some OpenAI-compatible upstreams send an empty finish_reason on every chunk.
+        for chunk in [
+            &b"data: {\"choices\":[{\"finish_reason\":\"\",\"delta\":{\"content\":\"x\"}}]}\n\n"[..],
+            &b"data: {\"choices\":[{\"finish_reason\":\" \",\"delta\":{\"content\":\"x\"}}]}\n\n"[..],
+            &b"data: {\"choices\":[{\"finish_reason\":0,\"delta\":{\"content\":\"x\"}}]}\n\n"[..],
+        ] {
+            assert!(!external_stream_chunk_has_terminal_event(
+                &Bytes::copy_from_slice(chunk)
+            ));
+        }
+        assert!(!external_stream_chunk_has_terminal_event(&sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":""},"usage":{"output_tokens":1}}"#
+        )));
     }
 
     #[test]
