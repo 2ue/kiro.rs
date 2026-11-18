@@ -1490,6 +1490,55 @@ impl AdminService {
         Ok(pool.masked_for_admin_response())
     }
 
+    /// 复制外部账号。Key 从不下发给浏览器，所以在服务端读未脱敏的原账号，原样带上 Key 和全部配置
+    /// 新建一条，再走和新建一样的审计与缓存刷新。副本默认停用：它和原账号用的是同一个上游 Key。
+    pub fn copy_external_pool(
+        &self,
+        id: u64,
+        request: crate::external_pool::CopyExternalPoolRequest,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let source = block_on_admin_store(async move { store.get_external_pool(id, false).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+        let name = match request
+            .name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => name,
+            None => {
+                let store = self.postgres_store.clone();
+                let taken =
+                    block_on_admin_store(async move { store.list_external_pools(true).await })
+                        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+                        .into_iter()
+                        .map(|pool| pool.name)
+                        .collect();
+                crate::external_pool::external_pool_copy_name(&source.name, &taken)
+            }
+        };
+        let mut create = CreateExternalPoolRequest::copy_of(&source, name).ok_or_else(|| {
+            AdminServiceError::InvalidCredential(format!("外部账号 #{id} 没有可复制的 Key"))
+        })?;
+        create.supported_models =
+            Self::normalize_external_pool_supported_models(create.supported_models);
+        let store = self.postgres_store.clone();
+        let pool =
+            block_on_admin_store(async move { store.create_external_pool_unmasked(create).await })
+                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        self.audit(
+            "copy_external_pool",
+            "external_pool",
+            Some(pool.id.to_string()),
+            true,
+            None,
+            json!({ "name": pool.name, "baseUrl": pool.base_url, "sourceId": id }),
+        );
+        self.invalidate_external_pool_admin_cache_with_pool("create", &pool);
+        Ok(pool.masked_for_admin_response())
+    }
+
     pub fn update_external_pool(
         &self,
         id: u64,

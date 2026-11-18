@@ -532,6 +532,12 @@ export async function updateExternalPool(id: number, req: UpdateExternalPoolRequ
   return data
 }
 
+/** 复制外部账号：后端带上 Key 和全部配置新建一个停用的副本，返回新账号（Key 已脱敏）。 */
+export async function copyExternalPool(id: number, name?: string): Promise<ExternalPool> {
+  const { data } = await api.post<ExternalPool>(`/external-pools/${id}/copy`, name ? { name } : {})
+  return data
+}
+
 export async function deleteExternalPool(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/external-pools/${id}`)
   return data

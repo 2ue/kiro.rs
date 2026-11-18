@@ -1310,6 +1310,33 @@ pub async fn create_external_pool(
     }
 }
 
+/// POST /api/admin/external-pools/{id}/copy
+///
+/// 请求体可省略：没有或全是空白时按默认处理（名称"原名 副本"，副本停用）；有内容就必须是合法 JSON。
+pub async fn copy_external_pool(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let payload = if body.iter().all(u8::is_ascii_whitespace) {
+        crate::external_pool::CopyExternalPoolRequest::default()
+    } else {
+        match serde_json::from_slice::<crate::external_pool::CopyExternalPoolRequest>(&body) {
+            Ok(payload) => payload,
+            Err(err) => {
+                let err = super::error::AdminServiceError::InvalidCredential(format!(
+                    "请求体不是合法 JSON: {err}"
+                ));
+                return (err.status_code(), Json(err.into_response())).into_response();
+            }
+        }
+    };
+    match state.service.copy_external_pool(id, payload) {
+        Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
 pub async fn update_external_pool(
     State(state): State<AdminState>,
     Path(id): Path<u64>,

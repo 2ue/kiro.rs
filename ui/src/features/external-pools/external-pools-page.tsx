@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  CopyPlus,
   FlaskConical,
   Pencil,
   Plus,
@@ -14,6 +15,7 @@ import { toast } from 'sonner'
 import {
   clearExternalPoolAutoDisabled,
   clearExternalPoolCooldown,
+  copyExternalPool,
   createExternalPool,
   deleteExternalPool,
   discoverExternalPoolSupportedModels,
@@ -148,6 +150,9 @@ export function ExternalPoolsPage() {
   const [samePoolRetryStatusCodesText, setSamePoolRetryStatusCodesText] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [editingPool, setEditingPool] = useState<ExternalPool | null>(null)
+  /** 编辑弹窗是由“复制”打开时，记下来源账号。 */
+  const [copiedFrom, setCopiedFrom] = useState<{ id: number; name: string } | null>(null)
+  const [copyingPoolId, setCopyingPoolId] = useState<number | null>(null)
   const [testingPool, setTestingPool] = useState<ExternalPool | null>(null)
   const [savingPool, setSavingPool] = useState(false)
   const [createForm, setCreateForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
@@ -268,8 +273,50 @@ export function ExternalPoolsPage() {
   }
 
   const startEdit = (pool: ExternalPool) => {
+    setCopiedFrom(null)
     setEditingPool(pool)
     setEditForm(poolFormFromPool(pool))
+  }
+
+  // 复制：后端先建一个停用的副本（带原 Key 和全部配置），再打开它的编辑弹窗。
+  const copyPool = async (pool: ExternalPool) => {
+    if (copyingPoolId !== null) return
+    setCopyingPoolId(pool.id)
+    try {
+      const copy = await copyExternalPool(pool.id)
+      toast.success(`已复制为 #${copy.id}「${copy.name}」（已停用）`)
+      invalidate()
+      setCopiedFrom({ id: pool.id, name: pool.name })
+      setEditingPool(copy)
+      setEditForm(poolFormFromPool(copy))
+    } catch (error) {
+      toast.error(`复制失败：${extractErrorMessage(error)}`)
+    } finally {
+      setCopyingPoolId(null)
+    }
+  }
+
+  const closeEdit = () => {
+    if (savingPool) return
+    setEditingPool(null)
+    setEditForm(defaultPoolForm())
+    setCopiedFrom(null)
+  }
+
+  const deleteCopy = async () => {
+    if (!editingPool) return
+    const confirmed = await confirmDialog({ title: '删除副本', message: `删除刚复制的「${editingPool.name}」？原账号不受影响。`, confirmText: '删除', tone: 'danger' })
+    if (!confirmed) return
+    try {
+      await deleteExternalPool(editingPool.id)
+      toast.success('副本已删除')
+      setEditingPool(null)
+      setEditForm(defaultPoolForm())
+      setCopiedFrom(null)
+      invalidate()
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    }
   }
 
   const savePoolEdit = async () => {
@@ -295,6 +342,7 @@ export function ExternalPoolsPage() {
       toast.success('外部账号已更新')
       setEditingPool(null)
       setEditForm(defaultPoolForm())
+      setCopiedFrom(null)
       invalidate()
     } catch (error) {
       toast.error(extractErrorMessage(error))
@@ -681,6 +729,9 @@ export function ExternalPoolsPage() {
                     </div>
                     <div className="flex flex-wrap gap-1.5 lg:shrink-0">
                       <Button variant="ghost" size="xs" onClick={() => startEdit(pool)}><Pencil className="h-3.5 w-3.5" />编辑</Button>
+                      <Button variant="ghost" size="xs" onClick={() => void copyPool(pool)} disabled={copyingPoolId !== null} title="复制为一个停用的新账号（带原 Key 和全部配置），然后编辑">
+                        <CopyPlus className="h-3.5 w-3.5" />{copyingPoolId === pool.id ? '复制中…' : '复制'}
+                      </Button>
                       <Button variant="ghost" size="xs" onClick={() => setTestingPool(pool)}><FlaskConical className="h-3.5 w-3.5" />测试</Button>
                       <Button variant="ghost" size="xs" onClick={() => mutatePool(() => setExternalPoolEnabled(pool.id, !pool.enabled), pool.enabled ? '已停用' : '已启用')}>
                         <Power className="h-3.5 w-3.5" />{pool.enabled ? '停用' : '启用'}
@@ -747,7 +798,9 @@ export function ExternalPoolsPage() {
           })
           return response.supportedModels
         }}
-        onClose={() => { if (savingPool) return; setEditingPool(null); setEditForm(defaultPoolForm()) }}
+        onClose={closeEdit}
+        copiedFrom={copiedFrom}
+        onDeleteCopy={() => void deleteCopy()}
         onSubmit={savePoolEdit}
       />
       <ExternalPoolTestModal
