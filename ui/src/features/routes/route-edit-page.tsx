@@ -34,7 +34,7 @@ import {
 } from "@/hooks/use-runtime-config";
 import { extractErrorMessage } from "@/lib/utils";
 import type { RouteConfig, RouteRule } from "@/types/routes";
-import { ArrowLeft, Copy, Eye, Link2, Save } from "lucide-react";
+import { ArrowLeft, Copy, Eye, Link2, Route as RouteIcon, Save } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
@@ -143,21 +143,32 @@ export function RouteEditPage() {
           </>
         }
       />
-      <div className="rounded-xl border bg-card p-4 shadow-sm">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div className="min-w-0 space-y-2">
+      <div className="overflow-hidden rounded-xl border bg-card shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-4 px-5 py-4">
+          <div className="min-w-0 flex-1 space-y-3">
             <div className="flex flex-wrap items-center gap-2">
-              <h2 className="font-mono text-lg font-semibold">{displayRoutePrefix(prefix)}</h2>
-              {isBuiltinRoute(prefix) ? <Badge size="xs" tone="secondary">内置</Badge> : <Badge size="xs" tone="info">自定义</Badge>}
-              {!draft.enabled && <Badge size="xs" tone="warning">已停用</Badge>}
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <RouteIcon className="size-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="truncate font-mono text-lg font-semibold leading-6">{displayRoutePrefix(prefix)}</h2>
+                  {isBuiltinRoute(prefix) ? <Badge size="xs" tone="secondary">内置</Badge> : <Badge size="xs" tone="info">自定义</Badge>}
+                  {!draft.enabled && <Badge size="xs" tone="warning">已停用</Badge>}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {isBuiltinRoute(prefix) ? "内置入口不可删除；缓存策略、注入、功能与规则都可以在下面调整。" : "客户端把 Base URL 指向这条路由即可接入。"}
+                </p>
+              </div>
             </div>
-            <div className="flex min-w-0 items-center gap-1 rounded-md border border-border/70 bg-muted/40 py-1 pl-2.5 pr-1 text-xs">
+            <div className="flex max-w-xl items-center gap-1 rounded-md border border-border/70 bg-muted/40 py-1 pl-2.5 pr-1 text-xs">
               <Link2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
               <span className="min-w-0 flex-1 truncate font-mono" title={routeBaseUrl(prefix)}>{routeBaseUrl(prefix)}</span>
               <Button
                 variant="ghost"
                 size="icon-xs"
                 title="复制路由地址"
+                aria-label="复制路由地址"
                 onClick={async () => {
                   try {
                     await navigator.clipboard.writeText(routeBaseUrl(prefix));
@@ -171,11 +182,11 @@ export function RouteEditPage() {
               </Button>
             </div>
           </div>
-          <div className="flex flex-wrap items-end gap-4">
-            <Field label="名称" htmlFor="route-name" className="w-64">
-              <Input id="route-name" value={draft.name} onChange={(e) => set("name", e.target.value)} />
+          <div className="flex w-full flex-wrap items-center gap-5 border-t border-border/60 pt-4 sm:w-auto sm:border-t-0 sm:pt-0">
+            <Field label="名称" htmlFor="route-name" description="显示在列表与用量统计里" className="w-full sm:w-64">
+              <Input id="route-name" value={draft.name} placeholder={displayRoutePrefix(prefix)} onChange={(e) => set("name", e.target.value)} />
             </Field>
-            <Field label="启用" htmlFor="route-enabled" inline className="py-0">
+            <Field label="启用" htmlFor="route-enabled" description={draft.enabled ? "入口可用" : "入口返回 404"} className="shrink-0">
               <Switch id="route-enabled" checked={draft.enabled} onCheckedChange={(v) => set("enabled", v)} />
             </Field>
           </div>
