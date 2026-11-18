@@ -50,13 +50,15 @@ export function TogField({
 }: {
   label: string; desc?: string; checked: boolean; disabled?: boolean; onChange: (v: boolean) => void
 }) {
+  const id = React.useId()
   return (
     <div className="min-w-0 space-y-1.5">
-      <div className="flex min-h-8 items-center justify-between gap-4">
-        <div className="min-w-0 text-[13px] font-medium leading-5 text-foreground">{label}</div>
-        <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} className="shrink-0" aria-label={label} />
+      <label htmlFor={id} className="block text-[13px] font-medium leading-5 text-foreground">{label}</label>
+      <div className="flex min-h-8 items-center gap-2">
+        <Switch id={id} checked={checked} disabled={disabled} onCheckedChange={onChange} className="shrink-0" />
+        <span className="text-xs text-muted-foreground">{checked ? '开启' : '关闭'}</span>
       </div>
-      {desc && <div className="text-xs leading-5 text-muted-foreground">{desc}</div>}
+      {desc && <div className="text-[11px] leading-4 text-muted-foreground">{desc}</div>}
     </div>
   )
 }
@@ -2493,61 +2495,61 @@ function FieldPolicyEditor({
   const set = <K extends keyof ReportedUsageFieldPolicy>(key: K) => (v: ReportedUsageFieldPolicy[K]) =>
     onChange({ ...policy, [key]: v })
   return (
-    <div className="min-w-0 space-y-4 border-t border-border/60 pt-4">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold">{title}</div>
-          <div className="mt-1 text-xs leading-5 text-muted-foreground">{FIELD_MODE_DESCS[policy.mode]}</div>
+    <div className="min-w-0 space-y-4 rounded-lg border border-border/60 bg-muted/10 p-4">
+      <FieldGrid>
+        <div className="min-w-0 space-y-1.5">
+          <label className="block text-[13px] font-medium leading-5 text-foreground">{title}</label>
+          <Select value={policy.mode} onValueChange={(v) => set('mode')(v as ReportedUsageFieldPolicy['mode'])}>
+            <SelectTrigger size="sm" className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {Object.entries(FIELD_MODE_LABELS).map(([k, label]) => (
+                <SelectItem key={k} value={k}>{label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="text-[11px] leading-4 text-muted-foreground">{FIELD_MODE_DESCS[policy.mode]}</div>
         </div>
-        <Select value={policy.mode} onValueChange={(v) => set('mode')(v as ReportedUsageFieldPolicy['mode'])}>
-          <SelectTrigger size="sm" className="w-full max-w-36 shrink-0"><SelectValue /></SelectTrigger>
-          <SelectContent>
-            {Object.entries(FIELD_MODE_LABELS).map(([k, label]) => (
-              <SelectItem key={k} value={k}>{label}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-      {fieldNeedsMax(policy) && (
-        <NumField
-          label="封顶 Token"
-          desc="这个字段最多显示多少 Token；0 表示不改写。"
-          value={policy.maxTokens}
-          min={0}
-          suffix="Token"
-          onChange={set('maxTokens')}
-        />
-      )}
-      {fieldNeedsTarget(policy) && (
-        <TwoCol>
+        {fieldNeedsMax(policy) && (
           <NumField
-            label="目标 Token"
-            desc="希望这个字段大致显示到多少 Token 附近；0 表示不改写。"
-            value={policy.targetTokens}
+            label="封顶 Token"
+            desc="这个字段最多显示多少 Token；0 表示不改写。"
+            value={policy.maxTokens}
             min={0}
             suffix="Token"
-            onChange={set('targetTokens')}
+            onChange={set('maxTokens')}
           />
-          <NumField
-            label="常规上限倍数"
-            desc="正常情况下最多显示到目标值的多少倍；例如 1.2 表示最多约 120%。"
-            value={policy.normalMaxMultiplier}
-            min={0}
-            step={0.1}
-            suffix="倍"
-            onChange={set('normalMaxMultiplier')}
+        )}
+        {fieldNeedsTarget(policy) && (
+          <>
+            <NumField
+              label="目标 Token"
+              desc="希望这个字段大致显示到多少 Token 附近；0 表示不改写。"
+              value={policy.targetTokens}
+              min={0}
+              suffix="Token"
+              onChange={set('targetTokens')}
+            />
+            <NumField
+              label="常规上限倍数"
+              desc="正常情况下最多显示到目标值的多少倍；例如 1.2 表示最多约 120%。"
+              value={policy.normalMaxMultiplier}
+              min={0}
+              step={0.1}
+              suffix="倍"
+              onChange={set('normalMaxMultiplier')}
+            />
+          </>
+        )}
+        {allowMoveDelta && (
+          <TogField
+            label="差额计入缓存读取"
+            desc="输入显示被压低且响应已有缓存读取证据时，少掉的部分加到缓存读取里；没有读取证据时计入缓存写入。"
+            checked={policy.moveDeltaToCacheRead}
+            disabled={policy.mode === 'preserve' || policy.mode === 'raw'}
+            onChange={set('moveDeltaToCacheRead')}
           />
-        </TwoCol>
-      )}
-      {allowMoveDelta && (
-        <TogField
-          label="差额计入缓存读取"
-          desc="如果输入显示被压低，且响应已有缓存读取证据，少掉的部分加到缓存读取里；没有读取证据时差额计入缓存写入，不伪造缓存读取。"
-          checked={policy.moveDeltaToCacheRead}
-          disabled={policy.mode === 'preserve' || policy.mode === 'raw'}
-          onChange={set('moveDeltaToCacheRead')}
-        />
-      )}
+        )}
+      </FieldGrid>
     </div>
   )
 }
@@ -2654,8 +2656,8 @@ export function PathPolicyEditor({
       </ParameterGroup>
       {policy.enabled && (
         <>
-          <ParameterGroup title="字段展示规则" desc="分别决定 input、output、cache_read 和 cache_creation 的展示方式；字段之间互不挤在同一行。">
-            <div className="grid gap-x-8 gap-y-8 xl:grid-cols-2">
+          <ParameterGroup title="字段展示规则" desc="分别决定 input、output、cache_read 和 cache_creation 的展示方式。">
+            <div className="grid gap-4 lg:grid-cols-2">
               <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
               <FieldPolicyEditor title="展示输出" policy={policy.output} onChange={set('output')} />
               <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />
@@ -2666,7 +2668,7 @@ export function PathPolicyEditor({
             <FinalOutputGuardForm policy={policy} onChange={onChange} />
           </ParameterGroup>
           <ParameterGroup title="缓存读写上限" desc="只压低已经算出的缓存读取 / 写入，不会把较小的值抬高。">
-            <div className="grid gap-x-8 gap-y-8 xl:grid-cols-2">
+            <div className="grid gap-4 lg:grid-cols-2">
               <div className="space-y-4 border-t border-border/60 pt-4">
                 <div>
                   <div className="text-sm font-semibold">缓存写入 cache_creation</div>
