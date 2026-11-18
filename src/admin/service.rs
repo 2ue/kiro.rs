@@ -7224,6 +7224,8 @@ impl AdminService {
             token_refresh_background_enabled: config.token_refresh_background_enabled,
             token_refresh_background_interval_secs: config.token_refresh_background_interval_secs,
             token_refresh_background_lead_secs: config.token_refresh_background_lead_secs,
+            inventory_renew_min_interval_secs: config.inventory_renew_min_interval_secs,
+            inventory_renew_max_per_pass: config.inventory_renew_max_per_pass,
             token_refresh_admission_runtime: TokenRefreshAdmissionRuntimeResponse {
                 authority: token_refresh_admission.authority.as_str().to_string(),
                 breaker_state: token_refresh_admission.breaker_state.to_string(),
@@ -7438,6 +7440,12 @@ impl AdminService {
         let token_refresh_background_lead_secs = req
             .token_refresh_background_lead_secs
             .unwrap_or(current_config.token_refresh_background_lead_secs);
+        let inventory_renew_min_interval_secs = req
+            .inventory_renew_min_interval_secs
+            .unwrap_or(current_config.inventory_renew_min_interval_secs);
+        let inventory_renew_max_per_pass = req
+            .inventory_renew_max_per_pass
+            .unwrap_or(current_config.inventory_renew_max_per_pass);
         let kiro_upstream_stream_retry_on_idle_timeout = req
             .kiro_upstream_stream_retry_on_idle_timeout
             .unwrap_or(current_config.kiro_upstream_stream_retry_on_idle_timeout);
@@ -7890,6 +7898,28 @@ impl AdminService {
                 MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS, MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
             )));
         }
+        {
+            use crate::model::config::{
+                MAX_INVENTORY_RENEW_MAX_PER_PASS, MAX_INVENTORY_RENEW_MIN_INTERVAL_SECS,
+                MIN_INVENTORY_RENEW_MAX_PER_PASS, MIN_INVENTORY_RENEW_MIN_INTERVAL_SECS,
+            };
+            if !(MIN_INVENTORY_RENEW_MIN_INTERVAL_SECS..=MAX_INVENTORY_RENEW_MIN_INTERVAL_SECS)
+                .contains(&inventory_renew_min_interval_secs)
+            {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "inventoryRenewMinIntervalSecs 必须在 {} 到 {} 之间",
+                    MIN_INVENTORY_RENEW_MIN_INTERVAL_SECS, MAX_INVENTORY_RENEW_MIN_INTERVAL_SECS
+                )));
+            }
+            if !(MIN_INVENTORY_RENEW_MAX_PER_PASS..=MAX_INVENTORY_RENEW_MAX_PER_PASS)
+                .contains(&inventory_renew_max_per_pass)
+            {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "inventoryRenewMaxPerPass 必须在 {} 到 {} 之间",
+                    MIN_INVENTORY_RENEW_MAX_PER_PASS, MAX_INVENTORY_RENEW_MAX_PER_PASS
+                )));
+            }
+        }
         if credential_prompt_logic_retry_max_attempts > 10_000 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialPromptLogicRetryMaxAttempts 不能大于 10000".to_string(),
@@ -8179,6 +8209,8 @@ impl AdminService {
                 config.token_refresh_background_interval_secs =
                     token_refresh_background_interval_secs;
                 config.token_refresh_background_lead_secs = token_refresh_background_lead_secs;
+                config.inventory_renew_min_interval_secs = inventory_renew_min_interval_secs;
+                config.inventory_renew_max_per_pass = inventory_renew_max_per_pass;
                 config.kiro_upstream_stream_retry_on_idle_timeout =
                     kiro_upstream_stream_retry_on_idle_timeout;
                 config.kiro_upstream_stream_retry_on_read_error =

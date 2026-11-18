@@ -254,6 +254,7 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
 }) {
   const [defaults, setDefaults] = useState(initialParameterDefaults)
   const [autoDiscover, setAutoDiscover] = useState(false)
+  const [restoreOrigin, setRestoreOrigin] = useState(true)
   const [result, setResult] = useState<InventoryActionResponse | null>(null)
   const [error, setError] = useState('')
   const proxyResources = useProxyResources()
@@ -261,9 +262,10 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
   const push = usePushInventory()
   const keepsProxy = items.filter((item) => item.proxyResourceId ? item.proxyUsable : Boolean(item.proxyUrl))
   const needsProxy = items.length - keepsProxy.length
+  const fromPool = items.filter((item) => item.origin).length
 
   useEffect(() => {
-    if (!open) { setDefaults(initialParameterDefaults()); setResult(null); setError(''); setAutoDiscover(false) }
+    if (!open) { setDefaults(initialParameterDefaults()); setResult(null); setError(''); setAutoDiscover(false); setRestoreOrigin(true) }
   }, [open])
 
   const submit = async () => {
@@ -275,6 +277,7 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
         ids: items.map((item) => item.id),
         defaults: parameterDefaultsToImportDefaults(defaults),
         autoDiscoverSupportedModels: autoDiscover,
+        restoreOriginSettings: restoreOrigin,
       })
       setResult(response)
       if (response.failed === 0) toast.success(`已推送 ${response.succeeded} 个账号到账号池`)
@@ -325,6 +328,15 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
             hideProxy={needsProxy === 0}
           />
           <FormSection title="推送选项">
+            {fromPool > 0 && (
+              <label className="mb-2 flex items-start gap-2">
+                <Checkbox checked={restoreOrigin} onCheckedChange={(value) => setRestoreOrigin(value === true)} className="mt-0.5" />
+                <span>
+                  恢复移入前的调度参数
+                  <span className="ml-1 text-xs text-muted-foreground">（{fromPool} 个账号是从账号池移入的：沿用它们原来的优先级、RPM、并发和模型列表，上面的默认值只补它们没有的项）</span>
+                </span>
+              </label>
+            )}
             <label className="flex items-center gap-2">
               <Checkbox checked={autoDiscover} onCheckedChange={(value) => setAutoDiscover(value === true)} />
               <span>自动发现模型限制（API Key 账号）</span>

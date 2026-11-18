@@ -30,6 +30,12 @@ pub(crate) const MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS: u64 = 3_600;
 pub(crate) const DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 600;
 pub(crate) const MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 60;
 pub(crate) const MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 3_600;
+pub(crate) const DEFAULT_INVENTORY_RENEW_MIN_INTERVAL_SECS: u64 = 6 * 3_600;
+pub(crate) const MIN_INVENTORY_RENEW_MIN_INTERVAL_SECS: u64 = 3_600;
+pub(crate) const MAX_INVENTORY_RENEW_MIN_INTERVAL_SECS: u64 = 7 * 24 * 3_600;
+pub(crate) const DEFAULT_INVENTORY_RENEW_MAX_PER_PASS: u32 = 10;
+pub(crate) const MIN_INVENTORY_RENEW_MAX_PER_PASS: u32 = 1;
+pub(crate) const MAX_INVENTORY_RENEW_MAX_PER_PASS: u32 = 200;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
@@ -5476,6 +5482,15 @@ pub struct Config {
     #[serde(default = "default_token_refresh_background_lead_secs")]
     pub token_refresh_background_lead_secs: u64,
 
+    /// 库存账号两次续期的最短间隔（秒）。库存账号不调用模型，续期只为保住 refreshToken，
+    /// 不必跟着 access token 每小时轮换；续期与账号池共用后台开关和 Token 刷新限流。
+    #[serde(default = "default_inventory_renew_min_interval_secs")]
+    pub inventory_renew_min_interval_secs: u64,
+
+    /// 每轮后台扫描最多续期的库存账号数，避免库存占满共享的 Token 刷新额度。
+    #[serde(default = "default_inventory_renew_max_per_pass")]
+    pub inventory_renew_max_per_pass: u32,
+
     /// 上游 eventstream idle timeout 发生在下游提交前时是否允许重试。
     #[serde(default = "default_true")]
     pub kiro_upstream_stream_retry_on_idle_timeout: bool,
@@ -6265,6 +6280,14 @@ pub(crate) fn default_token_refresh_background_interval_secs() -> u64 {
 
 pub(crate) fn default_token_refresh_background_lead_secs() -> u64 {
     DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
+}
+
+pub(crate) fn default_inventory_renew_min_interval_secs() -> u64 {
+    DEFAULT_INVENTORY_RENEW_MIN_INTERVAL_SECS
+}
+
+pub(crate) fn default_inventory_renew_max_per_pass() -> u32 {
+    DEFAULT_INVENTORY_RENEW_MAX_PER_PASS
 }
 
 fn default_credential_in_flight_lease_max_secs() -> u64 {
@@ -7235,6 +7258,8 @@ impl Default for Config {
             token_refresh_background_interval_secs: default_token_refresh_background_interval_secs(
             ),
             token_refresh_background_lead_secs: default_token_refresh_background_lead_secs(),
+            inventory_renew_min_interval_secs: default_inventory_renew_min_interval_secs(),
+            inventory_renew_max_per_pass: default_inventory_renew_max_per_pass(),
             kiro_upstream_stream_retry_on_idle_timeout: true,
             kiro_upstream_stream_retry_on_read_error: true,
             kiro_upstream_stream_retry_on_status_error: true,
@@ -11017,6 +11042,14 @@ mod tests {
         assert_eq!(
             config.token_refresh_background_lead_secs,
             DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
+        );
+        assert_eq!(
+            config.inventory_renew_min_interval_secs,
+            DEFAULT_INVENTORY_RENEW_MIN_INTERVAL_SECS
+        );
+        assert_eq!(
+            config.inventory_renew_max_per_pass,
+            DEFAULT_INVENTORY_RENEW_MAX_PER_PASS
         );
         assert!(!config.weighted_capacity.enabled);
         assert_eq!(config.weighted_capacity.max_units_per_request, 8);

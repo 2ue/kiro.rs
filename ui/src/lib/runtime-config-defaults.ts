@@ -824,6 +824,8 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   tokenRefreshBackgroundEnabled: true,
   tokenRefreshBackgroundIntervalSecs: 60,
   tokenRefreshBackgroundLeadSecs: 600,
+  inventoryRenewMinIntervalSecs: 21600,
+  inventoryRenewMaxPerPass: 10,
   tokenRefreshAdmissionRuntime: {
     authority: 'process_local',
     configuredRpm: 60,

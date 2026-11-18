@@ -112,7 +112,7 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "credential_inventory",
-        column_name: "origin_reason",
+        column_name: "next_renew_at",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
@@ -14516,6 +14516,8 @@ CREATE INDEX IF NOT EXISTS idx_credential_inventory_status
 ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS group_name TEXT;
 ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS origin_credential_id BIGINT;
 ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS origin_reason TEXT;
+ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS origin_snapshot JSONB;
+ALTER TABLE credential_inventory ADD COLUMN IF NOT EXISTS next_renew_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_credential_inventory_group
     ON credential_inventory (group_name, id DESC) WHERE deleted_at IS NULL;
 "#;
@@ -15018,7 +15020,7 @@ mod tests {
             ("credential_runtime_state", "generation"),
             ("credential_runtime_mutations", "operation_id"),
             ("credential_stats_delta_batches", "operation_id"),
-            ("credential_inventory", "origin_reason"),
+            ("credential_inventory", "next_renew_at"),
         ] {
             assert!(
                 required.contains(&pair),

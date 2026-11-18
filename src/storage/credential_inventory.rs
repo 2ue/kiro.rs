@@ -20,7 +20,7 @@ pub const STATUS_PUSHED: &str = "pushed";
 const ROW_COLUMNS: &str = "id, status, auth_kind, refresh_token_hash, api_key_hash, identity_key, \
      email, data, source, note, account_info, last_check_at, last_check_error, last_refresh_at, \
      last_refresh_error, refresh_failure_count, pushed_credential_id, pushed_at, created_at, \
-     updated_at, group_name, origin_credential_id, origin_reason";
+     updated_at, group_name, origin_credential_id, origin_reason, origin_snapshot, next_renew_at";
 
 /// Group filter value for rows without a group.
 pub const UNGROUPED_FILTER: &str = "__none__";
@@ -57,6 +57,10 @@ pub struct InventoryRow {
     pub origin_credential_id: Option<u64>,
     /// Disabled reason the pool account had when it was moved here.
     pub origin_reason: Option<String>,
+    /// The pool account's state when it was moved here (status, quota, scheduling parameters).
+    pub origin_snapshot: Option<serde_json::Value>,
+    /// Renewal after a failed one waits until then.
+    pub next_renew_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +92,7 @@ pub struct MovedInventoryRow<'a> {
     pub account_info_at: Option<DateTime<Utc>>,
     pub origin_credential_id: u64,
     pub origin_reason: Option<&'a str>,
+    pub origin_snapshot: Option<&'a serde_json::Value>,
 }
 
 /// Filter on the group column.
@@ -117,11 +122,47 @@ impl GroupFilter {
     }
 }
 
+/// Filter on where a row came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginFilter {
+    /// Moved in from the pool.
+    Pool,
+    /// Imported (not moved from the pool).
+    Imported,
+    /// Moved in from the pool with this disabled reason.
+    Reason(String),
+}
+
+impl OriginFilter {
+    pub const POOL: &'static str = "__pool__";
+    pub const IMPORTED: &'static str = "__imported__";
+
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        let value = value.map(str::trim).filter(|value| !value.is_empty())?;
+        Some(match value {
+            Self::POOL => Self::Pool,
+            Self::IMPORTED => Self::Imported,
+            reason => Self::Reason(reason.to_string()),
+        })
+    }
+
+    /// ($6 reason, $7 moved from the pool only, $8 imported only).
+    fn binds(filter: Option<&Self>) -> (Option<&str>, bool, bool) {
+        match filter {
+            Some(Self::Pool) => (None, true, false),
+            Some(Self::Imported) => (None, false, true),
+            Some(Self::Reason(reason)) => (Some(reason.as_str()), false, false),
+            None => (None, false, false),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InventoryListFilter {
     pub status: Option<String>,
     pub query: Option<String>,
     pub group: Option<GroupFilter>,
+    pub origin: Option<OriginFilter>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -179,11 +220,14 @@ fn row_from_pg(row: sqlx::postgres::PgRow) -> anyhow::Result<InventoryRow> {
             .try_get::<Option<i64>, _>("origin_credential_id")?
             .map(|id| id as u64),
         origin_reason: row.try_get("origin_reason")?,
+        origin_snapshot: row.try_get("origin_snapshot")?,
+        next_renew_at: row.try_get("next_renew_at")?,
     })
 }
 
-/// Filter of `list`, `export_rows` and their counts. Binds: $1 status, $2 search pattern,
-/// $3 searched id, $4 group name, $5 rows without a group only.
+/// Filter of `list` and `export_rows`. Binds: $1 status, $2 search pattern, $3 searched id,
+/// $4 group name, $5 rows without a group only, $6 origin disabled reason, $7 moved from the
+/// pool only, $8 imported only.
 const LIST_WHERE_SQL: &str = "deleted_at IS NULL \
      AND ($1::text IS NULL OR status = $1) \
      AND ($2::text IS NULL OR email ILIKE $2 OR note ILIKE $2 OR source ILIKE $2 \
@@ -191,7 +235,11 @@ const LIST_WHERE_SQL: &str = "deleted_at IS NULL \
           OR ($3::bigint IS NOT NULL AND (id = $3 OR pushed_credential_id = $3 \
               OR origin_credential_id = $3))) \
      AND ($4::text IS NULL OR group_name = $4) \
-     AND (NOT $5 OR group_name IS NULL)";
+     AND (NOT $5 OR group_name IS NULL) \
+     AND ($6::text IS NULL OR (origin_credential_id IS NOT NULL \
+          AND COALESCE(origin_reason, '') = CASE WHEN $6 = '__none__' THEN '' ELSE $6 END)) \
+     AND (NOT $7 OR origin_credential_id IS NOT NULL) \
+     AND (NOT $8 OR origin_credential_id IS NULL)";
 
 fn search_pattern(query: Option<&str>) -> Option<String> {
     query.map(str::trim).filter(|q| !q.is_empty()).map(|q| {
@@ -295,6 +343,7 @@ impl InventoryStore {
         let pattern = search_pattern(filter.query.as_deref());
         let id_query = search_id(filter.query.as_deref());
         let (group, ungrouped) = GroupFilter::binds(filter.group.as_ref());
+        let (origin_reason, from_pool, imported) = OriginFilter::binds(filter.origin.as_ref());
         let total: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM credential_inventory WHERE {LIST_WHERE_SQL}"
         ))
@@ -303,17 +352,23 @@ impl InventoryStore {
         .bind(id_query)
         .bind(group)
         .bind(ungrouped)
+        .bind(origin_reason)
+        .bind(from_pool)
+        .bind(imported)
         .fetch_one(&self.pool)
         .await?;
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM credential_inventory WHERE {LIST_WHERE_SQL} \
-             ORDER BY id DESC LIMIT $6 OFFSET $7"
+             ORDER BY id DESC LIMIT $9 OFFSET $10"
         ))
         .bind(filter.status.as_deref())
         .bind(pattern.as_deref())
         .bind(id_query)
         .bind(group)
         .bind(ungrouped)
+        .bind(origin_reason)
+        .bind(from_pool)
+        .bind(imported)
         .bind(filter.limit)
         .bind(filter.offset)
         .fetch_all(&self.pool)
@@ -422,6 +477,7 @@ impl InventoryStore {
         let pattern = search_pattern(filter.query.as_deref());
         let id_query = search_id(filter.query.as_deref());
         let (group, ungrouped) = GroupFilter::binds(filter.group.as_ref());
+        let (origin_reason, from_pool, imported) = OriginFilter::binds(filter.origin.as_ref());
         let rows = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM credential_inventory WHERE {LIST_WHERE_SQL} ORDER BY id ASC"
         ))
@@ -430,6 +486,9 @@ impl InventoryStore {
         .bind(id_query)
         .bind(group)
         .bind(ungrouped)
+        .bind(origin_reason)
+        .bind(from_pool)
+        .bind(imported)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(row_from_pg).collect()
@@ -482,8 +541,9 @@ impl InventoryStore {
         let row = sqlx::query(&format!(
             "INSERT INTO credential_inventory \
                (status, auth_kind, refresh_token_hash, api_key_hash, identity_key, email, data, \
-                source, group_name, account_info, last_check_at, origin_credential_id, origin_reason) \
-             VALUES ('pushing', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                source, group_name, account_info, last_check_at, origin_credential_id, origin_reason, \
+                origin_snapshot) \
+             VALUES ('pushing', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              RETURNING {ROW_COLUMNS}"
         ))
         .bind(moved.auth_kind)
@@ -498,6 +558,7 @@ impl InventoryStore {
         .bind(moved.account_info.and(moved.account_info_at))
         .bind(moved.origin_credential_id as i64)
         .bind(moved.origin_reason)
+        .bind(moved.origin_snapshot)
         .fetch_one(&self.pool)
         .await?;
         row_from_pg(row)
@@ -518,7 +579,7 @@ impl InventoryStore {
                last_check_at = CASE WHEN $9::jsonb IS NULL THEN last_check_at ELSE $10 END, \
                last_check_error = NULL, last_refresh_error = NULL, refresh_failure_count = 0, \
                pushed_credential_id = NULL, pushed_at = NULL, origin_credential_id = $11, \
-               origin_reason = $12, updated_at = now() \
+               origin_reason = $12, origin_snapshot = $13, next_renew_at = NULL, updated_at = now() \
              WHERE id = $1 AND deleted_at IS NULL AND status = 'pushed' \
              RETURNING {ROW_COLUMNS}"
         ))
@@ -534,6 +595,7 @@ impl InventoryStore {
         .bind(moved.account_info_at)
         .bind(moved.origin_credential_id as i64)
         .bind(moved.origin_reason)
+        .bind(moved.origin_snapshot)
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_from_pg).transpose()
@@ -587,7 +649,7 @@ impl InventoryStore {
         let result = sqlx::query(
             "UPDATE credential_inventory SET data = $2, refresh_token_hash = COALESCE($3, refresh_token_hash), \
                status = 'stored', last_refresh_at = now(), last_refresh_error = NULL, \
-               refresh_failure_count = 0, updated_at = now() \
+               refresh_failure_count = 0, next_renew_at = NULL, updated_at = now() \
              WHERE id = $1 AND deleted_at IS NULL AND status IN ('stored', 'invalid')",
         )
         .bind(id as i64)
@@ -605,10 +667,12 @@ impl InventoryStore {
         invalid: bool,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "UPDATE credential_inventory SET last_refresh_error = $2, \
-               refresh_failure_count = refresh_failure_count + 1, \
-               status = CASE WHEN $3 THEN 'invalid' ELSE status END, updated_at = now() \
-             WHERE id = $1 AND deleted_at IS NULL AND status IN ('stored', 'invalid')",
+            &format!(
+                "UPDATE credential_inventory SET last_refresh_error = $2, \
+                   refresh_failure_count = refresh_failure_count + 1, next_renew_at = {RENEW_BACKOFF_SQL}, \
+                   status = CASE WHEN $3 THEN 'invalid' ELSE status END, updated_at = now() \
+                 WHERE id = $1 AND deleted_at IS NULL AND status IN ('stored', 'invalid')"
+            ),
         )
         .bind(id as i64)
         .bind(error)
@@ -722,18 +786,22 @@ impl InventoryStore {
 
     /// Renews due tokens one row at a time. The row stays locked while `renew` runs, so two
     /// instances never refresh the same token (a rotated refresh token would be lost).
+    ///
+    /// A row is due when its access token expires before `due_before`, it was not renewed after
+    /// `renewed_before`, and a failed renewal's backoff has passed. A `Deferred` outcome (the
+    /// shared refresh limiter is busy) ends the pass without touching the row.
     pub async fn renew_due<F, Fut>(
         &self,
         due_before: DateTime<Utc>,
+        renewed_before: DateTime<Utc>,
         max_rows: usize,
         mut renew: F,
-    ) -> anyhow::Result<(usize, usize)>
+    ) -> anyhow::Result<RenewPass>
     where
         F: FnMut(InventoryRow) -> Fut,
         Fut: std::future::Future<Output = RenewOutcome>,
     {
-        let mut renewed = 0;
-        let mut failed = 0;
+        let mut pass = RenewPass::default();
         let mut last_id: i64 = 0;
         for _ in 0..max_rows {
             let mut tx = self.pool.begin().await?;
@@ -743,10 +811,13 @@ impl InventoryStore {
                    AND data IS NOT NULL AND id > $1 \
                    AND (NULLIF(data->>'expiresAt', '') IS NULL \
                         OR (data->>'expiresAt')::timestamptz <= $2) \
+                   AND (last_refresh_at IS NULL OR last_refresh_at <= $3) \
+                   AND (next_renew_at IS NULL OR next_renew_at <= now()) \
                  ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
             ))
             .bind(last_id)
             .bind(due_before)
+            .bind(renewed_before)
             .fetch_optional(&mut *tx)
             .await?;
             let Some(row) = row else {
@@ -764,7 +835,8 @@ impl InventoryStore {
                     sqlx::query(
                         "UPDATE credential_inventory SET data = $2, \
                            refresh_token_hash = COALESCE($3, refresh_token_hash), last_refresh_at = now(), \
-                           last_refresh_error = NULL, refresh_failure_count = 0, updated_at = now() \
+                           last_refresh_error = NULL, refresh_failure_count = 0, next_renew_at = NULL, \
+                           updated_at = now() \
                          WHERE id = $1",
                     )
                     .bind(id as i64)
@@ -772,27 +844,47 @@ impl InventoryStore {
                     .bind(refresh_token_hash.as_deref())
                     .execute(&mut *tx)
                     .await?;
-                    renewed += 1;
+                    pass.renewed += 1;
                 }
                 RenewOutcome::Failed { error, invalid } => {
-                    sqlx::query(
+                    sqlx::query(&format!(
                         "UPDATE credential_inventory SET last_refresh_error = $2, \
                            refresh_failure_count = refresh_failure_count + 1, \
+                           next_renew_at = {RENEW_BACKOFF_SQL}, \
                            status = CASE WHEN $3 THEN 'invalid' ELSE status END, updated_at = now() \
-                         WHERE id = $1",
-                    )
+                         WHERE id = $1"
+                    ))
                     .bind(id as i64)
                     .bind(&error)
                     .bind(invalid)
                     .execute(&mut *tx)
                     .await?;
-                    failed += 1;
+                    pass.failed += 1;
+                }
+                RenewOutcome::Deferred => {
+                    tx.rollback().await?;
+                    pass.deferred = true;
+                    break;
                 }
             }
             tx.commit().await?;
         }
-        Ok((renewed, failed))
+        Ok(pass)
     }
+}
+
+/// Backoff after a failed renewal, from the failure count before this failure: 5 minutes,
+/// doubling, at most a day. Read in an UPDATE, where columns still hold their old values.
+const RENEW_BACKOFF_SQL: &str =
+    "now() + make_interval(secs => LEAST(300 * power(2, LEAST(refresh_failure_count, 9)), 86400))";
+
+/// What one renewal pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenewPass {
+    pub renewed: usize,
+    pub failed: usize,
+    /// The shared refresh limiter was busy; the pass stopped early.
+    pub deferred: bool,
 }
 
 pub enum RenewOutcome {
@@ -804,6 +896,8 @@ pub enum RenewOutcome {
         error: String,
         invalid: bool,
     },
+    /// Not attempted: the refresh limiter shared with the pool is busy. Not a failure.
+    Deferred,
 }
 
 #[cfg(test)]
@@ -859,6 +953,7 @@ mod tests {
             account_info_at: Some(Utc::now()),
             origin_credential_id: pool_id,
             origin_reason: Some("QuotaExceeded"),
+            origin_snapshot: None,
         }
     }
 
@@ -1073,6 +1168,159 @@ mod tests {
         let stored = store.get(row.id).await.unwrap().unwrap();
         assert_eq!(stored.status, STATUS_STORED);
         assert_eq!(stored.group_name.as_deref(), Some("月底恢复"));
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewal_waits_for_the_interval_backs_off_and_yields() {
+        let Some((postgres, store)) = test_store().await else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let expired = json!({"refreshToken": "r", "expiresAt": "2020-01-01T00:00:00Z"});
+        let a = store
+            .insert(new_row("h-renew-a", &expired, None))
+            .await
+            .unwrap();
+        let b = store
+            .insert(new_row("h-renew-b", &expired, None))
+            .await
+            .unwrap();
+        let c = store
+            .insert(new_row("h-renew-c", &expired, None))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let renewed = |data: &serde_json::Value| RenewOutcome::Refreshed {
+            data: data.clone(),
+            refresh_token_hash: None,
+        };
+
+        // a renews, b fails, c is never tried: the limiter is busy.
+        let mut seen = Vec::new();
+        let pass = store
+            .renew_due(now, now, 10, |row| {
+                seen.push(row.id);
+                let outcome = if row.id == a.id {
+                    renewed(&expired)
+                } else if row.id == b.id {
+                    RenewOutcome::Failed {
+                        error: "boom".into(),
+                        invalid: false,
+                    }
+                } else {
+                    RenewOutcome::Deferred
+                };
+                async move { outcome }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pass,
+            RenewPass {
+                renewed: 1,
+                failed: 1,
+                deferred: true
+            }
+        );
+        assert_eq!(seen, vec![a.id, b.id, c.id]);
+        let c_row = store.get(c.id).await.unwrap().unwrap();
+        assert_eq!(
+            c_row.refresh_failure_count, 0,
+            "a deferred row is not a failure"
+        );
+        assert!(c_row.last_refresh_error.is_none());
+        let b_row = store.get(b.id).await.unwrap().unwrap();
+        assert_eq!(b_row.refresh_failure_count, 1);
+        assert!(
+            b_row.next_renew_at.unwrap() > Utc::now(),
+            "a failure backs off"
+        );
+
+        // Next pass: a was renewed after `renewed_before`, b is backing off; only c is due.
+        let mut seen = Vec::new();
+        let pass = store
+            .renew_due(now, now, 10, |row| {
+                seen.push(row.id);
+                let outcome = renewed(&expired);
+                async move { outcome }
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![c.id]);
+        assert_eq!(pass.renewed, 1);
+        // The pass size caps how many rows one pass renews.
+        let pass = store
+            .renew_due(
+                now,
+                Utc::now() + chrono::Duration::hours(1),
+                1,
+                |_| async move {
+                    RenewOutcome::Failed {
+                        error: "x".into(),
+                        invalid: false,
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pass.failed, 1);
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    async fn origin_ids(store: &InventoryStore, filter: &str) -> Vec<u64> {
+        store
+            .list(&InventoryListFilter {
+                origin: OriginFilter::parse(Some(filter)),
+                limit: 100,
+                ..InventoryListFilter::default()
+            })
+            .await
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rows_filter_by_where_they_came_from() {
+        let Some((postgres, store)) = test_store().await else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let data = json!({"refreshToken": "r"});
+        let imported = store
+            .insert(new_row("h-imported", &data, None))
+            .await
+            .unwrap();
+        let snapshot = json!({"priority": 3, "healthStatus": "quota_exhausted"});
+        let mut from_pool = moved("h-pool", &data, None, 8);
+        from_pool.origin_snapshot = Some(&snapshot);
+        let moved_row = store.begin_move_insert(&from_pool).await.unwrap();
+        store.finish_move(moved_row.id, false).await.unwrap();
+        assert_eq!(
+            store
+                .get(moved_row.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin_snapshot,
+            Some(snapshot)
+        );
+        assert_eq!(
+            origin_ids(&store, OriginFilter::POOL).await,
+            vec![moved_row.id]
+        );
+        assert_eq!(
+            origin_ids(&store, OriginFilter::IMPORTED).await,
+            vec![imported.id]
+        );
+        assert_eq!(
+            origin_ids(&store, "QuotaExceeded").await,
+            vec![moved_row.id]
+        );
+        assert!(origin_ids(&store, "Manual").await.is_empty());
         postgres.drop_test_schema().await.unwrap();
     }
 

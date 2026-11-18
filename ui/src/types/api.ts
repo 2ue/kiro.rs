@@ -2707,6 +2707,10 @@ export interface RuntimeConfig {
   tokenRefreshBackgroundEnabled: boolean
   tokenRefreshBackgroundIntervalSecs: number
   tokenRefreshBackgroundLeadSecs: number
+  /** 库存账号两次续期的最短间隔（秒）。 */
+  inventoryRenewMinIntervalSecs: number
+  /** 每轮后台扫描最多续期的库存账号数。 */
+  inventoryRenewMaxPerPass: number
   tokenRefreshAdmissionRuntime: TokenRefreshAdmissionRuntime
   kiroUpstreamStreamRetryOnIdleTimeout: boolean
   kiroUpstreamStreamRetryOnReadError: boolean
@@ -3144,20 +3148,57 @@ export interface InventoryItem {
   lastRefreshAt?: string
   lastRefreshError?: string
   refreshFailureCount: number
+  /** 续期失败后的下次重试时间（失败越多间隔越长，最长一天）。 */
+  nextRenewAt?: string
   source?: string
   note?: string
   pool?: InventoryPoolLink
   pushedAt?: string
   group?: string
-  /** 从账号池移入时的原账号和禁用原因。 */
+  /** 从账号池移入时账号的原状态。 */
   origin?: InventoryOrigin
   createdAt: string
   updatedAt: string
 }
 
+/** 账号从账号池移入库存时的原状态快照。 */
 export interface InventoryOrigin {
   credentialId: number
-  disabledReason?: string
+  email?: string | null
+  authMethod?: string | null
+  disabledReason?: string | null
+  /** 账号页的健康口径：account_error / quota_exhausted / unknown / normal。 */
+  healthStatus?: string | null
+  subscriptionTitle?: string | null
+  currentUsage?: number | null
+  usageLimit?: number | null
+  priority?: number
+  fast?: number
+  rpm?: number | null
+  maxConcurrentRequests?: number | null
+  supportedModels?: string[]
+  tags?: string[]
+  endpoint?: string | null
+  hadProxy?: boolean
+  proxyResourceId?: number | null
+  proxyResourceName?: string | null
+  failureCount?: number
+  refreshFailureCount?: number
+  successCount?: number
+  lastErrorKind?: string | null
+  lastErrorReason?: string | null
+  lastUsedAt?: string | null
+  createdAt?: string | null
+  movedAt?: string | null
+}
+
+/** 库存续期设置：后台开关和扫描间隔与账号池共用，刷新走同一个限流。 */
+export interface InventoryRenewalSettings {
+  enabled: boolean
+  scanIntervalSecs: number
+  minIntervalSecs: number
+  maxPerPass: number
+  tokenRefreshMaxRpm: number
 }
 
 export interface InventoryCounts {
@@ -3175,6 +3216,7 @@ export interface InventoryListResponse {
   totalPages: number
   counts: InventoryCounts
   items: InventoryItem[]
+  renewal?: InventoryRenewalSettings
 }
 
 export interface InventoryListQuery {
@@ -3184,6 +3226,8 @@ export interface InventoryListQuery {
   q?: string
   /** 分组名；`__none__` 表示未分组。 */
   group?: string
+  /** `__pool__` 账号池移入，`__imported__` 导入，或某个禁用原因。 */
+  origin?: string
 }
 
 export interface InventoryUpdateRequest {
@@ -3202,6 +3246,8 @@ export interface InventoryPushRequest {
   ids: number[]
   defaults?: BatchCredentialImportDefaults
   autoDiscoverSupportedModels?: boolean
+  /** 从账号池移入的账号恢复原来的优先级、RPM、并发和模型列表；默认 true。 */
+  restoreOriginSettings?: boolean
 }
 
 export interface InventoryActionItem {
@@ -3241,11 +3287,13 @@ export type InventoryExportFormat = 'json' | 'jsonl'
 /** 导出范围：选中的库存账号，或列表筛选条件。 */
 export type InventoryExportScope =
   | { ids: number[] }
-  | { filter: { status?: string; group?: string; q?: string } }
+  | { filter: { status?: string; group?: string; origin?: string; q?: string } }
 
 export interface MoveToInventoryRequest {
   /** 只处理这些账号（其中已禁用的）；不传处理全部已禁用账号。 */
   ids?: number[]
+  /** 要移入的禁用原因（无原因用 `__none__`）；不传表示全部原因。 */
+  reasons?: string[]
   excludeAbnormal: boolean
   keepProxy: boolean
   group?: string
@@ -3257,6 +3305,8 @@ export interface MovePreviewReason {
   count: number
   abnormal: number
   moving: number
+  /** 默认勾选：额度耗尽、手动禁用、无原因。 */
+  suggested: boolean
 }
 
 export interface MoveToInventoryPreview {
