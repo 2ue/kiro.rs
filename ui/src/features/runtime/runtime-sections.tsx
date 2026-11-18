@@ -71,7 +71,7 @@ function FieldGrid({ children }: { children: React.ReactNode }) {
  * 文档式的参数分组：只用标题、细线和留白表达层级，不再给每个子组套一层卡片。
  * 适合放在策略弹窗中，避免多个分组嵌套后所有内容看起来同级。
  */
-function ParameterGroup({
+export function ParameterGroup({
   title,
   desc,
   children,
@@ -96,7 +96,7 @@ function ParameterGroup({
   )
 }
 
-function EditorSection({
+export function EditorSection({
   id,
   title,
   desc,
@@ -391,7 +391,7 @@ const CACHE_STRATEGY_OPTIONS: Array<{
   { value: 'bounded_high_cache', title: '上下限优先缓存', desc: '参数同本地模拟缓存；各字段上下限是最终约束，计费只在范围内补。' },
 ]
 
-function StrategyChoice({
+export function StrategyChoice({
   value,
   onChange,
 }: {

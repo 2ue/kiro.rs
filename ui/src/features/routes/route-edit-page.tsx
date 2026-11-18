@@ -21,7 +21,7 @@ import {
   Textarea,
 } from "@/components/ui";
 import { RouteCacheEditor } from "@/features/cache-policies/route-cache-editor";
-import { RouteInjectionEditor } from "@/features/prompt-injection/route-injection-editor";
+import { RouteInjectionEditor, SettingGroup, SettingRow } from "@/features/prompt-injection/route-injection-editor";
 import { useAccounts } from "@/hooks/use-accounts";
 import {
   useRouteEffective,
@@ -50,36 +50,6 @@ import {
 import { Badge } from "@/components/ui";
 import { Field } from "@/components/patterns";
 import { RULE_MODE_OPTIONS } from "@/lib/enum-labels";
-function RuleMode({
-  value,
-  onChange,
-}: {
-  value: RouteRule;
-  onChange: (v: RouteRule) => void;
-}) {
-  return (
-    <div className="space-y-3">
-      <Select
-        value={value.mode}
-        onValueChange={(mode) =>
-          onChange({ ...value, mode: mode as RouteRule["mode"] })
-        }
-      >
-        <SelectTrigger className="max-w-sm">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {RULE_MODE_OPTIONS.map((option) => (
-            <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      <p className="text-sm text-muted-foreground">
-        {ruleSummary(value.mode, value.rules)}
-      </p>
-    </div>
-  );
-}
 export function RouteEditPage() {
   const params = useParams(),
     prefix = params.prefix === "_root" ? "" : (params.prefix ?? ""),
@@ -252,79 +222,112 @@ export function RouteEditPage() {
             onChange={(v) => set("features", v)}
           />
         </TabsContent>
-        <TabsContent value="accounts" className="space-y-5">
-          <RuleMode
-            value={draft.accountRule}
-            onChange={(v) => set("accountRule", v)}
-          />
-          {draft.accountRule.mode !== "allow_all" && (
-            <div className="grid gap-3 md:grid-cols-2">
-              {(accounts.data?.accounts ?? []).map((a) => (
-                <label
-                  className="flex items-center gap-3 rounded-lg border p-3"
-                  key={a.id}
-                >
-                  <Checkbox
-                    checked={draft.accountRule.rules.includes(String(a.id))}
-                    onCheckedChange={(v) =>
-                      toggleAccount(String(a.id), v === true)
-                    }
-                  />
-                  {a.name}{" "}
-                  <span className="text-xs text-muted-foreground">#{a.id}</span>
-                </label>
-              ))}
-            </div>
-          )}
-        </TabsContent>
-        <TabsContent value="models" className="space-y-5">
-          <RuleMode
-            value={draft.modelRule}
-            onChange={(v) => set("modelRule", v)}
-          />
-          <div className="grid gap-5 md:grid-cols-2">
-            <div>
-              <p className="mb-2 text-sm">每行一条模型规则，支持尾部 *</p>
-              <Textarea
-                rows={12}
-                value={draft.modelRule.rules.join("\n")}
-                disabled={draft.modelRule.mode === "allow_all"}
-                onChange={(e) =>
-                  set("modelRule", {
-                    ...draft.modelRule,
-                    rules: e.target.value.split("\n"),
-                  })
-                }
-              />
-            </div>
-            <div>
-              <h3 className="mb-2 font-medium">当前可用账号支持的模型</h3>
-              <div className="flex flex-wrap gap-2">
-                {models.map((model) => (
-                  <Button
-                    key={model}
-                    size="sm"
-                    variant="outline"
-                    onClick={() =>
-                      set("modelRule", {
-                        ...draft.modelRule,
-                        mode:
-                          draft.modelRule.mode === "allow_all"
-                            ? "allow_list"
-                            : draft.modelRule.mode,
-                        rules: [...new Set([...draft.modelRule.rules, model])],
-                      })
-                    }
-                  >
-                    {model}
-                  </Button>
-                ))}
+        <TabsContent value="accounts">
+          <SettingGroup title="账号规则" desc="决定哪些账号可以承接这条路由。账号自身也有“接受的路由”规则，两边都放行才会被调度到。">
+            <SettingRow
+              title="规则模式"
+              control={
+                <Select value={draft.accountRule.mode} onValueChange={(mode) => set("accountRule", { mode: mode as RouteRule["mode"], rules: mode === "allow_all" ? [] : draft.accountRule.rules })}>
+                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {RULE_MODE_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label.replace("入口", "账号")}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              }
+            >
+              <p className="text-xs leading-5 text-muted-foreground">{ruleSummary(draft.accountRule.mode, draft.accountRule.rules)}；可用账号 {availableAccounts.length} 个。</p>
+            </SettingRow>
+            {draft.accountRule.mode !== "allow_all" && (
+              <div className="py-3">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>{draft.accountRule.mode === "allow_list" ? "勾选允许承接这条路由的账号" : "勾选禁止承接这条路由的账号"}，已选 {draft.accountRule.rules.length} 个</span>
+                  <div className="flex gap-1">
+                    <Button size="xs" variant="ghost" onClick={() => set("accountRule", { ...draft.accountRule, rules: (accounts.data?.accounts ?? []).map((a) => String(a.id)) })}>全选</Button>
+                    <Button size="xs" variant="ghost" disabled={draft.accountRule.rules.length === 0} onClick={() => set("accountRule", { ...draft.accountRule, rules: [] })}>清空</Button>
+                  </div>
+                </div>
+                {(accounts.data?.accounts ?? []).length === 0 ? (
+                  <p className="py-6 text-center text-sm text-muted-foreground">还没有账号，先到账号页添加。</p>
+                ) : (
+                  <div className="max-h-[28rem] divide-y overflow-y-auto rounded-md border">
+                    {(accounts.data?.accounts ?? []).map((a) => {
+                      const checked = draft.accountRule.rules.includes(String(a.id));
+                      const acceptsRoute = accountAllowsRoute(a, prefix);
+                      return (
+                        <label key={a.id} className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/30">
+                          <Checkbox checked={checked} onCheckedChange={(v) => toggleAccount(String(a.id), v === true)} aria-label={`选择账号 #${a.id}`} />
+                          <span className="shrink-0 font-mono text-xs text-muted-foreground">#{a.id}</span>
+                          <span className="min-w-0 flex-1 truncate text-sm">{a.name}</span>
+                          <span className="flex shrink-0 gap-1">
+                            {!a.enabled && <Badge size="xs" tone="neutral">停用</Badge>}
+                            {a.autoDisabled && <Badge size="xs" tone="error">自动禁用</Badge>}
+                            {!acceptsRoute && <Badge size="xs" tone="warning" title="该账号自身的路由规则不接受这条路由">账号侧不接受</Badge>}
+                            {a.supportedModels.length > 0 && <Badge size="xs" tone="info">{a.supportedModels.length} 个模型</Badge>}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-              <p className="mt-3 text-xs text-muted-foreground">
-                支持模型为空的账号不限模型。模型是否可用仍受账号自己的路由规则约束。
-              </p>
-            </div>
-          </div>
+            )}
+          </SettingGroup>
+        </TabsContent>
+        <TabsContent value="models">
+          <SettingGroup title="模型规则" desc="决定这条路由允许请求哪些模型。模型还要被某个可用账号接受才会真正可调度。">
+            <SettingRow
+              title="规则模式"
+              control={
+                <Select value={draft.modelRule.mode} onValueChange={(mode) => set("modelRule", { mode: mode as RouteRule["mode"], rules: mode === "allow_all" ? [] : draft.modelRule.rules })}>
+                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {RULE_MODE_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label.replace("入口", "模型")}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              }
+            >
+              <p className="text-xs leading-5 text-muted-foreground">{ruleSummary(draft.modelRule.mode, draft.modelRule.rules.filter(Boolean))}。</p>
+            </SettingRow>
+            {draft.modelRule.mode !== "allow_all" && (
+              <div className="grid gap-5 py-3 md:grid-cols-2">
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium" htmlFor="route-model-rules">模型规则</label>
+                  <p className="text-xs text-muted-foreground">每行一条，支持尾部 *，例如 claude-sonnet-4-5 或 claude-opus-*。</p>
+                  <Textarea
+                    id="route-model-rules"
+                    rows={12}
+                    className="font-mono text-xs"
+                    value={draft.modelRule.rules.join("\n")}
+                    onChange={(e) => set("modelRule", { ...draft.modelRule, rules: e.target.value.split("\n") })}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <div className="text-sm font-medium">当前可用账号支持的模型</div>
+                  <p className="text-xs text-muted-foreground">点一下加入规则。支持模型为空的账号不限模型。</p>
+                  {models.length === 0 ? (
+                    <p className="py-6 text-center text-xs text-muted-foreground">可用账号没有声明支持的模型。</p>
+                  ) : (
+                    <div className="flex max-h-[20rem] flex-wrap gap-1.5 overflow-y-auto rounded-md border p-2">
+                      {models.map((model) => {
+                        const included = draft.modelRule.rules.includes(model);
+                        return (
+                          <Button
+                            key={model}
+                            size="xs"
+                            variant={included ? "secondary" : "outline"}
+                            className="font-mono"
+                            onClick={() => set("modelRule", { ...draft.modelRule, rules: included ? draft.modelRule.rules.filter((r) => r !== model) : [...new Set([...draft.modelRule.rules.filter(Boolean), model])] })}
+                          >
+                            {model}
+                          </Button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </SettingGroup>
         </TabsContent>
       </Tabs>
       <EffectiveSheet
