@@ -706,6 +706,7 @@ impl ExternalPool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(rename_all = "camelCase")]
 pub struct CreateExternalPoolRequest {
     pub name: String,
@@ -759,6 +760,77 @@ pub struct CreateExternalPoolRequest {
     pub route_rules: Vec<String>,
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+impl CreateExternalPoolRequest {
+    /// A disabled copy of `source`: every setting and the same key. `source` must have been read
+    /// unmasked (`None` when it has no key). Runtime state (auto-disable, cooldowns, in-flight
+    /// counts, usage history) is keyed by the pool id, so the new row starts without any.
+    pub fn copy_of(source: &ExternalPool, name: String) -> Option<Self> {
+        let api_key = source.api_key.clone().filter(|key| !key.is_empty())?;
+        Some(Self {
+            name,
+            base_url: source.base_url.clone(),
+            api_key,
+            auth_type: source.auth_type,
+            header_profile: source.header_profile,
+            append_beta_query: source.append_beta_query,
+            header_overrides: source.header_overrides.clone(),
+            wire_profile: source.wire_profile,
+            tls_profile: source.tls_profile,
+            // Both would spend the same upstream key; the copy is enabled once it is edited.
+            enabled: false,
+            priority: source.priority,
+            max_concurrent_requests: source.max_concurrent_requests,
+            usage_projection_mode: source.usage_projection_mode,
+            stream_response_mode: source.stream_response_mode,
+            request_body_mode: source.request_body_mode,
+            raw_model_mode: source.raw_model_mode,
+            auto_disable_policy: source.auto_disable_policy,
+            pre_output_stream_retry_mode: source.pre_output_stream_retry_mode,
+            preserve_path: source.preserve_path,
+            normalize_model_version_dots: source.normalize_model_version_dots,
+            model_mapping_mode: source.model_mapping_mode,
+            model_mapping_require_match: source.model_mapping_require_match,
+            model_mapping_rules: source.model_mapping_rules.clone(),
+            supported_models: source.supported_models.clone(),
+            route_mode: source.route_mode,
+            route_rules: source.route_rules.clone(),
+            notes: source.notes.clone(),
+        })
+    }
+}
+
+/// `POST /external-pools/{id}/copy`. Without a name the copy is called "{source} 副本".
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyExternalPoolRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+const COPY_NAME_SUFFIX: &str = "副本";
+
+/// "{source} 副本", or "{source} 副本 N" with the smallest N not in `taken`. A copy of a copy
+/// is numbered from the original name instead of growing another suffix.
+pub fn external_pool_copy_name(source: &str, taken: &HashSet<String>) -> String {
+    let trimmed = source.trim();
+    let root = trimmed
+        .rsplit_once(' ')
+        .filter(|(_, last)| last.chars().all(|ch| ch.is_ascii_digit()) && !last.is_empty())
+        .map_or(trimmed, |(head, _)| head)
+        .strip_suffix(COPY_NAME_SUFFIX)
+        .map(str::trim_end)
+        .filter(|root| !root.is_empty())
+        .unwrap_or(trimmed);
+    let base = format!("{root} {COPY_NAME_SUFFIX}");
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .expect("an unused copy number exists")
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -16696,3 +16768,121 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
 #[cfg(test)]
 #[path = "external_pool/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    /// A pool where every setting differs from the create defaults, so a field the copy forgets
+    /// shows up as a mismatch.
+    fn source_pool() -> ExternalPool {
+        ExternalPool {
+            id: 42,
+            revision: 7,
+            name: "上游 A".to_string(),
+            base_url: "https://upstream.example.com/v1".to_string(),
+            api_key: Some("sk-source-secret".to_string()),
+            masked_api_key: None,
+            auth_type: ExternalPoolAuthType::XApiKey,
+            header_profile: ExternalPoolHeaderProfile::ClaudeCodeMimic,
+            append_beta_query: true,
+            header_overrides: HashMap::from([("x-custom".to_string(), "1".to_string())]),
+            wire_profile: ExternalPoolWireProfile::Http1TitleCase,
+            tls_profile: ExternalPoolTlsProfile::NativeTls,
+            enabled: true,
+            priority: 3,
+            max_concurrent_requests: 7,
+            usage_projection_mode: ExternalPoolUsageProjectionMode::CurrentPathPolicy,
+            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
+            request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
+            raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
+            auto_disable_policy: ExternalPoolAutoDisablePolicy::Enabled,
+            pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Disabled,
+            auto_disabled: true,
+            auto_disabled_reason: Some("quota".to_string()),
+            auto_disabled_at: Some(Utc::now()),
+            auto_disabled_until: Some(Utc::now()),
+            auto_disabled_last_error: Some("429".to_string()),
+            preserve_path: false,
+            normalize_model_version_dots: true,
+            model_mapping_mode: ExternalPoolModelMappingMode::DirectMapping,
+            model_mapping_require_match: true,
+            model_mapping_rules: vec![ModelMappingRule {
+                enabled: true,
+                source: "client-model".to_string(),
+                target: "mapped-model".to_string(),
+                kind: Default::default(),
+                note: Some("note".to_string()),
+            }],
+            supported_models: vec!["claude-sonnet-4-5".to_string()],
+            route_mode: ExternalPoolRouteMode::AllowList,
+            route_rules: vec!["/cc".to_string()],
+            notes: Some("备注".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_copy_carries_every_setting_and_the_key_but_starts_disabled() {
+        let source = source_pool();
+        let copy = CreateExternalPoolRequest::copy_of(&source, "上游 A 副本".to_string()).unwrap();
+        assert_eq!(copy.name, "上游 A 副本");
+        assert_eq!(copy.api_key, "sk-source-secret");
+        assert!(!copy.enabled);
+
+        let copied = serde_json::to_value(&copy).unwrap();
+        let original = serde_json::to_value(&source).unwrap();
+        for (field, value) in copied.as_object().unwrap() {
+            if matches!(field.as_str(), "name" | "enabled" | "apiKey") {
+                continue;
+            }
+            assert_eq!(
+                original.get(field),
+                Some(value),
+                "field {field} is not copied from the source pool"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pool_without_a_key_cannot_be_copied() {
+        let mut source = source_pool();
+        source.api_key = None;
+        assert!(CreateExternalPoolRequest::copy_of(&source, "x".to_string()).is_none());
+        source.api_key = Some(String::new());
+        assert!(CreateExternalPoolRequest::copy_of(&source, "x".to_string()).is_none());
+    }
+
+    #[test]
+    fn copy_names_are_numbered_from_the_original_name() {
+        let taken = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(
+            external_pool_copy_name("上游 A", &taken(&[])),
+            "上游 A 副本"
+        );
+        assert_eq!(
+            external_pool_copy_name("上游 A", &taken(&["上游 A 副本"])),
+            "上游 A 副本 2"
+        );
+        assert_eq!(
+            external_pool_copy_name("上游 A 副本", &taken(&["上游 A 副本", "上游 A 副本 2"])),
+            "上游 A 副本 3"
+        );
+        assert_eq!(
+            external_pool_copy_name("上游 A 副本 2", &taken(&["上游 A 副本"])),
+            "上游 A 副本 2"
+        );
+        // A name that merely ends with a number keeps it.
+        assert_eq!(
+            external_pool_copy_name("pool 2", &taken(&[])),
+            "pool 2 副本"
+        );
+        assert_eq!(external_pool_copy_name("  ", &taken(&[])).trim(), "副本");
+    }
+}

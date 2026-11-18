@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Loader2, Plus, Save } from 'lucide-react'
 import { toast } from 'sonner'
 import type { ExternalPool } from '@/types/api'
-import { ModalShell } from '@/components/patterns'
+import { Callout, ModalShell } from '@/components/patterns'
 import { Button } from '@/components/ui'
 import { SelectItem } from '@/components/ui'
 import { cn } from '@/lib/utils'
@@ -63,7 +63,7 @@ function ModelMappingPresetTags({ presets, disabled, onSelect }: {
 // --- Main modal ---
 
 export function ExternalPoolFormModal({
-  mode, pool, open, draft, saving, onDraftChange, onClose, onSubmit, onDiscoverSupportedModels,
+  mode, pool, open, draft, saving, onDraftChange, onClose, onSubmit, onDiscoverSupportedModels, copiedFrom, onDeleteCopy,
 }: {
   mode: 'create' | 'edit'
   pool?: ExternalPool | null
@@ -74,9 +74,14 @@ export function ExternalPoolFormModal({
   onClose: () => void
   onSubmit: () => void
   onDiscoverSupportedModels?: () => Promise<string[]>
+  /** 由“复制”打开时的来源账号：显示副本提示和“删除这个副本”。 */
+  copiedFrom?: { id: number; name: string } | null
+  onDeleteCopy?: () => void
 }) {
   const isEdit = mode === 'edit'
-  const title = isEdit ? `编辑外部账号${pool ? ` #${pool.id}` : ''}` : '添加外部账号'
+  const title = copiedFrom
+    ? `编辑副本${pool ? ` #${pool.id}` : ''}`
+    : isEdit ? `编辑外部账号${pool ? ` #${pool.id}` : ''}` : '添加外部账号'
   const keyLabel = isEdit ? '新请求 Key' : '请求 Key'
   const keyDescription = isEdit
     ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}`
@@ -141,7 +146,17 @@ export function ExternalPoolFormModal({
       onClose={onClose}
       footer={
         <>
-          <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={saving}>取消</Button>
+          {copiedFrom && onDeleteCopy && (
+            <Button
+              type="button" variant="ghost" size="sm"
+              className="mr-auto text-destructive hover:bg-destructive/10 hover:text-destructive"
+              onClick={onDeleteCopy}
+              disabled={saving}
+            >
+              删除这个副本
+            </Button>
+          )}
+          <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={saving}>{copiedFrom ? '关闭（保留停用的副本）' : '取消'}</Button>
           <Button type="button" size="sm" onClick={onSubmit} disabled={saving}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : isEdit ? <Save className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
             {isEdit ? '保存外部账号' : '添加外部账号'}
@@ -150,6 +165,13 @@ export function ExternalPoolFormModal({
       }
     >
       <div className="space-y-4">
+        {copiedFrom && (
+          <Callout tone="warning">
+            这是从 #{copiedFrom.id}「{copiedFrom.name}」复制的副本，已带上原账号的 Key 和全部配置，当前为停用状态。
+            副本和原账号共用同一个上游 Key，同时启用会叠加这个 Key 上的并发；改好名称、Key 或地址后再勾选启用。
+            副本不在已保存的路由场景里，以后应用旧场景时它的路由规则会被重置为全部允许。
+          </Callout>
+        )}
         <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接外部账号。">
           <div className="grid gap-3 md:grid-cols-2">
             <TextBox label="名称" value={draft.name} disabled={saving} onChange={(v) => set('name', v)} />

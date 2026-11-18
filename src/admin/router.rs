@@ -255,6 +255,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(set_external_pool_enabled),
         )
         .route(
+            "/external-pools/{id}/copy",
+            post(super::handlers::copy_external_pool),
+        )
+        .route(
             "/external-pools/{id}/supported-models",
             post(set_external_pool_supported_models),
         )
