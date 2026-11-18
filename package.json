@@ -1,6 +1,6 @@
 {
   "name": "claude-pool",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Claude Code 协议账号池调度网关，按路由管理账号调度、模型映射与 usage 整形。",
   "main": "index.js",
   "directories": {
