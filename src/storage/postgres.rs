@@ -1949,6 +1949,8 @@ impl PostgresStore {
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
                       request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
+                      header_profile, append_beta_query, header_overrides,
+                      wire_profile, tls_profile,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -22352,6 +22354,84 @@ mod tests {
             .unwrap();
         assert!(after_concurrent_inserts.id.unwrap() > (EXPLICIT_INSERTS * 10_000) as u64);
 
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_clearing_auto_disable_keeps_header_wire_and_tls_settings() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let created = store
+            .create_external_pool(CreateExternalPoolRequest {
+                name: "profiled-pool".to_string(),
+                base_url: "https://example.com".to_string(),
+                api_key: "sk-test".to_string(),
+                auth_type: ExternalPoolAuthType::XApiKey,
+                header_profile: ExternalPoolHeaderProfile::ClaudeCodeMimic,
+                append_beta_query: true,
+                header_overrides: HashMap::from([("x-custom".to_string(), "1".to_string())]),
+                wire_profile: ExternalPoolWireProfile::Http1TitleCase,
+                tls_profile: ExternalPoolTlsProfile::NativeTls,
+                enabled: true,
+                priority: 1,
+                max_concurrent_requests: 2,
+                usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+                stream_response_mode: None,
+                request_body_mode: Default::default(),
+                raw_model_mode: Default::default(),
+                auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+                pre_output_stream_retry_mode: Default::default(),
+                preserve_path: true,
+                normalize_model_version_dots: false,
+                model_mapping_mode: Default::default(),
+                model_mapping_require_match: false,
+                model_mapping_rules: Vec::new(),
+                supported_models: Vec::new(),
+                route_mode: Default::default(),
+                route_rules: Vec::new(),
+                notes: None,
+            })
+            .await
+            .unwrap();
+        store
+            .auto_disable_external_pool(created.id, "test", "boom", 600)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_external_pool(created.id, true)
+                .await
+                .unwrap()
+                .unwrap()
+                .auto_disabled
+        );
+
+        // The cleared pool is what the admin service pushes into the local dispatch snapshot.
+        let cleared = store
+            .clear_external_pool_auto_disabled_unmasked(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cleared.auto_disabled);
+        assert_eq!(
+            cleared.header_profile,
+            ExternalPoolHeaderProfile::ClaudeCodeMimic
+        );
+        assert!(cleared.append_beta_query);
+        assert_eq!(
+            cleared.header_overrides.get("x-custom").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            cleared.wire_profile,
+            ExternalPoolWireProfile::Http1TitleCase
+        );
+        assert_eq!(cleared.tls_profile, ExternalPoolTlsProfile::NativeTls);
+        assert_eq!(cleared.api_key.as_deref(), Some("sk-test"));
         store.drop_test_schema().await.unwrap();
     }
 
