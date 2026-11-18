@@ -8,6 +8,13 @@ import {
   SelectValue,
   Switch,
 } from "@/components/ui";
+import {
+  ENUM_OPTIONS_BY_FIELD,
+  IMAGE_PROCESSING_MODE_OPTIONS,
+  PAYLOAD_GUARD_MODE_OPTIONS,
+  REPORTED_USAGE_FIELD_MODE_OPTIONS,
+  type EnumOption,
+} from "@/lib/enum-labels";
 const labels: Record<string, string> = {
   rpm: "每分钟请求数",
   maxConcurrentRequests: "并发上限",
@@ -33,16 +40,66 @@ const labels: Record<string, string> = {
   trimHistory: "裁剪历史",
   externalEnabled: "用于账号请求",
   mode: "模式",
-};
-const enums: Record<string, string[]> = {
-  capacityMode: ["fail_fast", "wait"],
-  streamResponseMode: ["event_passthrough"],
-  modelUnavailableCooldownMode: ["disabled", "model", "pool"],
-  policy: ["reject", "default_value"],
-  thinkingTrigger: ["off", "real_request", "always"],
-  tooLongHandling: ["client_compaction", "trim_retry"],
-  mode: ["preemptive", "on_too_long"],
-  tlsBackend: ["rustls", "native-tls"],
+  inferenceUpstreamMaxAttempts: "单次请求最多尝试账号数",
+  streamPreOutputHoldSecs: "首输出前缓冲（秒）",
+  capacityMode: "账号槽位满时",
+  retryStatusCodes: "可跨账号重试的状态码",
+  retryOnNetworkError: "网络错误跨账号重试",
+  retryOnProtocolError: "协议错误跨账号重试",
+  samePoolRetryCount: "同账号重试次数",
+  samePoolRetryStatusCodes: "同账号重试的状态码",
+  samePoolRetryDelayMs: "同账号重试间隔（毫秒）",
+  transientFailurePriorityPenalty: "瞬态失败降权分",
+  qualityAwareSchedulingEnabled: "质量感知调度",
+  qualityEwmaAlpha: "质量平滑系数",
+  qualitySampleTtlSecs: "质量样本有效期（秒）",
+  qualityMinSamples: "参与评分最少样本数",
+  qualityPriorityWeight: "优先级权重",
+  qualityLoadWeight: "负载权重",
+  qualityErrorWeight: "失败率权重",
+  qualityLatencyWeight: "首字延迟权重",
+  qualityProbationWeight: "临时避让权重",
+  qualityTopK: "候选池大小",
+  degradeWindowSecs: "劣化判定窗口（秒）",
+  degradeErrorRateThreshold: "触发降级的失败率",
+  degradeProbationSecs: "临时降级时长（秒）",
+  maxProbationSecs: "最长降级时长（秒）",
+  probeSharePercent: "降级期探测流量（%）",
+  recoveryRampSecs: "恢复爬坡时长（秒）",
+  autoDisableEnabled: "连续失败自动停用",
+  autoDisableOnAuthError: "鉴权失败即停用",
+  autoDisableOnSecurityLock: "安全锁定即停用",
+  autoDisableOnQuotaExhausted: "额度耗尽即停用",
+  autoDisableOnMisconfiguredEndpoint: "端点配置错误即停用",
+  autoDisableOnChannelDisabled: "上游渠道已禁用即停用",
+  autoDisableFailureThreshold: "停用阈值（次）",
+  autoDisableWindowSecs: "失败计数窗口（秒）",
+  autoDisableDurationSecs: "停用时长（秒）",
+  rateLimitCooldownSecs: "限流冷却（秒）",
+  serverErrorCooldownSecs: "服务端错误冷却（秒）",
+  networkErrorCooldownSecs: "网络错误冷却（秒）",
+  protocolErrorCooldownSecs: "协议错误冷却（秒）",
+  modelUnavailableCooldownMode: "模型不可用时冷却范围",
+  modelUnavailableCooldownSecs: "模型不可用冷却（秒）",
+  streamPreOutputRetryEnabled: "首输出前失败换号",
+  streamResponseMode: "流式响应处理",
+  usageDebugEnabled: "记录 usage 诊断文件",
+  usageDebugDir: "usage 诊断目录",
+  usageDebugMaxBodyBytes: "usage 诊断单文件上限（字节）",
+  usageDebugMaxFiles: "usage 诊断文件数上限",
+  wireDebugEnabled: "记录请求交互诊断文件",
+  wireDebugDir: "交互诊断目录",
+  wireDebugMaxBodyBytes: "交互诊断单文件上限（字节）",
+  wireDebugMaxFiles: "交互诊断文件数上限",
+  modelResolutionMode: "模型名解析",
+  compatProfile: "兼容档位",
+  tlsBackend: "TLS 实现",
+  auditLogRetentionDays: "审计日志保留（天）",
+  usageRecordLimit: "内存用量记录上限（条）",
+  thinkingTrigger: "thinking 触发方式",
+  tooLongHandling: "输入过长时",
+  oversizedImageHandling: "超大图片处理",
+  payloadGuardMode: "payload 裁剪时机",
 };
 export function ConfigFields({
   value,
@@ -73,24 +130,15 @@ export function ConfigFields({
               />
             </div>
           );
-        const options =
-          key === "mode" &&
-          [
-            "preserve",
-            "sample",
-            "cap",
-            "fixed",
-            "scale",
-            "move_delta",
-          ].includes(String(current))
-            ? ["preserve", "raw", "sample_max", "sample_target"]
-            : key === "mode" && (current === "safe" || current === "light")
-              ? ["safe", "light"]
-              : enums[key];
+        const options: EnumOption[] | undefined =
+          key === "mode"
+            ? [REPORTED_USAGE_FIELD_MODE_OPTIONS, IMAGE_PROCESSING_MODE_OPTIONS, PAYLOAD_GUARD_MODE_OPTIONS]
+                .find((table) => table.some((option) => option.value === String(current)))
+            : ENUM_OPTIONS_BY_FIELD[key];
+        const selected = options?.find((option) => option.value === String(current));
         return (
-          <div key={key} className="space-y-2">
-            <Label htmlFor={id}>{labels[key] ?? key}</Label>
-            <div className="text-xs text-muted-foreground">{key}</div>
+          <div key={key} className="min-w-0 space-y-2">
+            <Label htmlFor={id} title={key}>{labels[key] ?? key}</Label>
             {typeof current === "boolean" ? (
               <Switch
                 id={id}
@@ -106,9 +154,9 @@ export function ConfigFields({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {options.map((v) => (
-                    <SelectItem key={v} value={v}>
-                      {v}
+                  {options.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -148,6 +196,9 @@ export function ConfigFields({
                   })
                 }
               />
+            )}
+            {selected?.description && (
+              <div className="text-xs leading-4 text-muted-foreground">{selected.description}</div>
             )}
           </div>
         );

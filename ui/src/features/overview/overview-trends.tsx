@@ -10,7 +10,7 @@ import {
   YAxis,
 } from 'recharts'
 import { Table2, BarChart3 } from 'lucide-react'
-import { formatCompact, formatCredits, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
+import { formatCompact, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import {
   CACHE_HIT_RATE_CRITICAL,
   CACHE_HIT_RATE_WARNING,
@@ -47,17 +47,8 @@ const OTHER_COLOR = 'var(--trend-other)'
 const INK_COLOR = 'var(--trend-line)'
 const SURFACE = 'hsl(var(--card))'
 const MAX_STACK_MEMBERS = 5
-// 策略直连是主动选择用蓝；容量不足琥珀；账号不可用紫；模型不支持玫红；系统降级青。
-// 这个顺序与相邻关系已单独做过色盲校验，改动前先重跑校验。
-const EXTERNAL_REASON_COLORS: Record<string, string> = {
-  policy_direct: SLOT_COLORS[0],
-  local_capacity: SLOT_COLORS[1],
-  local_unavailable: SLOT_COLORS[4],
-  model_unsupported: SLOT_COLORS[3],
-  system_degraded: SLOT_COLORS[2],
-}
 
-type ValueFormat = 'count' | 'usd' | 'credits' | 'usdPerCredit' | 'percent'
+type ValueFormat = 'count' | 'usd' | 'percent'
 
 type TrendSeries = {
   key: string
@@ -70,7 +61,7 @@ type TrendLine = {
   key: string
   name: string
   color: string
-  /** null 表示该时段无意义（例如没有消耗积分），折线断开而不是画成 0 */
+  /** null 表示该时段无意义（例如没有输入 token），折线断开而不是画成 0 */
   value: (point: UsageOverviewSeriesPoint) => number | null
   /** 整个范围的汇总值；比例类折线必须先汇总分子分母再相除，不能对每个时段的比例求和 */
   aggregate?: (points: UsageOverviewSeriesPoint[]) => number | null
@@ -103,15 +94,12 @@ export type TrendView = {
 function formatValue(value: number, format: ValueFormat): string {
   if (!Number.isFinite(value)) return '-'
   if (format === 'usd') return formatUsdFixed2(value)
-  if (format === 'credits') return formatCredits(value)
-  if (format === 'usdPerCredit') return `$${value.toFixed(3)}`
   if (format === 'percent') return formatPercent(value)
   return formatNumber(value)
 }
 
 function formatAxisValue(value: number, format: ValueFormat): string {
   if (format === 'usd') return `$${formatCompact(value)}`
-  if (format === 'usdPerCredit') return `$${value.toFixed(2)}`
   if (format === 'percent') return `${Math.round(value * 100)}%`
   return formatCompact(value)
 }
@@ -120,7 +108,7 @@ function formatAxisValue(value: number, format: ValueFormat): string {
 function formatSummaryValue(value: number | null, format: ValueFormat): string {
   if (value == null || !Number.isFinite(value)) return '-'
   if (format === 'usd') return Math.abs(value) >= 1000 ? `$${formatCompact(value)}` : formatUsdFixed2(value)
-  if (format === 'count' || format === 'credits') return formatCompact(value)
+  if (format === 'count') return formatCompact(value)
   return formatValue(value, format)
 }
 
@@ -133,10 +121,6 @@ function aggregateHitRate(
   pick: (point: UsageOverviewSeriesPoint) => CacheTokenMetrics | undefined,
 ): number | null {
   return cacheHitRate(sumCacheTokens(points.map(pick).filter((item): item is CacheTokenMetrics => Boolean(item))))
-}
-
-function totalTokens(metrics: UsageOverviewSeriesMetrics): number {
-  return metrics.inputTokens + metrics.outputTokens + metrics.cacheReadInputTokens + metrics.cacheCreationInputTokens
 }
 
 function errorRate(metrics: UsageOverviewSeriesMetrics): string {
@@ -154,23 +138,18 @@ function breakdownValue(
 
 /**
  * 把一个维度的成员展开成堆叠系列：前 5 个各占一个槽位，其余合并成“其他”。
- * `fixedColors` 给已知成员固定颜色；未知成员按出现顺序取剩余槽位。
  */
 function stackSeries(
   groups: UsageOverviewSeriesGroup[],
   rows: (point: UsageOverviewSeriesPoint) => UsageOverviewSeriesBreakdown[] | undefined,
   pick: (metrics: UsageOverviewSeriesMetrics) => number,
-  fixedColors?: Record<string, string>,
 ): TrendSeries[] {
   const head = groups.slice(0, MAX_STACK_MEMBERS)
   const tail = groups.slice(MAX_STACK_MEMBERS)
-  const used = new Set(head.map((group) => fixedColors?.[group.key]).filter(Boolean))
-  const free = SLOT_COLORS.filter((color) => !used.has(color))
-  let nextFree = 0
-  const series: TrendSeries[] = head.map((group) => ({
+  const series: TrendSeries[] = head.map((group, index) => ({
     key: group.key,
     name: group.label,
-    color: fixedColors?.[group.key] ?? free[nextFree++] ?? OTHER_COLOR,
+    color: SLOT_COLORS[index] ?? OTHER_COLOR,
     value: (point) => breakdownValue(rows(point), group.key, pick),
   }))
   if (tail.length > 0) {
@@ -187,6 +166,8 @@ function stackSeries(
   return series
 }
 
+// ─── 两组视图定义 ─────────────────────────────────────────────────────────────
+
 const HIT_RATE_FOOTNOTE = `缓存读 ÷（未缓存输入 + 缓存读 + 缓存写），与 sub2api 口径一致，按 token 加权。参考线：低于 ${Math.round(CACHE_HIT_RATE_WARNING * 100)}% 需关注，低于 ${Math.round(CACHE_HIT_RATE_CRITICAL * 100)}% 偏低。`
 const HIT_RATE_REFERENCE = { value: CACHE_HIT_RATE_WARNING, label: '关注线' }
 
@@ -194,9 +175,8 @@ const HIT_RATE_REFERENCE = { value: CACHE_HIT_RATE_WARNING, label: '关注线' }
 function hitRateLines(
   groups: UsageOverviewSeriesGroup[],
   rows: (point: UsageOverviewSeriesPoint) => UsageOverviewSeriesBreakdown[] | undefined,
-  fixedColors?: Record<string, string>,
 ): TrendLine[] {
-  return stackSeries(groups.slice(0, MAX_STACK_MEMBERS), rows, () => 0, fixedColors).map((series) => ({
+  return stackSeries(groups.slice(0, MAX_STACK_MEMBERS), rows, () => 0).map((series) => ({
     key: `hit:${series.key}`,
     name: series.name,
     color: series.color,
@@ -208,24 +188,51 @@ function hitRateLines(
   }))
 }
 
-// ─── 三个分区的视图定义 ─────────────────────────────────────────────────────────
-
-export function summaryTrendViews(_creditUnitPriceUsd: number | null): TrendView[] {
-  const splitBars = (pick: (metrics: UsageOverviewSeriesMetrics) => number): TrendSeries[] => [
-    { key: 'local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => pick(point.local) },
-    { key: 'external', name: '账号', color: SLOT_COLORS[1], value: (point) => pick(point.external) },
-  ]
+/** 汇总分区：整体请求、对外计费、Token、缓存命中率。 */
+export function summaryTrendViews(): TrendView[] {
   const errorRow: TrendExtraRow = { label: '错误率', value: (point) => errorRate(point.all) }
-  const views: TrendView[] = [
-    { key: 'requests', label: '请求', format: 'count', bars: splitBars((m) => m.requests), extraRows: [errorRow] },
+  return [
+    {
+      key: 'requests',
+      label: '请求',
+      format: 'count',
+      bars: [{ key: 'requests', name: '请求', color: SLOT_COLORS[0], value: (point) => point.all.requests }],
+      lines: [{
+        key: 'errors',
+        name: '错误',
+        color: SLOT_COLORS[3],
+        value: (point) => point.all.errorRequests,
+        aggregate: (points) => sumOver(points, (point) => point.all.errorRequests),
+      }],
+      extraRows: [errorRow],
+    },
     {
       key: 'revenue',
       label: '对外计费',
       format: 'usd',
-      bars: splitBars((m) => m.estimatedCostUsd),
-      footnote: '本地为估算计费，账号为最终可计费金额，两者都是对下游收的钱，可以直接相加。',
+      bars: [{ key: 'billable', name: '可计费', color: SLOT_COLORS[0], value: (point) => point.all.billableCostUsd }],
+      lines: [{
+        key: 'rawCost',
+        name: '上游成本',
+        color: INK_COLOR,
+        reference: true,
+        value: (point) => point.all.rawCostUsd,
+        aggregate: (points) => sumOver(points, (point) => point.all.rawCostUsd),
+      }],
+      extraRows: [{ label: '毛利', value: (point) => formatUsdFixed2(point.all.profitUsd) }],
+      footnote: '柱子是按最终上报 usage 对下游的可计费金额，虚线是账号实际花出去的上游成本。',
     },
-    { key: 'tokens', label: 'Token', format: 'count', bars: splitBars(totalTokens) },
+    {
+      key: 'tokens',
+      label: 'Token',
+      format: 'count',
+      bars: [
+        { key: 'input', name: '输入', color: SLOT_COLORS[2], value: (point) => point.all.inputTokens },
+        { key: 'output', name: '输出', color: SLOT_COLORS[4], value: (point) => point.all.outputTokens },
+        { key: 'cacheRead', name: '缓存读', color: SLOT_COLORS[0], value: (point) => point.all.cacheReadInputTokens },
+        { key: 'cacheWrite', name: '缓存写', color: SLOT_COLORS[1], value: (point) => point.all.cacheCreationInputTokens },
+      ],
+    },
     {
       key: 'cacheHitRate',
       label: '缓存命中率',
@@ -234,19 +241,17 @@ export function summaryTrendViews(_creditUnitPriceUsd: number | null): TrendView
       ratioAxis: true,
       reference: HIT_RATE_REFERENCE,
       lines: [
-        { key: 'hit:all', name: '整体', color: INK_COLOR, reference: true, value: (point) => cacheHitRate(point.all), aggregate: (points) => aggregateHitRate(points, (point) => point.all) },
-        { key: 'hit:local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => cacheHitRate(point.local), aggregate: (points) => aggregateHitRate(points, (point) => point.local) },
-        { key: 'hit:external', name: '账号', color: SLOT_COLORS[1], value: (point) => cacheHitRate(point.external), aggregate: (points) => aggregateHitRate(points, (point) => point.external) },
+        { key: 'hit:all', name: '整体', color: SLOT_COLORS[0], value: (point) => cacheHitRate(point.all), aggregate: (points) => aggregateHitRate(points, (point) => point.all) },
       ],
       headline: { label: '整体命中率', value: (points) => aggregateHitRate(points, (point) => point.all) },
       footnote: HIT_RATE_FOOTNOTE,
     },
   ]
-  return views
 }
 
-export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView[] {
-  const byPool = (pick: (metrics: UsageOverviewSeriesMetrics) => number) => stackSeries(
+/** 账号分区：按账号堆叠的上游成本、毛利、请求与命中率。 */
+export function accountTrendViews(groups: UsageOverviewSeriesGroups): TrendView[] {
+  const byAccount = (pick: (metrics: UsageOverviewSeriesMetrics) => number) => stackSeries(
     groups.accounts,
     (point) => point.accounts,
     pick,
@@ -256,7 +261,7 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
       key: 'rawCost',
       label: '上游成本',
       format: 'usd',
-      bars: byPool((m) => m.rawCostUsd),
+      bars: byAccount((m) => m.rawCostUsd),
       lines: [{
         key: 'billable',
         name: '可计费',
@@ -266,7 +271,7 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
         aggregate: (points) => sumOver(points, (point) => point.external.billableCostUsd),
       }],
       extraRows: [{ label: '毛利', value: (point) => formatUsdFixed2(point.external.profitUsd) }],
-      footnote: '柱子是账号实际花出去的上游成本，折线是对下游的可计费金额。',
+      footnote: '柱子是各账号实际花出去的上游成本，虚线是对下游的可计费金额。',
     },
     {
       key: 'profit',
@@ -276,6 +281,13 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
       footnote: '补偿后计费 - 上游原始成本；低于 0 的时段在亏钱。',
     },
     {
+      key: 'requests',
+      label: '请求',
+      format: 'count',
+      bars: byAccount((m) => m.requests),
+      extraRows: [{ label: '错误率', value: (point) => errorRate(point.external) }],
+    },
+    {
       key: 'cacheHitRate',
       label: '缓存命中率',
       format: 'percent',
@@ -283,33 +295,8 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
       ratioAxis: true,
       reference: HIT_RATE_REFERENCE,
       lines: hitRateLines(groups.accounts, (point) => point.accounts),
-      headline: { label: '外部命中率', value: (points) => aggregateHitRate(points, (point) => point.external) },
+      headline: { label: '账号命中率', value: (points) => aggregateHitRate(points, (point) => point.external) },
       footnote: HIT_RATE_FOOTNOTE,
-    },
-    {
-      key: 'reasonHitRate',
-      label: '原因命中率',
-      format: 'percent',
-      bars: [],
-      ratioAxis: true,
-      reference: HIT_RATE_REFERENCE,
-      lines: hitRateLines(groups.externalReasons, (point) => point.externalReasons, EXTERNAL_REASON_COLORS),
-      headline: { label: '外部命中率', value: (points) => aggregateHitRate(points, (point) => point.external) },
-      emptyHint: groups.externalReasons.length === 0
-        ? '当前范围没有原因数据。历史记录需要离线运行 maintenance usage-route-dimension-backfill 回灌。'
-        : undefined,
-      footnote: '按走外部的原因拆开命中率：从本地溢出到外部的请求会丢失会话粘性，命中率明显低于策略直连时说明溢出在损失缓存。',
-    },
-    {
-      key: 'reasons',
-      label: '走外部原因',
-      format: 'count',
-      bars: stackSeries(groups.externalReasons, (point) => point.externalReasons, (m) => m.requests, EXTERNAL_REASON_COLORS),
-      extraRows: [{ label: '错误率', value: (point) => errorRate(point.external) }],
-      emptyHint: groups.externalReasons.length === 0
-        ? '当前范围没有原因数据。历史记录需要离线运行 maintenance usage-route-dimension-backfill 回灌。'
-        : undefined,
-      footnote: '按“该谁处理”归类：策略直连是主动选择；容量不足要加账号或调并发；账号不可用要查账号健康。',
     },
   ]
 }

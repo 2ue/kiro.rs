@@ -356,12 +356,12 @@ export interface UsageOverviewSeriesBreakdown {
 export interface UsageOverviewSeriesPoint {
   bucketStart: string;
   label: string;
+  /** 全部请求 */
   all: UsageOverviewSeriesMetrics;
-  local: UsageOverviewSeriesMetrics;
+  /** 走账号池的请求（当前与 all 相同，字段名沿用后端） */
   external: UsageOverviewSeriesMetrics;
-  localRoutes: UsageOverviewSeriesBreakdown[];
+  /** 按账号拆分，成员与 `UsageOverviewSeriesGroups.accounts` 对应 */
   accounts: UsageOverviewSeriesBreakdown[];
-  externalReasons: UsageOverviewSeriesBreakdown[];
 }
 
 export interface UsageOverviewSeriesGroup {
@@ -370,12 +370,8 @@ export interface UsageOverviewSeriesGroup {
 }
 
 export interface UsageOverviewSeriesGroups {
-  /** 按消耗积分降序 */
-  localRoutes: UsageOverviewSeriesGroup[];
   /** 按上游原始成本降序 */
   accounts: UsageOverviewSeriesGroup[];
-  /** 按请求数降序 */
-  externalReasons: UsageOverviewSeriesGroup[];
 }
 
 export interface UsageOverviewPoolRow {
@@ -392,18 +388,6 @@ export interface UsageOverviewPoolRow {
   costFloorAppliedRequests: number;
 }
 
-export interface UsageOverviewAccountRow {
-  accountId: number;
-  label: string;
-  metrics: UsageOverviewMetrics;
-}
-
-export interface UsageOverviewRouteRow {
-  key: string;
-  label: string;
-  metrics: UsageOverviewMetrics;
-}
-
 export interface UsageOverviewRankRow {
   key: string;
   label: string;
@@ -416,8 +400,7 @@ export interface UsageOverviewResponse {
   generatedAt: string;
   timezone: string;
   range: {
-    key: string;
-    label: string;
+    key?: string | null;
     from: string;
     to: string;
     requestedFrom: string;
@@ -475,19 +458,11 @@ export interface UsageOverviewSeriesResponse {
   seriesGroups: UsageOverviewSeriesGroups;
 }
 
-export interface UsageOverviewExternalResponse {
-  generatedAt: string;
-  timezone: string;
-  range: UsageOverviewResponse["range"];
-  external: UsageOverviewResponse["billing"];
-}
-
 export interface UsageOverviewRankingsResponse {
   generatedAt: string;
   timezone: string;
   range: UsageOverviewResponse["range"];
   totalRequests: number;
-  totalLocalRequests: number;
   totalErrors: number;
   topModels: UsageOverviewRankRow[];
   topAccounts: UsageOverviewRankRow[];
