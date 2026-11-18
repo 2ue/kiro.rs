@@ -5,6 +5,7 @@ import {
   PageContainer,
   PageHeader,
   SectionCard,
+  useConfirm,
 } from "@/components/patterns";
 import { PathPolicyEditor, StrategyTemplateEditor } from "@/features/runtime/runtime-sections";
 import {
@@ -24,6 +25,7 @@ import {
   useRuntimeConfig,
   useUpdateRuntimeConfig,
 } from "@/hooks/use-runtime-config";
+import { useUnsavedChangesGuard } from "@/hooks/use-unsaved-changes-guard";
 import { extractErrorMessage } from "@/lib/utils";
 import type { CachePolicyConfig, CacheRoutePolicyPatch, PromptCacheStrategyType, RuntimeConfig } from "@/types/api";
 import { Edit3, FileText, Gauge, Save, WandSparkles, X, Zap } from "lucide-react";
@@ -95,11 +97,16 @@ export function PolicyTemplatesPage() {
   const query = useRuntimeConfig();
   const catalog = usePromptInjectionCatalog();
   const update = useUpdateRuntimeConfig();
+  const confirm = useConfirm();
   const [draft, setDraft] = useState<RuntimeConfig | null>(null);
   const [editing, setEditing] = useState<{ type: PromptCacheStrategyType; policy: CacheRoutePolicyPatch } | null>(null);
   useEffect(() => {
     if (query.data) setDraft(structuredClone(query.data));
   }, [query.data]);
+  // hooks 必须在任何条件 return 之前调用。
+  useUnsavedChangesGuard(
+    draft !== null && query.data !== undefined && JSON.stringify(draft) !== JSON.stringify(query.data) && !update.isPending,
+  );
 
   if (query.isLoading || catalog.isLoading) return <LoadingState text="加载策略模板..." />;
   if (query.error || !draft)
@@ -122,14 +129,35 @@ export function PolicyTemplatesPage() {
     ...(draft.cachePolicy[TEMPLATE_KEYS[type]] ?? {}),
     cacheType: type,
   });
+  // 单个模板的保存只提交 cachePolicy 里这一个键，页面上其它分区（usage 整形、注入文案）
+  // 未保存的改动不被连带写入；失败时弹窗保持打开，用户可以改完重试。
   const saveTemplate = async () => {
-    if (!editing) return;
-    const next: RuntimeConfig = {
-      ...draft,
-      cachePolicy: { ...draft.cachePolicy, [TEMPLATE_KEYS[editing.type]]: editing.policy },
-    };
-    setDraft(next);
-    await saveAll(next, `${TEMPLATE_META.find((m) => m.type === editing.type)?.title ?? "模板"}已保存`);
+    if (!editing || !query.data) return;
+    const key = TEMPLATE_KEYS[editing.type];
+    const cachePolicy = { ...query.data.cachePolicy, [key]: editing.policy };
+    try {
+      await update.mutateAsync({ cachePolicy });
+      setDraft({ ...draft, cachePolicy: { ...draft.cachePolicy, [key]: editing.policy } });
+      toast.success(`${TEMPLATE_META.find((m) => m.type === editing.type)?.title ?? "模板"}已保存`);
+      setEditing(null);
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    }
+  };
+  const templateDirty = editing
+    ? JSON.stringify(editing.policy) !== JSON.stringify(templatePolicy(editing.type))
+    : false;
+  const closeEditor = async () => {
+    if (update.isPending) return;
+    if (templateDirty) {
+      const ok = await confirm({
+        title: "放弃未保存的修改？",
+        message: "这个模板里改过的参数还没有保存，关闭后会丢失。",
+        confirmText: "放弃修改",
+        tone: "danger",
+      });
+      if (!ok) return;
+    }
     setEditing(null);
   };
 
@@ -239,12 +267,10 @@ export function PolicyTemplatesPage() {
           description="参数只会在点击保存后写入运行配置；取消不会改变当前服务配置。"
           width="max-w-5xl"
           noBodyPadding
-          onClose={() => {
-            if (!update.isPending) setEditing(null);
-          }}
+          onClose={() => void closeEditor()}
           footer={
             <>
-              <Button variant="outline" onClick={() => setEditing(null)} disabled={update.isPending}><X />取消</Button>
+              <Button variant="outline" onClick={() => void closeEditor()} disabled={update.isPending}><X />取消</Button>
               <Button onClick={() => void saveTemplate()} disabled={update.isPending}><Save />保存模板</Button>
             </>
           }

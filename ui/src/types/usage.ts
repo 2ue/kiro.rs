@@ -819,10 +819,14 @@ export interface AdminAuditLogPageQuery {
   /** Account label substring or id. */
   account?: string;
   action?: string;
+  /** Comma-separated action list (a console category expanded to actions). */
+  actions?: string;
   actor?: string;
   success?: boolean;
   /** RFC3339, inclusive. */
   since?: string;
   /** RFC3339, exclusive. */
   until?: string;
+  /** Free-text search, server side across all pages. */
+  q?: string;
 }

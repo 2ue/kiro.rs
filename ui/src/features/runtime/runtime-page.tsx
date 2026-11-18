@@ -6,6 +6,7 @@ import {
   PageContainer,
   PageHeader,
   SectionCard,
+  useConfirm,
 } from "@/components/patterns";
 import { ConfigFields } from "@/components/patterns/config-fields";
 import {
@@ -21,6 +22,7 @@ import {
   useRuntimeConfig,
   useUpdateRuntimeConfig,
 } from "@/hooks/use-runtime-config";
+import { useUnsavedChangesGuard } from "@/hooks/use-unsaved-changes-guard";
 import { extractErrorMessage } from "@/lib/utils";
 import type { AccountsConfig, RuntimeConfig } from "@/types/api";
 import { Save } from "lucide-react";
@@ -41,11 +43,15 @@ const accountSections: Array<{ key: string; title: string; desc: string; matches
 export function RuntimePage() {
   const query = useRuntimeConfig(),
     update = useUpdateRuntimeConfig(),
+    confirm = useConfirm(),
     models = useModelCapabilities(),
     [draft, setDraft] = useState<RuntimeConfig | null>(null);
   useEffect(() => {
     if (query.data) setDraft(structuredClone(query.data));
   }, [query.data]);
+  useUnsavedChangesGuard(
+    draft !== null && query.data !== undefined && JSON.stringify(draft) !== JSON.stringify(query.data) && !update.isPending,
+  );
   if (query.isLoading) return <LoadingState />;
   if (query.error || !draft)
     return (
@@ -62,7 +68,26 @@ export function RuntimePage() {
     key: K,
     value: RuntimeConfig[K],
   ) => setDraft({ ...draft, [key]: value });
+  const dirty = JSON.stringify(draft) !== JSON.stringify(query.data);
   const save = async () => {
+    // 开启自动清理或缩短已开启的保留天数都会删数据，和审计页同一口径先确认。
+    const before = query.data;
+    const deletions: string[] = [];
+    if (before) {
+      if (draft.auditLogRetentionEnabled && (!before.auditLogRetentionEnabled || draft.auditLogRetentionDays < before.auditLogRetentionDays))
+        deletions.push(`${draft.auditLogRetentionDays} 天以前的审计日志（含账号异动）`);
+      if (draft.usageRecordRetentionEnabled && (!before.usageRecordRetentionEnabled || draft.usageRecordRetentionDays < before.usageRecordRetentionDays))
+        deletions.push(`${draft.usageRecordRetentionDays} 天以前的用量明细（汇总与趋势保留）`);
+    }
+    if (deletions.length > 0) {
+      const ok = await confirm({
+        title: "开启自动清理？",
+        message: `保存后，后台会在 1 小时内开始删除：${deletions.join("；")}。删除后无法恢复，需要留存请先备份。`,
+        confirmText: "确认开启",
+        tone: "danger",
+      });
+      if (!ok) return;
+    }
     try {
       const {
         cachePolicy: _cache,
@@ -80,7 +105,7 @@ export function RuntimePage() {
     <PageContainer>
       <PageHeader
         actions={
-          <Button onClick={save} disabled={update.isPending}>
+          <Button onClick={save} disabled={update.isPending || !dirty} title={dirty ? undefined : "没有未保存的修改"}>
             <Save />
             保存配置
           </Button>

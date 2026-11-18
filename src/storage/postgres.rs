@@ -3203,11 +3203,17 @@ pub struct AdminAuditLogFilter {
     /// Substring of the account label (email, pool name, ...), case-insensitive.
     pub account_query: Option<String>,
     pub action: Option<String>,
+    /// Only these actions (the console maps its categories to action lists).
+    pub actions: Option<Vec<String>>,
     /// `admin-api`, `system-scheduler`, ...
     pub actor: Option<String>,
     pub success: Option<bool>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Free text: case-insensitive substring of action, actor, object type, object id,
+    /// error message or the account label inside `detail`. Runs server side so it covers
+    /// every page, not just the one already loaded.
+    pub text_query: Option<String>,
 }
 
 fn push_admin_audit_log_filter(
@@ -3251,6 +3257,40 @@ fn push_admin_audit_log_filter(
     }
     if let Some(action) = present(&filter.action) {
         builder.push(" AND action = ").push_bind(action);
+    }
+    if let Some(actions) = filter
+        .actions
+        .as_ref()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+    {
+        builder
+            .push(" AND action = ANY(")
+            .push_bind(actions)
+            .push(")");
+    }
+    if let Some(text) = present(&filter.text_query) {
+        let pattern = format!("%{}%", escape_like_pattern(&text));
+        builder
+            .push(" AND (action ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR actor ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR object_type ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR COALESCE(object_id, '') ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR COALESCE(error_message, '') ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR COALESCE(detail->>'accountLabel', detail->>'credentialLabel', '') ILIKE ")
+            .push_bind(pattern)
+            .push(" ESCAPE '\\')");
     }
     if let Some(actor) = present(&filter.actor) {
         builder.push(" AND actor = ").push_bind(actor);
@@ -11122,6 +11162,60 @@ mod tests {
         })
         .await;
         assert_eq!(recent.records.len(), 4);
+        // 分类 = 动作列表；全文搜索覆盖 action / actor / object / 错误与账号标签，服务端执行。
+        let by_actions = page(AdminAuditLogFilter {
+            actions: Some(vec![
+                "auto_disable_credential".into(),
+                "missing_action".into(),
+            ]),
+            ..Default::default()
+        })
+        .await;
+        assert!(!by_actions.records.is_empty());
+        assert!(
+            by_actions
+                .records
+                .iter()
+                .all(|row| row.action == "auto_disable_credential")
+        );
+        let empty_actions = page(AdminAuditLogFilter {
+            actions: Some(vec![" ".into()]),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(
+            empty_actions.records.len(),
+            6,
+            "blank action list means no filter"
+        );
+        let by_text = page(AdminAuditLogFilter {
+            text_query: Some("OLD@EXAMPLE".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(
+            by_text.records.len(),
+            1,
+            "account label inside detail is searchable"
+        );
+        let by_actor = page(AdminAuditLogFilter {
+            text_query: Some("scheduler".into()),
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            by_actor
+                .records
+                .iter()
+                .all(|row| row.actor.contains("scheduler"))
+        );
+        assert!(!by_actor.records.is_empty());
+        let like_escaped = page(AdminAuditLogFilter {
+            text_query: Some("%".into()),
+            ..Default::default()
+        })
+        .await;
+        assert!(like_escaped.records.is_empty(), "wildcards are literal");
         // Paging stays exact under a filter.
         let first = store
             .query_admin_audit_logs_filtered(

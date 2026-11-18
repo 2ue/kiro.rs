@@ -1,5 +1,5 @@
 import { getRouteScenarioOptions } from "@/api/route-scenarios";
-import { Field, FieldGrid, ModalShell } from "@/components/patterns";
+import { Field, FieldGrid, ModalShell, useConfirm } from "@/components/patterns";
 import {
   Button,
   Input,
@@ -89,6 +89,7 @@ export function AccountFormModal({
     enabled: open,
   });
   const [discovering, setDiscovering] = useState(false);
+  const confirm = useConfirm();
   const set = <K extends keyof AccountFormDraft>(key: K, value: AccountFormDraft[K]) =>
     onDraftChange((p) => ({ ...p, [key]: value }));
 
@@ -240,7 +241,22 @@ export function AccountFormModal({
               onClick={async () => {
                 setDiscovering(true);
                 try {
-                  set("supportedModelsText", (await onDiscoverSupportedModels!()).join("\n"));
+                  const found = await onDiscoverSupportedModels!();
+                  const current = draft.supportedModelsText.split("\n").filter(Boolean);
+                  const removed = current.filter((m) => !found.includes(m));
+                  // 表单里已经填了列表且发现结果会去掉其中一些：先确认再覆盖，避免手填的资格被悄悄抹掉。
+                  if (removed.length > 0) {
+                    const ok = await confirm({
+                      title: "用上游结果覆盖当前列表？",
+                      message: `上游返回 ${found.length} 个模型，会移除当前列表里的 ${removed.length} 个：${removed.join("、")}。保存后该账号不再承接这些模型。`,
+                      confirmText: "覆盖",
+                      tone: "danger",
+                    });
+                    if (!ok) return;
+                  }
+                  set("supportedModelsText", found.join("\n"));
+                } catch {
+                  // 发现失败的提示由调用方给出，这里只负责不改表单。
                 } finally {
                   setDiscovering(false);
                 }

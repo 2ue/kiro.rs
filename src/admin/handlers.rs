@@ -30,12 +30,16 @@ pub struct AuditLogsQueryParams {
     /// Account label substring or id.
     pub account: Option<String>,
     pub action: Option<String>,
+    /// Comma-separated action list; the console sends a category expanded to its actions.
+    pub actions: Option<String>,
     pub actor: Option<String>,
     pub success: Option<bool>,
     /// RFC3339 lower bound (inclusive).
     pub since: Option<String>,
     /// RFC3339 upper bound (exclusive).
     pub until: Option<String>,
+    /// Free-text search across action, actor, object and error message.
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1024,10 +1028,18 @@ pub async fn get_audit_logs(
             object_id: params.object_id,
             account_query: params.account,
             action: params.action,
+            actions: params.actions.map(|value| {
+                value
+                    .split(',')
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect()
+            }),
             actor: params.actor,
             success: params.success,
             since,
             until,
+            text_query: params.q,
         },
         (Err(err), _) | (_, Err(err)) => {
             return (err.status_code(), Json(err.into_response())).into_response();

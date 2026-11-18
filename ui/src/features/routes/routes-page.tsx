@@ -188,6 +188,8 @@ export function RoutesPage() {
   const builtinCount = routes.filter((r) => isBuiltinRoute(r.prefix)).length;
   const customCount = routes.length - builtinCount;
   const disabledCount = routes.filter((r) => !r.enabled).length;
+  const describeAccountCount = (count: number | "全部") =>
+    count === "全部" ? "当前所有账号都可承接这个入口。" : count > 0 ? `当前有 ${count} 个账号可承接这个入口。` : "";
   const accountCountFor = (route: RouteConfig): number | "全部" => {
     if (route.accountRule.mode === "allow_all") return "全部";
     const list = accounts.data?.accounts ?? [];
@@ -265,12 +267,22 @@ export function RoutesPage() {
                 runtime={runtime.data}
                 accountCount={accountCountFor(route)}
                 busy={update.isPending}
-                onToggle={(enabled) =>
+                onToggle={async (enabled) => {
+                  // 停用会让该入口立刻返回 404，先确认；启用没有破坏性，直接保存。
+                  if (!enabled) {
+                    const ok = await confirm({
+                      title: "停用路由",
+                      message: `停用 ${displayRoutePrefix(route.prefix)} 后该入口立即返回 404，使用它的客户端会失败。${describeAccountCount(accountCountFor(route))}`,
+                      confirmText: "停用",
+                      tone: "danger",
+                    });
+                    if (!ok) return;
+                  }
                   save(
                     routes.map((item) => (item.id === route.id ? { ...item, enabled } : item)),
                     enabled ? `${displayRoutePrefix(route.prefix)} 已启用` : `${displayRoutePrefix(route.prefix)} 已停用`,
-                  )
-                }
+                  );
+                }}
                 onEdit={() => navigate(routeEditorPath(route.id))}
                 onCopy={() => openCreator(route)}
                 onDelete={async () => {

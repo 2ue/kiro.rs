@@ -35,6 +35,7 @@ Tabs,
 TabsList,
 TabsTrigger,
 } from '@/components/ui'
+import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import { useRuntimeConfig,useUpdateRuntimeConfig } from '@/hooks/use-runtime-config'
 import { useAccountEventSummary,useAuditLogsPage } from '@/hooks/use-usage'
 import { formatDate } from '@/lib/format'
@@ -114,6 +115,14 @@ const ACTION_CATEGORIES = [
   { value: 'usage', label: '用量操作' },
   { value: 'account', label: '账号' },
 ]
+
+/** 一个分类对应的动作列表，以逗号拼接后交给服务端 `actions` 参数。 */
+function categoryActions(category: string): string {
+  return Object.entries(ACTION_TO_CATEGORY)
+    .filter(([, value]) => value === category)
+    .map(([action]) => action)
+    .join(',')
+}
 
 const ACTION_TO_CATEGORY: Record<string, string> = {
   update_runtime_config: 'config',
@@ -452,35 +461,18 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
   const [categoryFilter, setCategoryFilter] = useState('__all__')
   const [showFilters, setShowFilters] = useState(false)
 
+  // 搜索与分类都交给服务端：按条件翻页，不再只过滤当前已加载的一页。
+  const debouncedQ = useDebouncedValue(q.trim(), 300)
   const query = useMemo<AdminAuditLogPageQuery>(() => ({
     page,
     limit: pageSize,
     success: successFilter === '__all__' ? undefined : successFilter === 'success',
-  }), [page, pageSize, successFilter, categoryFilter])
+    actions: categoryFilter === '__all__' ? undefined : categoryActions(categoryFilter),
+    q: debouncedQ || undefined,
+  }), [page, pageSize, successFilter, categoryFilter, debouncedQ])
   const logs = useAuditLogsPage(query)
   const pending = logs.isPlaceholderData || logs.isFetching
-
-  // Free-text and categories without their own object type still filter the loaded page.
-  const records = useMemo(() => {
-    let filtered = logs.data?.records ?? []
-    if (q.trim()) {
-      const lower = q.toLowerCase()
-      filtered = filtered.filter(
-        (r) =>
-          r.action.includes(lower) ||
-          actionLabel(r.action).toLowerCase().includes(lower) ||
-          r.actor.toLowerCase().includes(lower) ||
-          r.objectType.includes(lower) ||
-          objectLabel(r.objectType).toLowerCase().includes(lower) ||
-          (r.objectId && String(r.objectId).includes(lower)) ||
-          (r.errorMessage && r.errorMessage.toLowerCase().includes(lower))
-      )
-    }
-    if (categoryFilter !== '__all__' && categoryFilter !== 'account') {
-      filtered = filtered.filter((r) => ACTION_TO_CATEGORY[r.action] === categoryFilter)
-    }
-    return filtered
-  }, [logs.data?.records, q, categoryFilter])
+  const records = logs.data?.records ?? []
 
   const hasFilters = successFilter !== '__all__' || categoryFilter !== '__all__' || !!q.trim()
   const filterCount = [successFilter !== '__all__', categoryFilter !== '__all__', !!q.trim()].filter(Boolean).length

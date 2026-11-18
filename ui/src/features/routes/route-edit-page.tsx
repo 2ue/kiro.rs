@@ -32,6 +32,7 @@ import {
   usePromptInjectionCatalog,
   useRuntimeConfig,
 } from "@/hooks/use-runtime-config";
+import { useUnsavedChangesGuard } from "@/hooks/use-unsaved-changes-guard";
 import { extractErrorMessage } from "@/lib/utils";
 import type { RouteConfig, RouteRule } from "@/types/routes";
 import { ArrowLeft, Copy, Eye, Link2, Route as RouteIcon, Save } from "lucide-react";
@@ -66,6 +67,9 @@ export function RouteEditPage() {
     const route = routes.data?.find((r) => r.id === routeId);
     if (route) setDraft(structuredClone(route));
   }, [routes.data, routeId]);
+  const saved = routes.data?.find((r) => r.id === routeId);
+  const dirty = draft !== null && saved !== undefined && JSON.stringify(draft) !== JSON.stringify(saved);
+  useUnsavedChangesGuard(dirty && !update.isPending);
   const prefix = draft?.prefix ?? "";
   if (routes.isLoading || runtime.isLoading || catalog.isLoading)
     return <LoadingState />;
@@ -132,7 +136,8 @@ export function RouteEditPage() {
               查看生效配置
             </Button>
             <Button
-              disabled={update.isPending}
+              disabled={update.isPending || !dirty}
+              title={dirty ? undefined : "没有未保存的修改"}
               onClick={async () => {
                 try {
                   await update.mutateAsync(

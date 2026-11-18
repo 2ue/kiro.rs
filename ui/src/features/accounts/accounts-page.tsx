@@ -85,6 +85,13 @@ function statusOf(account: Account, runtime?: AccountStatus): StatusFilter {
   return "dispatchable";
 }
 
+/** 用户在确认框里点了取消：不是错误，静默结束这次操作。 */
+class SilentCancel extends Error {
+  constructor() {
+    super("cancelled");
+  }
+}
+
 export function AccountsPage() {
   const query = useAccounts();
   const runtimeConfig = useRuntimeConfig();
@@ -95,7 +102,9 @@ export function AccountsPage() {
   const [search, setSearch] = useState("");
   const [tag, setTag] = useState("_all");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [editor, setEditor] = useState<{ mode: "create" | "edit"; account: Account | null; draft: AccountFormDraft } | null>(null);
+  const [editor, setEditor] = useState<{ mode: "create" | "edit"; account: Account | null; draft: AccountFormDraft; initialDraft: AccountFormDraft } | null>(null);
+  const openEditor = (next: { mode: "create" | "edit"; account: Account | null; draft: AccountFormDraft }) =>
+    setEditor({ ...next, initialDraft: structuredClone(next.draft) });
   const [testing, setTesting] = useState<Account | null>(null);
   const [effectiveId, setEffectiveId] = useState<number | null>(null);
   const effective = useAccountEffective(effectiveId);
@@ -106,7 +115,10 @@ export function AccountsPage() {
   const mutation = useMutation({
     mutationFn: async (action: () => Promise<unknown>) => action(),
     onSuccess: invalidate,
-    onError: (error) => toast.error(extractErrorMessage(error)),
+    onError: (error) => {
+      if (error instanceof SilentCancel) return;
+      toast.error(extractErrorMessage(error));
+    },
   });
   const run = (action: () => Promise<unknown>, success: string) =>
     mutation.mutate(async () => {
@@ -177,7 +189,7 @@ export function AccountsPage() {
     <PageContainer>
       <PageHeader
         actions={
-          <Button onClick={() => setEditor({ mode: "create", account: null, draft: defaultAccountForm() })}>
+          <Button onClick={() => openEditor({ mode: "create", account: null, draft: defaultAccountForm() })}>
             <Plus />
             添加账号
           </Button>
@@ -236,7 +248,7 @@ export function AccountsPage() {
         </Toolbar>
 
         {accounts.length === 0 ? (
-          <EmptyState icon={<Users />} title="还没有账号" description="添加第一个账号后，请求才会有地方可去。" action={<Button onClick={() => setEditor({ mode: "create", account: null, draft: defaultAccountForm() })}><Plus />添加账号</Button>} />
+          <EmptyState icon={<Users />} title="还没有账号" description="添加第一个账号后，请求才会有地方可去。" action={<Button onClick={() => openEditor({ mode: "create", account: null, draft: defaultAccountForm() })}><Plus />添加账号</Button>} />
         ) : visible.length === 0 ? (
           <EmptyState title="没有匹配的账号" description="换个关键字或筛选条件。" />
         ) : (
@@ -283,7 +295,7 @@ export function AccountsPage() {
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-1.5 lg:shrink-0 lg:justify-end">
-                      <Button variant="ghost" size="xs" onClick={() => setEditor({ mode: "edit", account, draft: accountFormFromAccount(account) })}><Pencil className="h-3.5 w-3.5" />编辑</Button>
+                      <Button variant="ghost" size="xs" onClick={() => openEditor({ mode: "edit", account, draft: accountFormFromAccount(account) })}><Pencil className="h-3.5 w-3.5" />编辑</Button>
                       <Button
                         variant="ghost"
                         size="xs"
@@ -293,7 +305,7 @@ export function AccountsPage() {
                           mutation.mutate(async () => {
                             const created = await copyAccount(account.id);
                             toast.success(`已复制为新账号 #${created.id}「${created.name}」，默认停用`);
-                            setEditor({ mode: "edit", account: created, draft: accountFormFromAccount(created) });
+                            openEditor({ mode: "edit", account: created, draft: accountFormFromAccount(created) });
                           })
                         }
                       >
@@ -310,8 +322,30 @@ export function AccountsPage() {
                         disabled={mutation.isPending}
                         onClick={() =>
                           run(async () => {
+                            // 先发现、再比对、再确认：覆盖的是调度资格列表，错了会让账号接不到模型。
                             const found = await discoverStoredAccountSupportedModels(account.id);
-                            await updateAccount(account.id, { supportedModels: found.supportedModels });
+                            const next = found.supportedModels;
+                            const current = account.supportedModels ?? [];
+                            const removed = current.filter((m) => !next.includes(m));
+                            const added = next.filter((m) => !current.includes(m));
+                            if (removed.length === 0 && added.length === 0) {
+                              toast.info("上游返回的模型列表与当前一致，无需更新");
+                              return;
+                            }
+                            const ok = await confirm({
+                              title: `用上游结果覆盖 ${account.name} 的支持模型？`,
+                              message: (
+                                <div className="space-y-1">
+                                  <div>上游返回 {next.length} 个模型，当前列表 {current.length} 个。</div>
+                                  {added.length > 0 && <div>新增：{added.join("、")}</div>}
+                                  {removed.length > 0 && <div className="text-destructive">移除：{removed.join("、")}（移除后该账号不再承接这些模型）</div>}
+                                </div>
+                              ),
+                              confirmText: "覆盖",
+                              tone: removed.length > 0 ? "danger" : "default",
+                            });
+                            if (!ok) throw new SilentCancel();
+                            await updateAccount(account.id, { supportedModels: next });
                           }, "已刷新支持的模型")
                         }
                       >
@@ -371,7 +405,19 @@ export function AccountsPage() {
           draft={editor.draft}
           saving={mutation.isPending}
           onDraftChange={(v) => setEditor({ ...editor, draft: typeof v === "function" ? v(editor.draft) : v })}
-          onClose={() => setEditor(null)}
+          onClose={async () => {
+            if (mutation.isPending) return;
+            if (JSON.stringify(editor.draft) !== JSON.stringify(editor.initialDraft)) {
+              const ok = await confirm({
+                title: "放弃未保存的修改？",
+                message: editor.mode === "edit" ? "这个账号的修改还没有保存，关闭后会丢失。" : "新账号还没有保存，关闭后填写的内容会丢失。",
+                confirmText: "放弃修改",
+                tone: "danger",
+              });
+              if (!ok) return;
+            }
+            setEditor(null);
+          }}
           onSubmit={save}
           onDiscoverSupportedModels={async () => {
             try {

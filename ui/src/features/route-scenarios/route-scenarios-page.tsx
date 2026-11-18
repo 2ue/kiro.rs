@@ -35,6 +35,7 @@ import {
   previewRouteScenario,
   updateRouteScenario,
 } from "@/api/route-scenarios";
+import { useUnsavedChangesGuard } from "@/hooks/use-unsaved-changes-guard";
 import { formatDate } from "@/lib/format";
 import { extractErrorMessage } from "@/lib/utils";
 import type {
@@ -450,6 +451,8 @@ function PreviewDialog({
   scenario,
   preview,
   loading,
+  error,
+  onRetry,
   applying,
   onClose,
   onApply,
@@ -457,6 +460,8 @@ function PreviewDialog({
   scenario: RouteScenario | null;
   preview: RouteScenarioPreview | undefined;
   loading: boolean;
+  error: unknown;
+  onRetry: () => void;
   applying: boolean;
   onClose: () => void;
   onApply: () => void;
@@ -475,7 +480,13 @@ function PreviewDialog({
         </>
       }
     >
-      {loading || !preview ? (
+      {error ? (
+        <ErrorState
+          title="无法计算这次应用会改什么"
+          message={extractErrorMessage(error)}
+          action={<Button variant="outline" size="sm" onClick={onRetry}>重试</Button>}
+        />
+      ) : loading || !preview ? (
         <LoadingState text="计算变化..." />
       ) : (
         <div className="space-y-3">
@@ -612,6 +623,24 @@ export function RouteScenariosPage() {
   const scenarios = useQuery({ queryKey: ["route-scenarios"], queryFn: getRouteScenarios });
   const options = useQuery({ queryKey: ["route-scenario-options"], queryFn: getRouteScenarioOptions });
   const [editor, setEditor] = React.useState<EditorState | null>(null);
+  const editorInitial = React.useRef<string>("");
+  const openEditor = (state: EditorState) => {
+    editorInitial.current = JSON.stringify(state);
+    setEditor(state);
+  };
+  const editorDirty = editor !== null && JSON.stringify(editor) !== editorInitial.current;
+  const cancelEditor = async () => {
+    if (editorDirty) {
+      const ok = await confirm({
+        title: "放弃未保存的修改？",
+        message: "这个场景的修改还没有保存，取消后会丢失。",
+        confirmText: "放弃修改",
+        tone: "danger",
+      });
+      if (!ok) return;
+    }
+    setEditor(null);
+  };
   const [previewing, setPreviewing] = React.useState<RouteScenario | null>(null);
   const [result, setResult] = React.useState<{ scenario: RouteScenario; response: RouteScenarioApplyResponse } | null>(null);
   const fileInput = React.useRef<HTMLInputElement>(null);
@@ -621,6 +650,8 @@ export function RouteScenariosPage() {
     queryFn: () => previewRouteScenario(previewing!.id),
     enabled: Boolean(previewing),
     staleTime: 0,
+    // 失败立刻把错误交给弹窗显示，用户手动重试；默认的 3 次退避重试会让弹窗转圈十几秒。
+    retry: false,
   });
 
   const refreshAfterApply = () => {
@@ -641,6 +672,7 @@ export function RouteScenariosPage() {
     },
     onError: (error) => toast.error(`保存失败：${extractErrorMessage(error)}`),
   });
+  useUnsavedChangesGuard(editorDirty && !save.isPending);
 
   const apply = useMutation({
     mutationFn: ({ scenario, only }: { scenario: RouteScenario; only: RouteScenarioItemKey[] }) => applyRouteScenario(scenario.id, only),
@@ -676,7 +708,7 @@ export function RouteScenariosPage() {
   const startFromCurrent = async () => {
     try {
       const content = await getCurrentRouteScenarioContent();
-      setEditor({ id: null, name: "", description: "", content });
+      openEditor({ id: null, name: "", description: "", content });
     } catch (error) {
       toast.error(`读取当前设置失败：${extractErrorMessage(error)}`);
     }
@@ -686,7 +718,7 @@ export function RouteScenariosPage() {
     try {
       // 新建场景也要带上当前路由定义，否则应用时会把路由清空。
       const content = await getCurrentRouteScenarioContent();
-      setEditor({ id: null, name: "", description: "", content: emptyContent(content.routes) });
+      openEditor({ id: null, name: "", description: "", content: emptyContent(content.routes) });
     } catch (error) {
       toast.error(`读取当前路由失败：${extractErrorMessage(error)}`);
     }
@@ -695,7 +727,7 @@ export function RouteScenariosPage() {
   const importFile = async (file: File) => {
     try {
       const parsed = parseScenarioFile(await file.text());
-      setEditor({ id: null, ...parsed });
+      openEditor({ id: null, ...parsed });
     } catch (error) {
       toast.error(`导入失败：${extractErrorMessage(error)}`);
     }
@@ -719,7 +751,7 @@ export function RouteScenariosPage() {
           accounts={accounts}
           saving={save.isPending}
           onChange={setEditor}
-          onCancel={() => setEditor(null)}
+          onCancel={() => void cancelEditor()}
           onSave={() => {
             if (!editor.name.trim()) {
               toast.error("请填写场景名称");
@@ -780,8 +812,8 @@ export function RouteScenariosPage() {
                 description={scenario.description || undefined}
                 actions={
                   <div className="flex shrink-0 gap-1">
-                    <Button size="icon-xs" variant="ghost" title="编辑" aria-label={`编辑 ${scenario.name}`} onClick={() => setEditor({ id: scenario.id, name: scenario.name, description: scenario.description ?? "", content: structuredClone(scenario.content) })}><Pencil /></Button>
-                    <Button size="icon-xs" variant="ghost" title="复制" aria-label={`复制 ${scenario.name}`} onClick={() => setEditor({ id: null, name: `${scenario.name} 副本`, description: scenario.description ?? "", content: structuredClone(scenario.content) })}><Copy /></Button>
+                    <Button size="icon-xs" variant="ghost" title="编辑" aria-label={`编辑 ${scenario.name}`} onClick={() => openEditor({ id: scenario.id, name: scenario.name, description: scenario.description ?? "", content: structuredClone(scenario.content) })}><Pencil /></Button>
+                    <Button size="icon-xs" variant="ghost" title="复制" aria-label={`复制 ${scenario.name}`} onClick={() => openEditor({ id: null, name: `${scenario.name} 副本`, description: scenario.description ?? "", content: structuredClone(scenario.content) })}><Copy /></Button>
                     <Button size="icon-xs" variant="ghost" title="导出 JSON" aria-label={`导出 ${scenario.name}`} onClick={() => downloadScenario(scenario)}><Download /></Button>
                     <Button size="icon-xs" variant="ghost" className="text-destructive hover:text-destructive" title="删除" aria-label={`删除 ${scenario.name}`} onClick={() => void remove(scenario)}><Trash2 /></Button>
                   </div>
@@ -812,6 +844,8 @@ export function RouteScenariosPage() {
         scenario={previewing}
         preview={preview.data}
         loading={preview.isFetching}
+        error={preview.error}
+        onRetry={() => void preview.refetch()}
         applying={apply.isPending}
         onClose={() => setPreviewing(null)}
         onApply={() => previewing && apply.mutate({ scenario: previewing, only: [] })}

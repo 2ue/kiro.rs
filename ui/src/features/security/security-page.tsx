@@ -2,6 +2,7 @@ import { useAccessKeys, useRequestKeyUsageLimits } from '@/hooks/use-security'
 import { createRequestApiKey,deleteRequestApiKey,resetRequestKeyUsage,updateAdminApiKey,updateRequestApiKey } from '@/api/security'
 import {
 Callout,
+ErrorState,
 LoadingState,
 PageContainer,
 PageHeader,
@@ -634,6 +635,15 @@ export function SecurityPage() {
   }
 
   if (loading) return <LoadingState text="加载访问密钥..." />
+  // 接口失败时不能把"没拿到数据"显示成"未配置 Key"，那会误导管理员去重建密钥。
+  if (accessKeysQuery.isError && !keys)
+    return (
+      <ErrorState
+        title="读取访问密钥失败"
+        message={extractErrorMessage(accessKeysQuery.error)}
+        action={<Button variant="outline" onClick={() => accessKeysQuery.refetch()}>重试</Button>}
+      />
+    )
 
   const adminKeyValue = showAdminKey ? keys?.adminApiKey : keys?.maskedAdminApiKey
 
