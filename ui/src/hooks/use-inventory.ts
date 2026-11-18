@@ -99,7 +99,7 @@ export function useDeleteInventoryGroup() {
 /** 禁用账号入库的预览；选项变化时重新计算。 */
 export function useMoveToInventoryPreview(payload: MoveToInventoryRequest, enabled: boolean) {
   return useQuery({
-    queryKey: ['move-to-inventory-preview', payload.ids ?? null, payload.excludeAbnormal],
+    queryKey: ['move-to-inventory-preview', payload.ids ?? null, payload.excludeAbnormal, payload.reasons ?? null],
     queryFn: () => previewMoveToInventory(payload),
     enabled,
     staleTime: 0,

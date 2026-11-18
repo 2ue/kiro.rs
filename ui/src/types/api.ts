@@ -3223,7 +3223,10 @@ export interface MovePreviewReason {
   reason?: string | null
   count: number
   abnormal: number
+  /** 按当前勾选和选项实际会移入的数量。 */
   moving: number
+  /** 勾选了但会跳过：库存里已有同一账号，或同一批里前面已有同邮箱的账号；它们留在账号池。 */
+  duplicates: number
   /** 默认勾选：额度耗尽、手动禁用、无原因。 */
   suggested: boolean
 }
@@ -3231,6 +3234,7 @@ export interface MovePreviewReason {
 export interface MoveToInventoryPreview {
   disabled: number
   moving: number
+  duplicates: number
   excluded: number
   notDisabled: number
   reasons: MovePreviewReason[]

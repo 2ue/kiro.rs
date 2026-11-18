@@ -5,6 +5,8 @@
 //! renews its token. Pushing an account moves the secrets to the pool: the row keeps only the
 //! identity and the id of the pool account, so a refresh token is never held in two places.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
@@ -180,6 +182,16 @@ pub struct MoveMatch {
     pub id: u64,
     pub status: String,
     pub pushed_credential_id: Option<u64>,
+}
+
+/// What the rows still holding their account (every live row not pushed out) are matched on
+/// by a move: a pool account matching any of these is skipped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldMoveKeys {
+    pub refresh_token_hashes: HashSet<String>,
+    pub api_key_hashes: HashSet<String>,
+    pub identity_keys: HashSet<String>,
+    pub pushed_credential_ids: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -529,6 +541,33 @@ impl InventoryStore {
                 })
             })
             .collect()
+    }
+
+    /// The keys `find_move_matches` skips a move on, for every live row not pushed out, so a
+    /// preview can tell the duplicates without a query per account.
+    pub async fn held_move_keys(&self) -> anyhow::Result<HeldMoveKeys> {
+        let rows = sqlx::query(
+            "SELECT refresh_token_hash, api_key_hash, identity_key, pushed_credential_id \
+             FROM credential_inventory WHERE deleted_at IS NULL AND status <> 'pushed'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut keys = HeldMoveKeys::default();
+        for row in rows {
+            if let Some(hash) = row.try_get::<Option<String>, _>("refresh_token_hash")? {
+                keys.refresh_token_hashes.insert(hash);
+            }
+            if let Some(hash) = row.try_get::<Option<String>, _>("api_key_hash")? {
+                keys.api_key_hashes.insert(hash);
+            }
+            if let Some(identity) = row.try_get::<Option<String>, _>("identity_key")? {
+                keys.identity_keys.insert(identity);
+            }
+            if let Some(id) = row.try_get::<Option<i64>, _>("pushed_credential_id")? {
+                keys.pushed_credential_ids.insert(id as u64);
+            }
+        }
+        Ok(keys)
     }
 
     /// First step of a move: a new row in `pushing`, so renewal leaves it alone until the pool

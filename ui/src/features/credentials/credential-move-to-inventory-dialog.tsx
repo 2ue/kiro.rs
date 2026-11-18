@@ -17,12 +17,6 @@ function reasonKey(reason: MovePreviewReason): string {
   return reason.reason || NO_REASON
 }
 
-/** 这个原因下会移入的数量：勾选了才移；排除账号异常时，其中异常的不移。 */
-function movingCount(reason: MovePreviewReason, selected: boolean, excludeAbnormal: boolean): number {
-  if (!selected) return 0
-  return excludeAbnormal ? reason.count - reason.abnormal : reason.count
-}
-
 function OptionCard({ checked, onChange, title, desc, disabled }: {
   checked: boolean
   onChange: (value: boolean) => void
@@ -66,12 +60,15 @@ export function CredentialMoveToInventoryModal({ open, ids, onClose, onDone }: {
   }, [open])
 
   const scopedIds = ids && ids.length > 0 ? ids : undefined
+  // 预览按当前勾选计算，和实际移入用同一套判断（含账号异常、与库存或同批账号重复）。
+  const previewReasons = useMemo(() => (selectedReasons ? Array.from(selectedReasons).sort() : undefined), [selectedReasons])
   const previewRequest = useMemo<MoveToInventoryRequest>(() => ({
     ids: scopedIds,
-    excludeAbnormal: true,
+    reasons: previewReasons,
+    excludeAbnormal,
     keepProxy: false,
     check: false,
-  }), [scopedIds])
+  }), [scopedIds, previewReasons, excludeAbnormal])
   const preview = useMoveToInventoryPreview(previewRequest, open && !result)
   const data = preview.data
   const reasons = useMemo(() => data?.reasons ?? [], [data])
@@ -84,7 +81,10 @@ export function CredentialMoveToInventoryModal({ open, ids, onClose, onDone }: {
   }, [open, data, selectedReasons])
 
   const selected = selectedReasons ?? new Set<string>()
-  const moving = reasons.reduce((sum, reason) => sum + movingCount(reason, selected.has(reasonKey(reason)), excludeAbnormal), 0)
+  // 首次预览还没按建议勾选时（全选口径），先不显示数量。
+  const settled = selectedReasons !== null && !preview.isFetching
+  const moving = selectedReasons === null ? 0 : (data?.moving ?? 0)
+  const duplicates = selectedReasons === null ? 0 : (data?.duplicates ?? 0)
   const disabledTotal = data?.disabled ?? 0
   const toggleReason = (key: string, value: boolean) => setSelectedReasons((current) => {
     const next = new Set(current ?? [])
@@ -131,7 +131,7 @@ export function CredentialMoveToInventoryModal({ open, ids, onClose, onDone }: {
       ) : (
         <>
           <Button variant="outline" onClick={onClose} disabled={move.isPending}>取消</Button>
-          <Button onClick={() => void submit()} disabled={move.isPending || moving === 0}>
+          <Button onClick={() => void submit()} disabled={move.isPending || !settled || moving === 0}>
             {move.isPending && <Spinner size="sm" />}
             {move.isPending ? '移入中…' : `移入 ${moving} 个账号`}
           </Button>
@@ -175,6 +175,7 @@ export function CredentialMoveToInventoryModal({ open, ids, onClose, onDone }: {
                 {disabledTotal === 0
                   ? '没有已禁用的账号。'
                   : `共 ${disabledTotal} 个已禁用账号，按当前勾选将移入 ${moving} 个，其余 ${disabledTotal - moving} 个留在账号池。`}
+                {duplicates > 0 && ` 其中 ${duplicates} 个勾选了但与库存里已有的账号、或同一批里前面的账号是同一账号（同邮箱或同密钥），每个账号只移入一份，这些会跳过并留在账号池。`}
                 {scopedIds && data.notDisabled > 0 && ` 选中项里有 ${data.notDisabled} 个未禁用，不会处理。`}
               </Callout>
               {reasons.length > 0 && (
@@ -183,7 +184,7 @@ export function CredentialMoveToInventoryModal({ open, ids, onClose, onDone }: {
                     {reasons.map((reason) => {
                       const key = reasonKey(reason)
                       const checked = selected.has(key)
-                      const count = movingCount(reason, checked, excludeAbnormal)
+                      const count = reason.moving
                       return (
                         <label key={key} className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-xs">
                           <span className="flex items-center gap-2">
@@ -194,6 +195,7 @@ export function CredentialMoveToInventoryModal({ open, ids, onClose, onDone }: {
                           <span className="flex items-center gap-2 tabular-nums text-muted-foreground">
                             <span>{reason.count} 个</span>
                             {checked && excludeAbnormal && reason.abnormal > 0 && <span>（{reason.abnormal} 个账号异常不移入）</span>}
+                            {checked && reason.duplicates > 0 && <span>（{reason.duplicates} 个重复跳过）</span>}
                             {checked ? <Badge tone="success">移入 {count}</Badge> : <Badge>不移入</Badge>}
                           </span>
                         </label>
