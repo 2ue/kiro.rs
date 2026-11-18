@@ -288,14 +288,14 @@ function OverallSummarySection({
           tone="default"
         />
         <StatCard
-          title="报告估值"
+          title="估算计费"
           value={formatUsdFixed2(billing.reportedCostUsd)}
           desc={`按最终上报 usage 计价 · 计价覆盖 ${formatPercent(metricsShare(metrics.pricedRequests, metrics.requests))}`}
           icon={<DollarSign />}
           tone="primary"
         />
         <StatCard
-          title="原始估值"
+          title="原始计费"
           value={formatUsdFixed2(billing.rawCostUsd)}
           desc="按上游原始 usage 计价"
           icon={<DollarSign />}
@@ -311,7 +311,7 @@ function OverallSummarySection({
         <StatCard
           title="差额"
           value={`${delta.deltaUsd >= 0 ? '+' : '-'}${formatUsdFixed2(Math.abs(delta.deltaUsd))}`}
-          desc={`报告估值 - 账号成本 · 占账号成本 ${delta.percentText}`}
+          desc={`估算计费 - 账号成本 · 占账号成本 ${delta.percentText}`}
           icon={<TrendingUp />}
           tone={delta.tone === 'loss' ? 'error' : delta.tone === 'profit' ? 'success' : 'default'}
         />
@@ -320,7 +320,7 @@ function OverallSummarySection({
           value={formatUsdFixed2(billing.billableCostUsd)}
           desc={(
             <span>
-              补偿后 {formatUsdFixed2(billing.upliftedCostUsd)} · 毛利{' '}
+              补偿后计费 {formatUsdFixed2(billing.upliftedCostUsd)} · 毛利{' '}
               <span className={billingDeltaTextClass(billingDeltaTone(billing.profitUsd))}>
                 {billing.profitUsd >= 0 ? '+' : '-'}{formatUsdFixed2(Math.abs(billing.profitUsd))}
               </span>
@@ -331,9 +331,9 @@ function OverallSummarySection({
         />
       </div>
       <div className="mt-3 rounded-lg bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
-        <span className="font-medium text-foreground/75">报告估值</span> 按最终上报给下游的 usage 计价；
-        <span className="ml-1 font-medium text-foreground/75">原始估值</span> 按上游返回的原始 usage 计价；
-        <span className="ml-1 font-medium text-foreground/75">账号成本</span> 是原始估值乘以各账号的成本倍率，差额就是对下游收的钱减去真实花的钱。
+        <span className="font-medium text-foreground/75">估算计费</span> 按最终上报给下游的 usage 计价，是对下游收的钱；
+        <span className="ml-1 font-medium text-foreground/75">原始计费</span> 按上游返回的原始 usage 计价；
+        <span className="ml-1 font-medium text-foreground/75">账号成本</span> 是上游原始成本乘以各账号的成本倍率，差额即估算计费减账号成本。
         <span className="ml-1 font-medium text-foreground/75">可计费</span> 是补偿与成本底线修复后的最终金额，毛利按它减上游原始成本。
       </div>
     </SectionCard>
@@ -817,7 +817,7 @@ export function OverviewPage() {
       {summaryData.totals.all.errorRequests > 0 && summaryData.totals.all.errorRate >= 0.05 && (
         <Callout tone={summaryData.totals.all.errorRate >= 0.2 ? 'error' : 'warning'}>
           <AlertTriangle className="mr-1 inline size-3.5" />
-          当前范围错误率 {formatPercent(summaryData.totals.all.errorRate)}，共 {formatNumber(summaryData.totals.all.errorRequests)} 次错误请求，建议到排行的“错误”页签查看。
+          当前范围错误率 {formatPercent(summaryData.totals.all.errorRate)}，共 {formatNumber(summaryData.totals.all.errorRequests)} 次错误请求，可到排行的“错误”页签查看。
         </Callout>
       )}
 

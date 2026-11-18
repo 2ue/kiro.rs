@@ -136,7 +136,7 @@ function TrendView({ refetchInterval }: { refetchInterval: number | false }) {
       </SectionCard>
       <SectionCard
         title="最近 7 天（按天）"
-        description="报告估值与原始估值趋势"
+        description="估算计费与原始计费趋势"
         actions={dailyData.length > 0 ? <Badge tone="neutral">{formatUsdFixed2(dailyOriginal)}</Badge> : undefined}
       >
         {dailyData.length === 0
@@ -146,8 +146,8 @@ function TrendView({ refetchInterval }: { refetchInterval: number | false }) {
               data={dailyData}
               xKey="label"
               series={[
-                { key: 'cost', name: '报告估值', color: CHART_COLORS[2] },
-                { key: 'originalCost', name: '原始估值', color: CHART_COLORS[4] },
+                { key: 'cost', name: '估算计费', color: CHART_COLORS[2] },
+                { key: 'originalCost', name: '原始计费', color: CHART_COLORS[4] },
               ]}
               height={200}
               valueFormatter={(value, key) => (key === 'cost' || key === 'originalCost' ? formatUsdFixed2(Number(value)) : formatNumber(Number(value)))}
@@ -224,8 +224,8 @@ function RecordsView({ onViewDetail, refetchInterval }: { onViewDetail: (record:
           <Table className="min-w-[1080px] text-xs">
             <TableHeader>
               <TableRow>
-                {['时间', '账号', '模型', '路由', '状态', '输入', '输出', '报告估值', '原始估值', '账号成本', '详情'].map((title) => (
-                  <TableHead key={title} className={['输入', '输出', '报告估值', '原始估值', '账号成本'].includes(title) ? 'text-right' : undefined}>{title}</TableHead>
+                {['时间', '账号', '模型', '路由', '状态', '输入', '输出', '估算计费', '原始计费', '账号成本', '详情'].map((title) => (
+                  <TableHead key={title} className={['输入', '输出', '估算计费', '原始计费', '账号成本'].includes(title) ? 'text-right' : undefined}>{title}</TableHead>
                 ))}
               </TableRow>
             </TableHeader>
@@ -388,19 +388,19 @@ export function UsagePage() {
         <StatCard
           title="缓存命中率"
           value={Number.isFinite(cacheHit) ? formatPercent(cacheHit) : '-'}
-          desc={`缓存读 ${formatCompact(cacheRead)} · 读+写占输入 ${Number.isFinite(cachedShare) ? formatPercent(cachedShare) : '-'} · 高命中 ${formatCompact(data?.highCacheRequests ?? 0)} 次`}
+          desc={`缓存读 ${formatCompact(cacheRead)} · 读+写占输入 ${Number.isFinite(cachedShare) ? formatPercent(cachedShare) : '-'} · 高命中请求 ${formatCompact(data?.highCacheRequests ?? 0)} 次`}
           icon={<Zap />}
           tone="success"
         />
         <StatCard
-          title="报告估值"
+          title="估算计费"
           value={formatUsdFixed2(data?.totalEstimatedCostUsd ?? 0)}
           desc={`按最终上报 usage 计价 · 计价覆盖 ${formatPercent(ratio(data?.pricedRequests ?? 0, data?.totalRequests ?? 1))}`}
           icon={<Clock3 />}
           tone="primary"
         />
         <StatCard
-          title="原始估值"
+          title="原始计费"
           value={formatUsdFixed2(data?.totalOriginalCostUsd ?? 0)}
           desc="按上游原始 usage 计价"
           icon={<Clock3 />}
@@ -409,7 +409,7 @@ export function UsagePage() {
         <StatCard
           title="上游原始成本"
           value={formatUsdFixed2(billing?.rawCostUsd ?? 0)}
-          desc={`展示计费 ${formatUsdFixed2(billing?.shapedCostUsd ?? 0)} · 原始/整形 ${billing && billing.rawCostUsd > 0 && (billing.shapedCostUsd ?? 0) > 0 ? (billing.rawCostUsd / (billing.shapedCostUsd ?? 1)).toFixed(3) : '-'}`}
+          desc={`展示计费 ${formatUsdFixed2(billing?.shapedCostUsd ?? 0)} · 原始/整形倍率 ${billing && billing.rawCostUsd > 0 && (billing.shapedCostUsd ?? 0) > 0 ? (billing.rawCostUsd / (billing.shapedCostUsd ?? 1)).toFixed(3) : '-'}`}
           icon={<DollarSign />}
           tone="warning"
         />
@@ -418,7 +418,7 @@ export function UsagePage() {
           value={formatUsdFixed2(billing?.billableCostUsd ?? 0)}
           desc={(
             <span>
-              补偿后 {formatUsdFixed2(billing?.upliftedCostUsd ?? 0)} · 毛利{' '}
+              补偿后计费 {formatUsdFixed2(billing?.upliftedCostUsd ?? 0)} · 毛利{' '}
               <span className={cn('font-semibold', (billing?.profitUsd ?? 0) < 0 ? 'text-destructive' : 'text-success')}>
                 {(billing?.profitUsd ?? 0) >= 0 ? '+' : '-'}{formatUsdFixed2(Math.abs(billing?.profitUsd ?? 0))}
               </span>

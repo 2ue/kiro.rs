@@ -14,8 +14,8 @@ export function costDeltaPercent(deltaUsd: number, rawCostUsd: number): string {
 export type CostDeltaTone = 'loss' | 'profit' | 'even'
 
 /**
- * 报告估值（对下游收的钱）减去账号成本（上游原始成本 × 账号成本倍率）。
- * 这是本项目“账号成本”口径下的毛利；账号成本为 0 时没有占比。
+ * 估算计费（对下游收的钱）减去账号成本（上游原始成本 × 账号成本倍率）。
+ * 账号成本为 0 时没有占比。
  */
 export function accountCostDelta(reportedCostUsd: number, accountCostUsd: number): {
   deltaUsd: number

@@ -37,12 +37,12 @@ const OVERRIDES: Array<[keyof AccountOverrides, string, string]> = [
   ["requestTimeoutSecs", "请求超时", "秒"],
   ["streamRequestTimeoutSecs", "流式请求超时", "秒"],
   ["streamIdleTimeoutSecs", "流式空闲超时", "秒"],
-  ["streamFirstOutputTimeoutSecs", "首输出超时", "秒"],
-  ["usageProjectionUpliftPercent", "输入放大", "%"],
-  ["usageProjectionCostFloorEnabled", "成本下限", ""],
-  ["usageProjectionCostFloorMarginPercent", "成本下限余量", "%"],
-  ["usageProjectionOutputUpliftMinTokens", "输出放大最小量", "token"],
-  ["usageProjectionOutputUpliftPercent", "输出放大", "%"],
+  ["streamFirstOutputTimeoutSecs", "首输出等待上限", "秒"],
+  ["usageProjectionUpliftPercent", "输入补偿", "%"],
+  ["usageProjectionCostFloorEnabled", "成本底线", ""],
+  ["usageProjectionCostFloorMarginPercent", "成本底线余量", "%"],
+  ["usageProjectionOutputUpliftMinTokens", "输出补偿阈值", "token"],
+  ["usageProjectionOutputUpliftPercent", "输出补偿", "%"],
 ];
 
 /** 分组标题：同一视觉层级，左侧竖线对齐统计卡的风格。 */
@@ -162,17 +162,17 @@ export function AccountFormModal({
       }
     >
       <div className="space-y-8">
-        <Group title="基本信息">
+        <Group title="连接信息" description="系统会使用这里的服务地址和 Key 连接账号。">
           <FieldGrid min="18rem">
             {text("name", "名称", { required: true })}
-            {text("baseUrl", "上游地址", { required: true, placeholder: "https://api.example.com" })}
+            {text("baseUrl", "服务地址", { required: true, placeholder: "https://api.example.com", description: "填写服务地址即可，通常不需要带具体请求路径" })}
             {text("apiKey", mode === "edit" ? "密钥" : "密钥", {
               required: mode === "create",
               password: true,
               placeholder: mode === "edit" ? "留空保留现有密钥" : undefined,
             })}
-            {choice("authType", "密钥发送方式", ACCOUNT_AUTH_TYPE_OPTIONS)}
-            {text("proxyUrl", "代理地址", { placeholder: "留空继承全局代理" })}
+            {choice("authType", "认证方式", ACCOUNT_AUTH_TYPE_OPTIONS)}
+            {text("proxyUrl", "代理地址", { placeholder: "留空继承全局" })}
             {text("tagsText", "标签", { placeholder: "多个标签用逗号分隔" })}
           </FieldGrid>
           <div className="flex flex-wrap gap-x-8 gap-y-2">
@@ -180,31 +180,31 @@ export function AccountFormModal({
           </div>
         </Group>
 
-        <Group title="调度与计费">
+        <Group title="调度设置" description="这些设置只影响当前账号，不改变全局排队和冷却策略。">
           <FieldGrid min="14rem">
-            {number("priority", "优先级", { description: "数字越小越先被选中" })}
-            {number("maxConcurrentRequests", "并发上限", { min: 1, description: "同时在飞的请求数" })}
+            {number("priority", "优先级", { description: "数字越小越靠前；同优先级再按容量和状态分配" })}
+            {number("maxConcurrentRequests", "单账号最大并发", { min: 1, description: "当前账号同时处理的最大请求数，不是 RPM" })}
             {number("costMultiplier", "成本倍率", { step: "0.01", min: 0, description: "账号成本 = 上游原始成本 × 倍率" })}
           </FieldGrid>
           <FieldGrid min="18rem">
-            {choice("usageProjectionMode", "下游 usage 口径", USAGE_PROJECTION_MODE_OPTIONS)}
-            {choice("autoDisablePolicy", "连续失败自动停用", AUTO_DISABLE_POLICY_OPTIONS)}
+            {choice("usageProjectionMode", "下游 usage", USAGE_PROJECTION_MODE_OPTIONS)}
+            {choice("autoDisablePolicy", "自动禁用策略", AUTO_DISABLE_POLICY_OPTIONS)}
           </FieldGrid>
         </Group>
 
-        <Group title="上游请求方式" description="默认值适用于绝大多数中转站；只有上游明确要求时才需要调整。">
+        <Group title="上游 Header 兼容" description="控制转发到该账号时的请求头、Claude Code 指纹和 beta 查询参数。">
           <FieldGrid min="18rem">
-            {choice("headerProfile", "请求头风格", ACCOUNT_HEADER_PROFILE_OPTIONS)}
-            {choice("wireProfile", "HTTP 传输", ACCOUNT_WIRE_PROFILE_OPTIONS)}
-            {choice("tlsProfile", "TLS 实现", ACCOUNT_TLS_PROFILE_OPTIONS)}
-            {choice("streamResponseMode", "流式响应处理", ACCOUNT_STREAM_RESPONSE_OPTIONS)}
-            {choice("preOutputStreamRetryMode", "首输出前失败换号", STREAM_RETRY_MODE_OPTIONS)}
+            {choice("headerProfile", "Header profile", ACCOUNT_HEADER_PROFILE_OPTIONS)}
+            {choice("wireProfile", "Wire profile", ACCOUNT_WIRE_PROFILE_OPTIONS)}
+            {choice("tlsProfile", "TLS profile", ACCOUNT_TLS_PROFILE_OPTIONS)}
+            {choice("streamResponseMode", "SSE 转发", ACCOUNT_STREAM_RESPONSE_OPTIONS)}
+            {choice("preOutputStreamRetryMode", "首输出前流式恢复", STREAM_RETRY_MODE_OPTIONS)}
           </FieldGrid>
           <div className="flex flex-wrap gap-x-8 gap-y-2">
-            {toggle("appendBetaQuery", "在 URL 上追加 beta 参数", "部分上游要求 ?beta=true")}
-            {toggle("normalizeModelVersionDots", "模型版本号点号归一", "把 claude-3.5 这类写法转成 claude-3-5")}
+            {toggle("appendBetaQuery", "URL 追加 beta=true")}
+            {toggle("normalizeModelVersionDots", "未命中时点号转横杠", "未命中映射规则时，自动将版本号点号替换为横杠")}
           </div>
-          <Field label="额外请求头" htmlFor="account-headerOverrides" description="每行一个，格式 name: value；会覆盖同名头">
+          <Field label="Header 覆盖" htmlFor="account-headerOverrides" description="每行一个 name: value；敏感头如 authorization、x-api-key、cookie 会被后端拒绝">
             <Textarea
               id="account-headerOverrides"
               rows={3}
@@ -214,9 +214,9 @@ export function AccountFormModal({
           </Field>
         </Group>
 
-        <Group title="接受的路由">
+        <Group title="入口路由" description="只限制当前账号能承接哪些入口。">
           <FieldGrid min="18rem">
-            {choice("routeMode", "规则模式", RULE_MODE_OPTIONS)}
+            {choice("routeMode", "路由模式", RULE_MODE_OPTIONS)}
           </FieldGrid>
           <RouteSelector
             routes={routes.data?.routes ?? []}
@@ -227,8 +227,8 @@ export function AccountFormModal({
         </Group>
 
         <Group
-          title="支持的模型"
-          description="留空表示不限制；填了列表后只有列表内的模型会调度到这个账号。"
+          title="调度资格"
+          description="只决定该账号是否允许承接某些模型；空列表表示不限制。不改变请求体里的 model，也不影响模型映射规则。"
           actions={
             <Button
               size="sm"
@@ -254,14 +254,14 @@ export function AccountFormModal({
           />
         </Group>
 
-        <Group title="模型映射">
+        <Group title="模型处理" description="控制当前账号发出请求时的模型名称处理方式。">
           <FieldGrid min="18rem">
             {choice("modelMappingMode", "映射模式", MODEL_MAPPING_MODE_OPTIONS)}
           </FieldGrid>
           <div className="flex flex-wrap gap-x-8 gap-y-2">
-            {toggle("modelMappingRequireMatch", "未命中规则时拒绝请求")}
+            {toggle("modelMappingRequireMatch", "必须命中映射")}
           </div>
-          <Field label="映射规则" htmlFor="account-modelMappingRules" description="每行一条，格式 source -> target">
+          <Field label="映射规则" htmlFor="account-modelMappingRules" description="每行一条：claude-sonnet-4-5-20250929 -> claude-sonnet-4.5">
             <Textarea
               id="account-modelMappingRules"
               rows={5}

@@ -19,67 +19,67 @@ export function enumLabel(options: readonly EnumOption[], value: string | null |
   return options.find((option) => option.value === value)?.label ?? value
 }
 
-// ─── 账号：鉴权与请求发送方式 ───────────────────────────────────────────────────
+// ─── 账号：连接与 Header（文案与 main 外部池表单一致）────────────────────────────
 
 export const ACCOUNT_AUTH_TYPE_OPTIONS: EnumOption[] = [
-  { value: 'bearer', label: 'Authorization: Bearer', description: '密钥放在 Authorization 头里，大多数中转站用这种方式' },
-  { value: 'x_api_key', label: 'x-api-key 头', description: '密钥放在 x-api-key 头里，与 Anthropic 官方 API 一致' },
+  { value: 'bearer', label: 'Authorization: Bearer <key>' },
+  { value: 'x_api_key', label: 'x-api-key: <key>' },
 ]
 
 export const ACCOUNT_HEADER_PROFILE_OPTIONS: EnumOption[] = [
-  { value: 'generic', label: '通用', description: '只发鉴权头和必要的协议头，适合大多数中转站' },
-  { value: 'anthropic_passthrough', label: '透传 Anthropic 头', description: '把下游请求里的 anthropic-* 头原样转发给上游' },
-  { value: 'claude_code_mimic', label: '模拟 Claude Code', description: '补齐 Claude Code CLI 会发的 user-agent 与 beta 头，用于只接受官方客户端的上游' },
+  { value: 'generic', label: '默认泛用转发', description: '保持泛用转发策略，仅过滤认证、连接、cookie、x-goog-api-key 等敏感请求头；是否追加 beta=true 由开关控制。' },
+  { value: 'anthropic_passthrough', label: 'Anthropic allowlist', description: '只透传 Anthropic/Claude Code 相关请求头，过滤 cookie、x-goog-api-key 和非必要客户端头；URL 自动追加 beta=true。' },
+  { value: 'claude_code_mimic', label: 'Claude Code mimic', description: '忽略客户端指纹，使用 Claude Code 风格的 x-stainless、User-Agent、x-client-request-id 和 anthropic-beta；URL 自动追加 beta=true。' },
 ]
 
 export const ACCOUNT_WIRE_PROFILE_OPTIONS: EnumOption[] = [
-  { value: 'default', label: '默认（HTTP/2 优先）', description: '按上游协商结果选择 HTTP 版本，头名小写' },
-  { value: 'http1_title_case', label: '仅 HTTP/1.1，头名首字母大写', description: '部分老式网关要求 Content-Type 这类写法，并且不支持 HTTP/2' },
+  { value: 'default', label: '默认传输', description: '使用默认 reqwest 传输行为，允许 HTTP/2 协商，header 大小写由 HTTP 客户端决定。' },
+  { value: 'http1_title_case', label: 'HTTP/1 Title-Case', description: '强制 HTTP/1，并启用 Title-Case header 写出；这是兼容增强，不是完整 Claude Code 复刻。' },
 ]
 
 export const ACCOUNT_TLS_PROFILE_OPTIONS: EnumOption[] = [
-  { value: 'default', label: '默认（rustls）', description: '内置 TLS 实现，无系统依赖' },
-  { value: 'native_tls', label: '系统 TLS', description: '使用操作系统的 TLS 库，个别上游对 TLS 指纹有要求时使用' },
+  { value: 'default', label: '默认 TLS', description: '使用默认 TLS 栈（rustls）。' },
+  { value: 'native_tls', label: 'Native TLS', description: '使用系统 native-tls 栈；这是 TLS 栈切换，不是完整 ClientHello 指纹。' },
 ]
 
-// ─── 账号：usage 与流式行为 ─────────────────────────────────────────────────────
+// ─── 账号：usage 与流式 ─────────────────────────────────────────────────────────
 
 export const USAGE_PROJECTION_MODE_OPTIONS: EnumOption[] = [
-  { value: 'current_path_policy', label: '按路由策略整形', description: '下游看到的 usage 按入口路由挂载的缓存策略整理（默认）' },
-  { value: 'pass_through', label: '原样返回上游 usage', description: '不做任何整形，上游返回什么下游就看到什么' },
+  { value: 'current_path_policy', label: '按当前入口路径整理 usage', description: '返回给下游的 usage 按当前入口路径的缓存策略整理。' },
+  { value: 'pass_through', label: '透传上游 usage', description: '返回给下游的 usage 保持上游原始值，不按入口路径整理。' },
 ]
 
 export const ACCOUNT_STREAM_RESPONSE_OPTIONS: EnumOption[] = [
-  { value: 'inherit', label: '继承全局' },
-  { value: 'event_passthrough', label: '按事件透传', description: '逐个 SSE 事件转发，并屏蔽上游错误事件里的内部细节' },
+  { value: 'inherit', label: '继承全局默认' },
+  { value: 'event_passthrough', label: 'SSE 事件级透传', description: '文本、thinking、tool 等事件按上游事件级转发；usage 是否透传由上面的下游 usage 决定。' },
 ]
 
 export const STREAM_RETRY_MODE_OPTIONS: EnumOption[] = [
   { value: 'inherit', label: '继承全局' },
-  { value: 'enabled', label: '开启', description: '首个有效输出之前上游出错、断流或空闲超时时，换账号重试' },
-  { value: 'disabled', label: '关闭', description: '首输出前出错直接按失败处理，不换账号' },
-  { value: 'early_commit', label: '提前提交首包', description: '立即把 message_start 发给下游以降低首字延迟；首个内容前出错仍可换账号重放' },
+  { value: 'enabled', label: '启用', description: 'stream 在 message_start、ping 等协议前缀后遇到 error、断流、EOF 或空闲超时时，可在未提交内容前换其他账号。' },
+  { value: 'disabled', label: '禁用', description: 'stream body 内错误保持现有流错误行为，不重放到其他账号。' },
+  { value: 'early_commit', label: '先提交首包再换池', description: '收到上游 message_start 后立即转发并持续发送 ping；首个内容前出错仍可换账号重试，下游只收到一次 message_start。' },
 ]
 
 export const AUTO_DISABLE_POLICY_OPTIONS: EnumOption[] = [
-  { value: 'inherit', label: '继承全局' },
-  { value: 'enabled', label: '开启', description: '连续失败达到阈值后自动停用该账号一段时间' },
-  { value: 'disabled', label: '关闭', description: '只降权，不自动停用' },
+  { value: 'inherit', label: '继承全局自动禁用' },
+  { value: 'enabled', label: '单独启用自动禁用' },
+  { value: 'disabled', label: '关闭自动禁用' },
 ]
 
 // ─── 账号：路由与模型 ───────────────────────────────────────────────────────────
 
 export const RULE_MODE_OPTIONS: EnumOption[] = [
-  { value: 'allow_all', label: '允许全部' },
-  { value: 'allow_list', label: '只允许列表内', description: '只有命中规则的项可用' },
-  { value: 'deny_list', label: '拒绝列表内', description: '命中规则的项不可用，其余可用' },
+  { value: 'allow_all', label: '全部入口允许' },
+  { value: 'allow_list', label: '只允许下列入口' },
+  { value: 'deny_list', label: '禁止下列入口' },
 ]
 
 export const MODEL_MAPPING_MODE_OPTIONS: EnumOption[] = [
-  { value: 'passthrough', label: '不映射', description: '请求里的模型名原样发给上游' },
-  { value: 'passthrough_mapping', label: '只按规则替换', description: '命中规则的替换，其余原样透传' },
-  { value: 'direct_mapping', label: '规则映射，未命中按原名', description: '先按规则替换；没命中时用请求原名，不做别名归一' },
-  { value: 'processed_mapping', label: '先解析别名再映射', description: '先把 sonnet、opus 等短名解析成完整模型，再按规则替换（默认）' },
+  { value: 'passthrough', label: '直接使用请求模型', description: '直接使用客户端请求里的模型，不应用映射规则和兜底转换。' },
+  { value: 'passthrough_mapping', label: '请求模型优先映射', description: '先用客户端请求模型匹配规则；未命中时仍使用原请求模型。' },
+  { value: 'direct_mapping', label: '映射后内部处理', description: '用客户端请求模型匹配规则；未命中后使用内部处理模型。' },
+  { value: 'processed_mapping', label: '内部处理后映射', description: '先使用本系统解析后的模型匹配规则；未命中后使用内部处理模型。' },
 ]
 
 export const MODEL_MAPPING_RULE_KIND_OPTIONS: EnumOption[] = [
@@ -88,77 +88,77 @@ export const MODEL_MAPPING_RULE_KIND_OPTIONS: EnumOption[] = [
   { value: 'fallback', label: '兜底' },
 ]
 
-// ─── 运行配置 ───────────────────────────────────────────────────────────────────
+// ─── 运行配置（文案与 main 运行配置页一致）───────────────────────────────────────
 
 export const CAPACITY_MODE_OPTIONS: EnumOption[] = [
-  { value: 'wait', label: '排队等待', description: '没有空闲账号槽位时进入等待队列，直到拿到槽位或超过等待时间（默认）' },
-  { value: 'fail_fast', label: '立即失败', description: '没有空闲槽位时直接返回不可用' },
+  { value: 'wait', label: '等待容量' },
+  { value: 'fail_fast', label: '立即失败' },
 ]
 
 export const MODEL_UNAVAILABLE_COOLDOWN_MODE_OPTIONS: EnumOption[] = [
-  { value: 'model', label: '只冷却该模型', description: '上游说模型不可用时，只避开这个账号的这个模型（默认）' },
-  { value: 'pool', label: '冷却整个账号', description: '把整个账号暂时移出调度' },
-  { value: 'disabled', label: '不冷却' },
+  { value: 'model', label: '仅当前模型' },
+  { value: 'pool', label: '整个账号' },
+  { value: 'disabled', label: '不写冷却' },
 ]
 
 export const MODEL_RESOLUTION_MODE_OPTIONS: EnumOption[] = [
-  { value: 'compatible', label: '兼容 Claude Code', description: '允许 sonnet、opus、default 等短名，并把同系列旧版本映射到可用模型（默认）' },
-  { value: 'alias_only', label: '只认精确名和显式别名', description: '不做同系列宽松归一' },
-  { value: 'exact_only', label: '只认目录里的精确模型 ID' },
+  { value: 'compatible', label: '默认兼容解析' },
+  { value: 'alias_only', label: '仅精确与显式别名' },
+  { value: 'exact_only', label: '仅完整模型名' },
 ]
 
 export const COMPAT_PROFILE_OPTIONS: EnumOption[] = [
-  { value: 'claude-code', label: 'Claude Code 兼容', description: '保留 Claude Code CLI 需要的协议改写（默认）' },
-  { value: 'anthropic-strict', label: '严格 Anthropic', description: '尽量不做协议和提示词改写' },
-  { value: 'debug', label: '调试', description: '同 Claude Code 兼容，但默认暴露代理警告头' },
+  { value: 'claude-code', label: 'Claude Code 兼容' },
+  { value: 'anthropic-strict', label: 'Anthropic 严格模式' },
+  { value: 'debug', label: '调试模式' },
 ]
 
 export const TLS_BACKEND_OPTIONS: EnumOption[] = [
-  { value: 'rustls', label: 'rustls（内置）' },
-  { value: 'native-tls', label: '系统 TLS' },
+  { value: 'rustls', label: 'rustls' },
+  { value: 'native-tls', label: 'native-tls' },
 ]
 
 export const MISSING_MAX_TOKENS_POLICY_OPTIONS: EnumOption[] = [
-  { value: 'default_value', label: '补默认值', description: '请求没带 max_tokens 时补一个较小的正数（默认）' },
-  { value: 'reject', label: '拒绝请求' },
+  { value: 'default_value', label: '自动补全' },
+  { value: 'reject', label: '直接拒绝' },
 ]
 
 export const THINKING_TRIGGER_OPTIONS: EnumOption[] = [
-  { value: 'off', label: '不自动开启', description: '只按客户端显式的 thinking 字段处理' },
-  { value: 'real_request', label: '按请求信号触发', description: '客户端带 ultrathink 等可见信号时开启 thinking' },
-  { value: 'always', label: '始终开启', description: '请求未显式关闭时一律开启 thinking' },
+  { value: 'off', label: '不自动开启' },
+  { value: 'real_request', label: '按请求触发' },
+  { value: 'always', label: '总是触发' },
 ]
 
 export const PAYLOAD_GUARD_MODE_OPTIONS: EnumOption[] = [
-  { value: 'on_too_long', label: '上游报超长后再裁剪', description: '首次只做协议修复，上游返回输入过长后裁剪并重试一次（默认）' },
-  { value: 'preemptive', label: '发送前预先裁剪', description: '按字节上限在发送上游前就裁剪历史' },
+  { value: 'on_too_long', label: '失败后再处理并重试' },
+  { value: 'preemptive', label: '发送前先处理' },
 ]
 
 export const TOO_LONG_HANDLING_OPTIONS: EnumOption[] = [
-  { value: 'client_compaction', label: '交给客户端压缩', description: '按 Claude Code 协议返回“prompt is too long”，由客户端压缩后重试（默认）' },
-  { value: 'trim_retry', label: '服务端裁剪后重试' },
+  { value: 'client_compaction', label: '返回 prompt is too long，交给客户端压缩' },
+  { value: 'trim_retry', label: '服务端裁剪历史后重试' },
 ]
 
 export const OVERSIZED_IMAGE_HANDLING_OPTIONS: EnumOption[] = [
-  { value: 'drop-with-placeholder', label: '移除图片并留占位' },
+  { value: 'drop-with-placeholder', label: '移除图片并占位' },
   { value: 'reject', label: '直接报错' },
 ]
 
 export const IMAGE_PROCESSING_MODE_OPTIONS: EnumOption[] = [
-  { value: 'safe', label: '安全', description: '只做无损的规范化' },
-  { value: 'light', label: '轻量', description: '允许轻度压缩以满足上游限制' },
+  { value: 'safe', label: 'Safe：兼容修复' },
+  { value: 'light', label: 'Light：轻量透传' },
 ]
 
 export const REPORTED_USAGE_FIELD_MODE_OPTIONS: EnumOption[] = [
   { value: 'preserve', label: '保持整形结果' },
-  { value: 'raw', label: '原样上报上游值' },
-  { value: 'sample-max', label: '随机采样，不超过上限' },
+  { value: 'raw', label: '原样上报' },
+  { value: 'sample-max', label: '采样，不超过上限' },
   { value: 'sample-target', label: '围绕目标值采样' },
 ]
 
 export const INPUT_DELTA_TARGET_OPTIONS: EnumOption[] = [
-  { value: 'input', label: '留在输入' },
-  { value: 'cache_read', label: '转到缓存读取' },
+  { value: 'input', label: '输入 input' },
+  { value: 'cache_read', label: '缓存读取 cache_read' },
   { value: 'drop', label: '直接丢弃' },
 ]
 

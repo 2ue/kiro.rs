@@ -88,10 +88,10 @@ export function InjectionPreviewPanel({
           <Select value={request.toolChoice} onValueChange={(value) => set('toolChoice')(value as PreviewToolChoice)}>
             <SelectTrigger id="preview-tool-choice" size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="auto">自动（auto）</SelectItem>
-              <SelectItem value="any">必须调用某个工具（any）</SelectItem>
+              <SelectItem value="auto">auto</SelectItem>
+              <SelectItem value="any">any</SelectItem>
               <SelectItem value="tool">tool（Read）</SelectItem>
-              <SelectItem value="none">不调用工具（none）</SelectItem>
+              <SelectItem value="none">none</SelectItem>
             </SelectContent>
           </Select>
         </Field>
@@ -100,8 +100,8 @@ export function InjectionPreviewPanel({
             <SelectTrigger id="preview-thinking" size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="off">不带 thinking</SelectItem>
-              <SelectItem value="enabled">开启（enabled）</SelectItem>
-              <SelectItem value="adaptive">自适应（adaptive）</SelectItem>
+              <SelectItem value="enabled">enabled</SelectItem>
+              <SelectItem value="adaptive">adaptive</SelectItem>
             </SelectContent>
           </Select>
         </Field>
