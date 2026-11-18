@@ -28,15 +28,14 @@ use crate::anthropic::usage::{
     UsageAccountRiskQuery, UsageAccountRiskResponse, UsageAccountRiskSample,
     UsageAccountRiskThresholds, UsageAccountRiskTotals, UsageAccountRiskWindow, UsageAggregate,
     UsageBreakdownItem, UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary,
-    UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec, UsageOverviewAccountRow,
-    UsageOverviewExternal, UsageOverviewMetrics, UsageOverviewPoolRow, UsageOverviewRankRow,
-    UsageOverviewResponse, UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup,
-    UsageOverviewSeriesGroups, UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint,
-    UsageOverviewSpec, UsageOverviewTotals, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
-    UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult, UsageRouteKind,
-    UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
-    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
-    usage_dashboard_windows,
+    UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec, UsageOverviewExternal,
+    UsageOverviewMetrics, UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse,
+    UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup, UsageOverviewSeriesGroups,
+    UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals,
+    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
+    UsageRecordsResult, UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary,
+    UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
+    usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
 };
 use crate::model::config::{
     Config, ModelMappingRule, RouteRuleMode, StreamResponseMode, normalize_route_rules,
@@ -70,6 +69,12 @@ const ADMIN_AUDIT_CLEANUP_LOCK_TIMEOUT_MS: u64 = 250;
 const ADMIN_AUDIT_CLEANUP_STATEMENT_TIMEOUT_MS: u64 = 5_000;
 const USAGE_SOFT_DELETE_WATERMARK_SCOPE: &str = "soft_delete_created_at";
 const USAGE_CLEANUP_LOCK_TIMEOUT_MS: u64 = 250;
+/// Rows per batch for the automatic usage detail retention job.
+const USAGE_RETENTION_MAX_BATCH: usize = 2_000;
+/// Startup backfill of the overview total columns only runs when the detail table is small;
+/// bigger deployments run `maintenance usage-overview-totals-backfill` off-peak.
+const USAGE_OVERVIEW_TOTALS_STARTUP_MAX_BYTES: i64 = 256 * 1024 * 1024;
+const USAGE_OVERVIEW_TOTALS_BACKFILL_VERSION: &str = "usage-overview-totals-backfill-v1";
 const USAGE_CLEANUP_STATEMENT_TIMEOUT_MS: u64 = 10_000;
 const USAGE_DASHBOARD_STATEMENT_TIMEOUT_MS: u64 = 115_000;
 const USAGE_DASHBOARD_LOCK_TIMEOUT_MS: u64 = 250;
@@ -112,6 +117,14 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
         column_name: "total_compat_input_tokens",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "account_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "account_raw_tokens",
     },
     RequiredPostgresColumn {
         table_name: "accounts",
@@ -832,6 +845,7 @@ impl PostgresStore {
                 // multi-GB production usage history before the service becomes available.
                 execute_sql_statements_in_tx(&mut tx, SCHEMA_SQL).await?;
                 ensure_usage_indexes_if_startup_safe(&mut tx).await?;
+                backfill_usage_overview_totals_if_startup_safe(&mut tx).await?;
                 run_versioned_migration_in_tx(
                     &mut tx,
                     "usage-cleanup-batch-size-limit-v1",
@@ -2991,6 +3005,98 @@ async fn ensure_usage_indexes_if_startup_safe(
     Ok(())
 }
 
+/// Scans active rollup-bearing detail rows and rewrites the two overview total columns.
+async fn backfill_usage_overview_totals_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<u64> {
+    for table in ["usage_rollup_time_buckets", "usage_rollup_totals"] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET account_cost_usd = 0, account_raw_tokens = 0 WHERE account_cost_usd <> 0 OR account_raw_tokens <> 0"
+        ))
+        .execute(&mut **tx)
+        .await?;
+    }
+    let mut backfill = UsageOverviewTotalsBackfill::default();
+    let mut scanned = 0_u64;
+    let mut last_id: Option<String> = None;
+    loop {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, data
+            FROM usage_records
+            WHERE deleted_at IS NULL
+              AND rollup_active
+              AND ($1::text IS NULL OR id > $1)
+            ORDER BY id ASC
+            LIMIT 1000
+            "#,
+        )
+        .bind(last_id.as_deref())
+        .fetch_all(&mut **tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            last_id = Some(row.try_get("id")?);
+            let value: serde_json::Value = row.try_get("data")?;
+            let mut record: UsageRecord = serde_json::from_value(value)?;
+            apply_usage_record_legacy_cost_compatibility(&mut record);
+            backfill.add_record(&record);
+            scanned += 1;
+        }
+    }
+    backfill.apply(tx).await?;
+    Ok(scanned)
+}
+
+/// Marks the overview totals backfill as applied so startup does not repeat it.
+async fn mark_usage_overview_totals_backfilled(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO schema_migrations (version, checksum, applied_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (version) DO NOTHING
+        "#,
+    )
+    .bind(USAGE_OVERVIEW_TOTALS_BACKFILL_VERSION)
+    .bind(sha256_hex(USAGE_OVERVIEW_TOTALS_BACKFILL_VERSION))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Startup path for the overview totals backfill: bounded like the index creation. Small
+/// detail tables are backfilled in place; large ones are skipped with a pointer to the
+/// maintenance command so a routine upgrade never blocks on multi-GB usage history.
+async fn backfill_usage_overview_totals_if_startup_safe(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    let applied: Option<String> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = $1")
+            .bind(USAGE_OVERVIEW_TOTALS_BACKFILL_VERSION)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if applied.is_some() {
+        return Ok(());
+    }
+    let size = relation_size_bytes(tx, "usage_records").await?;
+    if size > USAGE_OVERVIEW_TOTALS_STARTUP_MAX_BYTES {
+        tracing::warn!(
+            usage_records_bytes = size,
+            max_startup_bytes = USAGE_OVERVIEW_TOTALS_STARTUP_MAX_BYTES,
+            "usage_records 过大，启动时跳过总览合计列回填；总览的账号成本/原始 token 在回填前只统计新记录，请低峰期执行 maintenance usage-overview-totals-backfill"
+        );
+        return Ok(());
+    }
+    let scanned = backfill_usage_overview_totals_in_tx(tx).await?;
+    mark_usage_overview_totals_backfilled(tx).await?;
+    tracing::info!(scanned, "已从明细回填总览合计列（账号成本、原始 token）");
+    Ok(())
+}
+
 async fn usage_rollup_hour_compression_v1_applied(
     conn: &mut sqlx::pool::PoolConnection<Postgres>,
 ) -> anyhow::Result<bool> {
@@ -3663,7 +3769,6 @@ impl PostgresUsageStore {
         let dimensions = vec![
             "global".to_string(),
             "account".to_string(),
-            "credential".to_string(),
             "model".to_string(),
             "endpoint".to_string(),
             "request_api_key".to_string(),
@@ -3704,7 +3809,9 @@ impl PostgresUsageStore {
                 account_reported_cost_usd,
                 account_billable_cost_usd,
                 account_profit_usd,
-                account_cost_floor_delta_usd
+                account_cost_floor_delta_usd,
+                account_cost_usd,
+                account_raw_tokens
             FROM usage_rollup_time_buckets
             WHERE dimension = ANY($1::text[])
               AND bucket_start >= $2
@@ -3725,8 +3832,6 @@ impl PostgresUsageStore {
         let mut series = HashMap::<String, OverviewSeriesAccumulator>::new();
         let mut series_groups = OverviewSeriesGroupsAccumulator::default();
         let mut pools = HashMap::<String, OverviewPoolAccumulator>::new();
-        let mut accounts = HashMap::<String, OverviewAccumulator>::new();
-        let mut account_labels = HashMap::<String, String>::new();
         let mut models = HashMap::<String, OverviewRankAccumulator>::new();
         let mut keys = HashMap::<String, OverviewRankAccumulator>::new();
         let mut paths = HashMap::<String, OverviewRankAccumulator>::new();
@@ -3785,13 +3890,6 @@ impl PostgresUsageStore {
                     }
                 }
 
-                "credential" => {
-                    let account = accounts.entry(dimension_key.clone()).or_default();
-                    account.add(metrics);
-                    if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
-                        account_labels.insert(dimension_key, label.to_string());
-                    }
-                }
                 "model" => {
                     let rank = models.entry(dimension_key.clone()).or_default();
                     rank.add(metrics);
@@ -3861,39 +3959,16 @@ impl PostgresUsageStore {
                 .then_with(|| left.pool_id.cmp(&right.pool_id))
         });
 
-        let mut account_rows = accounts
-            .into_iter()
-            .filter_map(|(credential_id, metrics)| {
-                let Ok(credential_id) = credential_id.parse::<u64>() else {
-                    return None;
-                };
-                Some(UsageOverviewAccountRow {
-                    credential_id,
-                    label: account_labels
-                        .get(&credential_id.to_string())
-                        .cloned()
-                        .unwrap_or_else(|| format!("#{}", credential_id)),
-                    metrics: metrics.to_metrics(),
-                })
-            })
-            .filter(|row| row.metrics.requests > 0)
-            .collect::<Vec<_>>();
-        account_rows.sort_by(|left, right| {
-            right
-                .metrics
-                .estimated_cost_usd
-                .total_cmp(&left.metrics.estimated_cost_usd)
-                .then_with(|| right.metrics.requests.cmp(&left.metrics.requests))
-                .then_with(|| left.credential_id.cmp(&right.credential_id))
-        });
-        let mut top_accounts = account_rows
+        // 排行里的“账号”就是账号池本身：按下游估算计费排序，和其它维度口径一致。
+        let mut top_accounts = pool_rows
             .iter()
-            .map(|row| UsageOverviewRankRow {
-                key: row.credential_id.to_string(),
-                label: row.label.clone(),
-                requests: row.metrics.requests,
-                error_requests: row.metrics.error_requests,
-                estimated_cost_usd: row.metrics.estimated_cost_usd,
+            .filter(|pool| pool.metrics.requests > 0)
+            .map(|pool| UsageOverviewRankRow {
+                key: pool.pool_id.to_string(),
+                label: pool.pool_name.clone(),
+                requests: pool.metrics.requests,
+                error_requests: pool.metrics.error_requests,
+                estimated_cost_usd: pool.metrics.estimated_cost_usd,
             })
             .collect::<Vec<_>>();
         top_accounts.sort_by(|left, right| {
@@ -3946,6 +4021,8 @@ impl PostgresUsageStore {
                 profit_usd: pool_rows.iter().map(|pool| pool.profit_usd).sum(),
                 cost_floor_delta_usd: pool_rows.iter().map(|pool| pool.cost_floor_delta_usd).sum(),
                 cost_floor_applied_requests,
+                account_cost_usd: all.account_cost_usd.max(0.0),
+                raw_tokens: all.account_raw_tokens.max(0),
                 pools: pool_rows,
             },
             series: series_points,
@@ -4375,6 +4452,78 @@ impl PostgresUsageStore {
     /// Rebuilds the route dimensions (`local_route`, `external_reason`) from the
     /// active usage records. Offline maintenance only: the caller holds the
     /// exclusive maintenance fence and the commit guard blocks writers.
+    /// Recomputes the overview total columns (`account_cost_usd`, `account_raw_tokens`) of both
+    /// rollup tables from active detail rows. Zeroing first keeps the command idempotent;
+    /// every other rollup column is left untouched. Runs under the usage cleanup commit
+    /// guard so concurrent writers cannot interleave partial sums.
+    pub async fn backfill_usage_overview_totals(&self) -> anyhow::Result<u64> {
+        let mut tx = self.store.pool().begin().await?;
+        acquire_usage_cleanup_commit_guard(&mut tx).await?;
+        let scanned = backfill_usage_overview_totals_in_tx(&mut tx).await?;
+        mark_usage_overview_totals_backfilled(&mut tx).await?;
+        tx.commit().await?;
+        Ok(scanned)
+    }
+
+    /// Physically deletes usage detail rows (active rows by `created_at`, tombstones by
+    /// `deleted_at`) older than `retention`, oldest first, in one bounded batch. Rollups are
+    /// kept, so overview and trends keep their history; only the per-request detail goes.
+    /// Returns the number of removed rows; `limit` rows means there may be more.
+    pub async fn delete_expired_usage_records(
+        &self,
+        retention: std::time::Duration,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        let limit = limit.clamp(1, USAGE_RETENTION_MAX_BATCH);
+        let retention_secs = i64::try_from(retention.as_secs())
+            .map_err(|_| anyhow::anyhow!("用量明细保留时长超出 PgSQL 范围"))?;
+        let cutoff = Utc::now() - ChronoDuration::seconds(retention_secs);
+        let result = self
+            .hard_delete_cleanup_batch_preserving_summary(cutoff, limit)
+            .await?;
+        Ok(result.processed_rows)
+    }
+
+    /// Prunes per-conversation rollup rows (`dimension = 'conversation'`, one row per
+    /// conversation, never time-bucketed) whose last activity is older than `retention`.
+    /// They only feed the "top conversations" list, so dropping stale ones keeps that table
+    /// from growing forever once detail retention is on. Bounded by `limit` rows per call.
+    pub async fn delete_stale_conversation_rollups(
+        &self,
+        retention: std::time::Duration,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        let limit = limit.clamp(1, USAGE_RETENTION_MAX_BATCH);
+        let retention_secs = i64::try_from(retention.as_secs())
+            .map_err(|_| anyhow::anyhow!("用量明细保留时长超出 PgSQL 范围"))?;
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_cleanup_transaction(&mut tx).await?;
+        let removed = sqlx::query(
+            r#"
+            WITH stale AS (
+                SELECT dimension_key
+                FROM usage_rollup_totals
+                WHERE dimension = 'conversation'
+                  AND updated_at < now() - ($1::bigint * interval '1 second')
+                ORDER BY updated_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM usage_rollup_totals AS rollup
+            USING stale
+            WHERE rollup.dimension = 'conversation'
+              AND rollup.dimension_key = stale.dimension_key
+            "#,
+        )
+        .bind(retention_secs)
+        .bind(usize_to_i64(limit))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     pub async fn rebuild_usage_route_dimensions(&self) -> anyhow::Result<u64> {
         let dimensions = USAGE_ROUTE_ROLLUP_DIMENSIONS
             .iter()
@@ -6885,6 +7034,10 @@ struct UsageRollupMetrics {
     duration_ms_sum: i64,
     duration_ms_count: i64,
     duration_ms_max: i64,
+    /// 账号成本：上游原始成本 × 账号倍率（`UsageRecord::account_cost_usd`）。
+    account_cost_usd: f64,
+    /// 上游原始用量的输入 + 输出 token，总览用来和下游报告量做对照。
+    account_raw_tokens: i64,
 }
 
 impl UsageRollupMetrics {
@@ -6968,6 +7121,8 @@ impl UsageRollupMetrics {
             } else {
                 0
             },
+            account_cost_usd: record.account_cost_usd * sign as f64,
+            account_raw_tokens: usage_record_raw_tokens(record) * sign,
         }
     }
 
@@ -7008,7 +7163,20 @@ impl UsageRollupMetrics {
         self.duration_ms_sum += other.duration_ms_sum;
         self.duration_ms_count += other.duration_ms_count;
         self.duration_ms_max = self.duration_ms_max.max(other.duration_ms_max);
+        self.account_cost_usd += other.account_cost_usd;
+        self.account_raw_tokens += other.account_raw_tokens;
     }
+}
+
+/// 上游原始用量的输入 + 输出 token。优先取账号计费里的原始快照，老记录退回顶层 `raw_usage`。
+fn usage_record_raw_tokens(record: &UsageRecord) -> i64 {
+    let raw = record
+        .account_billing
+        .as_ref()
+        .map(|billing| billing.raw_usage)
+        .or(record.raw_usage);
+    raw.map(|usage| i64::from(usage.total_input_tokens) + i64::from(usage.output_tokens))
+        .unwrap_or(0)
 }
 
 struct UsageRollupDimension {
@@ -7041,6 +7209,109 @@ struct UsageRollupBatchDelta {
     cache_read_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
     duration_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
     has_negative: bool,
+}
+
+/// Accumulates the overview totals (`account_cost_usd`, raw tokens) per rollup row for the
+/// targeted backfill of the two columns added after launch.
+#[derive(Default)]
+struct UsageOverviewTotalsBackfill {
+    totals: HashMap<(&'static str, String), (f64, i64)>,
+    time_buckets: HashMap<(DateTime<Utc>, &'static str, String), (f64, i64)>,
+}
+
+impl UsageOverviewTotalsBackfill {
+    fn add_record(&mut self, record: &UsageRecord) {
+        let cost = record.account_cost_usd;
+        let raw_tokens = usage_record_raw_tokens(record);
+        if cost == 0.0 && raw_tokens == 0 {
+            return;
+        }
+        let bucket_start = usage_rollup_bucket_start(parse_usage_created_at(record));
+        for dimension in usage_rollup_dimensions(record) {
+            let total = self
+                .totals
+                .entry((dimension.dimension, dimension.key.clone()))
+                .or_default();
+            total.0 += cost;
+            total.1 += raw_tokens;
+            if dimension.include_time_bucket {
+                let bucket = self
+                    .time_buckets
+                    .entry((bucket_start, dimension.dimension, dimension.key))
+                    .or_default();
+                bucket.0 += cost;
+                bucket.1 += raw_tokens;
+            }
+        }
+    }
+
+    async fn apply(self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
+        const CHUNK: usize = 5_000;
+        let totals = self.totals.into_iter().collect::<Vec<_>>();
+        for chunk in totals.chunks(CHUNK) {
+            let dimensions = chunk
+                .iter()
+                .map(|((d, _), _)| d.to_string())
+                .collect::<Vec<_>>();
+            let keys = chunk
+                .iter()
+                .map(|((_, k), _)| k.clone())
+                .collect::<Vec<_>>();
+            let costs = chunk.iter().map(|(_, v)| v.0).collect::<Vec<_>>();
+            let tokens = chunk.iter().map(|(_, v)| v.1).collect::<Vec<_>>();
+            sqlx::query(
+                r#"
+                UPDATE usage_rollup_totals AS rollup
+                SET account_cost_usd = source.cost,
+                    account_raw_tokens = source.tokens
+                FROM unnest($1::text[], $2::text[], $3::double precision[], $4::bigint[])
+                    AS source(dimension, dimension_key, cost, tokens)
+                WHERE rollup.dimension = source.dimension
+                  AND rollup.dimension_key = source.dimension_key
+                "#,
+            )
+            .bind(&dimensions)
+            .bind(&keys)
+            .bind(&costs)
+            .bind(&tokens)
+            .execute(&mut **tx)
+            .await?;
+        }
+        let buckets = self.time_buckets.into_iter().collect::<Vec<_>>();
+        for chunk in buckets.chunks(CHUNK) {
+            let starts = chunk.iter().map(|((b, _, _), _)| *b).collect::<Vec<_>>();
+            let dimensions = chunk
+                .iter()
+                .map(|((_, d, _), _)| d.to_string())
+                .collect::<Vec<_>>();
+            let keys = chunk
+                .iter()
+                .map(|((_, _, k), _)| k.clone())
+                .collect::<Vec<_>>();
+            let costs = chunk.iter().map(|(_, v)| v.0).collect::<Vec<_>>();
+            let tokens = chunk.iter().map(|(_, v)| v.1).collect::<Vec<_>>();
+            sqlx::query(
+                r#"
+                UPDATE usage_rollup_time_buckets AS rollup
+                SET account_cost_usd = source.cost,
+                    account_raw_tokens = source.tokens
+                FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::double precision[], $5::bigint[])
+                    AS source(bucket_start, dimension, dimension_key, cost, tokens)
+                WHERE rollup.bucket_start = source.bucket_start
+                  AND rollup.dimension = source.dimension
+                  AND rollup.dimension_key = source.dimension_key
+                "#,
+            )
+            .bind(&starts)
+            .bind(&dimensions)
+            .bind(&keys)
+            .bind(&costs)
+            .bind(&tokens)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 /// Accumulates `compat_input_tokens` per rollup row for the targeted backfill.
@@ -7424,14 +7695,14 @@ async fn upsert_usage_rollup_total(
             account_profit_usd, account_reported_cost_usd,
             account_billable_cost_usd, account_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count, duration_ms_max, total_compat_input_tokens,
-            updated_at
+            account_cost_usd, account_raw_tokens, updated_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16,
             $17, $18, $19, $20, $21, $22, $23,
             $24, $25, $26, $27, $28, $29, $30, $31,
-            $32, $33, $34, $35, $36, $37, $38, now()
+            $32, $33, $34, $35, $36, $37, $38, $39, $40, now()
         )
         ON CONFLICT (dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_totals.dimension_label),
@@ -7476,6 +7747,8 @@ async fn upsert_usage_rollup_total(
                 WHEN usage_rollup_totals.duration_ms_count + EXCLUDED.duration_ms_count <= 0 THEN 0
                 ELSE GREATEST(usage_rollup_totals.duration_ms_max, EXCLUDED.duration_ms_max)
             END,
+            account_cost_usd = usage_rollup_totals.account_cost_usd + EXCLUDED.account_cost_usd,
+            account_raw_tokens = usage_rollup_totals.account_raw_tokens + EXCLUDED.account_raw_tokens,
             updated_at = now()
         "#,
     )
@@ -7520,6 +7793,8 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.duration_ms_count)
     .bind(metrics.duration_ms_max)
     .bind(metrics.total_compat_input_tokens)
+    .bind(metrics.account_cost_usd)
+    .bind(metrics.account_raw_tokens)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -7548,13 +7823,14 @@ async fn upsert_usage_rollup_time_bucket(
             account_uplifted_cost_usd, account_profit_usd, account_reported_cost_usd,
             account_billable_cost_usd, account_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count,
-            duration_ms_max, total_compat_input_tokens, updated_at
+            duration_ms_max, total_compat_input_tokens, account_cost_usd, account_raw_tokens,
+            updated_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16,
             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-            $32, $33, $34, $35, $36, $37, $38, $39, now()
+            $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, now()
         )
         ON CONFLICT (bucket_start, dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_time_buckets.dimension_label),
@@ -7599,6 +7875,8 @@ async fn upsert_usage_rollup_time_bucket(
                 WHEN usage_rollup_time_buckets.duration_ms_count + EXCLUDED.duration_ms_count <= 0 THEN 0
                 ELSE GREATEST(usage_rollup_time_buckets.duration_ms_max, EXCLUDED.duration_ms_max)
             END,
+            account_cost_usd = usage_rollup_time_buckets.account_cost_usd + EXCLUDED.account_cost_usd,
+            account_raw_tokens = usage_rollup_time_buckets.account_raw_tokens + EXCLUDED.account_raw_tokens,
             updated_at = now()
         "#,
     )
@@ -7644,6 +7922,8 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.duration_ms_count)
     .bind(metrics.duration_ms_max)
     .bind(metrics.total_compat_input_tokens)
+    .bind(metrics.account_cost_usd)
+    .bind(metrics.account_raw_tokens)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -8559,6 +8839,8 @@ struct OverviewAccumulator {
     duration_ms_sum: i64,
     duration_ms_count: i64,
     account_cost_floor_applied_requests: i64,
+    account_cost_usd: f64,
+    account_raw_tokens: i64,
 }
 
 impl OverviewAccumulator {
@@ -8581,6 +8863,8 @@ impl OverviewAccumulator {
             duration_ms_count: row.try_get("duration_ms_count")?,
             account_cost_floor_applied_requests: row
                 .try_get("account_cost_floor_applied_requests")?,
+            account_cost_usd: row.try_get("account_cost_usd")?,
+            account_raw_tokens: row.try_get("account_raw_tokens")?,
         })
     }
 
@@ -8600,6 +8884,8 @@ impl OverviewAccumulator {
         self.duration_ms_sum += other.duration_ms_sum;
         self.duration_ms_count += other.duration_ms_count;
         self.account_cost_floor_applied_requests += other.account_cost_floor_applied_requests;
+        self.account_cost_usd += other.account_cost_usd;
+        self.account_raw_tokens += other.account_raw_tokens;
     }
 
     fn to_metrics(self) -> UsageOverviewMetrics {
@@ -9875,6 +10161,8 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     duration_ms_count BIGINT NOT NULL DEFAULT 0,
     duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_raw_tokens BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (dimension, dimension_key)
 );
@@ -9919,6 +10207,8 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_raw_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
@@ -9964,6 +10254,8 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     duration_ms_count BIGINT NOT NULL DEFAULT 0,
     duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    account_raw_tokens BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (bucket_start, dimension, dimension_key)
 );
@@ -10008,6 +10300,8 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS duration_ms_sum BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS account_raw_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS usage_cache_read_totals (
@@ -10635,6 +10929,20 @@ mod tests {
             (
                 "usage_records",
                 vec!["account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0"],
+            ),
+            (
+                "usage_rollup_totals",
+                vec![
+                    "account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0",
+                    "account_raw_tokens BIGINT NOT NULL DEFAULT 0",
+                ],
+            ),
+            (
+                "usage_rollup_time_buckets",
+                vec![
+                    "account_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0",
+                    "account_raw_tokens BIGINT NOT NULL DEFAULT 0",
+                ],
             ),
         ] {
             let create = SCHEMA_SQL
@@ -11977,6 +12285,203 @@ mod tests {
             )
             .await;
         }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 总览的账号成本与原始 token 直接来自汇总表；写入、负向抵消、回填三条路径口径一致。
+    #[tokio::test]
+    async fn postgres_overview_totals_come_from_rollups_and_backfill_matches() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let now = Utc::now();
+        let mut first = external_usage_record("overview-totals-1", 1.0, 0.8, 1.2);
+        first.account_cost_usd = 1.5;
+        first.created_at = now.to_rfc3339();
+        let mut second = external_usage_record("overview-totals-2", 2.0, 1.6, 2.4);
+        second.account_cost_usd = 3.0;
+        second.created_at = now.to_rfc3339();
+        // 本地记录没有账号计费：不贡献账号成本与原始 token。
+        let mut local = usage_record("overview-totals-local", 10);
+        local.created_at = now.to_rfc3339();
+        usage_store
+            .record_batch(vec![first.clone(), second.clone(), local])
+            .await
+            .unwrap();
+
+        let expected_raw_tokens = [&first, &second]
+            .iter()
+            .map(|record| usage_record_raw_tokens(record))
+            .sum::<i64>();
+        assert!(expected_raw_tokens > 0, "fixture must carry raw usage");
+
+        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
+            Utc::now(),
+            Some("UTC"),
+            Some("today"),
+            None,
+            None,
+            Some("hour"),
+            Some(10),
+        )
+        .unwrap();
+        let overview = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert!(
+            (overview.external.account_cost_usd - 4.5).abs() < 1e-9,
+            "{overview:?}"
+        );
+        assert_eq!(overview.external.raw_tokens, expected_raw_tokens);
+        // 排行里的“账号”就是账号池：两条外部记录同一个池 #42。
+        assert_eq!(overview.top_accounts.len(), 1);
+        assert_eq!(overview.top_accounts[0].key, "42");
+        assert_eq!(overview.top_accounts[0].label, "backup-a");
+        assert_eq!(overview.top_accounts[0].requests, 2);
+
+        // 把列清零后用回填重建，必须得到同样的数字。
+        for table in ["usage_rollup_totals", "usage_rollup_time_buckets"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET account_cost_usd = 0, account_raw_tokens = 0"
+            ))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let scanned = usage_store.backfill_usage_overview_totals().await.unwrap();
+        assert_eq!(scanned, 3);
+        let rebuilt = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert!((rebuilt.external.account_cost_usd - 4.5).abs() < 1e-9);
+        assert_eq!(rebuilt.external.raw_tokens, expected_raw_tokens);
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = $1")
+                .bind(USAGE_OVERVIEW_TOTALS_BACKFILL_VERSION)
+                .fetch_optional(store.pool())
+                .await
+                .unwrap();
+        assert!(marker.is_some(), "backfill must record its marker");
+
+        // 软删一条后合计跟着减少（负向增量同样带着这两列）。
+        let cutoff = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let mut newer = external_usage_record("overview-totals-3", 1.0, 0.8, 1.2);
+        newer.account_cost_usd = 0.25;
+        newer.created_at = Utc::now().to_rfc3339();
+        usage_store.record(newer).await.unwrap();
+        let result = usage_store
+            .soft_delete_cleanup_batch(cutoff, 10)
+            .await
+            .unwrap();
+        assert_eq!(result.processed_rows, 3);
+        let after = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert!(
+            (after.external.account_cost_usd - 0.25).abs() < 1e-9,
+            "{after:?}"
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 用量明细保留只删 usage_records（含墓碑），汇总与总览保持不变。
+    #[tokio::test]
+    async fn postgres_usage_retention_deletes_detail_but_keeps_rollups() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let old_created = Utc::now() - chrono::Duration::days(10);
+        let mut records = Vec::new();
+        for index in 0..5 {
+            let mut record = usage_record(&format!("retention-old-{index}"), 100);
+            record.created_at = old_created.to_rfc3339();
+            records.push(record);
+        }
+        let mut fresh = usage_record("retention-fresh", 100);
+        fresh.created_at = Utc::now().to_rfc3339();
+        records.push(fresh);
+        usage_store.record_batch(records).await.unwrap();
+        let summary_before = usage_store.summary(500).await.unwrap();
+        assert_eq!(summary_before.total_requests, 6);
+
+        // 7 天保留，批大小 2：三批删完 5 条旧的，新的留下。
+        let retention = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        let mut removed_total = 0;
+        for _ in 0..4 {
+            let removed = usage_store
+                .delete_expired_usage_records(retention, 2)
+                .await
+                .unwrap();
+            removed_total += removed;
+            if removed < 2 {
+                break;
+            }
+        }
+        assert_eq!(removed_total, 5);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_records")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+        let summary_after = usage_store.summary(500).await.unwrap();
+        assert_eq!(
+            summary_after.total_requests, 6,
+            "rollups must keep history after detail retention"
+        );
+        assert_eq!(
+            usage_store
+                .delete_expired_usage_records(retention, 2)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // 会话维度汇总按最后活跃时间裁剪：把两条会话行的 updated_at 做旧，其余不动。
+        for key in ["conv-stale-1", "conv-stale-2", "conv-live"] {
+            sqlx::query(
+                r#"
+                INSERT INTO usage_rollup_totals (dimension, dimension_key, requests, updated_at)
+                VALUES ('conversation', $1, 1, now())
+                ON CONFLICT (dimension, dimension_key) DO NOTHING
+                "#,
+            )
+            .bind(key)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE usage_rollup_totals SET updated_at = now() - interval '30 days' WHERE dimension = 'conversation' AND dimension_key LIKE 'conv-stale-%'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let pruned = usage_store
+            .delete_stale_conversation_rollups(retention, 10)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 2);
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM usage_rollup_totals WHERE dimension = 'conversation' AND dimension_key = 'conv-live'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(live, 1, "recently active conversations stay");
+        let global: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM usage_rollup_totals WHERE dimension = 'global'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(global, 1, "other dimensions are untouched");
 
         store.drop_test_schema().await.unwrap();
     }

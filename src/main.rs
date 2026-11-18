@@ -460,6 +460,19 @@ async fn async_main() {
                 .then_some(config.audit_log_retention_days)
         })
     };
+    // 用量明细保留走 usage 独立连接池，不和调度抢主业务池；默认关闭。
+    let usage_retention_task = {
+        let runtime = runtime.clone();
+        storage::account_events::spawn_usage_retention_worker(
+            usage_postgres_store.clone(),
+            move || {
+                let config = runtime.config();
+                config
+                    .usage_record_retention_enabled
+                    .then_some(config.usage_record_retention_days)
+            },
+        )
+    };
     let startup_pricing_sync_task = {
         let postgres_store = postgres_store.clone();
         let pricing_catalog = pricing_catalog.clone();
@@ -593,6 +606,7 @@ async fn async_main() {
     tokio::join!(
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
         abort_task_with_timeout("audit log retention", audit_retention_task),
+        abort_task_with_timeout("usage record retention", usage_retention_task),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 
@@ -1215,6 +1229,13 @@ async fn handle_maintenance_command(
         MaintenanceCommand::UsageRollupCompression => {
             store.compress_usage_rollups_to_hour_buckets().await?;
             println!("usage rollup compression completed");
+        }
+        MaintenanceCommand::UsageOverviewTotalsBackfill => {
+            store.migrate_with_options(false).await?;
+            let scanned = PostgresUsageStore::new(std::sync::Arc::new(store))
+                .backfill_usage_overview_totals()
+                .await?;
+            println!("usage overview totals backfill completed: records={scanned}");
         }
         MaintenanceCommand::UsageRouteDimensionBackfill => {
             store.migrate_with_options(false).await?;

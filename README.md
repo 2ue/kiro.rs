@@ -221,6 +221,7 @@ tag 推送后 `Publish Claude Pool Docker Images` 工作流会校验 tag 与 Car
 | `activeRouteScenarioId` | 未设置 | 最近完整应用的路由场景标识 |
 | `usageRecordLimit`、`highCacheThreshold` | `5000`、`10000` | 内存记录上限与管理端高缓存判定阈值 |
 | `auditLogRetentionEnabled`、`auditLogRetentionDays` | `false`、`15` | 审计自动清理默认关闭 |
+| `usageRecordRetentionEnabled`、`usageRecordRetentionDays` | `false`、`90` | 用量明细自动清理默认关闭；开启后按批物理删除过期明细，汇总与趋势保留 |
 | `runtimeConfigMigrationVersion` | `2` | 内部配置迁移标记 |
 
 账号池常用默认值为全局并发 `512`、排队 `64`、调度等待 `60s`、跨账号尝试 `3`、请求超时 `180s`、流空闲超时 `180s`、首输出超时 `120s`。质量评分和自动禁用默认关闭。详见 [04 调度](docs/claude-pool-refactor/04-调度.md)。

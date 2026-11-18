@@ -501,22 +501,25 @@ pub async fn usage_overview(
     State(state): State<AdminState>,
     Query(params): Query<crate::admin::handlers::UsageOverviewQueryParams>,
 ) -> Response {
-    let result = async {
-        let overview = state.service.get_usage_dashboard_overview(params.timezone, params.range, params.from, params.to, params.granularity, params.top_n)?;
-        let from = DateTime::parse_from_rfc3339(&overview.range.from).map_err(invalid)?.with_timezone(&Utc);
-        let to = DateTime::parse_from_rfc3339(&overview.range.to).map_err(invalid)?.with_timezone(&Utc);
-        let totals: Value = sqlx::query_scalar(r#"
-            SELECT jsonb_build_object(
-                'accountCostUsd', COALESCE(SUM(COALESCE((data->>'accountCostUsd')::double precision,0)),0),
-                'rawTokens', COALESCE(SUM(COALESCE((data->'accountBilling'->'rawUsage'->>'totalInputTokens')::bigint,(data->'rawUsage'->>'totalInputTokens')::bigint,0) + COALESCE((data->'accountBilling'->'rawUsage'->>'outputTokens')::bigint,(data->'rawUsage'->>'outputTokens')::bigint,0)),0))
-            FROM usage_records WHERE deleted_at IS NULL AND created_at >= $1 AND created_at < $2
-        "#).bind(from).bind(to).fetch_one(state.service.postgres_store.pool()).await.map_err(internal)?;
-        Ok(json!({"generatedAt":overview.generated_at,"timezone":overview.timezone,"range":overview.range,
+    // 全部字段来自已物化的汇总表（走 usage 独立连接池、查询闸门与 2 秒缓存），
+    // 不再每 30 秒在主业务池上对最长 90 天的 usage_records JSONB 做全表聚合。
+    let result = state
+        .service
+        .get_usage_dashboard_overview(
+            params.timezone,
+            params.range,
+            params.from,
+            params.to,
+            params.granularity,
+            params.top_n,
+        )
+        .map(|overview| {
+            json!({"generatedAt":overview.generated_at,"timezone":overview.timezone,"range":overview.range,
             "totals":overview.totals.all,"billing":overview.external,"series":overview.series.iter().map(|point| json!({"bucketStart":point.bucket_start,"label":point.label,"metrics":point.all})).collect::<Vec<_>>(),
             "topModels":overview.top_models,"topAccounts":overview.top_accounts,"topKeys":overview.top_keys,
             "topPaths":overview.top_paths,"topErrors":overview.top_errors,
-            "accountCostUsd":totals["accountCostUsd"],"rawTokens":totals["rawTokens"]}))
-    }.await;
+            "accountCostUsd":overview.external.account_cost_usd,"rawTokens":overview.external.raw_tokens})
+        });
     respond(result)
 }
 

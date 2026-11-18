@@ -97,6 +97,8 @@ const labels: Record<string, string> = {
   tlsBackend: "TLS 后端",
   auditLogRetentionEnabled: "启用审计自动清理",
   auditLogRetentionDays: "审计日志保留",
+  usageRecordRetentionEnabled: "启用用量明细自动清理",
+  usageRecordRetentionDays: "用量明细保留",
   usageRecordLimit: "内存用量记录上限",
   thinkingTrigger: "自动触发 thinking",
   tooLongHandling: "输入过长处理",
@@ -137,6 +139,7 @@ const UNITS: Record<string, string> = {
   usageDebugMaxBodyBytes: "字节",
   wireDebugMaxBodyBytes: "字节",
   auditLogRetentionDays: "天",
+  usageRecordRetentionDays: "天",
   usageRecordLimit: "条",
 };
 const DESCRIPTIONS: Record<string, string> = {
@@ -201,6 +204,8 @@ const DESCRIPTIONS: Record<string, string> = {
   streamPreOutputHoldSecs: "首个内容出现前，最多攒多久再决定是否换账号；0 表示不等待。",
   auditLogRetentionEnabled: "按下面的天数定期清理审计日志；这是会删数据的功能，默认关闭。",
   auditLogRetentionDays: "超过天数的审计日志自动清理。",
+  usageRecordRetentionEnabled: "按下面的天数定期物理删除逐条用量明细；总览、趋势、排行用的汇总不受影响。这是会删数据的功能，默认关闭。",
+  usageRecordRetentionDays: "超过天数的用量明细自动清理，含已软删的记录；超过天数没有活动的会话排行汇总也一起裁掉。",
   usageRecordLimit: "内存里保留的最近用量记录条数，用于控制台实时列表。",
   rpm: "每分钟允许的请求数；0 表示不限。",
   maxConcurrentRequests: "同时在飞的请求上限。",

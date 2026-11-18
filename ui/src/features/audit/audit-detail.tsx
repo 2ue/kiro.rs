@@ -31,6 +31,8 @@ const FIELD_LABELS: Record<string, string> = {
   definedCacheRoutes: '自定义缓存路径',
   auditLogRetentionEnabled: '自动清理过期日志',
   auditLogRetentionDays: '审计日志保留天数',
+  usageRecordRetentionEnabled: '自动清理过期用量明细',
+  usageRecordRetentionDays: '用量明细保留天数',
   proxyUrl: '代理地址',
   proxyUsername: '代理用户名',
   proxyPassword: '代理密码',

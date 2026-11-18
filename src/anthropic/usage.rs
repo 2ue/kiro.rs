@@ -1403,14 +1403,6 @@ pub struct UsageOverviewPoolRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UsageOverviewAccountRow {
-    pub credential_id: u64,
-    pub label: String,
-    pub metrics: UsageOverviewMetrics,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UsageOverviewRankRow {
     pub key: String,
     pub label: String,
@@ -1515,6 +1507,12 @@ pub struct UsageOverviewExternal {
     pub profit_usd: f64,
     pub cost_floor_delta_usd: f64,
     pub cost_floor_applied_requests: usize,
+    /// 账号成本合计（原始成本 × 账号倍率），来自汇总表，不再扫明细。
+    #[serde(default)]
+    pub account_cost_usd: f64,
+    /// 上游原始输入 + 输出 token 合计。
+    #[serde(default)]
+    pub raw_tokens: i64,
     pub pools: Vec<UsageOverviewPoolRow>,
 }
 

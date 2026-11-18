@@ -378,6 +378,8 @@ pub struct RuntimeConfigResponse {
     pub model_mapping: ModelMappingConfig,
     pub audit_log_retention_enabled: bool,
     pub audit_log_retention_days: u32,
+    pub usage_record_retention_enabled: bool,
+    pub usage_record_retention_days: u32,
     pub tls_backend: crate::model::config::TlsBackend,
     pub usage_record_limit: usize,
 }
@@ -464,6 +466,10 @@ pub struct UpdateRuntimeConfigRequest {
     pub audit_log_retention_enabled: Option<bool>,
     #[serde(default)]
     pub audit_log_retention_days: Option<u32>,
+    #[serde(default)]
+    pub usage_record_retention_enabled: Option<bool>,
+    #[serde(default)]
+    pub usage_record_retention_days: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_nullable_update")]
     pub proxy_url: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_nullable_update")]

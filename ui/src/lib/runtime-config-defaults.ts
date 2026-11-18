@@ -437,6 +437,8 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   modelMapping: defaultModelMappingConfig(),
   auditLogRetentionEnabled: false,
   auditLogRetentionDays: 15,
+  usageRecordRetentionEnabled: false,
+  usageRecordRetentionDays: 90,
 }
 
 export function reportedUsageModeDescription(mode: ReportedUsageFieldMode): string {

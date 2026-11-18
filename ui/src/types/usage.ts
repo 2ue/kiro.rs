@@ -415,6 +415,8 @@ export interface UsageOverviewResponse {
     billableCostUsd: number;
     profitUsd: number;
     costFloorDeltaUsd: number;
+    accountCostUsd: number;
+    rawTokens: number;
     pools: UsageOverviewPoolRow[];
   };
   accountCostUsd: number;

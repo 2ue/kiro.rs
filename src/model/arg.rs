@@ -48,6 +48,8 @@ pub enum MaintenanceCommand {
     UsageRollupCompression,
     /// 从明细重建总览的路由维度（本地路由、走外部原因）；必须先停止并排空所有网关实例
     UsageRouteDimensionBackfill,
+    /// 从明细回填总览合计列（账号成本、原始 token）；启动时只对小表自动做，大表在低峰期执行这里
+    UsageOverviewTotalsBackfill,
     /// 向隔离的 overview demo 数据库写入可重复的本地/外部用量样本
     UsageDemoSeed {
         /// 生成最近多少天的数据

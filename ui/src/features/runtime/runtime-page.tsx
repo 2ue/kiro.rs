@@ -156,11 +156,13 @@ export function RuntimePage() {
           </SectionCard>
         </TabsContent>
         <TabsContent value="retention">
-          <SectionCard title="数据保留" description="审计日志与内存用量记录保留多少。">
+          <SectionCard title="数据保留" description="审计日志、用量明细与内存用量记录保留多少。两个自动清理默认关闭，开启前请确认已有备份。">
             <ConfigFields
               value={{
                 auditLogRetentionEnabled: draft.auditLogRetentionEnabled,
                 auditLogRetentionDays: draft.auditLogRetentionDays,
+                usageRecordRetentionEnabled: draft.usageRecordRetentionEnabled,
+                usageRecordRetentionDays: draft.usageRecordRetentionDays,
                 usageRecordLimit: draft.usageRecordLimit,
               }}
               onChange={(next) => setDraft({ ...draft, ...next })}

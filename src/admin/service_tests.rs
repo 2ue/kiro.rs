@@ -747,6 +747,7 @@ fn runtime_config_rejects_invalid_common_settings_before_install() {
         Box::new(|config| config.prompt_cache_entry_ttl_secs = 0),
         Box::new(|config| config.inference_upstream_max_attempts = 0),
         Box::new(|config| config.audit_log_retention_days = 0),
+        Box::new(|config| config.usage_record_retention_days = 0),
         Box::new(|config| config.high_cache_threshold = -1),
         Box::new(|config| config.routes.routes.clear()),
         Box::new(|config| config.request_admission.rpm = u32::MAX),

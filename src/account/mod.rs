@@ -128,6 +128,12 @@ const ACCOUNT_COORDINATOR_RECOVERY_GRACE_SECS: u64 = 35;
 const ACCOUNT_COORDINATOR_RUN_ID_PROBE_INTERVAL_SECS: u64 = 5;
 const ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID: &str = "account_redis_coordination_epoch";
 const ACCOUNT_COORDINATOR_POSTGRES_LOCK_ID: i64 = 0x4b49_524f_4558_5450;
+/// 一次 epoch 对齐（PG 事务锁 + Redis 安装）允许的总时长。超时后事务随 future 一起丢弃并回滚，
+/// 事务级 advisory lock 随之释放，不会像会话锁那样跟着连接泄漏回池。
+const ACCOUNT_COORDINATOR_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 等待其它实例释放 epoch 对齐锁的上限；拿不到就本轮放弃，调度走 CoordinatorUnavailable 分支。
+const ACCOUNT_COORDINATOR_POSTGRES_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const ACCOUNT_COORDINATOR_POSTGRES_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCOUNT_USAGE_DEBUG_DEFAULT_DIR: &str = "/tmp/claude-pool/account-usage-debug";
 const ACCOUNT_USAGE_DEBUG_DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024;
 const ACCOUNT_USAGE_DEBUG_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -1459,6 +1465,21 @@ impl ExternalLatencyTraceState {
 fn load_nonzero(value: &AtomicU64) -> Option<u64> {
     let value = value.load(Ordering::Acquire);
     (value > 0).then_some(value)
+}
+
+/// 协调路径上的单次 Redis 调用：统一套 `ACCOUNT_COORDINATOR_REDIS_OPERATION_TIMEOUT`，
+/// 超时与错误都作为普通错误返回，由调用方决定是否标记需要重新探测。
+async fn account_coordinator_redis_call<T>(
+    operation: &'static str,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match timeout(ACCOUNT_COORDINATOR_REDIS_OPERATION_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "{operation} timed out after {}ms",
+            ACCOUNT_COORDINATOR_REDIS_OPERATION_TIMEOUT.as_millis()
+        ),
+    }
 }
 
 fn account_coordination_monotonic_ms() -> u64 {
@@ -5780,17 +5801,22 @@ impl AccountManager {
             return Ok(epoch);
         }
 
-        let current_run_id = self.redis.account_redis_run_id().await?;
+        // 持有本地对齐锁期间的每一次 Redis 往返都必须有上限：Redis 变慢时这里不能把
+        // 所有等 epoch 的调度请求一起挂住。
+        let current_run_id =
+            account_coordinator_redis_call("Redis INFO run_id", self.redis.account_redis_run_id())
+                .await?;
         match (cached_epoch.as_ref(), cached_run_id.as_ref()) {
             (Some(epoch), Some(run_id)) if *run_id == current_run_id => {
                 if !probe_required {
                     self.record_account_coordinator_probe(&current_run_id, epoch);
                     return Ok(epoch.clone());
                 }
-                match self
-                    .redis
-                    .account_coordinator_guard_state_for_epoch(epoch)
-                    .await?
+                match account_coordinator_redis_call(
+                    "Redis coordinator guard probe",
+                    self.redis.account_coordinator_guard_state_for_epoch(epoch),
+                )
+                .await?
                 {
                     AccountCoordinatorGuardState::Ready { .. }
                     | AccountCoordinatorGuardState::Recovering { .. } => {
@@ -5823,100 +5849,146 @@ impl AccountManager {
 
     async fn reconcile_account_coordinator_guard(
         &self,
-        mut current_run_id: String,
+        current_run_id: String,
     ) -> anyhow::Result<String> {
-        let mut postgres = self.postgres.pool().acquire().await?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(ACCOUNT_COORDINATOR_POSTGRES_LOCK_ID)
-            .execute(&mut *postgres)
-            .await?;
-
-        let result = async {
-            current_run_id = self.redis.account_redis_run_id().await?;
-            let existing: Option<serde_json::Value> =
-                sqlx::query_scalar("SELECT config FROM runtime_config WHERE id = $1")
-                    .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
-                    .fetch_optional(&mut *postgres)
-                    .await?;
-            let existing_run_id = existing
-                .as_ref()
-                .and_then(|value| value.get("redisRunId"))
-                .and_then(serde_json::Value::as_str);
-            let existing_epoch = existing
-                .as_ref()
-                .and_then(|value| value.get("coordinationEpoch"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty());
-
-            let existing_epoch =
-                existing_epoch.filter(|_| existing_run_id == Some(current_run_id.as_str()));
-            if let Some(epoch) = existing_epoch {
-                match self
-                    .redis
-                    .account_coordinator_guard_state_for_epoch(epoch)
-                    .await?
-                {
-                    AccountCoordinatorGuardState::Ready { .. }
-                    | AccountCoordinatorGuardState::Recovering { .. } => {
-                        return Ok(epoch.to_string());
-                    }
-                    AccountCoordinatorGuardState::EpochMismatch { .. } => {}
-                }
-            }
-
-            let recovery_required = existing.is_some();
-            let coordination_epoch = uuid::Uuid::new_v4().to_string();
-            let coordination_record = json!({
-                "redisRunId": current_run_id,
-                "coordinationEpoch": coordination_epoch,
-            });
-            sqlx::query(
-                r#"
-                INSERT INTO runtime_config (id, config, updated_at)
-                VALUES ($1, $2, now())
-                ON CONFLICT (id) DO UPDATE
-                SET config = EXCLUDED.config,
-                    version = runtime_config.version + 1,
-                    updated_at = now()
-                "#,
-            )
-            .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
-            .bind(coordination_record)
-            .execute(&mut *postgres)
-            .await?;
-            self.redis
-                .install_account_coordinator_guard(
-                    &coordination_epoch,
-                    if recovery_required {
-                        self.coordinator_recovery_grace
-                    } else {
-                        Duration::ZERO
-                    },
-                )
-                .await?;
-            let confirmed_run_id = self.redis.account_redis_run_id().await?;
-            if confirmed_run_id != current_run_id {
-                anyhow::bail!("Redis restarted while account coordinator epoch was installed");
-            }
-            Ok(coordination_epoch)
-        }
-        .await;
-        let unlock = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(ACCOUNT_COORDINATOR_POSTGRES_LOCK_ID)
-            .execute(&mut *postgres)
-            .await;
-        match result {
-            Ok(epoch) => {
-                unlock?;
-                self.record_account_coordinator_probe(&current_run_id, &epoch);
+        match timeout(
+            ACCOUNT_COORDINATOR_RECONCILE_TIMEOUT,
+            self.reconcile_account_coordinator_guard_in_transaction(current_run_id),
+        )
+        .await
+        {
+            Ok(Ok((run_id, epoch))) => {
+                self.record_account_coordinator_probe(&run_id, &epoch);
                 Ok(epoch)
             }
-            Err(err) => {
-                let _ = unlock;
+            Ok(Err(err)) => {
                 self.mark_account_coordinator_probe_required();
                 Err(err)
             }
+            Err(_) => {
+                self.mark_account_coordinator_probe_required();
+                anyhow::bail!(
+                    "account coordinator epoch reconcile timed out after {}s",
+                    ACCOUNT_COORDINATOR_RECONCILE_TIMEOUT.as_secs()
+                )
+            }
         }
+    }
+
+    /// 在一个带 `lock_timeout` / `statement_timeout` 的事务里完成 epoch 对齐。
+    /// 用 `pg_advisory_xact_lock` 而不是会话级锁：外层超时把这个 future 连同事务一起丢弃时，
+    /// 连接回池前会回滚，锁随事务释放；会话级锁在这种情况下会一直挂在连接上，
+    /// 后续所有实例的对齐最长要等到该连接被回收。
+    async fn reconcile_account_coordinator_guard_in_transaction(
+        &self,
+        _probe_run_id: String,
+    ) -> anyhow::Result<(String, String)> {
+        let mut tx = timeout(
+            ACCOUNT_SELECTION_POSTGRES_TIMEOUT,
+            self.postgres.pool().begin(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "acquiring a PostgreSQL connection for coordinator reconcile timed out after {}ms",
+                ACCOUNT_SELECTION_POSTGRES_TIMEOUT.as_millis()
+            )
+        })??;
+        sqlx::query(&format!(
+            "SET LOCAL lock_timeout = '{}ms'",
+            ACCOUNT_COORDINATOR_POSTGRES_LOCK_TIMEOUT.as_millis()
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{}ms'",
+            ACCOUNT_COORDINATOR_POSTGRES_STATEMENT_TIMEOUT.as_millis()
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ACCOUNT_COORDINATOR_POSTGRES_LOCK_ID)
+            .execute(&mut *tx)
+            .await?;
+
+        // 拿到锁后重新读 run_id：探测时读到的值在等锁期间可能已经因 Redis 重启失效。
+        let current_run_id =
+            account_coordinator_redis_call("Redis INFO run_id", self.redis.account_redis_run_id())
+                .await?;
+        let existing: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT config FROM runtime_config WHERE id = $1")
+                .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let existing_run_id = existing
+            .as_ref()
+            .and_then(|value| value.get("redisRunId"))
+            .and_then(serde_json::Value::as_str);
+        let existing_epoch = existing
+            .as_ref()
+            .and_then(|value| value.get("coordinationEpoch"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+
+        let existing_epoch =
+            existing_epoch.filter(|_| existing_run_id == Some(current_run_id.as_str()));
+        if let Some(epoch) = existing_epoch {
+            match account_coordinator_redis_call(
+                "Redis coordinator guard probe",
+                self.redis.account_coordinator_guard_state_for_epoch(epoch),
+            )
+            .await?
+            {
+                AccountCoordinatorGuardState::Ready { .. }
+                | AccountCoordinatorGuardState::Recovering { .. } => {
+                    let epoch = epoch.to_string();
+                    tx.commit().await?;
+                    return Ok((current_run_id, epoch));
+                }
+                AccountCoordinatorGuardState::EpochMismatch { .. } => {}
+            }
+        }
+
+        let recovery_required = existing.is_some();
+        let coordination_epoch = uuid::Uuid::new_v4().to_string();
+        let coordination_record = json!({
+            "redisRunId": current_run_id,
+            "coordinationEpoch": coordination_epoch,
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO runtime_config (id, config, updated_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (id) DO UPDATE
+            SET config = EXCLUDED.config,
+                version = runtime_config.version + 1,
+                updated_at = now()
+            "#,
+        )
+        .bind(ACCOUNT_COORDINATOR_RUNTIME_CONFIG_ID)
+        .bind(coordination_record)
+        .execute(&mut *tx)
+        .await?;
+        account_coordinator_redis_call(
+            "Redis coordinator guard install",
+            self.redis.install_account_coordinator_guard(
+                &coordination_epoch,
+                if recovery_required {
+                    self.coordinator_recovery_grace
+                } else {
+                    Duration::ZERO
+                },
+            ),
+        )
+        .await?;
+        let confirmed_run_id =
+            account_coordinator_redis_call("Redis INFO run_id", self.redis.account_redis_run_id())
+                .await?;
+        if confirmed_run_id != current_run_id {
+            anyhow::bail!("Redis restarted while account coordinator epoch was installed");
+        }
+        tx.commit().await?;
+        Ok((current_run_id, coordination_epoch))
     }
 
     fn forget_account_dispatch_counter(&self, account_id: u64) {
@@ -9807,16 +9879,27 @@ impl AccountManager {
                         }),
                     },
                 );
-                if let Err(err) = self
-                    .publish_account_data_changed("auto_disable", Some(pool.id))
-                    .await
+                // 在请求失败路径上，通知发布只能占用有限时间；超时也只是其它实例晚几秒
+                // 看到禁用状态（它们有自己的探测），不能让这里卡住失败处理。
+                match timeout(
+                    ACCOUNT_AUTO_DISABLE_REDIS_TIMEOUT,
+                    self.publish_account_data_changed("auto_disable", Some(pool.id)),
+                )
+                .await
                 {
-                    tracing::warn!(
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => tracing::warn!(
                         pool_id = pool.id,
                         pool_revision = pool.revision,
                         error = %err,
                         "自动禁用账号已提交，但跨实例失效通知发布失败"
-                    );
+                    ),
+                    Err(_) => tracing::warn!(
+                        pool_id = pool.id,
+                        pool_revision = pool.revision,
+                        timeout_ms = ACCOUNT_AUTO_DISABLE_REDIS_TIMEOUT.as_millis(),
+                        "自动禁用账号已提交，但跨实例失效通知发布超时"
+                    ),
                 }
             }
             Ok(Ok(false)) => {
@@ -10188,6 +10271,7 @@ impl AccountManager {
             downstream_chunks_forwarded: 0,
             downstream_bytes_forwarded: 0,
             estimated_output_tokens: 0,
+            terminal_event_forwarded: false,
             completed: false,
         };
         let stream = futures::stream::unfold(
@@ -10483,6 +10567,9 @@ struct ExternalStreamUsageGuard {
     downstream_chunks_forwarded: u64,
     downstream_bytes_forwarded: u64,
     estimated_output_tokens: i32,
+    /// 已经把终止事件（`message_stop`、带 `stop_reason` 的 `message_delta`、`[DONE]`）
+    /// 转发给下游。此后下游关连接是“读完即走”，不是中途断开。
+    terminal_event_forwarded: bool,
     completed: bool,
 }
 
@@ -10521,6 +10608,9 @@ impl ExternalStreamUsageGuard {
         self.downstream_bytes_forwarded = self
             .downstream_bytes_forwarded
             .saturating_add(chunk.len() as u64);
+        if !self.terminal_event_forwarded && external_stream_chunk_has_terminal_event(chunk) {
+            self.terminal_event_forwarded = true;
+        }
     }
 
     fn mark_first_token_if_output(&mut self, chunk: &Bytes) {
@@ -11006,8 +11096,79 @@ fn external_sse_data_has_first_output(value: &serde_json::Value) -> bool {
 
 impl Drop for ExternalStreamUsageGuard {
     fn drop(&mut self) {
+        // 下游已经收到终止事件后才关连接（例如读到 message_stop 就 Close 的客户端），
+        // 这次响应是完整的：按成功落账并保留 usage，只是比上游 EOF 早了一步。
+        if !self.completed && self.terminal_event_forwarded {
+            self.record_success();
+            return;
+        }
         self.record_client_dropped();
     }
+}
+
+/// 这段下游 chunk 里是否含有流的终止事件。按完整 SSE 事件切分后逐个判断，
+/// 识别 Anthropic 的 `message_stop`、带 `stop_reason` 的 `message_delta`，以及
+/// OpenAI 风格的 `data: [DONE]` / 非空 `finish_reason`。
+fn external_stream_chunk_has_terminal_event(chunk: &Bytes) -> bool {
+    let bytes = chunk.as_ref();
+    let mut offset = 0usize;
+    while let Some((idx, delimiter_len)) = find_sse_event_delimiter(&bytes[offset..]) {
+        let event_end = offset + idx + delimiter_len;
+        if external_sse_event_is_terminal(&bytes[offset..event_end]) {
+            return true;
+        }
+        offset = event_end;
+    }
+    false
+}
+
+fn external_sse_event_is_terminal(event: &[u8]) -> bool {
+    if external_sse_event_name(event).as_deref() == Some("message_stop") {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(event) else {
+        return false;
+    };
+    for line in text.split_inclusive('\n') {
+        let Some(data) = line.trim_end_matches(['\r', '\n']).strip_prefix("data:") else {
+            continue;
+        };
+        let data_json = data.trim();
+        if data_json.is_empty() {
+            continue;
+        }
+        if data_json == "[DONE]" {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data_json) else {
+            continue;
+        };
+        match value.get("type").and_then(|value| value.as_str()) {
+            Some("message_stop") => return true,
+            Some("message_delta")
+                if value
+                    .pointer("/delta/stop_reason")
+                    .is_some_and(|reason| !reason.is_null()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        if value
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .is_some_and(|value| !value.is_null())
+                })
+            })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn pool_auto_disable_policy_enabled(policy: AutoDisablePolicy, config: &AccountsConfig) -> bool {
@@ -16880,6 +17041,85 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
         .and_then(|value| value.as_i64())
         .unwrap_or(0)
         .clamp(0, i32::MAX as i64) as i32
+}
+
+#[cfg(test)]
+mod terminal_event_tests {
+    use super::*;
+
+    fn sse(name: &str, data: &str) -> Bytes {
+        Bytes::from(format!("event: {name}\ndata: {data}\n\n"))
+    }
+
+    #[test]
+    fn message_stop_and_stop_reason_delta_are_terminal() {
+        assert!(external_stream_chunk_has_terminal_event(&sse(
+            "message_stop",
+            r#"{"type":"message_stop"}"#
+        )));
+        assert!(external_stream_chunk_has_terminal_event(&sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#
+        )));
+        assert!(external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(b"data: [DONE]\n\n")
+        ));
+        assert!(external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(
+                b"data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"
+            )
+        ));
+    }
+
+    #[test]
+    fn content_events_and_null_stop_reason_are_not_terminal() {
+        for (name, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"m"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":1}}"#,
+            ),
+            ("ping", r#"{"type":"ping"}"#),
+        ] {
+            assert!(
+                !external_stream_chunk_has_terminal_event(&sse(name, data)),
+                "{name} must not count as terminal"
+            );
+        }
+        assert!(!external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(
+                b"data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"x\"}}]}\n\n"
+            )
+        ));
+    }
+
+    #[test]
+    fn terminal_event_is_found_inside_a_multi_event_chunk() {
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&sse(
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ));
+        chunk.extend_from_slice(&sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+        ));
+        chunk.extend_from_slice(&sse("message_stop", r#"{"type":"message_stop"}"#));
+        assert!(external_stream_chunk_has_terminal_event(&Bytes::from(
+            chunk
+        )));
+        // 不完整的尾事件（没有空行分隔）不算。
+        assert!(!external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}")
+        ));
+    }
 }
 
 #[cfg(test)]

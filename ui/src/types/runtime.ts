@@ -555,6 +555,8 @@ export interface RuntimeConfig {
   modelMapping: ModelMappingConfig;
   auditLogRetentionEnabled: boolean;
   auditLogRetentionDays: number;
+  usageRecordRetentionEnabled: boolean;
+  usageRecordRetentionDays: number;
   usageRecordLimit: number;
 }
 

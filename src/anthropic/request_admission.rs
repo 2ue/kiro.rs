@@ -1134,6 +1134,16 @@ fn format_limit_value(value: f64) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// 请求的完整入口路径。嵌套路由里 axum 会把被 nest 的前缀从 `uri()` 上剥掉，
+/// 完整路径保存在 `OriginalUri` 扩展里；没有扩展时（直接挂在根路由）退回 `uri()`。
+pub(crate) fn request_endpoint_path(request: &Request<Body>) -> String {
+    request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string())
+}
+
 /// Admission middleware for inference routes only. Authentication must be the
 /// outer layer so the request carries a digest-only identity extension.
 pub(crate) async fn request_admission_middleware(
@@ -1141,11 +1151,14 @@ pub(crate) async fn request_admission_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // 推理路由都挂在 `/v1`、`/cc/v1`、`/dfcache/{name}/v1` 这类前缀下；nest 之后
+    // `request.uri()` 只剩 `/messages`，拒绝记录与限额判定要用完整入口路径。
+    let endpoint = request_endpoint_path(&request);
     let Some(identity) = request.extensions().get::<RequestApiKeyIdentity>().copied() else {
         let request_id = envelope::request_id();
         tracing::warn!(
             request_id = %request_id,
-            path = %request.uri().path(),
+            path = %endpoint,
             "准入中间件未拿到认证身份，按认证失败拒绝"
         );
         return envelope::error_response_with_id(
@@ -1157,7 +1170,7 @@ pub(crate) async fn request_admission_middleware(
     };
 
     // Usage caps first: a key over its limit should not take a concurrency slot or queue.
-    if let Some(response) = usage_limit_rejection(&state, identity, request.uri().path()).await {
+    if let Some(response) = usage_limit_rejection(&state, identity, &endpoint).await {
         return response;
     }
 
@@ -1175,7 +1188,6 @@ pub(crate) async fn request_admission_middleware(
         }
         Err(rejection) => {
             let request_id = envelope::request_id();
-            let endpoint = request.uri().path().to_string();
             let reason = rejection
                 .kind
                 .reason()
@@ -1603,6 +1615,51 @@ mod tests {
             .unwrap();
         request.extensions_mut().insert(identity);
         request
+    }
+
+    #[tokio::test]
+    async fn nested_router_rejections_record_the_full_entry_path() {
+        let controller = test_controller(config(100, 1, 0, 0));
+        let recorder = Arc::new(UsageRecorder::new(64));
+        let middleware_state =
+            RequestAdmissionMiddlewareState::new(controller.clone(), recorder.clone());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let inner = Router::new()
+            .route(
+                "/messages",
+                post(counted_handler).layer(middleware::from_fn_with_state(
+                    middleware_state,
+                    request_admission_middleware,
+                )),
+            )
+            .with_state(MockState {
+                hits,
+                body_mode: BodyMode::Pending,
+            });
+        let app = Router::new().nest("/cc/v1", inner);
+        let key = identity("nested-route-key");
+
+        // 第一条请求占住唯一的并发名额（响应体一直挂着）。
+        let holding = app
+            .clone()
+            .oneshot(request("/cc/v1/messages", key))
+            .await
+            .unwrap();
+        assert_eq!(holding.status(), StatusCode::OK);
+        let rejected = app
+            .clone()
+            .oneshot(request("/cc/v1/messages", key))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let records = recorder.records_snapshot();
+        assert_eq!(records.len(), 1, "one sampled rejection record");
+        assert_eq!(
+            records[0].endpoint, "/cc/v1/messages",
+            "nested prefix must stay in the recorded endpoint"
+        );
+        drop(holding);
     }
 
     #[tokio::test]

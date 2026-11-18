@@ -252,6 +252,89 @@ pub fn spawn_audit_retention_worker(
     })
 }
 
+/// Usage detail retention: hourly like the audit job, smaller batches because each delete
+/// also touches the rollup commit guard. Off by default; nothing is deleted until an operator
+/// enables it in the runtime config. Rollups are never touched, only `usage_records`.
+const USAGE_RETENTION_BATCH: usize = 1_000;
+const USAGE_RETENTION_MAX_BATCHES: usize = 30;
+const USAGE_RETENTION_RUN_BUDGET: Duration = Duration::from_secs(60);
+const USAGE_RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(300);
+
+/// Background job that keeps `usage_records` to the configured retention. Same shape as the
+/// audit retention worker: own task, never on the request path, each run bounded, failures
+/// logged and retried next hour. `retention_days` returns `None` while cleanup is off.
+pub fn spawn_usage_retention_worker(
+    store: Arc<PostgresStore>,
+    retention_days: impl Fn() -> Option<u32> + Send + Sync + 'static,
+) -> tokio::task::JoinHandle<()> {
+    use crate::model::config::{MAX_USAGE_RECORD_RETENTION_DAYS, MIN_USAGE_RECORD_RETENTION_DAYS};
+    use crate::storage::postgres::PostgresUsageStore;
+
+    let usage_store = PostgresUsageStore::new(store);
+    tokio::spawn(async move {
+        tokio::time::sleep(AUDIT_RETENTION_FIRST_RUN_DELAY).await;
+        let mut interval = tokio::time::interval(AUDIT_RETENTION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let Some(days) = retention_days() else {
+                continue;
+            };
+            let days = days.clamp(
+                MIN_USAGE_RECORD_RETENTION_DAYS,
+                MAX_USAGE_RECORD_RETENTION_DAYS,
+            );
+            let retention = Duration::from_secs(u64::from(days) * 24 * 60 * 60);
+            let result = run_audit_retention_once(
+                |limit| {
+                    let usage_store = usage_store.clone();
+                    async move {
+                        usage_store
+                            .delete_expired_usage_records(retention, limit)
+                            .await
+                    }
+                },
+                USAGE_RETENTION_BATCH,
+                USAGE_RETENTION_MAX_BATCHES,
+                USAGE_RETENTION_RUN_BUDGET,
+                USAGE_RETENTION_BATCH_PAUSE,
+            )
+            .await;
+            match result {
+                Ok(report) if report.removed > 0 || report.saturated => tracing::info!(
+                    retention_days = days,
+                    removed = report.removed,
+                    batches = report.batches,
+                    saturated = report.saturated,
+                    "已清理过期用量明细（汇总与趋势不受影响）"
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    retention_days = days,
+                    "清理过期用量明细失败，下次再试，不影响调度: {}",
+                    err
+                ),
+            }
+            // 会话维度汇总只服务"会话排行"，一条会话一行且永不分桶；按最后活跃时间裁掉过期的，
+            // 每轮一小批，剩下的下轮再来。
+            match usage_store
+                .delete_stale_conversation_rollups(retention, USAGE_RETENTION_BATCH)
+                .await
+            {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(retention_days = days, removed, "已裁剪过期会话维度汇总")
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    retention_days = days,
+                    "裁剪过期会话维度汇总失败，下次再试: {}",
+                    err
+                ),
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

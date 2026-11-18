@@ -48,7 +48,8 @@ where
             });
         let ingress_id =
             crate::diagnostics::capture::ingress_id_from_extensions(request.extensions());
-        let uri = request.uri().clone();
+        // 嵌套路由下 uri() 已被剥掉前缀，拒绝记录要用完整入口路径。
+        let endpoint = super::request_admission::request_endpoint_path(&request);
         match Bytes::from_request(request, state).await {
             Ok(body) => Ok(Self(body, request_api_key_id, ingress_id)),
             Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -59,7 +60,7 @@ where
                         "body_extractor",
                         StatusCode::PAYLOAD_TOO_LARGE,
                         &request_id,
-                        uri.path(),
+                        &endpoint,
                     );
                 }
                 Err(envelope::error_response_with_id(
@@ -80,7 +81,7 @@ where
                         "body_extractor",
                         status,
                         &request_id,
-                        uri.path(),
+                        &endpoint,
                     );
                 }
                 Err(response)

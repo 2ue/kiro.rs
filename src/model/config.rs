@@ -4334,6 +4334,15 @@ pub struct Config {
     #[serde(default = "default_audit_log_retention_days")]
     pub audit_log_retention_days: u32,
 
+    /// 是否自动清理过期的用量明细（`usage_records`）。默认关闭：升级后不删任何已有记录，
+    /// 由管理员在运行配置里确认后开启。汇总表不受影响，总览和趋势继续可用。
+    #[serde(default)]
+    pub usage_record_retention_enabled: bool,
+
+    /// 用量明细保留天数；开启后，后台按批物理删除更早的明细（含已软删的墓碑行）。
+    #[serde(default = "default_usage_record_retention_days")]
+    pub usage_record_retention_days: u32,
+
     /// 外部备用号池和直连/预检 fallback 策略。
     #[serde(default)]
     pub accounts: AccountsConfig,
@@ -4617,6 +4626,13 @@ pub const MAX_AUDIT_LOG_RETENTION_DAYS: u32 = 3650;
 
 fn default_audit_log_retention_days() -> u32 {
     15
+}
+
+pub const MIN_USAGE_RECORD_RETENTION_DAYS: u32 = 1;
+pub const MAX_USAGE_RECORD_RETENTION_DAYS: u32 = 3650;
+
+fn default_usage_record_retention_days() -> u32 {
+    90
 }
 
 fn default_account_auto_disable_failure_threshold() -> u32 {
@@ -5036,6 +5052,8 @@ impl Default for Config {
             high_cache_threshold: default_high_cache_threshold(),
             audit_log_retention_enabled: false,
             audit_log_retention_days: default_audit_log_retention_days(),
+            usage_record_retention_enabled: false,
+            usage_record_retention_days: default_usage_record_retention_days(),
             accounts: AccountsConfig::default(),
             config_path: None,
         }

@@ -711,6 +711,12 @@ pub(super) fn validate_config(config: &Config) -> anyhow::Result<()> {
         "auditLogRetentionDays 超限"
     );
     anyhow::ensure!(
+        (crate::model::config::MIN_USAGE_RECORD_RETENTION_DAYS
+            ..=crate::model::config::MAX_USAGE_RECORD_RETENTION_DAYS)
+            .contains(&config.usage_record_retention_days),
+        "usageRecordRetentionDays 超限"
+    );
+    anyhow::ensure!(
         config.high_cache_threshold >= 0
             && (0.0..=0.99).contains(&config.prompt_cache_target_read_ratio)
             && (1.0..=3.0).contains(&config.prompt_cache_token_scale),

@@ -1743,22 +1743,31 @@ impl AdminService {
     ) {
         let detail = Self::normalize_audit_detail(detail);
         let store = self.postgres_store.clone();
-        tokio::spawn(async move {
-            if let Err(err) = store
-                .record_admin_audit_log(
-                    "admin-api",
-                    action,
-                    object_type,
-                    object_id.as_deref(),
-                    success,
-                    error_message.as_deref(),
-                    detail,
-                )
-                .await
-            {
-                tracing::warn!("写入 Admin 审计日志失败: {}", err);
-            }
-        });
+        // 和账号异动日志一样走有界、带超时的旁路写入队列；队列满时丢弃并告警，
+        // 不再为每次管理操作起一个无上限、无超时的任务。
+        let queued = crate::common::storage_task::spawn_best_effort_storage_task(
+            "写入 Admin 审计日志",
+            async move {
+                store
+                    .record_admin_audit_log(
+                        "admin-api",
+                        action,
+                        object_type,
+                        object_id.as_deref(),
+                        success,
+                        error_message.as_deref(),
+                        detail,
+                    )
+                    .await
+            },
+        );
+        if !queued {
+            tracing::warn!(
+                action,
+                object_type,
+                "存储任务队列已满，这条 Admin 审计日志被丢弃"
+            );
+        }
     }
 
     /// External-pool allowlists are exposed in Claude Code command syntax.
@@ -2674,6 +2683,8 @@ impl AdminService {
             model_mapping: config.model_mapping.clone(),
             audit_log_retention_enabled: config.audit_log_retention_enabled.clone(),
             audit_log_retention_days: config.audit_log_retention_days.clone(),
+            usage_record_retention_enabled: config.usage_record_retention_enabled,
+            usage_record_retention_days: config.usage_record_retention_days,
             tls_backend: config.tls_backend,
             usage_record_limit: config.usage_record_limit,
         }
@@ -2795,6 +2806,12 @@ impl AdminService {
             if let Some(value) = req.audit_log_retention_days {
                 config.audit_log_retention_days = value;
             }
+            if let Some(value) = req.usage_record_retention_enabled {
+                config.usage_record_retention_enabled = value;
+            }
+            if let Some(value) = req.usage_record_retention_days {
+                config.usage_record_retention_days = value;
+            }
         }
         if let Some(value) = req.proxy_url {
             candidate.proxy_url = value;
@@ -2863,6 +2880,16 @@ fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), Stri
             "auditLogRetentionDays 必须在 {} 到 {} 天之间",
             crate::model::config::MIN_AUDIT_LOG_RETENTION_DAYS,
             crate::model::config::MAX_AUDIT_LOG_RETENTION_DAYS
+        ));
+    }
+    if !(crate::model::config::MIN_USAGE_RECORD_RETENTION_DAYS
+        ..=crate::model::config::MAX_USAGE_RECORD_RETENTION_DAYS)
+        .contains(&config.usage_record_retention_days)
+    {
+        return Err(format!(
+            "usageRecordRetentionDays 必须在 {} 到 {} 天之间",
+            crate::model::config::MIN_USAGE_RECORD_RETENTION_DAYS,
+            crate::model::config::MAX_USAGE_RECORD_RETENTION_DAYS
         ));
     }
     if config.high_cache_threshold < 0 {
