@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "0.0.263"
+version = "0.0.264"
 edition = "2024"
 
 [features]
