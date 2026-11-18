@@ -12,7 +12,7 @@ import {
 } from '@/hooks/use-usage'
 import type { UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupStatusResponse } from '@/types/api'
 import { Badge, Button, Input, Progress } from '@/components/ui'
-import { Callout, ModalShell, useConfirm } from '@/components/patterns'
+import { Callout, Field, FieldGrid, ModalShell, useConfirm } from '@/components/patterns'
 
 const CLEANUP_MAX_OLDER_THAN_DAYS = 3650
 const CLEANUP_DEFAULT_BATCH_SIZE = 10_000
@@ -331,17 +331,20 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
             执行速度
           </Button>
           {showAdvanced && (
-            <div className="mt-2 grid gap-3 sm:grid-cols-2">
-              <label className="space-y-1">
-                <span className="block text-xs text-muted-foreground">每批清理（条）</span>
-                <Input type="number" min={1} max={CLEANUP_MAX_BATCH_SIZE} className="h-8 text-xs" value={batchSize} onChange={(event) => setBatchSize(event.target.value)} />
-              </label>
-              <label className="space-y-1">
-                <span className="block text-xs text-muted-foreground">批次间隔（毫秒）</span>
-                <Input type="number" min={0} max={CLEANUP_MAX_PAUSE_MS} className="h-8 text-xs" value={pauseMs} onChange={(event) => setPauseMs(event.target.value)} />
-              </label>
-              <p className="text-[11px] leading-4 text-muted-foreground sm:col-span-2">数据库压力大时，调小每批数量或加大间隔。默认值适合大多数情况。</p>
-            </div>
+            <FieldGrid className="mt-2">
+              <Field label="每批清理" htmlFor="cleanup-batch-size" description="每条 DELETE 处理的行数；数据库压力大时调小。">
+                <div className="flex items-center gap-2">
+                  <Input id="cleanup-batch-size" type="number" min={1} max={CLEANUP_MAX_BATCH_SIZE} className="h-8 w-28 text-xs" value={batchSize} onChange={(event) => setBatchSize(event.target.value)} />
+                  <span className="text-xs text-muted-foreground">条</span>
+                </div>
+              </Field>
+              <Field label="批次间隔" htmlFor="cleanup-pause" description="两批之间的停顿，给请求流量让路；压力大时加大。">
+                <div className="flex items-center gap-2">
+                  <Input id="cleanup-pause" type="number" min={0} max={CLEANUP_MAX_PAUSE_MS} className="h-8 w-28 text-xs" value={pauseMs} onChange={(event) => setPauseMs(event.target.value)} />
+                  <span className="text-xs text-muted-foreground">毫秒</span>
+                </div>
+              </Field>
+            </FieldGrid>
           )}
         </section>
 

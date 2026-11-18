@@ -47,7 +47,8 @@ import {
   LoadingState,
   ErrorState,
   Callout,
-  PageSizeSelect,
+  PAGE_SIZE_OPTIONS,
+  Pagination,
 } from '@/components/patterns'
 import {
   Badge,
@@ -457,18 +458,24 @@ function RecordsView({
   const [searchParams] = useSearchParams()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  // 其它页面（总览排行、风控样本、账号卡）带过来的筛选条件全部从 URL 读，进页面即生效。
   const [q, setQ] = useState('')
-  const [requestId, setRequestId] = useState('')
-  const [requestApiKeyId, setRequestApiKeyId] = useState('')
-  const [model, setModel] = useState('')
+  const [requestId, setRequestId] = useState(() => searchParams.get('requestId') ?? '')
+  const [requestApiKeyId, setRequestApiKeyId] = useState(() => searchParams.get('requestApiKeyId') ?? '')
+  const [model, setModel] = useState(() => searchParams.get('model') ?? '')
   const [endpoint, setEndpoint] = useState(() => searchParams.get('endpoint') ?? '')
-  const [conversationId, setConversationId] = useState('')
+  const [conversationId, setConversationId] = useState(() => searchParams.get('conversationId') ?? '')
   // 总览账号表、账号卡跳过来时带 accountId；老链接的 externalPoolId 也认。
   const initialAccountId = Number(searchParams.get('accountId') ?? searchParams.get('externalPoolId'))
   const initialAccountSelection: AccountSelectionValue =
     Number.isFinite(initialAccountId) && initialAccountId > 0 ? `account:${initialAccountId}` : 'all'
   const [accountSelection, setAccountSelection] = useState<AccountSelectionValue>(initialAccountSelection)
-  const [status, setStatus] = useState<UsageRecordStatus | '__all__'>('__all__')
+  const initialStatus = searchParams.get('status')
+  const [status, setStatus] = useState<UsageRecordStatus | '__all__'>(
+    initialStatus && ['success', 'error', 'stream_error', 'upstream_timeout', 'client_dropped'].includes(initialStatus)
+      ? (initialStatus as UsageRecordStatus)
+      : '__all__',
+  )
   const [source, setSource] = useState<UsageSource | '__all__'>('__all__')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
@@ -476,7 +483,9 @@ function RecordsView({
   const [since, setSince] = useState(() => isoToDatetimeLocalValue(searchParams.get('since')))
   const [until, setUntil] = useState(() => isoToDatetimeLocalValue(searchParams.get('until')))
   // 从别的页面带着账号跳进来时直接展开高级筛选，让人看到生效的条件。
-  const [advancedOpen, setAdvancedOpen] = useState(initialAccountSelection !== 'all')
+  const [advancedOpen, setAdvancedOpen] = useState(
+    initialAccountSelection !== 'all' || Boolean(searchParams.get('requestApiKeyId') || searchParams.get('conversationId') || searchParams.get('status')),
+  )
   const [exporting, setExporting] = useState(false)
 
   // 文本筛选项防抖,避免每次按键都触发查询(展示值即时,查询用防抖值)
@@ -966,32 +975,15 @@ function RecordsView({
             </div>
             {(page > 1 || hasNext || pageSize !== DEFAULT_PAGE_SIZE) && (
               <div className="px-4 py-3">
-                <div className="flex flex-wrap items-center justify-center gap-3">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={page === 1 || pageTransitionPending}
-                    onClick={() => setPage((v) => Math.max(1, v - 1))}
-                  >
-                    上一页
-                  </Button>
-                  <span className="text-xs text-muted-foreground">
-                    第 {page} 页{pageTransitionPending ? ' · 加载中' : ''}
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={!hasNext || pageTransitionPending}
-                    onClick={() => setPage((v) => v + 1)}
-                  >
-                    下一页
-                  </Button>
-                  <PageSizeSelect
-                    value={pageSize}
-                    onChange={(next) => { setPageSize(next); setPage(1) }}
-                    disabled={pageTransitionPending}
-                  />
-                </div>
+                <Pagination
+                  page={page}
+                  pageCount={hasNext ? page + 1 : page}
+                  pageSize={pageSize}
+                  pageSizeOptions={PAGE_SIZE_OPTIONS}
+                  pending={pageTransitionPending}
+                  onPageChange={setPage}
+                  onPageSizeChange={(next) => { setPageSize(next); setPage(1) }}
+                />
               </div>
             )}
           </>

@@ -15,14 +15,17 @@ import { RequestApiKeyIdDisplay } from './request-api-key-id'
 import { UsageCostBreakdown,UsageCostTiles,usageRecordCostModel } from './usage-billing'
 import {
 attemptActionLabel,
+errorSourceLabel,
 formatExternalAttemptChain,
 formatLatency,
+modelResolutionSourceLabel,
 resolvedModelLabel,
 routeLabel,
 routeTone,
 sourceLabel,
 statusLabel,
 statusTone,
+terminalReasonLabel,
 upstreamModelLabel,
 } from './usage-helpers'
 
@@ -339,10 +342,10 @@ export function UsageDetailModal({
               </div>
             )}
             <DetailField label="账号" value={record.accountId != null ? `#${record.accountId}${record.accountName ? ' ' + record.accountName : ''}` : '-'} />
-            <DetailField
-              label="路由"
-              value={`${routeLabel(record)} · ${record.routeKind || '-'}${record.routeSubtype ? ` · ${record.routeSubtype}` : ''}`}
-            />
+            <DetailField label="路由" value={routeLabel(record)} />
+            {record.modelResolutionSource && (
+              <DetailField label="模型解析方式" value={modelResolutionSourceLabel(record.modelResolutionSource)} />
+            )}
           </div>
         </div>
 
@@ -362,7 +365,7 @@ export function UsageDetailModal({
             {record.publicErrorMessage && <DetailField label="下游收到的错误" value={record.publicErrorMessage} />}
             {record.errorType && <DetailField label="错误类型" value={record.errorType} />}
             {record.errorStatusCode != null && <DetailField label="内部状态码" value={String(record.errorStatusCode)} />}
-            {record.errorSource && <DetailField label="错误阶段" value={record.errorSource} />}
+            {record.errorSource && <DetailField label="错误阶段" value={errorSourceLabel(record.errorSource)} />}
             {record.errorId && <DetailField label="错误 ID" value={record.errorId} mono />}
             {record.errorMessage && <DetailField label="内部错误信息" value={record.errorMessage} />}
             {record.fallbackReason && <DetailField label="Fallback 原因" value={record.fallbackReason} />}
@@ -498,7 +501,7 @@ export function UsageDetailModal({
                   <MetricTile label="客户端断开" value={formatLatency(record.latencyTrace.clientDroppedMs)} />
                 )}
                 {record.latencyTrace.terminalReason && (
-                  <MetricTile label="结束原因" value={record.latencyTrace.terminalReason} />
+                  <MetricTile label="结束原因" value={terminalReasonLabel(record.latencyTrace.terminalReason)} />
                 )}
                 {record.latencyTrace.upstreamMessageStatus && (
                   <MetricTile label="上游完成状态" value={record.latencyTrace.upstreamMessageStatus} tone={record.latencyTrace.sawUpstreamCompleted ? 'success' : 'info'} />

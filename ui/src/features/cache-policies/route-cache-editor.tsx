@@ -17,11 +17,11 @@ import { RotateCcw } from "lucide-react";
 
 export const CACHE_STRATEGIES: Array<[PromptCacheStrategyType, string]> = [
   ["no_cache", "无缓存"],
-  ["current_high_cache", "模拟高缓存"],
+  ["current_high_cache", "本地模拟缓存"],
   ["prefix_tool", "前缀追踪"],
-  ["stable_segment_cache", "稳定片段"],
+  ["stable_segment_cache", "稳定片段缓存"],
   ["prefix_tool_plus", "前缀追踪 Plus"],
-  ["bounded_high_cache", "上下限高缓存"],
+  ["bounded_high_cache", "上下限优先缓存"],
 ];
 
 const TEMPLATE_KEY = {

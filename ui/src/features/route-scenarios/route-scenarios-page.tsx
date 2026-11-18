@@ -17,6 +17,8 @@ import {
 import {
   Callout,
   EmptyState,
+  FieldGrid,
+  Field,
   ErrorState,
   LoadingState,
   ModalShell,
@@ -409,16 +411,14 @@ function ScenarioEditor({
           </div>
         }
       >
-        <div className="grid gap-3 md:grid-cols-2">
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium" htmlFor="scenario-name">名称</label>
+        <FieldGrid min="18rem">
+          <Field label="名称" htmlFor="scenario-name" required description="列表里显示的名字，最多 64 字。">
             <Input id="scenario-name" value={state.name} maxLength={64} onChange={(event) => onChange({ ...state, name: event.target.value })} placeholder="例如：日常、高峰期只走主账号" />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium" htmlFor="scenario-description">说明</label>
+          </Field>
+          <Field label="说明" htmlFor="scenario-description" description="可选，说明这个场景适用于什么时候。">
             <Textarea id="scenario-description" className="min-h-9" value={state.description} maxLength={500} onChange={(event) => onChange({ ...state, description: event.target.value })} placeholder="可选" />
-          </div>
-        </div>
+          </Field>
+        </FieldGrid>
         {unknownRoutes.length > 0 && (
           <Callout tone="warning" className="mt-3">
             这些路由已不在路由列表里：{unknownRoutes.join("、")}。请在下面移除，或先到路由页补回。

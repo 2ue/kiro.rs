@@ -22,6 +22,7 @@ import {
 } from "@/components/ui";
 import { RouteCacheEditor } from "@/features/cache-policies/route-cache-editor";
 import { RouteInjectionEditor, SettingGroup, SettingRow } from "@/features/prompt-injection/route-injection-editor";
+import { InjectionPreviewPanel } from "@/features/prompt-injection/injection-preview-panel";
 import { useAccounts } from "@/hooks/use-accounts";
 import {
   useRouteEffective,
@@ -237,6 +238,16 @@ export function RouteEditPage() {
             injection={draft.promptInjection}
             onChange={(v) => set("promptInjection", v)}
           />
+          <SettingGroup
+            title="注入效果预览"
+            desc="按已保存的全局注入模板模拟一次请求，看最终会注入哪些提示词。预览不改配置，也不发到上游。"
+          >
+            <InjectionPreviewPanel
+              routes={(routes.data ?? []).map((r) => r.prefix || "/")}
+              catalog={catalog.data?.items ?? []}
+              draft={{ promptInjection: runtime.data.promptInjection, routeFeatures: runtime.data.routeFeatures }}
+            />
+          </SettingGroup>
         </TabsContent>
         <TabsContent value="features">
           <RouteFeaturesEditor

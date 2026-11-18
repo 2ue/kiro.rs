@@ -5,8 +5,9 @@ ErrorState,
 LoadingState,
 ModalShell,
 PageContainer,
+PAGE_SIZE_OPTIONS,
 PageHeader,
-PageSizeSelect,
+Pagination,
 SectionCard,
 StatCard,
 StatGrid,
@@ -46,6 +47,7 @@ import { useMemo,useState } from 'react'
 import { toast } from 'sonner'
 import {
 ACCOUNT_EVENT_ORDER,
+ACTOR_LABELS,
 TIME_RANGES,
 accountEventMeta,
 accountEventQuery,
@@ -158,6 +160,7 @@ const ACTION_TO_CATEGORY: Record<string, string> = {
 }
 
 function actionLabel(action: string): string { return ACTION_LABELS[action] ?? action }
+function actorLabel(actor: string): string { return ACTOR_LABELS[actor] ?? actor }
 function objectLabel(type: string): string { return OBJECT_LABELS[type] ?? type }
 const DEFAULT_PAGE_LIMIT = 20
 
@@ -172,7 +175,7 @@ function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow 
         <div className="grid gap-3 sm:grid-cols-2">
           {[
             { label: '时间', value: formatDate(record.createdAt) },
-            { label: '执行者', value: event?.actor ?? record.actor },
+            { label: '执行者', value: actorLabel(event?.actor ?? record.actor) },
             { label: event ? '变动' : '动作', value: event ? event.label : actionLabel(record.action) },
             {
               label: event ? '账号' : '对象',
@@ -425,7 +428,7 @@ function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) 
                       </TableCell>
                       <TableCell><Badge tone={event.tone}>{event.label}</Badge></TableCell>
                       <TableCell className="max-w-72 truncate text-xs" title={event.reason}>{event.reason || '—'}</TableCell>
-                      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{event.actor}</TableCell>
+                      <TableCell className="whitespace-nowrap text-xs text-muted-foreground" title={event.actor}>{actorLabel(event.actor)}</TableCell>
                       <TableCell className="text-right">
                         <Button variant="ghost" size="icon-xs" onClick={(e) => { e.stopPropagation(); onSelect(record) }} title="查看详情" aria-label="查看详情">
                           <Eye className="size-3.5" />
@@ -575,7 +578,7 @@ function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => voi
                           {event ? `${objectLabel(record.objectType)} #${record.objectId}` : record.objectId ? `#${record.objectId}` : '—'}
                         </div>
                       </TableCell>
-                      <TableCell className="text-xs">{record.actor}</TableCell>
+                      <TableCell className="text-xs" title={record.actor}>{actorLabel(record.actor)}</TableCell>
                       <TableCell className="max-w-[18rem]"><AuditChangeSummary record={record} /></TableCell>
                       <TableCell>
                         <Badge tone={record.success ? 'success' : 'error'}>
@@ -622,17 +625,18 @@ function PageNav({ page, pageSize, hasNext, pending, onChange, onPageSizeChange 
   onChange: (page: number) => void
   onPageSizeChange: (pageSize: number) => void
 }) {
+  // 接口只告诉"还有没有下一页"，没有总数：把页数按当前页 +1 推进，共享分页控件照常可用。
   return (
-    <div className="flex flex-wrap items-center justify-center gap-3 py-1">
-      <Button variant="outline" size="sm" disabled={page === 1 || pending} onClick={() => onChange(Math.max(1, page - 1))}>
-        上一页
-      </Button>
-      <span className="text-xs text-muted-foreground">第 {page} 页</span>
-      <Button variant="outline" size="sm" disabled={!hasNext || pending} onClick={() => onChange(page + 1)}>
-        下一页
-      </Button>
-      <PageSizeSelect value={pageSize} onChange={onPageSizeChange} disabled={pending} />
-    </div>
+    <Pagination
+      className="py-1"
+      page={page}
+      pageCount={hasNext ? page + 1 : page}
+      pageSize={pageSize}
+      pageSizeOptions={PAGE_SIZE_OPTIONS}
+      pending={pending}
+      onPageChange={onChange}
+      onPageSizeChange={onPageSizeChange}
+    />
   )
 }
 
@@ -652,8 +656,8 @@ export function AuditPage() {
         title="审计"
         subtitle="账号异动和后台关键操作记录，便于排查账号状态与配置变化来源"
         actions={
-          <Button variant="outline" size="sm" onClick={() => setRetentionOpen(true)}>
-            <Settings2 className="h-3.5 w-3.5" />
+          <Button variant="outline" onClick={() => setRetentionOpen(true)}>
+            <Settings2 />
             {retentionEnabled ? `自动清理：保留 ${retentionDays ?? '-'} 天` : '自动清理：已关闭'}
           </Button>
         }

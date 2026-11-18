@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { Button,Input,Select,SelectContent,SelectItem,SelectTrigger,SelectValue,Switch,Textarea } from '@/components/ui'
+import { REPORTED_USAGE_FIELD_MODE_OPTIONS } from '@/lib/enum-labels'
 import { defaultCacheHitShaping,defaultPromptCacheCreationControl,inputSamplePolicy,pathPolicy,preserveFieldPolicy,writerSamplePolicy } from '@/lib/runtime-config-defaults'
 import type {
 CachePolicyConfig,
@@ -2462,12 +2463,9 @@ export function CacheCreationSection({
 
 // ─── 用量上报字段策略 ─────────────────────────────────────────────────────────
 
-const FIELD_MODE_LABELS: Record<string, string> = {
-  raw: '使用原始值',
-  preserve: '使用当前值',
-  'sample-max': '压到上限内',
-  'sample-target': '压到目标附近',
-}
+const FIELD_MODE_LABELS: Record<string, string> = Object.fromEntries(
+  REPORTED_USAGE_FIELD_MODE_OPTIONS.map((option) => [option.value, option.label]),
+)
 
 const FIELD_MODE_DESCS: Record<string, string> = {
   raw: '直接使用上游原始返回的这个数字。',

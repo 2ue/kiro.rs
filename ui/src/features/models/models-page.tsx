@@ -274,6 +274,7 @@ export function ModelsPage() {
   const [discovered, setDiscovered] = useState<ModelCatalogDiscoverResponse | null>(null)
   const [search, setSearch] = useState('')
   const [onlyListed, setOnlyListed] = useState(false)
+  const [priceSearch, setPriceSearch] = useState('')
 
   const models = capabilities.data?.models ?? []
   const priceIndex = useMemo(() => pricingIndex(pricing.data?.models ?? []), [pricing.data?.models])
@@ -282,6 +283,8 @@ export function ModelsPage() {
     (!keyword || `${m.model} ${m.displayName}`.toLowerCase().includes(keyword)) && (!onlyListed || m.listed),
   )
   const listedCount = models.filter((m) => m.listed).length
+  const priceKeyword = priceSearch.trim().toLowerCase()
+  const visiblePrices = (pricing.data?.models ?? []).filter((item) => !priceKeyword || item.model.toLowerCase().includes(priceKeyword))
 
   const handleDelete = async (item: ModelCapabilityItem) => {
     const ok = await confirm({
@@ -463,6 +466,18 @@ export function ModelsPage() {
         ) : !pricing.data?.models.length ? (
           <EmptyState title="暂无价格数据" description="点击「同步价格」获取模型价格目录" />
         ) : (
+          <>
+          <div className="px-5 pt-4">
+            <Toolbar>
+              <ToolbarSearch value={priceSearch} onChange={setPriceSearch} placeholder="搜索价格目录里的模型 ID" />
+              <ToolbarActions>
+                <span className="text-xs text-muted-foreground">{visiblePrices.length} / {pricing.data.models.length}</span>
+              </ToolbarActions>
+            </Toolbar>
+          </div>
+          {visiblePrices.length === 0 ? (
+            <EmptyState title="没有匹配的模型" description="换个关键字。" />
+          ) : (
           <div className="scrollbar-thin overflow-x-auto">
             <Table className="min-w-[860px]">
               <TableHeader>
@@ -478,7 +493,7 @@ export function ModelsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {pricing.data.models.map((item, index) => (
+                {visiblePrices.map((item, index) => (
                   <TableRow key={item.model}>
                     <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">{index + 1}</TableCell>
                     <TableCell className="font-mono text-xs max-w-[260px]"><div className="truncate" title={item.model}>{item.model}</div></TableCell>
@@ -493,6 +508,8 @@ export function ModelsPage() {
               </TableBody>
             </Table>
           </div>
+          )}
+          </>
         )}
       </SectionCard>
 

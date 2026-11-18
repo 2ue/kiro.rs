@@ -48,11 +48,11 @@ const TEMPLATE_META: Array<{
   description: string;
   tone: "primary" | "success" | "warning" | "info" | "secondary";
 }> = [
-  { type: "current_high_cache", title: "本地模拟缓存策略", description: "通过本地计算模拟缓存命中和缓存创建的展示用量。", tone: "primary" },
+  { type: "current_high_cache", title: "本地模拟缓存", description: "通过本地计算模拟缓存命中和缓存创建的展示用量。", tone: "primary" },
   { type: "prefix_tool", title: "前缀追踪", description: "按会话和请求路径追踪稳定前缀，再生成缓存用量。", tone: "success" },
   { type: "stable_segment_cache", title: "稳定片段缓存", description: "从 tools、system 和历史消息中提取稳定片段作为缓存边界。", tone: "warning" },
   { type: "prefix_tool_plus", title: "前缀追踪 Plus", description: "独立控制四类 usage 的整形、非流式策略、小请求和写入频次。", tone: "info" },
-  { type: "bounded_high_cache", title: "上下限优先缓存策略", description: "参数同本地模拟缓存；各字段上下限是最终约束，计费只在范围内补，差额跨请求记账。", tone: "secondary" },
+  { type: "bounded_high_cache", title: "上下限优先缓存", description: "参数同本地模拟缓存；各字段上下限是最终约束，计费只在范围内补，差额跨请求记账。", tone: "secondary" },
 ];
 
 const TONE_CLASS: Record<(typeof TEMPLATE_META)[number]["tone"], string> = {

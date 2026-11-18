@@ -187,7 +187,7 @@ export function AccountRiskPage() {
     <PageContainer>
       <PageHeader
         actions={
-          <Button size="sm" variant="outline" onClick={() => riskQuery.refetch()} disabled={riskQuery.isFetching}>
+          <Button variant="outline" onClick={() => riskQuery.refetch()} disabled={riskQuery.isFetching}>
             <RefreshCw className={cn(riskQuery.isFetching && 'animate-spin')} />
             刷新
           </Button>

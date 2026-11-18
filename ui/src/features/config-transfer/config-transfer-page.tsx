@@ -26,6 +26,23 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Download, Upload } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
+/** 配置包里每类条目的中文名，和导出文件里的 kind 一一对应。 */
+const CHANGE_KIND_LABELS: Record<string, string> = {
+  runtime_config: "运行配置",
+  route: "路由",
+  routes: "路由",
+  account: "账号",
+  accounts: "账号",
+  request_api_key: "请求 Key",
+  request_api_keys: "请求 Key",
+  route_scenario: "路由场景",
+  route_scenarios: "路由场景",
+  model_capability: "模型能力",
+  model_capabilities: "模型能力",
+  manual_model: "手动模型",
+  pricing: "价格目录",
+};
+
 export function ConfigTransferPage() {
   const [secrets, setSecrets] = useState(false),
     [bundle, setBundle] = useState<ConfigPackage | null>(null),
@@ -70,7 +87,7 @@ export function ConfigTransferPage() {
       <PageHeader
         actions={
           <>
-            <label className="flex items-center gap-2 text-sm">
+            <label className="flex items-center gap-2 text-sm" title="导出的配置包里带上账号密钥与请求 Key 明文；不勾选时这些字段写成 <redacted>，只能用于预览">
               <Switch checked={secrets} onCheckedChange={setSecrets} />
               包含密钥
             </label>
@@ -124,7 +141,7 @@ export function ConfigTransferPage() {
               <TableBody>
                 {report.changes.map((change) => (
                   <TableRow key={`${change.kind}:${change.naturalKey}`}>
-                    <TableCell>{change.kind}</TableCell>
+                    <TableCell>{CHANGE_KIND_LABELS[change.kind] ?? change.kind}</TableCell>
                     <TableCell>{change.naturalKey}</TableCell>
                     <TableCell>
                       {

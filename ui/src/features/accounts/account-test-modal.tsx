@@ -11,8 +11,9 @@ import {
   DEFAULT_TEST_PROMPT,
 } from '@/lib/test-models'
 import type { Account, AccountTestResponse } from '@/types/api'
-import { ModalShell } from '@/components/patterns'
-import { Badge, Button, Input, Label } from '@/components/ui'
+import { ModalShell, Field, FieldGrid } from '@/components/patterns'
+import { ACCOUNT_AUTH_TYPE_OPTIONS, enumLabel } from '@/lib/enum-labels'
+import { Badge, Button, Input, } from '@/components/ui'
 import {
   Select,
   SelectContent,
@@ -110,29 +111,27 @@ export function AccountTestModal({
           <div className="rounded-lg bg-surface-subtle p-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-semibold">#{account.id} {account.name}</span>
-              <Badge tone="neutral">{account.authType}</Badge>
+              <Badge tone="neutral">{enumLabel(ACCOUNT_AUTH_TYPE_OPTIONS, account.authType)}</Badge>
               <Badge tone={account.enabled ? 'success' : 'error'}>{account.enabled ? '启用' : '已禁用'}</Badge>
             </div>
             <div className="mt-1 break-all text-xs text-muted-foreground">{account.baseUrl}</div>
           </div>
 
-          <div className="grid gap-3 sm:grid-cols-[1fr_200px]">
-            <div className="space-y-1">
-              <Label>测试模型</Label>
+          <FieldGrid>
+            <Field label="测试模型" htmlFor="account-test-model" description="用账号支持的模型发一条最小请求，验证地址、密钥与请求头配置。">
               <Select value={model} onValueChange={selectModel} disabled={running}>
-                <SelectTrigger size="sm"><SelectValue placeholder="选择测试模型" /></SelectTrigger>
+                <SelectTrigger id="account-test-model" size="sm"><SelectValue placeholder="选择测试模型" /></SelectTrigger>
                 <SelectContent>
                   {modelOptions.map((option) => (
                     <SelectItem key={option.id} value={option.id}>{option.label}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
-            </div>
-            <div className="space-y-1">
-              <Label>测试消息</Label>
-              <Input size={undefined} className="h-9 text-sm" value={prompt} disabled={running} onChange={(e) => setPrompt(e.target.value)} />
-            </div>
-          </div>
+            </Field>
+            <Field label="测试消息" htmlFor="account-test-prompt" description="留空则发送默认的一句话。">
+              <Input id="account-test-prompt" className="h-9 text-sm" value={prompt} disabled={running} onChange={(e) => setPrompt(e.target.value)} />
+            </Field>
+          </FieldGrid>
 
           <div className="rounded-lg bg-surface-subtle p-4 font-mono text-xs">
             <div className="space-y-1 text-muted-foreground">

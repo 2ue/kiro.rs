@@ -65,7 +65,7 @@ export function EffectiveSheet({
                     <TableCell className="break-all text-xs">
                       {JSON.stringify(v)}
                     </TableCell>
-                    <TableCell>{sources?.[key] ?? "builtin_default"}</TableCell>
+                    <TableCell>{sourceLayerLabel(sources?.[key] ?? "builtin_default")}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -75,4 +75,18 @@ export function EffectiveSheet({
       </SheetContent>
     </Sheet>
   );
+}
+
+/** 生效参数的来源层：哪一层配置决定了这个值。 */
+function sourceLayerLabel(layer: string): string {
+  const labels: Record<string, string> = {
+    builtin_default: "内置默认",
+    global: "全局配置",
+    global_template: "全局模板",
+    template: "策略模板",
+    route: "本路由",
+    account: "本账号",
+    account_override: "账号覆盖",
+  };
+  return labels[layer] ?? layer;
 }

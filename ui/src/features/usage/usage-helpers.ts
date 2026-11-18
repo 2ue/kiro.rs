@@ -101,3 +101,50 @@ export function resolvedModelLabel(record: UsageRecord): string {
   const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
   return `${model}${source}`
 }
+
+/** 错误发生阶段的中文说明；未知值原样返回，方便发现漏项。 */
+export function errorSourceLabel(source?: string): string {
+  const labels: Record<string, string> = {
+    downstream_client: '下游客户端断开',
+    external_account: '账号上游响应',
+    external_account_stream: '账号上游流式',
+    external_stream: '账号上游流式',
+    external_dispatch: '账号调度',
+    admission: '请求准入',
+    body_extractor: '请求体读取',
+    payload_guard: '请求体保护',
+    gateway: '网关',
+  }
+  return source ? labels[source] ?? source : '-'
+}
+
+/** 流式结束原因的中文说明。 */
+export function terminalReasonLabel(reason?: string): string {
+  const labels: Record<string, string> = {
+    completed: '正常完成',
+    upstream_status_error: '上游状态错误',
+    upstream_json_exception: '上游 JSON 异常',
+    upstream_idle_timeout: '上游空闲超时',
+    first_output_timeout: '首输出超时',
+    upstream_max_duration: '超过最长时长',
+    malformed_sse: 'SSE 格式错误',
+    protocol_contamination: '协议污染',
+    client_dropped: '客户端断开',
+    internal_error: '内部错误',
+  }
+  return reason ? labels[reason] ?? reason : '-'
+}
+
+/** 模型解析来源的中文说明。 */
+export function modelResolutionSourceLabel(source?: string): string {
+  const labels: Record<string, string> = {
+    exact: '精确匹配',
+    alias: '别名',
+    family: '同家族最近版本',
+    version_fallback: '版本回退',
+    cross_family_fallback: '跨家族回退',
+    mapping: '映射规则',
+    passthrough: '直接透传',
+  }
+  return source ? labels[source] ?? source : '-'
+}
