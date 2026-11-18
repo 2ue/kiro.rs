@@ -41,8 +41,9 @@ import { defaultAccountsConfig } from "@/lib/runtime-config-defaults";
 import { extractErrorMessage } from "@/lib/utils";
 import type { Account, AccountQualityView, AccountStatus, CreateAccountRequest } from "@/types/api";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CopyPlus, Eye, FlaskConical, Pencil, Plus, Power, RefreshCw, RotateCcw, Sparkles, Trash2, Users } from "lucide-react";
+import { BarChart3, CopyPlus, Eye, FlaskConical, Pencil, Plus, Power, RefreshCw, RotateCcw, Sparkles, Trash2, Users } from "lucide-react";
 import { useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { AccountFormModal } from "./account-form-modal";
 import { AccountTestModal } from "./account-test-modal";
@@ -97,9 +98,11 @@ export function AccountsPage() {
   const runtimeConfig = useRuntimeConfig();
   const client = useQueryClient();
   const confirm = useConfirm();
+  const navigate = useNavigate();
   const promote = usePromoteAccountModels();
   const statuses = useQuery({ queryKey: ["accounts-status"], queryFn: getAccountsStatus, refetchInterval: 5000 });
-  const [search, setSearch] = useState("");
+  const [searchParams] = useSearchParams();
+  const [search, setSearch] = useState(() => searchParams.get("q") ?? "");
   const [tag, setTag] = useState("_all");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [editor, setEditor] = useState<{ mode: "create" | "edit"; account: Account | null; draft: AccountFormDraft; initialDraft: AccountFormDraft } | null>(null);
@@ -139,7 +142,10 @@ export function AccountsPage() {
   const config = { ...defaultAccountsConfig(), ...runtimeConfig.data?.accounts };
   const tags = [...new Set(accounts.flatMap((a) => a.tags ?? []))].sort();
   const keyword = search.trim().toLowerCase();
+  // "#12" 精确定位一个账号（用量明细跳过来用），其它关键字按名称/地址/标签模糊匹配。
+  const exactId = /^#\d+$/.test(keyword) ? Number(keyword.slice(1)) : undefined;
   const visible = accounts.filter((a) => {
+    if (exactId !== undefined) return a.id === exactId;
     if (keyword && !`${a.name} ${a.id} ${a.baseUrl} ${(a.tags ?? []).join(" ")}`.toLowerCase().includes(keyword)) return false;
     if (tag !== "_all" && !a.tags?.includes(tag)) return false;
     if (statusFilter !== "all" && statusOf(a, statusMap.get(a.id)) !== statusFilter) return false;
@@ -312,6 +318,7 @@ export function AccountsPage() {
                         <CopyPlus className="h-3.5 w-3.5" />复制
                       </Button>
                       <Button variant="ghost" size="xs" onClick={() => setTesting(account)}><FlaskConical className="h-3.5 w-3.5" />测试</Button>
+                      <Button variant="ghost" size="xs" onClick={() => navigate(`/usage?accountId=${account.id}`)} title="查看这个账号的用量明细"><BarChart3 className="h-3.5 w-3.5" />用量</Button>
                       <Button variant="ghost" size="xs" onClick={() => setEffectiveId(account.id)}><Eye className="h-3.5 w-3.5" />生效参数</Button>
                       <Button variant="ghost" size="xs" disabled={mutation.isPending} onClick={() => run(() => setAccountEnabled(account.id, !account.enabled), account.enabled ? "已停用" : "已启用")}>
                         <Power className="h-3.5 w-3.5" />{account.enabled ? "停用" : "启用"}

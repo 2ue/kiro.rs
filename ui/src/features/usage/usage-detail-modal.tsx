@@ -11,6 +11,7 @@ import { formatUsd,formatDate,formatNumber } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import type { UsageRecord } from '@/types/api'
 import type { ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 import { RequestApiKeyIdDisplay } from './request-api-key-id'
 import { UsageCostBreakdown,UsageCostTiles,usageRecordCostModel } from './usage-billing'
 import {
@@ -341,7 +342,21 @@ export function UsageDetailModal({
                 <DetailField label="模型解析说明" value={record.modelResolutionNote} />
               </div>
             )}
-            <DetailField label="账号" value={record.accountId != null ? `#${record.accountId}${record.accountName ? ' ' + record.accountName : ''}` : '-'} />
+            <div>
+              <div className="text-xs text-muted-foreground">账号</div>
+              {record.accountId != null ? (
+                <Link
+                  to={`/accounts?q=${encodeURIComponent(`#${record.accountId}`)}`}
+                  className="break-all text-sm text-primary underline-offset-2 hover:underline"
+                  title="到账号页查看这个账号"
+                  onClick={onClose}
+                >
+                  #{record.accountId}{record.accountName ? ` ${record.accountName}` : ''}
+                </Link>
+              ) : (
+                <div className="text-sm">-</div>
+              )}
+            </div>
             <DetailField label="路由" value={routeLabel(record)} />
             {record.modelResolutionSource && (
               <DetailField label="模型解析方式" value={modelResolutionSourceLabel(record.modelResolutionSource)} />
