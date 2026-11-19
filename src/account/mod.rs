@@ -11272,9 +11272,7 @@ fn external_sse_event_is_terminal(event: &[u8]) -> bool {
         match value.get("type").and_then(|value| value.as_str()) {
             Some("message_stop") => return true,
             Some("message_delta")
-                if value
-                    .pointer("/delta/stop_reason")
-                    .is_some_and(|reason| !reason.is_null()) =>
+                if external_sse_stop_reason_is_set(value.pointer("/delta/stop_reason")) =>
             {
                 return true;
             }
@@ -11284,17 +11282,23 @@ fn external_sse_event_is_terminal(event: &[u8]) -> bool {
             .get("choices")
             .and_then(|value| value.as_array())
             .is_some_and(|choices| {
-                choices.iter().any(|choice| {
-                    choice
-                        .get("finish_reason")
-                        .is_some_and(|value| !value.is_null())
-                })
+                choices
+                    .iter()
+                    .any(|choice| external_sse_stop_reason_is_set(choice.get("finish_reason")))
             })
         {
             return true;
         }
     }
     false
+}
+
+/// 停止原因只有是非空字符串才算流结束（与 `normalize_external_stop_reason` 同一口径）：
+/// 有些 OpenAI 兼容上游每个分片都带 `"finish_reason": ""`，不能把中途断开记成成功。
+fn external_sse_stop_reason_is_set(reason: Option<&serde_json::Value>) -> bool {
+    reason
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|reason| !reason.trim().is_empty())
 }
 
 fn pool_auto_disable_policy_enabled(policy: AutoDisablePolicy, config: &AccountsConfig) -> bool {
@@ -17288,6 +17292,24 @@ mod terminal_event_tests {
         assert!(!external_stream_chunk_has_terminal_event(
             &Bytes::from_static(
                 b"data: {\"choices\":[{\"finish_reason\":null,\"delta\":{\"content\":\"x\"}}]}\n\n"
+            )
+        ));
+        // 有些 OpenAI 兼容上游每个分片都带空的 finish_reason / stop_reason，不是流结束。
+        for chunk in [
+            &b"data: {\"choices\":[{\"finish_reason\":\"\",\"delta\":{\"content\":\"x\"}}]}\n\n"[..],
+            &b"data: {\"choices\":[{\"finish_reason\":\" \",\"delta\":{\"content\":\"x\"}}]}\n\n"[..],
+            &b"data: {\"choices\":[{\"finish_reason\":0,\"delta\":{\"content\":\"x\"}}]}\n\n"[..],
+            &b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"\"}}\n\n"[..],
+        ] {
+            assert!(
+                !external_stream_chunk_has_terminal_event(&Bytes::copy_from_slice(chunk)),
+                "{}",
+                String::from_utf8_lossy(chunk)
+            );
+        }
+        assert!(external_stream_chunk_has_terminal_event(
+            &Bytes::from_static(
+                b"data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n"
             )
         ));
     }
