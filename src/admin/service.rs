@@ -3571,8 +3571,26 @@ impl AdminService {
             .call_api_with_credential(id, &request_body)
             .await
             .map_err(|e| self.classify_test_error(e, id))?;
-        let runtime_config = self.token_manager.runtime_config();
         let credential_id = api_response.credential_id();
+        let response_text = self.read_model_test_response(api_response).await?;
+
+        Ok(TestCredentialResponse {
+            success: true,
+            credential_id,
+            model,
+            model_id,
+            prompt,
+            response: response_text,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Reads a model test reply within the size and time limits and returns its text.
+    async fn read_model_test_response(
+        &self,
+        api_response: crate::kiro::provider::KiroApiResponse,
+    ) -> Result<String, AdminServiceError> {
+        let runtime_config = self.token_manager.runtime_config();
         let (response, completion) = api_response.into_parts();
         let body_bytes = match response_bytes_with_limit_and_body_timeout(
             response,
@@ -3592,16 +3610,33 @@ impl AdminService {
         };
         let response_text = parse_model_test_response(&body_bytes)?;
         completion.release();
+        Ok(response_text)
+    }
 
-        Ok(TestCredentialResponse {
-            success: true,
-            credential_id,
-            model,
-            model_id,
-            prompt,
-            response: response_text,
-            duration_ms: started_at.elapsed().as_millis() as u64,
-        })
+    /// The model test request for an inventory account, with the pool test's default prompt:
+    /// (model, model id, prompt, body).
+    pub(super) fn inventory_model_test_request(
+        &self,
+        model: &str,
+        prompt: Option<&str>,
+    ) -> Result<(String, String, String, String), AdminServiceError> {
+        self.build_model_test_request(model, prompt.unwrap_or(DEFAULT_VALIDATION_TEST_PROMPT))
+    }
+
+    /// Sends a model test for an inventory account with a context built outside the pool and
+    /// returns the reply text.
+    pub(super) async fn inventory_call_model_test(
+        &self,
+        ctx: crate::kiro::token_manager::CallContext,
+        request_body: &str,
+        label: String,
+    ) -> Result<String, AdminServiceError> {
+        let api_response = self
+            .kiro_provider
+            .call_api_with_detached_context(ctx, request_body, label)
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(format!("测试调用失败: {e}")))?;
+        self.read_model_test_response(api_response).await
     }
 
     fn build_model_test_request(
@@ -12026,6 +12061,16 @@ impl AdminService {
 
 /// The account page's health classification (`account_error`, `quota_exhausted`, `unknown`,
 /// `normal`), shared with the inventory move.
+/// The pool's subscription tier of a title: `free`, `pro`, `pro_plus`, ... or `unknown`.
+pub(super) fn subscription_key_public(title: Option<&str>) -> String {
+    subscription_key(title)
+}
+
+/// The tier a subscription filter value asks for, as the pool reads it; `None` is no filter.
+pub(super) fn subscription_filter_key_public(value: &str) -> Option<String> {
+    subscription_filter_key(value)
+}
+
 pub(super) fn credential_health_status_public(credential: &CredentialStatusItem) -> &'static str {
     credential_health_status(credential)
 }

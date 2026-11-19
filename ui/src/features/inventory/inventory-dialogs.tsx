@@ -12,6 +12,7 @@ import {
   usePushInventory,
   useRenameInventoryGroup,
   useSetInventoryGroup,
+  useSetInventoryProxy,
   useUpdateInventory,
 } from '@/hooks/use-inventory'
 import { parseImportInputs, readImportFiles, type ParsedImportAccount } from '@/lib/credential-import/sources'
@@ -19,12 +20,15 @@ import { downloadBlob, timestampedFilename } from '@/lib/download'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   AddCredentialRequest,
+  InventoryActionItem,
   InventoryActionResponse,
   InventoryExportFormat,
   InventoryExportScope,
+  InventoryFilter,
   InventoryGroupItem,
   InventoryImportResponse,
   InventoryItem,
+  InventoryUpdateRequest,
 } from '@/types/api'
 import { InventoryGroupPicker, INVENTORY_GROUP_NAME_MAX } from './inventory-group-picker'
 import {
@@ -246,8 +250,16 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
 // Push to the pool: the pool import's parameter panel, without the JSON.
 // ============================================================================
 
-export function InventoryPushModal({ open, items, onClose, onDone }: {
+/** 每次推送请求的账号数：入池时要刷新 Token，分块推送避免单个请求过长。 */
+const PUSH_CHUNK = 20
+
+/**
+ * 推送到账号池。`ids` 是要推送的账号；`items` 是其中已加载的账号，只用于提示
+ * （跨页全选时可能只是一部分）。
+ */
+export function InventoryPushModal({ open, ids, items, onClose, onDone }: {
   open: boolean
+  ids: number[]
   items: InventoryItem[]
   onClose: () => void
   onDone: () => void
@@ -257,48 +269,66 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
   const [restoreOrigin, setRestoreOrigin] = useState(true)
   const [result, setResult] = useState<InventoryActionResponse | null>(null)
   const [error, setError] = useState('')
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
   const proxyResources = useProxyResources()
   const proxies = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
   const push = usePushInventory()
+  const partial = items.length < ids.length
   const keepsProxy = items.filter((item) => item.proxyResourceId ? item.proxyUsable : Boolean(item.proxyUrl))
   const needsProxy = items.length - keepsProxy.length
   const fromPool = items.filter((item) => item.origin).length
 
   useEffect(() => {
-    if (!open) { setDefaults(initialParameterDefaults()); setResult(null); setError(''); setAutoDiscover(false); setRestoreOrigin(true) }
+    if (!open) { setDefaults(initialParameterDefaults()); setResult(null); setError(''); setAutoDiscover(false); setRestoreOrigin(true); setProgress(null) }
   }, [open])
 
   const submit = async () => {
     setError('')
     const proxyError = validateProxyAssignment(defaults)
     if (proxyError) { setError(proxyError); return }
+    const importDefaults = parameterDefaultsToImportDefaults(defaults)
+    const rotation = importDefaults.proxyResourceIds ?? []
+    const pushed: InventoryActionItem[] = []
+    setProgress({ done: 0, total: ids.length })
     try {
-      const response = await push.mutateAsync({
-        ids: items.map((item) => item.id),
-        defaults: parameterDefaultsToImportDefaults(defaults),
-        autoDiscoverSupportedModels: autoDiscover,
-        restoreOriginSettings: restoreOrigin,
-      })
-      setResult(response)
-      if (response.failed === 0) toast.success(`已推送 ${response.succeeded} 个账号到账号池`)
-      else toast.warning(`推送成功 ${response.succeeded}，失败 ${response.failed}`)
-      onDone()
+      for (let start = 0; start < ids.length; start += PUSH_CHUNK) {
+        // Each request rotates from its first account: continue where the last chunk stopped.
+        const offset = rotation.length ? start % rotation.length : 0
+        const response = await push.mutateAsync({
+          ids: ids.slice(start, start + PUSH_CHUNK),
+          defaults: rotation.length
+            ? { ...importDefaults, proxyResourceIds: [...rotation.slice(offset), ...rotation.slice(0, offset)] }
+            : importDefaults,
+          autoDiscoverSupportedModels: autoDiscover,
+          restoreOriginSettings: restoreOrigin,
+        })
+        pushed.push(...response.items)
+        setProgress({ done: Math.min(start + PUSH_CHUNK, ids.length), total: ids.length })
+      }
     } catch (e) {
-      setError(extractErrorMessage(e))
+      setError(`${pushed.length > 0 ? `已处理 ${pushed.length} 个后中断：` : ''}${extractErrorMessage(e)}`)
     }
+    if (pushed.length === 0) { setProgress(null); return }
+    const succeeded = pushed.filter((item) => item.ok).length
+    setResult({ total: pushed.length, succeeded, failed: pushed.length - succeeded, items: pushed })
+    if (succeeded === pushed.length) toast.success(`已推送 ${succeeded} 个账号到账号池`)
+    else toast.warning(`推送成功 ${succeeded}，失败 ${pushed.length - succeeded}`)
+    onDone()
   }
 
   return (
     <ModalShell
       open={open}
       onClose={onClose}
-      title={`推送 ${items.length} 个账号到账号池`}
+      title={`推送 ${ids.length} 个账号到账号池`}
       description="推送后账号由账号池接管：账号池负责续期和调度，库存只保留记录并显示账号池里的状态。"
       width="max-w-5xl"
       footer={result ? <Button onClick={onClose}>完成</Button> : (
         <>
           <Button variant="outline" onClick={onClose} disabled={push.isPending}>取消</Button>
-          <Button onClick={() => void submit()} disabled={push.isPending || items.length === 0}>{push.isPending ? '推送中…' : '推送到账号池'}</Button>
+          <Button onClick={() => void submit()} disabled={push.isPending || ids.length === 0}>
+            {push.isPending ? `推送中… ${progress ? `${progress.done}/${progress.total}` : ''}` : '推送到账号池'}
+          </Button>
         </>
       )}
     >
@@ -317,23 +347,25 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
       ) : (
         <div className="space-y-4 text-sm">
           <Callout tone="info">
+            {partial && `已加载 ${items.length} / ${ids.length} 个账号的信息，下面的统计只含已加载的部分。`}
             {keepsProxy.length > 0 && `${keepsProxy.length} 个账号保留原来的代理（代理仍可用）。`}
             {needsProxy > 0 && `${needsProxy} 个账号没有可用代理，使用下面选择的代理。`}
             区域沿用库存里的设置；下面的区域只填补账号缺失的值。
+            {ids.length > PUSH_CHUNK && ` 每 ${PUSH_CHUNK} 个一批推送。`}
           </Callout>
           <CredentialParameterDefaultsPanel
             defaults={defaults}
             onChange={setDefaults}
             proxyResources={proxies}
-            hideProxy={needsProxy === 0}
+            hideProxy={!partial && needsProxy === 0}
           />
           <FormSection title="推送选项">
-            {fromPool > 0 && (
+            {(partial || fromPool > 0) && (
               <label className="mb-2 flex items-start gap-2">
                 <Checkbox checked={restoreOrigin} onCheckedChange={(value) => setRestoreOrigin(value === true)} className="mt-0.5" />
                 <span>
                   恢复移入前的调度参数
-                  <span className="ml-1 text-xs text-muted-foreground">（{fromPool} 个账号是从账号池移入的：优先级、Fast、RPM、并发、模型列表和标签按移入前原样恢复，上面这几项默认值对它们不生效；不勾选则按上面的默认值推送）</span>
+                  <span className="ml-1 text-xs text-muted-foreground">（{partial ? '从账号池移入的账号' : `${fromPool} 个账号是从账号池移入的`}：优先级、Fast、RPM、并发、模型列表和标签按移入前原样恢复，上面这几项默认值对它们不生效；不勾选则按上面的默认值推送）</span>
                 </span>
               </label>
             )}
@@ -356,7 +388,8 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
 export function InventoryEditModal({ item, onClose }: { item: InventoryItem | null; onClose: () => void }) {
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
-  const [proxyResourceId, setProxyResourceId] = useState('')
+  const [changeProxy, setChangeProxy] = useState(false)
+  const [proxy, setProxy] = useState<ProxyAssignmentValue>(() => initialProxyAssignment('clear'))
   const [note, setNote] = useState('')
   const [group, setGroup] = useState('')
   const proxyResources = useProxyResources()
@@ -368,7 +401,11 @@ export function InventoryEditModal({ item, onClose }: { item: InventoryItem | nu
     if (item) {
       setAuthRegion(item.authRegion || '')
       setApiRegion(item.apiRegion || '')
-      setProxyResourceId(item.proxyResourceId ? String(item.proxyResourceId) : '')
+      setChangeProxy(false)
+      // A direct proxy is listed masked: it is never prefilled, a change has to be typed in.
+      setProxy(item.proxyResourceId
+        ? { ...initialProxyAssignment('single'), resourceId: String(item.proxyResourceId) }
+        : initialProxyAssignment(item.proxyUrl ? 'direct_url' : 'clear'))
       setNote(item.note || '')
       setGroup(item.group || '')
     }
@@ -376,13 +413,17 @@ export function InventoryEditModal({ item, onClose }: { item: InventoryItem | nu
 
   const save = async () => {
     if (!item) return
+    if (changeProxy) {
+      const proxyError = validateProxyAssignmentValue(proxy, { requireSingle: true })
+      if (proxyError) { toast.error(proxyError); return }
+    }
     try {
       await update.mutateAsync({
         id: item.id,
         payload: {
           authRegion,
           apiRegion,
-          proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
+          ...(changeProxy ? proxyUpdate(proxy) : {}),
           note,
           group: group.trim() || null,
         },
@@ -410,20 +451,114 @@ export function InventoryEditModal({ item, onClose }: { item: InventoryItem | nu
       <FieldGrid>
         <Field label="Auth Region"><Input className="font-mono" value={authRegion} onChange={(e) => setAuthRegion(e.target.value)} /></Field>
         <Field label="API Region"><Input className="font-mono" value={apiRegion} onChange={(e) => setApiRegion(e.target.value)} /></Field>
-        <Field label="代理资源" description={item?.proxyUrl ? `当前直连代理 ${item.proxyUrl}；选择代理资源会替换它` : undefined}>
-          <Select value={proxyResourceId || '__none__'} onValueChange={(value) => setProxyResourceId(value === '__none__' ? '' : value)}>
-            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__none__">不绑定</SelectItem>
-              {proxies.map((resource) => <SelectItem key={resource.id} value={String(resource.id)}>{resource.name}</SelectItem>)}
-            </SelectContent>
-          </Select>
+        <Field label="代理" description={`当前：${proxySummary(item)}`}>
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={changeProxy} onCheckedChange={(value) => setChangeProxy(value === true)} />
+            修改代理
+          </label>
         </Field>
-        <Field label="备注"><Input value={note} onChange={(e) => setNote(e.target.value)} /></Field>
+        {changeProxy && (
+          <div className="sm:col-span-2">
+            <ProxyAssignmentField
+              value={proxy}
+              onChange={setProxy}
+              proxyResources={proxies}
+              modes={['clear', 'single', 'direct_url']}
+              description="清除后，续期和查询走全局代理或本机出口；推送到账号池时按推送设置再分配。"
+            />
+          </div>
+        )}
+        <Field label="备注" description="清空即删除备注"><Input value={note} onChange={(e) => setNote(e.target.value)} /></Field>
         <Field label="分组">
           <InventoryGroupPicker value={group} groups={namedGroups(groups.data?.groups)} onChange={setGroup} className="w-full" />
         </Field>
       </FieldGrid>
+    </ModalShell>
+  )
+}
+
+/** 卡片和编辑弹窗上的代理说明。 */
+export function proxySummary(item: InventoryItem | null): string {
+  if (!item?.hasProxy) return '未绑定代理'
+  if (item.proxyResourceId) return item.proxyResourceName || `代理资源 #${item.proxyResourceId}`
+  return item.proxyUrl ? `直连代理 ${item.proxyUrl}` : '直连代理'
+}
+
+/** 代理选择 → 库存编辑接口的字段；清除同时去掉代理资源和直连代理。 */
+function proxyUpdate(proxy: ProxyAssignmentValue): Partial<InventoryUpdateRequest> {
+  if (proxy.mode === 'single') return { proxyResourceId: Number(proxy.resourceId) }
+  if (proxy.mode === 'direct_url') {
+    return { proxyUrl: proxy.url.trim(), proxyUsername: proxy.username || undefined, proxyPassword: proxy.password || undefined }
+  }
+  return { proxyResourceId: null, proxyUrl: '' }
+}
+
+// ============================================================================
+// Set or remove the proxy of many accounts.
+// ============================================================================
+
+export function InventoryProxyModal({ open, ids, onClose, onDone }: {
+  open: boolean
+  ids: number[]
+  onClose: () => void
+  onDone: () => void
+}) {
+  const [proxy, setProxy] = useState<ProxyAssignmentValue>(() => initialProxyAssignment('clear'))
+  const [error, setError] = useState('')
+  const proxyResources = useProxyResources()
+  const proxies = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
+  const setInventoryProxy = useSetInventoryProxy()
+
+  useEffect(() => {
+    if (!open) { setProxy(initialProxyAssignment('clear')); setError('') }
+  }, [open])
+
+  const submit = async () => {
+    setError('')
+    const proxyError = validateProxyAssignmentValue(proxy, { requireSingle: true })
+    if (proxyError) { setError(proxyError); return }
+    try {
+      const result = await setInventoryProxy.mutateAsync({
+        ids,
+        mode: proxy.mode === 'single' || proxy.mode === 'round_robin' || proxy.mode === 'direct_url' ? proxy.mode : 'none',
+        ...(proxy.mode === 'single' ? { proxyResourceId: Number(proxy.resourceId) } : {}),
+        ...(proxy.mode === 'round_robin' ? { proxyResourceIds: proxy.resourceIds.map(Number) } : {}),
+        ...(proxy.mode === 'direct_url' ? { proxyUrl: proxy.url.trim(), proxyUsername: proxy.username || undefined, proxyPassword: proxy.password || undefined } : {}),
+      })
+      const verb = proxy.mode === 'clear' ? '清除了代理' : '设置了代理'
+      if (result.failed === 0) toast.success(`已为 ${result.succeeded} 个账号${verb}`)
+      else toast.warning(`${result.succeeded} 个账号${verb}，${result.failed} 个失败`)
+      onDone()
+      onClose()
+    } catch (e) {
+      setError(extractErrorMessage(e))
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title={`设置 ${ids.length} 个账号的代理`}
+      description="只改库存里保存的代理。续期、查询、测试都走这里的代理；推送到账号池时，有可用代理的账号保留它，没有的按推送设置分配。"
+      width="max-w-2xl"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose} disabled={setInventoryProxy.isPending}>取消</Button>
+          <Button onClick={() => void submit()} disabled={setInventoryProxy.isPending || ids.length === 0}>
+            {setInventoryProxy.isPending ? '保存中…' : proxy.mode === 'clear' ? '清除代理' : '保存'}
+          </Button>
+        </>
+      }
+    >
+      <ProxyAssignmentField
+        value={proxy}
+        onChange={setProxy}
+        proxyResources={proxies}
+        modes={['clear', 'single', 'round_robin', 'direct_url']}
+        description="清除后，续期和查询走全局代理或本机出口。"
+      />
+      {error && <Callout tone="error" className="mt-3">{error}</Callout>}
     </ModalShell>
   )
 }
@@ -586,7 +721,7 @@ export function InventoryExportModal({ open, onClose, selectedIds, filter, filte
   onClose: () => void
   selectedIds: number[]
   /** 库存页当前的筛选条件。 */
-  filter: { status?: string; group?: string; q?: string }
+  filter: InventoryFilter
   filterLabel: string
   filteredCount: number
 }) {

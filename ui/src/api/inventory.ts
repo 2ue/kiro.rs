@@ -5,12 +5,18 @@ import type {
   InventoryExportScope,
   InventoryGroupChangeResponse,
   InventoryGroupsResponse,
+  InventoryIdsResponse,
   InventoryImportRequest,
   InventoryImportResponse,
   InventoryItem,
   InventoryListQuery,
   InventoryListResponse,
+  InventoryProxyRequest,
   InventoryPushRequest,
+  InventorySortQuery,
+  InventoryTestRequest,
+  InventoryTestResponse,
+  InventoryFilter,
   InventoryUpdateRequest,
   MoveToInventoryPreview,
   MoveToInventoryRequest,
@@ -19,6 +25,23 @@ import type {
 
 export async function getInventory(query: InventoryListQuery): Promise<InventoryListResponse> {
   const { data } = await api.get<InventoryListResponse>('/inventory', { params: query })
+  return data
+}
+
+/** 当前筛选下所有在库、失效账号的 ID，用于跨页全选。 */
+export async function getInventoryIds(query: InventoryFilter & InventorySortQuery): Promise<InventoryIdsResponse> {
+  const { data } = await api.get<InventoryIdsResponse>('/inventory/ids', { params: query })
+  return data
+}
+
+/** 用库存账号真实调一次模型；Token 过期会先刷新并写回库存。 */
+export async function testInventory(id: number, payload: InventoryTestRequest): Promise<InventoryTestResponse> {
+  const { data } = await api.post<InventoryTestResponse>(`/inventory/${id}/test`, payload, { timeout: 180_000 })
+  return data
+}
+
+export async function setInventoryProxy(payload: InventoryProxyRequest): Promise<InventoryActionResponse> {
+  const { data } = await api.post<InventoryActionResponse>('/inventory/proxy', payload)
   return data
 }
 

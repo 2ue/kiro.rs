@@ -3136,17 +3136,86 @@ export interface InventoryListResponse {
   counts: InventoryCounts
   items: InventoryItem[]
   renewal?: InventoryRenewalSettings
+  summary?: InventorySummary
 }
 
-export interface InventoryListQuery {
-  page?: number
-  limit?: number
+/** 当前筛选下仍持有账号（在库、失效）的额度汇总，按各账号最近一次查询。 */
+export interface InventorySummary {
+  accounts: number
+  unchecked: number
+  exhausted: number
+  remaining: number
+  usageLimit: number
+  /** key 与账号页的订阅筛选一致：free、pro、pro_plus、pro_max、power、students、unknown。 */
+  bySubscription: { key: string; accounts: number; remaining: number }[]
+  /** 库存里出现过的认证方式，用于筛选。 */
+  authKinds: string[]
+}
+
+/** 库存列表的筛选与排序（列表、导出、全选共用）。 */
+export interface InventoryFilter {
   status?: string
   q?: string
   /** 分组名；`__none__` 表示未分组。 */
   group?: string
   /** `__pool__` 账号池移入，`__imported__` 导入，或某个禁用原因。 */
   origin?: string
+  /** 订阅档位，与账号页一致。 */
+  subscription?: string
+  /** remaining 有剩余 / exhausted 已用尽 / unchecked 未查询。 */
+  quota?: string
+  /** with 有代理 / without 无代理 / 代理资源 ID。 */
+  proxy?: string
+  auth?: string
+}
+
+export interface InventorySortQuery {
+  /** remaining 剩余额度 / checked 最近查询 / created 入库时间 / expires Token 到期；默认最新入库在前。 */
+  sort?: string
+  order?: 'asc' | 'desc'
+}
+
+export interface InventoryListQuery extends InventoryFilter, InventorySortQuery {
+  page?: number
+  limit?: number
+}
+
+/** 跨页全选：当前筛选下所有在库、失效账号的 ID（最多 5000 个）。 */
+export interface InventoryIdsResponse {
+  ids: number[]
+  total: number
+  truncated: boolean
+}
+
+/** 批量设置代理：none 清除，single 绑定一个代理资源，round_robin 轮流绑定，direct_url 直连地址。 */
+export interface InventoryProxyRequest {
+  ids: number[]
+  mode: 'none' | 'single' | 'round_robin' | 'direct_url'
+  proxyResourceId?: number
+  proxyResourceIds?: number[]
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+}
+
+export interface InventoryTestRequest {
+  model: string
+  prompt?: string
+}
+
+/** 库存账号测试结果；请求本身之外的失败都在 outcome 里，不是 HTTP 错误。 */
+export interface InventoryTestResponse {
+  id: number
+  /** invalid：refreshToken 被拒，账号已标为失效；deferred：刷新限流或正在续期，稍后再试。 */
+  outcome: 'success' | 'invalid' | 'failed' | 'deferred'
+  stage?: 'refresh' | 'model'
+  model: string
+  modelId: string
+  response?: string
+  /** 本次为测试刷新了 Token（已写回库存）。 */
+  refreshed: boolean
+  durationMs: number
+  message?: string
 }
 
 export interface InventoryUpdateRequest {
@@ -3174,12 +3243,16 @@ export interface InventoryActionItem {
   ok: boolean
   credentialId?: number
   message?: string
+  /** 暂未执行、不算失败：刷新限流中或该账号正在续期，稍后再试。 */
+  deferred?: boolean
 }
 
 export interface InventoryActionResponse {
   total: number
   succeeded: number
   failed: number
+  /** 暂未执行的数量（见 InventoryActionItem.deferred）。 */
+  deferred?: number
   items: InventoryActionItem[]
 }
 
@@ -3206,7 +3279,7 @@ export type InventoryExportFormat = 'json' | 'jsonl'
 /** 导出范围：选中的库存账号，或列表筛选条件。 */
 export type InventoryExportScope =
   | { ids: number[] }
-  | { filter: { status?: string; group?: string; origin?: string; q?: string } }
+  | { filter: InventoryFilter }
 
 export interface MoveToInventoryRequest {
   /** 只处理这些账号（其中已禁用的）；不传处理全部已禁用账号。 */

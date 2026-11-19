@@ -165,8 +165,75 @@ pub struct InventoryListFilter {
     pub query: Option<String>,
     pub group: Option<GroupFilter>,
     pub origin: Option<OriginFilter>,
+    /// Subscription titles to match, `""` for rows without one; an empty list matches nothing.
+    pub subscription_titles: Option<Vec<String>>,
+    /// `remaining`, `exhausted` or `unchecked` (no quota snapshot yet).
+    pub quota: Option<String>,
+    /// `with` or `without` a proxy (a resource or a direct URL).
+    pub proxy: Option<String>,
+    pub proxy_resource_id: Option<u64>,
+    pub auth_kind: Option<String>,
+    pub sort: InventorySort,
+    pub ascending: bool,
     pub limit: i64,
     pub offset: i64,
+}
+
+/// List order. Every order ends with `id DESC`, so pages stay stable; empty values sort last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InventorySort {
+    /// Newest rows first.
+    #[default]
+    Newest,
+    /// Quota left at the last check.
+    Remaining,
+    /// Last quota check.
+    Checked,
+    /// When the row entered the inventory.
+    Created,
+    /// When the stored access token expires.
+    Expires,
+}
+
+impl InventorySort {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("remaining") => Self::Remaining,
+            Some("checked") => Self::Checked,
+            Some("created") => Self::Created,
+            Some("expires") => Self::Expires,
+            _ => Self::Newest,
+        }
+    }
+
+    fn order_by(self, ascending: bool) -> String {
+        let expression = match self {
+            Self::Newest => return "id DESC".to_string(),
+            Self::Remaining => REMAINING_SQL,
+            Self::Checked => "last_check_at",
+            Self::Created => "created_at",
+            // RFC 3339 text sorts in time order and cannot fail to cast.
+            Self::Expires => "NULLIF(data->>'expiresAt', '')",
+        };
+        let direction = if ascending { "ASC" } else { "DESC" };
+        format!("{expression} {direction} NULLS LAST, id DESC")
+    }
+}
+
+/// Quota left at the last check; NULL when the row has no numeric snapshot.
+const REMAINING_SQL: &str = "(CASE WHEN jsonb_typeof(account_info->'remaining') = 'number' \
+     THEN (account_info->>'remaining')::float8 END)";
+
+/// Quota totals of the filtered rows that hold an account, per subscription title.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InventoryTitleSummary {
+    /// `""` for rows without a subscription title.
+    pub title: String,
+    pub accounts: u64,
+    pub unchecked: u64,
+    pub exhausted: u64,
+    pub remaining: f64,
+    pub usage_limit: f64,
 }
 
 /// Row counts of one group; `name` is `None` for rows without a group.
@@ -251,7 +318,92 @@ const LIST_WHERE_SQL: &str = "deleted_at IS NULL \
      AND ($6::text IS NULL OR (origin_credential_id IS NOT NULL \
           AND COALESCE(origin_reason, '') = CASE WHEN $6 = '__none__' THEN '' ELSE $6 END)) \
      AND (NOT $7 OR origin_credential_id IS NOT NULL) \
-     AND (NOT $8 OR origin_credential_id IS NULL)";
+     AND (NOT $8 OR origin_credential_id IS NULL) \
+     AND ($9::text[] IS NULL OR COALESCE(account_info->>'subscriptionTitle', '') = ANY($9)) \
+     AND ($10::text IS NULL \
+          OR ($10 = 'unchecked' AND account_info IS NULL) \
+          OR ($10 = 'remaining' AND (CASE WHEN jsonb_typeof(account_info->'remaining') = 'number' \
+              THEN (account_info->>'remaining')::float8 END) > 0) \
+          OR ($10 = 'exhausted' AND (CASE WHEN jsonb_typeof(account_info->'remaining') = 'number' \
+              THEN (account_info->>'remaining')::float8 END) <= 0)) \
+     AND ($11::text IS NULL \
+          OR ($11 = 'with' AND (data ? 'proxyUrl' OR data ? 'proxyResourceId')) \
+          OR ($11 = 'without' AND data IS NOT NULL \
+              AND NOT (data ? 'proxyUrl' OR data ? 'proxyResourceId'))) \
+     AND ($12::bigint IS NULL OR data->'proxyResourceId' = to_jsonb($12::bigint)) \
+     AND ($13::text IS NULL OR auth_kind = $13)";
+
+/// How many values `LIST_WHERE_SQL` binds; the next placeholder is `$14`.
+const LIST_FILTER_BINDS: usize = 13;
+
+/// Rows that still hold an account: what select-all, the quota summary and the batch
+/// actions work on.
+const HOLDS_ACCOUNT_SQL: &str = "status IN ('stored', 'invalid')";
+
+type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
+
+/// The values bound to `LIST_WHERE_SQL`, shared by every query over the filtered rows so the
+/// list, its counts, the export, select-all and the summary always agree.
+struct ListBinds {
+    status: Option<String>,
+    pattern: Option<String>,
+    id_query: Option<i64>,
+    group: Option<String>,
+    ungrouped: bool,
+    origin_reason: Option<String>,
+    from_pool: bool,
+    imported: bool,
+    subscription_titles: Option<Vec<String>>,
+    quota: Option<String>,
+    proxy: Option<String>,
+    proxy_resource_id: Option<i64>,
+    auth_kind: Option<String>,
+}
+
+impl ListBinds {
+    fn new(filter: &InventoryListFilter) -> Self {
+        let (group, ungrouped) = GroupFilter::binds(filter.group.as_ref());
+        let (origin_reason, from_pool, imported) = OriginFilter::binds(filter.origin.as_ref());
+        Self {
+            status: filter.status.clone(),
+            pattern: search_pattern(filter.query.as_deref()),
+            id_query: search_id(filter.query.as_deref()),
+            group: group.map(str::to_string),
+            ungrouped,
+            origin_reason: origin_reason.map(str::to_string),
+            from_pool,
+            imported,
+            subscription_titles: filter.subscription_titles.clone(),
+            quota: filter.quota.clone(),
+            proxy: filter.proxy.clone(),
+            proxy_resource_id: filter.proxy_resource_id.map(|id| id as i64),
+            auth_kind: filter.auth_kind.clone(),
+        }
+    }
+
+    /// The same filter without the status, for the status counts.
+    fn any_status(mut self) -> Self {
+        self.status = None;
+        self
+    }
+
+    fn bind<'q>(&'q self, query: PgQuery<'q>) -> PgQuery<'q> {
+        query
+            .bind(self.status.as_deref())
+            .bind(self.pattern.as_deref())
+            .bind(self.id_query)
+            .bind(self.group.as_deref())
+            .bind(self.ungrouped)
+            .bind(self.origin_reason.as_deref())
+            .bind(self.from_pool)
+            .bind(self.imported)
+            .bind(self.subscription_titles.as_deref())
+            .bind(self.quota.as_deref())
+            .bind(self.proxy.as_deref())
+            .bind(self.proxy_resource_id)
+            .bind(self.auth_kind.as_deref())
+    }
+}
 
 fn search_pattern(query: Option<&str>) -> Option<String> {
     query.map(str::trim).filter(|q| !q.is_empty()).map(|q| {
@@ -352,39 +504,26 @@ impl InventoryStore {
         &self,
         filter: &InventoryListFilter,
     ) -> anyhow::Result<(Vec<InventoryRow>, u64)> {
-        let pattern = search_pattern(filter.query.as_deref());
-        let id_query = search_id(filter.query.as_deref());
-        let (group, ungrouped) = GroupFilter::binds(filter.group.as_ref());
-        let (origin_reason, from_pool, imported) = OriginFilter::binds(filter.origin.as_ref());
-        let total: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*) FROM credential_inventory WHERE {LIST_WHERE_SQL}"
-        ))
-        .bind(filter.status.as_deref())
-        .bind(pattern.as_deref())
-        .bind(id_query)
-        .bind(group)
-        .bind(ungrouped)
-        .bind(origin_reason)
-        .bind(from_pool)
-        .bind(imported)
-        .fetch_one(&self.pool)
-        .await?;
-        let rows = sqlx::query(&format!(
+        let binds = ListBinds::new(filter);
+        let count_sql = format!("SELECT count(*) FROM credential_inventory WHERE {LIST_WHERE_SQL}");
+        let total: i64 = binds
+            .bind(sqlx::query(&count_sql))
+            .fetch_one(&self.pool)
+            .await?
+            .try_get(0)?;
+        let list_sql = format!(
             "SELECT {ROW_COLUMNS} FROM credential_inventory WHERE {LIST_WHERE_SQL} \
-             ORDER BY id DESC LIMIT $9 OFFSET $10"
-        ))
-        .bind(filter.status.as_deref())
-        .bind(pattern.as_deref())
-        .bind(id_query)
-        .bind(group)
-        .bind(ungrouped)
-        .bind(origin_reason)
-        .bind(from_pool)
-        .bind(imported)
-        .bind(filter.limit)
-        .bind(filter.offset)
-        .fetch_all(&self.pool)
-        .await?;
+             ORDER BY {} LIMIT ${} OFFSET ${}",
+            filter.sort.order_by(filter.ascending),
+            LIST_FILTER_BINDS + 1,
+            LIST_FILTER_BINDS + 2,
+        );
+        let rows = binds
+            .bind(sqlx::query(&list_sql))
+            .bind(filter.limit)
+            .bind(filter.offset)
+            .fetch_all(&self.pool)
+            .await?;
         Ok((
             rows.into_iter()
                 .map(row_from_pg)
@@ -393,18 +532,17 @@ impl InventoryStore {
         ))
     }
 
-    /// Status counts, within one group when `group` is set.
-    pub async fn counts(&self, group: Option<&GroupFilter>) -> anyhow::Result<InventoryCounts> {
-        let (group, ungrouped) = GroupFilter::binds(group);
-        let rows = sqlx::query(
-            "SELECT status, count(*) AS n FROM credential_inventory WHERE deleted_at IS NULL \
-               AND ($1::text IS NULL OR group_name = $1) AND (NOT $2 OR group_name IS NULL) \
-             GROUP BY status",
-        )
-        .bind(group)
-        .bind(ungrouped)
-        .fetch_all(&self.pool)
-        .await?;
+    /// Status counts of the filtered rows, whatever status the filter selects.
+    pub async fn filtered_counts(
+        &self,
+        filter: &InventoryListFilter,
+    ) -> anyhow::Result<InventoryCounts> {
+        let binds = ListBinds::new(filter).any_status();
+        let sql = format!(
+            "SELECT status, count(*) AS n FROM credential_inventory WHERE {LIST_WHERE_SQL} \
+             GROUP BY status"
+        );
+        let rows = binds.bind(sqlx::query(&sql)).fetch_all(&self.pool).await?;
         let mut counts = InventoryCounts::default();
         for row in rows {
             let status: String = row.try_get("status")?;
@@ -414,7 +552,90 @@ impl InventoryStore {
         Ok(counts)
     }
 
-    /// Every group with its status counts, named groups by name, then the rows without a group.
+    /// Ids of the filtered rows that hold an account, in list order, at most `cap` of them,
+    /// with how many there are.
+    pub async fn filtered_ids(
+        &self,
+        filter: &InventoryListFilter,
+        cap: usize,
+    ) -> anyhow::Result<(Vec<u64>, u64)> {
+        let binds = ListBinds::new(filter);
+        let count_sql = format!(
+            "SELECT count(*) FROM credential_inventory WHERE {LIST_WHERE_SQL} AND {HOLDS_ACCOUNT_SQL}"
+        );
+        let total: i64 = binds
+            .bind(sqlx::query(&count_sql))
+            .fetch_one(&self.pool)
+            .await?
+            .try_get(0)?;
+        let ids_sql = format!(
+            "SELECT id FROM credential_inventory WHERE {LIST_WHERE_SQL} AND {HOLDS_ACCOUNT_SQL} \
+             ORDER BY {} LIMIT ${}",
+            filter.sort.order_by(filter.ascending),
+            LIST_FILTER_BINDS + 1,
+        );
+        let rows = binds
+            .bind(sqlx::query(&ids_sql))
+            .bind(cap as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        let ids = rows
+            .into_iter()
+            .map(|row| row.try_get::<i64, _>(0).map(|id| id as u64))
+            .collect::<Result<_, _>>()?;
+        Ok((ids, total.max(0) as u64))
+    }
+
+    /// Quota totals of the filtered rows that hold an account, per subscription title.
+    pub async fn filtered_summary(
+        &self,
+        filter: &InventoryListFilter,
+    ) -> anyhow::Result<Vec<InventoryTitleSummary>> {
+        let binds = ListBinds::new(filter);
+        let sql = format!(
+            "SELECT COALESCE(account_info->>'subscriptionTitle', '') AS title, count(*) AS accounts, \
+               count(*) FILTER (WHERE account_info IS NULL) AS unchecked, \
+               count(*) FILTER (WHERE {REMAINING_SQL} <= 0) AS exhausted, \
+               COALESCE(sum({REMAINING_SQL}) FILTER (WHERE {REMAINING_SQL} > 0), 0)::float8 AS remaining, \
+               COALESCE(sum(CASE WHEN jsonb_typeof(account_info->'usageLimit') = 'number' \
+                 THEN (account_info->>'usageLimit')::float8 END), 0)::float8 AS usage_limit \
+             FROM credential_inventory WHERE {LIST_WHERE_SQL} AND {HOLDS_ACCOUNT_SQL} \
+             GROUP BY 1 ORDER BY 2 DESC, 1"
+        );
+        let rows = binds.bind(sqlx::query(&sql)).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(InventoryTitleSummary {
+                    title: row.try_get("title")?,
+                    accounts: row.try_get::<i64, _>("accounts")?.max(0) as u64,
+                    unchecked: row.try_get::<i64, _>("unchecked")?.max(0) as u64,
+                    exhausted: row.try_get::<i64, _>("exhausted")?.max(0) as u64,
+                    remaining: row.try_get("remaining")?,
+                    usage_limit: row.try_get("usage_limit")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every auth kind in the inventory, for the filter options.
+    pub async fn auth_kinds(&self) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT auth_kind FROM credential_inventory WHERE deleted_at IS NULL ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Every subscription title in the inventory, `""` for rows without one.
+    pub async fn subscription_titles(&self) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT COALESCE(account_info->>'subscriptionTitle', '') \
+             FROM credential_inventory WHERE deleted_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn group_counts(&self) -> anyhow::Result<Vec<InventoryGroupCounts>> {
         let rows = sqlx::query(
             "SELECT group_name, status, count(*) AS n FROM credential_inventory \
@@ -486,23 +707,11 @@ impl InventoryStore {
             .await?;
             return rows.into_iter().map(row_from_pg).collect();
         }
-        let pattern = search_pattern(filter.query.as_deref());
-        let id_query = search_id(filter.query.as_deref());
-        let (group, ungrouped) = GroupFilter::binds(filter.group.as_ref());
-        let (origin_reason, from_pool, imported) = OriginFilter::binds(filter.origin.as_ref());
-        let rows = sqlx::query(&format!(
+        let binds = ListBinds::new(filter);
+        let sql = format!(
             "SELECT {ROW_COLUMNS} FROM credential_inventory WHERE {LIST_WHERE_SQL} ORDER BY id ASC"
-        ))
-        .bind(filter.status.as_deref())
-        .bind(pattern.as_deref())
-        .bind(id_query)
-        .bind(group)
-        .bind(ungrouped)
-        .bind(origin_reason)
-        .bind(from_pool)
-        .bind(imported)
-        .fetch_all(&self.pool)
-        .await?;
+        );
+        let rows = binds.bind(sqlx::query(&sql)).fetch_all(&self.pool).await?;
         rows.into_iter().map(row_from_pg).collect()
     }
 
@@ -677,48 +886,49 @@ impl InventoryStore {
         }
     }
 
-    /// Stores a renewed credential. Only applies while the row is still `stored` (or `invalid` for a
-    /// manual recheck), so a renewal racing with a push cannot overwrite it.
-    pub async fn save_refreshed(
-        &self,
-        id: u64,
-        data: &serde_json::Value,
-        refresh_token_hash: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        let result = sqlx::query(
-            "UPDATE credential_inventory SET data = $2, refresh_token_hash = COALESCE($3, refresh_token_hash), \
-               status = 'stored', last_refresh_at = now(), last_refresh_error = NULL, \
-               refresh_failure_count = 0, next_renew_at = NULL, updated_at = now() \
-             WHERE id = $1 AND deleted_at IS NULL AND status IN ('stored', 'invalid')",
-        )
+    /// Refreshes one row under the lock the renewal takes (`FOR UPDATE SKIP LOCKED`), so two
+    /// refreshes never spend the same refresh token and an edit, being an atomic patch, waits
+    /// for the new token instead of writing back an old copy. The outcome is written in the
+    /// same transaction. `Busy` when the renewal or another refresh holds the row.
+    pub async fn refresh_locked<F, Fut>(&self, id: u64, refresh: F) -> anyhow::Result<LockedRefresh>
+    where
+        F: FnOnce(InventoryRow) -> Fut,
+        Fut: std::future::Future<Output = RenewOutcome>,
+    {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ROW_COLUMNS} FROM credential_inventory \
+             WHERE id = $1 AND {REFRESHABLE_SQL} FOR UPDATE SKIP LOCKED"
+        ))
         .bind(id as i64)
-        .bind(data)
-        .bind(refresh_token_hash)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    pub async fn record_refresh_failure(
-        &self,
-        id: u64,
-        error: &str,
-        invalid: bool,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            &format!(
-                "UPDATE credential_inventory SET last_refresh_error = $2, \
-                   refresh_failure_count = refresh_failure_count + 1, next_renew_at = {RENEW_BACKOFF_SQL}, \
-                   status = CASE WHEN $3 THEN 'invalid' ELSE status END, updated_at = now() \
-                 WHERE id = $1 AND deleted_at IS NULL AND status IN ('stored', 'invalid')"
-            ),
-        )
-        .bind(id as i64)
-        .bind(error)
-        .bind(invalid)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        let Some(row) = row else {
+            tx.rollback().await?;
+            let refreshable: bool = sqlx::query_scalar(&format!(
+                "SELECT EXISTS (SELECT 1 FROM credential_inventory WHERE id = $1 AND {REFRESHABLE_SQL})"
+            ))
+            .bind(id as i64)
+            .fetch_one(&self.pool)
+            .await?;
+            return Ok(if refreshable {
+                LockedRefresh::Busy
+            } else {
+                LockedRefresh::Missing
+            });
+        };
+        let outcome = refresh(row_from_pg(row)?).await;
+        if matches!(outcome, RenewOutcome::Deferred) {
+            tx.rollback().await?;
+            return Ok(LockedRefresh::Deferred);
+        }
+        write_refresh_outcome(&mut tx, id, &outcome).await?;
+        tx.commit().await?;
+        Ok(match outcome {
+            RenewOutcome::Refreshed { data, .. } => LockedRefresh::Refreshed(data),
+            RenewOutcome::Failed { error, invalid } => LockedRefresh::Failed { error, invalid },
+            RenewOutcome::Deferred => LockedRefresh::Deferred,
+        })
     }
 
     pub async fn save_check(
@@ -742,19 +952,27 @@ impl InventoryStore {
         Ok(())
     }
 
-    pub async fn update_settings(
+    /// Edits a stored row in place: drops `remove` keys from its data, merges `patch` over it,
+    /// and sets the note when `note` is given (`Some(None)` clears it). One statement on the
+    /// current value, so a refresh holding the row is waited for and its new token kept.
+    pub async fn patch_data(
         &self,
         id: u64,
-        data: &serde_json::Value,
-        note: Option<&str>,
+        remove: &[&str],
+        patch: &serde_json::Value,
+        note: Option<Option<&str>>,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query(
-            "UPDATE credential_inventory SET data = $2, note = $3, updated_at = now() \
-             WHERE id = $1 AND deleted_at IS NULL AND status IN ('stored', 'invalid')",
-        )
+        let remove: Vec<String> = remove.iter().map(|key| key.to_string()).collect();
+        let result = sqlx::query(&format!(
+            "UPDATE credential_inventory SET data = (data - $2::text[]) || $3::jsonb, \
+               note = CASE WHEN $4 THEN $5 ELSE note END, updated_at = now() \
+             WHERE id = $1 AND {REFRESHABLE_SQL}"
+        ))
         .bind(id as i64)
-        .bind(data)
-        .bind(note)
+        .bind(&remove)
+        .bind(patch)
+        .bind(note.is_some())
+        .bind(note.flatten())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -866,50 +1084,70 @@ impl InventoryStore {
             let row = row_from_pg(row)?;
             last_id = row.id as i64;
             let id = row.id;
-            match renew(row).await {
-                RenewOutcome::Refreshed {
-                    data,
-                    refresh_token_hash,
-                } => {
-                    sqlx::query(
-                        "UPDATE credential_inventory SET data = $2, \
-                           refresh_token_hash = COALESCE($3, refresh_token_hash), last_refresh_at = now(), \
-                           last_refresh_error = NULL, refresh_failure_count = 0, next_renew_at = NULL, \
-                           updated_at = now() \
-                         WHERE id = $1",
-                    )
-                    .bind(id as i64)
-                    .bind(&data)
-                    .bind(refresh_token_hash.as_deref())
-                    .execute(&mut *tx)
-                    .await?;
-                    pass.renewed += 1;
-                }
-                RenewOutcome::Failed { error, invalid } => {
-                    sqlx::query(&format!(
-                        "UPDATE credential_inventory SET last_refresh_error = $2, \
-                           refresh_failure_count = refresh_failure_count + 1, \
-                           next_renew_at = {RENEW_BACKOFF_SQL}, \
-                           status = CASE WHEN $3 THEN 'invalid' ELSE status END, updated_at = now() \
-                         WHERE id = $1"
-                    ))
-                    .bind(id as i64)
-                    .bind(&error)
-                    .bind(invalid)
-                    .execute(&mut *tx)
-                    .await?;
-                    pass.failed += 1;
-                }
+            let outcome = renew(row).await;
+            match &outcome {
+                RenewOutcome::Refreshed { .. } => pass.renewed += 1,
+                RenewOutcome::Failed { .. } => pass.failed += 1,
                 RenewOutcome::Deferred => {
                     tx.rollback().await?;
                     pass.deferred = true;
                     break;
                 }
             }
+            write_refresh_outcome(&mut tx, id, &outcome).await?;
             tx.commit().await?;
         }
         Ok(pass)
     }
+}
+
+/// A row a refresh or an edit may touch: live, not pushed out, with its credential.
+const REFRESHABLE_SQL: &str =
+    "deleted_at IS NULL AND status IN ('stored', 'invalid') AND data IS NOT NULL";
+
+/// Writes a refresh outcome in the transaction holding the row lock. A refreshed row is
+/// `stored` again (a manual refresh recovers an `invalid` one); a failure backs off and marks
+/// a rejected refresh token `invalid`.
+async fn write_refresh_outcome(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: u64,
+    outcome: &RenewOutcome,
+) -> anyhow::Result<()> {
+    match outcome {
+        RenewOutcome::Refreshed {
+            data,
+            refresh_token_hash,
+        } => {
+            sqlx::query(
+                "UPDATE credential_inventory SET data = $2, \
+                   refresh_token_hash = COALESCE($3, refresh_token_hash), status = 'stored', \
+                   last_refresh_at = now(), last_refresh_error = NULL, refresh_failure_count = 0, \
+                   next_renew_at = NULL, updated_at = now() \
+                 WHERE id = $1",
+            )
+            .bind(id as i64)
+            .bind(data)
+            .bind(refresh_token_hash.as_deref())
+            .execute(&mut **tx)
+            .await?;
+        }
+        RenewOutcome::Failed { error, invalid } => {
+            sqlx::query(&format!(
+                "UPDATE credential_inventory SET last_refresh_error = $2, \
+                   refresh_failure_count = refresh_failure_count + 1, \
+                   next_renew_at = {RENEW_BACKOFF_SQL}, \
+                   status = CASE WHEN $3 THEN 'invalid' ELSE status END, updated_at = now() \
+                 WHERE id = $1"
+            ))
+            .bind(id as i64)
+            .bind(error)
+            .bind(*invalid)
+            .execute(&mut **tx)
+            .await?;
+        }
+        RenewOutcome::Deferred => {}
+    }
+    Ok(())
 }
 
 /// Backoff after a failed renewal, from the failure count before this failure: 5 minutes,
@@ -937,6 +1175,23 @@ pub enum RenewOutcome {
     },
     /// Not attempted: the refresh limiter shared with the pool is busy. Not a failure.
     Deferred,
+}
+
+/// What a manual refresh of one row did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockedRefresh {
+    /// The new token is stored and the row is `stored`; carries the stored data.
+    Refreshed(serde_json::Value),
+    Failed {
+        error: String,
+        invalid: bool,
+    },
+    /// The refresh limiter shared with the pool is busy; nothing changed.
+    Deferred,
+    /// The renewal or another refresh is refreshing this row right now.
+    Busy,
+    /// Not in the inventory, or pushed out.
+    Missing,
 }
 
 #[cfg(test)]
@@ -1055,7 +1310,10 @@ mod tests {
             vec![(Some("乙".to_string()), 1), (Some("甲".to_string()), 2)]
         );
         let counts = store
-            .counts(Some(&GroupFilter::Named("甲".into())))
+            .filtered_counts(&InventoryListFilter {
+                group: Some(GroupFilter::Named("甲".into())),
+                ..InventoryListFilter::default()
+            })
             .await
             .unwrap();
         assert_eq!((counts.total, counts.stored), (2, 2));
@@ -1304,6 +1562,317 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pass.failed, 1);
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_edit_waits_for_a_refresh_and_keeps_its_new_token() {
+        let Some((postgres, store)) = test_store().await else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let data = json!({
+            "refreshToken": "old",
+            "authRegion": "us-east-1",
+            "proxyUrl": "http://proxy.invalid:1",
+            "proxyPassword": "secret",
+        });
+        let id = store
+            .insert(new_row("h-edit", &data, None))
+            .await
+            .unwrap()
+            .id;
+
+        // A refresh holds the row while the upstream rotates the refresh token.
+        let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let refreshing = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .refresh_locked(id, |row| async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        let mut data = row.data.unwrap();
+                        data["refreshToken"] = json!("new");
+                        RenewOutcome::Refreshed {
+                            data,
+                            refresh_token_hash: Some("h-new".to_string()),
+                        }
+                    })
+                    .await
+            })
+        };
+        started.await.unwrap();
+        // Another refresh finds the row busy and does not run.
+        let busy = store
+            .refresh_locked(id, |_| async { RenewOutcome::Deferred })
+            .await
+            .unwrap();
+        assert_eq!(busy, LockedRefresh::Busy);
+        // An edit sent meanwhile waits for the lock, then applies on top of the new token.
+        let edit = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .patch_data(
+                        id,
+                        &["proxyUrl", "proxyPassword"],
+                        &json!({"authRegion": "eu-west-1"}),
+                        Some(Some("备注")),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!edit.is_finished(), "the edit waits for the refresh");
+        release.send(()).unwrap();
+        assert!(matches!(
+            refreshing.await.unwrap().unwrap(),
+            LockedRefresh::Refreshed(_)
+        ));
+        assert!(edit.await.unwrap().unwrap());
+
+        let row = store.get(id).await.unwrap().unwrap();
+        let data = row.data.clone().unwrap();
+        assert_eq!(
+            data["refreshToken"], "new",
+            "the rotated token survives the edit"
+        );
+        assert_eq!(data["authRegion"], "eu-west-1");
+        assert!(data.get("proxyUrl").is_none() && data.get("proxyPassword").is_none());
+        assert_eq!(row.refresh_token_hash.as_deref(), Some("h-new"));
+        assert_eq!(row.note.as_deref(), Some("备注"));
+
+        // The note can be cleared; a missing note leaves it alone.
+        assert!(
+            store
+                .patch_data(id, &[], &json!({}), Some(None))
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get(id).await.unwrap().unwrap().note, None);
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_manual_refresh_marks_recovers_and_yields() {
+        let Some((postgres, store)) = test_store().await else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let data = json!({"refreshToken": "r"});
+        let id = store
+            .insert(new_row("h-manual", &data, None))
+            .await
+            .unwrap()
+            .id;
+
+        let rejected = store
+            .refresh_locked(id, |_| async {
+                RenewOutcome::Failed {
+                    error: "invalid_grant".to_string(),
+                    invalid: true,
+                }
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rejected,
+            LockedRefresh::Failed { invalid: true, .. }
+        ));
+        let row = store.get(id).await.unwrap().unwrap();
+        assert_eq!(row.status, STATUS_INVALID);
+        assert_eq!(row.refresh_failure_count, 1);
+        assert!(row.next_renew_at.is_some());
+
+        // The shared limiter said no: nothing changes.
+        let deferred = store
+            .refresh_locked(id, |_| async { RenewOutcome::Deferred })
+            .await
+            .unwrap();
+        assert_eq!(deferred, LockedRefresh::Deferred);
+        assert_eq!(
+            store.get(id).await.unwrap().unwrap().refresh_failure_count,
+            1
+        );
+
+        // A successful manual refresh brings an invalid row back.
+        let refreshed = store
+            .refresh_locked(id, |row| async move {
+                RenewOutcome::Refreshed {
+                    data: row.data.unwrap(),
+                    refresh_token_hash: None,
+                }
+            })
+            .await
+            .unwrap();
+        assert!(matches!(refreshed, LockedRefresh::Refreshed(_)));
+        let row = store.get(id).await.unwrap().unwrap();
+        assert_eq!(row.status, STATUS_STORED);
+        assert_eq!(row.refresh_failure_count, 0);
+        assert!(row.next_renew_at.is_none() && row.last_refresh_at.is_some());
+        assert_eq!(row.refresh_token_hash.as_deref(), Some("h-manual"));
+
+        let missing = store
+            .refresh_locked(id + 1000, |_| async { RenewOutcome::Deferred })
+            .await
+            .unwrap();
+        assert_eq!(missing, LockedRefresh::Missing);
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[test]
+    fn the_filter_binds_every_placeholder() {
+        let highest = LIST_WHERE_SQL
+            .split('$')
+            .skip(1)
+            .filter_map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .max();
+        assert_eq!(highest, Some(LIST_FILTER_BINDS));
+    }
+
+    #[test]
+    fn sorts_are_whitelisted_and_stable() {
+        assert_eq!(
+            InventorySort::parse(Some("id; drop table")),
+            InventorySort::Newest
+        );
+        assert_eq!(InventorySort::Newest.order_by(true), "id DESC");
+        for sort in ["remaining", "checked", "created", "expires"] {
+            let order = InventorySort::parse(Some(sort)).order_by(true);
+            assert!(order.ends_with("ASC NULLS LAST, id DESC"), "{order}");
+        }
+    }
+
+    #[tokio::test]
+    async fn filters_sort_select_all_and_summary_agree() {
+        let Some((postgres, store)) = test_store().await else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let with_resource = json!({"refreshToken": "a", "proxyResourceId": 3});
+        let with_url = json!({"refreshToken": "b", "proxyUrl": "http://proxy.invalid:1"});
+        let bare = json!({"refreshToken": "c"});
+        let a = store
+            .insert(new_row("h-fa", &with_resource, None))
+            .await
+            .unwrap()
+            .id;
+        let b = store
+            .insert(NewInventoryRow {
+                auth_kind: "idc",
+                ..new_row("h-fb", &with_url, None)
+            })
+            .await
+            .unwrap()
+            .id;
+        let c = store.insert(new_row("h-fc", &bare, None)).await.unwrap().id;
+        let pro = json!({"subscriptionTitle": "KIRO PRO", "remaining": 50.0, "usageLimit": 100.0});
+        let free = json!({"subscriptionTitle": "KIRO FREE", "remaining": 0.0, "usageLimit": 50.0});
+        store.save_check(a, Some(&pro), None, None).await.unwrap();
+        store.save_check(b, Some(&free), None, None).await.unwrap();
+
+        let listed = |filter: InventoryListFilter| {
+            let store = store.clone();
+            async move {
+                let filter = InventoryListFilter {
+                    limit: 100,
+                    ..filter
+                };
+                let (rows, total) = store.list(&filter).await.unwrap();
+                assert_eq!(total as usize, rows.len());
+                rows.into_iter().map(|row| row.id).collect::<Vec<_>>()
+            }
+        };
+        let quota = |value: &str| InventoryListFilter {
+            quota: Some(value.to_string()),
+            ..InventoryListFilter::default()
+        };
+        assert_eq!(listed(quota("remaining")).await, vec![a]);
+        assert_eq!(listed(quota("exhausted")).await, vec![b]);
+        assert_eq!(listed(quota("unchecked")).await, vec![c]);
+        let proxy = |value: &str| InventoryListFilter {
+            proxy: Some(value.to_string()),
+            ..InventoryListFilter::default()
+        };
+        assert_eq!(listed(proxy("with")).await, vec![b, a]);
+        assert_eq!(listed(proxy("without")).await, vec![c]);
+        let resource = InventoryListFilter {
+            proxy_resource_id: Some(3),
+            ..InventoryListFilter::default()
+        };
+        assert_eq!(listed(resource).await, vec![a]);
+        let titles = |titles: &[&str]| InventoryListFilter {
+            subscription_titles: Some(titles.iter().map(|t| t.to_string()).collect()),
+            ..InventoryListFilter::default()
+        };
+        assert_eq!(listed(titles(&["KIRO PRO"])).await, vec![a]);
+        assert_eq!(listed(titles(&[""])).await, vec![c]);
+        assert!(
+            listed(titles(&[])).await.is_empty(),
+            "no matching title matches nothing"
+        );
+        let auth = InventoryListFilter {
+            auth_kind: Some("idc".to_string()),
+            ..InventoryListFilter::default()
+        };
+        assert_eq!(listed(auth).await, vec![b]);
+
+        // Empty values sort last in both directions.
+        let by_remaining = |ascending| InventoryListFilter {
+            sort: InventorySort::Remaining,
+            ascending,
+            ..InventoryListFilter::default()
+        };
+        assert_eq!(listed(by_remaining(false)).await, vec![a, b, c]);
+        assert_eq!(listed(by_remaining(true)).await, vec![b, a, c]);
+
+        // Select-all follows the list order, capped, with the full count.
+        let (ids, total) = store.filtered_ids(&by_remaining(false), 2).await.unwrap();
+        assert_eq!((ids, total), (vec![a, b], 3));
+
+        let summary = store
+            .filtered_summary(&InventoryListFilter::default())
+            .await
+            .unwrap();
+        let of = |title: &str| {
+            summary
+                .iter()
+                .find(|row| row.title == title)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!((of("").accounts, of("").unchecked), (1, 1));
+        assert_eq!(
+            (of("KIRO FREE").exhausted, of("KIRO FREE").usage_limit),
+            (1, 50.0)
+        );
+        assert_eq!(
+            (of("KIRO PRO").remaining, of("KIRO PRO").usage_limit),
+            (50.0, 100.0)
+        );
+
+        // The status tabs count within the other filters, whatever status is selected.
+        let counts = store
+            .filtered_counts(&InventoryListFilter {
+                status: Some(STATUS_PUSHED.to_string()),
+                proxy: Some("with".to_string()),
+                ..InventoryListFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!((counts.total, counts.stored), (2, 2));
+        let mut titles = store.subscription_titles().await.unwrap();
+        titles.sort();
+        assert_eq!(titles, vec!["", "KIRO FREE", "KIRO PRO"]);
+        assert_eq!(store.auth_kinds().await.unwrap(), vec!["idc", "social"]);
         postgres.drop_test_schema().await.unwrap();
     }
 
