@@ -370,6 +370,108 @@ async fn external_pool_local_mutations_keep_all_pools_when_own_event_is_observed
     postgres.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_local_mutation_after_snapshot_expiry_keeps_other_pools_dispatchable() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
+    let first = postgres
+        .create_external_pool(create_pool_request("expiry-first", 0, true))
+        .await
+        .unwrap();
+    let second = postgres
+        .create_external_pool(create_pool_request("expiry-second", 5, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .load_authoritative_pool_snapshot()
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(manager.load_static_pool_snapshot().await.len(), 2);
+
+    // 低流量时两份快照都会过期（stale_until 已过）；此时编辑一个账号不能把"只含该账号"的
+    // 局部列表当成完整快照发布，否则另一个账号在新快照过期前无法被调度、也无法切号。
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("monotonic clock has at least one second of history");
+    if let Some(snapshot) = manager.authoritative_pool_snapshot.lock().as_mut() {
+        snapshot.fresh_until = expired;
+        snapshot.stale_until = expired;
+    }
+    if let Some(snapshot) = manager.static_pool_snapshot.lock().as_mut() {
+        snapshot.fresh_until = expired;
+        snapshot.stale_until = expired;
+    }
+    let edited = postgres
+        .update_external_pool(
+            first.id,
+            UpdateExternalPoolRequest {
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                ..UpdateExternalPoolRequest::default()
+            },
+        )
+        .await
+        .unwrap()
+        .expect("edited pool remains present");
+    manager.notify_external_pool_data_changed_with_local_pool("test_local_update", &edited);
+
+    let mut static_ids = manager
+        .load_static_pool_snapshot()
+        .await
+        .iter()
+        .map(|pool| pool.id)
+        .collect::<Vec<_>>();
+    static_ids.sort_unstable();
+    assert_eq!(
+        static_ids,
+        vec![first.id, second.id],
+        "an edit after snapshot expiry must not publish a static snapshot holding only the edited pool"
+    );
+    let snapshot = manager.load_authoritative_pool_snapshot().await.unwrap();
+    let mut ids = snapshot.iter().map(|pool| pool.id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![first.id, second.id],
+        "an edit after snapshot expiry must reload every pool, not publish only the edited one"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .find(|pool| pool.id == first.id)
+            .map(|pool| pool.base_url.as_str()),
+        Some("http://127.0.0.1:1"),
+        "the reloaded snapshot must carry the edit"
+    );
+    let failover = manager
+        .scan_pool_availability_from_snapshot(
+            &snapshot,
+            &HashSet::from([first.id]),
+            &config,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        failover.selected_pool.map(|pool| pool.id),
+        Some(second.id),
+        "after the edited pool fails, the request must still fail over to the other pool"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 enum TestRawHttpBody {
     DeclaredOnly(usize),
     Chunked(Vec<u8>),
@@ -5267,6 +5369,24 @@ async fn external_pool_local_mutation_seed_survives_pg_lock_for_scheduler_degrad
         return;
     };
     let fake = AuxiliaryFallbackFakeServer::start().await;
+    // 本地变更只能合并进一份未过期的完整快照；没有完整快照时会作废快照改读 PgSQL 全量，
+    // 否则"只含本次变更账号"的列表会被当成完整列表，把其它账号挡在调度之外。
+    // 所以先在 PgSQL 可用时加载一份含已有账号的完整快照，再验证锁表期间的合并结果。
+    let mut existing_request = create_pool_request("local-mutation-existing", 2, true);
+    existing_request.supported_models = vec!["claude-opus-4-1".to_string()];
+    let existing = postgres
+        .create_external_pool(existing_request)
+        .await
+        .unwrap();
+    assert_eq!(manager.load_static_pool_snapshot().await.len(), 1);
+    assert_eq!(
+        manager
+            .load_authoritative_pool_snapshot()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     let mut request = create_pool_request("local-mutation-seed", 1, true);
     request.base_url = fake.base_url.clone();
     request.supported_models = vec!["claude-sonnet-4-6".to_string()];
@@ -5281,6 +5401,37 @@ async fn external_pool_local_mutation_seed_survives_pg_lock_for_scheduler_degrad
 
     let blocker = lock_external_pool_table(&postgres).await;
     manager.notify_external_pool_data_changed_with_local_pool("test_local_seed", &pool);
+    let mut static_ids = timeout(
+        Duration::from_millis(250),
+        manager.load_static_pool_snapshot(),
+    )
+    .await
+    .expect("merged static snapshot must not wait for locked PostgreSQL")
+    .iter()
+    .map(|pool| pool.id)
+    .collect::<Vec<_>>();
+    static_ids.sort_unstable();
+    assert_eq!(
+        static_ids,
+        vec![existing.id, pool.id],
+        "local mutation must merge into the complete static snapshot"
+    );
+    let mut authoritative_ids = timeout(
+        Duration::from_millis(250),
+        manager.load_authoritative_pool_snapshot(),
+    )
+    .await
+    .expect("merged authoritative snapshot must not wait for locked PostgreSQL")
+    .unwrap()
+    .iter()
+    .map(|pool| pool.id)
+    .collect::<Vec<_>>();
+    authoritative_ids.sort_unstable();
+    assert_eq!(
+        authoritative_ids,
+        vec![existing.id, pool.id],
+        "local mutation must merge into the complete authoritative snapshot"
+    );
     let config = ExternalPoolsConfig {
         external_pools_enabled: true,
         external_pool_global_max_concurrent_requests: 4,
@@ -7744,6 +7895,71 @@ async fn external_pool_not_found_invalid_model_uses_default_cross_pool_retry_sta
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(failing.snapshot(), 1);
     assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_bare_not_found_fails_over_to_the_next_pool() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::NOT_FOUND,
+        fake_external_error_body("not found"),
+    )
+    .await;
+    let succeeding = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("bare-404-ok"),
+    )
+    .await;
+    let primary =
+        create_messages_pool(&postgres, "bare-not-found-primary", 1, &failing.base_url).await;
+    create_messages_pool(
+        &postgres,
+        "bare-not-found-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_bare_not_found_failover".to_string();
+    route.error_id = "err_bare_not_found_failover".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("bare 404 failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("bare 404 from a misconfigured pool must fail over: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+    let primary = postgres
+        .get_external_pool(primary.id, true)
+        .await
+        .unwrap()
+        .expect("primary pool remains present");
+    assert!(
+        !primary.auto_disabled,
+        "bare 404 must not auto-disable the pool"
+    );
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -11369,6 +11585,120 @@ fn external_pool_error_classifies_not_found_invalid_model_as_retryable() {
     assert_eq!(
         err.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
         Some("model_unavailable")
+    );
+}
+
+#[test]
+fn external_pool_error_classifies_bare_not_found_as_retryable_without_cooldown() {
+    let err = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(br#"{"message":"not found"}"#),
+        HeaderMap::new(),
+        &ExternalPoolsConfig::default(),
+    );
+
+    assert!(
+        err.retryable,
+        "裸 404 必须交给 retryStatusCodes 决定是否换号"
+    );
+    assert!(
+        err.cooldown.is_none(),
+        "裸 404 不能写冷却，避免请求自身问题误伤账号"
+    );
+    assert!(err.auto_disable_reason.is_none(), "裸 404 不能触发自动禁用");
+    assert_eq!(error_type_for_external_error(&err), "external_pool_error");
+    assert!(
+        !external_error_affects_pool_quality(&err),
+        "裸 404 不计入被动质量，避免请求引用不存在的资源时把账号拉进观察期"
+    );
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &ExternalPoolsConfig::default(),
+        &err
+    ));
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&ExternalPoolsConfig::default(), &err),
+        0,
+        "默认同池重试码不含 404，裸 404 只换号不在同一账号重放"
+    );
+    assert!(
+        !retry_pipeline::should_retry_cross_pool(
+            &ExternalPoolsConfig {
+                external_pool_retry_status_codes: vec![StatusCode::TOO_MANY_REQUESTS.as_u16()],
+                ..ExternalPoolsConfig::default()
+            },
+            &err
+        ),
+        "retryStatusCodes 不含 404 时裸 404 不换号"
+    );
+
+    // 404 状态但正文指明了别的原因（限流）时仍按原分支处理并计入质量，排除只针对裸 404。
+    let rate_limited = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(br#"{"error":{"message":"rate limit exceeded"}}"#),
+        HeaderMap::new(),
+        &ExternalPoolsConfig::default(),
+    );
+    assert_eq!(
+        rate_limited
+            .cooldown
+            .as_ref()
+            .map(|(_, reason)| reason.as_str()),
+        Some("rate_limit")
+    );
+    assert!(external_error_affects_pool_quality(&rate_limited));
+}
+
+#[test]
+fn external_pool_error_classifies_anthropic_not_found_model_as_model_unavailable() {
+    for body in [
+        br#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-fable-5-1"}}"#
+            .as_slice(),
+        br#"{"error":{"message":"Model: claude-opus-4-1","type":"not_found_error"},"type":"error","request_id":"req_1"}"#
+            .as_slice(),
+    ] {
+        let err = classify_external_error(
+            StatusCode::NOT_FOUND,
+            Bytes::copy_from_slice(body),
+            HeaderMap::new(),
+            &ExternalPoolsConfig::default(),
+        );
+
+        assert!(err.retryable);
+        assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+        assert!(err.auto_disable_reason.is_none());
+        assert_eq!(
+            err.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
+            Some("model_unavailable")
+        );
+        assert!(!external_error_affects_pool_quality(&err));
+        assert!(
+            retry_pipeline::should_retry_cross_pool(
+                &ExternalPoolsConfig {
+                    external_pool_retry_status_codes: vec![
+                        StatusCode::TOO_MANY_REQUESTS.as_u16()
+                    ],
+                    ..ExternalPoolsConfig::default()
+                },
+                &err
+            ),
+            "模型不可用按路由错误换号，不受 retryStatusCodes 限制"
+        );
+    }
+
+    // not_found_error 但 message 不是 `model:` 开头（例如路径不存在）仍是裸 404。
+    let path_missing = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(
+            br#"{"type":"error","error":{"type":"not_found_error","message":"Not Found"}}"#,
+        ),
+        HeaderMap::new(),
+        &ExternalPoolsConfig::default(),
+    );
+    assert!(path_missing.retryable);
+    assert!(path_missing.cooldown.is_none());
+    assert_eq!(
+        error_type_for_external_error(&path_missing),
+        "external_pool_error"
     );
 }
 
