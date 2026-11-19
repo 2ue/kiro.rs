@@ -5096,7 +5096,10 @@ impl ExternalPoolManager {
             static_pools.push(external_pool_eligibility_from_pool(pool));
         }
         Self::sort_static_pool_eligibility(&mut static_pools);
-        if upsert_pool.is_some() || had_previous_static_pools {
+        // 只有手里有一份未过期的完整旧快照时才能就地合并本次变更；旧快照已过期时直接作废，
+        // 让下一次读取从 PgSQL 读全量。否则"只含本次变更账号"的快照会被当成完整列表，
+        // 其它账号在新快照过期前全部不可调度（低流量 30 秒无请求后编辑账号即触发）。
+        if had_previous_static_pools {
             let (static_fresh_ttl, static_stale_ttl) = self.static_snapshot_ttls(generation);
             let _ = self.publish_static_pool_snapshot_arc(
                 generation,
@@ -5134,7 +5137,8 @@ impl ExternalPoolManager {
             authoritative_pools.push(pool.clone());
         }
         Self::sort_authoritative_pools(&mut authoritative_pools);
-        if upsert_pool.is_some() || had_previous_authoritative_pools {
+        // 同上：没有未过期的完整旧快照就不发布局部快照，交给下一次读取走 PgSQL 全量加载。
+        if had_previous_authoritative_pools {
             let _ = self.publish_authoritative_pool_snapshot_success_arc(
                 generation,
                 Arc::new(authoritative_pools),
@@ -13437,6 +13441,27 @@ fn external_error_message_indicates_context_window_full(lower_message: &str) -> 
         || lower_message.contains("prompt is too long")
 }
 
+/// 上游错误没有命中任何已知分支时的统一文案。404 + 该文案即"裸 404"。
+const EXTERNAL_UNEXPECTED_ERROR_MESSAGE: &str = "external upstream returned an unexpected error";
+
+/// Anthropic 官方对不存在的模型返回 404 `not_found_error`，message 形如 `model: claude-xxx`
+/// （本服务对无效模型也这样回）。正文里没有 "model not found" 之类关键词，只能按结构识别，
+/// 否则会被当成裸 404。
+fn external_error_body_indicates_anthropic_model_not_found(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(error) = value.get("error") else {
+        return false;
+    };
+    error.get("type").and_then(serde_json::Value::as_str) == Some("not_found_error")
+        && error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|message| message.trim_start().get(..6))
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("model:"))
+}
+
 fn classified_external_error(
     status: StatusCode,
     message: &'static str,
@@ -13511,6 +13536,12 @@ fn external_error_affects_pool_quality(err: &ExternalPoolError) -> bool {
     if external_error_message_indicates_model_unavailable(&lower_message)
         || (err.status == Some(StatusCode::NOT_FOUND)
             && external_error_message_indicates_invalid_model(&lower_message))
+    {
+        return false;
+    }
+    // 裸 404 多半是账号服务地址/路径配错，也可能是请求本身引用了不存在的资源；
+    // 前者靠换号消化，后者换任何账号都一样，都不能把账号拉进观察期。
+    if err.status == Some(StatusCode::NOT_FOUND) && err.message == EXTERNAL_UNEXPECTED_ERROR_MESSAGE
     {
         return false;
     }
@@ -13620,7 +13651,8 @@ fn classify_external_error(
     }
     if external_error_message_indicates_model_unavailable(&lower)
         || (status == StatusCode::NOT_FOUND
-            && external_error_message_indicates_invalid_model(&lower))
+            && (external_error_message_indicates_invalid_model(&lower)
+                || external_error_body_indicates_anthropic_model_not_found(&body)))
     {
         return classified_external_error(
             status,
@@ -13735,10 +13767,14 @@ fn classify_external_error(
         )
         .with_raw_upstream_error(Some(raw_upstream_error));
     }
+    // 正文没指明模型问题的裸 404，多半是该账号的服务地址或路径配错，换个账号就能成功。
+    // 标为可重试只是把是否换号交还给 retryStatusCodes（默认含 404，同池重试码默认不含）；
+    // 不写冷却、不自动禁用，也不计入被动质量，避免请求本身引用了不存在的资源时误伤账号。
+    let retryable = status == StatusCode::NOT_FOUND;
     classified_external_error(
         status,
-        "external upstream returned an unexpected error",
-        false,
+        EXTERNAL_UNEXPECTED_ERROR_MESSAGE,
+        retryable,
         None,
         None,
     )
