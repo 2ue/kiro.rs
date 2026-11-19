@@ -16735,13 +16735,17 @@ mod tests {
 
         for round in 0..3 {
             clean(&store).await;
+            // 截止时间先定下来：新旧记录都相对它取时间，清理也用它。之前"新"记录只比现在
+            // 晚 1 秒、清理截止取执行时的现在，负载高时中间的写入与汇总查询超过 1 秒，
+            // 新记录也会被删掉。
+            let cutoff = Utc::now();
             let mut old_record = usage_record(&format!("physical-old-round-{round}"), 800);
-            old_record.created_at = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+            old_record.created_at = (cutoff - chrono::Duration::days(2)).to_rfc3339();
             old_record.estimated_cost_usd = 0.31;
             old_record.original_cost_usd = 0.36;
 
             let mut fresh_record = usage_record(&format!("physical-fresh-round-{round}"), 900);
-            fresh_record.created_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+            fresh_record.created_at = (cutoff + chrono::Duration::hours(1)).to_rfc3339();
             fresh_record.estimated_cost_usd = 0.17;
             fresh_record.original_cost_usd = 0.19;
             usage_store
@@ -16754,7 +16758,7 @@ mod tests {
             assert!((before.total_estimated_cost_usd - 0.48).abs() < 1e-12);
 
             let result = usage_store
-                .hard_delete_cleanup_batch_preserving_summary(Utc::now(), 10)
+                .hard_delete_cleanup_batch_preserving_summary(cutoff, 10)
                 .await
                 .unwrap();
             assert_eq!(
