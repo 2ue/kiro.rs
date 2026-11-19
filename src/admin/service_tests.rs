@@ -924,6 +924,47 @@ fn runtime_config_audit_masks_proxy_url_credentials() {
 }
 
 #[test]
+fn masked_account_proxy_credentials_are_restored_from_stored_value() {
+    let stored = Some("http://alice:p%40ss@proxy.example:3128");
+    assert!(proxy_url_has_masked_credentials(
+        "http://***:***@proxy.example:3128/"
+    ));
+    assert!(proxy_url_has_masked_credentials(
+        "http://alice:***@proxy.example:3128"
+    ));
+    assert!(!proxy_url_has_masked_credentials(
+        "http://alice:new@proxy.example:3128"
+    ));
+    assert!(!proxy_url_has_masked_credentials(
+        "http://proxy.example:3128"
+    ));
+
+    assert_eq!(
+        restore_masked_proxy_credentials("http://***:***@proxy.example:3128/", stored).unwrap(),
+        "http://alice:p%40ss@proxy.example:3128/"
+    );
+    // 换了端口但凭据保持打码：沿用原凭据，新端口生效。
+    assert_eq!(
+        restore_masked_proxy_credentials("http://***:***@proxy.example:3129/", stored).unwrap(),
+        "http://alice:p%40ss@proxy.example:3129/"
+    );
+    // 只改了用户名：密码沿用。
+    assert_eq!(
+        restore_masked_proxy_credentials("http://bob:***@proxy.example:3128/", stored).unwrap(),
+        "http://bob:p%40ss@proxy.example:3128/"
+    );
+    let err =
+        restore_masked_proxy_credentials("http://***:***@proxy.example:3128/", None).unwrap_err();
+    assert!(err.to_string().contains("没有可沿用"), "{err}");
+    let err = restore_masked_proxy_credentials(
+        "http://***:***@proxy.example:3128/",
+        Some("http://proxy.example:3128"),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("没有可沿用"), "{err}");
+}
+
+#[test]
 fn runtime_config_rejects_out_of_range_usage_record_limit() {
     for (limit, ok) in [
         (0, false),
@@ -1042,6 +1083,141 @@ fn accounts_config_with_transport_proxy_copies_global_proxy_settings() {
 }
 
 /// 处理器级审计测试：真实 PG/Redis，覆盖失败留痕、认证失败、采集与导出审计、模型提升审计。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_account_keeps_real_proxy_credentials_when_form_submits_masked_url() {
+    let Some(postgres_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_POSTGRES_URL")
+    else {
+        eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+        return;
+    };
+    let Some(redis_url) = crate::storage::integration_test_url("CLAUDE_POOL_TEST_REDIS_URL") else {
+        eprintln!("跳过 Redis 集成测试：未设置 CLAUDE_POOL_TEST_REDIS_URL");
+        return;
+    };
+    let mut config = Config::default();
+    config.postgres.url = Some(postgres_url);
+    config.postgres.max_connections = 3;
+    config.redis.url = Some(redis_url);
+    config.redis.key_prefix = format!("claude_pool:test:proxy_mask:{}", uuid::Uuid::new_v4());
+    let postgres = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+    let redis = Arc::new(
+        crate::storage::redis_cache::RedisStore::connect(&config)
+            .await
+            .unwrap(),
+    );
+    let service = AdminService::new(AdminServiceDependencies {
+        runtime: crate::model::runtime::RuntimeConfigStore::new(Config::default(), None),
+        usage_recorder: Arc::new(UsageRecorder::new(10)),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+        postgres_store: postgres.clone(),
+        observability_redis_store: None,
+        request_api_key_store: Arc::new(RequestApiKeyStore::new(["sk-primary-12345678"])),
+        request_admission: Arc::new(RequestAdmissionController::new(
+            RequestAdmissionConfig::disabled(),
+        )),
+        account_manager: Arc::new(AccountManager::new(postgres.clone(), redis)),
+    });
+    let marker = uuid::Uuid::new_v4().simple().to_string();
+    let create: CreateAccountRequest = serde_json::from_value(json!({
+        "name": format!("proxy-mask-{marker}"),
+        "baseUrl": "https://example.com",
+        "apiKey": "sk-proxy-mask-12345678",
+        "proxyUrl": "http://alice:real-secret@127.0.0.1:18080",
+    }))
+    .unwrap();
+
+    let err = service
+        .create_account(CreateAccountRequest {
+            proxy_url: Some("http://***:***@127.0.0.1:18080/".into()),
+            ..create.clone()
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("打码占位"), "{err}");
+
+    let created = service.create_account(create).unwrap();
+    let masked = created.proxy_url.clone().unwrap();
+    assert_eq!(masked, "http://***:***@127.0.0.1:18080/");
+    let stored_proxy = || {
+        let postgres = postgres.clone();
+        let id = created.id;
+        block_on_admin_store(async move { postgres.get_account(id, false).await })
+            .unwrap()
+            .unwrap()
+            .proxy_url
+    };
+
+    // 表单原样提交打码地址：真实凭据保留。
+    service
+        .update_account(
+            created.id,
+            UpdateAccountRequest {
+                name: Some(format!("proxy-mask-renamed-{marker}")),
+                proxy_url: Some(Some(masked.clone())),
+                ..UpdateAccountRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stored_proxy().as_deref(),
+        Some("http://alice:real-secret@127.0.0.1:18080/")
+    );
+
+    // 只改端口：凭据沿用，端口生效。
+    service
+        .update_account(
+            created.id,
+            UpdateAccountRequest {
+                proxy_url: Some(Some("http://***:***@127.0.0.1:18081/".into())),
+                ..UpdateAccountRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stored_proxy().as_deref(),
+        Some("http://alice:real-secret@127.0.0.1:18081/")
+    );
+
+    // 整段重填：用新凭据。
+    service
+        .update_account(
+            created.id,
+            UpdateAccountRequest {
+                proxy_url: Some(Some("http://bob:new-secret@127.0.0.1:18082".into())),
+                ..UpdateAccountRequest::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stored_proxy().as_deref(),
+        Some("http://bob:new-secret@127.0.0.1:18082")
+    );
+
+    // 清空代理后再提交打码地址：没有可沿用的凭据，拒绝且不改库。
+    service
+        .update_account(
+            created.id,
+            UpdateAccountRequest {
+                proxy_url: Some(None),
+                ..UpdateAccountRequest::default()
+            },
+        )
+        .unwrap();
+    let err = service
+        .update_account(
+            created.id,
+            UpdateAccountRequest {
+                proxy_url: Some(Some("http://***:***@127.0.0.1:18080/".into())),
+                ..UpdateAccountRequest::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("没有可沿用"), "{err}");
+    assert_eq!(stored_proxy(), None);
+
+    service.delete_account(created.id).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_audit_records_failed_changes_auth_failures_capture_and_export() {
     use crate::admin::middleware::AdminState;

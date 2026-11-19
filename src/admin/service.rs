@@ -310,6 +310,52 @@ pub(crate) fn mask_proxy_url_credentials(value: &str) -> String {
     }
 }
 
+/// 账号读接口里代理用户名、密码的打码值（见 `management::mask_account`）。
+const MASKED_PROXY_CREDENTIAL: &str = "***";
+
+/// 代理地址的用户名或密码是否是读接口给出的打码值。
+fn proxy_url_has_masked_credentials(value: &str) -> bool {
+    url::Url::parse(value.trim())
+        .map(|url| {
+            url.username() == MASKED_PROXY_CREDENTIAL
+                || url.password() == Some(MASKED_PROXY_CREDENTIAL)
+        })
+        .unwrap_or(false)
+}
+
+/// 表单把读接口返回的打码代理地址原样提交回来时，用库里的真实用户名、密码替换 `***`，
+/// 否则保存一次就会把真实凭据换成字面 `***`。库里没有对应凭据时拒绝。
+fn restore_masked_proxy_credentials(
+    submitted: &str,
+    stored: Option<&str>,
+) -> Result<String, AdminServiceError> {
+    let missing = || {
+        AdminServiceError::InvalidCredential(
+            "proxyUrl 里的 *** 是已保存凭据的打码，当前账号没有可沿用的代理用户名或密码，请填写真实值"
+                .to_string(),
+        )
+    };
+    let mut url = url::Url::parse(submitted.trim())
+        .map_err(|err| AdminServiceError::InvalidCredential(format!("proxyUrl 无效: {err}")))?;
+    let stored = stored.and_then(|value| url::Url::parse(value.trim()).ok());
+    if url.username() == MASKED_PROXY_CREDENTIAL {
+        let username = stored
+            .as_ref()
+            .map(|stored| stored.username())
+            .filter(|username| !username.is_empty())
+            .ok_or_else(missing)?;
+        url.set_username(username).map_err(|_| missing())?;
+    }
+    if url.password() == Some(MASKED_PROXY_CREDENTIAL) {
+        let password = stored
+            .as_ref()
+            .and_then(|stored| stored.password())
+            .ok_or_else(missing)?;
+        url.set_password(Some(password)).map_err(|_| missing())?;
+    }
+    Ok(url.to_string())
+}
+
 /// 代理地址是否内嵌了凭据。
 pub(crate) fn proxy_url_has_credentials(value: &str) -> bool {
     url::Url::parse(value)
@@ -1134,6 +1180,15 @@ impl AdminService {
     ) -> Result<Account, AdminServiceError> {
         validate_account_api_key(Some(&request.api_key))?;
         validate_account_max_concurrent_requests(Some(request.max_concurrent_requests))?;
+        if request
+            .proxy_url
+            .as_deref()
+            .is_some_and(proxy_url_has_masked_credentials)
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "proxyUrl 里的 *** 是打码占位，新建账号请填写真实的代理用户名和密码".to_string(),
+            ));
+        }
         validate_proxy_url_field("proxyUrl", request.proxy_url.as_deref())?;
         request.supported_models =
             Self::normalize_account_supported_models(request.supported_models);
@@ -1244,6 +1299,17 @@ impl AdminService {
         // `None` 表示不改密钥；传了就必须是非空白。
         validate_account_api_key(request.api_key.as_deref())?;
         validate_account_max_concurrent_requests(request.max_concurrent_requests)?;
+        if let Some(Some(submitted)) = request.proxy_url.as_ref()
+            && proxy_url_has_masked_credentials(submitted)
+        {
+            let store = self.postgres_store.clone();
+            let stored = block_on_admin_store(async move { store.get_account(id, false).await })
+                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+                .ok_or(AdminServiceError::NotFound { id })?;
+            let restored =
+                restore_masked_proxy_credentials(submitted, stored.proxy_url.as_deref())?;
+            request.proxy_url = Some(Some(restored));
+        }
         if let Some(proxy_url) = request.proxy_url.as_ref() {
             validate_proxy_url_field("proxyUrl", proxy_url.as_deref())?;
         }
