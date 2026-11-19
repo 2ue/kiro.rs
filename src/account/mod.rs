@@ -1835,10 +1835,17 @@ impl AccountFinalError {
         if self.is_public_invalid_request() {
             return StatusCode::BAD_REQUEST;
         }
-        if self.status == StatusCode::SERVICE_UNAVAILABLE || self.is_capacity_like() {
+        if self.is_upstream_overloaded() || self.is_capacity_like() {
             return StatusCode::from_u16(529).unwrap();
         }
         StatusCode::BAD_GATEWAY
+    }
+
+    /// 过载：上游报 503 / 官方 529 overloaded，或内部容量类错误（内部同样用 503 标记）。
+    /// 对外统一 529 overloaded_error + "服务繁忙"，客户端会退避重试；不能当成 502 网关错误，
+    /// 也不能说成"没有及时响应"。
+    fn is_upstream_overloaded(&self) -> bool {
+        self.status == StatusCode::SERVICE_UNAVAILABLE || self.status.as_u16() == 529
     }
 
     fn public_error_type(&self) -> &'static str {
@@ -1851,7 +1858,7 @@ impl AccountFinalError {
         if self.is_public_invalid_request() {
             return "invalid_request_error";
         }
-        if self.status == StatusCode::SERVICE_UNAVAILABLE || self.is_capacity_like() {
+        if self.is_upstream_overloaded() || self.is_capacity_like() {
             return "overloaded_error";
         }
         "api_error"
@@ -1871,6 +1878,8 @@ impl AccountFinalError {
             "prompt is too long: Context window is full for the external model. Reduce conversation history, system prompt, tools, documents, images, or tool results and retry."
         } else if self.is_public_invalid_request() {
             envelope::PUBLIC_INVALID_REQUEST_MESSAGE
+        } else if self.is_upstream_overloaded() {
+            envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE
         } else {
             envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE
         };

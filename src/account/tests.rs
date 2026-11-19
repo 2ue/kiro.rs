@@ -2747,7 +2747,8 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"]["type"], "overloaded_error");
     let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+    // 容量满是"服务繁忙"，不是"没有及时响应"。
+    assert!(message.contains(envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE));
     assert!(message.contains("request-id: req_01"));
     assert!(!message.contains("Request capacity is full"));
     assert_public_message_hides_internal_routing(message);
@@ -6999,6 +7000,43 @@ fn account_error_classifies_bare_not_found_as_retryable_without_cooldown() {
         },
         &err
     ));
+}
+
+/// 所有账号都被上游报过载（官方 529 / 503）时，对外同样是 529 overloaded_error + 服务繁忙文案，
+/// 客户端会退避重试；不能变成 502 "没有及时响应"。普通 5xx 仍是 502。
+#[test]
+fn upstream_overload_is_public_overloaded_error() {
+    let final_error = |status: u16| AccountFinalError {
+        status: StatusCode::from_u16(status).unwrap(),
+        response_error_type: "api_error".to_string(),
+        route_error_type: "server_error".to_string(),
+        message: "external upstream server was temporarily unavailable".to_string(),
+        error_id: "err_overload".to_string(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: Some(1),
+        pool_name: Some("a".to_string()),
+    };
+    for status in [529, 503] {
+        let public = final_error(status).public_error();
+        assert_eq!(public.status_code, 529, "upstream {status}");
+        assert_eq!(public.error_type, "overloaded_error", "upstream {status}");
+        assert!(
+            public
+                .message
+                .contains(envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE),
+            "upstream {status}: {}",
+            public.message
+        );
+    }
+    let public = final_error(500).public_error();
+    assert_eq!(public.status_code, 502);
+    assert_eq!(public.error_type, "api_error");
+    assert!(
+        public
+            .message
+            .contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE)
+    );
 }
 
 #[test]
