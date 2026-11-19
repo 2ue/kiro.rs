@@ -14203,7 +14203,8 @@ mod tests {
         let mut old_record = usage_record("rebuild-guard-old", 800);
         old_record.created_at = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
         let mut fresh_record = usage_record("rebuild-guard-fresh", 900);
-        fresh_record.created_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+        // 留足余量：下面先跑两个重建命令，负载高时会超过 1 秒，清理截止时间不能扫到这条。
+        fresh_record.created_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         usage_store
             .record_batch(vec![old_record, fresh_record])
             .await

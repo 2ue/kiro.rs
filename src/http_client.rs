@@ -1015,6 +1015,19 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    /// 定时器驱动的时钟只在驱动推进时更新：线程被占住几毫秒没让出时，它会落后真实时间，
+    /// 刚过期的 deadline 在 sleep_until 首次 poll 时还"没到"。用阻塞线程稳定复现，
+    /// 防止去掉进入 select 前的显式比较后回归。
+    #[tokio::test]
+    async fn deadline_first_timeout_rejects_elapsed_deadline_while_timer_clock_lags() {
+        for round in 0..5 {
+            std::thread::sleep(Duration::from_millis(5));
+            let deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+            let result = deadline_first_timeout_at(deadline, std::future::ready(round)).await;
+            assert_eq!(result, Err(()), "round {round}");
+        }
+    }
+
     #[tokio::test]
     async fn deadline_first_timeout_rejects_ready_future_after_elapsed_deadline_for_five_rounds() {
         for round in 0..5 {
