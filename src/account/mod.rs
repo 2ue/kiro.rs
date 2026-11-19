@@ -9533,7 +9533,16 @@ impl AccountManager {
         duration: Duration,
         models: Option<&[String]>,
     ) {
-        if !self.account_event_throttle.should_record(pool_id, reason) {
+        // 节流键带上模型：同一账号不同模型的冷却分别记，不会被前一个模型的事件吞掉。
+        let throttle_key = match models {
+            Some(models) if !models.is_empty() => format!("cooldown:{reason}:{}", models.join(",")),
+            _ => format!("cooldown:{reason}"),
+        };
+        if !self.account_event_throttle.should_record_with_window(
+            pool_id,
+            &throttle_key,
+            crate::storage::account_events::ACCOUNT_COOLDOWN_EVENT_THROTTLE_WINDOW,
+        ) {
             return;
         }
         let mut detail = json!({
@@ -13748,6 +13757,26 @@ fn external_error_message_indicates_model_unavailable(lower_message: &str) -> bo
         || lower_message.contains("model is not available for this endpoint")
 }
 
+/// Anthropic 官方格式的"模型不存在"：`{"type":"error","error":{"type":"not_found_error",
+/// "message":"model: claude-xxx"}}`。正文里没有 invalid/unknown model 之类的关键字，
+/// 不单独识别就会被当成裸 404 去逐个账号重试。
+fn external_error_body_is_anthropic_model_not_found(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    error.get("type").and_then(serde_json::Value::as_str) == Some("not_found_error")
+        && error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| {
+                message
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("model:")
+            })
+}
+
 fn external_error_message_indicates_invalid_model(lower_message: &str) -> bool {
     lower_message.contains("invalid model")
         || lower_message.contains("invalid_model_id")
@@ -13854,6 +13883,14 @@ fn external_error_affects_pool_quality(err: &AccountError) -> bool {
     if external_error_message_indicates_model_unavailable(&lower_message)
         || (err.status == Some(StatusCode::NOT_FOUND)
             && external_error_message_indicates_invalid_model(&lower_message))
+    {
+        return false;
+    }
+    // 裸 404（没有冷却也不自动禁用）可能是请求自身引用了不存在的资源，
+    // 换号由 retryStatusCodes 处理，不能把高优先级账号拉进观察期。
+    if err.status == Some(StatusCode::NOT_FOUND)
+        && err.cooldown.is_none()
+        && err.auto_disable_reason.is_none()
     {
         return false;
     }
@@ -13966,7 +14003,8 @@ fn classify_external_error(
     }
     if external_error_message_indicates_model_unavailable(&lower)
         || (status == StatusCode::NOT_FOUND
-            && external_error_message_indicates_invalid_model(&lower))
+            && (external_error_message_indicates_invalid_model(&lower)
+                || external_error_body_is_anthropic_model_not_found(&body)))
     {
         return classified_external_error(
             status,

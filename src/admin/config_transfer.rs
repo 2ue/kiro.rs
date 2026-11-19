@@ -146,6 +146,28 @@ fn package_from_rows(
         if !runtime_config["adminApiKey"].is_null() {
             runtime_config["adminApiKey"] = json!(REDACTED);
         }
+        // 代理密码与地址里内嵌的凭据同样是密钥：整值替换成 <redacted>，
+        // 这样脱敏包仍然只能预览、不能应用（应用前按整值判断 <redacted>）。
+        if runtime_config["proxyPassword"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        {
+            runtime_config["proxyPassword"] = json!(REDACTED);
+        }
+        if runtime_config["proxyUrl"]
+            .as_str()
+            .is_some_and(super::proxy_url_has_credentials)
+        {
+            runtime_config["proxyUrl"] = json!(REDACTED);
+        }
+        for account in &mut accounts {
+            if account["proxyUrl"]
+                .as_str()
+                .is_some_and(super::proxy_url_has_credentials)
+            {
+                account["proxyUrl"] = json!(REDACTED);
+            }
+        }
     }
     Ok(ConfigPackage {
         format_version: 1,
@@ -349,6 +371,7 @@ fn validate_package(package: &ConfigPackage, local: &Config) -> Result<Config, A
         let parsed_url = url::Url::parse(&account.base_url).map_err(invalid)?;
         if !matches!(parsed_url.scheme(), "http" | "https")
             || account.max_concurrent_requests == 0
+            || account.max_concurrent_requests > super::MAX_ACCOUNT_CONCURRENT_REQUESTS
             || account.route_rules.len() > 200
             || account.route_rules.iter().any(|rule| rule.len() > 256)
         {
@@ -551,6 +574,10 @@ pub async fn import_config(
                 .map_err(internal)?;
             let config = state.service.runtime.config();
             state.service.refresh_request_api_key_runtime(&config);
+            state
+                .service
+                .usage_recorder
+                .set_limit(config.usage_record_limit);
             let models = state
                 .service
                 .postgres_store
@@ -629,6 +656,19 @@ pub async fn import_config(
         Ok(report)
     }
     .await;
+    // 导出成败都留痕，导入也一样：真正写入（非预览）失败时记一条失败审计。
+    if let Err(error) = &result
+        && !query.dry_run
+    {
+        state.service.audit(
+            "import_config",
+            "runtime_config",
+            None,
+            false,
+            Some(error.to_string()),
+            json!({ "dryRun": false }),
+        );
+    }
     respond(result)
 }
 pub(crate) async fn publish_runtime_change(config: &Config) {
@@ -694,9 +734,25 @@ mod tests {
                 .changes
                 .is_empty()
         );
-        let redacted = package_from_rows(rows, false).unwrap();
+        let redacted = package_from_rows(rows.clone(), false).unwrap();
         assert_eq!(redacted.accounts[0]["apiKey"], REDACTED);
         assert_eq!(redacted.request_api_keys[0].api_key, REDACTED);
+        // 账号代理地址内嵌凭据，整值脱敏；脱敏包只能预览不能应用。
+        assert_eq!(redacted.accounts[0]["proxyUrl"], REDACTED);
+        assert!(contains_redacted(&json!(redacted)));
+        let mut with_proxy = rows.clone();
+        with_proxy["runtimeConfig"]["proxyPassword"] = json!("proxy-secret");
+        with_proxy["runtimeConfig"]["proxyUrl"] = json!("http://user:pass@proxy.example:3128");
+        let redacted = package_from_rows(with_proxy.clone(), false).unwrap();
+        assert_eq!(redacted.runtime_config["proxyPassword"], REDACTED);
+        assert_eq!(redacted.runtime_config["proxyUrl"], REDACTED);
+        let mut plain_proxy = with_proxy;
+        plain_proxy["runtimeConfig"]["proxyUrl"] = json!("http://proxy.example:3128");
+        let redacted = package_from_rows(plain_proxy, false).unwrap();
+        assert_eq!(
+            redacted.runtime_config["proxyUrl"],
+            "http://proxy.example:3128"
+        );
         let mut removed = package.clone();
         removed.accounts.clear();
         let report = compare_packages(&package, &removed, true).unwrap();

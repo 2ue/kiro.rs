@@ -63,6 +63,9 @@ pub struct AccountEventThrottle {
 }
 
 pub const ACCOUNT_EVENT_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
+/// 冷却事件的节流窗口更长：模型级冷却默认只有 10 秒，持续命中时按 60 秒记一条，
+/// 审计表（清理默认关闭）会持续膨胀；5 分钟一条足够看出趋势。
+pub const ACCOUNT_COOLDOWN_EVENT_THROTTLE_WINDOW: Duration = Duration::from_secs(300);
 pub const ACCOUNT_EVENT_THROTTLE_CAPACITY: usize = 4096;
 
 impl Default for AccountEventThrottle {
@@ -89,10 +92,25 @@ impl AccountEventThrottle {
     }
 
     pub fn should_record_at(&self, account_id: u64, reason: &str, now: std::time::Instant) -> bool {
+        self.should_record_with_window_at(account_id, reason, self.window, now)
+    }
+
+    /// 同 `should_record`，但用调用方给的窗口（冷却事件用更长的窗口）。
+    pub fn should_record_with_window(&self, account_id: u64, key: &str, window: Duration) -> bool {
+        self.should_record_with_window_at(account_id, key, window, std::time::Instant::now())
+    }
+
+    pub fn should_record_with_window_at(
+        &self,
+        account_id: u64,
+        reason: &str,
+        window: Duration,
+        now: std::time::Instant,
+    ) -> bool {
         let mut recent = self.recent.lock();
         let key = (account_id, reason.to_string());
         if let Some(last) = recent.get(&key)
-            && now.saturating_duration_since(*last) < self.window
+            && now.saturating_duration_since(*last) < window
         {
             return false;
         }
@@ -473,6 +491,39 @@ mod tests {
         assert!(throttle.should_record_at(8, "rate_limit", start + Duration::from_secs(30)));
         // 窗口过后再次记录。
         assert!(throttle.should_record_at(7, "rate_limit", start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn cooldown_throttle_uses_its_own_longer_window() {
+        let throttle = AccountEventThrottle::default();
+        let start = std::time::Instant::now();
+        let window = ACCOUNT_COOLDOWN_EVENT_THROTTLE_WINDOW;
+        assert!(throttle.should_record_with_window_at(
+            7,
+            "cooldown:model_unavailable:a",
+            window,
+            start
+        ));
+        // 普通 60 秒窗口过了，冷却事件仍在自己的 5 分钟窗口里。
+        assert!(!throttle.should_record_with_window_at(
+            7,
+            "cooldown:model_unavailable:a",
+            window,
+            start + Duration::from_secs(120)
+        ));
+        // 另一个模型的冷却单独记录。
+        assert!(throttle.should_record_with_window_at(
+            7,
+            "cooldown:model_unavailable:b",
+            window,
+            start + Duration::from_secs(120)
+        ));
+        assert!(throttle.should_record_with_window_at(
+            7,
+            "cooldown:model_unavailable:a",
+            window,
+            start + window
+        ));
     }
 
     #[test]

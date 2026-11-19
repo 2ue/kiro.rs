@@ -445,6 +445,7 @@ async fn async_main() {
     let runtime_event_listener = spawn_redis_runtime_event_listener(
         runtime.clone(),
         redis_store.clone(),
+        usage_recorder.clone(),
         account_manager.clone(),
         admin_api_key_store.clone(),
         request_api_key_store.clone(),
@@ -749,6 +750,8 @@ async fn serve_until_shutdown<L, F, Fut>(
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
+    for<'a> std::net::SocketAddr:
+        axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, L>>,
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -772,9 +775,13 @@ where
     };
 
     let mut server = Box::pin(
-        axum::serve(listener, app)
-            .with_graceful_shutdown(graceful_shutdown)
-            .into_future(),
+        // 带上对端地址：管理端认证失败按真实连接地址限速，代理头只作参考记录。
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful_shutdown)
+        .into_future(),
     );
     let result = tokio::select! {
         result = &mut server => result,
@@ -1105,9 +1112,11 @@ fn apply_request_api_key_runtime(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_redis_runtime_event_listener(
     runtime: Arc<model::runtime::RuntimeConfigStore>,
     redis_store: Arc<RedisStore>,
+    usage_recorder: Arc<anthropic::usage::UsageRecorder>,
 
     account_manager: Arc<AccountManager>,
     admin_api_key_store: admin::AdminApiKeyStore,
@@ -1156,6 +1165,7 @@ fn spawn_redis_runtime_event_listener(
                                         &config,
                                         &admin_api_key_store,
                                     );
+                                    usage_recorder.set_limit(config.usage_record_limit);
                                     tracing::info!(payload, "已根据 Redis 通知热加载运行配置");
                                 }
                                 Ok(false) => tracing::debug!(payload, "收到运行配置通知，但未执行热加载"),
@@ -1182,6 +1192,7 @@ fn spawn_redis_runtime_event_listener(
                                     &config,
                                     &admin_api_key_store,
                                 );
+                                usage_recorder.set_limit(config.usage_record_limit);
                             }
                             Ok(false) => {}
                             Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),

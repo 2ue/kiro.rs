@@ -93,6 +93,11 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
         table_name: "accounts",
         column_name: "tags",
     },
+    // 1.0.8 新表：migrate_on_start=false 时缺表要在启动时报出来，而不是采样写入静默失败。
+    RequiredPostgresColumn {
+        table_name: "account_quality_samples",
+        column_name: "sample_count",
+    },
     RequiredPostgresColumn {
         table_name: "accounts",
         column_name: "proxy_url",
@@ -905,13 +910,11 @@ impl PostgresStore {
 
             // Compression is an explicit, potentially large maintenance operation. Keep it out
             // of the bounded default startup transaction while retaining the session lock.
-            if compress_usage_rollups
-                && !usage_rollup_hour_compression_v1_applied(&mut conn).await?
-            {
+            if compress_usage_rollups && !usage_rollup_hour_compression_applied(&mut conn).await? {
                 run_usage_exclusive_versioned_migration(
                     &mut conn,
-                    "usage-rollup-hour-bucket-compression-v2",
-                    USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V2_SQL,
+                    "usage-rollup-hour-bucket-compression-v3",
+                    USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V3_SQL,
                 )
                 .await?;
             }
@@ -2798,10 +2801,13 @@ impl PostgresStore {
     }
 
     /// Account change counts per event kind since `since`, plus how many distinct accounts.
+    /// 账号异动按类型计数：`[since, until)`（`until` 缺省不设上限），可按账号过滤。
     pub async fn summarize_account_events(
         &self,
         since: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
         source: Option<&str>,
+        account_id: Option<u64>,
     ) -> anyhow::Result<Vec<AccountEventSummaryRow>> {
         let rows = sqlx::query(
             r#"
@@ -2811,12 +2817,16 @@ impl PostgresStore {
             FROM admin_audit_logs
             WHERE detail ? 'accountEvent'
               AND created_at >= $1
+              AND ($3::timestamptz IS NULL OR created_at < $3)
               AND ($2::text IS NULL OR detail->>'accountSource' = $2)
+              AND ($4::text IS NULL OR object_id = $4)
             GROUP BY detail->>'accountEvent'
             "#,
         )
         .bind(since)
         .bind(source)
+        .bind(until)
+        .bind(account_id.map(|id| id.to_string()))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -2977,35 +2987,42 @@ impl PostgresStore {
     }
 
     /// 一个账号最近 `since` 之后的质量采样点，按时间升序。
+    /// 质量分历史：`[since, until)` 内按 `bucket_secs` 秒分桶取平均（多实例、每分钟一行的
+    /// 原始点在长窗口里会有上万个），按时间升序。桶起点作为点的时间。
     pub async fn account_quality_history(
         &self,
         account_id: u64,
         since: DateTime<Utc>,
-        limit: usize,
+        until: DateTime<Utc>,
+        bucket_secs: u32,
     ) -> anyhow::Result<Vec<AccountQualitySampleRow>> {
         let rows = sqlx::query(
             r#"
-            SELECT account_id, sampled_at, recent_error_rate, ttft_ewma_ms, latency_ewma_ms, sample_count
-            FROM (
-                SELECT account_id, sampled_at, recent_error_rate, ttft_ewma_ms, latency_ewma_ms, sample_count
-                FROM account_quality_samples
-                WHERE account_id = $1 AND sampled_at >= $2
-                ORDER BY sampled_at DESC
-                LIMIT $3
-            ) AS recent
-            ORDER BY sampled_at ASC
+            SELECT
+                account_id,
+                to_timestamp(floor(extract(epoch FROM sampled_at) / $4) * $4) AS bucket_at,
+                AVG(recent_error_rate)::double precision AS recent_error_rate,
+                AVG(ttft_ewma_ms)::double precision AS ttft_ewma_ms,
+                AVG(latency_ewma_ms)::double precision AS latency_ewma_ms,
+                MAX(sample_count)::bigint AS sample_count
+            FROM account_quality_samples
+            WHERE account_id = $1 AND sampled_at >= $2 AND sampled_at < $3
+            GROUP BY account_id, bucket_at
+            ORDER BY bucket_at ASC
+            LIMIT 5000
             "#,
         )
         .bind(u64_to_i64(account_id))
         .bind(since)
-        .bind(usize_to_i64(limit.clamp(1, 10_000)))
+        .bind(until)
+        .bind(f64::from(bucket_secs.max(1)))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(|row| {
                 Ok(AccountQualitySampleRow {
                     account_id: row_i64_to_u64(&row, "account_id")?,
-                    sampled_at: row.try_get("sampled_at")?,
+                    sampled_at: row.try_get("bucket_at")?,
                     recent_error_rate: row.try_get("recent_error_rate")?,
                     ttft_ewma_ms: row.try_get("ttft_ewma_ms")?,
                     latency_ewma_ms: row.try_get("latency_ewma_ms")?,
@@ -3208,6 +3225,39 @@ async fn mark_usage_overview_totals_backfilled(
 /// Startup path for the overview totals backfill: bounded like the index creation. Small
 /// detail tables are backfilled in place; large ones are skipped with a pointer to the
 /// maintenance command so a routine upgrade never blocks on multi-GB usage history.
+/// 汇总表里的记录数是否多于现存明细：明细保留任务删明细时保留汇总，所以汇总可能
+/// 覆盖了明细里已经没有的历史。这时"清零后从明细重算"会把那部分历史永久抹掉。
+/// 返回 `(汇总条数, 现存明细条数)`，前者大于后者即不能从明细重建。
+async fn usage_rollups_exceed_live_records(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<Option<(i64, i64)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE((
+                SELECT requests FROM usage_rollup_totals
+                WHERE dimension = 'global' AND dimension_key = 'all'
+            ), 0)::bigint AS summarized,
+            (
+                SELECT COUNT(*) FROM usage_records
+                WHERE deleted_at IS NULL AND rollup_active
+            )::bigint AS live
+        "#,
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let summarized: i64 = row.try_get("summarized")?;
+    let live: i64 = row.try_get("live")?;
+    Ok((summarized > live).then_some((summarized, live)))
+}
+
+fn rebuild_refused_after_retention(command: &str, summarized: i64, live: i64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{command} 已拒绝执行：汇总表覆盖 {summarized} 条请求，现存明细只有 {live} 条\
+         （明细保留任务删掉了更早的明细但保留了汇总）。从明细重建会永久丢失这部分历史统计。"
+    )
+}
+
 async fn backfill_usage_overview_totals_if_startup_safe(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
@@ -3228,20 +3278,35 @@ async fn backfill_usage_overview_totals_if_startup_safe(
         );
         return Ok(());
     }
+    if let Some((summarized, live)) = usage_rollups_exceed_live_records(tx).await? {
+        tracing::warn!(
+            summarized,
+            live,
+            "汇总表覆盖的历史多于现存明细，启动时跳过总览合计列回填，避免抹掉已删明细对应的统计"
+        );
+        mark_usage_overview_totals_backfilled(tx).await?;
+        return Ok(());
+    }
     let scanned = backfill_usage_overview_totals_in_tx(tx).await?;
     mark_usage_overview_totals_backfilled(tx).await?;
     tracing::info!(scanned, "已从明细回填总览合计列（账号成本、原始 token）");
     Ok(())
 }
 
-async fn usage_rollup_hour_compression_v1_applied(
+/// 任何一个版本的小时桶压缩执行过，数据就已经是小时粒度，不再重复压缩。
+async fn usage_rollup_hour_compression_applied(
     conn: &mut sqlx::pool::PoolConnection<Postgres>,
 ) -> anyhow::Result<bool> {
-    let applied: Option<String> =
-        sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = $1")
-            .bind("usage-rollup-hour-bucket-compression-v1")
-            .fetch_optional(&mut **conn)
-            .await?;
+    let applied: Option<String> = sqlx::query_scalar(
+        "SELECT version FROM schema_migrations WHERE version = ANY($1::text[]) LIMIT 1",
+    )
+    .bind(vec![
+        "usage-rollup-hour-bucket-compression-v1".to_string(),
+        "usage-rollup-hour-bucket-compression-v2".to_string(),
+        "usage-rollup-hour-bucket-compression-v3".to_string(),
+    ])
+    .fetch_optional(&mut **conn)
+    .await?;
     Ok(applied.is_some())
 }
 
@@ -3467,6 +3532,8 @@ pub struct AccountEventSummaryRow {
 pub struct AccountEventSummaryResponse {
     pub hours: u32,
     pub since: String,
+    /// 窗口终点。
+    pub until: String,
     pub account_source: Option<String>,
     pub items: Vec<AccountEventSummaryRow>,
 }
@@ -4917,6 +4984,13 @@ impl PostgresUsageStore {
     pub async fn backfill_usage_overview_totals(&self) -> anyhow::Result<u64> {
         let mut tx = self.store.pool().begin().await?;
         acquire_usage_cleanup_commit_guard(&mut tx).await?;
+        if let Some((summarized, live)) = usage_rollups_exceed_live_records(&mut tx).await? {
+            return Err(rebuild_refused_after_retention(
+                "usage-overview-totals-backfill",
+                summarized,
+                live,
+            ));
+        }
         let scanned = backfill_usage_overview_totals_in_tx(&mut tx).await?;
         mark_usage_overview_totals_backfilled(&mut tx).await?;
         tx.commit().await?;
@@ -4991,6 +5065,13 @@ impl PostgresUsageStore {
             .collect::<Vec<_>>();
         let mut tx = self.store.pool().begin().await?;
         acquire_usage_cleanup_commit_guard(&mut tx).await?;
+        if let Some((summarized, live)) = usage_rollups_exceed_live_records(&mut tx).await? {
+            return Err(rebuild_refused_after_retention(
+                "usage-route-dimension-backfill",
+                summarized,
+                live,
+            ));
+        }
         for table in ["usage_rollup_time_buckets", "usage_rollup_totals"] {
             sqlx::query(&format!(
                 "DELETE FROM {table} WHERE dimension = ANY($1::text[])"
@@ -8056,12 +8137,36 @@ fn usage_rollup_attempt_entries(
     direction: i64,
 ) -> Vec<(UsageRollupDimension, UsageRollupMetrics)> {
     let sign = if direction < 0 { -1 } else { 1 };
+    let last_index = record.external_attempts.len().saturating_sub(1);
+    let earlier_duration_ms: u64 = record
+        .external_attempts
+        .iter()
+        .take(last_index)
+        .map(|attempt| attempt.duration_ms)
+        .sum();
     record
         .external_attempts
         .iter()
-        .map(|attempt| {
-            let success = attempt.action == "success";
-            let duration = attempt.duration_ms.min(i64::MAX as u64) as i64;
+        .enumerate()
+        .map(|(index, attempt)| {
+            // 拿到响应头时最后一次尝试就记成了 success；之后流中途出错或客户端断开，
+            // 记录状态不再是 Success，这次尝试也要按失败计，和账号维度同一口径。
+            // 它的耗时取整个请求耗时减去前面几次尝试，而不是只到响应头。
+            let dispatched = index == last_index && attempt.action == "success";
+            let success = if dispatched {
+                record.status == UsageRecordStatus::Success
+            } else {
+                attempt.action == "success"
+            };
+            let duration_ms = if dispatched {
+                record
+                    .duration_ms
+                    .saturating_sub(earlier_duration_ms)
+                    .max(attempt.duration_ms)
+            } else {
+                attempt.duration_ms
+            };
+            let duration = duration_ms.min(i64::MAX as u64) as i64;
             let metrics = UsageRollupMetrics {
                 requests: sign,
                 success_requests: signed_bool(success, sign),
@@ -8864,6 +8969,12 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
         builder.push(" AND endpoint LIKE ");
         builder.push_bind(format!("{}/v1/%", escape_like_pattern(prefix)));
         builder.push(" ESCAPE '\\'");
+        // LIKE 只是粗筛（能走前缀匹配）；再按"最后一个 /v1/ 之前"精确比较，
+        // 与总览分组、延迟分位、内存筛选同一口径（如 /dfcache/v1/v1/messages 归 /dfcache/v1）。
+        builder.push(
+            " AND COALESCE(NULLIF(rtrim(regexp_replace(endpoint, '^(.*)/v1(/.*)?$', '\\1'), '/'), ''), '/') = ",
+        );
+        builder.push_bind(route.clone());
     }
     if let Some(conversation_id) = &query.conversation_id {
         builder.push(" AND conversation_id = ");
@@ -11249,6 +11360,7 @@ FROM usage_duration_rollup_time_buckets_hourly;
 /// v1 (above) predates `total_compat_input_tokens`; its checksum is frozen in
 /// databases that already ran it, so the column-aware copy lives in v2. A
 /// database runs at most one of them: v2 is skipped once v1 has compressed.
+#[cfg(test)]
 const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V2_SQL: &str = r#"
 CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
 SELECT
@@ -11331,6 +11443,132 @@ SELECT
     account_shaped_cost_usd, account_uplifted_cost_usd,
     account_profit_usd, account_reported_cost_usd,
     account_billable_cost_usd, account_cost_floor_delta_usd,
+    duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+FROM usage_rollup_time_buckets_hourly;
+
+CREATE TEMP TABLE usage_cache_read_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    cache_read_input_tokens,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_cache_read_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), cache_read_input_tokens;
+
+TRUNCATE TABLE usage_cache_read_rollup_time_buckets;
+
+INSERT INTO usage_cache_read_rollup_time_buckets (
+    bucket_start, cache_read_input_tokens, requests, updated_at
+)
+SELECT bucket_start, cache_read_input_tokens, requests, updated_at
+FROM usage_cache_read_rollup_time_buckets_hourly;
+
+CREATE TEMP TABLE usage_duration_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    duration_ms,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_duration_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), duration_ms;
+
+TRUNCATE TABLE usage_duration_rollup_time_buckets;
+
+INSERT INTO usage_duration_rollup_time_buckets (
+    bucket_start, duration_ms, requests, updated_at
+)
+SELECT bucket_start, duration_ms, requests, updated_at
+FROM usage_duration_rollup_time_buckets_hourly;
+"#;
+
+/// v3：v2 漏了账号成本与原始 token 两列，压缩后会按默认值写成 0。新库一律跑 v3；
+/// v1/v2 已执行过的库不再重复压缩。
+const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V3_SQL: &str = r#"
+CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    dimension,
+    dimension_key,
+    NULLIF(MAX(NULLIF(dimension_label, '')), '') AS dimension_label,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(SUM(success_requests), 0)::bigint AS success_requests,
+    COALESCE(SUM(error_requests), 0)::bigint AS error_requests,
+    COALESCE(SUM(stream_requests), 0)::bigint AS stream_requests,
+    COALESCE(SUM(non_stream_requests), 0)::bigint AS non_stream_requests,
+    COALESCE(SUM(priced_requests), 0)::bigint AS priced_requests,
+    COALESCE(SUM(unpriced_requests), 0)::bigint AS unpriced_requests,
+    COALESCE(SUM(local_prompt_cache_requests), 0)::bigint AS local_prompt_cache_requests,
+    COALESCE(SUM(simulated_requests), 0)::bigint AS simulated_requests,
+    COALESCE(SUM(upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
+
+
+    COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
+    COALESCE(SUM(billable_input_tokens), 0)::bigint AS billable_input_tokens,
+    COALESCE(SUM(total_compat_input_tokens), 0)::bigint AS total_compat_input_tokens,
+    COALESCE(SUM(total_output_tokens), 0)::bigint AS total_output_tokens,
+    COALESCE(SUM(total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+    COALESCE(SUM(total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+    COALESCE(SUM(local_prompt_cache_input_tokens), 0)::bigint AS local_prompt_cache_input_tokens,
+    COALESCE(SUM(local_prompt_cache_read_input_tokens), 0)::bigint AS local_prompt_cache_read_input_tokens,
+    COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
+    COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+    COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
+
+    COALESCE(SUM(account_requests), 0)::bigint AS account_requests,
+    COALESCE(SUM(account_priced_requests), 0)::bigint AS account_priced_requests,
+    COALESCE(SUM(account_unpriced_requests), 0)::bigint AS account_unpriced_requests,
+    COALESCE(SUM(account_cost_floor_applied_requests), 0)::bigint AS account_cost_floor_applied_requests,
+    COALESCE(SUM(account_raw_cost_usd), 0)::double precision AS account_raw_cost_usd,
+    COALESCE(SUM(account_shaped_cost_usd), 0)::double precision AS account_shaped_cost_usd,
+    COALESCE(SUM(account_uplifted_cost_usd), 0)::double precision AS account_uplifted_cost_usd,
+    COALESCE(SUM(account_profit_usd), 0)::double precision AS account_profit_usd,
+    COALESCE(SUM(account_reported_cost_usd), 0)::double precision AS account_reported_cost_usd,
+    COALESCE(SUM(account_billable_cost_usd), 0)::double precision AS account_billable_cost_usd,
+    COALESCE(SUM(account_cost_floor_delta_usd), 0)::double precision AS account_cost_floor_delta_usd,
+    COALESCE(SUM(account_cost_usd), 0)::double precision AS account_cost_usd,
+    COALESCE(SUM(account_raw_tokens), 0)::bigint AS account_raw_tokens,
+    COALESCE(SUM(duration_ms_sum), 0)::bigint AS duration_ms_sum,
+    COALESCE(SUM(duration_ms_count), 0)::bigint AS duration_ms_count,
+    COALESCE(MAX(duration_ms_max), 0)::bigint AS duration_ms_max,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), dimension, dimension_key;
+
+TRUNCATE TABLE usage_rollup_time_buckets;
+
+INSERT INTO usage_rollup_time_buckets (
+    bucket_start, dimension, dimension_key, dimension_label, requests,
+    success_requests, error_requests, stream_requests, non_stream_requests,
+    priced_requests, unpriced_requests, local_prompt_cache_requests,
+    simulated_requests, upstream_metadata_requests, total_input_tokens, billable_input_tokens,
+    total_compat_input_tokens,
+    total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, total_original_cost_usd,
+    account_requests, account_priced_requests, account_unpriced_requests,
+    account_cost_floor_applied_requests, account_raw_cost_usd,
+    account_shaped_cost_usd, account_uplifted_cost_usd,
+    account_profit_usd, account_reported_cost_usd,
+    account_billable_cost_usd, account_cost_floor_delta_usd,
+    account_cost_usd, account_raw_tokens,
+    duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+)
+SELECT
+    bucket_start, dimension, dimension_key, dimension_label, requests,
+    success_requests, error_requests, stream_requests, non_stream_requests,
+    priced_requests, unpriced_requests, local_prompt_cache_requests,
+    simulated_requests, upstream_metadata_requests, total_input_tokens, billable_input_tokens,
+    total_compat_input_tokens,
+    total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, total_original_cost_usd, account_requests, account_priced_requests, account_unpriced_requests,
+    account_cost_floor_applied_requests, account_raw_cost_usd,
+    account_shaped_cost_usd, account_uplifted_cost_usd,
+    account_profit_usd, account_reported_cost_usd,
+    account_billable_cost_usd, account_cost_floor_delta_usd,
+    account_cost_usd, account_raw_tokens,
     duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
 FROM usage_rollup_time_buckets_hourly;
 
@@ -11581,6 +11819,7 @@ mod tests {
             ("usage_records", "rollup_active"),
             ("usage_cleanup_jobs", "batch_size"),
             ("usage_records", "original_cost_usd"),
+            ("account_quality_samples", "sample_count"),
         ] {
             assert!(
                 required.contains(&pair),
@@ -11801,7 +12040,7 @@ mod tests {
         assert!(first.has_next);
 
         let mut summary = store
-            .summarize_account_events(Utc::now() - chrono::Duration::days(1), None)
+            .summarize_account_events(Utc::now() - chrono::Duration::days(1), None, None, None)
             .await
             .unwrap();
         summary.sort_by(|a, b| a.event.cmp(&b.event));
@@ -11813,8 +12052,36 @@ mod tests {
             summary,
             vec![("auto_disabled", 1, 1), ("quota_exhausted", 3, 3)]
         );
+        // 按账号过滤：只统计 #9 的异动。
+        let only_nine = store
+            .summarize_account_events(Utc::now() - chrono::Duration::days(1), None, None, Some(9))
+            .await
+            .unwrap();
+        assert_eq!(
+            only_nine
+                .iter()
+                .map(|row| (row.event.as_str(), row.events))
+                .collect::<Vec<_>>(),
+            vec![("quota_exhausted", 1)]
+        );
+        // 窗口终点早于全部事件时为空（与查询窗口对齐，而不是从现在往前数）。
+        let before = store
+            .summarize_account_events(
+                Utc::now() - chrono::Duration::days(1),
+                Some(Utc::now() - chrono::Duration::hours(1)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(before.is_empty(), "{before:?}");
         let local = store
-            .summarize_account_events(Utc::now() - chrono::Duration::days(1), Some("local"))
+            .summarize_account_events(
+                Utc::now() - chrono::Duration::days(1),
+                None,
+                Some("local"),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -12147,6 +12414,62 @@ mod tests {
         net.add(removed);
         assert_eq!(net.total_compat_input_tokens, 0);
         assert_eq!(net.total_cache_read_input_tokens, 0);
+    }
+
+    /// 压缩会 TRUNCATE 时间桶表再插回去：插回的列必须覆盖表上的每一列，
+    /// 否则漏掉的列会按默认值写成 0（v2 漏了账号成本与原始 token）。
+    #[test]
+    fn usage_rollup_hour_compression_v3_carries_every_time_bucket_column() {
+        let table_start = SCHEMA_SQL
+            .find("CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (")
+            .expect("time bucket table");
+        let table_end = SCHEMA_SQL[table_start..]
+            .find(");")
+            .map(|offset| table_start + offset)
+            .unwrap();
+        let columns = SCHEMA_SQL[table_start..table_end]
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("PRIMARY KEY"))
+            .filter_map(|line| line.split_whitespace().next())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            columns.contains(&"account_cost_usd".to_string()),
+            "{columns:?}"
+        );
+        let insert_start = USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V3_SQL
+            .find("INSERT INTO usage_rollup_time_buckets (")
+            .unwrap();
+        let insert_end = USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V3_SQL[insert_start..]
+            .find(")\nSELECT")
+            .map(|offset| insert_start + offset)
+            .unwrap();
+        let inserted = USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V3_SQL[insert_start..insert_end]
+            .split(['(', ',', '\n'])
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        for column in &columns {
+            assert!(
+                inserted.contains(&column.as_str()),
+                "compression v3 drops column {column}"
+            );
+            assert!(
+                USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V3_SQL.contains(&format!("AS {column},"))
+                    || USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V3_SQL
+                        .contains(&format!("AS {column}\n"))
+                    || [
+                        "bucket_start",
+                        "dimension",
+                        "dimension_key",
+                        "dimension_label"
+                    ]
+                    .contains(&column.as_str()),
+                "compression v3 does not aggregate column {column}"
+            );
+        }
     }
 
     #[test]
@@ -13052,6 +13375,61 @@ mod tests {
 
     /// 账号尝试维度：一条记录两次尝试（一次失败被切走、一次成功）→ 尝试请求 2、尝试错误 1、
     /// 最终成功 1；软删抵消后归零；维护命令重建后恢复。
+    /// 拿到响应头就记成 success 的最后一次尝试，流中途出错时要按失败计，
+    /// 耗时取整个请求减去前面的尝试，和账号维度同一口径。
+    #[test]
+    fn attempt_entries_follow_the_final_record_status() {
+        let attempt = |pool_id: u64, action: &str, duration_ms: u64| AccountAttempt {
+            attempt: 1,
+            pool_id,
+            pool_name: format!("pool-{pool_id}"),
+            outbound_model: None,
+            status: Some(200),
+            action: action.to_string(),
+            duration_ms,
+            error_type: None,
+            error_message: None,
+            raw_upstream_error: None,
+        };
+        let mut record = external_usage_record("attempt-final", 1.0, 0.8, 1.2);
+        record.duration_ms = 2_000;
+        record.external_attempts = vec![attempt(7, "retry_next", 300), attempt(42, "success", 120)];
+
+        let summarize = |record: &UsageRecord| {
+            usage_rollup_attempt_entries(record, 1)
+                .into_iter()
+                .map(|(dimension, metrics)| {
+                    (
+                        dimension.key,
+                        metrics.success_requests,
+                        metrics.error_requests,
+                        metrics.duration_ms_sum,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        record.status = UsageRecordStatus::Success;
+        assert_eq!(
+            summarize(&record),
+            vec![
+                ("7".to_string(), 0, 1, 300),
+                ("42".to_string(), 1, 0, 1_700)
+            ]
+        );
+        record.status = UsageRecordStatus::StreamError;
+        assert_eq!(
+            summarize(&record),
+            vec![
+                ("7".to_string(), 0, 1, 300),
+                ("42".to_string(), 0, 1, 1_700)
+            ]
+        );
+        // 负向增量（软删）同样按最终状态抵消。
+        let negative = usage_rollup_attempt_entries(&record, -1);
+        assert_eq!(negative[1].1.error_requests, -1);
+        assert_eq!(negative[1].1.duration_ms_sum, -1_700);
+    }
+
     #[tokio::test]
     async fn postgres_account_attempt_dimension_counts_failed_attempts_and_reconciles() {
         let Some(config) = test_config() else {
@@ -13434,6 +13812,8 @@ mod tests {
             ("/", vec!["route-default"]),
             ("/dfcache/v1", vec!["route-custom"]),
             ("/dfcache/v1/", vec!["route-custom"]),
+            // /dfcache/v1/v1/messages 的 LIKE 也能命中 "/dfcache/v1/%"，必须靠精确前缀排除。
+            ("/dfcache", vec![]),
             ("/ha", vec![]),
         ] {
             let page = usage_store
@@ -13637,8 +14017,9 @@ mod tests {
         other.account_id = 7;
         store.record_account_quality_sample(&other).await.unwrap();
 
+        let until = now + ChronoDuration::minutes(1);
         let history = store
-            .account_quality_history(42, now - ChronoDuration::hours(24), 100)
+            .account_quality_history(42, now - ChronoDuration::hours(24), until, 60)
             .await
             .unwrap();
         assert_eq!(history.len(), 2, "{history:?}");
@@ -13652,11 +14033,43 @@ mod tests {
         updated.sample_count = 11;
         store.record_account_quality_sample(&updated).await.unwrap();
         let history = store
-            .account_quality_history(42, now - ChronoDuration::hours(24), 100)
+            .account_quality_history(42, now - ChronoDuration::hours(24), until, 60)
             .await
             .unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].sample_count, 11);
+
+        // 长窗口降采样：同一个桶里的点取平均，桶起点作为时间。
+        let bucket_secs = 864_000_u32;
+        let bucket_of = |minutes_ago: i64| {
+            (now - ChronoDuration::minutes(minutes_ago)).timestamp() / i64::from(bucket_secs)
+        };
+        let coarse = store
+            .account_quality_history(42, now - ChronoDuration::hours(24), until, bucket_secs)
+            .await
+            .unwrap();
+        if bucket_of(10) == bucket_of(5) {
+            assert_eq!(coarse.len(), 1, "{coarse:?}");
+            assert!(
+                (coarse[0].recent_error_rate - 0.25).abs() < 1e-9,
+                "{coarse:?}"
+            );
+            assert_eq!(coarse[0].sample_count, 11);
+            assert_eq!(coarse[0].sampled_at.timestamp() % i64::from(bucket_secs), 0);
+        } else {
+            assert_eq!(coarse.len(), 2, "{coarse:?}");
+        }
+        // 窗口终点之后的点不返回。
+        let bounded = store
+            .account_quality_history(
+                42,
+                now - ChronoDuration::hours(24),
+                now - ChronoDuration::minutes(7),
+                60,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 1, "{bounded:?}");
 
         let removed = store
             .delete_expired_account_quality_samples(
@@ -13771,6 +14184,64 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(global, 1, "other dimensions are untouched");
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    /// 明细保留任务删明细时保留汇总；之后"从明细重建"的维护命令必须拒绝执行，
+    /// 否则已删明细对应的历史统计会被永久抹掉。
+    #[tokio::test]
+    async fn postgres_rebuild_commands_refuse_after_retention_deleted_details() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 CLAUDE_POOL_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let mut old_record = usage_record("rebuild-guard-old", 800);
+        old_record.created_at = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let mut fresh_record = usage_record("rebuild-guard-fresh", 900);
+        fresh_record.created_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+        usage_store
+            .record_batch(vec![old_record, fresh_record])
+            .await
+            .unwrap();
+
+        // 明细完整时两个命令照常执行。
+        assert_eq!(
+            usage_store.rebuild_usage_route_dimensions().await.unwrap(),
+            2
+        );
+        assert_eq!(
+            usage_store.backfill_usage_overview_totals().await.unwrap(),
+            2
+        );
+
+        let result = usage_store
+            .hard_delete_cleanup_batch_preserving_summary(Utc::now(), 10)
+            .await
+            .unwrap();
+        assert_eq!(result.processed_rows, 1);
+
+        for err in [
+            usage_store
+                .rebuild_usage_route_dimensions()
+                .await
+                .unwrap_err(),
+            usage_store
+                .backfill_usage_overview_totals()
+                .await
+                .unwrap_err(),
+        ] {
+            let message = err.to_string();
+            assert!(message.contains("已拒绝执行"), "{message}");
+            assert!(message.contains("2") && message.contains("1"), "{message}");
+        }
+        // 汇总没有被动过。
+        let summary = usage_store.summary(500).await.unwrap();
+        assert_eq!(summary.total_requests, 2);
 
         store.drop_test_schema().await.unwrap();
     }

@@ -134,10 +134,12 @@ pub(crate) enum RequestRejectionReason {
     KeyUsageLimitExceeded,
     /// Usage-limit counters could not be read, so a limited key is rejected.
     KeyUsageLimitUnavailable,
+    /// Remote multimodal materialization is at its global concurrency bound.
+    MultimodalCapacity,
 }
 
 impl RequestRejectionReason {
-    const COUNT: usize = Self::KeyUsageLimitUnavailable as usize + 1;
+    const COUNT: usize = Self::MultimodalCapacity as usize + 1;
 
     const fn index(self) -> usize {
         self as usize
@@ -159,6 +161,7 @@ impl RequestRejectionReason {
             Self::MultimodalInvalid => "multimodal_invalid",
             Self::KeyUsageLimitExceeded => "key_usage_limit_exceeded",
             Self::KeyUsageLimitUnavailable => "key_usage_limit_unavailable",
+            Self::MultimodalCapacity => "multimodal_capacity",
         }
     }
 }
@@ -2252,6 +2255,7 @@ mod tests {
             RequestRejectionReason::MultimodalInvalid,
             RequestRejectionReason::KeyUsageLimitExceeded,
             RequestRejectionReason::KeyUsageLimitUnavailable,
+            RequestRejectionReason::MultimodalCapacity,
         ];
 
         for (expected_index, reason) in ALL_REASONS.iter().copied().enumerate() {

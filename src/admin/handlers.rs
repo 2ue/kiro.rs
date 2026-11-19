@@ -45,9 +45,15 @@ pub struct AuditLogsQueryParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountEventSummaryQueryParams {
-    /// Window in hours back from now, 1 to 720. Defaults to 24.
+    /// Window in hours back from now, 1 to 720. Defaults to 24. Ignored when `since` is given.
     pub hours: Option<u32>,
     pub account_source: Option<String>,
+    /// 窗口起点（RFC3339）；给了就按 `[since, until)` 统计，和查询窗口对齐。
+    pub since: Option<String>,
+    /// 窗口终点（RFC3339），缺省为现在。
+    pub until: Option<String>,
+    /// 只统计这个账号。
+    pub account_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,8 +137,12 @@ pub struct UsageAccountLatencyQueryParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountQualityHistoryQueryParams {
-    /// 回看小时数，1 到 168，默认 24。
+    /// 回看小时数，1 到 168，默认 24；给了 `from` 时忽略。
     pub hours: Option<u32>,
+    /// 窗口起点（RFC3339）；与 `to` 一起用于和查询窗口对齐。
+    pub from: Option<String>,
+    /// 窗口终点（RFC3339），缺省为现在。
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -982,10 +992,12 @@ pub async fn get_account_quality_history(
     Path(id): Path<u64>,
     Query(params): Query<AccountQualityHistoryQueryParams>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .get_account_quality_history(id, params.hours.unwrap_or(24))
-    {
+    match state.service.get_account_quality_history(
+        id,
+        params.hours.unwrap_or(24),
+        params.from,
+        params.to,
+    ) {
         Ok(data) => Json(data).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1134,12 +1146,16 @@ pub async fn get_account_event_summary(
     Query(params): Query<AccountEventSummaryQueryParams>,
 ) -> impl IntoResponse {
     let hours = params.hours.unwrap_or(24).clamp(1, 720);
-    Json(
-        state
-            .service
-            .get_account_event_summary(hours, params.account_source),
-    )
-    .into_response()
+    match state.service.get_account_event_summary(
+        hours,
+        params.account_source,
+        params.since,
+        params.until,
+        params.account_id,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 #[cfg(test)]

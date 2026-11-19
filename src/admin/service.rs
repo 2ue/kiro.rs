@@ -158,7 +158,16 @@ const USAGE_CLEANUP_RECOVERY_POLL_MAX_SECS: u64 = 15;
 const USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRIES: usize = 5;
 const USAGE_CLEANUP_LOCK_CONTENTION_RETRY_MS: u64 = 25;
 const USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRY_MS: u64 = 400;
+/// 存储队列满时丢审计的告警：10 秒最多一条，带被压掉的条数，暴力尝试时不刷屏。
+static AUDIT_QUEUE_FULL_LOG_THROTTLE: std::sync::LazyLock<
+    crate::common::log_throttle::LogThrottle,
+> = std::sync::LazyLock::new(|| {
+    crate::common::log_throttle::LogThrottle::new(std::time::Duration::from_secs(10))
+});
 const ADMIN_USAGE_CACHE_TTL_SECS: usize = 2;
+/// 延迟分位要扫明细做 percentile_cont，结果按整点窗口缓存一分钟，
+/// 避免自动刷新和多个控制台页面反复扫同一段明细。
+const ADMIN_USAGE_LATENCY_CACHE_TTL_SECS: usize = 60;
 const ADMIN_ACCOUNT_STATUS_CACHE_TTL_SECS: usize = 2;
 const ADMIN_CACHE_DEFAULT_LOCAL_TTL_SECS: usize = 2;
 const ADMIN_CACHE_REDIS_READ_TIMEOUT: StdDuration = StdDuration::from_millis(250);
@@ -179,6 +188,56 @@ fn admin_usage_dashboard_cache_key(timezone: Option<&str>, high_cache_threshold:
     format!(
         "admin_cache:usage:dashboard:{}:{}",
         timezone, high_cache_threshold
+    )
+}
+
+/// 质量历史窗口：给了 `from` 就用 `[from, to)`（`to` 缺省为现在），否则取最近 `hours`
+/// 小时。窗口最长 7 天（采样只保留 7 天），终点不晚于现在。
+fn resolve_quality_history_window(
+    now: DateTime<Utc>,
+    hours: u32,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), AdminServiceError> {
+    let parse = |label: &str, value: &str| {
+        DateTime::parse_from_rfc3339(value.trim())
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|_| {
+                AdminServiceError::InvalidRequest(format!("{label} 不是合法的 RFC3339 时间"))
+            })
+    };
+    let max_window = ChronoDuration::days(7);
+    let from = from.filter(|value| !value.trim().is_empty());
+    let to = to.filter(|value| !value.trim().is_empty());
+    let (since, until) = match from {
+        Some(from) => {
+            let since = parse("from", &from)?;
+            let until = match to {
+                Some(to) => parse("to", &to)?,
+                None => now,
+            }
+            .min(now);
+            if until <= since {
+                return Err(AdminServiceError::InvalidRequest(
+                    "质量历史窗口的结束时间必须晚于开始时间".to_string(),
+                ));
+            }
+            (since.max(until - max_window), until)
+        }
+        None => {
+            let hours = hours.clamp(1, 24 * 7);
+            (now - ChronoDuration::hours(i64::from(hours)), now)
+        }
+    };
+    Ok((since, until))
+}
+
+fn admin_usage_latency_cache_key(kind: &str, spec: &UsageOverviewSpec, scope: &str) -> String {
+    let timezone = spec.timezone.trim().replace([':', '/', ' '], "_");
+    format!(
+        "admin_cache:usage:latency:{kind}:{timezone}:{}:{}:{scope}",
+        spec.from.to_rfc3339(),
+        spec.to.to_rfc3339()
     )
 }
 
@@ -235,23 +294,47 @@ fn mask_secret(value: &str) -> String {
     format!("{}...{}", head, tail)
 }
 
-/// 全局代理密码只回传脱敏值；未设置或为空时返回 `None`。
-fn masked_proxy_password(value: Option<&str>) -> Option<String> {
-    value.filter(|value| !value.is_empty()).map(mask_secret)
+/// 代理地址里内嵌的用户名和密码（`http://user:pass@host`）换成 `***`；解析不了的原样返回。
+pub(crate) fn mask_proxy_url_credentials(value: &str) -> String {
+    match url::Url::parse(value) {
+        Ok(mut url) if !url.username().is_empty() || url.password().is_some() => {
+            if !url.username().is_empty() {
+                let _ = url.set_username("***");
+            }
+            if url.password().is_some() {
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        }
+        _ => value.to_string(),
+    }
 }
 
-/// 写入全局代理密码。读接口只回脱敏值，客户端把读到的配置原样回传时，提交值等于当前
-/// 密码的脱敏值：这时保留原密码，否则会把打码文本存成真密码、代理认证随之失败。
+/// 代理地址是否内嵌了凭据。
+pub(crate) fn proxy_url_has_credentials(value: &str) -> bool {
+    url::Url::parse(value)
+        .map(|url| !url.username().is_empty() || url.password().is_some())
+        .unwrap_or(false)
+}
+
+/// 全局代理密码在读接口里的占位符。代理密码通常很短，按前后缀打码几乎等于明文，
+/// 所以已设置时只回这个固定值。
+pub(crate) const PROXY_PASSWORD_PLACEHOLDER: &str = "********";
+
+/// 全局代理密码只回占位符；未设置或为空时返回 `None`。
+fn masked_proxy_password(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|_| PROXY_PASSWORD_PLACEHOLDER.to_string())
+}
+
+/// 写入全局代理密码。客户端把读到的配置原样回传时提交的是占位符：保留原密码，
+/// 否则会把占位符存成真密码、代理认证随之失败。`None` 表示清空，其它值表示设置新密码。
 fn apply_proxy_password_update(current: &mut Option<String>, submitted: Option<String>) {
-    let echoes_mask = match (submitted.as_deref(), current.as_deref()) {
-        (Some(submitted), Some(existing)) => {
-            masked_proxy_password(Some(existing)).as_deref() == Some(submitted)
-        }
-        _ => false,
-    };
-    if !echoes_mask {
-        *current = submitted;
+    if submitted.as_deref() == Some(PROXY_PASSWORD_PLACEHOLDER) {
+        return;
     }
+    *current = submitted;
 }
 
 fn request_api_key_items(
@@ -668,7 +751,7 @@ impl AdminService {
         );
     }
 
-    /// Current usage against each limit of every request key that has limits.
+    /// 每个请求 Key 的限额用量（有限额时）与最近 24 小时的准入拒绝次数。
     pub async fn get_request_key_usage_limits(
         &self,
     ) -> Result<RequestKeyUsageLimitsResponse, AdminServiceError> {
@@ -687,20 +770,30 @@ impl AdminService {
                 HashMap::new()
             }
         };
+        // 每个 Key 都返回一条：没配用量限额的 Key 也会被并发、RPM 等准入拒绝，
+        // 拒绝次数同样要能看到；只有配了限额的才去读计数。
+        let policies: HashMap<String, RequestApiKeyPolicy> = config
+            .request_api_key_policies()
+            .into_iter()
+            .map(|policy| (policy.api_key.clone(), policy))
+            .collect();
         let mut items = Vec::new();
-        for policy in config.request_api_key_policies() {
-            if policy.usage_limits.is_empty() {
-                continue;
-            }
-            let key_id = stable_request_api_key_id(&policy.api_key);
-            let (statuses, error) = match limiter.statuses(&key_id, now).await {
-                Ok(statuses) => (statuses.unwrap_or_default(), None),
-                Err(err) => (Vec::new(), Some(err.to_string())),
+        for api_key in config.request_api_keys() {
+            let key_id = stable_request_api_key_id(&api_key);
+            let policy = policies.get(&api_key);
+            let has_limits = policy.is_some_and(|policy| !policy.usage_limits.is_empty());
+            let (statuses, error) = if has_limits {
+                match limiter.statuses(&key_id, now).await {
+                    Ok(statuses) => (statuses.unwrap_or_default(), None),
+                    Err(err) => (Vec::new(), Some(err.to_string())),
+                }
+            } else {
+                (Vec::new(), None)
             };
             let rejected_requests_24h = rejections.get(&key_id).copied().unwrap_or(0);
             items.push(RequestKeyUsageLimitItem {
                 key_id,
-                enabled: policy.enabled,
+                enabled: policy.is_none_or(|policy| policy.enabled),
                 statuses,
                 rejected_requests_24h,
                 error,
@@ -1762,6 +1855,18 @@ impl AdminService {
                     "after": Self::summarize_runtime_config_array(after),
                 }));
             }
+            _ if path.rsplit('.').next() == Some("proxyUrl") => {
+                // 代理地址可能内嵌账号密码，审计里只留打码后的地址。
+                let mask = |value: &Value| match value {
+                    Value::String(value) => Value::String(mask_proxy_url_credentials(value)),
+                    other => other.clone(),
+                };
+                changes.push(json!({
+                    "path": path,
+                    "before": Self::summarize_runtime_config_value(&mask(before)),
+                    "after": Self::summarize_runtime_config_value(&mask(after)),
+                }));
+            }
             _ => {
                 changes.push(json!({
                     "path": path,
@@ -1973,10 +2078,11 @@ impl AdminService {
                     .await
             },
         );
-        if !queued {
+        if !queued && let Some(skipped) = AUDIT_QUEUE_FULL_LOG_THROTTLE.admit() {
             tracing::warn!(
                 action,
                 object_type,
+                skipped_since_last_log = skipped,
                 "存储任务队列已满，这条 Admin 审计日志被丢弃"
             );
         }
@@ -2136,9 +2242,24 @@ impl AdminService {
                 "账号延迟分位需要扫描用量明细，时间范围不能超过 {USAGE_OVERVIEW_HOURLY_MAX_DAYS} 天"
             )));
         }
-        self.usage_recorder
+        let cache_key = admin_usage_latency_cache_key(
+            "account",
+            &spec,
+            &account_id.map_or_else(|| "all".to_string(), |id| id.to_string()),
+        );
+        if let Some(cached) = self.read_admin_cache::<UsageAccountLatencyResponse>(&cache_key) {
+            return Ok(cached);
+        }
+        let latency = self
+            .usage_recorder
             .account_latency(spec, account_id)
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_usage_admin_cache(
+            cache_key,
+            latency.clone(),
+            ADMIN_USAGE_LATENCY_CACHE_TTL_SECS,
+        );
+        Ok(latency)
     }
 
     /// 按路由前缀的总耗时 / 首字延迟分位数。扫明细，范围同样限制在按小时总览的上限内。
@@ -2162,9 +2283,20 @@ impl AdminService {
                 "路由延迟分位需要扫描用量明细，时间范围不能超过 {USAGE_OVERVIEW_HOURLY_MAX_DAYS} 天"
             )));
         }
-        self.usage_recorder
+        let cache_key = admin_usage_latency_cache_key("route", &spec, "all");
+        if let Some(cached) = self.read_admin_cache::<UsageRouteLatencyResponse>(&cache_key) {
+            return Ok(cached);
+        }
+        let latency = self
+            .usage_recorder
             .route_latency(spec)
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_usage_admin_cache(
+            cache_key,
+            latency.clone(),
+            ADMIN_USAGE_LATENCY_CACHE_TTL_SECS,
+        );
+        Ok(latency)
     }
 
     /// 一个账号最近 `hours` 小时的质量分历史（EWMA 快照），按时间升序。
@@ -2172,20 +2304,37 @@ impl AdminService {
         &self,
         account_id: u64,
         hours: u32,
+        from: Option<String>,
+        to: Option<String>,
     ) -> Result<AccountQualityHistoryResponse, AdminServiceError> {
-        let hours = hours.clamp(1, 24 * 7);
-        let since = Utc::now() - ChronoDuration::hours(i64::from(hours));
+        let (since, until) = resolve_quality_history_window(Utc::now(), hours, from, to)?;
+        let window_secs = (until - since).num_seconds().max(1);
+        // 最多约 720 个点；最细一分钟一桶（采样本身每账号每分钟一行）。
+        let bucket_secs = u32::try_from(((window_secs + 719) / 720).max(60)).unwrap_or(u32::MAX);
         let store = self.postgres_store.clone();
         let points = block_on_admin_store(async move {
             store
-                .account_quality_history(account_id, since, 2_000)
+                .account_quality_history(account_id, since, until, bucket_secs)
                 .await
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        if points.is_empty() {
+            // 账号不存在且没有历史点时按 404；已删除账号的历史仍可查。
+            let store = self.postgres_store.clone();
+            let exists =
+                block_on_admin_store(async move { store.get_account(account_id, false).await })
+                    .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+                    .is_some();
+            if !exists {
+                return Err(AdminServiceError::NotFound { id: account_id });
+            }
+        }
         Ok(AccountQualityHistoryResponse {
             account_id,
-            hours,
+            hours: u32::try_from(((window_secs + 3599) / 3600).max(1)).unwrap_or(u32::MAX),
             since: since.to_rfc3339(),
+            until: until.to_rfc3339(),
+            bucket_secs,
             points: points
                 .into_iter()
                 .map(|point| AccountQualityHistoryPoint {
@@ -2952,8 +3101,39 @@ impl AdminService {
         &self,
         hours: u32,
         account_source: Option<String>,
-    ) -> AccountEventSummaryResponse {
-        let since = chrono::Utc::now() - chrono::Duration::hours(i64::from(hours));
+        since: Option<String>,
+        until: Option<String>,
+        account_id: Option<u64>,
+    ) -> Result<AccountEventSummaryResponse, AdminServiceError> {
+        let now = chrono::Utc::now();
+        let parse = |label: &str, value: &str| {
+            DateTime::parse_from_rfc3339(value.trim())
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|_| {
+                    AdminServiceError::InvalidRequest(format!("{label} 不是合法的 RFC3339 时间"))
+                })
+        };
+        let explicit_since = since
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse("since", value))
+            .transpose()?;
+        let until = until
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse("until", value))
+            .transpose()?
+            .map(|until| until.min(now));
+        let since =
+            explicit_since.unwrap_or_else(|| now - chrono::Duration::hours(i64::from(hours)));
+        if until.is_some_and(|until| until <= since) {
+            return Err(AdminServiceError::InvalidRequest(
+                "统计窗口的结束时间必须晚于开始时间".to_string(),
+            ));
+        }
+        let hours =
+            u32::try_from(((until.unwrap_or(now) - since).num_seconds().max(1) + 3599) / 3600)
+                .unwrap_or(u32::MAX);
         let source = account_source
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
@@ -2961,19 +3141,20 @@ impl AdminService {
         let query_source = source.clone();
         let items = block_on_admin_store(async move {
             store
-                .summarize_account_events(since, query_source.as_deref())
+                .summarize_account_events(since, until, query_source.as_deref(), account_id)
                 .await
         })
         .unwrap_or_else(|err| {
             tracing::warn!("统计账号异动失败: {}", err);
             Vec::new()
         });
-        AccountEventSummaryResponse {
+        Ok(AccountEventSummaryResponse {
             hours,
             since: since.to_rfc3339(),
+            until: until.unwrap_or(now).to_rfc3339(),
             account_source: source,
             items,
-        }
+        })
     }
 
     /// 获取运行时全局配置。
@@ -3201,9 +3382,33 @@ impl AdminService {
     // ============ 错误分类 ============
 }
 
+/// 内存里保留的用量记录条数上限；每条记录几 KB，十万条已是数百 MB。
+const MAX_USAGE_RECORD_LIMIT: usize = 100_000;
+
+/// 全局代理地址不带协议时（如 `127.0.0.1:7890`），底层 HTTP 库按 http 处理；
+/// 这里同样补上 `http://`，否则存量配置在升级后会让所有运行配置保存都失败。
+fn normalize_global_proxy_url(proxy_url: &mut Option<String>) {
+    if let Some(value) = proxy_url.as_mut() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            *proxy_url = None;
+        } else if !trimmed.contains("://") {
+            *value = format!("http://{trimmed}");
+        } else if trimmed.len() != value.len() {
+            *value = trimmed.to_string();
+        }
+    }
+}
+
 fn normalize_and_validate_runtime_config(config: &mut Config) -> Result<(), String> {
+    normalize_global_proxy_url(&mut config.proxy_url);
     validate_proxy_url_field("proxyUrl", config.proxy_url.as_deref())
         .map_err(|err| err.to_string())?;
+    if !(1..=MAX_USAGE_RECORD_LIMIT).contains(&config.usage_record_limit) {
+        return Err(format!(
+            "usageRecordLimit 必须在 1 到 {MAX_USAGE_RECORD_LIMIT} 之间"
+        ));
+    }
     config.request_admission.validate()?;
     config.route_features.validate()?;
     config.prompt_injection.validate()?;
@@ -4568,14 +4773,30 @@ impl AdminService {
         &self,
         routes: &crate::model::routes::RoutesConfig,
     ) -> Result<(), AdminServiceError> {
-        // 与手动保存路由同一套归一化与校验（含模型通配符只能在末尾），场景应用不能绕过。
-        let routes = management::normalize_routes(routes.clone(), &self.runtime.config())?;
+        // 与手动保存路由同一套归一化与校验（含模型通配符只能在末尾），场景应用不能绕过；
+        // 也不能删掉仍被请求 Key 的 allowedRoutes 引用的路由，否则之后所有 Key 的增删改都会失败。
+        let config = self.runtime.config();
+        let routes = management::normalize_routes(routes.clone(), &config)?;
+        management::reject_removing_routes_referenced_by_keys(
+            &config.routes,
+            &routes,
+            &config.request_api_key_policies(),
+        )?;
         self.runtime
             .update(|config| config.routes = routes.clone())
             .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
         self.invalidate_admin_cache_pattern("admin_cache:accounts:*");
         Ok(())
     }
+    /// 保存路由场景时按手动保存路由同一套规则归一化，避免存进去的快照与应用后的结果不一致
+    /// （否则刚应用完就显示"未同步"）。
+    pub(super) fn normalize_route_scenario_routes(
+        &self,
+        routes: crate::model::routes::RoutesConfig,
+    ) -> Result<crate::model::routes::RoutesConfig, AdminServiceError> {
+        management::normalize_routes(routes, &self.runtime.config())
+    }
+
     pub(super) fn route_scenario_audit(
         &self,
         action: &'static str,

@@ -7001,6 +7001,40 @@ fn account_error_classifies_bare_not_found_as_retryable_without_cooldown() {
     ));
 }
 
+#[test]
+fn account_error_classifies_anthropic_model_not_found_as_model_unavailable() {
+    let err = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(
+            br#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-not-real"}}"#,
+        ),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+    assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+    assert_eq!(
+        err.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
+        Some("model_unavailable")
+    );
+    assert!(!external_error_affects_pool_quality(&err));
+
+    // 其它 not_found_error（资源不存在）仍是裸 404：可换号，但不计入账号质量。
+    let bare = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(
+            br#"{"type":"error","error":{"type":"not_found_error","message":"file_abc not found"}}"#,
+        ),
+        HeaderMap::new(),
+        &AccountsConfig::default(),
+    );
+    assert!(bare.retryable);
+    assert!(bare.cooldown.is_none());
+    assert!(
+        !external_error_affects_pool_quality(&bare),
+        "bare 404 must stay quality-neutral"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_bare_not_found_fails_over_to_the_next_pool() {
     let Some((manager, postgres)) = test_account_manager().await else {

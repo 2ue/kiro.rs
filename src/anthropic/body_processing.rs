@@ -758,10 +758,9 @@ async fn download_remote_multimodal_source(
         bytes.as_slice(),
     )
     .ok_or_else(|| {
-        format!(
-            "unsupported {} URL media type for {}",
-            block_type, final_url
-        )
+        // 跳转后的地址可能带预签名参数，只进日志，不回给下游。
+        tracing::warn!(block_type, url = %final_url, "unsupported remote multimodal media type");
+        format!("unsupported {} URL media type", block_type)
     })?;
 
     let encoded_len = base64_encoded_len(bytes.len())?;

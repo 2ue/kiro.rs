@@ -433,7 +433,8 @@ impl AdminService {
         &self,
         req: SaveRouteScenarioRequest,
     ) -> Result<RouteScenario, AdminServiceError> {
-        let (name, description, content) = validate_request(&req)?;
+        let (name, description, mut content) = validate_request(&req)?;
+        content.routes = self.normalize_route_scenario_routes(content.routes)?;
         let value = serde_json::to_value(&content)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let store = self.route_scenario_store();
@@ -457,7 +458,8 @@ impl AdminService {
         id: u64,
         req: SaveRouteScenarioRequest,
     ) -> Result<RouteScenario, AdminServiceError> {
-        let (name, description, content) = validate_request(&req)?;
+        let (name, description, mut content) = validate_request(&req)?;
+        content.routes = self.normalize_route_scenario_routes(content.routes)?;
         let value = serde_json::to_value(&content)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let store = self.route_scenario_store();

@@ -313,6 +313,10 @@ pub struct AccountQualityHistoryResponse {
     pub account_id: u64,
     pub hours: u32,
     pub since: String,
+    /// 窗口终点。
+    pub until: String,
+    /// 降采样桶宽（秒）；每个点是桶内平均值。
+    pub bucket_secs: u32,
     pub points: Vec<AccountQualityHistoryPoint>,
 }
 

@@ -85,7 +85,7 @@ pub(super) fn normalize_routes(
 
 /// 删路由前检查请求 Key 的 `allowedRoutes`：被删前缀仍被任一 Key 引用时拒绝，并列出 Key 名称。
 /// 两侧都按 `normalize_route_prefix` 比较，所以 policy 里写成 `/`、`/v1` 的根前缀也能对上。
-fn reject_removing_routes_referenced_by_keys(
+pub(super) fn reject_removing_routes_referenced_by_keys(
     before: &RoutesConfig,
     after: &RoutesConfig,
     policies: &[RequestApiKeyPolicy],

@@ -784,11 +784,58 @@ fn runtime_config_normalizes_custom_routes_and_installs_defaults() {
 // ============ 批次 E：校验、脱敏与审计 ============
 
 #[test]
+fn quality_history_window_follows_the_query_window() {
+    let now = DateTime::parse_from_rfc3339("2026-11-19T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    // 没给 from：最近 hours 小时，最多 7 天。
+    let (since, until) = resolve_quality_history_window(now, 24, None, None).unwrap();
+    assert_eq!(until, now);
+    assert_eq!(now - since, ChronoDuration::hours(24));
+    let (since, _) = resolve_quality_history_window(now, 10_000, None, None).unwrap();
+    assert_eq!(now - since, ChronoDuration::days(7));
+    // 给了窗口：与查询窗口一致，终点不晚于现在，最长 7 天。
+    let (since, until) = resolve_quality_history_window(
+        now,
+        24,
+        Some("2026-11-18T00:00:00Z".into()),
+        Some("2026-11-18T06:00:00Z".into()),
+    )
+    .unwrap();
+    assert_eq!(since.to_rfc3339(), "2026-11-18T00:00:00+00:00");
+    assert_eq!(until.to_rfc3339(), "2026-11-18T06:00:00+00:00");
+    let (since, until) = resolve_quality_history_window(
+        now,
+        24,
+        Some("2026-10-01T00:00:00Z".into()),
+        Some("2026-12-01T00:00:00Z".into()),
+    )
+    .unwrap();
+    assert_eq!(until, now);
+    assert_eq!(until - since, ChronoDuration::days(7));
+    assert!(resolve_quality_history_window(now, 24, Some("bad".into()), None).is_err());
+    assert!(
+        resolve_quality_history_window(
+            now,
+            24,
+            Some("2026-11-18T06:00:00Z".into()),
+            Some("2026-11-18T00:00:00Z".into())
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn proxy_password_update_keeps_secret_when_client_echoes_the_mask() {
     let secret = "super-secret-proxy-pass".to_string();
     let masked = masked_proxy_password(Some(&secret)).unwrap();
+    assert_eq!(masked, PROXY_PASSWORD_PLACEHOLDER, "读接口只回固定占位符");
+    assert_eq!(
+        masked_proxy_password(Some("pass")).as_deref(),
+        Some("********")
+    );
 
-    // 原样回传读接口给的脱敏值：保留原密码。
+    // 原样回传读接口给的占位符：保留原密码。
     let mut current = Some(secret.clone());
     apply_proxy_password_update(&mut current, Some(masked.clone()));
     assert_eq!(current.as_deref(), Some(secret.as_str()));
@@ -799,10 +846,10 @@ fn proxy_password_update_keeps_secret_when_client_echoes_the_mask() {
     apply_proxy_password_update(&mut current, None);
     assert_eq!(current, None);
 
-    // 没有旧密码时，提交什么就存什么（包括恰好长得像脱敏值的字符串）。
+    // 没有旧密码时提交占位符也不会把占位符存成密码。
     let mut empty = None;
-    apply_proxy_password_update(&mut empty, Some(masked.clone()));
-    assert_eq!(empty.as_deref(), Some(masked.as_str()));
+    apply_proxy_password_update(&mut empty, Some(masked));
+    assert_eq!(empty, None);
 }
 
 #[test]
@@ -811,7 +858,7 @@ fn runtime_config_masks_proxy_password_and_rejects_bad_proxy_urls() {
     assert_eq!(masked_proxy_password(Some("")), None);
     let masked = masked_proxy_password(Some("super-secret-proxy-pass")).unwrap();
     assert!(!masked.contains("secret"), "{masked}");
-    assert!(masked.contains("..."), "{masked}");
+    assert_eq!(masked, PROXY_PASSWORD_PLACEHOLDER);
 
     for valid in [
         None,
@@ -834,11 +881,63 @@ fn runtime_config_masks_proxy_password_and_rejects_bad_proxy_urls() {
     ] {
         let err = validate_proxy_url_field("proxyUrl", Some(invalid)).unwrap_err();
         assert!(err.to_string().contains("proxyUrl"), "{invalid}: {err}");
+        if invalid == "127.0.0.1:7890" {
+            // 全局代理不带协议时按 http 补全（与底层 HTTP 库一致），存量配置不会卡住保存。
+            continue;
+        }
         let mut config = Config::default();
         config.proxy_url = Some(invalid.to_string());
         assert!(
             normalize_and_validate_runtime_config(&mut config).is_err(),
             "全局代理 {invalid} 必须被拒绝"
+        );
+    }
+    let mut config = Config::default();
+    config.proxy_url = Some(" 127.0.0.1:7890 ".to_string());
+    normalize_and_validate_runtime_config(&mut config).expect("不带协议的全局代理按 http 补全");
+    assert_eq!(config.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+    let mut config = Config::default();
+    config.proxy_url = Some("   ".to_string());
+    normalize_and_validate_runtime_config(&mut config).expect("空白代理视为未配置");
+    assert_eq!(config.proxy_url, None);
+}
+
+#[test]
+fn runtime_config_audit_masks_proxy_url_credentials() {
+    let mut changes = Vec::new();
+    AdminService::append_runtime_config_changes(
+        "proxyUrl",
+        &serde_json::json!("http://alice:old-secret@proxy.example:3128"),
+        &serde_json::json!("http://alice:new-secret@proxy.example:3129"),
+        &mut changes,
+    );
+    let text = serde_json::to_string(&changes).unwrap();
+    assert!(!text.contains("secret"), "{text}");
+    assert!(!text.contains("alice"), "{text}");
+    assert!(text.contains("proxy.example:3129"), "{text}");
+    assert_eq!(
+        mask_proxy_url_credentials("http://proxy.example:3128"),
+        "http://proxy.example:3128"
+    );
+    assert!(proxy_url_has_credentials("socks5://u:p@10.0.0.1:1080"));
+    assert!(!proxy_url_has_credentials("socks5://10.0.0.1:1080"));
+}
+
+#[test]
+fn runtime_config_rejects_out_of_range_usage_record_limit() {
+    for (limit, ok) in [
+        (0, false),
+        (1, true),
+        (5_000, true),
+        (100_000, true),
+        (100_001, false),
+    ] {
+        let mut config = Config::default();
+        config.usage_record_limit = limit;
+        assert_eq!(
+            normalize_and_validate_runtime_config(&mut config).is_ok(),
+            ok,
+            "usageRecordLimit {limit}"
         );
     }
 }
@@ -1113,9 +1212,21 @@ async fn admin_audit_records_failed_changes_auth_failures_capture_and_export() {
     );
     let mut routes = runtime.config().routes;
     routes.routes.retain(|route| route.prefix != team_prefix);
-    let err = service.update_routes(routes).unwrap_err();
+    let err = service.update_routes(routes.clone()).unwrap_err();
     assert!(err.to_string().contains(&format!("team-{marker}")), "{err}");
     assert!(err.to_string().contains(&team_prefix), "{err}");
+    // 应用路由场景走同一个检查：场景快照里没有这条被引用的路由时拒绝应用，路由保持不变。
+    let err = service.set_route_scenario_definitions(&routes).unwrap_err();
+    assert!(err.to_string().contains(&format!("team-{marker}")), "{err}");
+    assert!(
+        runtime
+            .config()
+            .routes
+            .routes
+            .iter()
+            .any(|route| route.prefix == team_prefix),
+        "scenario apply must not delete a key-referenced route"
+    );
 
     // 成功路径：创建账号 → 提升模型 → 删除，promote 要有审计。
     let created = service

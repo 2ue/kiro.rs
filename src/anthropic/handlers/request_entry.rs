@@ -167,9 +167,7 @@ pub(super) async fn route_body_patches(
             config,
         )
         .await
-        .map_err(|error| {
-            EntryRequestError::invalid(error.to_string(), "image_processing_failed")
-        })?;
+        .map_err(entry_error_from_multimodal_preprocessing)?;
         // 物化（含可选压缩）之后仍超过上游 5MB 内联上限的当前轮图片，按官方 400 拒绝；
         // 不这样做模型会当作看不到图片继续回答。功能关闭时不做此检查，原样透传。
         if let Some(violation) = super::super::payload_guard::find_oversized_current_image(&payload)
@@ -419,11 +417,34 @@ pub(super) struct EntryRequestError {
     original_effort: Option<String>,
 }
 
+/// 多模态预处理失败：远程资源下载并发已满是服务端暂时过载，按 529 overloaded_error
+/// 让客户端重试（与 count_tokens 入口一致）；其余错误是请求本身的问题，按 400 拒绝。
+fn entry_error_from_multimodal_preprocessing(message: String) -> EntryRequestError {
+    if body_processing::is_remote_multimodal_capacity_error(&message) {
+        EntryRequestError::overloaded(
+            "Remote media processing is temporarily at capacity. Retry shortly.",
+            "image_processing_capacity",
+        )
+    } else {
+        EntryRequestError::invalid(message, "image_processing_failed")
+    }
+}
+
 impl EntryRequestError {
     fn invalid(message: impl Into<String>, reason: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
+            message: message.into(),
+            reason,
+            original_effort: None,
+        }
+    }
+
+    fn overloaded(message: impl Into<String>, reason: &'static str) -> Self {
+        Self {
+            status: StatusCode::from_u16(529).expect("529 is a valid status code"),
+            error_type: "overloaded_error",
             message: message.into(),
             reason,
             original_effort: None,
@@ -436,13 +457,20 @@ impl EntryRequestError {
     }
 
     pub(super) fn to_response(&self, request_id: &str) -> Response {
-        envelope::error_response_with_id_and_headers(
+        let mut response = envelope::error_response_with_id_and_headers(
             self.status,
             self.error_type,
             envelope::public_message_with_error_id(&self.message, request_id),
             request_id,
             [("x-error-id", request_id.to_string())],
-        )
+        );
+        if self.status.as_u16() == 529 {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 
     fn rejection_reason(&self) -> RequestRejectionReason {
@@ -450,6 +478,7 @@ impl EntryRequestError {
             "strict_request_protocol_contamination" => {
                 RequestRejectionReason::StrictRequestProtocolContamination
             }
+            "image_processing_capacity" => RequestRejectionReason::MultimodalCapacity,
             _ => RequestRejectionReason::RequestEntryInvalid,
         }
     }
@@ -818,6 +847,37 @@ mod tests {
     };
     use crate::common::auth::RequestApiKeyStore;
     use crate::model::config::{DEFAULT_MISSING_MAX_TOKENS_VALUE, RequestAdmissionConfig};
+
+    /// messages 入口遇到远程多模态下载并发已满时按 529 overloaded_error 返回并带 retry-after，
+    /// 客户端会重试；其它预处理失败仍是 400 请求错误。
+    #[test]
+    fn multimodal_capacity_maps_to_retryable_overload() {
+        let capacity = entry_error_from_multimodal_preprocessing(
+            body_processing::REMOTE_MULTIMODAL_CAPACITY_ERROR.to_string(),
+        );
+        assert_eq!(capacity.status.as_u16(), 529);
+        assert_eq!(capacity.error_type, "overloaded_error");
+        assert_eq!(
+            capacity.rejection_reason(),
+            RequestRejectionReason::MultimodalCapacity
+        );
+        let response = capacity.to_response("req_capacity");
+        assert_eq!(response.status().as_u16(), 529);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let invalid =
+            entry_error_from_multimodal_preprocessing("unsupported image URL media type".into());
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.error_type, "invalid_request_error");
+        let response = invalid.to_response("req_invalid");
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+    }
 
     fn test_state(recorder: Arc<UsageRecorder>) -> AppState {
         AppState::new(
