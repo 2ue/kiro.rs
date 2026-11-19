@@ -11,9 +11,18 @@ import {
   pushInventory,
   renameInventoryGroup,
   setInventoryGroup,
+  setInventoryProxy,
+  testInventory,
   updateInventory,
 } from '@/api/inventory'
-import type { InventoryListQuery, InventoryPushRequest, InventoryUpdateRequest, MoveToInventoryRequest } from '@/types/api'
+import type {
+  InventoryListQuery,
+  InventoryProxyRequest,
+  InventoryPushRequest,
+  InventoryTestRequest,
+  InventoryUpdateRequest,
+  MoveToInventoryRequest,
+} from '@/types/api'
 
 function invalidateInventory(queryClient: QueryClient, poolChanged = false) {
   queryClient.invalidateQueries({ queryKey: ['inventory'] })
@@ -43,6 +52,19 @@ export function useImportInventory() {
 export function useCheckInventory() {
   const queryClient = useQueryClient()
   return useMutation({ mutationFn: (ids: number[]) => checkInventory(ids), onSuccess: () => invalidateInventory(queryClient) })
+}
+
+export function useTestInventory() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: InventoryTestRequest }) => testInventory(id, payload),
+    onSuccess: () => invalidateInventory(queryClient),
+  })
+}
+
+export function useSetInventoryProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({ mutationFn: (payload: InventoryProxyRequest) => setInventoryProxy(payload), onSuccess: () => invalidateInventory(queryClient) })
 }
 
 export function usePushInventory() {

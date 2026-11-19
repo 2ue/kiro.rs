@@ -13250,6 +13250,26 @@ impl KiroProvider {
             .await
     }
 
+    /// Calls the API once for a credential outside the pool (an inventory account) with a
+    /// context the caller built: no scheduling slot, nothing recorded against a pool account.
+    pub(crate) async fn call_api_with_detached_context(
+        &self,
+        ctx: CallContext,
+        request_body: &str,
+        credential_label: String,
+    ) -> anyhow::Result<KiroApiResponse> {
+        let request_kiro_version = self.token_manager.runtime_config().effective_kiro_version();
+        let credential_context = format!("库存账号 {}", credential_label);
+        self.call_api_with_single_context(
+            ctx,
+            request_body,
+            credential_label,
+            credential_context,
+            request_kiro_version,
+        )
+        .await
+    }
+
     async fn call_api_with_single_context(
         &self,
         mut ctx: CallContext,

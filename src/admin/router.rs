@@ -103,8 +103,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(batch_create_kiro_api_keys),
         )
         .route("/inventory", get(inventory_http::list))
+        .route("/inventory/ids", get(inventory_http::ids))
         .route("/inventory/import", post(inventory_http::import))
         .route("/inventory/check", post(inventory_http::check))
+        .route("/inventory/proxy", post(inventory_http::proxy))
         .route("/inventory/push", post(inventory_http::push))
         .route("/inventory/delete", post(inventory_http::delete))
         .route("/inventory/groups", get(inventory_http::groups))
@@ -127,6 +129,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(inventory_http::move_from_pool),
         )
         .route("/inventory/{id}", put(inventory_http::update))
+        .route("/inventory/{id}/test", post(inventory_http::test))
         .route(
             "/route-scenarios",
             get(route_scenario_http::list).post(route_scenario_http::create),

@@ -15375,10 +15375,41 @@ impl MultiTokenManager {
         &self,
         credentials: KiroCredentials,
     ) -> anyhow::Result<KiroCredentials> {
-        Ok(self
+        let source = credentials.clone();
+        let refreshed = self
             .acquire_context_for_external_credentials(credentials)
             .await?
-            .credentials)
+            .credentials;
+        // The call context carries the proxy resource resolved into a URL and password. The
+        // stored credential keeps its own binding, or a change to the resource never reaches it.
+        Ok(Self::preserve_proxy_fields(refreshed, &source))
+    }
+
+    /// A call context for a credential outside the pool whose access token (or API key) is
+    /// still good: resolves its proxy, does not refresh, takes no scheduling slot.
+    pub fn detached_call_context(
+        &self,
+        mut credentials: KiroCredentials,
+    ) -> anyhow::Result<CallContext> {
+        credentials.canonicalize_auth_method();
+        credentials.normalize_api_key_defaults();
+        credentials.normalize_external_idp_defaults();
+        let credentials = self.resolve_proxy_for_credential(credentials)?;
+        let token = if credentials.is_api_key_credential() {
+            credentials.kiro_api_key.clone()
+        } else {
+            credentials.access_token.clone()
+        }
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("凭据缺少可用 token"))?;
+        Ok(CallContext {
+            id: EXTERNAL_CREDENTIAL_CONTEXT_ID,
+            credentials,
+            token,
+            sticky_bound: false,
+            fallback_from_sticky: false,
+            in_flight_lease: None,
+        })
     }
 
     /// Queries quota and subscription for a credential that is not in the pool, using an access

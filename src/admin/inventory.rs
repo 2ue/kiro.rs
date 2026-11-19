@@ -18,24 +18,28 @@ use sha2::{Digest, Sha256};
 use super::error::AdminServiceError;
 use super::service::{
     AdminService, balance_response_from_usage_public, credential_health_status_public,
+    subscription_filter_key_public, subscription_key_public,
 };
 use super::types::{
     AddCredentialRequest, BalanceResponse, BatchCredentialImportDefaults, CredentialAccountInfo,
-    CredentialStatusItem,
+    CredentialStatusItem, TestCredentialRequest,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{AuxiliaryConcurrencySaturated, RefreshFailureStage};
 use crate::kiro::token_manager::{
-    KeepThenDeleteError, MultiTokenManager, RefreshFailure, RefreshFailureKind,
+    KeepThenDeleteError, MultiTokenManager, RefreshFailure, RefreshFailureKind, is_token_expired,
 };
 use crate::storage::credential_inventory::{
-    GroupFilter, HeldMoveKeys, InventoryListFilter, InventoryRow, InventoryStore,
-    MAX_GROUP_NAME_CHARS, MovedInventoryRow, NewInventoryRow, OriginFilter, RenewOutcome,
-    STATUS_INVALID, STATUS_PUSHED, STATUS_PUSHING, STATUS_STORED, UNGROUPED_FILTER,
+    GroupFilter, HeldMoveKeys, InventoryListFilter, InventoryRow, InventorySort, InventoryStore,
+    InventoryTitleSummary, LockedRefresh, MAX_GROUP_NAME_CHARS, MovedInventoryRow, NewInventoryRow,
+    OriginFilter, RenewOutcome, STATUS_INVALID, STATUS_PUSHED, STATUS_PUSHING, STATUS_STORED,
+    UNGROUPED_FILTER,
 };
 
 const MAX_IMPORT: usize = 500;
 const MAX_PAGE_SIZE: usize = 1000;
+/// Most ids "select all filtered" returns; batch actions run on them a chunk at a time.
+const MAX_SELECT_ALL: usize = 5000;
 /// A `pushing` row older than this was left by a crash and is reconciled at startup.
 const STALE_PUSH_SECS: i64 = 300;
 
@@ -220,6 +224,123 @@ pub struct InventoryListQuery {
     /// `__pool__` (moved from the pool), `__imported__`, or a disabled reason of moved rows.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Subscription tier as the account page filters it (`free`, `pro`, `pro_plus`, ...,
+    /// `unknown`).
+    #[serde(default)]
+    pub subscription: Option<String>,
+    /// `remaining`, `exhausted` or `unchecked`.
+    #[serde(default)]
+    pub quota: Option<String>,
+    /// `with`, `without`, or a proxy resource id.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// Auth kind (`social`, `idc`, `api_key`, `external_idp`, ...).
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// `remaining`, `checked`, `created` or `expires`; newest first otherwise.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// `asc` or `desc` (default).
+    #[serde(default)]
+    pub order: Option<String>,
+}
+
+/// `GET /inventory/ids`: every account the list filter selects (in list order), for
+/// select-all. Only rows that still hold an account.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryIdsQuery {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Subscription tier as the account page filters it (`free`, `pro`, `pro_plus`, ...,
+    /// `unknown`).
+    #[serde(default)]
+    pub subscription: Option<String>,
+    /// `remaining`, `exhausted` or `unchecked`.
+    #[serde(default)]
+    pub quota: Option<String>,
+    /// `with`, `without`, or a proxy resource id.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// Auth kind (`social`, `idc`, `api_key`, `external_idp`, ...).
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// `remaining`, `checked`, `created` or `expires`; newest first otherwise.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// `asc` or `desc` (default).
+    #[serde(default)]
+    pub order: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryIdsResponse {
+    pub ids: Vec<u64>,
+    pub total: u64,
+    /// More rows match than were returned.
+    pub truncated: bool,
+}
+
+/// The list filter fields shared by the list, the export and select-all.
+#[derive(Debug, Clone, Copy, Default)]
+struct FilterParams<'a> {
+    status: Option<&'a str>,
+    q: Option<&'a str>,
+    group: Option<&'a str>,
+    origin: Option<&'a str>,
+    subscription: Option<&'a str>,
+    quota: Option<&'a str>,
+    proxy: Option<&'a str>,
+    auth: Option<&'a str>,
+    sort: Option<&'a str>,
+    order: Option<&'a str>,
+}
+
+macro_rules! filter_params {
+    ($query:expr) => {
+        FilterParams {
+            status: $query.status.as_deref(),
+            q: $query.q.as_deref(),
+            group: $query.group.as_deref(),
+            origin: $query.origin.as_deref(),
+            subscription: $query.subscription.as_deref(),
+            quota: $query.quota.as_deref(),
+            proxy: $query.proxy.as_deref(),
+            auth: $query.auth.as_deref(),
+            ..FilterParams::default()
+        }
+    };
+}
+
+/// Quota totals of the listed accounts that still hold one (stored or invalid), from each
+/// account's last check.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventorySummary {
+    pub accounts: u64,
+    pub unchecked: u64,
+    pub exhausted: u64,
+    pub remaining: f64,
+    pub usage_limit: f64,
+    pub by_subscription: Vec<InventorySubscriptionSummary>,
+    /// Auth kinds present in the inventory, for the filter options.
+    pub auth_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InventorySubscriptionSummary {
+    /// The account page's subscription tier: `free`, `pro`, `pro_plus`, ..., `unknown`.
+    pub key: String,
+    pub accounts: u64,
+    pub remaining: f64,
 }
 
 /// State of the pool account an inventory row was pushed to.
@@ -429,6 +550,7 @@ pub struct InventoryListResponse {
     pub counts: InventoryCountsResponse,
     pub items: Vec<InventoryItem>,
     pub renewal: InventoryRenewalSettings,
+    pub summary: InventorySummary,
 }
 
 /// How stored accounts are renewed: the pool's background refresh switch and scan interval,
@@ -496,6 +618,10 @@ pub struct InventoryActionItem {
     pub credential_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Not done for now, and not a failure: the refresh limit shared with the pool is busy, or
+    /// the renewal is refreshing this account. Try again shortly.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -504,7 +630,49 @@ pub struct InventoryActionResponse {
     pub total: usize,
     pub succeeded: usize,
     pub failed: usize,
+    pub deferred: usize,
     pub items: Vec<InventoryActionItem>,
+}
+
+/// Proxy for a batch of inventory accounts: `none` removes it, `single` binds one resource,
+/// `round_robin` binds the resources in turn, `direct_url` sets a proxy URL.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryProxyRequest {
+    pub ids: Vec<u64>,
+    pub mode: String,
+    #[serde(default)]
+    pub proxy_resource_id: Option<u64>,
+    #[serde(default)]
+    pub proxy_resource_ids: Vec<u64>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+}
+
+/// One model test of an inventory account.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryTestResponse {
+    pub id: u64,
+    /// `success`; `invalid` (refresh token rejected, the account is now invalid); `failed`;
+    /// `deferred` (refresh limit busy or the renewal holds the account; try again shortly).
+    pub outcome: &'static str,
+    /// Where it stopped when it did not succeed: `refresh` or `model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<&'static str>,
+    pub model: String,
+    pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    /// The token was refreshed (and stored) for this test.
+    pub refreshed: bool,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// A group with its status counts; `name` is `None` for the accounts without a group.
@@ -569,6 +737,19 @@ pub struct InventoryExportQuery {
     pub origin: Option<String>,
     #[serde(default)]
     pub q: Option<String>,
+    /// Subscription tier as the account page filters it (`free`, `pro`, `pro_plus`, ...,
+    /// `unknown`).
+    #[serde(default)]
+    pub subscription: Option<String>,
+    /// `remaining`, `exhausted` or `unchecked`.
+    #[serde(default)]
+    pub quota: Option<String>,
+    /// `with`, `without`, or a proxy resource id.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// Auth kind (`social`, `idc`, `api_key`, `external_idp`, ...).
+    #[serde(default)]
+    pub auth: Option<String>,
 }
 
 /// Moves disabled pool accounts into the inventory (also the body of the preview).
@@ -661,10 +842,12 @@ pub struct MoveToInventoryResponse {
 impl InventoryActionResponse {
     fn from_items(items: Vec<InventoryActionItem>) -> Self {
         let succeeded = items.iter().filter(|item| item.ok).count();
+        let deferred = items.iter().filter(|item| item.deferred).count();
         Self {
             total: items.len(),
             succeeded,
-            failed: items.len() - succeeded,
+            failed: items.len() - succeeded - deferred,
+            deferred,
             items,
         }
     }
@@ -792,27 +975,25 @@ impl AdminService {
     ) -> Result<InventoryListResponse, AdminServiceError> {
         let limit = query.limit.unwrap_or(20).clamp(1, MAX_PAGE_SIZE);
         let page = query.page.unwrap_or(1).max(1);
-        let status = query
-            .status
-            .filter(|s| !s.trim().is_empty() && s != "__all__")
-            .filter(|s| {
-                [STATUS_STORED, STATUS_INVALID, STATUS_PUSHING, STATUS_PUSHED].contains(&s.as_str())
-            });
         let store = self.inventory_store();
-        let filter = InventoryListFilter {
-            status,
-            query: query.q,
-            group: GroupFilter::parse(query.group.as_deref()),
-            origin: OriginFilter::parse(query.origin.as_deref()),
-            limit: limit as i64,
-            offset: ((page - 1) * limit) as i64,
-        };
-        let (rows, total) = super::service::block_on_admin_store_public(store.list(&filter))
-            .map_err(|e| AdminServiceError::InternalError(format!("读取库存失败: {e}")))?;
-        // The status tabs count within the selected group.
-        let counts =
-            super::service::block_on_admin_store_public(store.counts(filter.group.as_ref()))
-                .map_err(|e| AdminServiceError::InternalError(format!("读取库存失败: {e}")))?;
+        let mut filter = self.inventory_filter(FilterParams {
+            sort: query.sort.as_deref(),
+            order: query.order.as_deref(),
+            ..filter_params!(query)
+        })?;
+        filter.limit = limit as i64;
+        filter.offset = ((page - 1) * limit) as i64;
+        let read =
+            |e: anyhow::Error| AdminServiceError::InternalError(format!("读取库存失败: {e}"));
+        let (rows, total) =
+            super::service::block_on_admin_store_public(store.list(&filter)).map_err(read)?;
+        // The status tabs count within the other filters.
+        let counts = super::service::block_on_admin_store_public(store.filtered_counts(&filter))
+            .map_err(read)?;
+        let titles = super::service::block_on_admin_store_public(store.filtered_summary(&filter))
+            .map_err(read)?;
+        let auth_kinds =
+            super::service::block_on_admin_store_public(store.auth_kinds()).map_err(read)?;
         let pool = self.pool_lookup();
         Ok(InventoryListResponse {
             page,
@@ -831,6 +1012,78 @@ impl AdminService {
                 .map(|row| self.inventory_item(row, &pool))
                 .collect(),
             renewal: self.inventory_renewal_settings(),
+            summary: summarize(&titles, auth_kinds),
+        })
+    }
+
+    /// Ids of every account the filter selects, for select-all.
+    pub fn inventory_ids(
+        &self,
+        query: InventoryIdsQuery,
+    ) -> Result<InventoryIdsResponse, AdminServiceError> {
+        let filter = self.inventory_filter(FilterParams {
+            sort: query.sort.as_deref(),
+            order: query.order.as_deref(),
+            ..filter_params!(query)
+        })?;
+        let (ids, total) = super::service::block_on_admin_store_public(
+            self.inventory_store().filtered_ids(&filter, MAX_SELECT_ALL),
+        )
+        .map_err(|e| AdminServiceError::InternalError(format!("读取库存失败: {e}")))?;
+        Ok(InventoryIdsResponse {
+            truncated: total > ids.len() as u64,
+            ids,
+            total,
+        })
+    }
+
+    /// The store filter for list-style query parameters. Unknown values filter nothing.
+    fn inventory_filter(
+        &self,
+        params: FilterParams<'_>,
+    ) -> Result<InventoryListFilter, AdminServiceError> {
+        let trimmed = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != "__all__")
+                .map(str::to_string)
+        };
+        let status = trimmed(params.status).filter(|status| {
+            [STATUS_STORED, STATUS_INVALID, STATUS_PUSHING, STATUS_PUSHED]
+                .contains(&status.as_str())
+        });
+        let subscription_titles = match params.subscription.and_then(subscription_filter_key_public)
+        {
+            Some(key) => {
+                let titles = super::service::block_on_admin_store_public(
+                    self.inventory_store().subscription_titles(),
+                )
+                .map_err(|e| AdminServiceError::InternalError(format!("读取库存失败: {e}")))?;
+                Some(titles_of_tier(titles, &key))
+            }
+            None => None,
+        };
+        let quota = trimmed(params.quota)
+            .filter(|quota| ["remaining", "exhausted", "unchecked"].contains(&quota.as_str()));
+        let (proxy, proxy_resource_id) = match trimmed(params.proxy) {
+            Some(proxy) if proxy == "with" || proxy == "without" => (Some(proxy), None),
+            Some(proxy) => (None, proxy.trim_start_matches('#').parse::<u64>().ok()),
+            None => (None, None),
+        };
+        Ok(InventoryListFilter {
+            status,
+            query: params.q.map(str::to_string),
+            group: GroupFilter::parse(params.group),
+            origin: OriginFilter::parse(params.origin),
+            subscription_titles,
+            quota,
+            proxy,
+            proxy_resource_id,
+            auth_kind: trimmed(params.auth).map(|auth| auth.to_ascii_lowercase()),
+            sort: InventorySort::parse(params.sort),
+            ascending: params.order.map(str::trim) == Some("asc"),
+            limit: 0,
+            offset: 0,
         })
     }
 
@@ -1043,89 +1296,111 @@ impl AdminService {
     }
 
     /// Refreshes the token (storing a rotated refresh token) and queries quota and subscription.
+    /// Refreshes one account's token under the renewal's row lock, in a task of its own: once
+    /// the upstream has rotated the refresh token, the new one is stored even if the request
+    /// that asked for it goes away.
+    async fn refresh_inventory_account(&self, id: u64) -> Result<KiroCredentials, RowFailure> {
+        let store = self.inventory_store();
+        let manager = self.inventory_token_manager();
+        let outcome = tokio::spawn(async move {
+            store
+                .refresh_locked(id, move |row| async move { renew_row(&manager, row).await })
+                .await
+        })
+        .await;
+        match outcome {
+            Ok(Ok(LockedRefresh::Refreshed(data))) => serde_json::from_value(data)
+                .map_err(|e| RowFailure::Failed(format!("库存账号数据损坏: {e}"))),
+            Ok(Ok(LockedRefresh::Failed { error, invalid })) => Err(if invalid {
+                RowFailure::Invalid(error)
+            } else {
+                RowFailure::Failed(error)
+            }),
+            Ok(Ok(LockedRefresh::Deferred)) => Err(RowFailure::Limited),
+            Ok(Ok(LockedRefresh::Busy)) => Err(RowFailure::Busy),
+            Ok(Ok(LockedRefresh::Missing)) => {
+                Err(RowFailure::Failed("库存账号不存在或已推送".to_string()))
+            }
+            Ok(Err(err)) => Err(RowFailure::Failed(format!("保存续期结果失败: {err}"))),
+            Err(err) => Err(RowFailure::Failed(format!("续期任务异常: {err}"))),
+        }
+    }
+
+    /// Queries an account's quota and subscription. The stored access token is used while it
+    /// lasts; it is refreshed (and stored) when it has expired, or once when the query is
+    /// refused with an auth error.
     async fn check_inventory_row(
         &self,
         store: &InventoryStore,
         row: InventoryRow,
-    ) -> Result<(), AdminServiceError> {
-        let credential = credential_from_row(&row)?;
-        let manager = self.inventory_token_manager();
-        let refreshed = if credential.is_api_key_credential() {
-            credential
-        } else {
-            match manager.refresh_detached_credential(credential).await {
-                Ok(refreshed) => {
-                    let data = credential_json(&refreshed)?;
-                    let (_, _, hash) = secret_hashes(&refreshed);
-                    super::service::block_on_admin_store_public(store.save_refreshed(
-                        row.id,
-                        &data,
-                        hash.as_deref(),
-                    ))
-                    .map_err(|e| {
-                        AdminServiceError::InternalError(format!("保存续期结果失败: {e}"))
-                    })?;
-                    refreshed
-                }
-                Err(err) if refresh_deferred_locally(&err) => {
-                    return Err(AdminServiceError::Conflict(
-                        REFRESH_DEFERRED_MESSAGE.to_string(),
-                    ));
-                }
-                Err(err) => {
-                    let invalid = is_invalid_grant(&err);
-                    let message = refresh_error_message(&err, invalid);
-                    let _ = super::service::block_on_admin_store_public(
-                        store.record_refresh_failure(row.id, &message, invalid),
-                    );
-                    let _ = super::service::block_on_admin_store_public(store.save_check(
-                        row.id,
-                        None,
-                        Some(&message),
-                        None,
-                    ));
-                    return Err(AdminServiceError::UpstreamError(message));
-                }
-            }
-        };
-        match manager
-            .usage_limits_for_detached_credential(&refreshed)
-            .await
-        {
-            Ok(usage) => {
-                let email = usage.email().map(str::to_string);
-                let balance = balance_response_from_usage_public(row.id, usage);
-                let value = serde_json::to_value(&balance)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                super::service::block_on_admin_store_public(store.save_check(
-                    row.id,
-                    Some(&value),
-                    None,
-                    email.as_deref(),
-                ))
-                .map_err(|e| AdminServiceError::InternalError(format!("保存查询结果失败: {e}")))?;
-                Ok(())
-            }
-            Err(err) => {
-                let message = format!("查询额度失败: {err}");
-                let _ = super::service::block_on_admin_store_public(store.save_check(
-                    row.id,
-                    None,
-                    Some(&message),
-                    None,
-                ));
-                Err(AdminServiceError::UpstreamError(message))
-            }
+    ) -> Result<(), RowFailure> {
+        let result = self.check_inventory_account(store, &row).await;
+        if let Err(failure @ (RowFailure::Invalid(_) | RowFailure::Failed(_))) = &result {
+            let _ = super::service::block_on_admin_store_public(store.save_check(
+                row.id,
+                None,
+                Some(&failure.message()),
+                None,
+            ));
         }
+        result
     }
 
+    async fn check_inventory_account(
+        &self,
+        store: &InventoryStore,
+        row: &InventoryRow,
+    ) -> Result<(), RowFailure> {
+        let mut credential =
+            credential_from_row(row).map_err(|e| RowFailure::Failed(e.to_string()))?;
+        let manager = self.inventory_token_manager();
+        let refreshable = !credential.is_api_key_credential();
+        let mut refreshed = false;
+        if refreshable && is_token_expired(&credential) {
+            credential = self.refresh_inventory_account(row.id).await?;
+            refreshed = true;
+        }
+        let mut usage = manager
+            .usage_limits_for_detached_credential(&credential)
+            .await;
+        if let Err(err) = &usage
+            && refreshable
+            && !refreshed
+            && looks_like_auth_error(&err.to_string())
+        {
+            credential = self.refresh_inventory_account(row.id).await?;
+            usage = manager
+                .usage_limits_for_detached_credential(&credential)
+                .await;
+        }
+        let usage = usage.map_err(|err| RowFailure::Failed(format!("查询额度失败: {err}")))?;
+        let email = usage.email().map(str::to_string);
+        let balance = balance_response_from_usage_public(row.id, usage);
+        let value =
+            serde_json::to_value(&balance).map_err(|e| RowFailure::Failed(e.to_string()))?;
+        super::service::block_on_admin_store_public(store.save_check(
+            row.id,
+            Some(&value),
+            None,
+            email.as_deref(),
+        ))
+        .map_err(|e| RowFailure::Failed(format!("保存查询结果失败: {e}")))
+    }
+
+    /// Checks the accounts one after another. Once the refresh limit shared with the pool says
+    /// no, the rest are returned as deferred instead of being tried.
     pub async fn check_inventory(
         &self,
         req: InventoryIdsRequest,
     ) -> Result<InventoryActionResponse, AdminServiceError> {
         let store = self.inventory_store();
         let mut items = Vec::with_capacity(req.ids.len());
+        let mut limited = false;
         for id in dedup(req.ids) {
+            if limited {
+                items.push(RowFailure::Limited.item(id));
+                continue;
+            }
             let row = match super::service::block_on_admin_store_public(store.get(id)) {
                 Ok(Some(row)) if row.status == STATUS_STORED || row.status == STATUS_INVALID => row,
                 Ok(Some(row)) => {
@@ -1134,6 +1409,7 @@ impl AdminService {
                         ok: false,
                         credential_id: row.pushed_credential_id,
                         message: Some("已推送到账号池的账号请在账号页查询".to_string()),
+                        deferred: false,
                     });
                     continue;
                 }
@@ -1143,6 +1419,7 @@ impl AdminService {
                         ok: false,
                         credential_id: None,
                         message: Some("库存账号不存在".to_string()),
+                        deferred: false,
                     });
                     continue;
                 }
@@ -1152,19 +1429,118 @@ impl AdminService {
                         ok: false,
                         credential_id: None,
                         message: Some(err.to_string()),
+                        deferred: false,
                     });
                     continue;
                 }
             };
-            let result = self.check_inventory_row(&store, row).await;
-            items.push(InventoryActionItem {
-                id,
-                ok: result.is_ok(),
-                credential_id: None,
-                message: result.err().map(|e| e.to_string()),
-            });
+            match self.check_inventory_row(&store, row).await {
+                Ok(()) => items.push(InventoryActionItem {
+                    id,
+                    ok: true,
+                    credential_id: None,
+                    message: None,
+                    deferred: false,
+                }),
+                Err(failure) => {
+                    limited = matches!(failure, RowFailure::Limited);
+                    items.push(failure.item(id));
+                }
+            }
         }
         Ok(InventoryActionResponse::from_items(items))
+    }
+
+    /// Calls the model once with an inventory account, as the pool's account test does. The
+    /// token is refreshed and stored first when it has expired, or once when the call is
+    /// refused with an auth error. Failures past the request checks come back as an outcome,
+    /// not an HTTP error.
+    pub async fn test_inventory(
+        &self,
+        id: u64,
+        req: TestCredentialRequest,
+    ) -> Result<InventoryTestResponse, AdminServiceError> {
+        let (model, model_id, _prompt, request_body) =
+            self.inventory_model_test_request(&req.model, req.prompt.as_deref())?;
+        let store = self.inventory_store();
+        let row = super::service::block_on_admin_store_public(store.get(id))
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+        if row.status != STATUS_STORED && row.status != STATUS_INVALID {
+            return Err(AdminServiceError::Conflict(
+                "已推送到账号池的账号请在账号页测试".to_string(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let mut response = InventoryTestResponse {
+            id,
+            outcome: "success",
+            stage: None,
+            model,
+            model_id,
+            response: None,
+            refreshed: false,
+            duration_ms: 0,
+            message: None,
+        };
+        let finish = |mut response: InventoryTestResponse| {
+            response.duration_ms = started.elapsed().as_millis() as u64;
+            Ok(response)
+        };
+        let mut credential = credential_from_row(&row)?;
+        let refreshable = !credential.is_api_key_credential();
+        if refreshable && is_token_expired(&credential) {
+            match self.refresh_inventory_account(id).await {
+                Ok(fresh) => {
+                    credential = fresh;
+                    response.refreshed = true;
+                }
+                Err(failure) => return finish(failure.test_response(response, "refresh")),
+            }
+        }
+        let label = format!("#{id}");
+        let mut result = self
+            .call_inventory_model_test(&credential, &request_body, &label)
+            .await;
+        if let Err(err) = &result
+            && refreshable
+            && !response.refreshed
+            && looks_like_auth_error(&err.to_string())
+        {
+            match self.refresh_inventory_account(id).await {
+                Ok(fresh) => {
+                    credential = fresh;
+                    response.refreshed = true;
+                    result = self
+                        .call_inventory_model_test(&credential, &request_body, &label)
+                        .await;
+                }
+                Err(failure) => return finish(failure.test_response(response, "refresh")),
+            }
+        }
+        match result {
+            Ok(text) => response.response = Some(text),
+            Err(err) => {
+                response.outcome = "failed";
+                response.stage = Some("model");
+                response.message = Some(err.to_string());
+            }
+        }
+        finish(response)
+    }
+
+    async fn call_inventory_model_test(
+        &self,
+        credential: &KiroCredentials,
+        request_body: &str,
+        label: &str,
+    ) -> Result<String, AdminServiceError> {
+        let ctx = self
+            .inventory_token_manager()
+            .detached_call_context(credential.clone())
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
+        self.inventory_call_model_test(ctx, request_body, label.to_string())
+            .await
     }
 
     pub fn update_inventory(
@@ -1173,7 +1549,7 @@ impl AdminService {
         req: InventoryUpdateRequest,
     ) -> Result<InventoryItem, AdminServiceError> {
         let store = self.inventory_store();
-        let row = super::service::block_on_admin_store_public(store.get(id))
+        super::service::block_on_admin_store_public(store.get(id))
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
         let group = req
@@ -1181,44 +1557,40 @@ impl AdminService {
             .as_ref()
             .map(|group| normalize_group_name(group.as_deref()))
             .transpose()?;
-        let mut credential = credential_from_row(&row)?;
+        let mut edit = DataEdit::default();
         if let Some(region) = req.auth_region {
-            credential.auth_region = Some(region.trim().to_string()).filter(|r| !r.is_empty());
+            edit.set_or_remove("authRegion", region.trim());
         }
         if let Some(region) = req.api_region {
-            credential.api_region = Some(region.trim().to_string()).filter(|r| !r.is_empty());
+            edit.set_or_remove("apiRegion", region.trim());
         }
         if let Some(resource) = req.proxy_resource_id {
+            edit.remove(&["proxyResourceId"]);
             if let Some(resource_id) = resource {
-                let missing = self
-                    .inventory_token_manager()
-                    .missing_proxy_resource_ids(&[resource_id]);
-                if !missing.is_empty() {
-                    return Err(AdminServiceError::InvalidCredential(format!(
-                        "代理资源 #{resource_id} 不存在"
-                    )));
-                }
-                credential.proxy_url = None;
-                credential.proxy_username = None;
-                credential.proxy_password = None;
+                self.require_proxy_resources(&[resource_id])?;
+                edit.remove(&DIRECT_PROXY_KEYS);
+                edit.set("proxyResourceId", json!(resource_id));
             }
-            credential.proxy_resource_id = resource;
         }
         if let Some(url) = req.proxy_url {
-            let url = url.trim().to_string();
-            credential.proxy_url = Some(url).filter(|u| !u.is_empty());
-            if credential.proxy_url.is_some() {
-                credential.proxy_resource_id = None;
+            edit.remove(&DIRECT_PROXY_KEYS);
+            let url = url.trim();
+            if !url.is_empty() {
+                edit.remove(&["proxyResourceId"]);
+                edit.set("proxyUrl", json!(url));
+                edit.set_present("proxyUsername", req.proxy_username.as_deref());
+                edit.set_present("proxyPassword", req.proxy_password.as_deref());
             }
-            credential.proxy_username = req.proxy_username.filter(|v| !v.is_empty());
-            credential.proxy_password = req.proxy_password.filter(|v| !v.is_empty());
         }
-        let data = credential_json(&credential)?;
-        let note = req.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
-        let updated = super::service::block_on_admin_store_public(store.update_settings(
+        let note = req
+            .note
+            .as_deref()
+            .map(|note| Some(note.trim()).filter(|note| !note.is_empty()));
+        let updated = super::service::block_on_admin_store_public(store.patch_data(
             id,
-            &data,
-            note.or(row.note.as_deref()),
+            &edit.remove,
+            &serde_json::Value::Object(edit.patch),
+            note,
         ))
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         if !updated {
@@ -1236,6 +1608,60 @@ impl AdminService {
         Ok(self.inventory_item(row, &self.pool_lookup()))
     }
 
+    fn require_proxy_resources(&self, ids: &[u64]) -> Result<(), AdminServiceError> {
+        let missing = self
+            .inventory_token_manager()
+            .missing_proxy_resource_ids(ids);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let missing = missing
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join("、");
+        Err(AdminServiceError::InvalidCredential(format!(
+            "代理资源 {missing} 不存在"
+        )))
+    }
+
+    /// Sets or removes the proxy of many accounts at once; each row is patched in place.
+    pub fn set_inventory_proxy(
+        &self,
+        req: InventoryProxyRequest,
+    ) -> Result<InventoryActionResponse, AdminServiceError> {
+        let plan = ProxyPlan::parse(&req).map_err(AdminServiceError::InvalidCredential)?;
+        if let ProxyPlan::Resources(ids) = &plan {
+            self.require_proxy_resources(ids)?;
+        }
+        let store = self.inventory_store();
+        let items = dedup(req.ids)
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let patch = plan.patch(index);
+                let result = super::service::block_on_admin_store_public(store.patch_data(
+                    id,
+                    &PROXY_KEYS,
+                    &patch,
+                    None,
+                ));
+                InventoryActionItem {
+                    id,
+                    ok: matches!(result, Ok(true)),
+                    credential_id: None,
+                    message: match result {
+                        Ok(true) => None,
+                        Ok(false) => Some("账号不在库存中，或已推送".to_string()),
+                        Err(err) => Some(err.to_string()),
+                    },
+                    deferred: false,
+                }
+            })
+            .collect();
+        Ok(InventoryActionResponse::from_items(items))
+    }
+
     pub fn delete_inventory(
         &self,
         req: InventoryIdsRequest,
@@ -1250,18 +1676,21 @@ impl AdminService {
                         ok: true,
                         credential_id: None,
                         message: None,
+                        deferred: false,
                     },
                     Ok(false) => InventoryActionItem {
                         id,
                         ok: false,
                         credential_id: None,
                         message: Some("不存在或正在推送".to_string()),
+                        deferred: false,
                     },
                     Err(err) => InventoryActionItem {
                         id,
                         ok: false,
                         credential_id: None,
                         message: Some(err.to_string()),
+                        deferred: false,
                     },
                 },
             )
@@ -1314,6 +1743,7 @@ impl AdminService {
                         ok: false,
                         credential_id: None,
                         message: Some("账号不在库存中，或已推送、正在推送".to_string()),
+                        deferred: false,
                     });
                     continue;
                 }
@@ -1323,6 +1753,7 @@ impl AdminService {
                         ok: false,
                         credential_id: None,
                         message: Some(err.to_string()),
+                        deferred: false,
                     });
                     continue;
                 }
@@ -1365,6 +1796,7 @@ impl AdminService {
                         ok: true,
                         credential_id: Some(credential_id),
                         message: None,
+                        deferred: false,
                     });
                 }
                 Err(err) => {
@@ -1377,6 +1809,7 @@ impl AdminService {
                         ok: false,
                         credential_id: None,
                         message: Some(message),
+                        deferred: false,
                     });
                 }
             }
@@ -1525,19 +1958,7 @@ impl AdminService {
         query: InventoryExportQuery,
     ) -> Result<(String, String, usize, usize), AdminServiceError> {
         let ids = parse_id_list(query.ids.as_deref())?;
-        let status = query
-            .status
-            .filter(|s| !s.trim().is_empty() && s != "__all__")
-            .filter(|s| {
-                [STATUS_STORED, STATUS_INVALID, STATUS_PUSHING, STATUS_PUSHED].contains(&s.as_str())
-            });
-        let filter = InventoryListFilter {
-            status,
-            query: query.q,
-            group: GroupFilter::parse(query.group.as_deref()),
-            origin: OriginFilter::parse(query.origin.as_deref()),
-            ..InventoryListFilter::default()
-        };
+        let filter = self.inventory_filter(filter_params!(query))?;
         let rows = super::service::block_on_admin_store_public(
             self.inventory_store()
                 .export_rows((!ids.is_empty()).then_some(ids.as_slice()), &filter),
@@ -2142,6 +2563,240 @@ pub fn spawn_inventory_renewal_worker(
     })
 }
 
+/// The subscription titles that fall in a tier, as the account page tiers them.
+fn titles_of_tier(titles: Vec<String>, key: &str) -> Vec<String> {
+    titles
+        .into_iter()
+        .filter(|title| {
+            subscription_key_public(Some(title.as_str()).filter(|title| !title.is_empty())) == key
+        })
+        .collect()
+}
+
+/// Folds the per-title totals into the summary, by subscription tier.
+fn summarize(titles: &[InventoryTitleSummary], auth_kinds: Vec<String>) -> InventorySummary {
+    let mut summary = InventorySummary {
+        auth_kinds,
+        ..InventorySummary::default()
+    };
+    for title in titles {
+        summary.accounts += title.accounts;
+        summary.unchecked += title.unchecked;
+        summary.exhausted += title.exhausted;
+        summary.remaining += title.remaining;
+        summary.usage_limit += title.usage_limit;
+        let key = subscription_key_public(Some(title.title.as_str()).filter(|t| !t.is_empty()));
+        match summary
+            .by_subscription
+            .iter_mut()
+            .find(|tier| tier.key == key)
+        {
+            Some(tier) => {
+                tier.accounts += title.accounts;
+                tier.remaining += title.remaining;
+            }
+            None => summary.by_subscription.push(InventorySubscriptionSummary {
+                key,
+                accounts: title.accounts,
+                remaining: title.remaining,
+            }),
+        }
+    }
+    summary
+        .by_subscription
+        .sort_by(|a, b| b.accounts.cmp(&a.accounts).then_with(|| a.key.cmp(&b.key)));
+    summary
+}
+
+/// Why an inventory account could not be refreshed, checked or tested right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowFailure {
+    /// The refresh limit shared with the pool is busy: try again shortly.
+    Limited,
+    /// The renewal is refreshing this account right now.
+    Busy,
+    /// The refresh token was rejected; the account is now `invalid`.
+    Invalid(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for RowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl RowFailure {
+    fn message(&self) -> String {
+        match self {
+            Self::Limited => REFRESH_DEFERRED_MESSAGE.to_string(),
+            Self::Busy => "该账号正在续期，稍后再试".to_string(),
+            Self::Invalid(message) | Self::Failed(message) => message.clone(),
+        }
+    }
+
+    fn deferred(&self) -> bool {
+        matches!(self, Self::Limited | Self::Busy)
+    }
+
+    fn item(&self, id: u64) -> InventoryActionItem {
+        InventoryActionItem {
+            id,
+            ok: false,
+            credential_id: None,
+            message: Some(self.message()),
+            deferred: self.deferred(),
+        }
+    }
+
+    fn test_response(
+        &self,
+        mut response: InventoryTestResponse,
+        stage: &'static str,
+    ) -> InventoryTestResponse {
+        response.outcome = match self {
+            Self::Limited | Self::Busy => "deferred",
+            Self::Invalid(_) => "invalid",
+            Self::Failed(_) => "failed",
+        };
+        response.stage = Some(stage);
+        response.message = Some(self.message());
+        response
+    }
+}
+
+/// An upstream refusal that a fresh access token may fix: worth one refresh and retry.
+fn looks_like_auth_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "401",
+        "403",
+        "unauthorized",
+        "expired",
+        "invalid token",
+        "accessdenied",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// The keys of a direct proxy in the stored credential.
+const DIRECT_PROXY_KEYS: [&str; 3] = ["proxyUrl", "proxyUsername", "proxyPassword"];
+/// Every proxy key in the stored credential.
+const PROXY_KEYS: [&str; 4] = [
+    "proxyUrl",
+    "proxyUsername",
+    "proxyPassword",
+    "proxyResourceId",
+];
+
+/// Keys to drop from and values to merge into a stored credential, applied in one statement.
+#[derive(Debug, Default)]
+struct DataEdit {
+    remove: Vec<&'static str>,
+    patch: serde_json::Map<String, serde_json::Value>,
+}
+
+impl DataEdit {
+    fn remove(&mut self, keys: &[&'static str]) {
+        for key in keys {
+            self.patch.remove(*key);
+            if !self.remove.contains(key) {
+                self.remove.push(key);
+            }
+        }
+    }
+
+    fn set(&mut self, key: &'static str, value: serde_json::Value) {
+        self.patch.insert(key.to_string(), value);
+    }
+
+    /// Sets a non-empty value; leaves the key removed otherwise.
+    fn set_present(&mut self, key: &'static str, value: Option<&str>) {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            self.set(key, json!(value));
+        }
+    }
+
+    fn set_or_remove(&mut self, key: &'static str, value: &str) {
+        self.remove(&[key]);
+        if !value.is_empty() {
+            self.set(key, json!(value));
+        }
+    }
+}
+
+/// A validated batch proxy request.
+#[derive(Debug, Clone, PartialEq)]
+enum ProxyPlan {
+    None,
+    Resources(Vec<u64>),
+    Direct {
+        url: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+}
+
+impl ProxyPlan {
+    fn parse(req: &InventoryProxyRequest) -> Result<Self, String> {
+        let trimmed = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        match req.mode.as_str() {
+            "none" => Ok(Self::None),
+            "single" => req
+                .proxy_resource_id
+                .map(|id| Self::Resources(vec![id]))
+                .ok_or_else(|| "请选择代理资源".to_string()),
+            "round_robin" => {
+                let ids = dedup(req.proxy_resource_ids.clone());
+                if ids.is_empty() {
+                    Err("请选择至少一个代理资源".to_string())
+                } else {
+                    Ok(Self::Resources(ids))
+                }
+            }
+            "direct_url" => {
+                let url = trimmed(&req.proxy_url).ok_or_else(|| "请填写代理地址".to_string())?;
+                Ok(Self::Direct {
+                    url,
+                    username: trimmed(&req.proxy_username),
+                    password: trimmed(&req.proxy_password),
+                })
+            }
+            other => Err(format!("未知的代理模式: {other}")),
+        }
+    }
+
+    /// The proxy keys for the account at `index` in the request (all four are removed first).
+    fn patch(&self, index: usize) -> serde_json::Value {
+        match self {
+            Self::None => json!({}),
+            Self::Resources(ids) => json!({ "proxyResourceId": ids[index % ids.len()] }),
+            Self::Direct {
+                url,
+                username,
+                password,
+            } => {
+                let mut patch = serde_json::Map::new();
+                patch.insert("proxyUrl".to_string(), json!(url));
+                if let Some(username) = username {
+                    patch.insert("proxyUsername".to_string(), json!(username));
+                }
+                if let Some(password) = password {
+                    patch.insert("proxyPassword".to_string(), json!(password));
+                }
+                serde_json::Value::Object(patch)
+            }
+        }
+    }
+}
+
 async fn renew_row(manager: &MultiTokenManager, row: InventoryRow) -> RenewOutcome {
     let credential = match row
         .data
@@ -2297,13 +2952,14 @@ pub(super) mod http {
     };
 
     use super::{
-        InventoryDeleteGroupRequest, InventoryExportQuery, InventoryIdsRequest,
-        InventoryImportRequest, InventoryListQuery, InventoryPushRequest,
+        InventoryDeleteGroupRequest, InventoryExportQuery, InventoryIdsQuery, InventoryIdsRequest,
+        InventoryImportRequest, InventoryListQuery, InventoryProxyRequest, InventoryPushRequest,
         InventoryRenameGroupRequest, InventorySetGroupRequest, InventoryUpdateRequest,
         MoveToInventoryRequest,
     };
     use crate::admin::error::AdminServiceError;
     use crate::admin::middleware::AdminState;
+    use crate::admin::types::TestCredentialRequest;
 
     fn respond<T: serde::Serialize>(result: Result<T, AdminServiceError>) -> Response {
         match result {
@@ -2320,6 +2976,14 @@ pub(super) mod http {
         respond(state.service.list_inventory(query))
     }
 
+    /// GET /api/admin/inventory/ids
+    pub async fn ids(
+        State(state): State<AdminState>,
+        Query(query): Query<InventoryIdsQuery>,
+    ) -> Response {
+        respond(state.service.inventory_ids(query))
+    }
+
     /// POST /api/admin/inventory/import
     pub async fn import(
         State(state): State<AdminState>,
@@ -2334,6 +2998,23 @@ pub(super) mod http {
         Json(payload): Json<InventoryIdsRequest>,
     ) -> Response {
         respond(state.service.check_inventory(payload).await)
+    }
+
+    /// POST /api/admin/inventory/{id}/test
+    pub async fn test(
+        State(state): State<AdminState>,
+        Path(id): Path<u64>,
+        Json(payload): Json<TestCredentialRequest>,
+    ) -> Response {
+        respond(state.service.test_inventory(id, payload).await)
+    }
+
+    /// POST /api/admin/inventory/proxy
+    pub async fn proxy(
+        State(state): State<AdminState>,
+        Json(payload): Json<InventoryProxyRequest>,
+    ) -> Response {
+        respond(state.service.set_inventory_proxy(payload))
     }
 
     /// POST /api/admin/inventory/push
@@ -2475,6 +3156,210 @@ mod tests {
         ];
         let duplicates = move_duplicates(accounts.iter(), &mut held);
         assert_eq!(duplicates, HashSet::from([2, 4, 7, 8]));
+    }
+
+    fn proxy_request(mode: &str) -> InventoryProxyRequest {
+        InventoryProxyRequest {
+            ids: vec![1, 2, 3],
+            mode: mode.to_string(),
+            proxy_resource_id: None,
+            proxy_resource_ids: Vec::new(),
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+        }
+    }
+
+    #[test]
+    fn proxy_plans_validate_and_rotate() {
+        assert_eq!(
+            ProxyPlan::parse(&proxy_request("none")),
+            Ok(ProxyPlan::None)
+        );
+        assert_eq!(ProxyPlan::None.patch(0), json!({}));
+        assert!(ProxyPlan::parse(&proxy_request("single")).is_err());
+        assert!(ProxyPlan::parse(&proxy_request("round_robin")).is_err());
+        assert!(ProxyPlan::parse(&proxy_request("direct_url")).is_err());
+        assert!(ProxyPlan::parse(&proxy_request("socks")).is_err());
+
+        let single = ProxyPlan::parse(&InventoryProxyRequest {
+            proxy_resource_id: Some(7),
+            ..proxy_request("single")
+        })
+        .unwrap();
+        assert_eq!(single.patch(2), json!({"proxyResourceId": 7}));
+
+        let rotation = ProxyPlan::parse(&InventoryProxyRequest {
+            proxy_resource_ids: vec![4, 5, 4],
+            ..proxy_request("round_robin")
+        })
+        .unwrap();
+        assert_eq!(rotation, ProxyPlan::Resources(vec![4, 5]));
+        let assigned: Vec<_> = (0..3).map(|index| rotation.patch(index)).collect();
+        assert_eq!(
+            assigned,
+            vec![
+                json!({"proxyResourceId": 4}),
+                json!({"proxyResourceId": 5}),
+                json!({"proxyResourceId": 4}),
+            ]
+        );
+
+        let direct = ProxyPlan::parse(&InventoryProxyRequest {
+            proxy_url: Some(" http://proxy.example:8080 ".to_string()),
+            proxy_username: Some("user".to_string()),
+            proxy_password: Some("  ".to_string()),
+            ..proxy_request("direct_url")
+        })
+        .unwrap();
+        assert_eq!(
+            direct.patch(0),
+            json!({"proxyUrl": "http://proxy.example:8080", "proxyUsername": "user"})
+        );
+    }
+
+    #[test]
+    fn data_edits_drop_keys_before_setting_them() {
+        let mut edit = DataEdit::default();
+        edit.set_or_remove("authRegion", "");
+        edit.set_or_remove("apiRegion", "eu-west-1");
+        edit.remove(&DIRECT_PROXY_KEYS);
+        edit.set("proxyResourceId", json!(3));
+        edit.remove(&["proxyResourceId"]);
+        assert_eq!(
+            edit.remove,
+            vec![
+                "authRegion",
+                "apiRegion",
+                "proxyUrl",
+                "proxyUsername",
+                "proxyPassword",
+                "proxyResourceId"
+            ]
+        );
+        assert_eq!(
+            serde_json::Value::Object(edit.patch),
+            json!({"apiRegion": "eu-west-1"}),
+            "a key removed after being set stays removed"
+        );
+    }
+
+    #[test]
+    fn auth_refusals_are_worth_one_refresh() {
+        assert!(looks_like_auth_error("upstream returned 403 Forbidden"));
+        assert!(looks_like_auth_error(
+            "The bearer token included in the request is invalid token"
+        ));
+        assert!(looks_like_auth_error("token expired"));
+        assert!(!looks_like_auth_error(
+            "error sending request: connection refused"
+        ));
+        assert!(!looks_like_auth_error("429 Too Many Requests"));
+    }
+
+    #[test]
+    fn row_failures_map_to_deferred_items_and_test_outcomes() {
+        let item = RowFailure::Limited.item(5);
+        assert!(item.deferred && !item.ok);
+        assert!(RowFailure::Busy.item(5).deferred);
+        assert!(!RowFailure::Failed("x".to_string()).item(5).deferred);
+        let response = InventoryActionResponse::from_items(vec![
+            RowFailure::Limited.item(1),
+            RowFailure::Invalid("bad".to_string()).item(2),
+            InventoryActionItem {
+                id: 3,
+                ok: true,
+                credential_id: None,
+                message: None,
+                deferred: false,
+            },
+        ]);
+        assert_eq!(
+            (response.succeeded, response.failed, response.deferred),
+            (1, 1, 1)
+        );
+        let base = InventoryTestResponse {
+            id: 1,
+            outcome: "success",
+            stage: None,
+            model: "m".to_string(),
+            model_id: "m".to_string(),
+            response: None,
+            refreshed: false,
+            duration_ms: 0,
+            message: None,
+        };
+        let invalid =
+            RowFailure::Invalid("rejected".to_string()).test_response(base.clone(), "refresh");
+        assert_eq!(
+            (invalid.outcome, invalid.stage),
+            ("invalid", Some("refresh"))
+        );
+        assert_eq!(
+            RowFailure::Busy.test_response(base, "refresh").outcome,
+            "deferred"
+        );
+    }
+
+    #[test]
+    fn the_quota_summary_folds_titles_into_the_account_page_tiers() {
+        let titles = vec![
+            InventoryTitleSummary {
+                title: "KIRO PRO".to_string(),
+                accounts: 2,
+                remaining: 30.0,
+                usage_limit: 200.0,
+                ..InventoryTitleSummary::default()
+            },
+            InventoryTitleSummary {
+                title: "Kiro Pro".to_string(),
+                accounts: 1,
+                remaining: 10.0,
+                usage_limit: 100.0,
+                ..InventoryTitleSummary::default()
+            },
+            InventoryTitleSummary {
+                title: String::new(),
+                accounts: 4,
+                unchecked: 4,
+                ..InventoryTitleSummary::default()
+            },
+        ];
+        let summary = summarize(&titles, vec!["social".to_string()]);
+        assert_eq!(
+            (
+                summary.accounts,
+                summary.unchecked,
+                summary.remaining,
+                summary.usage_limit
+            ),
+            (7, 4, 40.0, 300.0)
+        );
+        assert_eq!(
+            summary.by_subscription,
+            vec![
+                InventorySubscriptionSummary {
+                    key: "unknown".to_string(),
+                    accounts: 4,
+                    remaining: 0.0,
+                },
+                InventorySubscriptionSummary {
+                    key: "pro".to_string(),
+                    accounts: 3,
+                    remaining: 40.0,
+                },
+            ]
+        );
+        let all = || {
+            vec![
+                "KIRO PRO".to_string(),
+                "KIRO FREE".to_string(),
+                String::new(),
+            ]
+        };
+        assert_eq!(titles_of_tier(all(), "pro"), vec!["KIRO PRO"]);
+        assert_eq!(titles_of_tier(all(), "unknown"), vec![""]);
+        assert!(titles_of_tier(all(), "power").is_empty());
     }
 
     #[test]
