@@ -325,6 +325,11 @@ async fn deadline_first_timeout_at<F>(deadline: Instant, future: F) -> Result<F:
 where
     F: Future,
 {
+    // 已过期的 deadline 必须直接拒绝：定时器驱动的时钟只在驱动推进时更新，线程被占住时会落后
+    // 真实时间，只靠 sleep_until 会让刚过期的 deadline 在首次 poll 时还"没到"，被立即就绪的 future 抢先。
+    if Instant::now() >= deadline {
+        return Err(());
+    }
     let timer = tokio::time::sleep_until(deadline);
     tokio::pin!(timer);
     tokio::pin!(future);
@@ -1049,6 +1054,19 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    /// 定时器驱动的时钟只在驱动推进时更新：线程被占住几毫秒没让出时，它会落后真实时间，
+    /// 刚过期的 deadline 在 sleep_until 首次 poll 时还"没到"，被立即就绪的 future 抢先。
+    /// 这正是负载高时上面那条用例偶发失败的原因；这里用阻塞线程稳定复现。
+    #[tokio::test]
+    async fn deadline_first_timeout_rejects_elapsed_deadline_while_timer_clock_lags() {
+        for round in 0..5 {
+            std::thread::sleep(Duration::from_millis(5));
+            let deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+            let result = deadline_first_timeout_at(deadline, std::future::ready(round)).await;
+            assert_eq!(result, Err(()), "round {round}");
+        }
     }
 
     #[tokio::test]
