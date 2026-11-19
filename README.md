@@ -28,7 +28,7 @@ pnpm --dir ui build
 cargo build --release --locked --bin claude-pool
 ```
 
-默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。发布前核对 CLI 版本，预期输出 `claude-pool 1.0.9`：
+默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。发布前核对 CLI 版本，预期输出 `claude-pool 1.0.10`：
 
 ```bash
 cargo run --release --locked --bin claude-pool -- --version
@@ -110,15 +110,15 @@ mkdir -p config logs
 cp config.example.json config/config.json
 # 编辑 config/config.json 中的下游密钥与管理密钥
 export CLAUDE_POOL_POSTGRES_PASSWORD='replace-with-database-password'
-export CLAUDE_POOL_VERSION=1.0.9
+export CLAUDE_POOL_VERSION=1.0.10
 docker compose -f docker-compose.database.yml up -d
 ```
 
 自建镜像：
 
 ```bash
-docker build -t claude-pool:1.0.9 .
-CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.9 \
+docker build -t claude-pool:1.0.10 .
+CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.10 \
   docker compose -f docker-compose.database.yml up -d
 ```
 
@@ -129,7 +129,7 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.9 \
 | 项 | `claude-main` | `main`（kiro-rs） |
 |---|---|---|
 | 包名 / 二进制 | `claude-pool` | `kiro-rs` |
-| 版本来源 | `Cargo.toml`（当前 `1.0.9`） | `Cargo.toml` |
+| 版本来源 | `Cargo.toml`（当前 `1.0.10`） | `Cargo.toml` |
 | 发布 tag | `claude-vMAJOR.MINOR.PATCH` | `vMAJOR.MINOR.PATCH` |
 | 镜像 | `ghcr.io/2ue/claude-pool`、`docker.io/<user>/claude-pool` | `ghcr.io/2ue/kiro-rs` |
 | 质量门禁 | 对 `claude-main` 的 push / PR 跑全量门禁 | 对 `main` |
@@ -139,10 +139,10 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.9 \
 ```bash
 # 1. 顺延版本号：Cargo.toml、Cargo.lock、package.json、ui/package.json 四处一致
 # 2. 提交
-git commit -am "chore(release): 1.0.9"
+git commit -am "chore(release): 1.0.10"
 # 3. 推送分支并打 tag，tag 必须严格等于 claude-v + Cargo 版本
 git push origin claude-main
-git tag claude-v1.0.9 && git push origin claude-v1.0.9
+git tag claude-v1.0.10 && git push origin claude-v1.0.10
 ```
 
 tag 推送后 `Publish Claude Pool Docker Images` 工作流会校验 tag 与 Cargo 版本一致、运行 release 档质量门禁、构建 amd64 与 arm64 镜像并推送多架构 manifest；`latest` 只在 `claude-v*` 命名空间内按最高版本更新。
