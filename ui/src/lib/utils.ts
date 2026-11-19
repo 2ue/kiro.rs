@@ -38,6 +38,13 @@ export function parseError(error: unknown): ParsedError {
     }
   }
 
+  // 请求体反序列化失败等情况，后端（axum）返回的是纯文本说明而不是 JSON。
+  const text = typeof response?.data === 'string' ? response.data.trim() : ''
+  if (text && !text.startsWith('<')) {
+    const detail = text.length > 300 ? `${text.slice(0, 300)}…` : text
+    return { title: status === 422 || status === 400 ? `请求参数无效（${status}）：${detail}` : `请求失败（${status ?? '未知状态'}）：${detail}` }
+  }
+
   if ('message' in axiosError && typeof axiosError.message === 'string') {
     return { title: axiosError.message }
   }

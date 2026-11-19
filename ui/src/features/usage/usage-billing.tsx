@@ -255,7 +255,7 @@ export function AccountBillingPanel({
           <CostMetric
             label="上游原始成本"
             value={formatUsdFixed2(billing.rawCostUsd)}
-            detail="按外部上游返回 usage 估算"
+            detail="按上游返回 usage 估算"
           />
           <CostMetric
             label="展示计费"

@@ -1,4 +1,5 @@
 import { injectionSetting } from "./injection-model";
+import { effectiveInjectionText, injectionCharCount, isInjectionTextEdited } from "./injection-rules";
 import { Badge, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui";
 import type { InjectionCatalogEntry, InjectionItemOverride, RuntimeConfig } from "@/types/api";
 import { Link } from "react-router-dom";
@@ -101,8 +102,8 @@ export function RouteInjectionEditor({
     <div className="space-y-4">
       <p className="text-xs leading-5 text-muted-foreground">
         每一项单独设置，“跟随默认”使用全局默认。注入的文本在
-        <Link className="mx-1 text-primary underline-offset-2 hover:underline" to="/policy-templates">策略模板</Link>
-        页面编辑。
+        <Link className="mx-1 text-primary underline-offset-2 hover:underline" to="/policy-templates?tab=injection">策略模板</Link>
+        页面编辑，各路由的开关总览见那里的“路由矩阵”。
       </p>
       <SettingGroup title="提示词注入" desc="决定发往上游的 system 里附加哪些提示词；开关按路由生效，文本全局共用。">
         {catalog.map((item) => {
@@ -110,7 +111,9 @@ export function RouteInjectionEditor({
           const inherited = injectionSetting(config.promptInjection.defaults, {}, item.id).enabled;
           const effective = own ?? inherited;
           const blocked = strict && item.strictBlocks ? "anthropic-strict 模式下不注入" : null;
-          const text = item.texts[0] ? (config.promptInjection.texts[item.texts[0].key] ?? item.texts[0].defaultText) : (item.readOnlyVariants[0]?.defaultText ?? "");
+          const variant = item.texts[0];
+          const text = variant ? effectiveInjectionText(config.promptInjection.texts, variant) : (item.readOnlyVariants[0]?.defaultText ?? "");
+          const edited = variant ? isInjectionTextEdited(config.promptInjection.texts, variant) : false;
           return (
             <SettingRow
               key={item.id}
@@ -120,6 +123,7 @@ export function RouteInjectionEditor({
                 <>
                   <Badge size="xs" tone="neutral">{CATEGORY_LABEL[item.category]}</Badge>
                   {item.recommendation === "keep_on" && <Badge size="xs" tone="warning">建议开</Badge>}
+                  {edited && <Badge size="xs" tone="primary" title="全局文本与内置文本不同，在策略模板页可以恢复默认">已修改</Badge>}
                 </>
               }
               control={
@@ -143,6 +147,11 @@ export function RouteInjectionEditor({
               {text.trim() && (
                 <p className="line-clamp-2 break-all font-mono text-[0.68rem] leading-4 text-muted-foreground/80" title={text}>
                   {text.slice(0, 200)}
+                </p>
+              )}
+              {variant && (
+                <p className="text-[0.68rem] leading-4 text-muted-foreground">
+                  {injectionCharCount(text)} 字符 · {edited ? "全局文本已修改" : "内置文本"}
                 </p>
               )}
             </SettingRow>

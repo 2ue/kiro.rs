@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Activity,
   AlertTriangle,
@@ -28,6 +28,7 @@ import {
   qualityChartRows,
   rowsCrossDays,
 } from './quality-history'
+import { riskInitialFromSearch } from './risk-url-params'
 import { TrendAreaChart } from '@/components/charts'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
@@ -169,22 +170,29 @@ function formatMs(value: number | null | undefined): string {
 
 export function AccountRiskPage() {
   const navigate = useNavigate()
-  const [windowKey, setWindowKey] = useState('last24h')
+  const [searchParams] = useSearchParams()
+  // 账号卡片“诊断”跳过来时带 accountId（也可带时间窗口）；只在进入页面时读一次作为初值。
+  const [initial] = useState(() => riskInitialFromSearch(searchParams))
+  const [windowKey, setWindowKey] = useState<string>(initial.windowKey)
   const [warningInput, setWarningInput] = useState(String(DEFAULT_WARNING_TOKENS))
   const [criticalInput, setCriticalInput] = useState(String(DEFAULT_CRITICAL_TOKENS))
-  const [poolInput, setPoolInput] = useState('')
+  const [poolInput, setPoolInput] = useState(initial.accountId ? String(initial.accountId) : '')
   const [endpointInput, setEndpointInput] = useState('')
   const [modelInput, setModelInput] = useState('')
-  const [sinceInput, setSinceInput] = useState(() => recentDatetimeLocal(24))
-  const [untilInput, setUntilInput] = useState(() => toDatetimeLocalValue(new Date()))
+  const [sinceInput, setSinceInput] = useState(() => (initial.since ? toDatetimeLocalValue(initial.since) : recentDatetimeLocal(24)))
+  const [untilInput, setUntilInput] = useState(() => toDatetimeLocalValue(initial.until ?? new Date()))
   const [streamFilter, setStreamFilter] = useState<StreamFilter>('all')
-  const [submitted, setSubmitted] = useState<UsageAccountRiskQuery>({
+  const [submitted, setSubmitted] = useState<UsageAccountRiskQuery>(() => ({
     timezone: TIMEZONE,
-    windowKey: 'last24h',
+    windowKey: initial.windowKey,
+    // 自定义窗口没带起止时与输入框默认值一致：最近 24 小时
+    since: initial.windowKey === 'custom' ? (initial.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000)).toISOString() : undefined,
+    until: initial.windowKey === 'custom' ? (initial.until ?? new Date()).toISOString() : undefined,
     warningThresholdTokens: DEFAULT_WARNING_TOKENS,
     criticalThresholdTokens: DEFAULT_CRITICAL_TOKENS,
+    accountId: initial.accountId,
     limit: 50,
-  })
+  }))
 
   const riskQuery = useUsageDashboardAccountRisk(submitted)
   const data = riskQuery.data

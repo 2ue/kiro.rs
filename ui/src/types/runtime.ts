@@ -215,7 +215,6 @@ export type CacheTtlMode =
   | "upstream_then_request_default_5m";
 
 export interface CacheTtlPolicyPatch {
-  local?: CacheTtlMode;
   account?: CacheTtlMode;
 }
 
@@ -296,15 +295,14 @@ export type InjectionTextKey =
   | "webSearchGuidance"
   | "emptyTurnNudge";
 
+/** 一项的全局默认；后端 `ItemSetting` 只有 `enabled`，且拒绝未知字段。 */
 export interface InjectionItemSetting {
   enabled: boolean;
-  /** Only present on items that can be injected into account requests. */
-  account?: boolean;
 }
 
+/** 一项在某条路由上的设置；没写表示跟随全局默认。后端拒绝未知字段。 */
 export interface InjectionItemOverride {
   enabled?: boolean;
-  account?: boolean;
 }
 
 export interface PromptInjectionConfig {
@@ -357,7 +355,6 @@ export interface InjectionCatalogEntry {
   recommendation: InjectionRecommendation;
   recommendationNote: string;
   defaultEnabled: boolean;
-  account: boolean;
   strictBlocks: boolean;
   editable: boolean;
   texts: InjectionTextVariant[];

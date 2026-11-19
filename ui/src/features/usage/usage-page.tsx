@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactNode } from 'react'
+import { useRuntimeConfig } from '@/hooks/use-runtime-config'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -1058,6 +1059,8 @@ export function UsagePage() {
   const modelPricing = useModelPricing(autoRefresh.refetchInterval)
   const writerStats = useUsageWriterStats(autoRefresh.refetchInterval)
   const syncPricing = useSyncModelPricing()
+  const runtimeConfig = useRuntimeConfig()
+  const highCacheThreshold = runtimeConfig.data?.highCacheThreshold
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
   const data = summary.data
@@ -1178,7 +1181,9 @@ export function UsagePage() {
           title="缓存命中较高"
           value={formatCompact(data?.highCacheRequests ?? 0)}
           valueTitle={formatNumber(data?.highCacheRequests ?? 0)}
-          desc="highCacheThreshold 以上的请求"
+          desc={typeof highCacheThreshold === 'number'
+            ? `单次缓存读取 ≥ ${formatNumber(highCacheThreshold)} token 的请求（阈值在路由页"统计展示"里设）`
+            : '单次缓存读取达到阈值的请求（阈值在路由页"统计展示"里设）'}
           icon={<Zap />}
           tone="success"
         />

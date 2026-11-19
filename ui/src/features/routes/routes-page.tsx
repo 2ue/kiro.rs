@@ -1,4 +1,5 @@
-import { useRuntimeConfig } from "@/hooks/use-runtime-config";
+import { useUnsavedChangesGuard } from "@/hooks/use-unsaved-changes-guard";
+import { useRuntimeConfig, useUpdateRuntimeConfig } from "@/hooks/use-runtime-config";
 import { useAccounts } from "@/hooks/use-accounts";
 import {
   EmptyState,
@@ -13,6 +14,12 @@ import {
   StatGrid,
   useConfirm,
 } from "@/components/patterns";
+import {
+  CONFIG_FIELD_GRID_CLASS,
+  CONFIG_FIELD_GRID_STYLE,
+  ConfigFieldCell,
+  ConfigNumberControl,
+} from "@/components/patterns/config-fields";
 import {
   Badge,
   Button,
@@ -31,11 +38,18 @@ import {
   Switch,
 } from "@/components/ui";
 import { CACHE_STRATEGIES } from "@/features/cache-policies/route-cache-editor";
+import { RoutePolicyImportDialog, type ImportedRoutePolicy } from "@/features/cache-policies/route-policy-import-dialog";
+import {
+  buildRoutePolicyFile,
+  downloadRoutePolicyFile,
+  routeFromImportedPolicy,
+} from "@/features/cache-policies/route-policy-transfer";
+import { formatNumber } from "@/lib/format";
 import { useRoutes, useUpdateRoutes } from "@/hooks/use-routes";
 import { extractErrorMessage } from "@/lib/utils";
 import type { RouteConfig } from "@/types/routes";
 import type { RuntimeConfig } from "@/types/api";
-import { Copy, CopyPlus, Edit3, Link2, Plus, Route as RouteIcon, Trash2 } from "lucide-react";
+import { Copy, CopyPlus, Download, Edit3, Info, Link2, Plus, Route as RouteIcon, Save, Trash2, Upload } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
@@ -90,6 +104,7 @@ function RouteCard({
   onToggle,
   onEdit,
   onCopy,
+  onExport,
   onDelete,
 }: {
   route: RouteConfig;
@@ -99,6 +114,7 @@ function RouteCard({
   onToggle: (enabled: boolean) => void;
   onEdit: () => void;
   onCopy: () => void;
+  onExport: () => void;
   onDelete: () => void;
 }) {
   const builtIn = isBuiltinRoute(route.prefix);
@@ -125,6 +141,7 @@ function RouteCard({
           <Switch checked={route.enabled} disabled={busy} onCheckedChange={onToggle} aria-label={`启用 ${prefix}`} />
           <Button variant="ghost" size="icon-xs" title="编辑" aria-label={`编辑 ${prefix}`} onClick={onEdit}><Edit3 /></Button>
           <Button variant="ghost" size="icon-xs" title="复制为新路由" aria-label={`以 ${prefix} 的配置新建路由`} onClick={onCopy}><CopyPlus /></Button>
+          <Button variant="ghost" size="icon-xs" title="导出 JSON" aria-label={`导出 ${prefix} 的策略`} onClick={onExport}><Download /></Button>
           {!builtIn && (
             <Button variant="ghost" size="icon-xs" className="text-destructive hover:text-destructive" title="删除" aria-label={`删除 ${prefix}`} disabled={busy} onClick={onDelete}><Trash2 /></Button>
           )}
@@ -161,14 +178,37 @@ function RouteCard({
   );
 }
 
+/** 新建路由弹窗：空白新建、复制已有路由或导入策略文件，三者走同一条创建流程。 */
+interface CreatorState {
+  source: RouteConfig | null;
+  name: string;
+  routeName: string;
+  origin: { kind: "copy" | "import"; route: string | null } | null;
+}
+
+/** 后端阈值是 i32，且不能为负。 */
+const MAX_HIGH_CACHE_THRESHOLD = 2_147_483_647;
+
 export function RoutesPage() {
   const runtime = useRuntimeConfig();
+  const updateRuntime = useUpdateRuntimeConfig();
   const accounts = useAccounts();
   const query = useRoutes();
   const update = useUpdateRoutes();
   const navigate = useNavigate();
   const confirm = useConfirm();
-  const [creator, setCreator] = useState<{ source: RouteConfig | null; name: string; routeName: string } | null>(null);
+  const [creator, setCreator] = useState<CreatorState | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  /** 阈值输入框的草稿；null 表示未改动，显示已保存的值。 */
+  const [thresholdDraft, setThresholdDraft] = useState<number | null>(null);
+  // hooks 必须在条件 return 之前调用。
+  useUnsavedChangesGuard(
+    thresholdDraft !== null &&
+      runtime.data !== undefined &&
+      thresholdDraft !== runtime.data.highCacheThreshold &&
+      !updateRuntime.isPending,
+    "缓存命中判定阈值还没有保存，离开后会丢失。",
+  );
 
   const save = async (routes: RouteConfig[], message = "路由已保存") => {
     try {
@@ -216,7 +256,35 @@ export function RoutesPage() {
       source,
       name: "",
       routeName: source ? `${source.name || displayRoutePrefix(source.prefix)} 副本` : "",
+      origin: source ? { kind: "copy", route: displayRoutePrefix(source.prefix) } : null,
     });
+  /** 导入的策略进入同一条新建流程，前缀重新填写。 */
+  const openImportedCreator = (imported: ImportedRoutePolicy) => {
+    setImportOpen(false);
+    setCreator({
+      source: routeFromImportedPolicy(imported.policy),
+      name: "",
+      routeName: imported.name ?? "",
+      origin: { kind: "import", route: imported.sourceRoute },
+    });
+  };
+  const exportRoute = (route: RouteConfig) => {
+    downloadRoutePolicyFile(buildRoutePolicyFile(route));
+    toast.success(`已导出 ${displayRoutePrefix(route.prefix)} 的路由策略`);
+  };
+  const savedThreshold = runtime.data?.highCacheThreshold ?? 0;
+  const threshold = thresholdDraft ?? savedThreshold;
+  const thresholdValid = Number.isInteger(threshold) && threshold >= 0 && threshold <= MAX_HIGH_CACHE_THRESHOLD;
+  const saveThreshold = async () => {
+    if (!thresholdValid) return;
+    try {
+      await updateRuntime.mutateAsync({ highCacheThreshold: threshold });
+      setThresholdDraft(null);
+      toast.success("缓存命中判定阈值已保存");
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    }
+  };
   const normalizedNewPrefix = creator ? normalizeCustomRoutePrefix(creator.name) : null;
   const duplicate = normalizedNewPrefix != null && routes.some((r) => normalizeRoutePrefix(r.prefix) === normalizedNewPrefix);
   const create = async () => {
@@ -238,10 +306,16 @@ export function RoutesPage() {
     <PageContainer>
       <PageHeader
         actions={
-          <Button onClick={() => openCreator(null)}>
-            <Plus />
-            新增路由
-          </Button>
+          <>
+            <Button variant="outline" onClick={() => setImportOpen(true)}>
+              <Upload />
+              导入
+            </Button>
+            <Button onClick={() => openCreator(null)}>
+              <Plus />
+              新增路由
+            </Button>
+          </>
         }
       />
 
@@ -249,6 +323,7 @@ export function RoutesPage() {
         <StatCard title="路由" value={routes.length} desc={`内置 ${builtinCount} · 自定义 ${customCount}`} icon={<RouteIcon />} tone="primary" />
         <StatCard title="已停用" value={disabledCount} desc={disabledCount ? "停用的入口返回 404" : "全部入口可用"} icon={<RouteIcon />} tone={disabledCount ? "warning" : "success"} />
         <StatCard title="自定义前缀" value={CUSTOM_ROUTE_PREFIX.replace(/\/$/, "")} desc="自定义路由统一挂在这个前缀下，与内置入口隔离" icon={<Link2 />} tone="info" />
+        <StatCard title="命中判定阈值" value={runtime.data ? `${formatNumber(savedThreshold)} Token` : "—"} desc="用量页“缓存命中较高”的统计阈值" icon={<Info />} tone="warning" />
       </StatGrid>
 
       <SectionCard
@@ -285,6 +360,7 @@ export function RoutesPage() {
                 }}
                 onEdit={() => navigate(routeEditorPath(route.id))}
                 onCopy={() => openCreator(route)}
+                onExport={() => exportRoute(route)}
                 onDelete={async () => {
                   if (
                     await confirm({
@@ -302,11 +378,70 @@ export function RoutesPage() {
         )}
       </SectionCard>
 
+      <SectionCard
+        title="统计展示"
+        description="只影响用量页的统计口径，不改变请求处理和返回给客户端的 usage。"
+        icon={<Info />}
+      >
+        <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
+          <div className={`${CONFIG_FIELD_GRID_CLASS} min-w-0 flex-1`} style={CONFIG_FIELD_GRID_STYLE}>
+            <ConfigFieldCell
+              id="high-cache-threshold"
+              label="缓存命中判定阈值"
+              description={
+                thresholdValid
+                  ? "单次请求的缓存读取达到这个 Token 数，用量页把它计入“缓存命中较高”。"
+                  : `请输入 0 到 ${formatNumber(MAX_HIGH_CACHE_THRESHOLD)} 之间的整数。`
+              }
+            >
+              <ConfigNumberControl
+                id="high-cache-threshold"
+                value={threshold}
+                unit="Token"
+                min={0}
+                step={1}
+                disabled={!runtime.data}
+                onChange={setThresholdDraft}
+              />
+            </ConfigFieldCell>
+          </div>
+          <Button
+            variant="outline"
+            disabled={!runtime.data || updateRuntime.isPending || !thresholdValid || threshold === savedThreshold}
+            title={threshold === savedThreshold ? "没有未保存的修改" : undefined}
+            onClick={() => void saveThreshold()}
+          >
+            <Save />
+            保存阈值
+          </Button>
+        </div>
+      </SectionCard>
+
+      {importOpen && (
+        <RoutePolicyImportDialog
+          accountIds={(accounts.data?.accounts ?? []).map((account) => account.id)}
+          onClose={() => setImportOpen(false)}
+          onImport={openImportedCreator}
+        />
+      )}
+
       <ModalShell
         open={creator !== null}
         onClose={() => setCreator(null)}
-        title={creator?.source ? `复制路由 · 来自 ${displayRoutePrefix(creator.source.prefix)}` : "新增路由"}
-        description={creator?.source ? "缓存、注入、功能与规则都会复制；路由前缀需要重新填写。" : "自定义路由固定挂在 /dfcache/ 下，只填后缀名。创建后进入编辑页配置策略。"}
+        title={
+          creator?.origin?.kind === "copy"
+            ? `复制路由 · 来自 ${creator.origin.route}`
+            : creator?.origin?.kind === "import"
+              ? `导入路由策略${creator.origin.route ? ` · 来自 ${creator.origin.route}` : ""}`
+              : "新增路由"
+        }
+        description={
+          creator?.origin?.kind === "copy"
+            ? "缓存、注入、功能与规则都会复制；路由前缀需要重新填写。"
+            : creator?.origin?.kind === "import"
+              ? "已填入导入的缓存策略、usage 整形、提示词注入、路由功能与账号/模型规则；路由不会导入，前缀需要重新填写。创建后进入编辑页核对。"
+              : "自定义路由固定挂在 /dfcache/ 下，只填后缀名。创建后进入编辑页配置策略。"
+        }
         footer={
           <>
             <Button variant="outline" onClick={() => setCreator(null)} disabled={update.isPending}>取消</Button>

@@ -1,3 +1,5 @@
+import type * as React from "react";
+import { useState } from "react";
 import {
   Input,
   Label,
@@ -215,6 +217,109 @@ const DESCRIPTIONS: Record<string, string> = {
 const GROUP_META: Record<string, { title: string; desc?: string }> = {
   requestAdmission: { title: "每实例 · 每 Key 限制", desc: "速率、并发与排队限制按每个实例、每把下游 Key 分别计；外层限制优先，密钥层只能收紧。" },
 };
+/** 参数格网格：列宽 15rem 起自适应，与 ConfigFields 相同。 */
+export const CONFIG_FIELD_GRID_CLASS = "grid gap-x-8 gap-y-5";
+export const CONFIG_FIELD_GRID_STYLE = { gridTemplateColumns: "repeat(auto-fill, minmax(min(15rem, 100%), 1fr))" } as const;
+
+/** 一个参数格：标签在上、控件居中、说明在下。ConfigFields 与需要联动的自定义分组共用同一排版。 */
+export function ConfigFieldCell({
+  id,
+  label,
+  title,
+  description,
+  children,
+}: {
+  id: string;
+  label: React.ReactNode;
+  title?: string;
+  description?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <Label htmlFor={id} title={title} className="block text-[13px] font-medium leading-5 text-foreground">{label}</Label>
+      <div className="flex min-h-8 items-center gap-2">{children}</div>
+      {description && <p className="text-[11px] leading-4 text-muted-foreground">{description}</p>}
+    </div>
+  );
+}
+
+/** 参数格里的开关：开关 + “开启/关闭”文字。 */
+export function ConfigSwitchControl({
+  id,
+  checked,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <>
+      <Switch id={id} checked={checked} disabled={disabled} onCheckedChange={onChange} />
+      <span className="text-xs text-muted-foreground">{checked ? "开启" : "关闭"}</span>
+    </>
+  );
+}
+
+/** 参数格里的数字框：固定宽度，单位放在右侧。
+ *  输入框清空或输入到一半（如 "-"）时不向上提交，失焦后恢复成当前值，避免清空被当成 0；
+ *  `integer` 时取整并按 min/max 限幅，对应后端的整数字段。 */
+export function ConfigNumberControl({
+  id,
+  value,
+  unit,
+  min,
+  max,
+  step,
+  integer,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  value: number;
+  unit?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+  integer?: boolean;
+  disabled?: boolean;
+  onChange: (value: number) => void;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  const normalize = (raw: number) => {
+    let next = integer ? Math.round(raw) : raw;
+    if (min !== undefined) next = Math.max(min, next);
+    if (max !== undefined) next = Math.min(max, next);
+    return next;
+  };
+  return (
+    <>
+      <Input
+        id={id}
+        type="number"
+        inputMode={integer ? "numeric" : "decimal"}
+        min={min}
+        max={max}
+        step={step ?? (integer ? 1 : undefined)}
+        disabled={disabled}
+        className="h-8 w-28 shrink-0 px-2 text-sm tabular-nums"
+        value={text ?? String(value ?? "")}
+        onChange={(e) => {
+          const raw = e.target.value;
+          setText(raw);
+          const parsed = Number(raw);
+          if (raw.trim() !== "" && Number.isFinite(parsed)) onChange(normalize(parsed));
+        }}
+        onBlur={() => setText(null)}
+      />
+      {unit && <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">{unit}</span>}
+    </>
+  );
+}
+
 /**
  * 通用配置表单。
  *
@@ -243,7 +348,7 @@ export function ConfigFields({
   return (
     <div className="max-w-5xl space-y-6">
       {leaves.length > 0 && (
-        <div className="grid gap-x-8 gap-y-5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(min(15rem, 100%), 1fr))" }}>
+        <div className={CONFIG_FIELD_GRID_CLASS} style={CONFIG_FIELD_GRID_STYLE}>
           {leaves.map(([key, current]) => {
             const id = `${prefix}-${key}`;
             const label = labels[key] ?? key;
@@ -257,51 +362,44 @@ export function ConfigFields({
             const isNumber = typeof current === "number";
             const isList = Array.isArray(current);
             return (
-              <div key={key} className="min-w-0 space-y-1.5">
-                <Label htmlFor={id} title={key} className="block text-[13px] font-medium leading-5 text-foreground">{label}</Label>
-                <div className="flex min-h-8 items-center gap-2">
-                  {isBool ? (
-                    <>
-                      <Switch id={id} checked={current as boolean} onCheckedChange={(v) => setField(key, v)} />
-                      <span className="text-xs text-muted-foreground">{current ? "开启" : "关闭"}</span>
-                    </>
-                  ) : options ? (
-                    <Select value={String(current)} onValueChange={(v) => setField(key, v)}>
-                      <SelectTrigger id={id} size="sm" className="w-full"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  ) : (
-                    <>
-                      <Input
-                        id={id}
-                        type={isNumber ? "number" : "text"}
-                        inputMode={isNumber ? "decimal" : undefined}
-                        className={isNumber ? "h-8 w-28 shrink-0 px-2 text-sm tabular-nums" : "h-8 w-full text-sm"}
-                        value={isList ? (current as unknown[]).join(", ") : String(current ?? "")}
-                        onChange={(e) =>
-                          setField(
-                            key,
-                            isNumber
-                              ? Number(e.target.value)
-                              : isList
-                                ? e.target.value
-                                    .split(",")
-                                    .map((v) => v.trim())
-                                    .filter(Boolean)
-                                    .map((v) => ((current as unknown[]).every((item) => typeof item === "number") ? Number(v) : v))
-                                    .filter((v) => typeof v !== "number" || Number.isFinite(v))
-                                : e.target.value,
-                          )
-                        }
-                      />
-                      {UNITS[key] && <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">{UNITS[key]}</span>}
-                    </>
-                  )}
-                </div>
-                {description && <p className="text-[11px] leading-4 text-muted-foreground">{description}</p>}
-              </div>
+              <ConfigFieldCell key={key} id={id} label={label} title={key} description={description}>
+                {isBool ? (
+                  <ConfigSwitchControl id={id} checked={current as boolean} onChange={(v) => setField(key, v)} />
+                ) : options ? (
+                  <Select value={String(current)} onValueChange={(v) => setField(key, v)}>
+                    <SelectTrigger id={id} size="sm" className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <>
+                    <Input
+                      id={id}
+                      type={isNumber ? "number" : "text"}
+                      inputMode={isNumber ? "decimal" : undefined}
+                      className={isNumber ? "h-8 w-28 shrink-0 px-2 text-sm tabular-nums" : "h-8 w-full text-sm"}
+                      value={isList ? (current as unknown[]).join(", ") : String(current ?? "")}
+                      onChange={(e) =>
+                        setField(
+                          key,
+                          isNumber
+                            ? Number(e.target.value)
+                            : isList
+                              ? e.target.value
+                                  .split(",")
+                                  .map((v) => v.trim())
+                                  .filter(Boolean)
+                                  .map((v) => ((current as unknown[]).every((item) => typeof item === "number") ? Number(v) : v))
+                                  .filter((v) => typeof v !== "number" || Number.isFinite(v))
+                              : e.target.value,
+                        )
+                      }
+                    />
+                    {UNITS[key] && <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">{UNITS[key]}</span>}
+                  </>
+                )}
+              </ConfigFieldCell>
             );
           })}
         </div>

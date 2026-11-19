@@ -33,9 +33,22 @@ export function routePrefixForEndpoint(endpoint: string | null | undefined): str
   const prefix = value.slice(0, index).replace(/\/+$/, "");
   return prefix || "/";
 }
-/** 编辑页地址只放 id，前缀不进 URL。 */
-export function routeEditorPath(id: number): string {
-  return `/routes/${id}`;
+/** 路由编辑页的页签。 */
+export const ROUTE_EDIT_TABS = ["cache", "injection", "features", "accounts", "models"] as const;
+export type RouteEditTab = (typeof ROUTE_EDIT_TABS)[number];
+/** main 的旧页签名：behavior 是“提示词与功能”，按注入页签打开。 */
+const ROUTE_EDIT_TAB_ALIASES: Record<string, RouteEditTab> = { behavior: "injection" };
+
+/** `?tab=` 的取值归一化；不认识的值回到缓存页签。 */
+export function resolveRouteEditTab(value: string | null | undefined): RouteEditTab {
+  const key = (value ?? "").trim().toLowerCase();
+  if ((ROUTE_EDIT_TABS as readonly string[]).includes(key)) return key as RouteEditTab;
+  return ROUTE_EDIT_TAB_ALIASES[key] ?? "cache";
+}
+
+/** 编辑页地址只放 id，前缀不进 URL；可带页签直达。 */
+export function routeEditorPath(id: number, tab?: RouteEditTab): string {
+  return tab && tab !== "cache" ? `/routes/${id}?tab=${tab}` : `/routes/${id}`;
 }
 export function isBuiltinRoute(prefix: string): boolean {
   return (BUILTIN_ROUTE_PREFIXES as readonly string[]).includes(normalizeRoutePrefix(prefix));

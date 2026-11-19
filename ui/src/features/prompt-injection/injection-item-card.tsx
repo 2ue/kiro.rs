@@ -6,25 +6,29 @@ import type {
   PromptInjectionConfig,
 } from '@/types/api'
 import { CATEGORY_LABEL } from './injection-model'
+import { effectiveInjectionText, injectionCharCount, isInjectionTextEdited } from './injection-rules'
 
 const RECOMMENDATION_LABEL = { keep_on: '建议开', user_choice: '由你决定' } as const
 
+/** 一个注入项的全局默认开关与文本（与 main 提示词注入页的卡片一致）。 */
 export function InjectionItemCard({
   entry,
   config,
+  maxTextChars,
   onChange,
 }: {
   entry: InjectionCatalogEntry
   config: PromptInjectionConfig
+  /** 单段文本上限（字符），来自注入目录。 */
+  maxTextChars: number
   onChange: (next: PromptInjectionConfig) => void
 }) {
-  const setting = config.defaults[entry.id] ?? { enabled: entry.defaultEnabled }
-  const offWarning = entry.recommendation === 'keep_on' && !setting.enabled
+  const enabled = config.defaults[entry.id]?.enabled ?? entry.defaultEnabled
+  const offWarning = entry.recommendation === 'keep_on' && !enabled
   const switchId = `injection-${entry.id}-enabled`
-  const externalId = `injection-${entry.id}-external`
 
-  const setSetting = (patch: Partial<typeof setting>) =>
-    onChange({ ...config, defaults: { ...config.defaults, [entry.id]: { ...setting, ...patch } } })
+  const setEnabled = (next: boolean) =>
+    onChange({ ...config, defaults: { ...config.defaults, [entry.id]: { enabled: next } } })
   const setText = (key: InjectionTextKey, text: string | null) => {
     const texts = { ...config.texts }
     if (text === null) delete texts[key]
@@ -49,23 +53,10 @@ export function InjectionItemCard({
             位置：{entry.position}。触发：{entry.trigger}。
           </p>
         </div>
-        <div className="flex shrink-0 flex-col items-end gap-2">
-          <label className="flex items-center gap-2 text-xs font-medium" htmlFor={switchId}>
-            默认开启
-            <Switch id={switchId} checked={setting.enabled} onCheckedChange={(enabled) => setSetting({ enabled })} />
-          </label>
-          {entry.account && (
-            <label className="flex items-center gap-2 text-xs text-muted-foreground" htmlFor={externalId}>
-              账号也注入
-              <Switch
-                id={externalId}
-                checked={setting.account ?? false}
-                disabled={!setting.enabled}
-                onCheckedChange={(account) => setSetting({ account })}
-              />
-            </label>
-          )}
-        </div>
+        <label className="flex shrink-0 items-center gap-2 text-xs font-medium" htmlFor={switchId}>
+          默认开启
+          <Switch id={switchId} checked={enabled} onCheckedChange={setEnabled} />
+        </label>
       </header>
 
       <dl className="mt-3 grid gap-2 text-xs leading-5 md:grid-cols-2">
@@ -85,17 +76,19 @@ export function InjectionItemCard({
       {entry.texts.length > 0 && (
         <div className="mt-3 space-y-3">
           {entry.texts.map((variant) => {
-            const edited = config.texts[variant.key]
-            const value = edited ?? variant.defaultText
+            const value = config.texts[variant.key] ?? variant.defaultText
+            const edited = isInjectionTextEdited(config.texts, variant)
+            const chars = injectionCharCount(effectiveInjectionText(config.texts, variant))
+            const over = chars > maxTextChars
             const textId = `injection-text-${variant.key}`
             return (
               <div key={variant.key} className="space-y-1.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <label htmlFor={textId} className="text-xs font-medium">
                     {entry.texts.length > 1 ? variant.label : '注入文本'}
-                    {edited !== undefined && <Badge size="xs" tone="primary" className="ml-2">已修改</Badge>}
+                    {edited && <Badge size="xs" tone="primary" className="ml-2">已修改</Badge>}
                   </label>
-                  {edited !== undefined && (
+                  {config.texts[variant.key] !== undefined && (
                     <Button variant="ghost" size="sm" onClick={() => setText(variant.key, null)}>
                       <RotateCcw className="size-3.5" />
                       恢复默认
@@ -106,14 +99,16 @@ export function InjectionItemCard({
                   id={textId}
                   className="min-h-24 font-mono text-xs"
                   value={value}
+                  aria-invalid={over || undefined}
                   placeholder={variant.key === 'custom' ? '为空时不注入。文本计入缓存前缀，不要写时间或 request id。' : undefined}
                   onChange={(event) => {
                     const next = event.target.value
                     setText(variant.key, next === variant.defaultText ? null : next)
                   }}
                 />
-                <p className="text-[0.7rem] text-muted-foreground">
-                  {value.length} 字符{variant.key !== 'custom' && '；清空后保存会恢复内置文本'}
+                <p className={over ? 'text-[0.7rem] text-destructive' : 'text-[0.7rem] text-muted-foreground'}>
+                  {chars} 字符{over ? `，超过单段上限 ${maxTextChars}` : ''}
+                  {variant.key !== 'custom' && '；清空后保存会恢复内置文本'}
                 </p>
               </div>
             )

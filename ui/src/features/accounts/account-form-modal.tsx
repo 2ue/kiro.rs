@@ -1,5 +1,6 @@
 import { getRouteScenarioOptions } from "@/api/route-scenarios";
-import { Field, FieldGrid, ModalShell, useConfirm } from "@/components/patterns";
+import { Callout, Field, FieldGrid, ModalShell, useConfirm } from "@/components/patterns";
+import { TagsField } from "@/components/patterns/tags-field";
 import {
   Button,
   Input,
@@ -27,23 +28,52 @@ import {
   USAGE_PROJECTION_MODE_OPTIONS,
   type EnumOption,
 } from "@/lib/enum-labels";
-import type { Account, AccountOverrides } from "@/types/api";
+import type { Account } from "@/types/api";
 import { useQuery } from "@tanstack/react-query";
-import { Plus, Save } from "lucide-react";
-import { useState, type ReactNode } from "react";
-import type { AccountFormDraft } from "./account-utils";
+import { Eraser, ListPlus, Plus, Save, Upload } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
+import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+import {
+  ACCOUNT_OVERRIDE_FIELDS,
+  PROXY_MASK_HINT,
+  appendModelMappingPreset,
+  appendModelMappingPresets,
+  appendModelMappingRules,
+  modelMappingPresetClass,
+  modelMappingPresetsForMode,
+  hasMaskedProxyCredentials,
+  parseModelMappingRules,
+  type AccountFormDraft,
+  type AccountModelMappingPreset,
+} from "./account-utils";
+import { RUNTIME_LINKS } from "./account-usage";
 
-const OVERRIDES: Array<[keyof AccountOverrides, string, string]> = [
-  ["requestTimeoutSecs", "请求超时", "秒"],
-  ["streamRequestTimeoutSecs", "流式请求超时", "秒"],
-  ["streamIdleTimeoutSecs", "流式空闲超时", "秒"],
-  ["streamFirstOutputTimeoutSecs", "首输出等待上限", "秒"],
-  ["usageProjectionUpliftPercent", "输入补偿", "%"],
-  ["usageProjectionCostFloorEnabled", "成本底线", ""],
-  ["usageProjectionCostFloorMarginPercent", "成本底线余量", "%"],
-  ["usageProjectionOutputUpliftMinTokens", "输出补偿阈值", "token"],
-  ["usageProjectionOutputUpliftPercent", "输出补偿", "%"],
-];
+/** 快捷映射标签：点一下把这条规则追加到映射规则里，已存在的源模型跳过。与 main 外部池表单一致。 */
+function ModelMappingPresetTags({ presets, disabled, onSelect }: {
+  presets: AccountModelMappingPreset[]
+  disabled?: boolean
+  onSelect: (preset: AccountModelMappingPreset) => void
+}) {
+  if (!presets.length) return null
+  return (
+    <div className="flex flex-wrap gap-2">
+      {presets.map((preset) => (
+        <button
+          key={`${preset.source}->${preset.target}`}
+          type="button"
+          className={cn("rounded-lg px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50", modelMappingPresetClass(preset.tone))}
+          title={`${preset.source} -> ${preset.target}`}
+          disabled={disabled}
+          onClick={() => onSelect(preset)}
+        >
+          + {preset.label}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 /** 分组标题：同一视觉层级，左侧竖线对齐统计卡的风格。 */
 function Group({ title, description, actions, children }: { title: string; description?: string; actions?: ReactNode; children: ReactNode }) {
@@ -71,6 +101,9 @@ export function AccountFormModal({
   onClose,
   onSubmit,
   onDiscoverSupportedModels,
+  copiedFrom,
+  onDeleteCopy,
+  tagOptions = [],
 }: {
   mode: "create" | "edit";
   account?: Account | null;
@@ -81,6 +114,11 @@ export function AccountFormModal({
   onClose: () => void;
   onSubmit: () => void;
   onDiscoverSupportedModels?: () => Promise<string[]>;
+  /** 由“复制”打开时的来源账号：显示副本提示和“删除这个副本”。 */
+  copiedFrom?: { id: number; name: string } | null;
+  onDeleteCopy?: () => void;
+  /** 已有标签，标签输入框里点一下即可添加。 */
+  tagOptions?: string[];
 }) {
   const runtime = useRuntimeConfig();
   const routes = useQuery({
@@ -89,11 +127,58 @@ export function AccountFormModal({
     enabled: open,
   });
   const [discovering, setDiscovering] = useState(false);
+  const [quickImportText, setQuickImportText] = useState("");
   const confirm = useConfirm();
+  // 异步操作（从上游发现模型）返回后要拿最新草稿比较，不能用点击时闭包里的旧值。
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   const set = <K extends keyof AccountFormDraft>(key: K, value: AccountFormDraft[K]) =>
     onDraftChange((p) => ({ ...p, [key]: value }));
+  const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode]);
+  useEffect(() => {
+    if (!open) setQuickImportText("");
+  }, [open]);
 
-  const text = (key: "name" | "baseUrl" | "apiKey" | "proxyUrl" | "tagsText", label: string, extra?: { placeholder?: string; required?: boolean; description?: string; password?: boolean }) => (
+  const addMappingPreset = (preset: AccountModelMappingPreset) => {
+    const result = appendModelMappingPreset(draft.modelMappingRulesText, preset);
+    onDraftChange((p) => ({ ...p, modelMappingRulesText: result.text }));
+    if (result.added) toast.success("模型映射规则已添加");
+    else toast.info("该模型映射规则已存在");
+  };
+  const addAllMappingPresets = () => {
+    const result = appendModelMappingPresets(draft.modelMappingRulesText, mappingPresets);
+    onDraftChange((p) => ({ ...p, modelMappingRulesText: result.text }));
+    if (result.added > 0) toast.success(`已添加 ${result.added} 条模型映射规则`);
+    else toast.info("快捷模型映射规则都已存在");
+  };
+  const importMappingRules = () => {
+    const rules = parseModelMappingRules(quickImportText);
+    if (!rules.length) {
+      toast.error("没有可导入的模型映射规则");
+      return;
+    }
+    const result = appendModelMappingRules(draft.modelMappingRulesText, rules);
+    onDraftChange((p) => ({ ...p, modelMappingRulesText: result.text }));
+    if (result.added > 0) {
+      toast.success(`已导入 ${result.added} 条模型映射规则`);
+      setQuickImportText("");
+    } else {
+      toast.info("导入的模型映射规则都已存在");
+    }
+  };
+  const clearMappingRules = async () => {
+    const count = parseModelMappingRules(draft.modelMappingRulesText).length;
+    if (!count) return;
+    const ok = await confirm({
+      title: "清空映射规则？",
+      message: `会清空当前表单里的 ${count} 条映射规则，保存后才生效。`,
+      confirmText: "清空",
+      tone: "danger",
+    });
+    if (ok) set("modelMappingRulesText", "");
+  };
+
+  const text = (key: "name" | "baseUrl" | "apiKey" | "proxyUrl", label: string, extra?: { placeholder?: string; required?: boolean; description?: string; password?: boolean }) => (
     <Field label={label} htmlFor={`account-${key}`} required={extra?.required} description={extra?.description}>
       <Input
         id={`account-${key}`}
@@ -157,12 +242,22 @@ export function AccountFormModal({
     <ModalShell
       open={open}
       onClose={onClose}
-      title={mode === "edit" ? `编辑账号 #${account?.id}` : "新增账号"}
+      title={copiedFrom ? `编辑副本 #${account?.id}` : mode === "edit" ? `编辑账号 #${account?.id}` : "新增账号"}
       description="上游地址与密钥是必填项，其余保持默认即可开始使用。"
       width="max-w-4xl"
       footer={
         <>
-          <Button variant="outline" onClick={onClose} disabled={saving}>取消</Button>
+          {copiedFrom && onDeleteCopy && (
+            <Button
+              variant="ghost"
+              className="mr-auto text-destructive hover:bg-destructive/10 hover:text-destructive"
+              onClick={onDeleteCopy}
+              disabled={saving}
+            >
+              删除这个副本
+            </Button>
+          )}
+          <Button variant="outline" onClick={onClose} disabled={saving}>{copiedFrom ? "关闭（保留停用的副本）" : "取消"}</Button>
           <Button onClick={onSubmit} disabled={saving}>
             <Save />
             保存
@@ -171,6 +266,13 @@ export function AccountFormModal({
       }
     >
       <div className="space-y-8">
+        {copiedFrom && (
+          <Callout tone="warning">
+            这是从 #{copiedFrom.id}「{copiedFrom.name}」复制的副本，已带上原账号的密钥和全部配置，当前为停用状态。
+            副本和原账号共用同一个上游 Key，同时启用会叠加这个 Key 上的并发；改好名称、密钥或地址后再打开启用。
+            副本不在已保存的路由场景里，以后应用旧场景时它的路由规则会被重置为全部允许。
+          </Callout>
+        )}
         <Group title="连接信息" description="系统会使用这里的服务地址和 Key 连接账号。">
           <FieldGrid min="16rem">
             {text("name", "名称", { required: true })}
@@ -181,10 +283,19 @@ export function AccountFormModal({
               placeholder: mode === "edit" ? "留空保留现有密钥" : undefined,
             })}
             {choice("authType", "认证方式", ACCOUNT_AUTH_TYPE_OPTIONS)}
-            {text("proxyUrl", "代理地址", { placeholder: "留空继承全局" })}
-            {text("tagsText", "标签", { placeholder: "多个标签用逗号分隔" })}
+            {text("proxyUrl", "代理地址", {
+              placeholder: "留空继承全局",
+              description: mode === "edit" && hasMaskedProxyCredentials(account?.proxyUrl)
+                ? PROXY_MASK_HINT
+                : mode === "create"
+                  ? "留空继承全局；支持 http、https、socks5、socks5h，需填写完整的用户名和密码（不能用 *** 占位）"
+                  : "留空继承全局；支持 http、https、socks5、socks5h",
+            })}
             {toggle("enabled", "启用账号", "关闭后不参与调度，配置保留")}
           </FieldGrid>
+          <Field label="标签" htmlFor="account-tags" description="回车或逗号添加，点下面的已有标签直接加上；用于筛选和批量操作">
+            <TagsField id="account-tags" value={draft.tags} options={tagOptions} onChange={(v) => set("tags", v)} disabled={saving} />
+          </Field>
         </Group>
 
         <Group title="调度设置" description="这些设置只影响当前账号，不改变全局排队和冷却策略。">
@@ -242,7 +353,7 @@ export function AccountFormModal({
                 setDiscovering(true);
                 try {
                   const found = await onDiscoverSupportedModels!();
-                  const current = draft.supportedModelsText.split("\n").filter(Boolean);
+                  const current = draftRef.current.supportedModelsText.split("\n").filter(Boolean);
                   const removed = current.filter((m) => !found.includes(m));
                   // 表单里已经填了列表且发现结果会去掉其中一些：先确认再覆盖，避免手填的资格被悄悄抹掉。
                   if (removed.length > 0) {
@@ -279,14 +390,48 @@ export function AccountFormModal({
             {toggle("modelMappingRequireMatch", "必须命中映射", "未命中任何规则时直接拒绝，而不是用原模型名")}
             {toggle("normalizeModelVersionDots", "未命中时点号转横杠", "未命中映射规则时，自动将版本号点号替换为横杠")}
           </FieldGrid>
-          <Field label="映射规则" htmlFor="account-modelMappingRules" description="每行一条：claude-sonnet-4-5-20250929 -> claude-sonnet-4.5">
-            <Textarea
-              id="account-modelMappingRules"
-              rows={5}
-              value={draft.modelMappingRulesText}
-              onChange={(e) => set("modelMappingRulesText", e.target.value)}
-            />
-          </Field>
+          {draft.modelMappingMode !== "passthrough" && (
+            <>
+              <Field label="映射规则" htmlFor="account-modelMappingRules" description="每行一条：claude-sonnet-4-5-20250929 -> claude-sonnet-4.5">
+                <div className="space-y-2">
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button type="button" size="xs" variant="ghost" disabled={saving || !mappingPresets.length} onClick={addAllMappingPresets}>
+                      <ListPlus />
+                      全部添加
+                    </Button>
+                    <Button type="button" size="xs" variant="ghost" disabled={saving || !draft.modelMappingRulesText.trim()} onClick={() => void clearMappingRules()}>
+                      <Eraser />
+                      清空
+                    </Button>
+                  </div>
+                  <Textarea
+                    id="account-modelMappingRules"
+                    rows={5}
+                    value={draft.modelMappingRulesText}
+                    onChange={(e) => set("modelMappingRulesText", e.target.value)}
+                  />
+                </div>
+              </Field>
+              <ModelMappingPresetTags presets={mappingPresets} disabled={saving} onSelect={addMappingPreset} />
+              <Field label="快捷导入" htmlFor="account-modelMappingQuickImport" description="粘贴多行 source -> target（也认 =>、→、=），点击解析导入后追加到上方规则，已存在的源模型跳过。">
+                <div className="space-y-2">
+                  <Textarea
+                    id="account-modelMappingQuickImport"
+                    rows={3}
+                    value={quickImportText}
+                    placeholder={"claude-sonnet-4-5 -> claude-sonnet-4.5\nclaude-opus-4-6 -> claude-opus-4.6"}
+                    onChange={(e) => setQuickImportText(e.target.value)}
+                  />
+                  <div className="flex justify-end">
+                    <Button type="button" size="xs" variant="outline" disabled={saving || !quickImportText.trim()} onClick={importMappingRules}>
+                      <Upload />
+                      解析导入
+                    </Button>
+                  </div>
+                </div>
+              </Field>
+            </>
+          )}
         </Group>
 
         <details className="rounded-xl border">
@@ -294,9 +439,16 @@ export function AccountFormModal({
             覆盖全局参数
             <span className="ml-2 text-xs font-normal text-muted-foreground">留空表示沿用全局值</span>
           </summary>
-          <div className="border-t px-4 pb-4 pt-4">
+          <div className="space-y-3 border-t px-4 pb-4 pt-4">
+            <p className="text-xs text-muted-foreground">
+              全局值在运行配置 → 账号池的
+              <Link to={RUNTIME_LINKS.timeouts} target="_blank" rel="noreferrer" className="mx-1 text-primary underline-offset-4 hover:underline">超时与流式</Link>
+              和
+              <Link to={RUNTIME_LINKS.uplift} target="_blank" rel="noreferrer" className="mx-1 text-primary underline-offset-4 hover:underline">用量补偿</Link>
+              分组统一保存（新标签页打开，不影响这里未保存的修改）。
+            </p>
             <FieldGrid min="15rem">
-              {OVERRIDES.map(([key, label, unit]) => {
+              {ACCOUNT_OVERRIDE_FIELDS.map(([key, label, unit]) => {
                 const global = runtime.data?.accounts[key];
                 const current = draft.overrides[key];
                 const id = `account-override-${key}`;

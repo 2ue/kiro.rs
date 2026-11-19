@@ -25,23 +25,19 @@ import {
 import { useUnsavedChangesGuard } from "@/hooks/use-unsaved-changes-guard";
 import { extractErrorMessage } from "@/lib/utils";
 import type { AccountsConfig, RuntimeConfig } from "@/types/api";
-import { Save } from "lucide-react";
+import { FileText, Route as RouteIcon, Save, Users } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { proxyPasswordIsSet, proxyPasswordPatch, type ProxyPasswordAction } from "./proxy-password";
 import { ModelMappingSection } from "./runtime-sections";
-const accountSections: Array<{ key: string; title: string; desc: string; matches: (key: string) => boolean }> = [
-  { key: "capacity", title: "容量与排队", desc: "账号池整体的并发上限、排队与等待。", matches: (k) => /^(enabled|globalMax|maxQueued|capacityMode|dispatch)/.test(k) },
-  { key: "retry", title: "重试与故障转移", desc: "同一请求在账号之间怎么重试，瞬态失败的账号怎么降权。", matches: (k) => /^(retry|samePool|transient)/.test(k) },
-  { key: "quality", title: "质量感知调度", desc: "按失败率、延迟和负载给账号打分，优先把请求交给表现好的账号。", matches: (k) => /^(quality|degrade|probation|maxProbation|probe|recovery)/.test(k) },
-  { key: "cooldown", title: "冷却", desc: "不同错误类型后账号暂停调度多久。", matches: (k) => /Cooldown/.test(k) },
-  { key: "disable", title: "自动禁用", desc: "命中特定错误达到阈值后自动停用账号；默认关闭，单个账号可覆盖。", matches: (k) => k.startsWith("autoDisable") },
-  { key: "timeouts", title: "超时与流式", desc: "请求总超时、流式空闲与首输出超时，以及 SSE 转发方式。", matches: (k) => /Timeout|streamResponseMode|streamPreOutput/.test(k) },
-  { key: "uplift", title: "用量补偿", desc: "按路径整理 usage 的账号，在上游原始 usage 之上怎么补。", matches: (k) => k.startsWith("usageProjection") },
-  { key: "diagnostics", title: "诊断", desc: "临时记录上游原始数据用于排查；默认关闭，开启后注意磁盘占用。", matches: (k) => /Debug/.test(k) },
-];
+import { ACCOUNT_SECTIONS, RUNTIME_TABS, accountSectionAnchor, resolveRuntimeTab } from "./runtime-tabs";
+import { UsageCompensationFields } from "./usage-compensation-fields";
 export function RuntimePage() {
+  // 页签跟随 ?tab=：页签名直达页签，账号池分组名（如 cooldown）打开账号池并定位到该组。
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { tab, section } = resolveRuntimeTab(searchParams.get("tab"));
+  const setTab = (next: string) => setSearchParams({ tab: next }, { replace: true });
   const query = useRuntimeConfig(),
     update = useUpdateRuntimeConfig(),
     confirm = useConfirm(),
@@ -58,6 +54,11 @@ export function RuntimePage() {
       setProxyPasswordAction("keep");
     }
   }, [query.data]);
+  const loaded = draft !== null;
+  useEffect(() => {
+    if (!section || !loaded) return;
+    requestAnimationFrame(() => document.getElementById(accountSectionAnchor(section))?.scrollIntoView({ block: "start", behavior: "smooth" }));
+  }, [section, loaded]);
   const proxyPasswordDirty = proxyPasswordInput.length > 0 || proxyPasswordAction === "clear";
   useUnsavedChangesGuard(
     draft !== null &&
@@ -142,22 +143,23 @@ export function RuntimePage() {
     <PageContainer>
       <PageHeader
         actions={
-          <Button onClick={save} disabled={update.isPending || !dirty} title={dirty ? undefined : "没有未保存的修改"}>
-            <Save />
-            保存配置
-          </Button>
+          <>
+            <Button asChild variant="outline">
+              <Link to="/routes">
+                <RouteIcon />
+                管理路由
+              </Link>
+            </Button>
+            <Button onClick={save} disabled={update.isPending || !dirty} title={dirty ? undefined : "没有未保存的修改"}>
+              <Save />
+              保存配置
+            </Button>
+          </>
         }
       />
-      <Tabs defaultValue="admission">
+      <Tabs value={tab} onValueChange={setTab}>
         <TabsList className="flex-wrap">
-          {[
-            ["admission", "请求准入"],
-            ["accounts", "账号池"],
-            ["models", "模型解析"],
-            ["proxy", "代理与 TLS"],
-            ["retention", "数据保留"],
-            ["features", "路由功能默认参数"],
-          ].map(([key, label]) => (
+          {RUNTIME_TABS.map(({ key, label }) => (
             <TabsTrigger key={key} value={key}>
               {label}
             </TabsTrigger>
@@ -176,14 +178,33 @@ export function RuntimePage() {
           </SectionCard>
         </TabsContent>
         <TabsContent value="accounts" className="space-y-4">
-          {accountSections.map(({ key, title, desc, matches }) => (
-            <SectionCard key={key} title={title} description={desc}>
-              <ConfigFields
-                prefix={`accounts-${key}`}
-                value={Object.fromEntries(Object.entries(draft.accounts).filter(([k]) => matches(k)))}
-                onChange={(next) => set("accounts", { ...draft.accounts, ...next } as AccountsConfig)}
-              />
-            </SectionCard>
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card px-4 py-3 shadow-sm">
+            <p className="min-w-0 flex-1 text-xs leading-5 text-muted-foreground">
+              这里是账号池的全局默认；单个账号的覆盖、接受的路由与模型在账号页修改，批量调整账号与路由的对应关系用路由场景。
+            </p>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <Button asChild variant="outline" size="sm">
+                <Link to="/accounts"><Users />在账号页修改</Link>
+              </Button>
+              <Button asChild variant="outline" size="sm">
+                <Link to="/route-scenarios"><RouteIcon />路由场景</Link>
+              </Button>
+            </div>
+          </div>
+          {ACCOUNT_SECTIONS.map(({ key, title, desc, matches }) => (
+            <div key={key} id={accountSectionAnchor(key)} className="scroll-mt-4">
+              <SectionCard title={title} description={desc}>
+                {key === "uplift" ? (
+                  <UsageCompensationFields value={draft.accounts} onChange={(next) => set("accounts", next)} />
+                ) : (
+                  <ConfigFields
+                    prefix={`accounts-${key}`}
+                    value={Object.fromEntries(Object.entries(draft.accounts).filter(([k]) => matches(k)))}
+                    onChange={(next) => set("accounts", { ...draft.accounts, ...next } as AccountsConfig)}
+                  />
+                )}
+              </SectionCard>
+            </div>
           ))}
         </TabsContent>
         <TabsContent value="models" className="space-y-4">
@@ -253,11 +274,24 @@ export function RuntimePage() {
             />
           </SectionCard>
         </TabsContent>
-        <TabsContent value="features">
+        <TabsContent value="features" className="space-y-4">
           <SectionCard title="路由功能默认参数" description="请求体保护、参数兼容、图片处理与 max_tokens 补全在各路由的“路由功能”页签里编辑；这里的全局默认值是继承来源，新增功能默认关闭。">
             <Button variant="outline" asChild>
               <Link to="/routes">去路由页管理</Link>
             </Button>
+          </SectionCard>
+          <SectionCard
+            title="提示词注入"
+            description="代理写进上游请求的提示词（任务质量、语言约束、自定义、身份声明）每一项单独设置：默认开关与文本在策略模板页编辑，和路由的关联在路由编辑页的“提示词注入”页签设置。"
+          >
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" size="sm" asChild>
+                <Link to="/policy-templates?tab=injection"><FileText />打开提示词注入</Link>
+              </Button>
+              <Button variant="outline" size="sm" asChild>
+                <Link to="/policy-templates?tab=matrix"><RouteIcon />路由 × 注入矩阵</Link>
+              </Button>
+            </div>
           </SectionCard>
         </TabsContent>
       </Tabs>

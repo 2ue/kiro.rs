@@ -1,4 +1,5 @@
-import type { Account,AccountModelMappingRule,AccountsConfig,CreateAccountRequest,StreamResponseMode,StreamRetryMode } from '@/types/api'
+import type { Account,AccountModelMappingRule,AccountOverrides,AccountsConfig,CreateAccountRequest,StreamResponseMode,StreamRetryMode,UpdateAccountRequest } from '@/types/api'
+import { cleanTags } from '../../components/patterns/tag-utils.ts'
 
 export const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 export const joinRules = (value: string[] = []) => value.join('\n')
@@ -101,6 +102,17 @@ export const DIRECT_MODEL_MAPPING_PRESETS: AccountModelMappingPreset[] = [
   { label: 'Opus 4.8→4.8', source: 'claude-opus-4-8', target: 'claude-opus-4.8', tone: 'purple' },
   { label: 'Haiku 4.5 完整ID→4.5', source: 'claude-haiku-4-5-20251001', target: 'claude-haiku-4.5', tone: 'emerald' },
   { label: 'Haiku 4.5→4.5', source: 'claude-haiku-4-5', target: 'claude-haiku-4.5', tone: 'emerald' },
+  { label: 'Sonnet 5 原样', source: 'claude-sonnet-5', target: 'claude-sonnet-5', tone: 'cyan' },
+  { label: 'Sonnet 5.5→5.5', source: 'claude-sonnet-5-5', target: 'claude-sonnet-5.5', tone: 'cyan' },
+  { label: 'Opus 5 原样', source: 'claude-opus-5', target: 'claude-opus-5', tone: 'purple' },
+  { label: 'Opus 5.5→5.5', source: 'claude-opus-5-5', target: 'claude-opus-5.5', tone: 'purple' },
+  { label: 'Haiku 5.5→5.5', source: 'claude-haiku-5-5', target: 'claude-haiku-5.5', tone: 'emerald' },
+  { label: 'Fable 5 原样', source: 'claude-fable-5', target: 'claude-fable-5', tone: 'rose' },
+  { label: 'Fable 5.1→5.1', source: 'claude-fable-5-1', target: 'claude-fable-5.1', tone: 'rose' },
+  { label: 'Fable 5.2→5.2', source: 'claude-fable-5-2', target: 'claude-fable-5.2', tone: 'rose' },
+  { label: 'Mythos 5 原样', source: 'claude-mythos-5', target: 'claude-mythos-5', tone: 'rose' },
+  { label: 'Mythos 5.1→5.1', source: 'claude-mythos-5-1', target: 'claude-mythos-5.1', tone: 'rose' },
+  { label: 'Mythos 5.2→5.2', source: 'claude-mythos-5-2', target: 'claude-mythos-5.2', tone: 'rose' },
   { label: '3.5 Sonnet 完整ID', source: 'claude-3-5-sonnet-20241022', target: 'claude-3.5-sonnet', tone: 'amber' },
   { label: '3.5 Haiku 完整ID', source: 'claude-3-5-haiku-20241022', target: 'claude-3.5-haiku', tone: 'emerald' },
 ]
@@ -120,13 +132,37 @@ export const PROCESSED_MODEL_MAPPING_PRESETS: AccountModelMappingPreset[] = [
   { label: 'Opus 4.8→4-8', source: 'claude-opus-4.8', target: 'claude-opus-4-8', tone: 'purple' },
   { label: 'Haiku 4.5→4-5', source: 'claude-haiku-4.5', target: 'claude-haiku-4-5', tone: 'emerald' },
   { label: 'Haiku 4-5 原样', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: 'Sonnet 5 原样', source: 'claude-sonnet-5', target: 'claude-sonnet-5', tone: 'cyan' },
+  { label: 'Sonnet 5.5→5-5', source: 'claude-sonnet-5.5', target: 'claude-sonnet-5-5', tone: 'cyan' },
+  { label: 'Opus 5 原样', source: 'claude-opus-5', target: 'claude-opus-5', tone: 'purple' },
+  { label: 'Opus 5.5→5-5', source: 'claude-opus-5.5', target: 'claude-opus-5-5', tone: 'purple' },
+  { label: 'Haiku 5.5→5-5', source: 'claude-haiku-5.5', target: 'claude-haiku-5-5', tone: 'emerald' },
+  { label: 'Fable 5 原样', source: 'claude-fable-5', target: 'claude-fable-5', tone: 'rose' },
+  { label: 'Fable 5.1→5-1', source: 'claude-fable-5.1', target: 'claude-fable-5-1', tone: 'rose' },
+  { label: 'Fable 5.2→5-2', source: 'claude-fable-5.2', target: 'claude-fable-5-2', tone: 'rose' },
+  { label: 'Mythos 5 原样', source: 'claude-mythos-5', target: 'claude-mythos-5', tone: 'rose' },
+  { label: 'Mythos 5.1→5-1', source: 'claude-mythos-5.1', target: 'claude-mythos-5-1', tone: 'rose' },
+  { label: 'Mythos 5.2→5-2', source: 'claude-mythos-5.2', target: 'claude-mythos-5-2', tone: 'rose' },
   { label: '3.5 Sonnet→3-5', source: 'claude-3.5-sonnet', target: 'claude-3-5-sonnet', tone: 'amber' },
   { label: '3.5 Haiku→3-5', source: 'claude-3.5-haiku', target: 'claude-3-5-haiku', tone: 'emerald' },
 ]
 
+/** 单账号可覆盖的全局参数：键、名称、单位；账号表单和批量修改共用。 */
+export const ACCOUNT_OVERRIDE_FIELDS: Array<[keyof AccountOverrides, string, string]> = [
+  ['requestTimeoutSecs', '请求超时', '秒'],
+  ['streamRequestTimeoutSecs', '流式请求超时', '秒'],
+  ['streamIdleTimeoutSecs', '流式空闲超时', '秒'],
+  ['streamFirstOutputTimeoutSecs', '首输出等待上限', '秒'],
+  ['usageProjectionUpliftPercent', '缓存读写补偿', '%'],
+  ['usageProjectionCostFloorEnabled', '成本底线', ''],
+  ['usageProjectionCostFloorMarginPercent', '成本底线余量', '%'],
+  ['usageProjectionOutputUpliftMinTokens', '输出补偿阈值', 'token'],
+  ['usageProjectionOutputUpliftPercent', '输出补偿', '%'],
+]
+
 export type AccountFormDraft = {
- tagsText: string
- proxyUrl: string
+  tags: string[]
+  proxyUrl: string
  costMultiplier: number
  overrides: import('@/types/api').AccountOverrides
   name: string
@@ -156,7 +192,7 @@ export type AccountFormDraft = {
 }
 
 export const defaultAccountForm = (): AccountFormDraft => ({
- tagsText: '', proxyUrl: '', costMultiplier: 1, overrides: {},
+ tags: [], proxyUrl: '', costMultiplier: 1, overrides: {},
   name: '',
   baseUrl: '',
   apiKey: '',
@@ -169,7 +205,7 @@ export const defaultAccountForm = (): AccountFormDraft => ({
   enabled: false,
   priority: 100,
   maxConcurrentRequests: 10,
-  usageProjectionMode: 'pass_through',
+  usageProjectionMode: 'current_path_policy',
   streamResponseMode: 'inherit',
   preOutputStreamRetryMode: 'inherit',
   autoDisablePolicy: 'inherit',
@@ -184,7 +220,7 @@ export const defaultAccountForm = (): AccountFormDraft => ({
 })
 
 export const accountFormFromAccount = (account: Account): AccountFormDraft => ({
- tagsText: (account.tags??[]).join(', '), proxyUrl: account.proxyUrl??'', costMultiplier: account.costMultiplier??1, overrides: {...account.overrides},
+ tags: [...(account.tags ?? [])], proxyUrl: account.proxyUrl??'', costMultiplier: account.costMultiplier??1, overrides: {...account.overrides},
   name: account.name,
   baseUrl: account.baseUrl,
   apiKey: '',
@@ -210,6 +246,63 @@ export const accountFormFromAccount = (account: Account): AccountFormDraft => ({
   modelMappingRulesText: joinModelMappingRules(account.modelMappingRules || []),
   notes: account.notes || '',
 })
+
+/** 账号代理地址里已保存凭据的打码占位（后端读接口把用户名、密码显示成它）。 */
+export const PROXY_MASK = '***'
+
+/** 编辑单个账号代理时的说明：*** 原样保留时后端沿用库里的真实凭据。 */
+export const PROXY_MASK_HINT = '地址里的 *** 是已保存凭据的打码，保持不动即沿用原用户名和密码；要换凭据请整段重填。'
+
+export const hasMaskedProxyCredentials = (value: string | null | undefined) => Boolean(value?.includes(PROXY_MASK))
+
+/** 表单草稿转成创建 / 更新请求；新建时整份提交，编辑时再和初始草稿逐字段比较。 */
+export function buildAccountRequest(draft: AccountFormDraft): CreateAccountRequest {
+  const { tags, modelMappingRulesText, supportedModelsText, headerOverridesText, streamResponseMode, proxyUrl, overrides, ...form } = draft
+  // 覆盖值为空表示沿用全局，后端 null 与不传等价；去掉空值后，清空再填回同一个值不会被当成改动。
+  const cleanedOverrides = Object.fromEntries(
+    Object.entries(overrides ?? {}).filter(([, value]) => value !== null && value !== undefined),
+  ) as AccountOverrides
+  return {
+    ...form,
+    // 已有标签只去空白去重，不截断数量和长度。
+    tags: cleanTags(tags),
+    proxyUrl: proxyUrl.trim() || null,
+    overrides: cleanedOverrides,
+    headerOverrides: parseHeaderOverridesText(headerOverridesText),
+    modelMappingRules: parseModelMappingRules(modelMappingRulesText),
+    supportedModels: parseSupportedModelsText(supportedModelsText),
+    streamResponseMode: streamResponseMode === 'inherit' ? null : streamResponseMode,
+  }
+}
+
+/** 键排好序的 JSON，用来比较对象、数组是否相同，不受键顺序影响。 */
+export function stableStringify(value: unknown): string {
+  if (value === undefined) return 'undefined'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(',')}}`
+}
+
+/**
+ * 编辑保存时只提交变化的字段：用打开表单时的初始草稿和当前草稿分别生成请求，逐字段比较。
+ * 密钥留空表示不改（编辑时初始草稿的密钥总是空的），所以只在填了新密钥时提交。
+ */
+export function diffAccountRequest(initial: CreateAccountRequest, current: CreateAccountRequest): UpdateAccountRequest {
+  const update: Record<string, unknown> = {}
+  const keys = new Set([...Object.keys(initial), ...Object.keys(current)]) as Set<keyof CreateAccountRequest>
+  for (const key of keys) {
+    if (key === 'apiKey') {
+      if (current.apiKey) update.apiKey = current.apiKey
+      continue
+    }
+    if (!(key in current)) continue
+    if (stableStringify(initial[key]) !== stableStringify(current[key])) update[key] = current[key]
+  }
+  return update as UpdateAccountRequest
+}
 
 export function modelMappingPresetsForMode(mode: AccountFormDraft['modelMappingMode']): AccountModelMappingPreset[] {
   if (mode === 'passthrough_mapping') return DIRECT_MODEL_MAPPING_PRESETS
@@ -361,30 +454,6 @@ export function streamRetrySummary(account: Account, config: AccountsConfig): st
   return config.streamPreOutputRetryEnabled
     ? '首输出恢复：继承启用'
     : '首输出恢复：继承禁用'
-}
-
-export function accountUsageSummary(account: Account, config: AccountsConfig): string {
-  const parts = account.usageProjectionMode === 'current_path_policy'
-    ? ['Usage：按路径整理']
-    : ['Usage：透传上游']
-  const streamMode = account.streamResponseMode || config.streamResponseMode
-  parts.push(streamMode === 'event_passthrough' ? '流式：事件透传' : '流式：继承默认')
-  if (account.streamResponseMode) {
-    parts.push('单池覆盖')
-  }
-  if (account.usageProjectionMode !== 'current_path_policy') {
-    return parts.join(' · ')
-  }
-  if (config.usageProjectionUpliftPercent > 0) {
-    parts.push(`缓存 +${config.usageProjectionUpliftPercent}%`)
-  }
-  if (config.usageProjectionCostFloorEnabled) {
-    parts.push(`成本底线 +${config.usageProjectionCostFloorMarginPercent}%`)
-  }
-  if (config.usageProjectionOutputUpliftMinTokens > 0 && config.usageProjectionOutputUpliftPercent > 0) {
-    parts.push(`输出 >= ${config.usageProjectionOutputUpliftMinTokens} 后 +${config.usageProjectionOutputUpliftPercent}%`)
-  }
-  return parts.join(' · ')
 }
 
 export function authLabel(authType: Account['authType']): string {

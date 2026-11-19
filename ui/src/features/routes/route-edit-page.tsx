@@ -3,6 +3,7 @@ import {
   LoadingState,
   PageContainer,
   PageHeader,
+  useConfirm,
 } from "@/components/patterns";
 import {
   Button,
@@ -23,6 +24,7 @@ import {
 import { RouteCacheEditor } from "@/features/cache-policies/route-cache-editor";
 import { RouteInjectionEditor, SettingGroup, SettingRow } from "@/features/prompt-injection/route-injection-editor";
 import { InjectionPreviewPanel } from "@/features/prompt-injection/injection-preview-panel";
+import { injectionPrefixChanges } from "@/features/prompt-injection/injection-rules";
 import { useAccounts } from "@/hooks/use-accounts";
 import {
   useRouteEffective,
@@ -38,7 +40,7 @@ import { extractErrorMessage } from "@/lib/utils";
 import type { RouteConfig, RouteRule } from "@/types/routes";
 import { ArrowLeft, Copy, Eye, Link2, Route as RouteIcon, Save } from "lucide-react";
 import { useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { EffectiveSheet } from "./effective-sheet";
 import { RouteFeaturesEditor } from "./route-features-editor";
@@ -47,12 +49,23 @@ import {
   displayRoutePrefix,
   isBuiltinRoute,
   previewRoutePrefix,
+  resolveRouteEditTab,
   routeBaseUrl,
+  ROUTE_EDIT_TABS,
   ruleSummary,
+  type RouteEditTab,
 } from "./route-utils";
 import { Badge } from "@/components/ui";
 import { Field } from "@/components/patterns";
 import { RULE_MODE_OPTIONS } from "@/lib/enum-labels";
+const TAB_LABELS: Record<RouteEditTab, string> = {
+  cache: "缓存与 usage",
+  injection: "提示词注入",
+  features: "路由功能",
+  accounts: "账号规则",
+  models: "模型规则",
+};
+
 export function RouteEditPage() {
   const params = useParams(),
     routeId = Number(params.id ?? 0),
@@ -64,6 +77,11 @@ export function RouteEditPage() {
     update = useUpdateRoutes();
   const [draft, setDraft] = useState<RouteConfig | null>(null),
     [showEffective, setShowEffective] = useState(false);
+  const confirm = useConfirm();
+  // 页签跟随 ?tab=（例如注入矩阵链接到 ?tab=injection）；切换页签只替换地址，不进历史。
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = resolveRouteEditTab(searchParams.get("tab"));
+  const setTab = (next: string) => setSearchParams(next === "cache" ? {} : { tab: next }, { replace: true });
   const effective = useRouteEffective(routeId, showEffective);
   useEffect(() => {
     const route = routes.data?.find((r) => r.id === routeId);
@@ -117,6 +135,32 @@ export function RouteEditPage() {
   const models = [
     ...new Set(availableAccounts.flatMap((a) => a.supportedModels)),
   ].sort();
+  /** 注入开关改动会改变这条路由写进 system 的内容，已有会话的缓存前缀会失效，先确认。 */
+  const confirmInjectionChange = async (): Promise<boolean> => {
+    if (!saved?.enabled || !catalog.data || !runtime.data) return true;
+    const config = runtime.data.promptInjection;
+    const changes = injectionPrefixChanges(
+      catalog.data.items,
+      { config, routes: [saved] },
+      { config, routes: [draft] },
+      runtime.data.compatProfile === "anthropic-strict",
+    );
+    if (changes.length === 0) return true;
+    return confirm({
+      title: "保存注入改动",
+      message: `${changes.map((change) => change.name).join("、")}的开关改动会改变这条路由写进 system 的内容。这些内容计入缓存前缀，保存后这条路由上已有会话的缓存前缀会失效一次。`,
+      confirmText: "保存",
+    });
+  };
+  const saveRoute = async () => {
+    if (!(await confirmInjectionChange())) return;
+    try {
+      await update.mutateAsync((routes.data ?? []).map((r) => (r.id === routeId ? draft : r)));
+      toast.success("路由已保存");
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    }
+  };
   const toggleAccount = (id: string, checked: boolean) =>
     set("accountRule", {
       ...draft.accountRule,
@@ -140,16 +184,7 @@ export function RouteEditPage() {
             <Button
               disabled={update.isPending || !dirty}
               title={dirty ? undefined : "没有未保存的修改"}
-              onClick={async () => {
-                try {
-                  await update.mutateAsync(
-                    (routes.data ?? []).map((r) => (r.id === routeId ? draft : r)),
-                  );
-                  toast.success("路由已保存");
-                } catch (error) {
-                  toast.error(extractErrorMessage(error));
-                }
-              }}
+              onClick={() => void saveRoute()}
             >
               <Save />
               保存
@@ -206,17 +241,11 @@ export function RouteEditPage() {
           </div>
         </div>
       </div>
-      <Tabs defaultValue="cache">
+      <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
-          {[
-            ["cache", "缓存与 usage"],
-            ["injection", "提示词注入"],
-            ["features", "路由功能"],
-            ["accounts", "账号规则"],
-            ["models", "模型规则"],
-          ].map(([value, label]) => (
+          {ROUTE_EDIT_TABS.map((value) => (
             <TabsTrigger key={value} value={value}>
-              {label}
+              {TAB_LABELS[value]}
             </TabsTrigger>
           ))}
         </TabsList>

@@ -649,15 +649,8 @@ function CacheTtlPolicyForm({
     >
       <FieldGrid>
         <CacheTtlModeSelect
-          label="本地账号"
-          desc="本地 上游 账号返回的缓存写入时长。"
-          value={value?.local}
-          external={false}
-          onChange={(local) => onChange({ ...value, local })}
-        />
-        <CacheTtlModeSelect
-          label="账号账号"
-          desc="账号按本路径策略整形 usage 时的缓存写入时长；账号透传 usage 时不改。"
+          label="写入时长"
+          desc="账号按本路由策略整形 usage 时生效；账号透传上游 usage 时不改。"
           value={value?.account}
           external
           onChange={(account) => onChange({ ...value, account })}
@@ -1613,7 +1606,7 @@ const NON_STREAM_CACHE_OPTIONS: Array<{ value: NonStreamCacheMode; label: string
   {
     value: 'force_off',
     label: '强制不缓存',
-    desc: '所有非流式请求都不整理 usage、不推进本地缓存：账号保持上游 usage 原样，本地账号用上游原始 metadata。',
+    desc: '所有非流式请求都不整理 usage、不推进本地缓存：账号保持上游 usage 原样。',
   },
 ]
 
@@ -2074,7 +2067,7 @@ export function PathStrategyBindingCard({
               <ParameterGroup title="缓存空间" desc="决定本路径是否使用独立的本地模拟缓存状态。">
                 <TogField
                   label="独立路径缓存空间"
-                  desc="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一凭据、会话、模型的默认缓存空间共享。"
+                  desc="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一账号、会话、模型的默认缓存空间共享。"
                   checked={Boolean(effectivePolicy.routeNamespace)}
                   onChange={(routeNamespace) => patch({ routeNamespace })}
                 />
