@@ -155,7 +155,7 @@ const DESCRIPTIONS: Record<string, string> = {
   samePoolRetryStatusCodes: "触发同账号重试的状态码；逗号分隔。",
   samePoolRetryDelayMs: "同一个账号重试之间的等待时间。",
   transientFailurePriorityPenalty: "账号出现可重试瞬态失败后，在失败窗口内临时增加有效优先级；默认 20 可让优先级 1 的故障账号让位给 10/20 的健康账号，0 表示关闭。",
-  qualityAwareSchedulingEnabled: "关闭后完全退回“优先级 → 负载”的旧排序；质量状态仍采集但不参与选择，可作为线上快速回退手段。",
+  qualityAwareSchedulingEnabled: "关闭后完全退回“优先级 → 负载”的旧排序，也不再采样质量数据（账号风控页的质量分趋势不会有新点），可作为线上快速回退手段。",
   qualityTopK: "在评分最优的 K 个账号里加权随机挑选，避免多实例同时扑向同一个账号。1 表示总是选最优。",
   qualityEwmaAlpha: "EWMA 系数，有效窗口约为最近 1/系数 个请求。越大越灵敏，越小越稳定。",
   qualityMinSamples: "累计样本不足时按中性处理，不加分也不减分；避免新账号因冷启动数据难看而永远起不来。",

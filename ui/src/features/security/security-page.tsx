@@ -450,6 +450,9 @@ function RequestKeysSection({
           const visible = visibleIds.has(item.id)
           const busy = processingKeyId === item.id
           const admission = item.requestAdmission ?? defaultAdmission
+          // 后端对每个 Key 都回用量条目（没配限额的 limits 为空），24h 拒绝数对所有 Key 显示；
+          // 老后端只回有限额的 Key，没有条目时不显示。
+          const rejected24h = usageByKey.get(item.id)?.rejectedRequests24h
           return (
             <div key={item.id} role="listitem" className="border-t px-4 py-3 first:border-t-0">
               <div className="grid gap-3 md:grid-cols-[minmax(0,1.35fr)_minmax(0,1.4fr)_minmax(0,1fr)_auto] md:items-center">
@@ -481,12 +484,14 @@ function RequestKeysSection({
                   {item.usageLimits.length > 0 && (
                     <span className="rounded border border-primary/30 bg-primary/5 px-2 py-1 text-primary">限额 {item.usageLimits.length} 项</span>
                   )}
-                  {(usageByKey.get(item.id)?.rejectedRequests24h ?? 0) > 0 && (
+                  {typeof rejected24h === 'number' && (
                     <span
-                      className="rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-destructive"
-                      title="最近 24 小时被准入拒绝（限额、并发等）的请求数"
+                      className={rejected24h > 0
+                        ? 'rounded border border-destructive/30 px-2 py-1 text-destructive'
+                        : 'px-2 py-1'}
+                      title="最近 24 小时被准入拒绝（限额、RPM、并发、队列等）的请求数"
                     >
-                      24h 拒绝 {formatNumber(usageByKey.get(item.id)?.rejectedRequests24h ?? 0)} 次
+                      24h 拒绝 {formatNumber(rejected24h)} 次
                     </span>
                   )}
                 </div>

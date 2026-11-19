@@ -625,12 +625,12 @@ function PageNav({ page, pageSize, hasNext, pending, onChange, onPageSizeChange 
   onChange: (page: number) => void
   onPageSizeChange: (pageSize: number) => void
 }) {
-  // 接口只告诉"还有没有下一页"，没有总数：把页数按当前页 +1 推进，共享分页控件照常可用。
+  // 接口只告诉"还有没有下一页"，没有总数：用分页控件的总数未知模式，只给上一页 / 下一页。
   return (
     <Pagination
       className="py-1"
       page={page}
-      pageCount={hasNext ? page + 1 : page}
+      hasNext={hasNext}
       pageSize={pageSize}
       pageSizeOptions={PAGE_SIZE_OPTIONS}
       pending={pending}

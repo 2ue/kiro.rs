@@ -149,11 +149,12 @@ export const IMAGE_PROCESSING_MODE_OPTIONS: EnumOption[] = [
   { value: 'light', label: 'Light：轻量透传' },
 ]
 
+/** 用量上报字段策略：叫法和顺序与 main 运行配置页的字段策略下拉一致。 */
 export const REPORTED_USAGE_FIELD_MODE_OPTIONS: EnumOption[] = [
-  { value: 'preserve', label: '保持整形结果' },
-  { value: 'raw', label: '原样上报' },
-  { value: 'sample-max', label: '采样，不超过上限' },
-  { value: 'sample-target', label: '围绕目标值采样' },
+  { value: 'raw', label: '使用原始值' },
+  { value: 'preserve', label: '使用当前值' },
+  { value: 'sample-max', label: '压到上限内' },
+  { value: 'sample-target', label: '压到目标附近' },
 ]
 
 export const INPUT_DELTA_TARGET_OPTIONS: EnumOption[] = [

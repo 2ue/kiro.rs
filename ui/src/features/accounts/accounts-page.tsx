@@ -428,10 +428,12 @@ export function AccountsPage() {
           onSubmit={save}
           onDiscoverSupportedModels={async () => {
             try {
-              const result =
-                editor.account && !editor.draft.apiKey
-                  ? await discoverStoredAccountSupportedModels(editor.account.id)
-                  : await discoverAccountSupportedModels({ baseUrl: editor.draft.baseUrl, apiKey: editor.draft.apiKey || undefined, authType: editor.draft.authType });
+              const overrides = { baseUrl: editor.draft.baseUrl, apiKey: editor.draft.apiKey || undefined, authType: editor.draft.authType }
+              // 编辑已有账号时走账号接口：表单里改的地址、密钥覆盖已保存的值，
+              // 代理、Header profile 与 TLS profile 仍按该账号的配置，和真实转发一致。
+              const result = editor.account
+                ? await discoverStoredAccountSupportedModels(editor.account.id, overrides)
+                : await discoverAccountSupportedModels(overrides);
               return result.supportedModels;
             } catch (error) {
               toast.error(extractErrorMessage(error));

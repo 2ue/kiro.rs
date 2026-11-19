@@ -1,16 +1,17 @@
 import type { RouteConfig, UsageOverviewRouteRow, UsageRouteLatencyRow } from '@/types/api'
 import { cacheHitRate } from './cache-hit-rate.ts'
-import { displayRoutePrefix, sortRoutes } from '../routes/route-utils.ts'
+import { displayRoutePrefix, sortRoutes, UNKNOWN_USAGE_ROUTE } from '../routes/route-utils.ts'
 
 /** 后端用量里无法解析出路由前缀的入口。 */
-export const UNKNOWN_ROUTE_KEY = 'unknown'
+export const UNKNOWN_ROUTE_KEY = UNKNOWN_USAGE_ROUTE
 
 /** 用量与筛选里的路由键：默认路由为 "/"，其它为归一化前缀（与后端口径一致）。 */
 export function routeUsageKey(prefix: string): string {
   return displayRoutePrefix(prefix)
 }
 
-export type RouteRowStatus = 'enabled' | 'disabled' | 'deleted' | 'unknown'
+/** `unverified`：路由配置还没加载成功，无法判断该前缀是否已删除。 */
+export type RouteRowStatus = 'enabled' | 'disabled' | 'deleted' | 'unknown' | 'unverified'
 
 export type RouteOverviewRow = {
   /** 路由键："/"、"/cc"、"/dfcache/x"，或 `unknown` */
@@ -47,11 +48,13 @@ export function routeLabelResolver(configs: RouteConfig[]): (routeKey: string) =
 /**
  * 路由表的行：已配置路由（含没有流量的）+ 用量里出现但配置里已不存在的前缀。
  * 有流量的排前面，按可计费、请求数降序；没有流量的按路由页同一顺序（内置在前）。
+ * `configsLoaded` 为 false（路由配置还在加载或读取失败）时，不把配置里找不到的前缀判成已删除。
  */
 export function buildRouteOverviewRows(
   configs: RouteConfig[],
   usage: UsageOverviewRouteRow[],
   latency: UsageRouteLatencyRow[] = [],
+  configsLoaded = true,
 ): RouteOverviewRow[] {
   const usageByKey = new Map(usage.map((item) => [item.route, item]))
   const latencyByKey = new Map(latency.map((item) => [item.route, item]))
@@ -76,7 +79,7 @@ export function buildRouteOverviewRows(
         key: item.route,
         route: undefined,
         name: item.route === UNKNOWN_ROUTE_KEY ? '未识别入口' : item.route,
-        status: (item.route === UNKNOWN_ROUTE_KEY ? 'unknown' : 'deleted') as RouteRowStatus,
+        status: (item.route === UNKNOWN_ROUTE_KEY ? 'unknown' : configsLoaded ? 'deleted' : 'unverified') as RouteRowStatus,
         usage: item,
         latency: latencyByKey.get(item.route),
       })),
@@ -103,11 +106,19 @@ export type RouteInsights = {
   /** 已配置且启用的路由数 */
   enabledRoutes: number
   configuredRoutes: number
-  /** 有流量、但配置里已不存在的前缀数 */
+  /** 有流量、但配置里已不存在的前缀数（配置没加载成功时不判断，为 0） */
   unconfiguredActiveRoutes: number
   topBillable?: RouteOverviewRow
+  /** 命中率最低的路由；缓存策略为“无缓存”的路由不参与比较 */
   lowestHitRate?: { row: RouteOverviewRow; rate: number }
+  /** 有流量、因缓存策略为“无缓存”而不参与命中率比较的路由数 */
+  noCacheExcluded: number
   highestErrorRate?: { row: RouteOverviewRow; rate: number }
+}
+
+/** 路由的缓存策略是否为“无缓存”；配置里找不到的前缀按未知处理，不算。 */
+export function isNoCacheRoute(row: RouteOverviewRow): boolean {
+  return row.route?.cachePolicy?.cacheType === 'no_cache'
 }
 
 /** 统计卡用的路由洞察：只看有流量的路由。 */
@@ -116,11 +127,14 @@ export function routeInsights(rows: RouteOverviewRow[]): RouteInsights {
   let topBillable: RouteOverviewRow | undefined
   let lowestHitRate: RouteInsights['lowestHitRate']
   let highestErrorRate: RouteInsights['highestErrorRate']
+  let noCacheExcluded = 0
   for (const row of active) {
     const usage = row.usage!
     if (!topBillable || usage.billableCostUsd > (topBillable.usage?.billableCostUsd ?? 0)) topBillable = row
+    // 无缓存路由的命中率本来就是 0，放进来只会一直占着“最低”。
     const rate = cacheHitRate(usage.metrics)
-    if (rate != null && (!lowestHitRate || rate < lowestHitRate.rate)) lowestHitRate = { row, rate }
+    if (isNoCacheRoute(row)) noCacheExcluded += 1
+    else if (rate != null && (!lowestHitRate || rate < lowestHitRate.rate)) lowestHitRate = { row, rate }
     const errorRate = usage.metrics.requests > 0 ? usage.metrics.errorRequests / usage.metrics.requests : 0
     if (errorRate > 0 && (!highestErrorRate || errorRate > highestErrorRate.rate)) highestErrorRate = { row, rate: errorRate }
   }
@@ -128,9 +142,10 @@ export function routeInsights(rows: RouteOverviewRow[]): RouteInsights {
     activeRoutes: active.length,
     enabledRoutes: rows.filter((row) => row.status === 'enabled').length,
     configuredRoutes: rows.filter((row) => row.route).length,
-    unconfiguredActiveRoutes: active.filter((row) => !row.route).length,
+    unconfiguredActiveRoutes: active.filter((row) => row.status === 'deleted').length,
     topBillable: topBillable && (topBillable.usage?.billableCostUsd ?? 0) > 0 ? topBillable : undefined,
     lowestHitRate,
+    noCacheExcluded,
     highestErrorRate,
   }
 }

@@ -14,15 +14,23 @@ export function costDeltaPercent(deltaUsd: number, rawCostUsd: number): string {
 export type CostDeltaTone = 'loss' | 'profit' | 'even'
 
 /**
+ * 金额差额按两位小数展示：绝对值不到半分（0.005）的浮点残差按 0 处理，
+ * 避免显示成红色的 "-$0.00"。
+ */
+export function zeroBelowCent(value: number): number {
+  return Number.isFinite(value) && Math.abs(value) >= 0.005 ? value : 0
+}
+
+/**
  * 估算计费（对下游收的钱）减去账号成本（上游原始成本 × 账号成本倍率）。
- * 账号成本为 0 时没有占比。
+ * 账号成本为 0 时没有占比；不到半分的差额按 0。
  */
 export function accountCostDelta(reportedCostUsd: number, accountCostUsd: number): {
   deltaUsd: number
   percentText: string
   tone: CostDeltaTone
 } {
-  const deltaUsd = reportedCostUsd - accountCostUsd
+  const deltaUsd = zeroBelowCent(reportedCostUsd - accountCostUsd)
   return {
     deltaUsd,
     percentText: accountCostUsd > 0 ? `${((deltaUsd / accountCostUsd) * 100).toFixed(1)}%` : '-',
@@ -85,4 +93,27 @@ export function perMinute(value: number): number {
 export function averagePerMinute<T>(points: T[], pick: (point: T) => number): number | null {
   if (points.length === 0) return null
   return perMinute(points.reduce((sum, point) => sum + pick(point), 0)) / points.length
+}
+
+/**
+ * 已经结束的时段：`partialFrom` 起是还没结束的桶（当前小时或当天）。
+ * 平均速率的分子分母都只用已结束的桶，进行中的那一小时会把平均值拉低。
+ */
+export function completedBuckets<T>(points: T[], partialFrom: number): T[] {
+  return points.slice(0, Math.max(0, Math.min(points.length, partialFrom)))
+}
+
+const HOUR_MS = 3_600_000
+
+/**
+ * 延迟分位接口的范围上限判断：后端先把 from 向下、to 向上对齐到整点（UTC）再比较跨度，
+ * 前端按同一口径判断，免得恰好 8 天但不是整点的范围被前端放行、后端拒绝。
+ */
+export function latencyRangeWithinLimit(fromIso: string, toIso: string, maxDays = 8): boolean {
+  const from = Date.parse(fromIso)
+  const to = Date.parse(toIso)
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return false
+  const alignedFrom = Math.floor(from / HOUR_MS) * HOUR_MS
+  const alignedTo = Math.ceil(to / HOUR_MS) * HOUR_MS
+  return alignedTo - alignedFrom <= maxDays * 86_400_000
 }

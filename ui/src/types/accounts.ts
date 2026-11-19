@@ -74,8 +74,17 @@ export interface AccountEventSummaryRow {
 export interface AccountEventSummaryResponse {
   hours: number;
   since: string;
+  /** 窗口终点；新后端总会返回，老后端没有这个字段（只认 hours，不认 since/until/accountId） */
+  until?: string;
   accountSource?: string | null;
   items: AccountEventSummaryRow[];
+}
+
+/** 按固定窗口统计账号异动：`[since, until)`，可只看一个账号。 */
+export interface AccountEventWindowSummaryQuery {
+  since: string;
+  until: string;
+  accountId?: number;
 }
 
 /** 账号质量分历史的一个点：调度用的 EWMA 在该时刻的快照 */
@@ -94,8 +103,15 @@ export interface AccountQualityHistoryResponse {
   accountId: number;
   hours: number;
   since: string;
+  /** 窗口终点；按 from/to 查询时返回，老后端没有这个字段（只认 hours，从现在往前算） */
+  until?: string;
+  /** 降采样桶宽（秒）；点是桶内平均值，最多约 720 个点 */
+  bucketSecs?: number;
   points: AccountQualityHistoryPoint[];
 }
+
+/** 质量分历史的查询窗口：按 from/to（RFC3339）查，或按最近 hours 小时查，二选一。 */
+export type AccountQualityHistoryWindow = { from: string; to: string } | { hours: number };
 
 export type AccountAuthType = "bearer" | "x_api_key";
 

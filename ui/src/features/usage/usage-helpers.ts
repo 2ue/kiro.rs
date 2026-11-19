@@ -1,6 +1,7 @@
 import type { BadgeProps } from '@/components/ui'
 import type { UsageRecord, UsageSource } from '@/types/api'
 import { formatNumber } from '@/lib/format'
+import { routePrefixForEndpoint, UNKNOWN_USAGE_ROUTE } from '@/features/routes/route-utils'
 
 export type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -56,8 +57,15 @@ export function statusTone(status: string): NonNullable<BadgeProps['tone']> {
   return 'error'
 }
 
+/** 调度去向：转发到账号，或本地处理（本地缓存命中等）。 */
 export function routeLabel(record: UsageRecord): string {
   return record.routeKind === 'account' ? '账号' : '本地'
+}
+
+/** 请求所属的路由前缀，从入口路径推出，与总览、用量筛选同一口径；推不出时写“未识别入口”。 */
+export function usageRoutePrefixLabel(record: Pick<UsageRecord, 'endpoint'>): string {
+  const route = routePrefixForEndpoint(record.endpoint)
+  return route === UNKNOWN_USAGE_ROUTE ? '未识别入口' : route
 }
 
 export function routeTone(record: UsageRecord): NonNullable<BadgeProps['tone']> {
@@ -135,16 +143,15 @@ export function terminalReasonLabel(reason?: string): string {
   return reason ? labels[reason] ?? reason : '-'
 }
 
-/** 模型解析来源的中文说明。 */
+/** 模型解析来源的中文说明，键与后端 `ModelResolutionSource` 的取值一一对应；未知值原样返回。 */
 export function modelResolutionSourceLabel(source?: string): string {
   const labels: Record<string, string> = {
-    exact: '精确匹配',
+    exact_upstream: '精确匹配',
+    manual: '手动模型',
     alias: '别名',
-    family: '同家族最近版本',
-    version_fallback: '版本回退',
-    cross_family_fallback: '跨家族回退',
-    mapping: '映射规则',
-    passthrough: '直接透传',
+    family_normalized: '同家族归一',
+    pass_through: '直接透传',
+    unsupported: '不支持的模型',
   }
   return source ? labels[source] ?? source : '-'
 }

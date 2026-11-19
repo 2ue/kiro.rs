@@ -292,7 +292,9 @@ function RouteTargetSelect({
     [routes.data],
   )
   // 从总览带过来的前缀可能已在路由页删除：保留为一个选项，否则下拉显示不出当前条件。
+  // 只有路由配置读取成功后才判断“已删除”；加载中或读取失败时只显示前缀本身。
   const missing = value !== ALL_ROUTES && !options.some((option) => option.key === value)
+  const missingLabel = routes.isSuccess ? `${value}（已删除）` : value
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger size="sm" className="w-full">
@@ -305,7 +307,7 @@ function RouteTargetSelect({
             {option.label}{option.enabled ? '' : '（停用）'}
           </SelectItem>
         ))}
-        {missing && <SelectItem value={value}>{value}（已删除）</SelectItem>}
+        {missing && <SelectItem value={value}>{missingLabel}</SelectItem>}
       </SelectContent>
     </Select>
   )
@@ -675,7 +677,9 @@ function RecordsView({
       >
         <div className="space-y-3 px-4 pt-4 pb-2">
           <div className="rounded-xl bg-card p-3 shadow-sm">
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1fr_1fr_1fr_0.9fr_0.95fr_0.95fr_auto]">
+            {/* 8 个格子：中等宽度（含 1280）排成 4 列两行，保证起止时间框放得下完整的 `YYYY-MM-DD HH:mm`；
+                足够宽时才排成一行，时间列设最小宽度。 */}
+            <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-[1.2fr_1fr_minmax(10rem,1fr)_minmax(10rem,1fr)_0.9fr_0.95fr_0.95fr_auto]">
               <FilterField label="请求 ID">
                 <Input
                   placeholder="req_..."
@@ -1025,7 +1029,7 @@ function RecordsView({
               <div className="px-4 py-3">
                 <Pagination
                   page={page}
-                  pageCount={hasNext ? page + 1 : page}
+                  hasNext={hasNext}
                   pageSize={pageSize}
                   pageSizeOptions={PAGE_SIZE_OPTIONS}
                   pending={pageTransitionPending}

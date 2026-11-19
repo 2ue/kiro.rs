@@ -26,21 +26,14 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Download, Upload } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-/** 配置包里每类条目的中文名，和导出文件里的 kind 一一对应。 */
+/** 预览差异里每类条目的中文名，键与后端 TransferChange.kind 的取值一一对应。 */
 const CHANGE_KIND_LABELS: Record<string, string> = {
-  runtime_config: "运行配置",
-  route: "路由",
-  routes: "路由",
   account: "账号",
-  accounts: "账号",
-  request_api_key: "请求 Key",
-  request_api_keys: "请求 Key",
-  route_scenario: "路由场景",
-  route_scenarios: "路由场景",
-  model_capability: "模型能力",
-  model_capabilities: "模型能力",
-  manual_model: "手动模型",
-  pricing: "价格目录",
+  routeScenario: "路由场景",
+  modelPricing: "模型价格",
+  manualModel: "手动模型",
+  requestApiKey: "请求 Key",
+  runtimeConfig: "运行配置",
 };
 
 export function ConfigTransferPage() {

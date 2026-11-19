@@ -115,3 +115,26 @@ export function summaryTiles(items: AccountEventSummaryRow[]): { kind: string; l
     return [{ kind, label: meta.label, tone: meta.tone, events: item.events, accounts: item.accounts }]
   })
 }
+
+/**
+ * Whether the summary response was computed for the requested `[since, until)` window.
+ * Older servers ignore since/until/accountId, count "the last N hours from now" and omit `until`.
+ */
+export function summaryHonorsWindow(response: { until?: string | null } | undefined): boolean {
+  return Boolean(response?.until)
+}
+
+/**
+ * Counts per event kind from already loaded account events (distinct accounts per kind).
+ * Fallback for older servers whose summary endpoint can't count a fixed window.
+ */
+export function summarizeAccountEvents(events: Pick<AccountEventView, 'kind' | 'source' | 'accountId'>[]): AccountEventSummaryRow[] {
+  const byKind = new Map<string, { events: number; accounts: Set<string> }>()
+  for (const event of events) {
+    const entry = byKind.get(event.kind) ?? { events: 0, accounts: new Set<string>() }
+    entry.events += 1
+    if (event.accountId) entry.accounts.add(`${event.source}:${event.accountId}`)
+    byKind.set(event.kind, entry)
+  }
+  return [...byKind].map(([event, entry]) => ({ event, events: entry.events, accounts: entry.accounts.size }))
+}

@@ -1,6 +1,7 @@
 import type {
   Account,
   AccountQualityHistoryResponse,
+  AccountQualityHistoryWindow,
   AccountsListResponse,
   AccountsStatusResponse,
   AccountTestRequest,
@@ -139,14 +140,15 @@ export async function promoteAccountModels(
   return (await api.post(`/accounts/${id}/models/promote`)).data;
 }
 
-/** 账号质量分历史（错误率 / 首字 / 耗时 EWMA 快照），最近 `hours` 小时，按时间升序。 */
+/** 账号质量分历史（错误率 / 首字 / 耗时 EWMA 快照），按时间升序；窗口给 from/to 或 hours 二选一。 */
 export async function getAccountQualityHistory(
   id: number,
-  hours = 24,
+  window: AccountQualityHistoryWindow = { hours: 24 },
 ): Promise<AccountQualityHistoryResponse> {
+  const params = "hours" in window ? { hours: window.hours } : { from: window.from, to: window.to };
   const { data } = await api.get<AccountQualityHistoryResponse>(
     `/accounts/${id}/quality-history`,
-    { params: { hours } },
+    { params },
   );
   return data;
 }

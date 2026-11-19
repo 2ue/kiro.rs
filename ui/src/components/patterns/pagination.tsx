@@ -13,7 +13,12 @@ import { cn } from '@/lib/utils'
 
 interface PaginationProps {
   page: number
-  pageCount: number
+  /** 总页数；总数未知（接口只告诉有没有下一页）时不传，改传 `hasNext` */
+  pageCount?: number
+  /**
+   * 总数未知模式：传了它就只显示上一页 / 下一页和“第 N 页”，不显示页码列表、跳转和假的总页数。
+   */
+  hasNext?: boolean
   total?: number
   pageSize?: number
   pageSizeOptions?: number[]
@@ -86,7 +91,60 @@ function pageItems(page: number, pageCount: number): PageItem[] {
 }
 
 /** 统一分页控件 */
-export function Pagination({
+export function Pagination(props: PaginationProps) {
+  if (props.hasNext !== undefined) return <CursorPagination {...props} hasNext={props.hasNext} />
+  return <NumberedPagination {...props} pageCount={props.pageCount ?? 1} />
+}
+
+/** 总数未知：只有上一页 / 下一页。 */
+function CursorPagination({
+  page,
+  hasNext,
+  pageSize,
+  pageSizeOptions,
+  onPageChange,
+  onPageSizeChange,
+  pending = false,
+  className,
+}: PaginationProps & { hasNext: boolean }) {
+  const current = Math.max(1, page)
+  const pageSizes = usePageSizes(pageSize, pageSizeOptions)
+  return (
+    <div className={cn('flex flex-wrap items-center justify-between gap-3', className)}>
+      <div className="min-w-0 text-xs text-muted-foreground">
+        <span className="tabular-nums">
+          第 {current} 页
+          {pending ? ' · 加载中' : ''}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        {pageSizes.length > 0 && onPageSizeChange && pageSize !== undefined && (
+          <PageSizeSelect value={pageSize} options={pageSizes} onChange={onPageSizeChange} disabled={pending} />
+        )}
+        <div className="flex items-center gap-1">
+          <Button variant="outline" size="sm" disabled={current <= 1 || pending} onClick={() => onPageChange(current - 1)}>
+            <ChevronLeft className="size-4" />
+            上一页
+          </Button>
+          <Button variant="outline" size="sm" disabled={!hasNext || pending} onClick={() => onPageChange(current + 1)}>
+            下一页
+            <ChevronRight className="size-4" />
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function usePageSizes(pageSize?: number, pageSizeOptions?: number[]) {
+  return useMemo(() => {
+    const values = new Set(pageSizeOptions ?? [])
+    if (pageSize) values.add(pageSize)
+    return Array.from(values).filter(Boolean).sort((left, right) => left - right)
+  }, [pageSize, pageSizeOptions])
+}
+
+function NumberedPagination({
   page,
   pageCount,
   total,
@@ -96,15 +154,11 @@ export function Pagination({
   onPageSizeChange,
   pending = false,
   className,
-}: PaginationProps) {
+}: PaginationProps & { pageCount: number }) {
   const normalizedPage = clampPage(page, pageCount)
   const [jumpValue, setJumpValue] = useState(String(normalizedPage))
   const pages = useMemo(() => pageItems(normalizedPage, Math.max(pageCount, 1)), [normalizedPage, pageCount])
-  const pageSizes = useMemo(() => {
-    const values = new Set(pageSizeOptions ?? [])
-    if (pageSize) values.add(pageSize)
-    return Array.from(values).filter(Boolean).sort((left, right) => left - right)
-  }, [pageSize, pageSizeOptions])
+  const pageSizes = usePageSizes(pageSize, pageSizeOptions)
 
   useEffect(() => {
     setJumpValue(String(normalizedPage))

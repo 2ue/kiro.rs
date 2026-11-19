@@ -29,6 +29,7 @@ import { Save } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
+import { proxyPasswordIsSet, proxyPasswordPatch, type ProxyPasswordAction } from "./proxy-password";
 import { ModelMappingSection } from "./runtime-sections";
 const accountSections: Array<{ key: string; title: string; desc: string; matches: (key: string) => boolean }> = [
   { key: "capacity", title: "容量与排队", desc: "账号池整体的并发上限、排队与等待。", matches: (k) => /^(enabled|globalMax|maxQueued|capacityMode|dispatch)/.test(k) },
@@ -46,16 +47,23 @@ export function RuntimePage() {
     confirm = useConfirm(),
     models = useModelCapabilities(),
     [draft, setDraft] = useState<RuntimeConfig | null>(null),
-    // 后端只回传脱敏后的代理密码；用户没在输入框里改过就不把它回传，避免把脱敏值当密码存进去。
-    [proxyPasswordDirty, setProxyPasswordDirty] = useState(false);
+    // 后端只回传代理密码的掩码，草稿里的 proxyPassword 原样不动、也不提交；
+    // 新密码单独放在输入框状态里，清除要经过危险确认，保存时由 proxyPasswordPatch 决定怎么带。
+    [proxyPasswordInput, setProxyPasswordInput] = useState(""),
+    [proxyPasswordAction, setProxyPasswordAction] = useState<ProxyPasswordAction>("keep");
   useEffect(() => {
     if (query.data) {
       setDraft(structuredClone(query.data));
-      setProxyPasswordDirty(false);
+      setProxyPasswordInput("");
+      setProxyPasswordAction("keep");
     }
   }, [query.data]);
+  const proxyPasswordDirty = proxyPasswordInput.length > 0 || proxyPasswordAction === "clear";
   useUnsavedChangesGuard(
-    draft !== null && query.data !== undefined && JSON.stringify(draft) !== JSON.stringify(query.data) && !update.isPending,
+    draft !== null &&
+      query.data !== undefined &&
+      (JSON.stringify(draft) !== JSON.stringify(query.data) || proxyPasswordDirty) &&
+      !update.isPending,
   );
   if (query.isLoading) return <LoadingState />;
   if (query.error || !draft)
@@ -73,8 +81,27 @@ export function RuntimePage() {
     key: K,
     value: RuntimeConfig[K],
   ) => setDraft({ ...draft, [key]: value });
-  const dirty = JSON.stringify(draft) !== JSON.stringify(query.data);
-  const proxyPasswordSet = Boolean(query.data?.proxyPassword);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(query.data) || proxyPasswordDirty;
+  const proxyPasswordSet = proxyPasswordIsSet(query.data?.proxyPassword);
+  const clearProxyPassword = async () => {
+    const ok = await confirm({
+      title: "清除代理密码？",
+      message: "保存配置后，出站代理不再带密码认证；如果代理要求认证，走全局代理的账号请求会失败。点“保存配置”前可以撤销。",
+      confirmText: "清除密码",
+      tone: "danger",
+    });
+    if (!ok) return;
+    setProxyPasswordInput("");
+    setProxyPasswordAction("clear");
+  };
+  const proxyPasswordDescription =
+    proxyPasswordAction === "clear"
+      ? "保存配置后清除代理密码"
+      : proxyPasswordSet
+        ? proxyPasswordInput
+          ? "保存后替换为新密码；清空输入框则保持原密码"
+          : "已设置；留空保持不变，输入新值则替换"
+        : undefined;
   const save = async () => {
     // 开启自动清理或缩短已开启的保留天数都会删数据，和审计页同一口径先确认。
     const before = query.data;
@@ -99,10 +126,13 @@ export function RuntimePage() {
         cachePolicy: _cache,
         reportedUsage: _usage,
         promptInjection: _injection,
-        proxyPassword,
+        proxyPassword: _proxyPassword,
         ...runtime
       } = draft;
-      await update.mutateAsync(proxyPasswordDirty ? { ...runtime, proxyPassword } : runtime);
+      await update.mutateAsync({ ...runtime, ...proxyPasswordPatch(proxyPasswordInput, proxyPasswordAction) });
+      // 只改了密码时回包仍是同一个掩码，查询缓存的结构共享会保留旧引用、上面的 effect 不会触发，这里显式复位。
+      setProxyPasswordInput("");
+      setProxyPasswordAction("keep");
       toast.success("运行配置已保存");
     } catch (error) {
       toast.error(extractErrorMessage(error));
@@ -178,18 +208,30 @@ export function RuntimePage() {
               <Field label="代理用户名" htmlFor="runtime-proxy-user">
                 <Input id="runtime-proxy-user" value={draft.proxyUsername ?? ""} onChange={(e) => set("proxyUsername", e.target.value || null)} />
               </Field>
-              <Field label="代理密码" htmlFor="runtime-proxy-pass" description={proxyPasswordSet && !proxyPasswordDirty ? "已设置；留空保持不变，输入新值则替换" : undefined}>
-                <Input
-                  id="runtime-proxy-pass"
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder={proxyPasswordSet ? "已设置，留空保持不变" : undefined}
-                  value={proxyPasswordDirty ? (draft.proxyPassword ?? "") : ""}
-                  onChange={(e) => {
-                    setProxyPasswordDirty(true);
-                    set("proxyPassword", e.target.value || null);
-                  }}
-                />
+              <Field label="代理密码" htmlFor="runtime-proxy-pass" description={proxyPasswordDescription}>
+                <div className="flex min-w-0 items-center gap-2">
+                  <Input
+                    id="runtime-proxy-pass"
+                    type="password"
+                    autoComplete="new-password"
+                    className="min-w-0 flex-1"
+                    placeholder={proxyPasswordAction === "clear" ? "保存后清除" : proxyPasswordSet ? "已设置，留空保持不变" : "未设置"}
+                    disabled={proxyPasswordAction === "clear"}
+                    value={proxyPasswordInput}
+                    onChange={(e) => setProxyPasswordInput(e.target.value)}
+                  />
+                  {proxyPasswordAction === "clear" ? (
+                    <Button variant="outline" size="sm" className="shrink-0" onClick={() => setProxyPasswordAction("keep")}>
+                      撤销
+                    </Button>
+                  ) : (
+                    proxyPasswordSet && (
+                      <Button variant="outline" size="sm" className="shrink-0 text-destructive hover:text-destructive" onClick={clearProxyPassword}>
+                        清除密码
+                      </Button>
+                    )
+                  )}
+                </div>
               </Field>
             </FieldGrid>
             <div className="mt-5 border-t pt-5">

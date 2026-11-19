@@ -39,18 +39,31 @@ function BoolField({ id, label, checked, onChange }: { id: string; label: string
   )
 }
 
+/** 默认选中的路由：调用方指定且在列表里时用它，否则沿用 /cc → 第一个 → /v1。 */
+function defaultPreviewRoute(routes: string[], initialRoute?: string): string {
+  if (initialRoute && routes.includes(initialRoute)) return initialRoute
+  return routes.includes('/cc') ? '/cc' : routes[0] ?? '/v1'
+}
+
 export function InjectionPreviewPanel({
   routes,
+  initialRoute,
   catalog,
   draft,
+  note = '使用页面上还没保存的设置。后端走和真实请求相同的注入与转换代码，不访问上游，也不会保存任何东西。',
 }: {
+  /** 预览接口认的路由写法：默认路由为 `/v1`，其余为前缀 */
   routes: string[]
+  /** 默认选中的路由（例如正在编辑的路由）；不在列表里时忽略 */
+  initialRoute?: string
   catalog: InjectionCatalogEntry[]
   draft: { promptInjection: PromptInjectionConfig; routeFeatures: RouteFeaturesConfig }
+  /** 表单底部的说明：预览用的是哪份配置 */
+  note?: string
 }) {
   const preview = usePromptInjectionPreview()
-  const [request, setRequest] = React.useState<PromptInjectionPreviewRequest>({
-    route: routes.includes('/cc') ? '/cc' : routes[0] ?? '/v1',
+  const [request, setRequest] = React.useState<PromptInjectionPreviewRequest>(() => ({
+    route: defaultPreviewRoute(routes, initialRoute),
     model: 'claude-sonnet-4-5',
     nativeReasoning: false,
     withSystem: true,
@@ -60,7 +73,15 @@ export function InjectionPreviewPanel({
     language: 'none',
     emptyTurnRetry: false,
     stream: false,
-  })
+  }))
+  // 路由列表晚于面板加载时（或编辑页切到另一条路由），把默认选中补成目标路由；用户手动选过就不再改。
+  const routeTouched = React.useRef(false)
+  const routesKey = routes.join('\n')
+  React.useEffect(() => {
+    if (routeTouched.current) return
+    const next = defaultPreviewRoute(routesKey ? routesKey.split('\n') : [], initialRoute)
+    setRequest((current) => (current.route === next ? current : { ...current, route: next }))
+  }, [initialRoute, routesKey])
   const set = <K extends keyof PromptInjectionPreviewRequest>(key: K) => (value: PromptInjectionPreviewRequest[K]) =>
     setRequest((current) => ({ ...current, [key]: value }))
   const names = new Map(catalog.map((entry) => [entry.id, `${entry.code} ${entry.name}`]))
@@ -77,7 +98,13 @@ export function InjectionPreviewPanel({
         }}
       >
         <Field label="路由" htmlFor="preview-route">
-          <Select value={request.route} onValueChange={set('route')}>
+          <Select
+            value={request.route}
+            onValueChange={(value) => {
+              routeTouched.current = true
+              set('route')(value)
+            }}
+          >
             <SelectTrigger id="preview-route" size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
               {routes.map((route) => <SelectItem key={route} value={route}>{route}</SelectItem>)}
@@ -123,9 +150,7 @@ export function InjectionPreviewPanel({
           <Eye className="size-4" />
           生成预览
         </Button>
-        <p className="text-[0.7rem] leading-4 text-muted-foreground">
-          使用页面上还没保存的设置。后端走和真实请求相同的注入与转换代码，不访问上游，也不会保存任何东西。
-        </p>
+        <p className="text-[0.7rem] leading-4 text-muted-foreground">{note}</p>
       </form>
 
       <section className="space-y-4 rounded-xl border bg-card p-4" aria-live="polite" aria-label="预览结果">

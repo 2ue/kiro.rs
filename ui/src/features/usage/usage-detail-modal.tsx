@@ -28,6 +28,7 @@ statusLabel,
 statusTone,
 terminalReasonLabel,
 upstreamModelLabel,
+usageRoutePrefixLabel,
 } from './usage-helpers'
 
 function MetricTile({
@@ -357,7 +358,7 @@ export function UsageDetailModal({
                 <div className="text-sm">-</div>
               )}
             </div>
-            <DetailField label="路由" value={routeLabel(record)} />
+            <DetailField label="路由" value={usageRoutePrefixLabel(record)} mono />
             {record.modelResolutionSource && (
               <DetailField label="模型解析方式" value={modelResolutionSourceLabel(record.modelResolutionSource)} />
             )}

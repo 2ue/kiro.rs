@@ -1,6 +1,7 @@
 import { api } from '@/api/http'
 import type {
 AccountEventSummaryResponse,
+AccountEventWindowSummaryQuery,
 AdminAuditLogPage,
 AdminAuditLogPageQuery,
 UsageAccountLatencyResponse,
@@ -233,6 +234,14 @@ export async function getAuditLogsPage(query: AdminAuditLogPageQuery): Promise<A
 export async function getAccountEventSummary(hours: number, accountSource?: string): Promise<AccountEventSummaryResponse> {
   const { data } = await api.get<AccountEventSummaryResponse>('/audit-logs/account-summary', {
     params: { hours, accountSource: accountSource || undefined },
+  })
+  return data
+}
+
+/** 按 `[since, until)` 窗口统计账号异动；给了 since 时后端忽略 hours。 */
+export async function getAccountEventWindowSummary(query: AccountEventWindowSummaryQuery): Promise<AccountEventSummaryResponse> {
+  const { data } = await api.get<AccountEventSummaryResponse>('/audit-logs/account-summary', {
+    params: { since: query.since, until: query.until, accountId: query.accountId || undefined },
   })
   return data
 }

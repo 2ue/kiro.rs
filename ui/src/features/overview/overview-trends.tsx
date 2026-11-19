@@ -18,7 +18,7 @@ import {
   sumCacheTokens,
   type CacheTokenMetrics,
 } from './cache-hit-rate'
-import { averagePerMinute, perMinute, weightedAverageDuration } from './overview-metrics'
+import { averagePerMinute, completedBuckets, perMinute, weightedAverageDuration } from './overview-metrics'
 import { cn } from '@/lib/utils'
 import { EmptyState, LoadingState, SectionCard } from '@/components/patterns'
 import {
@@ -90,6 +90,8 @@ export type TrendView = {
   footnote?: ReactNode
   /** 图表顶部的大号汇总数；缺省为可见柱子的合计 */
   headline?: { label: string; value: (points: UsageOverviewSeriesPoint[]) => number | null }
+  /** 平均速率类视图（RPM / TPM）：汇总数和图例合计只用已结束的时段，进行中的那一小时不进分母 */
+  completedBucketsOnly?: boolean
 }
 
 function formatValue(value: number, format: ValueFormat): string {
@@ -290,7 +292,8 @@ export function summaryTrendViews(options: { hourly?: boolean } = {}): TrendView
           label: '平均 RPM',
           value: (points) => averagePerMinute(points, (point) => point.all.requests),
         },
-        footnote: '每个小时桶的请求数 ÷ 60，是该小时的平均每分钟请求；进行中的小时偏低，折线在那里断开。',
+        completedBucketsOnly: true,
+        footnote: '每个小时桶的请求数 ÷ 60，是该小时的平均每分钟请求；进行中的小时偏低，折线在那里断开，平均 RPM 也只算已结束的小时。',
       },
       {
         key: 'tpm',
@@ -308,7 +311,8 @@ export function summaryTrendViews(options: { hourly?: boolean } = {}): TrendView
           label: '平均 TPM',
           value: (points) => averagePerMinute(points, (point) => point.all.inputTokens + point.all.outputTokens),
         },
-        footnote: '每个小时桶的（输入 + 输出）token ÷ 60；缓存读写不计入。',
+        completedBucketsOnly: true,
+        footnote: '每个小时桶的（输入 + 输出）token ÷ 60；缓存读写不计入，平均 TPM 只算已结束的小时。',
       },
     )
   }
@@ -783,6 +787,8 @@ export function OverviewTrendCard({
     return next
   })
   const lineOnly = view.bars.length === 0
+  // 平均速率类视图的汇总不含进行中的时段；合计类视图照常用全部时段。
+  const summaryPoints = view.completedBucketsOnly ? completedBuckets(points, partialFrom) : points
   const legendItems = [
     ...view.bars.map((series) => ({
       key: series.key,
@@ -798,11 +804,11 @@ export function OverviewTrendCard({
       color: line.color,
       shape: 'line' as const,
       dashed: Boolean(line.reference),
-      total: line.aggregate ? line.aggregate(points) : null,
+      total: line.aggregate ? line.aggregate(summaryPoints) : null,
     })),
   ]
   const headlineValue = view.headline
-    ? view.headline.value(points)
+    ? view.headline.value(summaryPoints)
     : visibleBars.reduce((sum, series) => sum + sumOver(points, series.value), 0)
   const headlineLabel = view.headline?.label ?? `${view.label}合计`
   const barSlots = view.bars

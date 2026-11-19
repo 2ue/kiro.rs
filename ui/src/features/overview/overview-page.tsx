@@ -34,11 +34,14 @@ import {
   accountCostDelta,
   costDeltaPercent,
   costMultiplier,
+  latencyRangeWithinLimit,
   localDateTimeToIso,
   localDateTimeValue,
   metricsShare,
   totalTokenUsage,
+  zeroBelowCent,
 } from './overview-metrics'
+import { rankUsageFilter, type RankingDimension, type RankUsageFilter } from './rank-links'
 import { OverviewTrendCard, accountTrendViews, routeTrendViews, summaryTrendViews } from './overview-trends'
 import {
   buildRouteOverviewRows,
@@ -96,7 +99,6 @@ const AUTO_REFRESH_KEY = 'claude-pool-admin:auto-refresh:overview'
 
 type PresetRange = 'today' | 'yesterday' | 'last24h' | 'last7d' | 'last30d' | 'thisMonth'
 type OverviewTab = 'summary' | 'accounts' | 'routes' | 'rankings'
-type RankingDimension = 'models' | 'accounts' | 'keys' | 'paths' | 'errors'
 
 const PRESETS: Array<{ key: PresetRange; label: string }> = [
   { key: 'today', label: '今天' },
@@ -164,16 +166,7 @@ function formatHitRate(rate: number | null): string {
 /** 跳到用量页，带上账号 / 路由 / 模型 / 请求 Key 与时间范围筛选。 */
 function usageLink(
   navigate: ReturnType<typeof useNavigate>,
-  params: {
-    accountId?: number
-    endpoint?: string
-    /** 路由前缀，默认路由为 "/" */
-    route?: string
-    model?: string
-    requestApiKeyId?: string
-    since: string
-    until: string
-  },
+  params: RankUsageFilter & { since: string; until: string },
 ) {
   const search = new URLSearchParams()
   if (params.accountId) search.set('accountId', String(params.accountId))
@@ -186,32 +179,10 @@ function usageLink(
   navigate(`/usage?${search.toString()}`)
 }
 
-/** 排行各页签点击一行时带到用量页的筛选键。错误页签没有对应筛选。 */
-function rankUsageFilter(dimension: RankingDimension, key: string): Parameters<typeof usageLink>[1] | null {
-  const base = { since: '', until: '' }
-  switch (dimension) {
-    case 'models':
-      return { ...base, model: key }
-    case 'paths':
-      return { ...base, endpoint: key }
-    case 'keys':
-      return { ...base, requestApiKeyId: key }
-    case 'accounts': {
-      const accountId = Number(key)
-      return Number.isFinite(accountId) && accountId > 0 ? { ...base, accountId } : null
-    }
-    default:
-      return null
-  }
-}
-
 function formatMs(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return '-'
   return `${formatNumber(Math.round(value))} ms`
 }
-
-/** 延迟分位扫明细，后端限制范围 8 天以内；更长范围不请求、列显示 -。 */
-const LATENCY_MAX_RANGE_MS = 8 * 86_400_000
 
 // ─── 小组件 ─────────────────────────────────────────────────────────────────────
 
@@ -302,6 +273,7 @@ function OverallSummarySection({
   const hitRate = cacheHitRate(metrics)
   const hitLevel = cacheHitRateLevel(hitRate)
   const delta = accountCostDelta(billing.reportedCostUsd, accountCostUsd)
+  const profitUsd = zeroBelowCent(billing.profitUsd)
   const reportedTokens = totalTokenUsage(metrics)
   return (
     <SectionCard>
@@ -380,13 +352,13 @@ function OverallSummarySection({
           desc={(
             <span>
               补偿后计费 {formatUsdFixed2(billing.upliftedCostUsd)} · 毛利{' '}
-              <span className={billingDeltaTextClass(billingDeltaTone(billing.profitUsd))}>
-                {billing.profitUsd >= 0 ? '+' : '-'}{formatUsdFixed2(Math.abs(billing.profitUsd))}
+              <span className={billingDeltaTextClass(billingDeltaTone(profitUsd))}>
+                {profitUsd >= 0 ? '+' : '-'}{formatUsdFixed2(Math.abs(profitUsd))}
               </span>
             </span>
           )}
           icon={<DollarSign />}
-          tone={billing.profitUsd < 0 ? 'error' : 'success'}
+          tone={profitUsd < 0 ? 'error' : 'success'}
         />
       </div>
       <div className="mt-3 rounded-lg bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
@@ -404,6 +376,7 @@ function OverallSummarySection({
 function AccountsSection({
   billing,
   accounts,
+  accountsLoaded,
   statuses,
   latency,
   latencyUnavailable,
@@ -412,6 +385,8 @@ function AccountsSection({
 }: {
   billing: BillingTotals & { pools: UsageOverviewPoolRow[] }
   accounts: Account[]
+  /** 账号列表是否已读取成功；没成功时不把用量里的账号标成已删除 */
+  accountsLoaded: boolean
   statuses: AccountStatus[]
   /** 按账号的延迟分位；范围超过 8 天或接口失败时为空 */
   latency: UsageAccountLatencyRow[]
@@ -459,10 +434,12 @@ function AccountsSection({
   const totalRequests = rows.reduce((sum, item) => sum + (item.usage?.metrics.requests ?? 0), 0)
   const pricedRequests = rows.reduce((sum, item) => sum + (item.usage?.metrics.pricedRequests ?? 0), 0)
   const unpricedRequests = rows.reduce((sum, item) => sum + (item.usage?.metrics.unpricedRequests ?? 0), 0)
-  const deltaTone = billingDeltaTone(billing.profitUsd)
+  const profitUsd = zeroBelowCent(billing.profitUsd)
+  const deltaTone = billingDeltaTone(profitUsd)
   return (
     <SectionCard>
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+      {/* 5 张卡：宽屏一行排满；中等宽度 3 + 2，可计费说明最长，占两格补齐第二行。 */}
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
         <StatCard
           title="账号请求"
           value={formatNumber(totalRequests)}
@@ -500,13 +477,14 @@ function AccountsSection({
             <span>
               补偿后计费 {formatUsdFixed2(billing.upliftedCostUsd)} ·{' '}
               <span className={billingDeltaTextClass(deltaTone)}>
-                {billing.profitUsd >= 0 ? '+' : '-'}{formatUsdFixed2(Math.abs(billing.profitUsd))}
+                {profitUsd >= 0 ? '+' : '-'}{formatUsdFixed2(Math.abs(profitUsd))}
               </span>
               {billing.costFloorAppliedRequests > 0 && ` · 兜底 ${formatNumber(billing.costFloorAppliedRequests)} 次`}
             </span>
           )}
           icon={<TrendingUp />}
           tone={deltaTone === 'loss' ? 'error' : deltaTone === 'profit' ? 'warning' : 'success'}
+          className="sm:col-span-2 lg:col-span-2 2xl:col-span-1"
         />
       </div>
       <div className="mt-3 rounded-lg bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
@@ -518,6 +496,7 @@ function AccountsSection({
         {' '}按账号倍率折算。
         <span className="ml-1 font-medium text-foreground/75">错误率</span>
         {' '}先看最终落到该账号的请求，再看“含切走”：把中途失败后换到别的账号的尝试也算进来。
+        <span className="ml-1">账号尝试与含切走错误率从 1.0.8 起统计，跨升级时间的范围只覆盖升级之后。</span>
         {latencyUnavailable && <span className="ml-1">耗时分位：{latencyUnavailable}</span>}
       </div>
       {rows.length === 0 ? (
@@ -549,7 +528,7 @@ function AccountsSection({
                 const rawCostUsd = usage?.rawCostUsd ?? 0
                 const shapedCostUsd = usage?.shapedCostUsd ?? 0
                 const upliftedCostUsd = usage?.upliftedCostUsd ?? 0
-                const rowDelta = usage?.profitUsd ?? (upliftedCostUsd - rawCostUsd)
+                const rowDelta = zeroBelowCent(usage?.profitUsd ?? (upliftedCostUsd - rawCostUsd))
                 const rowTone = billingDeltaTone(rowDelta)
                 const attemptRequests = usage?.attemptRequests ?? 0
                 const attemptErrorRate = usage?.attemptErrorRate ?? 0
@@ -570,7 +549,7 @@ function AccountsSection({
                         <UsageTierBadge tier={tier} inFlight={status?.inFlight} />
                         {account && <Badge tone={account.enabled ? 'success' : 'neutral'} size="xs">{account.enabled ? '启用' : '停用'}</Badge>}
                         {account?.autoDisabled && <Badge tone="error" size="xs">自动禁用</Badge>}
-                        {!account && <Badge tone="neutral" size="xs">已删除</Badge>}
+                        {!account && accountsLoaded && <Badge tone="neutral" size="xs">已删除</Badge>}
                         {metrics.requests === 0 && <Badge tone="secondary" size="xs">无流量</Badge>}
                       </div>
                     </TableCell>
@@ -623,11 +602,13 @@ function AccountsSection({
 
 // ─── 路由分区 ───────────────────────────────────────────────────────────────────
 
-const ROUTE_STATUS_BADGE: Record<RouteRowStatus, { label: string; tone: 'success' | 'neutral' | 'warning' }> = {
+/** 路由配置没加载成功时（`unverified`）不显示状态，避免把仍存在的路由误标成已删除。 */
+const ROUTE_STATUS_BADGE: Record<RouteRowStatus, { label: string; tone: 'success' | 'neutral' | 'warning' } | null> = {
   enabled: { label: '启用', tone: 'success' },
   disabled: { label: '停用', tone: 'neutral' },
   deleted: { label: '已删除', tone: 'neutral' },
   unknown: { label: '未识别', tone: 'warning' },
+  unverified: null,
 }
 
 /** 缓存策略名称沿用路由编辑页的叫法；未设置时按后端默认的本地模拟缓存。 */
@@ -639,6 +620,7 @@ function routeStrategyLabel(route?: RouteConfig): string | undefined {
 
 function RoutesSection({
   routes,
+  routesLoaded,
   usage,
   latency,
   latencyUnavailable,
@@ -646,6 +628,8 @@ function RoutesSection({
   navigate,
 }: {
   routes: RouteConfig[]
+  /** 路由配置是否已读取成功；没成功时不判断启停和已删除 */
+  routesLoaded: boolean
   usage: UsageOverviewRouteRow[]
   /** 按路由的延迟分位；范围超过 8 天或接口失败时为空 */
   latency: UsageRouteLatencyRow[]
@@ -653,7 +637,7 @@ function RoutesSection({
   range: { from: string; to: string }
   navigate: ReturnType<typeof useNavigate>
 }) {
-  const rows = buildRouteOverviewRows(routes, usage, latency)
+  const rows = buildRouteOverviewRows(routes, usage, latency, routesLoaded)
   const insights = routeInsights(rows)
   const labelOf = routeLabelResolver(routes)
   const totalBillableUsd = rows.reduce((sum, row) => sum + (row.usage?.billableCostUsd ?? 0), 0)
@@ -664,7 +648,9 @@ function RoutesSection({
         <StatCard
           title="活跃路由"
           value={formatNumber(insights.activeRoutes)}
-          desc={`已启用 ${formatNumber(insights.enabledRoutes)} / 已配置 ${formatNumber(insights.configuredRoutes)}${insights.unconfiguredActiveRoutes > 0 ? ` · ${formatNumber(insights.unconfiguredActiveRoutes)} 个已删除前缀仍有流量` : ''}`}
+          desc={routesLoaded
+            ? `已启用 ${formatNumber(insights.enabledRoutes)} / 已配置 ${formatNumber(insights.configuredRoutes)}${insights.unconfiguredActiveRoutes > 0 ? ` · ${formatNumber(insights.unconfiguredActiveRoutes)} 个已删除前缀仍有流量` : ''}`
+            : '路由配置未加载，启停与已删除状态暂不判断'}
           icon={<RouteIcon />}
           tone="info"
         />
@@ -680,9 +666,12 @@ function RoutesSection({
         <StatCard
           title="命中率最低"
           value={insights.lowestHitRate ? formatHitRate(insights.lowestHitRate.rate) : '-'}
-          desc={insights.lowestHitRate
-            ? [rowLabel(insights.lowestHitRate.row), routeStrategyLabel(insights.lowestHitRate.row.route)].filter(Boolean).join(' · ')
-            : '当前范围没有输入 token'}
+          desc={[
+            insights.lowestHitRate
+              ? [rowLabel(insights.lowestHitRate.row), routeStrategyLabel(insights.lowestHitRate.row.route)].filter(Boolean).join(' · ')
+              : insights.noCacheExcluded > 0 ? '没有可比较的路由' : '当前范围没有输入 token',
+            insights.noCacheExcluded > 0 ? `已排除 ${formatNumber(insights.noCacheExcluded)} 个无缓存路由` : '',
+          ].filter(Boolean).join(' · ')}
           icon={<Layers3 />}
           tone={insights.lowestHitRate ? HIT_RATE_TONE[cacheHitRateLevel(insights.lowestHitRate.rate)] : 'default'}
         />
@@ -705,7 +694,7 @@ function RoutesSection({
         <span className="ml-1 font-medium text-foreground/75">可计费</span>
         {' '}取最终可计费金额，
         <span className="ml-1 font-medium text-foreground/75">账号成本</span>
-        {' '}按各账号倍率折算。命中率随路由的缓存策略变化，对照策略名称看。
+        {' '}按各账号倍率折算。命中率随路由的缓存策略变化，对照策略名称看；“命中率最低”不含缓存策略为“无缓存”的路由。
         {latencyUnavailable && <span className="ml-1">耗时分位：{latencyUnavailable}</span>}
       </div>
       {rows.length === 0 ? (
@@ -739,7 +728,7 @@ function RoutesSection({
                 const rawCostUsd = rowUsage?.rawCostUsd ?? 0
                 const shapedCostUsd = rowUsage?.shapedCostUsd ?? 0
                 const upliftedCostUsd = rowUsage?.upliftedCostUsd ?? 0
-                const rowDelta = rowUsage?.profitUsd ?? (upliftedCostUsd - rawCostUsd)
+                const rowDelta = zeroBelowCent(rowUsage?.profitUsd ?? (upliftedCostUsd - rawCostUsd))
                 const rowTone = billingDeltaTone(rowDelta)
                 const badge = ROUTE_STATUS_BADGE[status]
                 const strategy = routeStrategyLabel(route)
@@ -761,7 +750,7 @@ function RoutesSection({
                             {name}
                           </Button>
                         )}
-                        <Badge tone={badge.tone} size="xs">{badge.label}</Badge>
+                        {badge && <Badge tone={badge.tone} size="xs">{badge.label}</Badge>}
                         {metrics.requests === 0 && <Badge tone="secondary" size="xs">无流量</Badge>}
                         {route && (
                           <Button
@@ -847,8 +836,8 @@ function RankPanel({
   rows: UsageOverviewRankRow[]
   total: number
   errorRank?: boolean
-  /** 点击一行跳到用量页；错误页签没有筛选键，不可点 */
-  onOpen?: (row: UsageOverviewRankRow) => void
+  /** 点击一行跳到用量页；没有筛选键的行（错误页签、key 为 unknown）不可点 */
+  onOpen?: (filter: RankUsageFilter) => void
 }) {
   const isKeys = dimension === 'keys'
   return (
@@ -879,13 +868,13 @@ function RankPanel({
               const hitLevel = cacheHitRateLevel(hitRate)
               const accountCostUsd = row.accountCostUsd ?? 0
               const delta = accountCostDelta(row.estimatedCostUsd, accountCostUsd)
-              const clickable = Boolean(onOpen)
+              const filter = onOpen ? rankUsageFilter(dimension, row.key) : null
               return (
                 <TableRow
                   key={row.key}
-                  className={cn(clickable && 'cursor-pointer')}
-                  title={clickable ? '查看该项的用量明细' : undefined}
-                  onClick={clickable ? () => onOpen?.(row) : undefined}
+                  className={cn(filter && 'cursor-pointer')}
+                  title={filter ? '查看该项的用量明细' : undefined}
+                  onClick={filter ? () => onOpen?.(filter) : undefined}
                 >
                   <TableCell className="font-mono text-xs text-muted-foreground">{index + 1}</TableCell>
                   <TableCell>
@@ -953,11 +942,7 @@ function RankingsSection({
   navigate: ReturnType<typeof useNavigate>
 }) {
   const [dimension, setDimension] = useState<RankingDimension>('models')
-  const openUsage = (view: RankingDimension) => (row: UsageOverviewRankRow) => {
-    const filter = rankUsageFilter(view, row.key)
-    if (!filter) return
-    usageLink(navigate, { ...filter, since: range.from, until: range.to })
-  }
+  const openUsage = (filter: RankUsageFilter) => usageLink(navigate, { ...filter, since: range.from, until: range.to })
   const rankViews: Array<{ key: RankingDimension; label: string; rows: UsageOverviewRankRow[]; total: number; errorRank?: boolean }> = [
     { key: 'models', label: '模型', rows: rankings.topModels, total: rankings.totalRequests },
     { key: 'accounts', label: '账号', rows: rankings.topAccounts, total: rankings.totalRequests },
@@ -978,11 +963,11 @@ function RankingsSection({
               rows={view.rows}
               total={view.total}
               errorRank={view.errorRank}
-              onOpen={view.errorRank ? undefined : openUsage(view.key)}
+              onOpen={view.errorRank ? undefined : openUsage}
             />
           </TabsContent>
         ))}
-        <p className="mt-2 text-[0.68rem] text-muted-foreground">点击一行跳到用量页查看该项在当前范围内的明细；错误页签按错误类型聚合，没有对应筛选。</p>
+        <p className="mt-2 text-[0.68rem] text-muted-foreground">点击一行跳到用量页查看该项在当前范围内的明细（路由页签按该入口所属的路由前缀和入口路径筛选）；错误页签按错误类型聚合、unknown 行没有可用的筛选值，不可点。</p>
       </Tabs>
     </SectionCard>
   )
@@ -1033,9 +1018,10 @@ export function OverviewPage() {
   const series = useUsageOverviewSeries(queryParams, refreshInterval, (activeTab === 'summary' || activeTab === 'accounts' || activeTab === 'routes') && !summary.isError)
   const rankings = useUsageOverviewRankings(rankingQueryParams, refreshInterval, activeTab === 'rankings' && !summary.isError)
   // 延迟分位扫明细，后端限制 8 天以内：30 天 / 本月 / 过长的自定义范围不请求。
+  // 自定义范围按后端口径先对齐整点再比较，恰好 8 天但不是整点的范围对齐后会超过 8 天。
   const latencyRangeOk = rangeKey
     ? ['today', 'yesterday', 'last24h', 'last7d'].includes(rangeKey)
-    : !fromParam || !toParam || Date.parse(toParam) - Date.parse(fromParam) <= LATENCY_MAX_RANGE_MS
+    : !fromParam || !toParam || latencyRangeWithinLimit(fromParam, toParam)
   const latencyParams = useMemo(() => {
     const { granularity: _granularity, ...rest } = queryParams as typeof queryParams & { granularity?: string }
     return rest
@@ -1308,6 +1294,7 @@ export function OverviewPage() {
               <AccountsSection
                 billing={billing}
                 accounts={accounts.data?.accounts ?? []}
+                accountsLoaded={accounts.isSuccess}
                 statuses={accountStatuses.data?.accounts ?? []}
                 latency={latencyRangeOk ? latency.data?.accounts ?? [] : []}
                 latencyUnavailable={latencyUnavailable}
@@ -1335,6 +1322,7 @@ export function OverviewPage() {
             ) : (
               <RoutesSection
                 routes={routeConfigs.data ?? []}
+                routesLoaded={routeConfigs.isSuccess}
                 usage={overviewData?.routes ?? []}
                 latency={latencyRangeOk ? routeLatency.data?.routes ?? [] : []}
                 latencyUnavailable={routeLatencyUnavailable}

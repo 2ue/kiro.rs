@@ -119,3 +119,39 @@ test('路由显示名：名称与前缀不同写成"名称 前缀"，找不到�
   assert.equal(labelOf('/dfcache/gone'), '/dfcache/gone')
   assert.equal(labelOf('unknown'), '未识别入口')
 })
+
+test('路由配置没加载成功时，配置里找不到的前缀不判成已删除', () => {
+  const rows = buildRouteOverviewRows(
+    [],
+    [usage('/cc', { requests: 3 }), usage('unknown', { requests: 1 })],
+    [],
+    false,
+  )
+  assert.deepEqual(rows.map((row) => [row.key, row.status]), [
+    ['/cc', 'unverified'],
+    ['unknown', 'unknown'],
+  ])
+  const insights = routeInsights(rows)
+  assert.equal(insights.unconfiguredActiveRoutes, 0)
+  // 加载成功后同一前缀才是已删除。
+  assert.equal(routeInsights(buildRouteOverviewRows([], [usage('/cc', { requests: 3 })])).unconfiguredActiveRoutes, 1)
+})
+
+test('命中率最低排除缓存策略为“无缓存”的路由，并记下排除了几个', () => {
+  const noCache = { ...route(2, '/cc', '/cc'), cachePolicy: { cacheType: 'no_cache' as const } }
+  const configs = [route(1, '', 'default'), noCache, route(3, '/ha', '/ha')]
+  const rows = buildRouteOverviewRows(configs, [
+    usage('/', { requests: 10, uncached: 100, cacheRead: 900 }),
+    usage('/cc', { requests: 10, uncached: 1000, cacheRead: 0 }),
+    usage('/ha', { requests: 10, uncached: 500, cacheRead: 500 }),
+  ])
+  const insights = routeInsights(rows)
+  assert.equal(insights.lowestHitRate?.row.key, '/ha')
+  assert.equal(insights.lowestHitRate?.rate, 0.5)
+  assert.equal(insights.noCacheExcluded, 1)
+
+  // 只剩无缓存路由有流量时没有可比较的路由。
+  const only = routeInsights(buildRouteOverviewRows([noCache], [usage('/cc', { requests: 2, uncached: 10 })]))
+  assert.equal(only.lowestHitRate, undefined)
+  assert.equal(only.noCacheExcluded, 1)
+})

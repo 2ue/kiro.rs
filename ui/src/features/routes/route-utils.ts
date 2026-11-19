@@ -12,6 +12,27 @@ export function normalizeRoutePrefix(prefix: string): string {
 export function displayRoutePrefix(prefix: string): string {
   return normalizeRoutePrefix(prefix) || "/";
 }
+/** 注入预览接口的路由写法：默认路由是 `/v1`（`/` 会被拒绝），其余为归一化前缀。 */
+export function previewRoutePrefix(prefix: string): string {
+  return normalizeRoutePrefix(prefix) || "/v1";
+}
+
+/** 用量里无法从入口解析出路由前缀时的键。 */
+export const UNKNOWN_USAGE_ROUTE = "unknown";
+/**
+ * 从入口路径推路由前缀，与后端 `usage_route_prefix_for_endpoint` 同一口径：入口固定是
+ * `{前缀}/v1/...`，取最后一个 `/v1/` 之前的部分（自定义路由名本身含 `v1` 也不会截错）；
+ * 前缀为空是默认路由 `/`；空或 `unknown` 返回 `unknown`；不含 `/v1` 的路径原样返回。
+ */
+export function routePrefixForEndpoint(endpoint: string | null | undefined): string {
+  const value = (endpoint ?? "").trim();
+  if (!value || value === UNKNOWN_USAGE_ROUTE) return UNKNOWN_USAGE_ROUTE;
+  let index = value.lastIndexOf("/v1/");
+  if (index < 0 && value.endsWith("/v1")) index = value.length - 3;
+  if (index < 0) return value;
+  const prefix = value.slice(0, index).replace(/\/+$/, "");
+  return prefix || "/";
+}
 /** 编辑页地址只放 id，前缀不进 URL。 */
 export function routeEditorPath(id: number): string {
   return `/routes/${id}`;

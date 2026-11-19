@@ -46,6 +46,7 @@ import {
   accountAllowsRoute,
   displayRoutePrefix,
   isBuiltinRoute,
+  previewRoutePrefix,
   routeBaseUrl,
   ruleSummary,
 } from "./route-utils";
@@ -240,12 +241,16 @@ export function RouteEditPage() {
           />
           <SettingGroup
             title="注入效果预览"
-            desc="按已保存的全局注入模板模拟一次请求，看最终会注入哪些提示词。预览不改配置，也不发到上游。"
+            desc="按已保存的配置（全局注入模板、各路由已保存的注入开关和路由功能）模拟一次请求，看最终会注入哪些提示词；本页未保存的改动保存后才会体现。预览不改配置，也不发到上游。"
           >
             <InjectionPreviewPanel
-              routes={(routes.data ?? []).map((r) => r.prefix || "/")}
+              routes={(routes.data ?? []).map((r) => previewRoutePrefix(r.prefix))}
+              initialRoute={previewRoutePrefix(prefix)}
               catalog={catalog.data?.items ?? []}
               draft={{ promptInjection: runtime.data.promptInjection, routeFeatures: runtime.data.routeFeatures }}
+              note={dirty
+                ? "本页有未保存的改动，预览不包含它们，保存后才会体现。"
+                : "按已保存的配置计算；后端走和真实请求相同的注入与转换代码，不访问上游，也不会保存任何东西。"}
             />
           </SettingGroup>
         </TabsContent>

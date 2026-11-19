@@ -1,8 +1,9 @@
-import { cancelUsageCleanup,clearUsageRecords,getAccountEventSummary,getAuditLogsPage,getUsageAccountLatency,getUsageCleanupStatus,getUsageDashboard,getUsageDashboardAccountBilling,getUsageDashboardAccountRisk,getUsageDashboardBreakdown,getUsageDashboardSeries,getUsageDashboardTop,getUsageDashboardWindows,getUsageOverview,getUsageOverviewRankings,getUsageOverviewSeries,getUsageOverviewSummary,getUsageRecords,getUsageRecordsPage,getUsageRouteLatency,getUsageSummary,getUsageWriterStats,previewUsageCleanup,resumeUsageCleanup,startUsageCleanup } from '@/api/usage-dashboard'
+import { cancelUsageCleanup,clearUsageRecords,getAccountEventSummary,getAccountEventWindowSummary,getAuditLogsPage,getUsageAccountLatency,getUsageCleanupStatus,getUsageDashboard,getUsageDashboardAccountBilling,getUsageDashboardAccountRisk,getUsageDashboardBreakdown,getUsageDashboardSeries,getUsageDashboardTop,getUsageDashboardWindows,getUsageOverview,getUsageOverviewRankings,getUsageOverviewSeries,getUsageOverviewSummary,getUsageRecords,getUsageRecordsPage,getUsageRouteLatency,getUsageSummary,getUsageWriterStats,previewUsageCleanup,resumeUsageCleanup,startUsageCleanup } from '@/api/usage-dashboard'
 import type { UsageAccountLatencyQuery, UsageRouteLatencyQuery } from '@/api/usage-dashboard'
-import type { AdminAuditLogPageQuery,UsageAccountRiskQuery,UsageCleanupRequest,UsageCleanupStatusResponse,UsageRecordsPageQuery,UsageRecordsQuery } from '@/types/api'
+import type { AccountEventWindowSummaryQuery,AdminAuditLogPageQuery,UsageAccountRiskQuery,UsageCleanupRequest,UsageCleanupStatusResponse,UsageRecordsPageQuery,UsageRecordsQuery } from '@/types/api'
 import { useMutation,useQuery,useQueryClient } from '@tanstack/react-query'
 import { useEffect,useRef } from 'react'
+import { atLeastInterval, HEAVY_QUERY_MIN_INTERVAL_MS } from '@/lib/refetch-interval'
 
 type RefetchInterval = number | false
 
@@ -182,6 +183,7 @@ export function useUsageDashboardAccountBilling(
   })
 }
 
+/** 延迟分位扫用量明细，比汇总接口重：缓存至少 60 秒，自动刷新也不快于 60 秒。 */
 export function useUsageAccountLatency(
   params: UsageAccountLatencyQuery,
   refetchInterval: RefetchInterval = false,
@@ -190,12 +192,14 @@ export function useUsageAccountLatency(
   return useQuery({
     queryKey: ['usage-account-latency', params],
     queryFn: () => getUsageAccountLatency(params),
-    refetchInterval,
+    refetchInterval: atLeastInterval(refetchInterval),
+    staleTime: HEAVY_QUERY_MIN_INTERVAL_MS,
     enabled,
     placeholderData: (previousData) => previousData,
   })
 }
 
+/** 同 `useUsageAccountLatency`：缓存至少 60 秒，自动刷新也不快于 60 秒。 */
 export function useUsageRouteLatency(
   params: UsageRouteLatencyQuery,
   refetchInterval: RefetchInterval = false,
@@ -204,7 +208,8 @@ export function useUsageRouteLatency(
   return useQuery({
     queryKey: ['usage-route-latency', params],
     queryFn: () => getUsageRouteLatency(params),
-    refetchInterval,
+    refetchInterval: atLeastInterval(refetchInterval),
+    staleTime: HEAVY_QUERY_MIN_INTERVAL_MS,
     enabled,
     placeholderData: (previousData) => previousData,
   })
@@ -319,11 +324,12 @@ export function useResumeUsageCleanup() {
   })
 }
 
-export function useAuditLogsPage(query: AdminAuditLogPageQuery) {
+/** 审计分页；`refetchInterval` 默认 15 秒，固定时间窗口的查询可传 false 关掉。 */
+export function useAuditLogsPage(query: AdminAuditLogPageQuery, refetchInterval: RefetchInterval = 15000) {
   return useQuery({
     queryKey: ['audit-logs-page', query],
     queryFn: () => getAuditLogsPage(query),
-    refetchInterval: 15000,
+    refetchInterval,
     placeholderData: (previousData) => previousData,
   })
 }
@@ -333,6 +339,16 @@ export function useAccountEventSummary(hours: number, accountSource?: string) {
     queryKey: ['account-event-summary', hours, accountSource ?? ''],
     queryFn: () => getAccountEventSummary(hours, accountSource),
     refetchInterval: 30000,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+/** 固定窗口的账号异动计数：窗口起止是绝对时间，不需要定时重查；`enabled` 为 false 时不查。 */
+export function useAccountEventWindowSummary(query: AccountEventWindowSummaryQuery, enabled = true) {
+  return useQuery({
+    queryKey: ['account-event-window-summary', query],
+    queryFn: () => getAccountEventWindowSummary(query),
+    enabled,
     placeholderData: (previousData) => previousData,
   })
 }

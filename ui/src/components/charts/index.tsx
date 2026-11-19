@@ -98,6 +98,10 @@ interface BaseChartProps {
   valueFormatter?: (value: number | string, name: string) => React.ReactNode
   labelFormatter?: (label: string | number) => React.ReactNode
   xTickFormatter?: (value: string | number) => string
+  /** 纵轴刻度格式（百分比、毫秒等）；缺省显示原始数值 */
+  yTickFormatter?: (value: string | number) => string
+  /** 纵轴宽度，刻度带单位时需要放宽；默认 44 */
+  yAxisWidth?: number
   hideGrid?: boolean
   hideYAxis?: boolean
 }
@@ -112,6 +116,8 @@ export function TrendAreaChart({
   valueFormatter,
   labelFormatter,
   xTickFormatter,
+  yTickFormatter,
+  yAxisWidth = 44,
   hideGrid,
   hideYAxis,
 }: BaseChartProps) {
@@ -130,7 +136,7 @@ export function TrendAreaChart({
           </defs>
           {!hideGrid && <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--chart-grid))" vertical={false} />}
           <XAxis dataKey={xKey} {...axisProps} tickFormatter={xTickFormatter} minTickGap={24} />
-          {!hideYAxis && <YAxis {...axisProps} width={44} />}
+          {!hideYAxis && <YAxis {...axisProps} width={yAxisWidth} tickFormatter={yTickFormatter} />}
           <Tooltip content={<ChartTooltip formatter={valueFormatter} labelFormatter={labelFormatter} />} />
           {series.map((s, i) => (
             <Area

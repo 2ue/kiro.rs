@@ -15,14 +15,23 @@ import {
   Search,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { useAccountEventSummary, useAuditLogsPage, useUsageDashboardAccountRisk } from '@/hooks/use-usage'
+import { useAccountEventWindowSummary, useAuditLogsPage, useUsageDashboardAccountRisk } from '@/hooks/use-usage'
 import { useAccountQualityHistory } from '@/hooks/use-accounts'
-import { ACTOR_LABELS, accountEventView, summaryTiles } from '@/features/audit/account-events'
+import { ACTOR_LABELS, accountEventView, summarizeAccountEvents, summaryHonorsWindow, summaryTiles } from '@/features/audit/account-events'
+import {
+  bucketDescription,
+  formatMsTick,
+  formatQualityLabel,
+  formatQualityTick,
+  formatRateTick,
+  pointsInWindow,
+  qualityChartRows,
+  rowsCrossDays,
+} from './quality-history'
 import { TrendAreaChart } from '@/components/charts'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
-  AccountQualityHistoryPoint,
   UsageAccountRiskBucket,
   UsageAccountRiskCacheStats,
   UsageAccountRiskGroup,
@@ -137,13 +146,6 @@ function toneForRisk(criticalCount: number, warningCount: number): 'default' | '
   if (criticalCount > 0) return 'error'
   if (warningCount > 0) return 'warning'
   return 'success'
-}
-
-/** 把风控窗口换算成账号异动汇总接口要的小时数（1~720）。 */
-function windowHours(from: string, to: string): number {
-  const span = Date.parse(to) - Date.parse(from)
-  if (!Number.isFinite(span) || span <= 0) return 24
-  return Math.min(720, Math.max(1, Math.ceil(span / 3_600_000)))
 }
 
 /** 用量页的请求明细链接；用量页已支持 requestId 参数。 */
@@ -367,9 +369,7 @@ export function AccountRiskPage() {
             <SamplesTable samples={data.samples} onOpenRecord={(id) => navigate(usageRecordLink(id))} />
           </SectionCard>
 
-          {submitted.accountId && (
-            <QualityHistoryCard accountId={submitted.accountId} hours={windowHours(data.window.from, data.window.to)} />
-          )}
+          <QualityHistoryCard accountId={submitted.accountId} from={data.window.from} to={data.window.to} />
 
           <AccountEventsTimeline
             since={data.window.from}
@@ -608,37 +608,59 @@ function TokenPairCell({ left, right }: { left: number; right: number }) {
 
 // ─── 账号异动时间线 ─────────────────────────────────────────────────────────────
 
-/** 当前窗口内的账号异动（冷却、观察期、自动禁用、额度耗尽等），复用审计接口。 */
+/** 时间线表格只列最近这么多条。 */
+const EVENT_TABLE_LIMIT = 50
+/** 老后端的汇总接口不认窗口：退回按明细统计，单次最多取这么多条，超过时计数只含最近的这些条。 */
+const LEGACY_EVENT_COUNT_LIMIT = 500
+
+/**
+ * 当前窗口内的账号异动（冷却、观察期、自动禁用、额度耗尽等），复用审计接口。
+ * 计数走汇总接口，按查询窗口 `[from, to)` 统计，填了账号 ID 时只统计该账号，和下面的表格同一口径；
+ * 老后端（响应没有 until）只能从“现在”往前数小时，这时退回按窗口明细统计。
+ */
 function AccountEventsTimeline({ since, until, accountId }: { since: string; until: string; accountId?: number }) {
-  const hours = windowHours(since, until)
+  const summaryQuery = useMemo(() => ({ since, until, accountId }), [accountId, since, until])
+  const summary = useAccountEventWindowSummary(summaryQuery)
+  const legacySummary = summary.data !== undefined && !summaryHonorsWindow(summary.data)
   const query = useMemo(
     () => ({
       page: 1,
-      limit: 50,
+      limit: legacySummary ? LEGACY_EVENT_COUNT_LIMIT : EVENT_TABLE_LIMIT,
       accountEvents: true,
       since,
       until,
       account: accountId ? `#${accountId}` : undefined,
     }),
-    [accountId, since, until],
+    [accountId, legacySummary, since, until],
   )
-  const events = useAuditLogsPage(query)
-  const summary = useAccountEventSummary(hours)
-  const tiles = summaryTiles(summary.data?.items ?? [])
-  const rows = (events.data?.records ?? [])
+  // 窗口起止是固定时间，刷新页面查询时窗口会换新，这里不需要定时重查。
+  const events = useAuditLogsPage(query, false)
+  const allRows = (events.data?.records ?? [])
     .map((record) => ({ record, event: accountEventView(record) }))
     .filter((item): item is { record: typeof item.record; event: NonNullable<typeof item.event> } => item.event !== null)
+  const rows = allRows.slice(0, EVENT_TABLE_LIMIT)
+  const tiles = summaryTiles(
+    legacySummary ? summarizeAccountEvents(allRows.map((item) => item.event)) : summary.data?.items ?? [],
+  )
+  // 只有退回明细统计、且窗口内超过上限时，计数才是近似值。
+  const countsTruncated = legacySummary && Boolean(events.data?.hasNext)
+  const countsLoading = legacySummary ? events.isLoading && !events.data : summary.isLoading && !summary.data
+  const countsError = legacySummary ? events.isError && events.error : summary.isError && summary.error
+  const scope = accountId ? `账号 #${accountId}` : '全部账号'
 
   return (
     <SectionCard
       title="账号异动时间线"
-      description={`当前窗口内最近 50 条账号异动：进入冷却、进入观察期、自动禁用、额度耗尽等${accountId ? `，只看账号 #${accountId}` : ''}。`}
+      description={`当前窗口内最近 ${EVENT_TABLE_LIMIT} 条账号异动：进入冷却、进入观察期、自动禁用、额度耗尽等${accountId ? `，只看账号 #${accountId}` : ''}。`}
       icon={<FileClock />}
     >
       <div className="mb-3">
-        <div className="mb-1.5 text-xs text-muted-foreground">按事件类型计数（最近 {hours} 小时，全部账号）</div>
-        {summary.isError ? (
-          <div className="text-xs text-destructive">读取失败：{extractErrorMessage(summary.error)}</div>
+        <div className="mb-1.5 text-xs text-muted-foreground">
+          按事件类型计数（当前窗口，{scope}{legacySummary ? '；后端版本较旧，按窗口明细统计' : ''}）
+          {countsTruncated && `：窗口内超过 ${LEGACY_EVENT_COUNT_LIMIT} 条，只统计了最近 ${LEGACY_EVENT_COUNT_LIMIT} 条，完整计数到审计页按同一时间范围查看`}
+        </div>
+        {countsLoading ? null : countsError ? (
+          <div className="text-xs text-destructive">读取失败：{extractErrorMessage(countsError)}</div>
         ) : tiles.length === 0 ? (
           <div className="text-xs text-muted-foreground">没有账号异动。</div>
         ) : (
@@ -646,7 +668,7 @@ function AccountEventsTimeline({ since, until, accountId }: { since: string; unt
             {tiles.map((tile) => (
               <div key={tile.kind} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs">
                 <Badge tone={tile.tone} size="xs">{tile.label}</Badge>
-                <span className="font-mono tabular-nums">{formatNumber(tile.events)} 次</span>
+                <span className="font-mono tabular-nums">{countsTruncated ? '≥ ' : ''}{formatNumber(tile.events)} 次</span>
                 <span className="text-muted-foreground">· {formatNumber(tile.accounts)} 个账号</span>
               </div>
             ))}
@@ -686,8 +708,8 @@ function AccountEventsTimeline({ since, until, accountId }: { since: string; unt
               ))}
             </TableBody>
           </Table>
-          {events.data?.hasNext && (
-            <p className="mt-2 text-[0.68rem] text-muted-foreground">只显示最近 50 条，更早的到审计页查看。</p>
+          {(events.data?.hasNext || allRows.length > rows.length) && (
+            <p className="mt-2 text-[0.68rem] text-muted-foreground">只显示最近 {EVENT_TABLE_LIMIT} 条，更早的到审计页查看。</p>
           )}
         </div>
       )}
@@ -697,32 +719,35 @@ function AccountEventsTimeline({ since, until, accountId }: { since: string; unt
 
 // ─── 质量分趋势 ─────────────────────────────────────────────────────────────────
 
-type QualityChartRow = { label: string; errorRate: number; ttft: number; latency: number }
+const QUALITY_DESCRIPTION =
+  '调度器被动采样的 EWMA 快照，每账号每分钟最多一个点，保留 7 天；质量分只在运行配置开启“质量感知调度”后才会采样。错误率越高、首字越慢，相对同批候选越容易进入观察期。'
 
-function qualityChartRows(points: AccountQualityHistoryPoint[]): QualityChartRow[] {
-  return points.map((point) => ({
-    label: formatDate(point.sampledAt),
-    errorRate: point.recentErrorRate,
-    ttft: point.ttftEwmaMs ?? Number.NaN,
-    latency: point.latencyEwmaMs ?? Number.NaN,
-  }))
-}
-
-/** 单个账号的调度质量分历史：失败率 EWMA、首字 / 耗时 EWMA，每账号每分钟一个快照。 */
-function QualityHistoryCard({ accountId, hours }: { accountId: number; hours: number }) {
-  const history = useAccountQualityHistory(accountId, Math.min(hours, 24 * 7))
-  const points = history.data?.points ?? []
+/** 单个账号的调度质量分历史：失败率 EWMA、首字 / 耗时 EWMA，按查询窗口取数。 */
+function QualityHistoryCard({ accountId, from, to }: { accountId?: number; from: string; to: string }) {
+  const range = useMemo(() => ({ from, to }), [from, to])
+  const history = useAccountQualityHistory(accountId, range)
+  // 老后端不认 from/to（响应里没有 until），固定返回最近 24 小时：裁掉窗口外的点。
+  const legacyBackend = Boolean(history.data && !history.data.until)
+  const points = useMemo(() => pointsInWindow(history.data?.points ?? [], from, to), [from, history.data?.points, to])
   const rows = useMemo(() => qualityChartRows(points), [points])
+  const withDate = rowsCrossDays(rows)
   const latest = points[points.length - 1]
   const hasTtft = points.some((point) => point.ttftEwmaMs != null)
-  const timeTick = (value: string | number) => {
-    const text = String(value)
-    return text.length > 5 ? text.slice(-5) : text
+  const timeTick = (value: string | number) => formatQualityTick(value, withDate)
+  const bucket = bucketDescription(history.data?.bucketSecs)
+
+  if (!accountId) {
+    return (
+      <SectionCard title="质量分趋势" description={QUALITY_DESCRIPTION} icon={<Activity />}>
+        <EmptyState title="先在查询条件里填写账号 ID" description="质量分按单个账号查看，填写账号 ID 并点“查询”后显示该账号在当前窗口内的曲线。" />
+      </SectionCard>
+    )
   }
+
   return (
     <SectionCard
       title={`质量分趋势 · 账号 #${accountId}`}
-      description="调度器被动采样的 EWMA 快照（每账号每分钟最多一个点，保留 7 天）；错误率越高、首字越慢，相对同批候选越容易进入观察期。"
+      description={[QUALITY_DESCRIPTION, bucket ? `当前窗口${bucket}。` : ''].filter(Boolean).join('')}
       icon={<Activity />}
     >
       {history.isLoading && !history.data ? (
@@ -730,9 +755,15 @@ function QualityHistoryCard({ accountId, hours }: { accountId: number; hours: nu
       ) : history.isError ? (
         <div className="text-xs text-destructive">读取失败：{extractErrorMessage(history.error)}</div>
       ) : points.length === 0 ? (
-        <EmptyState title="窗口内没有质量采样" description="质量感知调度关闭或该账号在窗口内没有流量时不会有采样。" />
+        <EmptyState
+          title="窗口内没有质量采样"
+          description="运行配置没有开启质量感知调度、该账号在窗口内没有流量，或窗口超出了 7 天保留期时都不会有采样。"
+        />
       ) : (
         <>
+          {legacyBackend && (
+            <Callout tone="warning" className="mb-3">后端版本较旧，不支持按窗口查询，只显示最近 24 小时与当前窗口重叠的部分。</Callout>
+          )}
           <div className="mb-3 grid gap-3 sm:grid-cols-3">
             <Metric label="最新失败率 EWMA" value={formatPercent(latest?.recentErrorRate ?? 0)} tone={(latest?.recentErrorRate ?? 0) > 0.05 ? 'bad' : 'good'} />
             <Metric label="最新首字 EWMA" value={formatMs(latest?.ttftEwmaMs)} />
@@ -743,23 +774,29 @@ function QualityHistoryCard({ accountId, hours }: { accountId: number; hours: nu
               <div className="mb-1 text-xs text-muted-foreground">失败率 EWMA</div>
               <TrendAreaChart
                 data={rows}
-                xKey="label"
+                xKey="t"
                 height={200}
                 series={[{ key: 'errorRate', name: '失败率 EWMA' }]}
                 xTickFormatter={timeTick}
+                yTickFormatter={formatRateTick}
+                yAxisWidth={48}
+                labelFormatter={formatQualityLabel}
                 valueFormatter={(value) => formatPercent(Number(value))}
               />
             </div>
             <div>
-              <div className="mb-1 text-xs text-muted-foreground">{hasTtft ? '首字 / 耗时 EWMA（毫秒）' : '耗时 EWMA（毫秒，该账号没有流式首字采样）'}</div>
+              <div className="mb-1 text-xs text-muted-foreground">{hasTtft ? '首字 / 耗时 EWMA' : '耗时 EWMA（该账号没有流式首字采样）'}</div>
               <TrendAreaChart
                 data={rows}
-                xKey="label"
+                xKey="t"
                 height={200}
                 series={hasTtft
                   ? [{ key: 'ttft', name: '首字 EWMA' }, { key: 'latency', name: '耗时 EWMA' }]
                   : [{ key: 'latency', name: '耗时 EWMA' }]}
                 xTickFormatter={timeTick}
+                yTickFormatter={formatMsTick}
+                yAxisWidth={72}
+                labelFormatter={formatQualityLabel}
                 valueFormatter={(value) => formatMs(Number(value))}
               />
             </div>

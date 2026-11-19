@@ -15,10 +15,13 @@ import {
 import {
   accountCostDelta,
   averagePerMinute,
+  completedBuckets,
   costDeltaPercent,
   costMultiplier,
+  latencyRangeWithinLimit,
   perMinute,
   weightedAverageDuration,
+  zeroBelowCent,
 } from '../src/features/overview/overview-metrics.ts'
 
 test('average duration over buckets is weighted by requests, never averaged per bucket', () => {
@@ -74,4 +77,34 @@ test('account cost columns: multiplier, delta share and the reported-vs-account 
   assert.deepEqual(accountCostDelta(1.5, 1), { deltaUsd: 0.5, percentText: '50.0%', tone: 'profit' })
   assert.deepEqual(accountCostDelta(0.8, 1), { deltaUsd: -0.19999999999999996, percentText: '-20.0%', tone: 'loss' })
   assert.deepEqual(accountCostDelta(1, 0), { deltaUsd: 1, percentText: '-', tone: 'profit' })
+})
+
+test('差额不到半分按 0：不再显示红色的 -$0.00', () => {
+  assert.equal(zeroBelowCent(-0.004), 0)
+  assert.equal(zeroBelowCent(0.0049), 0)
+  assert.equal(zeroBelowCent(-0.005), -0.005)
+  assert.equal(zeroBelowCent(1.23), 1.23)
+  assert.equal(zeroBelowCent(Number.NaN), 0)
+  assert.deepEqual(accountCostDelta(1.001, 1.004), { deltaUsd: 0, percentText: '0.0%', tone: 'even' })
+  assert.equal(accountCostDelta(1, 1.01).tone, 'loss')
+})
+
+test('平均 RPM / TPM 只用已结束的小时，进行中的那一小时不进分母', () => {
+  const buckets = [{ n: 600 }, { n: 1200 }, { n: 60 }]
+  // 第 3 个桶是进行中的小时（partialFrom = 2）。
+  assert.equal(averagePerMinute(completedBuckets(buckets, 2), (bucket) => bucket.n), 15)
+  assert.equal(completedBuckets(buckets, 3).length, 3)
+  assert.equal(completedBuckets(buckets, 99).length, 3)
+  assert.equal(completedBuckets(buckets, -1).length, 0)
+  // 范围里只有进行中的小时：没有可平均的桶。
+  assert.equal(averagePerMinute(completedBuckets(buckets.slice(0, 1), 0), (bucket) => bucket.n), null)
+})
+
+test('延迟分位的范围上限按后端口径先对齐整点再比较', () => {
+  assert.equal(latencyRangeWithinLimit('2026-11-11T00:00:00Z', '2026-11-19T00:00:00Z'), true)
+  // 恰好 8 天但不是整点：from 向下、to 向上对齐后是 8 天 1 小时，后端会拒绝。
+  assert.equal(latencyRangeWithinLimit('2026-11-11T00:30:00Z', '2026-11-19T00:30:00Z'), false)
+  assert.equal(latencyRangeWithinLimit('2026-11-11T00:30:00Z', '2026-11-18T23:30:00Z'), true)
+  assert.equal(latencyRangeWithinLimit('2026-11-11T01:00:00+08:00', '2026-11-19T01:00:00+08:00'), true)
+  assert.equal(latencyRangeWithinLimit('bad', '2026-11-19T00:00:00Z'), false)
 })
