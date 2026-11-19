@@ -502,42 +502,38 @@ impl CaptureManager {
 /// manifest 中附带的事件类型说明，方便离线阅读。
 const EVENT_TYPE_DOCS: &[(&str, &str)] = &[
     (
+        "http_ingress",
+        "HTTP 入口原始请求：method、path、query、脱敏请求头与请求体；ingressId 用于关联被拒请求",
+    ),
+    (
+        "http_egress",
+        "HTTP 入口返回状态与脱敏响应头；通过 ingressId 关联 requestId",
+    ),
+    (
         "client_request",
         "客户端原始请求：endpoint、请求头、完整请求体（system/tools/messages）",
     ),
     (
-        "upstream_request",
-        "每次发往 上游 上游的请求：attempt、凭据 ID、endpoint/Region/clientVersion、URL、请求头、完整请求体",
+        "external_upstream_request",
+        "每次发往上游账号的请求：账号 ID、URL、请求头、请求体",
     ),
-    (
-        "upstream_response",
-        "上游响应状态与响应头，包含 endpoint/Region/clientVersion",
-    ),
+    ("external_upstream_response", "上游账号的响应状态与响应头"),
     (
         "upstream_error_body",
-        "上游非 2xx 响应体，包含 endpoint/Region/clientVersion",
+        "上游非 2xx 响应体，带账号 ID 与状态码",
+    ),
+    ("upstream_frame", "上游原始字节块（base64）"),
+    (
+        "external_upstream_chunk",
+        "上游账号原始流式响应分块（usage 整形前）",
     ),
     (
-        "protocol_request",
-        "账号协议请求：Token refresh、额度、超额设置；refresh token/client secret 只记录长度摘要",
-    ),
-    ("protocol_response", "账号协议响应状态与响应头"),
-    (
-        "protocol_response_body",
-        "账号协议响应体；Token refresh 响应正文不会采集",
-    ),
-    ("upstream_frame", "上游原始字节块"),
-    (
-        "upstream_body",
-        "非流式上游响应体中无法按 EventStream 解码的原始内容",
+        "external_upstream_body",
+        "上游账号原始非流式响应体（usage 整形前）",
     ),
     (
-        "upstream_stream_json_error",
-        "流式上游返回 2xx JSON 错误体的分类结果",
-    ),
-    (
-        "upstream_decode_error",
-        "EventStream 解码失败：错误与当次原始分块（base64）",
+        "upstream_stream_end",
+        "上游流终止原因、尝试次数、解码帧数与下游提交状态",
     ),
     (
         "client_sse",
@@ -549,46 +545,20 @@ const EVENT_TYPE_DOCS: &[(&str, &str)] = &[
         "客户端流结束：completed 或 dropped（客户端断开）",
     ),
     (
-        "external_upstream_request",
-        "外部号池转发请求：URL、请求头、请求体",
-    ),
-    ("external_upstream_response", "外部号池响应状态与响应头"),
-    (
-        "http_ingress",
-        "HTTP 入口原始请求：method、path、query、脱敏请求头与请求体；ingressId 用于关联被拒请求",
-    ),
-    (
-        "http_egress",
-        "HTTP 入口返回状态与脱敏响应头；通过 ingressId 关联 requestId",
-    ),
-    (
         "count_tokens_result",
         "count_tokens 结果：模型、input tokens 与 local/remote 计算方式",
     ),
     (
         "count_tokens_upstream_request",
-        "外部 count_tokens 请求：URL、脱敏请求头与请求体",
+        "远程 count_tokens 请求：URL、脱敏请求头与请求体",
     ),
     (
         "count_tokens_upstream_response",
-        "外部 count_tokens 响应：状态、脱敏响应头与响应体",
-    ),
-    (
-        "external_upstream_chunk",
-        "外部号池上游原始流式响应分块（投影前）",
-    ),
-    (
-        "external_upstream_body",
-        "外部号池上游原始非流式响应体（投影前）",
-    ),
-    ("mcp_response_body", "WebSearch/MCP 原始响应体"),
-    (
-        "upstream_stream_end",
-        "上游流终止原因、尝试次数、解码帧数与下游提交状态",
+        "远程 count_tokens 响应：状态、脱敏响应头与响应体",
     ),
     (
         "request_summary",
-        "请求最终 usage 汇总、凭据尝试链、计费字段、状态与耗时",
+        "请求最终 usage 汇总、账号尝试链、计费字段、状态与耗时",
     ),
 ];
 

@@ -9,13 +9,13 @@ use super::types::AdminErrorResponse;
 /// Admin 服务错误类型
 #[derive(Debug)]
 pub enum AdminServiceError {
-    /// 凭据不存在
+    /// 目标不存在（账号、路由场景等）
     NotFound { id: u64 },
 
     /// 内部状态错误
     InternalError(String),
 
-    /// 凭据无效（验证失败）
+    /// 参数无效（历史上叫凭据无效，现用于各类对象的校验失败）
     InvalidCredential(String),
 
     /// 请求参数无效（路由、运行配置等非凭据对象的校验失败）
@@ -29,10 +29,10 @@ impl fmt::Display for AdminServiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AdminServiceError::NotFound { id } => {
-                write!(f, "凭据不存在: {}", id)
+                write!(f, "目标不存在: {}", id)
             }
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
-            AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::InvalidCredential(msg) => write!(f, "参数无效: {}", msg),
             AdminServiceError::InvalidRequest(msg) => write!(f, "{}", msg),
             AdminServiceError::Conflict(msg) => write!(f, "资源冲突: {}", msg),
         }

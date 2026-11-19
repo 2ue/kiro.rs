@@ -158,7 +158,7 @@ pub fn entry(id: InjectionId) -> CatalogEntry {
             Operator,
             "system 第一段",
             "开关生效即注入",
-            "上游 上游 在服务端注入了自己的身份，模型可能自称 上游 或提到 AWS。",
+            "部分上游会在服务端注入自己的身份，模型可能自称上游渠道的名字。",
             UserChoice,
             "需要隐藏渠道的路由开。",
         ),

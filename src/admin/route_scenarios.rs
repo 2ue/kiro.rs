@@ -289,7 +289,7 @@ pub(super) fn validate_request(
         .validate()
         .map_err(AdminServiceError::InvalidCredential)?;
     for account in &content.external_accounts {
-        validate_policy(&account.policy, &format!("外部账号 #{}", account.id))?;
+        validate_policy(&account.policy, &format!("账号 #{}", account.id))?;
     }
     Ok((name, description, content))
 }
