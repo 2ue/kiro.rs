@@ -1572,10 +1572,7 @@ mod tests {
         assert!(c_row.last_refresh_error.is_none());
         let b_row = store.get(b.id).await.unwrap().unwrap();
         assert_eq!(b_row.refresh_failure_count, 1);
-        assert!(
-            b_row.next_renew_at.unwrap() > now,
-            "a failure backs off"
-        );
+        assert!(b_row.next_renew_at.unwrap() > now, "a failure backs off");
 
         // Next pass: a was renewed after `renewed_before`, b is backing off; only c is due.
         let mut seen = Vec::new();
@@ -1591,17 +1588,12 @@ mod tests {
         assert_eq!(pass.renewed, 1);
         // The pass size caps how many rows one pass renews.
         let pass = store
-            .renew_due(
-                now,
-                now + chrono::Duration::hours(1),
-                1,
-                |_| async move {
-                    RenewOutcome::Failed {
-                        error: "x".into(),
-                        invalid: false,
-                    }
-                },
-            )
+            .renew_due(now, now + chrono::Duration::hours(1), 1, |_| async move {
+                RenewOutcome::Failed {
+                    error: "x".into(),
+                    invalid: false,
+                }
+            })
             .await
             .unwrap();
         assert_eq!(pass.failed, 1);
