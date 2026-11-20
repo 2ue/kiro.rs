@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Loader2, Plus, Save } from 'lucide-react'
 import { toast } from 'sonner'
 import type { ExternalPool } from '@/types/api'
@@ -88,15 +88,19 @@ export function ExternalPoolFormModal({
     : '外部账号的请求密钥，保存后只显示脱敏值。'
   const [quickImportText, setQuickImportText] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
+  const discoveryGeneration = useRef(0)
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
   const scenarioOptions = useQuery({ queryKey: ['route-scenario-options'], queryFn: getRouteScenarioOptions, enabled: open })
   const routeOptions = scenarioOptions.data?.routes ?? []
 
   useEffect(() => {
+    discoveryGeneration.current += 1
+    setSyncingModels(false)
     if (!open) {
       setQuickImportText('')
     }
-  }, [open])
+    return () => { discoveryGeneration.current += 1 }
+  }, [open, pool?.id])
 
   const set = <K extends keyof ExternalPoolFormDraft>(key: K, value: ExternalPoolFormDraft[K]) =>
     onDraftChange((prev) => ({ ...prev, [key]: value }))
@@ -126,15 +130,17 @@ export function ExternalPoolFormModal({
 
   const syncSupportedModels = async () => {
     if (!onDiscoverSupportedModels) return
+    const generation = ++discoveryGeneration.current
     setSyncingModels(true)
     try {
       const supportedModels = await onDiscoverSupportedModels()
+      if (generation !== discoveryGeneration.current) return
       onDraftChange((prev) => ({ ...prev, supportedModelsText: supportedModels.join('\n') }))
-      toast.success(`已发现 ${supportedModels.length} 个支持模型`)
+      toast.success(`已获取 ${supportedModels.length} 个模型，保存后生效`)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : '同步失败')
+      if (generation === discoveryGeneration.current) toast.error(error instanceof Error ? error.message : '获取模型失败')
     } finally {
-      setSyncingModels(false)
+      if (generation === discoveryGeneration.current) setSyncingModels(false)
     }
   }
 
@@ -157,7 +163,7 @@ export function ExternalPoolFormModal({
             </Button>
           )}
           <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={saving}>{copiedFrom ? '关闭（保留停用的副本）' : '取消'}</Button>
-          <Button type="button" size="sm" onClick={onSubmit} disabled={saving}>
+          <Button type="button" size="sm" onClick={onSubmit} disabled={saving || syncingModels}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : isEdit ? <Save className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
             {isEdit ? '保存外部账号' : '添加外部账号'}
           </Button>
@@ -174,13 +180,13 @@ export function ExternalPoolFormModal({
         )}
         <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接外部账号。">
           <div className="grid gap-3 md:grid-cols-2">
-            <TextBox label="名称" value={draft.name} disabled={saving} onChange={(v) => set('name', v)} />
-            <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(v) => set('authType', v as ExternalPoolFormDraft['authType'])}>
+            <TextBox label="名称" value={draft.name} disabled={saving || syncingModels} onChange={(v) => set('name', v)} />
+            <SelectBox label="认证方式" value={draft.authType} disabled={saving || syncingModels} onChange={(v) => set('authType', v as ExternalPoolFormDraft['authType'])}>
               <SelectItem value="bearer">Authorization: Bearer &lt;key&gt;</SelectItem>
               <SelectItem value="x_api_key">x-api-key: &lt;key&gt;</SelectItem>
             </SelectBox>
-            <TextBox className="md:col-span-2" label="服务地址" description="填写服务地址即可，通常不需要带具体请求路径。" value={draft.baseUrl} disabled={saving} onChange={(v) => set('baseUrl', v)} />
-            <TextBox className="md:col-span-2" label={keyLabel} description={keyDescription} value={draft.apiKey} disabled={saving} onChange={(v) => set('apiKey', v)} />
+            <TextBox className="md:col-span-2" label="服务地址" description="填写服务地址即可，通常不需要带具体请求路径。" value={draft.baseUrl} disabled={saving || syncingModels} onChange={(v) => set('baseUrl', v)} />
+            <TextBox className="md:col-span-2" label={keyLabel} description={keyDescription} value={draft.apiKey} disabled={saving || syncingModels} onChange={(v) => set('apiKey', v)} />
           </div>
         </FormSection>
 
@@ -296,15 +302,15 @@ export function ExternalPoolFormModal({
             <SupportedModelTagsEditor
               value={parseSupportedModelItems(draft.supportedModelsText)}
               disabled={saving || syncingModels}
-              placeholder="sonnet sonnet-4.5 haiku-4.5"
+              placeholder="claude-sonnet-5 claude-opus-4-8"
               onChange={(models) => set('supportedModelsText', models.join('\n'))}
             />
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs leading-5 text-muted-foreground">
-                空列表表示不限制；请填写 Claude Code 模型命令（如 sonnet-4.5、haiku）；非空时，请求模型必须命中这里的标签才会调度到该外部账号。
+                获取后替换当前列表，保留上游模型 ID；清空表示不限制，保存后生效。
               </div>
               <Button type="button" variant="outline" size="sm" disabled={saving || syncingModels || !onDiscoverSupportedModels} onClick={syncSupportedModels}>
-                {syncingModels && <Loader2 className="h-4 w-4 animate-spin" />}发现模型
+                {syncingModels && <Loader2 className="h-4 w-4 animate-spin" />}从上游获取
               </Button>
             </div>
           </div>

@@ -36,7 +36,7 @@ pub struct InventoryRow {
     pub auth_kind: String,
     pub refresh_token_hash: Option<String>,
     pub api_key_hash: Option<String>,
-    /// Login identity (auth method + e-mail or profile ARN), stable across token rotation.
+    /// Legacy metadata; never used to decide whether credentials are duplicates.
     #[allow(dead_code)]
     pub identity_key: Option<String>,
     pub email: Option<String>,
@@ -257,7 +257,6 @@ pub struct MoveMatch {
 pub struct HeldMoveKeys {
     pub refresh_token_hashes: HashSet<String>,
     pub api_key_hashes: HashSet<String>,
-    pub identity_keys: HashSet<String>,
     pub pushed_credential_ids: HashSet<u64>,
 }
 
@@ -446,22 +445,20 @@ impl InventoryStore {
         Self { pool }
     }
 
-    /// Ids of live rows that match a secret hash or the identity key.
+    /// Legacy e-mail identity keys are deliberately excluded: providers can share an e-mail.
     pub async fn find_duplicates(
         &self,
         refresh_token_hash: Option<&str>,
         api_key_hash: Option<&str>,
-        identity_key: Option<&str>,
     ) -> anyhow::Result<Vec<(u64, String)>> {
         let rows = sqlx::query(
             "SELECT id, status FROM credential_inventory WHERE deleted_at IS NULL AND ( \
                ($1::text IS NOT NULL AND refresh_token_hash = $1) \
                OR ($2::text IS NOT NULL AND api_key_hash = $2) \
-               OR ($3::text IS NOT NULL AND identity_key = $3))",
+               )",
         )
         .bind(refresh_token_hash)
         .bind(api_key_hash)
-        .bind(identity_key)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -715,13 +712,11 @@ impl InventoryStore {
         rows.into_iter().map(row_from_pg).collect()
     }
 
-    /// Live rows that are the same account as a pool account about to be moved in: same secret,
-    /// same login, or the row it was pushed from.
+    /// Match a secret or the explicit pool link, including after refresh-token rotation.
     pub async fn find_move_matches(
         &self,
         refresh_token_hash: Option<&str>,
         api_key_hash: Option<&str>,
-        identity_key: Option<&str>,
         pool_credential_id: u64,
     ) -> anyhow::Result<Vec<MoveMatch>> {
         let rows = sqlx::query(
@@ -729,13 +724,11 @@ impl InventoryStore {
              WHERE deleted_at IS NULL AND ( \
                ($1::text IS NOT NULL AND refresh_token_hash = $1) \
                OR ($2::text IS NOT NULL AND api_key_hash = $2) \
-               OR ($3::text IS NOT NULL AND identity_key = $3) \
-               OR pushed_credential_id = $4) \
+               OR pushed_credential_id = $3) \
              ORDER BY id ASC",
         )
         .bind(refresh_token_hash)
         .bind(api_key_hash)
-        .bind(identity_key)
         .bind(pool_credential_id as i64)
         .fetch_all(&self.pool)
         .await?;
@@ -756,7 +749,7 @@ impl InventoryStore {
     /// preview can tell the duplicates without a query per account.
     pub async fn held_move_keys(&self) -> anyhow::Result<HeldMoveKeys> {
         let rows = sqlx::query(
-            "SELECT refresh_token_hash, api_key_hash, identity_key, pushed_credential_id \
+            "SELECT refresh_token_hash, api_key_hash, pushed_credential_id \
              FROM credential_inventory WHERE deleted_at IS NULL AND status <> 'pushed'",
         )
         .fetch_all(&self.pool)
@@ -768,9 +761,6 @@ impl InventoryStore {
             }
             if let Some(hash) = row.try_get::<Option<String>, _>("api_key_hash")? {
                 keys.api_key_hashes.insert(hash);
-            }
-            if let Some(identity) = row.try_get::<Option<String>, _>("identity_key")? {
-                keys.identity_keys.insert(identity);
             }
             if let Some(id) = row.try_get::<Option<i64>, _>("pushed_credential_id")? {
                 keys.pushed_credential_ids.insert(id as u64);
@@ -821,7 +811,7 @@ impl InventoryStore {
     ) -> anyhow::Result<Option<InventoryRow>> {
         let row = sqlx::query(&format!(
             "UPDATE credential_inventory SET status = 'pushing', auth_kind = $2, \
-               refresh_token_hash = $3, api_key_hash = $4, identity_key = COALESCE($5, identity_key), \
+               refresh_token_hash = $3, api_key_hash = $4, identity_key = $5, \
                email = COALESCE($6, email), data = $7, group_name = $8, \
                account_info = COALESCE($9, account_info), \
                last_check_at = CASE WHEN $9::jsonb IS NULL THEN last_check_at ELSE $10 END, \
@@ -1352,6 +1342,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_email_keys_do_not_block_distinct_credentials() {
+        let Some((postgres, store)) = test_store().await else {
+            return;
+        };
+        let google_data = json!({"authMethod":"social", "provider":"Google", "email":"same@example.com", "profileArn":"shared"});
+        let github_data = json!({"authMethod":"social", "provider":"Github", "email":"same@example.com", "profileArn":"shared"});
+        let legacy_key = "social|email|same@example.com";
+        let first = store
+            .insert(NewInventoryRow {
+                identity_key: Some(legacy_key),
+                email: Some("same@example.com"),
+                ..new_row("google-secret", &google_data, None)
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .find_duplicates(Some("github-secret"), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .find_move_matches(Some("github-secret"), None, 99)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let second = store
+            .insert(NewInventoryRow {
+                identity_key: Some(legacy_key),
+                email: Some("same@example.com"),
+                ..new_row("github-secret", &github_data, None)
+            })
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        let duplicate = store
+            .find_duplicates(Some("google-secret"), None)
+            .await
+            .unwrap();
+        assert_eq!(duplicate, vec![(first.id, STATUS_STORED.to_string())]);
+        let held = store.held_move_keys().await.unwrap();
+        assert!(held.refresh_token_hashes.contains("google-secret"));
+        assert!(held.refresh_token_hashes.contains("github-secret"));
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn moves_insert_finish_and_roll_back() {
         let Some((postgres, store)) = test_store().await else {
             eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -1372,7 +1412,7 @@ mod tests {
             "the pool's quota snapshot is kept"
         );
         let matches = store
-            .find_move_matches(Some("h-move"), None, None, 999)
+            .find_move_matches(Some("h-move"), None, 999)
             .await
             .unwrap();
         assert_eq!(matches.len(), 1);
@@ -1418,7 +1458,7 @@ mod tests {
 
         // The pool rotated the refresh token: only the pushed id still links the two.
         let matches = store
-            .find_move_matches(Some("h-rotated"), None, None, 77)
+            .find_move_matches(Some("h-rotated"), None, 77)
             .await
             .unwrap();
         assert_eq!(
@@ -1487,7 +1527,10 @@ mod tests {
             .insert(new_row("h-renew-c", &expired, None))
             .await
             .unwrap();
-        let now = Utc::now();
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
         let renewed = |data: &serde_json::Value| RenewOutcome::Refreshed {
             data: data.clone(),
             refresh_token_hash: None,
@@ -1529,10 +1572,7 @@ mod tests {
         assert!(c_row.last_refresh_error.is_none());
         let b_row = store.get(b.id).await.unwrap().unwrap();
         assert_eq!(b_row.refresh_failure_count, 1);
-        assert!(
-            b_row.next_renew_at.unwrap() > Utc::now(),
-            "a failure backs off"
-        );
+        assert!(b_row.next_renew_at.unwrap() > now, "a failure backs off");
 
         // Next pass: a was renewed after `renewed_before`, b is backing off; only c is due.
         let mut seen = Vec::new();
@@ -1548,17 +1588,12 @@ mod tests {
         assert_eq!(pass.renewed, 1);
         // The pass size caps how many rows one pass renews.
         let pass = store
-            .renew_due(
-                now,
-                Utc::now() + chrono::Duration::hours(1),
-                1,
-                |_| async move {
-                    RenewOutcome::Failed {
-                        error: "x".into(),
-                        invalid: false,
-                    }
-                },
-            )
+            .renew_due(now, now + chrono::Duration::hours(1), 1, |_| async move {
+                RenewOutcome::Failed {
+                    error: "x".into(),
+                    invalid: false,
+                }
+            })
             .await
             .unwrap();
         assert_eq!(pass.failed, 1);

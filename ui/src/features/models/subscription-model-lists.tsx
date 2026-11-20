@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Pencil, RefreshCw } from 'lucide-react'
 import { toast } from 'sonner'
 import { EmptyState, ErrorState, LoadingState, ModalShell, SectionCard } from '@/components/patterns'
@@ -146,6 +146,8 @@ function EditSubscriptionModelListDialog({ item, onClose }: { item: Subscription
   const save = useSetSubscriptionModelList()
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [extra, setExtra] = useState('')
+  const editingId = useRef<string | null>(null)
+  const [cleared, setCleared] = useState<{ selected: string[]; extra: string } | null>(null)
 
   const catalog = useMemo(
     () => (capabilities.data?.models ?? []).map((model) => model.model).sort((a, b) => a.localeCompare(b)),
@@ -153,7 +155,10 @@ function EditSubscriptionModelListDialog({ item, onClose }: { item: Subscription
   )
 
   useEffect(() => {
-    if (!item) return
+    if (!item) { editingId.current = null; return }
+    if (editingId.current === item.tier) return
+    editingId.current = item.tier
+    setCleared(null)
     const known = new Set(catalog)
     setSelected(new Set(item.models.filter((model) => known.has(model))))
     setExtra(item.models.filter((model) => !known.has(model)).join('\n'))
@@ -162,6 +167,7 @@ function EditSubscriptionModelListDialog({ item, onClose }: { item: Subscription
   if (!item) return null
 
   const toggle = (model: string, checked: boolean) => {
+    setCleared(null)
     setSelected((current) => {
       const next = new Set(current)
       if (checked) next.add(model)
@@ -189,13 +195,23 @@ function EditSubscriptionModelListDialog({ item, onClose }: { item: Subscription
   }
 
   return (
-    <ModalShell open title={`编辑 ${item.label} 允许模型`} width="max-w-lg" onClose={onClose}>
+    <ModalShell open title={`编辑 ${item.label} 允许模型`} width="max-w-lg" onClose={() => { if (!save.isPending) onClose() }}>
       <div className="space-y-4">
         <p className="text-xs text-muted-foreground">
           只影响没有设置自身支持模型的 {item.label} 账号。全部不选并清空下方输入即为不限制。
         </p>
         <div className="space-y-2">
-          <Label>模型目录</Label>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Label>模型目录</Label>
+            <div className="flex items-center gap-1">
+              {cleared && models.length === 0 && <Button type="button" variant="ghost" size="xs" disabled={save.isPending} onClick={() => {
+                setSelected(new Set(cleared.selected)); setExtra(cleared.extra); setCleared(null)
+              }}>撤销清空</Button>}
+              <Button type="button" variant="ghost" size="xs" disabled={save.isPending || models.length === 0} onClick={() => {
+                setCleared({ selected: [...selected], extra }); setSelected(new Set()); setExtra('')
+              }}>清空列表</Button>
+            </div>
+          </div>
           {catalog.length === 0 ? (
             <p className="text-xs text-muted-foreground">模型目录为空，可在下方直接填写模型 ID。</p>
           ) : (
@@ -204,7 +220,7 @@ function EditSubscriptionModelListDialog({ item, onClose }: { item: Subscription
                 const id = `tier-model-${item.tier}-${model}`
                 return (
                   <div key={model} className="flex items-center gap-2">
-                    <Checkbox id={id} checked={selected.has(model)} onCheckedChange={(checked) => toggle(model, checked === true)} />
+                    <Checkbox id={id} checked={selected.has(model)} disabled={save.isPending} onCheckedChange={(checked) => toggle(model, checked === true)} />
                     <Label htmlFor={id} className="cursor-pointer font-mono text-xs font-normal">{model}</Label>
                   </div>
                 )
@@ -217,7 +233,8 @@ function EditSubscriptionModelListDialog({ item, onClose }: { item: Subscription
           <Textarea
             id={`tier-extra-${item.tier}`}
             value={extra}
-            onChange={(e) => setExtra(e.target.value)}
+            disabled={save.isPending}
+            onChange={(e) => { setCleared(null); setExtra(e.target.value) }}
             placeholder="每行一个，目录里没有的模型填在这里"
             rows={3}
             className="font-mono text-xs"

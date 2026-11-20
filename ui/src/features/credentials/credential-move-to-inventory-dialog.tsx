@@ -175,7 +175,7 @@ export function CredentialMoveToInventoryModal({ open, ids, onClose, onDone }: {
                 {disabledTotal === 0
                   ? '没有已禁用的账号。'
                   : `共 ${disabledTotal} 个已禁用账号，按当前勾选将移入 ${moving} 个，其余 ${disabledTotal - moving} 个留在账号池。`}
-                {duplicates > 0 && ` 其中 ${duplicates} 个勾选了但与库存里已有的账号、或同一批里前面的账号是同一账号（同邮箱或同密钥），每个账号只移入一份，这些会跳过并留在账号池。`}
+                {duplicates > 0 && ` 其中 ${duplicates} 个勾选了但与库存里已有的账号、或同一批里前面的账号使用相同密钥或关联到同一条库存记录，每个账号只移入一份，这些会跳过并留在账号池。`}
                 {scopedIds && data.notDisabled > 0 && ` 选中项里有 ${data.notDisabled} 个未禁用，不会处理。`}
               </Callout>
               {reasons.length > 0 && (
