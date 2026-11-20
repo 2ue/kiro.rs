@@ -127,6 +127,7 @@ export function AccountFormModal({
     enabled: open,
   });
   const [discovering, setDiscovering] = useState(false);
+  const discoveryGeneration = useRef(0);
   const [quickImportText, setQuickImportText] = useState("");
   const confirm = useConfirm();
   // 异步操作（从上游发现模型）返回后要拿最新草稿比较，不能用点击时闭包里的旧值。
@@ -136,8 +137,11 @@ export function AccountFormModal({
     onDraftChange((p) => ({ ...p, [key]: value }));
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode]);
   useEffect(() => {
+    discoveryGeneration.current += 1;
+    setDiscovering(false);
     if (!open) setQuickImportText("");
-  }, [open]);
+    return () => { discoveryGeneration.current += 1; };
+  }, [open, account?.id]);
 
   const addMappingPreset = (preset: AccountModelMappingPreset) => {
     const result = appendModelMappingPreset(draft.modelMappingRulesText, preset);
@@ -258,7 +262,7 @@ export function AccountFormModal({
             </Button>
           )}
           <Button variant="outline" onClick={onClose} disabled={saving}>{copiedFrom ? "关闭（保留停用的副本）" : "取消"}</Button>
-          <Button onClick={onSubmit} disabled={saving}>
+          <Button onClick={onSubmit} disabled={saving || discovering}>
             <Save />
             保存
           </Button>
@@ -348,11 +352,18 @@ export function AccountFormModal({
             <Button
               size="sm"
               variant="outline"
-              disabled={discovering || !onDiscoverSupportedModels}
+              disabled={saving || discovering || !onDiscoverSupportedModels}
               onClick={async () => {
+                const generation = ++discoveryGeneration.current;
+                const connection = JSON.stringify([draftRef.current.baseUrl, draftRef.current.apiKey, draftRef.current.authType]);
                 setDiscovering(true);
                 try {
                   const found = await onDiscoverSupportedModels!();
+                  if (generation !== discoveryGeneration.current) return;
+                  if (connection !== JSON.stringify([draftRef.current.baseUrl, draftRef.current.apiKey, draftRef.current.authType])) {
+                    toast.info("连接信息已变更，请重新获取模型");
+                    return;
+                  }
                   const current = draftRef.current.supportedModelsText.split("\n").filter(Boolean);
                   const removed = current.filter((m) => !found.includes(m));
                   // 表单里已经填了列表且发现结果会去掉其中一些：先确认再覆盖，避免手填的资格被悄悄抹掉。
@@ -363,23 +374,25 @@ export function AccountFormModal({
                       confirmText: "覆盖",
                       tone: "danger",
                     });
-                    if (!ok) return;
+                    if (!ok || generation !== discoveryGeneration.current) return;
                   }
                   set("supportedModelsText", found.join("\n"));
+                  toast.success(`已获取 ${found.length} 个模型，保存后生效`);
                 } catch {
                   // 发现失败的提示由调用方给出，这里只负责不改表单。
                 } finally {
-                  setDiscovering(false);
+                  if (generation === discoveryGeneration.current) setDiscovering(false);
                 }
               }}
             >
               <Plus />
-              从上游发现
+              从上游获取
             </Button>
           }
         >
           <SupportedModelTagsEditor
             value={draft.supportedModelsText.split("\n").filter(Boolean)}
+            disabled={saving || discovering}
             onChange={(v) => set("supportedModelsText", v.join("\n"))}
           />
         </Group>

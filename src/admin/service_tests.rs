@@ -216,42 +216,28 @@ fn account_quality_weights_reject_negative_and_non_finite() {
 }
 
 #[test]
-fn account_supported_models_canonicalize_legacy_claude_35_commands() {
+fn account_supported_models_preserve_upstream_identifiers() {
     assert_eq!(
         AdminService::normalize_account_supported_models(vec![
-            "claude-3-5-sonnet-20241022".to_string(),
-            "claude-3.5-sonnet".to_string(),
-            "claude-3-5-haiku-20241022-thinking[1m]".to_string(),
-            "claude-3.5-haiku".to_string(),
-            "claude-3-5-opus-20241022".to_string(),
-            "tenant-claude-3-5-sonnet".to_string(),
+            " claude-sonnet-4-5-20250929 ".into(),
+            "claude-haiku-5-5".into(),
+            "claude-opus-4-8".into(),
+            "claude-fable-5-1".into(),
+            "claude-3-5-sonnet-20241022".into(),
+            "tenant-haiku-model".into(),
+            "QWEN3-CODER-NEXT".into(),
+            "claude-sonnet-4-5-20250929".into(),
+            "sonnet-4.5".into(),
         ]),
         vec![
-            "sonnet-3.5".to_string(),
-            "haiku-3.5-thinking[1m]".to_string(),
-            "haiku-3.5".to_string(),
-            "claude-3-5-opus-20241022".to_string(),
-            "tenant-claude-3-5-sonnet".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn account_supported_models_use_claude_code_family_commands() {
-    assert_eq!(
-        AdminService::normalize_account_supported_models(vec![
-            "claude-sonnet-4-5-20250929".to_string(),
-            "claude-haiku-4.5".to_string(),
-            "claude-opus-4-6-thinking".to_string(),
-            "tenant-haiku-model".to_string(),
-            "QWEN3-CODER-NEXT".to_string(),
-        ]),
-        vec![
-            "sonnet-4.5".to_string(),
-            "haiku-4.5".to_string(),
-            "opus-4.6-thinking".to_string(),
-            "tenant-haiku-model".to_string(),
-            "qwen3-coder-next".to_string(),
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-5-5",
+            "claude-opus-4-8",
+            "claude-fable-5-1",
+            "claude-3-5-sonnet-20241022",
+            "tenant-haiku-model",
+            "qwen3-coder-next",
+            "sonnet-4.5"
         ]
     );
 }
@@ -1261,7 +1247,10 @@ async fn admin_audit_records_failed_changes_auth_failures_capture_and_export() {
         request_admission,
         account_manager: Arc::new(AccountManager::new(postgres.clone(), redis)),
     });
-    let since = Utc::now() - ChronoDuration::seconds(5);
+    let since: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(postgres.pool())
+        .await
+        .unwrap();
     let marker = uuid::Uuid::new_v4().simple().to_string();
 
     // 准备：一条自定义路由和一个引用它的请求 Key，用于删路由检查（内置路由本来就不可删）。

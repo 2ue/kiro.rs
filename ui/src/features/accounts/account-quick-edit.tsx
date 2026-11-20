@@ -130,7 +130,7 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
         if (!ok) return
       }
       setModels(found)
-      toast.success(`上游返回 ${found.length} 个模型，确认后点保存`)
+      toast.success(`已获取 ${found.length} 个模型，保存后生效`)
     } catch (error) {
       toast.error(extractErrorMessage(error))
     } finally {
@@ -161,9 +161,8 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
         <>
           {field === 'supportedModels' && (
             <>
-              <Button variant="ghost" size="sm" className="mr-auto" disabled={busy || (account.supportedModels ?? []).length === 0} onClick={() => save({ supportedModels: [] }, '已改为不限制模型')}>不限制</Button>
               <Button variant="outline" size="sm" disabled={busy} onClick={() => void discover()}>
-                {discovering && <Loader2 className="animate-spin" />}从上游发现
+                {discovering && <Loader2 className="animate-spin" />}从上游获取
               </Button>
             </>
           )}
@@ -226,8 +225,8 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
         )}
         {field === 'supportedModels' && (
           <>
-            <InfoBox rows={[['当前限制', (account.supportedModels ?? []).length ? `${account.supportedModels.length} 个模型` : '不限制']]}>
-              只决定该账号是否允许承接某些模型；空列表表示不限制。不改变请求体里的 model，也不影响模型映射规则。
+            <InfoBox rows={[['编辑后限制', models.length ? `${models.length} 个模型` : '不限制']]}>
+              只决定该账号是否允许承接某些模型；空列表表示不限制。不改变请求体里的 model，也不影响模型映射规则。清空或获取模型后，保存才会生效。
             </InfoBox>
             <SupportedModelTagsEditor value={models} disabled={busy} onChange={setModels} />
           </>

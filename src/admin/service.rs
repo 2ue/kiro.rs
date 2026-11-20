@@ -64,86 +64,6 @@ const MAX_RUNTIME_CONFIG_AUDIT_CHANGES: usize = 200;
 const MAX_RUNTIME_CONFIG_AUDIT_STRING_CHARS: usize = 160;
 const MAX_RUNTIME_CONFIG_AUDIT_ARRAY_ITEMS: usize = 20;
 
-fn claude_code_model_name(model: &str) -> String {
-    let normalized = model.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return normalized;
-    }
-
-    let (base, suffix) = if let Some(base) = normalized.strip_suffix("[1m]") {
-        (base, "[1m]")
-    } else {
-        (normalized.as_str(), "")
-    };
-    let (base, thinking) = if let Some(base) = base.strip_suffix("-thinking") {
-        (base, "-thinking")
-    } else {
-        (base, "")
-    };
-
-    let parts = base.split('-').collect::<Vec<_>>();
-    if parts.len() < 3 || parts[0] != "claude" {
-        return normalized;
-    }
-    let family = parts[1];
-
-    let all_digits = |value: &str| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit());
-    let is_date = |value: &str| value.len() == 8 && all_digits(value);
-
-    // Legacy Anthropic IDs use either `claude-3-5-sonnet[-date]` or
-    // `claude-3.5-sonnet`. Claude Code exposes these as `sonnet-3.5`
-    // (and the corresponding `haiku-3.5`) commands.
-    let legacy_family = match parts.as_slice() {
-        ["claude", "3", "5", family] if matches!(*family, "sonnet" | "haiku") => Some(*family),
-        ["claude", "3", "5", family, date]
-            if matches!(*family, "sonnet" | "haiku") && is_date(date) =>
-        {
-            Some(*family)
-        }
-        ["claude", "3.5", family] if matches!(*family, "sonnet" | "haiku") => Some(*family),
-        ["claude", "3.5", family, date]
-            if matches!(*family, "sonnet" | "haiku") && is_date(date) =>
-        {
-            Some(*family)
-        }
-        _ => None,
-    };
-    if let Some(family) = legacy_family {
-        return format!("{family}-3.5{thinking}{suffix}");
-    }
-
-    if !matches!(family, "opus" | "sonnet" | "haiku") {
-        return normalized;
-    }
-
-    let version = match parts.as_slice() {
-        ["claude", _, version]
-            if version
-                .split_once('.')
-                .is_some_and(|(major, minor)| all_digits(major) && all_digits(minor))
-                || all_digits(version) =>
-        {
-            version.to_string()
-        }
-        ["claude", _, major, third]
-            if all_digits(major) && (all_digits(third) || is_date(third)) =>
-        {
-            if is_date(third) {
-                major.to_string()
-            } else {
-                format!("{major}.{third}")
-            }
-        }
-        ["claude", _, major, minor, date]
-            if all_digits(major) && all_digits(minor) && is_date(date) =>
-        {
-            format!("{major}.{minor}")
-        }
-        _ => return normalized,
-    };
-
-    format!("{family}-{version}{thinking}{suffix}")
-}
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS: u32 = 0;
 const USAGE_CLEANUP_DEFAULT_BATCH_SIZE: usize = 10_000;
@@ -2154,18 +2074,8 @@ impl AdminService {
         }
     }
 
-    /// External-pool allowlists are exposed in Claude Code command syntax.
-    /// Keep arbitrary provider-specific IDs intact, but collapse official
-    /// Claude dated/dashed IDs to a stable family/version command.
     fn normalize_account_supported_models(model_ids: Vec<String>) -> Vec<String> {
-        let mut normalized = Vec::new();
-        for model in normalize_supported_models(model_ids) {
-            let canonical = claude_code_model_name(&model);
-            if !normalized.iter().any(|existing| existing == &canonical) {
-                normalized.push(canonical);
-            }
-        }
-        normalized
+        normalize_supported_models(model_ids)
     }
 
     /// 查询请求级 usage 记录。
