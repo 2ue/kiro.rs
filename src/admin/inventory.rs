@@ -75,30 +75,6 @@ fn secret_hashes(credential: &KiroCredentials) -> (String, Option<String>, Optio
     (auth_kind, api_key_hash, refresh_token_hash)
 }
 
-/// The same account after a refresh-token rotation still has the same login: auth method plus
-/// e-mail or profile ARN. Hashes alone would miss it.
-fn identity_key(credential: &KiroCredentials) -> Option<String> {
-    let method = credential
-        .auth_method
-        .as_deref()
-        .unwrap_or("oauth")
-        .to_ascii_lowercase();
-    if let Some(email) = credential
-        .email
-        .as_deref()
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-    {
-        return Some(format!("{method}|email|{}", email.to_lowercase()));
-    }
-    credential
-        .profile_arn
-        .as_deref()
-        .map(str::trim)
-        .filter(|arn| !arn.is_empty())
-        .map(|arn| format!("{method}|arn|{arn}"))
-}
-
 fn is_invalid_grant(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<RefreshFailure>()
@@ -918,7 +894,6 @@ impl AdminService {
         let snapshot = self.inventory_token_manager().base_snapshot();
         let mut accounts = std::collections::HashMap::new();
         let mut hashes = HashSet::new();
-        let mut identities = HashSet::new();
         let mut proxy_names = std::collections::HashMap::new();
         for entry in snapshot.entries {
             if let Some(hash) = entry.refresh_token_hash.clone() {
@@ -926,19 +901,6 @@ impl AdminService {
             }
             if let Some(hash) = entry.api_key_hash.clone() {
                 hashes.insert(hash);
-            }
-            let method = entry
-                .auth_method
-                .as_deref()
-                .unwrap_or("oauth")
-                .to_ascii_lowercase();
-            if let Some(email) = entry
-                .email
-                .as_deref()
-                .map(str::trim)
-                .filter(|e| !e.is_empty())
-            {
-                identities.insert(format!("{method}|email|{}", email.to_lowercase()));
             }
             if let (Some(id), Some(name)) =
                 (entry.proxy_resource_id, entry.proxy_resource_name.clone())
@@ -964,7 +926,6 @@ impl AdminService {
         PoolLookup {
             accounts,
             hashes,
-            identities,
             proxy_names,
         }
     }
@@ -1167,14 +1128,8 @@ impl AdminService {
                 }
             };
             let (auth_kind, api_key_hash, refresh_token_hash) = secret_hashes(&credential);
-            let identity = identity_key(&credential);
             let secret = refresh_token_hash.clone().or(api_key_hash.clone());
-            if let Some(reason) = duplicate_reason(
-                &pool,
-                secret.as_deref(),
-                identity.as_deref(),
-                &mut seen_in_batch,
-            ) {
+            if let Some(reason) = duplicate_reason(&pool, secret.as_deref(), &mut seen_in_batch) {
                 items.push(InventoryImportItem {
                     index: import_index,
                     ok: false,
@@ -1185,11 +1140,9 @@ impl AdminService {
                 });
                 continue;
             }
-            match super::service::block_on_admin_store_public(store.find_duplicates(
-                refresh_token_hash.as_deref(),
-                api_key_hash.as_deref(),
-                identity.as_deref(),
-            )) {
+            match super::service::block_on_admin_store_public(
+                store.find_duplicates(refresh_token_hash.as_deref(), api_key_hash.as_deref()),
+            ) {
                 Ok(found) if !found.is_empty() => {
                     let (id, status) = &found[0];
                     let reason = if status == STATUS_PUSHED {
@@ -1231,7 +1184,7 @@ impl AdminService {
                     auth_kind: &auth_kind,
                     refresh_token_hash: refresh_token_hash.as_deref(),
                     api_key_hash: api_key_hash.as_deref(),
-                    identity_key: identity.as_deref(),
+                    identity_key: None,
                     email: credential.email.as_deref(),
                     data: &data,
                     source: req.source.as_deref(),
@@ -2213,14 +2166,13 @@ impl AdminService {
                 prepare_moved_credential(&mut credential, keep_proxy);
                 email = credential.email.clone().or(email.take());
                 let (auth_kind, api_key_hash, refresh_token_hash) = secret_hashes(&credential);
-                let identity = identity_key(&credential);
                 let data =
                     credential_json(&credential).map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 let moved = MovedInventoryRow {
                     auth_kind: &auth_kind,
                     refresh_token_hash: refresh_token_hash.as_deref(),
                     api_key_hash: api_key_hash.as_deref(),
-                    identity_key: identity.as_deref(),
+                    identity_key: None,
                     email: credential.email.as_deref(),
                     data: &data,
                     source: Some(MOVED_FROM_POOL_SOURCE),
@@ -2235,7 +2187,6 @@ impl AdminService {
                     super::service::block_on_admin_store_public(store.find_move_matches(
                         refresh_token_hash.as_deref(),
                         api_key_hash.as_deref(),
-                        identity.as_deref(),
                         id,
                     ))?;
                 // A copy the inventory still owns means the account is in both places; keep the
@@ -2377,8 +2328,8 @@ fn reason_suggested(reason: Option<&str>) -> bool {
 }
 
 /// The accounts a move skips as duplicates, walking them in move order: the inventory still
-/// holds the same account (same secret, same login, or the row it was pushed from), or an
-/// account earlier in the same move is the same login. Mirrors the check in
+/// holds the same secret or the row it was pushed from, or an account earlier in the
+/// same move uses the same secret. Mirrors the check in
 /// `move_one_to_inventory`, so a preview counts what the move will do.
 fn move_duplicates<'a>(
     accounts: impl IntoIterator<Item = &'a KiroCredentials>,
@@ -2390,24 +2341,19 @@ fn move_duplicates<'a>(
             continue;
         };
         let (_, api_key_hash, refresh_token_hash) = secret_hashes(credential);
-        let identity = identity_key(credential);
         let held_already = held.pushed_credential_ids.contains(&id)
             || refresh_token_hash
                 .as_ref()
                 .is_some_and(|hash| held.refresh_token_hashes.contains(hash))
             || api_key_hash
                 .as_ref()
-                .is_some_and(|hash| held.api_key_hashes.contains(hash))
-            || identity
-                .as_ref()
-                .is_some_and(|identity| held.identity_keys.contains(identity));
+                .is_some_and(|hash| held.api_key_hashes.contains(hash));
         if held_already {
             duplicates.insert(id);
             continue;
         }
         held.refresh_token_hashes.extend(refresh_token_hash);
         held.api_key_hashes.extend(api_key_hash);
-        held.identity_keys.extend(identity);
     }
     duplicates
 }
@@ -2847,7 +2793,6 @@ fn refresh_error_message(err: &anyhow::Error, invalid: bool) -> String {
 struct PoolLookup {
     accounts: std::collections::HashMap<u64, (bool, Option<String>, Option<String>)>,
     hashes: HashSet<String>,
-    identities: HashSet<String>,
     proxy_names: std::collections::HashMap<u64, String>,
 }
 
@@ -2875,18 +2820,15 @@ impl PoolLookup {
 fn duplicate_reason(
     pool: &PoolLookup,
     secret_hash: Option<&str>,
-    identity: Option<&str>,
     seen_in_batch: &mut HashSet<String>,
 ) -> Option<String> {
-    if secret_hash.is_some_and(|hash| pool.hashes.contains(hash))
-        || identity.is_some_and(|identity| pool.identities.contains(identity))
-    {
+    if secret_hash.is_some_and(|hash| pool.hashes.contains(hash)) {
         return Some("该账号已在账号池使用，不能再放入库存".to_string());
     }
-    for key in [secret_hash, identity].into_iter().flatten() {
-        if !seen_in_batch.insert(key.to_string()) {
-            return Some("与本次导入中前面的账号重复".to_string());
-        }
+    if let Some(key) = secret_hash
+        && !seen_in_batch.insert(key.to_string())
+    {
+        return Some("与本次导入中前面的账号重复".to_string());
     }
     None
 }
@@ -3134,28 +3076,50 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_skips_the_duplicates_a_move_skips() {
-        let account = |id: u64, email: Option<&str>, refresh: &str| KiroCredentials {
+    fn move_preview_keeps_distinct_secrets_with_the_same_email_and_profile() {
+        let account = |id: u64, provider: Option<&str>, refresh: &str| KiroCredentials {
             id: Some(id),
-            ..credential(email, Some(refresh))
+            provider: provider.map(str::to_string),
+            profile_arn: Some("shared-profile".to_string()),
+            ..credential(Some("same@example.com"), Some(refresh))
         };
-        let held_account = account(1, Some("held@example.com"), "rt-held");
+        let held_account = account(1, Some("Google"), "rt-held");
         let mut held = HeldMoveKeys::default();
-        held.identity_keys.extend(identity_key(&held_account));
+        held.refresh_token_hashes
+            .extend(secret_hashes(&held_account).2);
         held.pushed_credential_ids.insert(7);
-        let (_, _, held_refresh) = secret_hashes(&account(99, None, "rt-same-secret"));
-        held.refresh_token_hashes.extend(held_refresh);
-
         let accounts = [
-            account(2, Some("Held@Example.com"), "rt-2"), // same login as an inventory row
-            account(3, Some("a@example.com"), "rt-3"),
-            account(4, Some("a@example.com "), "rt-4"), // same login as #3, moved first
-            account(5, Some("b@example.com"), "rt-5"),
-            account(7, Some("c@example.com"), "rt-7"), // its inventory row is still held
-            account(8, None, "rt-same-secret"),        // same refresh token as an inventory row
+            account(2, Some("Github"), "rt-2"),
+            account(3, Some("Google"), "rt-3"),
+            account(4, None, "rt-4"),
+            account(5, None, "rt-4"),
+            account(7, None, "rt-7"),
+            account(8, None, "rt-held"),
         ];
-        let duplicates = move_duplicates(accounts.iter(), &mut held);
-        assert_eq!(duplicates, HashSet::from([2, 4, 7, 8]));
+        assert_eq!(
+            move_duplicates(accounts.iter(), &mut held),
+            HashSet::from([5, 7, 8])
+        );
+    }
+
+    #[test]
+    fn move_preview_rejects_reused_api_keys_but_keeps_distinct_keys() {
+        let account = |id: u64, key: &str| KiroCredentials {
+            id: Some(id),
+            auth_method: Some("api_key".to_string()),
+            email: Some("same@example.com".to_string()),
+            kiro_api_key: Some(key.to_string()),
+            ..Default::default()
+        };
+        let accounts = [
+            account(1, "key-a"),
+            account(2, "key-b"),
+            account(3, "key-a"),
+        ];
+        assert_eq!(
+            move_duplicates(accounts.iter(), &mut HeldMoveKeys::default()),
+            HashSet::from([3])
+        );
     }
 
     fn proxy_request(mode: &str) -> InventoryProxyRequest {
@@ -3363,57 +3327,25 @@ mod tests {
     }
 
     #[test]
-    fn identity_key_survives_refresh_token_rotation() {
-        let before = credential(Some("User@Example.com"), Some("rt-1"));
-        let after = credential(Some("user@example.com "), Some("rt-2"));
-        assert_eq!(identity_key(&before), identity_key(&after));
-        assert_ne!(secret_hashes(&before).2, secret_hashes(&after).2);
-    }
-
-    #[test]
-    fn duplicates_in_pool_and_in_batch_are_rejected() {
-        let mut pool = PoolLookup {
+    fn imports_only_reject_secrets_in_the_pool_or_already_accepted_in_the_batch() {
+        let pool = PoolLookup {
             accounts: Default::default(),
             hashes: HashSet::from(["h-pool".to_string()]),
-            identities: HashSet::from(["social|email|a@example.com".to_string()]),
             proxy_names: Default::default(),
         };
         let mut seen = HashSet::new();
         assert!(
-            duplicate_reason(&pool, Some("h-pool"), None, &mut seen)
+            duplicate_reason(&pool, Some("h-pool"), &mut seen)
                 .unwrap()
                 .contains("账号池")
         );
+        assert!(duplicate_reason(&pool, Some("h-new"), &mut seen).is_none());
+        assert!(duplicate_reason(&pool, Some("h-other"), &mut seen).is_none());
         assert!(
-            duplicate_reason(
-                &pool,
-                Some("h-x"),
-                Some("social|email|a@example.com"),
-                &mut seen
-            )
-            .unwrap()
-            .contains("账号池")
+            duplicate_reason(&pool, Some("h-new"), &mut seen)
+                .unwrap()
+                .contains("本次导入")
         );
-        assert!(
-            duplicate_reason(
-                &pool,
-                Some("h-new"),
-                Some("social|email|b@example.com"),
-                &mut seen
-            )
-            .is_none()
-        );
-        assert!(
-            duplicate_reason(
-                &pool,
-                Some("h-other"),
-                Some("social|email|b@example.com"),
-                &mut seen
-            )
-            .unwrap()
-            .contains("本次导入")
-        );
-        pool.hashes.clear();
     }
 
     #[test]
