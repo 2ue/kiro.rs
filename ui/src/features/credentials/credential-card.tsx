@@ -595,7 +595,7 @@ export function CredentialCard({
   const discoverSupportedModels = () => {
     discoverCredentialSupportedModels.mutate(credential.id, {
       onSuccess: (res) => {
-        toast.success(`已生成 ${res.count} 个模型标签`)
+        toast.success(`已获取 ${res.count} 个模型，保存后生效`)
         setSupportedModelsDraft(res.supportedModels)
       },
       onError: (e) => toast.error(`模型发现失败: ${extractErrorMessage(e)}`),
@@ -1264,7 +1264,7 @@ export function CredentialCard({
             </div>
             <div className="mt-1 text-xs text-muted-foreground">保存空列表表示该账号可参与任意模型调度；非空时只允许精确匹配模型调用该账号。</div>
           </div>
-          <Field label="支持模型" description="点击自动生成会先拉取当前 Kiro 账号支持模型，再生成可靠的 Claude/Claude Code 常用请求名；也可以手工添加或删除标签。">
+          <Field label="支持模型" description="从当前账号获取上游模型 ID 并替换列表；可清空、增删，保存后生效。">
             <SupportedModelTagsEditor
               value={supportedModelsDraft}
               disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}
@@ -1272,21 +1272,8 @@ export function CredentialCard({
             />
           </Field>
           <div className="flex flex-wrap justify-end gap-2">
-            <Button variant="ghost" size="sm" onClick={() => {
-              setSupportedModelsDraft([])
-              setCredentialSupportedModels.mutate({ id: credential.id, request: { supportedModels: [] } }, {
-                onSuccess: (res) => {
-                  toast.success('已清空模型限制')
-                  setSupportedModelsDraft(res.supportedModels)
-                  setEditingSupportedModels(false)
-                },
-                onError: (e) => toast.error(`清空失败: ${extractErrorMessage(e)}`),
-              })
-            }} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || supportedModels.length === 0}>
-              不限制
-            </Button>
             <Button variant="outline" size="sm" onClick={discoverSupportedModels} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}>
-              {discoverCredentialSupportedModels.isPending && <Spinner size="sm" />}拉取并生成官方写法
+              {discoverCredentialSupportedModels.isPending && <Spinner size="sm" />}从上游获取
             </Button>
             <Button size="sm" onClick={saveSupportedModels} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}>
               {setCredentialSupportedModels.isPending && <Spinner size="sm" />}保存
