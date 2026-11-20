@@ -948,6 +948,14 @@ function RecordsView({
                             </div>
                           )}
                           <div className="mt-1 flex flex-wrap gap-1">
+                            {upstreamResponseModelMismatch(record) && (
+                              <Badge
+                                tone="warning"
+                                title={`发出 ${record.externalOutboundModel || record.upstreamModel || record.model}，上游返回 ${record.upstreamResponseModel}；返回给调用方的仍是请求模型`}
+                              >
+                                上游模型不一致
+                              </Badge>
+                            )}
                             <Badge title={record.endpoint || '-'}>{record.endpoint || '-'}</Badge>
                             {record.simulated && <Badge tone="warning">{sourceLabel(record.usageSource)}</Badge>}
                             {!record.simulated && <Badge tone="neutral">{sourceLabel(record.usageSource)}</Badge>}
