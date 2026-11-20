@@ -122,7 +122,7 @@ const MAIN_ONLY_INJECTION_IDS = [
 ]
 
 const FEATURE_OBJECT_KEYS = ['missingMaxTokens', 'reasoningCompat', 'payloadGuard', 'payloadShaping', 'imageProcessing'] as const
-const FEATURE_BOOL_KEYS = ['historySanitize', 'thinkingModelName'] as const
+const FEATURE_BOOL_KEYS = ['historySanitize', 'thinkingModelName', 'returnRequestModel'] as const
 const THINKING_TRIGGERS: ThinkingTriggerMode[] = ['real_request', 'always', 'off']
 /** main 独有的路由功能：导入时忽略。 */
 const MAIN_ONLY_FEATURE_KEYS = ['channelLeakGuard', 'channelLeakGuardStream', 'modelDrivenWebSearch']

@@ -242,3 +242,10 @@ test('零用量估算随路由策略导出导入，无缓存路由也保留', ()
   }
   assert.match(error(file({ cachePolicy: { cacheType: 'no_cache', zeroUsageRepair: 'on' } })), /zeroUsageRepair/)
 })
+
+test('返回请求模型随路由功能导出导入，类型不对时报错', () => {
+  const source = route({ features: { returnRequestModel: false } })
+  const imported = ok(JSON.stringify(buildRoutePolicyFile(source)))
+  assert.deepEqual(imported.policy.features, { returnRequestModel: false })
+  assert.match(error(file({ features: { returnRequestModel: 'off' } })), /returnRequestModel/)
+})

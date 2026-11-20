@@ -12,7 +12,7 @@ import type { RouteFeatureOverride, RouteFeatureSet, RoutePayloadGuardConfig } f
 import { RotateCcw } from "lucide-react";
 
 type ObjectFeature = "missingMaxTokens" | "reasoningCompat" | "payloadGuard" | "payloadShaping" | "imageProcessing";
-type BoolFeature = "historySanitize" | "thinkingModelName";
+type BoolFeature = "historySanitize" | "thinkingModelName" | "returnRequestModel";
 
 const FEATURE_TEXT: Record<Exclude<keyof RouteFeatureSet, "thinkingTrigger">, { label: string; desc: string }> = {
   missingMaxTokens: { label: "补全 max_tokens", desc: "请求没带 max_tokens 时自动补一个值或直接拒绝。开启后可在下方调整补充值。" },
@@ -22,12 +22,17 @@ const FEATURE_TEXT: Record<Exclude<keyof RouteFeatureSet, "thinkingTrigger">, { 
   payloadGuard: { label: "请求体大小保护", desc: "请求体超过上限时按规则裁剪历史或交给客户端压缩，避免上游直接拒绝。" },
   payloadShaping: { label: "请求体内容处理", desc: "压缩工具说明、截短历史工具结果与网页抓取正文，减少无效 token。" },
   imageProcessing: { label: "图片处理", desc: "过大的图片按上限压缩或移除，避免上游拒绝整条请求。" },
+  returnRequestModel: {
+    label: "返回请求模型",
+    desc: "开启时返回给调用方的 model 是调用方请求的模型，不暴露映射后或上游实际返回的模型；关闭时透传上游返回的模型（会暴露映射后的模型）。用量记录里的上游返回模型不受影响。",
+  },
 };
 
 const GROUPS: Array<{ title: string; desc: string; keys: Array<keyof RouteFeatureSet> }> = [
   { title: "请求兼容", desc: "让写法不规范的客户端请求也能被上游接受。", keys: ["missingMaxTokens", "reasoningCompat", "historySanitize"] },
   { title: "thinking", desc: "决定这条路由上 thinking 何时开启、模型名怎么解析。", keys: ["thinkingModelName", "thinkingTrigger"] },
   { title: "请求体", desc: "大请求的裁剪、压缩与图片处理。", keys: ["payloadGuard", "payloadShaping", "imageProcessing"] },
+  { title: "响应", desc: "返回给调用方的内容怎么处理。", keys: ["returnRequestModel"] },
 ];
 
 function featureDefault(key: ObjectFeature): NonNullable<RouteFeatureSet[ObjectFeature]> {
@@ -144,7 +149,7 @@ export function RouteFeaturesEditor({
       {GROUPS.map((group) => (
         <SettingGroup key={group.title} title={group.title} desc={group.desc}>
           {group.keys.map((key) =>
-            key === "thinkingTrigger" ? renderThinkingTrigger() : key === "historySanitize" || key === "thinkingModelName" ? renderBool(key) : renderObject(key as ObjectFeature),
+            key === "thinkingTrigger" ? renderThinkingTrigger() : key === "historySanitize" || key === "thinkingModelName" || key === "returnRequestModel" ? renderBool(key) : renderObject(key as ObjectFeature),
           )}
         </SettingGroup>
       ))}

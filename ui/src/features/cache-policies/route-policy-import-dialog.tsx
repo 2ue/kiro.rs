@@ -42,6 +42,7 @@ const FEATURE_LABELS: Record<string, string> = {
   payloadGuard: '请求体大小保护',
   payloadShaping: '请求体内容处理',
   imageProcessing: '图片处理',
+  returnRequestModel: '返回请求模型',
 }
 
 function PreviewRow({ label, children }: { label: string; children: React.ReactNode }) {

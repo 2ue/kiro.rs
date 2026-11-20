@@ -2280,3 +2280,18 @@ async fn custom_route_http_entrypoints_enforce_definition_and_enabled_state() {
         }
     }
 }
+
+#[test]
+fn return_request_model_switch_controls_whether_client_model_is_kept() {
+    let mut features = RouteFeatureSet::default();
+    assert!(features.return_request_model, "全局默认开");
+    assert_eq!(
+        response_client_model(&features, Some("claude-fable-5-2".to_string())).as_deref(),
+        Some("claude-fable-5-2")
+    );
+    features.return_request_model = false;
+    assert_eq!(
+        response_client_model(&features, Some("claude-fable-5-2".to_string())),
+        None
+    );
+}

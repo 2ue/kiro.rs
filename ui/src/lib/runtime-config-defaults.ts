@@ -153,7 +153,7 @@ export function normalizePromptInjection(input?: Partial<PromptInjectionConfig> 
 }
 
 export function defaultRouteFeatures(): RouteFeaturesConfig {
-return { defaults: { thinkingModelName: false, thinkingTrigger: 'off', historySanitize: false, missingMaxTokens: null, reasoningCompat: null, payloadGuard: null, payloadShaping: null, imageProcessing: null } }
+return { defaults: { thinkingModelName: false, thinkingTrigger: 'off', historySanitize: false, missingMaxTokens: null, reasoningCompat: null, payloadGuard: null, payloadShaping: null, imageProcessing: null, returnRequestModel: true } }
 }
 export function normalizeRouteFeatures(input?: Partial<RouteFeaturesConfig> | null): RouteFeaturesConfig {
 return { defaults: { ...defaultRouteFeatures().defaults, ...input?.defaults } }

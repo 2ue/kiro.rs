@@ -77,7 +77,9 @@ function enabledInjectionCount(route: RouteConfig, runtime?: RuntimeConfig): num
 }
 
 function enabledFeatureCount(route: RouteConfig, runtime?: RuntimeConfig): number {
-  return Object.values({ ...runtime?.routeFeatures.defaults, ...route.features }).filter(
+  // “返回请求模型”默认开、只影响响应，不算进请求处理功能的数量。
+  const { returnRequestModel: _returnRequestModel, ...features } = { ...runtime?.routeFeatures.defaults, ...route.features }
+  return Object.values(features).filter(
     (v) =>
       v !== undefined &&
       v !== null &&

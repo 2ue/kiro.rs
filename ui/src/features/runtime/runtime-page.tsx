@@ -8,7 +8,13 @@ import {
   SectionCard,
   useConfirm,
 } from "@/components/patterns";
-import { ConfigFields } from "@/components/patterns/config-fields";
+import {
+  CONFIG_FIELD_GRID_CLASS,
+  CONFIG_FIELD_GRID_STYLE,
+  ConfigFieldCell,
+  ConfigFields,
+  ConfigSwitchControl,
+} from "@/components/patterns/config-fields";
 import {
   Button,
   Input,
@@ -275,10 +281,30 @@ export function RuntimePage() {
           </SectionCard>
         </TabsContent>
         <TabsContent value="features" className="space-y-4">
-          <SectionCard title="路由功能默认参数" description="请求体保护、参数兼容、图片处理与 max_tokens 补全在各路由的“路由功能”页签里编辑；这里的全局默认值是继承来源，新增功能默认关闭。">
-            <Button variant="outline" asChild>
-              <Link to="/routes">去路由页管理</Link>
-            </Button>
+          <SectionCard title="路由功能默认参数" description="请求体保护、参数兼容、图片处理与 max_tokens 补全在各路由的“路由功能”页签里编辑；这里的全局默认值是继承来源，新增的请求处理功能默认关闭。">
+            <div className="space-y-4">
+              <div className={CONFIG_FIELD_GRID_CLASS} style={CONFIG_FIELD_GRID_STYLE}>
+                <ConfigFieldCell
+                  id="route-feature-default-return-request-model"
+                  label="返回请求模型"
+                  description="开启时返回给调用方的 model 是调用方请求的模型，不暴露映射后或上游实际返回的模型；关闭时透传上游返回的模型。路由选“跟随全局”时用这里的值，用量记录里的上游返回模型不受影响。"
+                >
+                  <ConfigSwitchControl
+                    id="route-feature-default-return-request-model"
+                    checked={draft.routeFeatures.defaults.returnRequestModel ?? true}
+                    onChange={(returnRequestModel) =>
+                      setDraft({
+                        ...draft,
+                        routeFeatures: { ...draft.routeFeatures, defaults: { ...draft.routeFeatures.defaults, returnRequestModel } },
+                      })
+                    }
+                  />
+                </ConfigFieldCell>
+              </div>
+              <Button variant="outline" asChild>
+                <Link to="/routes">去路由页管理</Link>
+              </Button>
+            </div>
           </SectionCard>
           <SectionCard
             title="提示词注入"

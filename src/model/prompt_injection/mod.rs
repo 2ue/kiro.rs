@@ -427,7 +427,7 @@ impl Default for RoutePayloadGuardConfig {
         }
     }
 }
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct RouteFeatureSet {
     pub missing_max_tokens: Option<MissingMaxTokensConfig>,
@@ -438,6 +438,25 @@ pub struct RouteFeatureSet {
     pub payload_guard: Option<RoutePayloadGuardConfig>,
     pub payload_shaping: Option<PayloadShapingConfig>,
     pub image_processing: Option<ImageProcessingConfig>,
+    /// 返回给调用方的 `model` 用调用方请求的原值（默认开）；关闭时透传上游返回的模型。
+    /// 用量记录里的上游返回模型不受影响，照常记录。
+    pub return_request_model: bool,
+}
+
+impl Default for RouteFeatureSet {
+    fn default() -> Self {
+        Self {
+            missing_max_tokens: None,
+            reasoning_compat: None,
+            history_sanitize: false,
+            thinking_model_name: false,
+            thinking_trigger: ThinkingTriggerMode::default(),
+            payload_guard: None,
+            payload_shaping: None,
+            image_processing: None,
+            return_request_model: true,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -475,8 +494,10 @@ pub struct RouteFeatureOverride {
         skip_serializing_if = "Option::is_none"
     )]
     pub image_processing: Option<Option<ImageProcessingConfig>>,
+    pub return_request_model: Option<bool>,
 }
 impl RouteFeatureSet {
+    /// 是否不需要任何请求体处理（入口据此走快速路径）。`return_request_model` 只影响响应，不算在内。
     pub fn is_empty(&self) -> bool {
         self.missing_max_tokens.is_none()
             && self.reasoning_compat.is_none()
@@ -528,6 +549,9 @@ impl RouteFeatureOverride {
         if let Some(value) = route.image_processing {
             resolved.image_processing = value;
         }
+        if let Some(value) = route.return_request_model {
+            resolved.return_request_model = value;
+        }
         resolved
     }
 }
@@ -557,6 +581,38 @@ impl RouteFeaturesConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn return_request_model_defaults_on_and_routes_can_follow_or_override() {
+        // 全局默认开；老配置没有这个字段时也按开处理。
+        assert!(RouteFeatureSet::default().return_request_model);
+        let legacy: RouteFeaturesConfig =
+            serde_json::from_value(serde_json::json!({"defaults": {"historySanitize": true}}))
+                .unwrap();
+        assert!(legacy.defaults.return_request_model);
+        assert!(legacy.defaults.history_sanitize);
+        // 只开这个不影响请求体快速路径。
+        assert!(RouteFeatureSet::default().is_empty());
+
+        let follow = RouteFeatureOverride::default();
+        assert!(
+            follow
+                .apply(RouteFeatureSet::default())
+                .return_request_model
+        );
+        let off: RouteFeatureOverride =
+            serde_json::from_value(serde_json::json!({"returnRequestModel": false})).unwrap();
+        assert!(!off.apply(RouteFeatureSet::default()).return_request_model);
+        let global_off = RouteFeatureSet {
+            return_request_model: false,
+            ..RouteFeatureSet::default()
+        };
+        assert!(!follow.apply(global_off).return_request_model);
+        let on: RouteFeatureOverride =
+            serde_json::from_value(serde_json::json!({"returnRequestModel": true})).unwrap();
+        assert!(on.apply(global_off).return_request_model);
+        assert!(!off.is_empty());
+    }
 
     #[test]
     fn unknown_items_and_fields_are_rejected() {

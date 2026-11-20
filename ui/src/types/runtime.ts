@@ -339,6 +339,8 @@ export interface RouteFeatureSet {
   payloadGuard: RoutePayloadGuardConfig | null;
   payloadShaping: PayloadShapingConfig | null;
   imageProcessing: ImageProcessingConfig | null;
+  /** 返回给调用方的 model 用请求原值（默认开）；关闭时透传上游返回的模型。 */
+  returnRequestModel: boolean;
 }
 
 export type RouteFeatureOverride = Partial<RouteFeatureSet>;

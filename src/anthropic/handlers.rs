@@ -1113,6 +1113,17 @@ fn external_route_request_raw(
     }
 }
 
+/// 路由功能“返回请求模型”关闭时不改写：响应里透传上游返回的模型，用量记录照常记上游模型。
+fn response_client_model(
+    features: &RouteFeatureSet,
+    client_model: Option<String>,
+) -> Option<String> {
+    features
+        .return_request_model
+        .then_some(client_model)
+        .flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn post_messages_inner(
     state: AppState,
@@ -1183,6 +1194,7 @@ async fn post_messages_inner(
         route.client_model = probe_raw_messages_body(&raw_body).model;
     }
     route.raw_body = raw_body;
+    route.client_model = response_client_model(&features, route.client_model.take());
     route.history_sanitize_enabled = features.history_sanitize;
     route.payload_guard_retry_config = features
         .payload_guard
