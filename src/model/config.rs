@@ -1557,6 +1557,188 @@ impl ColdRequestGuardPolicyPatch {
     }
 }
 
+/// 上游返回 200 但 usage 里输入或输出为 0 时的估算修复。所有缓存策略共用，只对按路由策略整形
+/// usage 的账号生效（透传上游 usage 的账号不改）。估算值在整形之前写回上游 usage，之后照常
+/// 按路由整形，并受最终上下限约束。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeroUsageRepairPolicy {
+    #[serde(default)]
+    pub input: ZeroUsageSidePolicy,
+    #[serde(default)]
+    pub output: ZeroUsageSidePolicy,
+}
+
+impl ZeroUsageRepairPolicy {
+    pub fn is_active(&self) -> bool {
+        self.input.enabled || self.output.enabled
+    }
+
+    pub fn validate(&self, label: &str) -> Result<(), String> {
+        self.input.validate(&format!("{label}.input"))?;
+        self.output.validate(&format!("{label}.output"))
+    }
+}
+
+/// 输入或输出一侧的修复规则。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeroUsageSidePolicy {
+    /// 上游返回 0 时按真实请求（输入）或回复内容（输出）估算；关闭即保持上游原值。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 估算结果仍为 0 时的兜底方式。
+    #[serde(default)]
+    pub fallback: ZeroUsageFallback,
+    /// `range` 的随机下限，也是 `ratio` 结果的下限。
+    #[serde(default = "default_zero_usage_min_tokens")]
+    pub min_tokens: i32,
+    /// `range` 的随机上限，也是 `ratio` 结果的上限。
+    #[serde(default = "default_zero_usage_max_tokens")]
+    pub max_tokens: i32,
+    /// `ratio`：按另一侧用量的百分比生成（输出按输入、输入按输出）。
+    #[serde(default = "default_zero_usage_ratio_percent")]
+    pub ratio_percent: f64,
+}
+
+pub const ZERO_USAGE_MAX_TOKENS_LIMIT: i32 = 1_000_000;
+pub const ZERO_USAGE_RATIO_PERCENT_LIMIT: f64 = 10_000.0;
+
+fn default_zero_usage_min_tokens() -> i32 {
+    1
+}
+
+fn default_zero_usage_max_tokens() -> i32 {
+    20
+}
+
+fn default_zero_usage_ratio_percent() -> f64 {
+    0.5
+}
+
+impl Default for ZeroUsageSidePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fallback: ZeroUsageFallback::Keep,
+            min_tokens: default_zero_usage_min_tokens(),
+            max_tokens: default_zero_usage_max_tokens(),
+            ratio_percent: default_zero_usage_ratio_percent(),
+        }
+    }
+}
+
+impl ZeroUsageSidePolicy {
+    pub fn validate(&self, label: &str) -> Result<(), String> {
+        if self.min_tokens < 1 {
+            return Err(format!("{label}.minTokens 必须至少为 1"));
+        }
+        if self.max_tokens < self.min_tokens || self.max_tokens > ZERO_USAGE_MAX_TOKENS_LIMIT {
+            return Err(format!(
+                "{label}.maxTokens 必须在 minTokens 到 {ZERO_USAGE_MAX_TOKENS_LIMIT} 之间"
+            ));
+        }
+        if !self.ratio_percent.is_finite()
+            || self.ratio_percent <= 0.0
+            || self.ratio_percent > ZERO_USAGE_RATIO_PERCENT_LIMIT
+        {
+            return Err(format!(
+                "{label}.ratioPercent 必须大于 0 且不超过 {ZERO_USAGE_RATIO_PERCENT_LIMIT}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 估算仍为 0 时的兜底：保持 0、在范围内随机，或按另一侧用量的比例生成。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroUsageFallback {
+    #[default]
+    Keep,
+    Range,
+    Ratio,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeroUsageRepairPolicyPatch {
+    #[serde(default)]
+    pub input: Option<ZeroUsageSidePolicyPatch>,
+    #[serde(default)]
+    pub output: Option<ZeroUsageSidePolicyPatch>,
+}
+
+impl ZeroUsageRepairPolicyPatch {
+    fn apply_to(self, mut policy: ZeroUsageRepairPolicy) -> ZeroUsageRepairPolicy {
+        if let Some(patch) = self.input {
+            policy.input = patch.apply_to(policy.input);
+        }
+        if let Some(patch) = self.output {
+            policy.output = patch.apply_to(policy.output);
+        }
+        policy
+    }
+
+    // 只有 CacheRoutePolicyPatch::is_empty 用到，正式编译里同样只有测试调用。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_empty(&self) -> bool {
+        self.input
+            .as_ref()
+            .is_none_or(ZeroUsageSidePolicyPatch::is_empty)
+            && self
+                .output
+                .as_ref()
+                .is_none_or(ZeroUsageSidePolicyPatch::is_empty)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeroUsageSidePolicyPatch {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub fallback: Option<ZeroUsageFallback>,
+    #[serde(default)]
+    pub min_tokens: Option<i32>,
+    #[serde(default)]
+    pub max_tokens: Option<i32>,
+    #[serde(default)]
+    pub ratio_percent: Option<f64>,
+}
+
+impl ZeroUsageSidePolicyPatch {
+    fn apply_to(self, mut policy: ZeroUsageSidePolicy) -> ZeroUsageSidePolicy {
+        if let Some(value) = self.enabled {
+            policy.enabled = value;
+        }
+        if let Some(value) = self.fallback {
+            policy.fallback = value;
+        }
+        if let Some(value) = self.min_tokens {
+            policy.min_tokens = value;
+        }
+        if let Some(value) = self.max_tokens {
+            policy.max_tokens = value;
+        }
+        if let Some(value) = self.ratio_percent {
+            policy.ratio_percent = value;
+        }
+        policy
+    }
+
+    // 只有 CacheRoutePolicyPatch::is_empty 用到，正式编译里同样只有测试调用。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.fallback.is_none()
+            && self.min_tokens.is_none()
+            && self.max_tokens.is_none()
+            && self.ratio_percent.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheHitShapingPolicyPatch {
@@ -2625,6 +2807,9 @@ pub struct CacheRoutePolicyPatch {
     pub hit_shaping: Option<CacheHitShapingPolicyPatch>,
     #[serde(default)]
     pub cold_request_guard: Option<ColdRequestGuardPolicyPatch>,
+    /// 上游输入或输出为 0 时的估算修复；所有缓存策略都生效。
+    #[serde(default)]
+    pub zero_usage_repair: Option<ZeroUsageRepairPolicyPatch>,
     /// 缓存写入时长；所有缓存策略都生效（no_cache 无写入，不受影响）。
     #[serde(default)]
     pub cache_ttl: Option<CacheTtlPolicyPatch>,
@@ -2667,6 +2852,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.cache_ttl {
             policy.cache_ttl = patch.apply_to(policy.cache_ttl);
+        }
+        if let Some(patch) = self.zero_usage_repair {
+            policy.zero_usage_repair = patch.apply_to(policy.zero_usage_repair);
         }
         policy.normalized()
     }
@@ -2725,6 +2913,9 @@ impl CacheRoutePolicyPatch {
 
     fn apply_no_cache_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
         policy.reported_usage = ReportedUsagePathPolicy::disabled().normalized();
+        if let Some(patch) = self.zero_usage_repair {
+            policy.zero_usage_repair = patch.apply_to(policy.zero_usage_repair);
+        }
         policy.normalized()
     }
 
@@ -2751,6 +2942,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.cache_ttl {
             policy.cache_ttl = patch.apply_to(policy.cache_ttl);
         }
+        if let Some(patch) = self.zero_usage_repair {
+            policy.zero_usage_repair = patch.apply_to(policy.zero_usage_repair);
+        }
         policy.normalized()
     }
 
@@ -2768,6 +2962,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.cache_ttl {
             policy.cache_ttl = patch.apply_to(policy.cache_ttl);
+        }
+        if let Some(patch) = self.zero_usage_repair {
+            policy.zero_usage_repair = patch.apply_to(policy.zero_usage_repair);
         }
         policy.normalized()
     }
@@ -2794,6 +2991,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.cache_ttl {
             policy.cache_ttl = patch.apply_to(policy.cache_ttl);
+        }
+        if let Some(patch) = self.zero_usage_repair {
+            policy.zero_usage_repair = patch.apply_to(policy.zero_usage_repair);
         }
         policy.normalized()
     }
@@ -2840,6 +3040,10 @@ impl CacheRoutePolicyPatch {
                 .cold_request_guard
                 .as_ref()
                 .is_none_or(ColdRequestGuardPolicyPatch::is_empty)
+            && self
+                .zero_usage_repair
+                .as_ref()
+                .is_none_or(ZeroUsageRepairPolicyPatch::is_empty)
             && self
                 .cache_ttl
                 .as_ref()
@@ -2946,6 +3150,7 @@ impl CachePolicyConfig {
             cold_request_guard: base.cold_request_guard,
             prefix_tool_plus: base.prefix_tool_plus,
             cache_ttl: base.cache_ttl,
+            zero_usage_repair: base.zero_usage_repair,
         };
         self.prefix_tool.apply_prefix_tool_fields_to(neutral)
     }
@@ -2977,6 +3182,7 @@ impl CachePolicyConfig {
             cold_request_guard: base.cold_request_guard,
             prefix_tool_plus: base.prefix_tool_plus,
             cache_ttl: base.cache_ttl,
+            zero_usage_repair: base.zero_usage_repair,
         };
         self.stable_segment_cache
             .apply_stable_segment_fields_to(neutral)
@@ -3009,6 +3215,7 @@ impl CachePolicyConfig {
             cold_request_guard: ColdRequestGuardPolicy::disabled(),
             prefix_tool_plus: PrefixToolPlusCachePolicy::default(),
             cache_ttl: base.cache_ttl,
+            zero_usage_repair: base.zero_usage_repair,
         };
         self.prefix_tool_plus
             .apply_prefix_tool_plus_fields_to(neutral)
@@ -3036,6 +3243,7 @@ impl CachePolicyConfig {
             cold_request_guard: ColdRequestGuardPolicy::disabled(),
             prefix_tool_plus: base.prefix_tool_plus,
             cache_ttl: base.cache_ttl,
+            zero_usage_repair: base.zero_usage_repair,
         }
         .normalized()
     }
@@ -3087,6 +3295,8 @@ pub struct CacheRoutePolicy {
     pub prefix_tool_plus: PrefixToolPlusCachePolicy,
     /// 缓存写入时长（5 分钟 / 1 小时），本地账号与账号分开设置；所有缓存策略共用。
     pub cache_ttl: CacheTtlPolicy,
+    /// 上游输入或输出为 0 时的估算修复；所有缓存策略共用。
+    pub zero_usage_repair: ZeroUsageRepairPolicy,
 }
 
 impl CacheRoutePolicy {
@@ -3116,6 +3326,8 @@ impl CacheRoutePolicy {
         self.prefix_tool_plus
             .validate(&format!("{label}.prefixToolPlus"))?;
         self.cache_ttl.validate(&format!("{label}.cacheTtl"))?;
+        self.zero_usage_repair
+            .validate(&format!("{label}.zeroUsageRepair"))?;
         Ok(())
     }
 }
@@ -5094,6 +5306,7 @@ impl Config {
             cold_request_guard: ColdRequestGuardPolicy::default(),
             prefix_tool_plus: PrefixToolPlusCachePolicy::default(),
             cache_ttl: CacheTtlPolicy::default(),
+            zero_usage_repair: ZeroUsageRepairPolicy::default(),
         }
         .normalized()
     }
@@ -5557,6 +5770,70 @@ mod tests {
                 enabled: Some(true)
             })
         );
+    }
+
+    #[test]
+    fn zero_usage_repair_defaults_on_and_layers_template_and_route_overrides() {
+        let mut config = Config::default();
+        let defaults = config
+            .cache_policy_for_path("/dfcache/minea/v1/messages")
+            .policy
+            .zero_usage_repair;
+        assert!(defaults.input.enabled && defaults.output.enabled);
+        assert_eq!(defaults.output.fallback, ZeroUsageFallback::Keep);
+        assert_eq!(defaults.output.ratio_percent, 0.5);
+
+        // 模板改输出兜底为按比例，路由再单独关掉输入估算。
+        config.cache_policy.current_high_cache = serde_json::from_value(serde_json::json!({
+            "zeroUsageRepair": {"output": {"fallback": "ratio", "ratioPercent": 1.5, "maxTokens": 80}}
+        }))
+        .expect("template patch");
+        let route_patch: CacheRoutePolicyPatch = serde_json::from_value(serde_json::json!({
+            "cacheType": "current_high_cache",
+            "zeroUsageRepair": {"input": {"enabled": false}}
+        }))
+        .expect("route patch");
+        assert!(!route_patch.is_empty());
+        config.routes.route_mut("/dfcache/minea").cache_policy = route_patch.clone();
+        let resolved = config
+            .cache_policy_for_path("/dfcache/minea/v1/messages")
+            .policy
+            .zero_usage_repair;
+        assert!(!resolved.input.enabled);
+        assert!(resolved.output.enabled);
+        assert_eq!(resolved.output.fallback, ZeroUsageFallback::Ratio);
+        assert_eq!(resolved.output.ratio_percent, 1.5);
+        assert_eq!(resolved.output.max_tokens, 80);
+
+        // 无缓存路由同样生效（零用量修复与缓存策略无关）。
+        config.routes.route_mut("/na").cache_policy = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::NoCache),
+            ..route_patch.clone()
+        };
+        let no_cache = config
+            .cache_policy_for_path("/na/v1/messages")
+            .policy
+            .zero_usage_repair;
+        assert!(!no_cache.input.enabled);
+        assert!(no_cache.output.enabled);
+
+        let round_trip: CacheRoutePolicyPatch =
+            serde_json::from_value(serde_json::to_value(&route_patch).unwrap()).unwrap();
+        assert_eq!(round_trip.zero_usage_repair, route_patch.zero_usage_repair);
+    }
+
+    #[test]
+    fn zero_usage_repair_rejects_invalid_route_values() {
+        let patch: CacheRoutePolicyPatch = serde_json::from_value(serde_json::json!({
+            "cacheType": "no_cache",
+            "zeroUsageRepair": {"output": {"fallback": "range", "minTokens": 30, "maxTokens": 10}}
+        }))
+        .expect("patch json");
+        let base = Config::default()
+            .cache_policy_for_path("/cc/v1/messages")
+            .policy;
+        let err = patch.validate("routes./cc.cachePolicy", base).unwrap_err();
+        assert!(err.contains("zeroUsageRepair.output.maxTokens"), "{err}");
     }
 
     #[test]

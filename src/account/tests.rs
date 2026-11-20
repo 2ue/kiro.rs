@@ -1461,6 +1461,7 @@ pub(crate) fn test_route(model: &str) -> AccountRouteRequest {
 
         model_hint: None,
         client_model: None,
+        zero_usage_repair: Default::default(),
         stream_hint: None,
         request_input_tokens,
         upstream_model: Some(model.to_string()),
@@ -2648,6 +2649,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
 
         model_hint: None,
         client_model: None,
+        zero_usage_repair: Default::default(),
         stream_hint: None,
         request_input_tokens: 1,
         upstream_model: None,
@@ -21909,4 +21911,307 @@ async fn external_non_stream_returns_client_model_instead_of_mapped_or_upstream_
     assert_eq!(sent["model"], "claude-opus-4-8");
 
     postgres.drop_test_schema().await.unwrap();
+}
+
+fn zero_repair_pool() -> Account {
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
+    pool
+}
+
+const ZERO_USAGE_REPLY_TEXT: &str =
+    "Distributed consensus lets replicas agree on one ordered log even when some nodes fail.";
+
+#[test]
+fn non_stream_partial_zero_usage_is_estimated_when_route_keeps_upstream_usage() {
+    let route = test_route("claude-sonnet-4-6");
+    let pool = zero_repair_pool();
+    let request_estimate = estimated_external_request_input_tokens(&route, None);
+    assert!(request_estimate > 0);
+    let repair = || zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pool, None);
+
+    // 输入为 0、输出正常：只补输入。
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":25}}"#,
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        repair(),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    assert_eq!(value["usage"]["input_tokens"], request_estimate);
+    assert_eq!(value["usage"]["output_tokens"], 25);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_input")
+    );
+    let billing =
+        account_billing_from_capture(&route, &pool, projected.usage_capture).expect("billing");
+    assert!(billing.usage_estimated);
+    assert_eq!(billing.raw_usage.input_tokens, request_estimate);
+    assert_eq!(billing.raw_usage.output_tokens, 25);
+
+    // 输入正常、输出为 0：按回复内容估算输出。
+    let body = Bytes::from(
+        serde_json::json!({
+            "type": "message",
+            "content": [{"type": "text", "text": ZERO_USAGE_REPLY_TEXT}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 300, "output_tokens": 0}
+        })
+        .to_string(),
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        repair(),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    assert_eq!(value["usage"]["input_tokens"], 300);
+    let output = value["usage"]["output_tokens"].as_i64().unwrap();
+    assert!(output > 0, "{value}");
+    assert_eq!(
+        i64::from(projected.usage_capture.raw.unwrap().output_tokens),
+        output
+    );
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_output")
+    );
+}
+
+#[test]
+fn non_stream_partial_zero_usage_is_untouched_for_pass_through_accounts_or_disabled_route() {
+    let mut route = test_route("claude-sonnet-4-6");
+    let pass_through = test_pool("http://pool.example.com", false);
+    assert!(
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pass_through, None)
+            .is_none()
+    );
+    route.zero_usage_repair.input.enabled = false;
+    route.zero_usage_repair.output.enabled = false;
+    assert!(
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &zero_repair_pool(), None)
+            .is_none()
+    );
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":0,"output_tokens":25}}"#,
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body.clone(),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        None,
+    );
+    assert_eq!(projected.body, body);
+    assert!(!projected.usage_capture.usage_estimated);
+}
+
+#[test]
+fn non_stream_all_zero_usage_with_empty_reply_uses_output_fallback() {
+    let mut route = test_route("claude-sonnet-4-6");
+    route.zero_usage_repair.output.fallback = crate::model::config::ZeroUsageFallback::Range;
+    route.zero_usage_repair.output.min_tokens = 4;
+    route.zero_usage_repair.output.max_tokens = 6;
+    let pool = zero_repair_pool();
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}"#,
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pool, None),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    let output = value["usage"]["output_tokens"].as_i64().unwrap();
+    assert!((4..=6).contains(&output), "{value}");
+    assert!(value["usage"]["input_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(
+        i64::from(projected.usage_capture.raw.unwrap().output_tokens),
+        output
+    );
+    assert_eq!(
+        i64::from(projected.usage_capture.reported.unwrap().output_tokens),
+        output
+    );
+
+    // 兜底为保持估算时与现状一致：输出仍是 0。
+    let mut keep_route = test_route("claude-sonnet-4-6");
+    keep_route.zero_usage_repair.output.fallback = crate::model::config::ZeroUsageFallback::Keep;
+    let projected = process_non_stream_response_usage_with_repair(
+        Bytes::from_static(
+            br#"{"type":"message","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}"#,
+        ),
+        Some(&keep_route),
+        None,
+        std::iter::empty::<String>(),
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&keep_route, &pool, None),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    assert_eq!(value["usage"]["output_tokens"], 0);
+}
+
+#[test]
+fn non_stream_zero_output_repair_feeds_route_shaping() {
+    let mut route = test_route("claude-sonnet-4-6");
+    configure_usage_projection_test_path(&mut route, ReportedUsagePathPolicy::default());
+    let pool = zero_repair_pool();
+    let projection = projection_context(&route, &pool, 0).expect("route shaping projection");
+    let ctx =
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pool, Some(&projection))
+            .expect("repair context");
+    let body = Bytes::from(
+        serde_json::json!({
+            "type": "message",
+            "content": [{"type": "text", "text": ZERO_USAGE_REPLY_TEXT}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
+        })
+        .to_string(),
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        Some(&projection),
+        std::iter::empty::<String>(),
+        Some(ctx.clone()),
+    );
+    assert!(projected.usage_capture.projected);
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    assert!(reported.output_tokens > 0, "{reported:?}");
+    assert!(reported.total_input_tokens > 0, "{reported:?}");
+
+    // 只有输出为 0：补出来的输出作为原始用量参与整形。
+    let body = Bytes::from(
+        serde_json::json!({
+            "type": "message",
+            "content": [{"type": "text", "text": ZERO_USAGE_REPLY_TEXT}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 900, "output_tokens": 0}
+        })
+        .to_string(),
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        Some(&projection),
+        std::iter::empty::<String>(),
+        Some(ctx),
+    );
+    assert!(projected.usage_capture.projected);
+    let raw = projected.usage_capture.raw.expect("raw usage");
+    assert_eq!(raw.input_tokens, 900);
+    assert!(raw.output_tokens > 0);
+    assert!(projected.usage_capture.reported.unwrap().output_tokens > 0);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_output")
+    );
+}
+
+#[test]
+fn stream_zero_usage_repairs_only_the_final_usage_event() {
+    let mut route = test_route("claude-sonnet-4-6");
+    payload_mut(&mut route).stream = true;
+    refresh_test_route_derived_state(&mut route);
+    let pool = zero_repair_pool();
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        zero_usage_repair: zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+            &route, &pool, None,
+        ),
+        ..ExternalUsageCapture::default()
+    }));
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    let message_start = external_sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {"id": "m", "type": "message", "role": "assistant", "content": [],
+                        "model": "claude-sonnet-4-6", "usage": {"input_tokens": 0, "output_tokens": 0}}
+        }),
+    );
+    let message_delta = external_sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 0}
+        }),
+    );
+    let mut downstream = Vec::new();
+    for event in [
+        message_start.clone(),
+        external_sse_text_start(),
+        external_sse_text_delta(ZERO_USAGE_REPLY_TEXT),
+        external_sse_text_stop(),
+        message_delta,
+    ] {
+        downstream.push(process_sse_event_with_plan_and_transcript(
+            event.as_bytes(),
+            None,
+            Some(&capture),
+            None,
+            plan,
+            None,
+            None,
+        ));
+    }
+    assert_eq!(downstream[0], message_start.as_bytes());
+    let delta = event_data_value(&downstream[4]);
+    let request_estimate = estimated_external_request_input_tokens(&route, None);
+    assert_eq!(delta["usage"]["input_tokens"], request_estimate);
+    assert!(
+        delta["usage"]["output_tokens"].as_i64().unwrap() > 0,
+        "{delta}"
+    );
+    assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+    let capture = capture.lock();
+    let raw = capture.raw.expect("raw usage");
+    assert_eq!(raw.input_tokens, request_estimate);
+    assert!(raw.output_tokens > 0);
+    assert_eq!(
+        capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_input_output")
+    );
+}
+
+#[test]
+fn stream_normal_usage_is_not_reparsed_or_changed() {
+    let route = test_route("claude-sonnet-4-6");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        zero_usage_repair: zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+            &route,
+            &zero_repair_pool(),
+            None,
+        ),
+        ..ExternalUsageCapture::default()
+    }));
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    for event in external_stream_success_steps("msg_normal", "hello", 120, 9)
+        .into_iter()
+        .filter_map(|step| match step {
+            ExternalStreamFakeStep::Chunk(bytes) => Some(bytes),
+            _ => None,
+        })
+    {
+        let out = process_sse_event_with_plan_and_transcript(
+            &event,
+            None,
+            Some(&capture),
+            None,
+            plan,
+            None,
+            None,
+        );
+        assert_eq!(out, event);
+    }
+    assert!(!capture.lock().usage_estimated);
 }

@@ -229,3 +229,16 @@ test('导出文件名', () => {
   assert.equal(routePolicyFileName('/dfcache/team-a'), 'route-policy-dfcache-team-a.json')
   assert.equal(routePolicyFileName('/'), 'route-policy-root.json')
 })
+
+test('零用量估算随路由策略导出导入，无缓存路由也保留', () => {
+  const zeroUsageRepair = {
+    input: { enabled: false },
+    output: { fallback: 'ratio' as const, ratioPercent: 1.5, minTokens: 2, maxTokens: 80 },
+  }
+  for (const cacheType of ['current_high_cache', 'no_cache'] as const) {
+    const source = route({ cachePolicy: { cacheType, zeroUsageRepair } })
+    const imported = ok(JSON.stringify(buildRoutePolicyFile(source)))
+    assert.deepEqual(imported.policy.cachePolicy.zeroUsageRepair, zeroUsageRepair, cacheType)
+  }
+  assert.match(error(file({ cachePolicy: { cacheType: 'no_cache', zeroUsageRepair: 'on' } })), /zeroUsageRepair/)
+})

@@ -205,6 +205,7 @@ export interface CacheRoutePolicyPatch {
   hitShaping?: CacheHitShapingPolicyPatch;
   coldRequestGuard?: ColdRequestGuardPolicyPatch;
   cacheTtl?: CacheTtlPolicyPatch;
+  zeroUsageRepair?: ZeroUsageRepairPolicyPatch | null;
 }
 
 export type CacheTtlMode =
@@ -220,6 +221,23 @@ export interface CacheTtlPolicyPatch {
 
 export interface ColdRequestGuardPolicyPatch {
   enabled?: boolean;
+}
+
+/** 估算结果仍为 0 时的兜底：保持 0、在范围内随机、按另一侧用量的比例生成。 */
+export type ZeroUsageFallback = "keep" | "range" | "ratio";
+
+export interface ZeroUsageSidePolicyPatch {
+  enabled?: boolean | null;
+  fallback?: ZeroUsageFallback | null;
+  minTokens?: number | null;
+  maxTokens?: number | null;
+  ratioPercent?: number | null;
+}
+
+/** 上游 200 但 usage 输入或输出为 0 时的估算修复，输入、输出分开设置。 */
+export interface ZeroUsageRepairPolicyPatch {
+  input?: ZeroUsageSidePolicyPatch | null;
+  output?: ZeroUsageSidePolicyPatch | null;
 }
 
 export interface CacheHitShapingPolicyPatch {

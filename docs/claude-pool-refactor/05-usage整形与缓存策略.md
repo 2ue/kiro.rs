@@ -58,7 +58,25 @@ usage 整形只由路由挂载的策略决定（C2、R7）：
 
 流式：逐个 SSE `data:` 里的 usage 槽改写（`external_pool.rs:14211-14255`、`14745-14812`）；`message_start.usage` 只预览不提交，`message_delta.usage` 提交。非流式改写整包。成功终止后才提交前缀追踪与频次状态（`usage_projection.rs:522-575`）。
 
-### 3.1 与 C1 的关系
+### 3.1 零用量估算（`zeroUsageRepair`）
+
+上游返回 200 但 usage 里输入（输入 + 缓存读 + 缓存写）或输出为 0 时，在上游 usage 进入本系统的入口先估算写回，之后的门槛判断、整形、收口、采集都当作上游本来就给了这个值。只对按路由策略整形 usage 的账号生效，透传上游 usage 的账号不改；配置挂在路由缓存策略里（模板与路由两层，所有策略含 `no_cache` 都生效），输入、输出各一组：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | 开 | 输入按本次请求内容估算，输出按实际返回内容估算；关闭即保持上游原值 |
+| `fallback` | `keep` | 估算仍为 0 时：`keep` 保持 0；`range` 在下限到上限间随机；`ratio` 按另一侧用量的百分比生成（输出按输入、输入按输出），再收在下限到上限之间 |
+| `minTokens` / `maxTokens` | 1 / 20 | `range` 的范围，也是 `ratio` 结果的范围 |
+| `ratioPercent` | 0.5 | `ratio` 的百分比 |
+
+- 整形的请求：估算值进入上面第 1–16 步，最终上下限照常生效（第 2 步基准输入本来就用本地估算，零输入主要影响原始成本与成本下限的依据）。
+- 不整形的请求（门槛判断不通过，原样转发上游 usage）：补出来的输出按路由最终输出上限（`finalOutputMaxTokens` 扣掉最大扣减量）裁剪；输入与上游真实输入一样原样转发（输入字段 `sample-max` 是把超出部分挪进缓存的整形规则，不是截断上限）。
+- 流式只修最终用量事件（`message_delta` 的顶层 `usage`），判断时合并 `message_start` 已给出的用量；`message_start` 不动。
+- 非流式上游 usage 全为 0 时沿用“缺失用量”估算（`missing_upstream_usage`），估算结果里仍为 0 的一侧再按 `fallback` 补。
+- 修过的请求在计费记录里 `usageEstimated=true`，原因 `zero_upstream_input` / `zero_upstream_output` / `zero_upstream_input_output`。
+- 开销：每个 SSE 事件只做一次字节查找；请求输入估算只在真要补输入时才解析请求体（整形上下文已有估算时直接复用）。
+
+### 3.2 与 C1 的关系
 
 第 13 步"成本下限"在 `current_high_cache` 链路里可以突破 input 上限（这是旧的已知行为，memory 记录现网出现过上限 500 被补到 8198）。本方案**不改这个行为**：用户此前明确要求旧策略行为不动，新语义一律做成新策略（`bounded_high_cache` 就是为此而生）。需要上下限绝对约束的路由挂 `bounded_high_cache`。
 

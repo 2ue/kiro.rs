@@ -88,6 +88,7 @@ const CACHE_OBJECT_KEYS = [
   'stableSegment',
   'hitShaping',
   'coldRequestGuard',
+  'zeroUsageRepair',
 ] as const
 const MAIN_CACHE_KEYS: Record<string, (typeof CACHE_OBJECT_KEYS)[number]> = {
   kiroRsTool: 'prefixTool',

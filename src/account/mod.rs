@@ -99,6 +99,7 @@ mod model_pipeline;
 mod response_model;
 mod retry_pipeline;
 mod usage_projection;
+mod zero_usage_repair;
 
 use early_commit::EarlyCommitTaskGuard;
 pub use early_commit::ExternalEarlyCommitDownstream;
@@ -1187,6 +1188,8 @@ pub struct AccountRouteRequest {
     pub model_hint: Option<String>,
     /// 调用方请求体里的原始模型名；返回给调用方的 `model` 一律用它，不暴露映射后或上游实际的模型。
     pub client_model: Option<String>,
+    /// 路由缓存策略里的零用量估算规则。
+    pub zero_usage_repair: crate::model::config::ZeroUsageRepairPolicy,
     pub stream_hint: Option<bool>,
     pub request_input_tokens: i32,
     pub upstream_model: Option<String>,
@@ -1972,6 +1975,8 @@ struct ExternalUsageCapture {
     stream_error_message: Option<String>,
     raw_upstream_error: Option<RawUpstreamError>,
     stream_response_mode: Option<StreamResponseMode>,
+    /// 上游 usage 输入或输出为 0 时的估算修复；账号透传上游 usage 或路由关闭时为 `None`。
+    zero_usage_repair: Option<zero_usage_repair::ZeroUsageRepairContext>,
     debug_stream: ExternalUsageDebugStreamCapture,
     wire_debug: ExternalWireDebugCapture,
 }
@@ -7643,6 +7648,11 @@ impl AccountManager {
             let stream_usage_projection = projection_context.clone();
             let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
                 stream_response_mode: Some(stream_plan.response_mode),
+                zero_usage_repair: zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+                    route,
+                    pool,
+                    projection_context.as_ref(),
+                ),
                 ..ExternalUsageCapture::default()
             }));
             let stream_usage_capture = usage_capture.clone();
@@ -8138,11 +8148,16 @@ impl AccountManager {
                     })
                 },
             );
-            let projected = process_non_stream_response_usage(
+            let projected = process_non_stream_response_usage_with_repair(
                 bytes,
                 Some(route),
                 projection_context.as_ref(),
                 known_tool_names.iter().cloned(),
+                zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+                    route,
+                    pool,
+                    projection_context.as_ref(),
+                ),
             );
             account_usage_debug_non_stream_record(ExternalUsageDebugNonStreamRecordContext {
                 config,
@@ -14283,11 +14298,22 @@ fn maybe_project_non_stream_usage_with_tools(
     process_non_stream_response_usage(bytes, None, projection, known_tool_names)
 }
 
+#[cfg(test)]
 fn process_non_stream_response_usage(
     bytes: Bytes,
     route: Option<&AccountRouteRequest>,
     projection: Option<&ExternalUsageProjectionContext>,
     known_tool_names: impl IntoIterator<Item = String>,
+) -> ProjectedNonStreamBody {
+    process_non_stream_response_usage_with_repair(bytes, route, projection, known_tool_names, None)
+}
+
+fn process_non_stream_response_usage_with_repair(
+    bytes: Bytes,
+    route: Option<&AccountRouteRequest>,
+    projection: Option<&ExternalUsageProjectionContext>,
+    known_tool_names: impl IntoIterator<Item = String>,
+    zero_repair: Option<zero_usage_repair::ZeroUsageRepairContext>,
 ) -> ProjectedNonStreamBody {
     let mut usage_capture = ExternalUsageCapture {
         request_input_tokens: route
@@ -14324,9 +14350,25 @@ fn process_non_stream_response_usage(
                 };
             };
             let normalized = normalize_external_usage_value(usage);
-            usage_capture.raw = normalized.usage;
-            usage_capture.reported = normalized.usage;
-            changed |= normalized.changed;
+            let repaired = zero_repair
+                .map(|ctx| {
+                    zero_usage_repair::repair_usage_value(
+                        usage,
+                        None,
+                        response_output_estimate.unwrap_or(0),
+                        &ctx.with_known_request_input_tokens(usage_capture.request_input_tokens),
+                    )
+                })
+                .unwrap_or_default();
+            let raw_usage = if repaired.any() {
+                zero_usage_repair::mark_estimated(&mut usage_capture, repaired);
+                cache_usage_from_any_value(usage)
+            } else {
+                normalized.usage
+            };
+            usage_capture.raw = raw_usage;
+            usage_capture.reported = raw_usage;
+            changed |= normalized.changed || repaired.any();
 
             if let Some(projected) =
                 project_usage_value(usage, projection, true, response_output_estimate)
@@ -14375,6 +14417,13 @@ fn process_non_stream_response_usage(
             &mut value,
             anthropic_usage_value_for_body(estimated.reported, estimated.projected),
         );
+        if let Some(ctx) = zero_repair.as_ref() {
+            zero_usage_repair::apply_fallback_to_estimated_body(
+                &mut value,
+                &mut usage_capture,
+                ctx,
+            );
+        }
         let body = serde_json::to_vec(&value)
             .map(Bytes::from)
             .unwrap_or_else(|_| bytes.clone());
@@ -15946,6 +15995,8 @@ fn process_sse_event_with_plan_and_transcript(
         plan,
         ExternalWireDebugStreamSide::RawUpstream,
     );
+    let repaired = capture.and_then(|capture| zero_usage_repair::repair_sse_event(event, capture));
+    let event: &[u8] = repaired.as_deref().unwrap_or(event);
     let masked = plan
         .mask_errors
         .then(|| maybe_mask_external_stream_error_event(event, capture, stream_error_mask))

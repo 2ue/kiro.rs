@@ -14,7 +14,11 @@ PayloadShapingConfig,
 PromptCacheCreationControlConfig,
 ReportedUsageFieldPolicy,
 ReportedUsagePathPolicy,
+ZeroUsageFallback,
+ZeroUsageRepairPolicyPatch,
+ZeroUsageSidePolicyPatch,
 } from '@/types/api'
+import { ZERO_USAGE_FALLBACK_OPTIONS, resolveZeroUsageSide, zeroUsageSideError } from './zero-usage-repair'
 import { Check,Trash2 } from 'lucide-react'
 import { useEffect,useMemo,useState,type ReactNode } from 'react'
 
@@ -334,7 +338,7 @@ export function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyTy
   }
 }
 
-const SHARED_ROUTE_POLICY_FIELDS = ['cachePoint', 'bounds', 'cacheTtl'] as const
+const SHARED_ROUTE_POLICY_FIELDS = ['cachePoint', 'bounds', 'cacheTtl', 'zeroUsageRepair'] as const
 
 function pickDefinedRoutePolicyFields(
   policy: CacheRoutePolicyPatch,
@@ -353,7 +357,8 @@ function pickDefinedRoutePolicyFields(
  */
 export function sanitizeCacheRoutePolicy(policy: CacheRoutePolicyPatch): CacheRoutePolicyPatch {
   const cacheType = policy.cacheType ?? 'no_cache'
-  if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
+  // 零用量估算与缓存无关，无缓存路由也保留。
+  if (cacheType === 'no_cache') return { cacheType: 'no_cache', ...pickDefinedRoutePolicyFields(policy, ['zeroUsageRepair']) }
 
   const shared = pickDefinedRoutePolicyFields(policy, SHARED_ROUTE_POLICY_FIELDS)
   if (isHighCacheStrategy(cacheType)) {
@@ -674,6 +679,105 @@ function ColdRequestGuardToggle({
       checked={Boolean(value?.enabled)}
       onChange={(enabled) => onChange({ enabled })}
     />
+  )
+}
+
+function ZeroUsageSideFields({
+  label,
+  otherLabel,
+  estimateDesc,
+  value,
+  onChange,
+}: {
+  label: string
+  otherLabel: string
+  estimateDesc: string
+  value: ZeroUsageSidePolicyPatch | null | undefined
+  onChange: (next: ZeroUsageSidePolicyPatch) => void
+}) {
+  const side = resolveZeroUsageSide(value)
+  const set = (patch: ZeroUsageSidePolicyPatch) => onChange({ ...value, ...patch })
+  const selected = ZERO_USAGE_FALLBACK_OPTIONS.find((option) => option.value === side.fallback) ?? ZERO_USAGE_FALLBACK_OPTIONS[0]
+  const error = zeroUsageSideError(side, label)
+  const fallbackId = React.useId()
+  return (
+    <div className="space-y-3">
+      <div className="text-[13px] font-semibold text-foreground">{label}</div>
+      <FieldGrid>
+        <TogField label={`${label}为 0 时估算`} desc={estimateDesc} checked={side.enabled} onChange={(enabled) => set({ enabled })} />
+        <div className="min-w-0 space-y-1.5">
+          <label htmlFor={fallbackId} className="block text-[13px] font-medium leading-5 text-foreground">估算仍为 0 时</label>
+          <Select value={side.fallback} disabled={!side.enabled} onValueChange={(fallback) => set({ fallback: fallback as ZeroUsageFallback })}>
+            <SelectTrigger id={fallbackId} size="sm" className="w-full max-w-[15rem]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {ZERO_USAGE_FALLBACK_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="text-[11px] leading-4 text-muted-foreground">{selected.desc}</div>
+        </div>
+        <NumField
+          label="下限"
+          value={side.minTokens}
+          min={1}
+          step={1}
+          suffix="Token"
+          disabled={!side.enabled || side.fallback === 'keep'}
+          onChange={(minTokens) => set({ minTokens })}
+        />
+        <NumField
+          label="上限"
+          value={side.maxTokens}
+          min={1}
+          step={1}
+          suffix="Token"
+          disabled={!side.enabled || side.fallback === 'keep'}
+          onChange={(maxTokens) => set({ maxTokens })}
+        />
+        <NumField
+          label="比例"
+          desc={`按${otherLabel}的百分比生成，再收在下限到上限之间。`}
+          value={side.ratioPercent}
+          min={0.01}
+          step={0.1}
+          suffix="%"
+          disabled={!side.enabled || side.fallback !== 'ratio'}
+          onChange={(ratioPercent) => set({ ratioPercent })}
+        />
+      </FieldGrid>
+      {error && <div className="text-xs text-destructive">{error}</div>}
+    </div>
+  )
+}
+
+function ZeroUsageRepairForm({
+  value,
+  onChange,
+}: {
+  value: ZeroUsageRepairPolicyPatch | null | undefined
+  onChange: (next: ZeroUsageRepairPolicyPatch) => void
+}) {
+  return (
+    <ParameterGroup
+      title="零用量估算"
+      desc="上游返回 200 但 usage 里输入或输出为 0 时，按真实请求和回复内容估算，再按本路由整形，最终上下限照常生效。账号按本路由策略整形 usage 时生效；账号透传上游 usage 时不改。"
+    >
+      <ZeroUsageSideFields
+        label="输入"
+        otherLabel="输出"
+        estimateDesc="输入、缓存读取、缓存写入合计为 0 时，按本次请求内容估算输入。关闭即保持上游原值。"
+        value={value?.input}
+        onChange={(input) => onChange({ ...value, input })}
+      />
+      <ZeroUsageSideFields
+        label="输出"
+        otherLabel="输入"
+        estimateDesc="输出为 0 时，按实际返回的内容估算输出。关闭即保持上游原值。"
+        value={value?.output}
+        onChange={(output) => onChange({ ...value, output })}
+      />
+    </ParameterGroup>
   )
 }
 
@@ -1692,8 +1796,9 @@ function NonStreamCacheToggle({
 }
 
 export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
-  if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
   // 只透传已配置的值，不补默认：未配置的模板保持关闭且不新增字段。
+  const zeroUsageRepair = policy.zeroUsageRepair ? { zeroUsageRepair: policy.zeroUsageRepair } : {}
+  if (cacheType === 'no_cache') return { cacheType: 'no_cache', ...zeroUsageRepair }
   const coldRequestGuard = policy.coldRequestGuard ? { coldRequestGuard: policy.coldRequestGuard } : {}
   const cacheTtl = policy.cacheTtl ? { cacheTtl: policy.cacheTtl } : {}
   if (cacheType === 'prefix_tool') {
@@ -1704,6 +1809,7 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
       hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
       ...coldRequestGuard,
       ...cacheTtl,
+      ...zeroUsageRepair,
     }
   }
   if (cacheType === 'prefix_tool_plus') {
@@ -1711,6 +1817,7 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
       cacheType: 'prefix_tool_plus',
       prefixToolPlus: policy.prefixToolPlus ?? defaultPrefixToolPlusPatch(),
       ...cacheTtl,
+      ...zeroUsageRepair,
     }
   }
   if (cacheType === 'stable_segment_cache') {
@@ -1721,6 +1828,7 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
       hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
       ...coldRequestGuard,
       ...cacheTtl,
+      ...zeroUsageRepair,
     }
   }
   return {
@@ -1731,6 +1839,7 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
     hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
     ...coldRequestGuard,
     ...cacheTtl,
+    ...zeroUsageRepair,
   }
 }
 
@@ -1840,6 +1949,10 @@ export function StrategyTemplateEditor({
           onChange={(cacheTtl) => onChange({ ...template, cacheTtl })}
         />
       )}
+      <ZeroUsageRepairForm
+        value={template.zeroUsageRepair}
+        onChange={(zeroUsageRepair) => onChange({ ...template, zeroUsageRepair })}
+      />
     </div>
   )
 }
@@ -2172,6 +2285,12 @@ export function PathStrategyBindingCard({
               />
             </div>
           )}
+          <div className="mt-7">
+            <ZeroUsageRepairForm
+              value={effectivePolicy.zeroUsageRepair}
+              onChange={(zeroUsageRepair) => patch({ zeroUsageRepair })}
+            />
+          </div>
         </EditorSection>
         </div>
     </div>

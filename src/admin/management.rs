@@ -154,7 +154,8 @@ fn cache_value(resolved: &crate::model::config::ResolvedCacheRoutePolicy) -> Val
         "creationControl": p.creation_control, "reportedUsage": p.reported_usage,
         "bounds": p.bounds, "prefixTool": p.prefix_tool, "stableSegment": p.stable_segment,
         "hitShaping": p.hit_shaping, "coldRequestGuard": p.cold_request_guard,
-        "prefixToolPlus": p.prefix_tool_plus, "cacheTtl": p.cache_ttl
+        "prefixToolPlus": p.prefix_tool_plus, "cacheTtl": p.cache_ttl,
+        "zeroUsageRepair": p.zero_usage_repair
     }})
 }
 fn leaf_sources(

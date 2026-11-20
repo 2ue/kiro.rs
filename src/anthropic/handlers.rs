@@ -295,6 +295,7 @@ impl RequestRuntimeConfig {
             cold_request_guard: crate::model::config::ColdRequestGuardPolicy::default(),
             prefix_tool_plus: crate::model::config::PrefixToolPlusCachePolicy::default(),
             cache_ttl: crate::model::config::CacheTtlPolicy::default(),
+            zero_usage_repair: crate::model::config::ZeroUsageRepairPolicy::default(),
         }
         .normalized()
     }
@@ -1064,6 +1065,7 @@ fn external_route_request_raw(
         payload: projection_payload,
         history_sanitize_enabled: false,
         client_model: model_hint.clone(),
+        zero_usage_repair: policy.zero_usage_repair,
         model_hint,
         stream_hint,
         request_input_tokens: 0,
