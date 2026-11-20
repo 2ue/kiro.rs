@@ -7,15 +7,27 @@
 use bytes::Bytes;
 use serde_json::Value;
 
-/// 流式事件：是 `message_start` 时把 `message.model` 改成调用方模型；不需要改时返回 `None`。
-pub(super) fn rewrite_sse_event_model(event: &[u8], client_model: &str) -> Option<Vec<u8>> {
+/// 流式事件的模型处理结果：上游在 `message_start` 里声明的模型（改写前，记进用量记录），
+/// 以及改写后的事件（不需要改时为 `None`）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct SseModelRewrite {
+    pub(super) upstream_model: Option<String>,
+    pub(super) rewritten: Option<Vec<u8>>,
+}
+
+/// 流式事件：是 `message_start` 时取出上游声明的模型，并把 `message.model` 改成调用方模型
+/// （`client_model` 为 `None` 时只取不改）。
+pub(super) fn process_sse_event_model(event: &[u8], client_model: Option<&str>) -> SseModelRewrite {
+    let mut result = SseModelRewrite::default();
     // 绝大多数事件是内容增量，先按字节排除，避免逐个解析 JSON。
     if !contains(event, b"message_start") {
-        return None;
+        return result;
     }
-    let text = std::str::from_utf8(event).ok()?;
+    let Ok(text) = std::str::from_utf8(event) else {
+        return result;
+    };
     let mut changed = false;
-    let mut out = String::with_capacity(text.len() + client_model.len());
+    let mut out = String::with_capacity(text.len() + client_model.map_or(0, str::len));
     for line in text.split_inclusive('\n') {
         let body = line.trim_end_matches(['\r', '\n']);
         let ending = &line[body.len()..];
@@ -27,7 +39,15 @@ pub(super) fn rewrite_sse_event_model(event: &[u8], client_model: &str) -> Optio
                     return None;
                 }
                 let message = value.get_mut("message")?.as_object_mut()?;
-                if message.get("model").and_then(Value::as_str) == Some(client_model) {
+                let declared = message.get("model").and_then(Value::as_str);
+                if result.upstream_model.is_none() {
+                    result.upstream_model = declared
+                        .map(str::trim)
+                        .filter(|model| !model.is_empty())
+                        .map(str::to_string);
+                }
+                let client_model = client_model?;
+                if declared == Some(client_model) {
                     return None;
                 }
                 message.insert("model".to_string(), Value::String(client_model.to_string()));
@@ -43,7 +63,28 @@ pub(super) fn rewrite_sse_event_model(event: &[u8], client_model: &str) -> Optio
             None => out.push_str(line),
         }
     }
-    changed.then(|| out.into_bytes())
+    result.rewritten = changed.then(|| out.into_bytes());
+    result
+}
+
+/// 流式事件：是 `message_start` 时把 `message.model` 改成调用方模型；不需要改时返回 `None`。
+pub(super) fn rewrite_sse_event_model(event: &[u8], client_model: &str) -> Option<Vec<u8>> {
+    process_sse_event_model(event, Some(client_model)).rewritten
+}
+
+/// 非流式响应体里上游声明的模型（顶层 `model`，或包在 `message` 里）。
+pub(super) fn body_declared_model(value: &Value) -> Option<String> {
+    value
+        .get("model")
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("model"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
 }
 
 /// 非流式响应体：JSON 消息改顶层 `model`；上游按 SSE 返回的整段文本逐个事件改 `message_start`。
@@ -139,6 +180,35 @@ mod tests {
             keys,
             ["id", "type", "role", "model", "content", "usage"].map(String::from)
         );
+    }
+
+    #[test]
+    fn upstream_declared_model_is_reported_before_rewrite() {
+        let event = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\"}}\n\n";
+        let observed = process_sse_event_model(event, Some("claude-fable-5-2"));
+        assert_eq!(observed.upstream_model.as_deref(), Some("claude-opus-4-8"));
+        assert!(observed.rewritten.is_some());
+        // 不改写时也取得到；模型与调用方一致时不改写但仍记录。
+        let only_observe = process_sse_event_model(event, None);
+        assert_eq!(
+            only_observe.upstream_model.as_deref(),
+            Some("claude-opus-4-8")
+        );
+        assert!(only_observe.rewritten.is_none());
+        let same = process_sse_event_model(event, Some("claude-opus-4-8"));
+        assert_eq!(same.upstream_model.as_deref(), Some("claude-opus-4-8"));
+        assert!(same.rewritten.is_none());
+        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n";
+        assert_eq!(
+            process_sse_event_model(delta, Some("x")),
+            SseModelRewrite::default()
+        );
+        assert_eq!(
+            body_declared_model(&json!({"type": "message", "model": " claude-opus-4-8 "}))
+                .as_deref(),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(body_declared_model(&json!({"type": "error"})), None);
     }
 
     #[test]

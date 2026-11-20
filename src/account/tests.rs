@@ -21824,7 +21824,7 @@ async fn external_stream_returns_client_model_instead_of_upstream_model() {
     request.base_url = upstream.base_url.clone();
     request.supported_models = vec!["claude-sonnet-4-6".to_string()];
     postgres.create_account(request).await.unwrap();
-    let (mut route, _recorder) =
+    let (mut route, recorder) =
         external_stream_route("req_client_model_stream", "err_client_model_stream");
     route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
 
@@ -21838,6 +21838,12 @@ async fn external_stream_returns_client_model_instead_of_upstream_model() {
     assert_eq!(starts[0]["message"]["model"], CLIENT_REQUESTED_MODEL);
     assert_eq!(starts[0]["message"]["id"], "msg_client_model_stream");
     assert_eq!(starts[0]["message"]["usage"]["input_tokens"], 12);
+    // 用量记录保留上游实际返回的模型。
+    let record = wait_for_usage_record(&recorder, "req_client_model_stream").await;
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -21855,7 +21861,7 @@ async fn early_commit_stream_returns_client_model_instead_of_upstream_model() {
     ))
     .await;
     create_early_commit_pool(&postgres, "client-model-early", 1, &upstream.base_url).await;
-    let (mut route, _recorder) =
+    let (mut route, recorder) =
         external_stream_route("req_client_model_early", "err_client_model_early");
     route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
 
@@ -21867,6 +21873,11 @@ async fn early_commit_stream_returns_client_model_instead_of_upstream_model() {
     let starts = downstream_events_named(&events, "message_start");
     assert_eq!(starts.len(), 1, "{body}");
     assert_eq!(starts[0]["message"]["model"], CLIENT_REQUESTED_MODEL);
+    let record = wait_for_usage_record(&recorder, "req_client_model_early").await;
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -21893,6 +21904,9 @@ async fn external_non_stream_returns_client_model_instead_of_mapped_or_upstream_
     };
     let mut route = test_route(CLIENT_REQUESTED_MODEL);
     route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
+    route.request_id = "req_client_model_non_stream".to_string();
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(16));
+    route.recorder = recorder.clone();
 
     let response = match manager.forward_with_failover_result(config, route).await {
         AccountForwardOutcome::Response(response) => response,
@@ -21909,6 +21923,17 @@ async fn external_non_stream_returns_client_model_instead_of_mapped_or_upstream_
     assert_eq!(value["content"][0]["text"], "model-ok");
     let sent: serde_json::Value = serde_json::from_slice(&fake.request_bodies()[0]).unwrap();
     assert_eq!(sent["model"], "claude-opus-4-8");
+    // 记录里三个模型各归其位：调用方请求、映射后发出、上游实际返回。
+    let record = wait_for_usage_record(&recorder, "req_client_model_non_stream").await;
+    assert_eq!(record.model, CLIENT_REQUESTED_MODEL);
+    assert_eq!(
+        record.external_outbound_model.as_deref(),
+        Some("claude-opus-4-8")
+    );
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -22214,4 +22239,74 @@ fn stream_normal_usage_is_not_reparsed_or_changed() {
         assert_eq!(out, event);
     }
     assert!(!capture.lock().usage_estimated);
+}
+
+#[test]
+fn upstream_response_model_is_captured_before_rewrite_and_reaches_billing() {
+    let route = test_route("claude-sonnet-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let plan = ExternalStreamProcessingPlan::from_mode(StreamResponseMode::EventPassthrough);
+    let message_start = external_sse_message_start("msg_model", 40);
+    let out = process_sse_event_with_plan_and_transcript(
+        message_start.as_bytes(),
+        None,
+        Some(&capture),
+        None,
+        plan,
+        None,
+        Some("claude-fable-5-2"),
+    );
+    assert_eq!(
+        event_data_value(&out)["message"]["model"],
+        "claude-fable-5-2"
+    );
+    // 换号重放的第二个 message_start 不覆盖第一次记下的值。
+    let second = message_start.replace("claude-sonnet-4-6", "claude-opus-4-8");
+    process_sse_event_with_plan_and_transcript(
+        second.as_bytes(),
+        None,
+        Some(&capture),
+        None,
+        plan,
+        None,
+        Some("claude-fable-5-2"),
+    );
+    assert_eq!(
+        capture.lock().upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+    process_sse_event_with_plan_and_transcript(
+        external_sse_message_delta(40, 3).as_bytes(),
+        None,
+        Some(&capture),
+        None,
+        plan,
+        None,
+        Some("claude-fable-5-2"),
+    );
+    let billing = account_billing_from_capture_ref(&route, &pool, &capture).expect("billing");
+    assert_eq!(
+        billing.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+    // 只用于记录顶层字段，不随计费明细序列化。
+    assert!(
+        !serde_json::to_string(&billing)
+            .unwrap()
+            .contains("upstreamResponseModel")
+    );
+
+    let projected = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"type":"message","model":"claude-opus-4-8","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"output_tokens":2}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        projected.usage_capture.upstream_response_model.as_deref(),
+        Some("claude-opus-4-8")
+    );
 }

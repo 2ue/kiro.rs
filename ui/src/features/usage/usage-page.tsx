@@ -82,6 +82,7 @@ import {
   sourceLabel,
   formatExternalAttemptChain,
   upstreamModelLabel,
+  upstreamResponseModelMismatch,
 } from './usage-helpers'
 import { UsageDetailModal } from './usage-detail-modal'
 import { UsageCleanupModal } from './usage-cleanup-modal'
@@ -195,6 +196,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'endpoint',
     'requested_model',
     'upstream_model',
+    'upstream_response_model',
     'account_id',
     'account_name',
     'usage_source',
@@ -223,6 +225,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.endpoint,
     record.model,
     upstreamModelLabel(record) === '-' ? '' : upstreamModelLabel(record),
+    record.upstreamResponseModel ?? '',
     record.accountId,
     record.accountName,
     record.usageSource,
@@ -936,6 +939,14 @@ function RecordsView({
                           >
                             实际 {hasModelChange ? resolvedModel : '同请求模型'}
                           </div>
+                          {upstreamResponseModelMismatch(record) && (
+                            <div
+                              className="max-w-[220px] truncate font-mono text-[0.62rem] text-warning"
+                              title={`上游实际返回 ${record.upstreamResponseModel}，返回给调用方的仍是请求模型`}
+                            >
+                              上游返回 {record.upstreamResponseModel}
+                            </div>
+                          )}
                           <div className="mt-1 flex flex-wrap gap-1">
                             <Badge title={record.endpoint || '-'}>{record.endpoint || '-'}</Badge>
                             {record.simulated && <Badge tone="warning">{sourceLabel(record.usageSource)}</Badge>}

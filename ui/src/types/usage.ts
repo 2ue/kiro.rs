@@ -158,6 +158,8 @@ export interface UsageRecord {
   requestedMaxTokens?: number;
   upstreamModel?: string;
   externalOutboundModel?: string;
+  /** 上游实际返回的模型；返回给调用方的是请求模型，这里保留上游原值。 */
+  upstreamResponseModel?: string;
   modelResolutionSource?: string;
   modelResolutionNote?: string;
   conversationId?: string;

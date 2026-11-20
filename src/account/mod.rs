@@ -1977,6 +1977,8 @@ struct ExternalUsageCapture {
     stream_response_mode: Option<StreamResponseMode>,
     /// 上游 usage 输入或输出为 0 时的估算修复；账号透传上游 usage 或路由关闭时为 `None`。
     zero_usage_repair: Option<zero_usage_repair::ZeroUsageRepairContext>,
+    /// 上游实际返回的模型（改写成调用方模型之前）。
+    upstream_response_model: Option<String>,
     debug_stream: ExternalUsageDebugStreamCapture,
     wire_debug: ExternalWireDebugCapture,
 }
@@ -10560,6 +10562,9 @@ impl AccountManager {
             downstream_stop_reason,
             upstream_model: route.upstream_model.clone(),
             external_outbound_model,
+            upstream_response_model: billing
+                .as_ref()
+                .and_then(|billing| billing.upstream_response_model.clone()),
             model_resolution_source: route.model_resolution_source.clone(),
             model_resolution_note: route.model_resolution_note.clone(),
             conversation_id: route.stable_conversation_id(),
@@ -14333,6 +14338,7 @@ fn process_non_stream_response_usage_with_repair(
         return ProjectedNonStreamBody::without_protocol_contamination(bytes, usage_capture);
     };
     usage_capture.downstream_stop_reason = external_stop_reason_from_value(&value);
+    usage_capture.upstream_response_model = response_model::body_declared_model(&value);
     let sanitized = route.is_none_or(|route| route.history_sanitize_enabled)
         && sanitize_response_content(&mut value, known_tool_names).blocks > 0;
 
@@ -16020,9 +16026,11 @@ fn process_sse_event_with_plan_and_transcript(
             processed
         }
     };
-    let output = client_model
-        .and_then(|model| response_model::rewrite_sse_event_model(&output, model))
-        .unwrap_or(output);
+    let model_rewrite = response_model::process_sse_event_model(&output, client_model);
+    if let (Some(model), Some(capture)) = (model_rewrite.upstream_model, capture) {
+        capture.lock().upstream_response_model.get_or_insert(model);
+    }
+    let output = model_rewrite.rewritten.unwrap_or(output);
     record_external_wire_debug_sse_bytes(
         &output,
         capture,
@@ -17155,6 +17163,7 @@ fn account_billing_from_capture(
     billing.usage_candidate_path = capture.usage_candidate_path;
     billing.body_usage_projection_applied =
         capture.body_usage_projection_applied || capture.projected;
+    billing.upstream_response_model = capture.upstream_response_model;
     Some(billing)
 }
 
@@ -17203,6 +17212,7 @@ fn account_billing_from_stream_estimate(
     billing.usage_estimate_reason = Some("missing_stream_usage".to_string());
     billing.usage_candidate_path = Some("$stream.estimated".to_string());
     billing.body_usage_projection_applied = estimated.projected;
+    billing.upstream_response_model = capture.upstream_response_model;
     Some(billing)
 }
 
@@ -17248,6 +17258,7 @@ fn account_billing(
 
     AccountBilling {
         request_input_tokens: request_input_tokens.map(|tokens| tokens.max(0)),
+        upstream_response_model: None,
         raw_usage: external_usage_snapshot(raw_usage),
         shaped_usage: external_usage_snapshot(shaped_usage),
         reported_usage: external_usage_snapshot(reported_usage),
