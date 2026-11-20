@@ -230,6 +230,7 @@ export function defaultRouteFeatures(): RouteFeaturesConfig {
       channelLeakGuard: false,
       channelLeakGuardStream: true,
       modelDrivenWebSearch: false,
+      returnRequestModel: true,
     },
     pathOverrides: {},
   }

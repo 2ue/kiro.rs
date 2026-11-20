@@ -664,6 +664,10 @@ pub struct RouteFeatureSet {
     /// 原生 web_search 由模型生成搜索词，代理执行搜索，模型根据结果写带引用的回答。
     #[serde(default)]
     pub model_driven_web_search: bool,
+    /// 外部池返回给调用方的 `model` 用调用方请求的原值（默认开）；关闭时透传上游返回的模型。
+    /// 用量记录里的上游返回模型不受影响，照常记录。本地 Kiro 路径本来就返回请求模型。
+    #[serde(default = "default_true")]
+    pub return_request_model: bool,
 }
 
 impl Default for RouteFeatureSet {
@@ -674,6 +678,7 @@ impl Default for RouteFeatureSet {
             channel_leak_guard: false,
             channel_leak_guard_stream: true,
             model_driven_web_search: false,
+            return_request_model: true,
         }
     }
 }
@@ -697,6 +702,8 @@ pub struct RouteFeatureOverride {
     pub channel_leak_guard_stream: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_driven_web_search: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_request_model: Option<bool>,
 }
 
 impl RouteFeatureOverride {
@@ -759,6 +766,9 @@ impl RouteFeaturesConfig {
             if let Some(value) = route.model_driven_web_search {
                 resolved.model_driven_web_search = value;
             }
+            if let Some(value) = route.return_request_model {
+                resolved.return_request_model = value;
+            }
         }
         resolved
     }
@@ -767,6 +777,46 @@ impl RouteFeaturesConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn return_request_model_defaults_on_and_paths_can_follow_or_override() {
+        assert!(RouteFeatureSet::default().return_request_model);
+        let legacy: RouteFeaturesConfig =
+            serde_json::from_value(serde_json::json!({"defaults": {"channelLeakGuard": true}}))
+                .unwrap();
+        assert!(
+            legacy.defaults.return_request_model,
+            "老配置没有这个字段时按开处理"
+        );
+        let config: RouteFeaturesConfig = serde_json::from_value(serde_json::json!({
+            "pathOverrides": {
+                "/dfcache/a": {"returnRequestModel": false},
+                "/dfcache/b": {"channelLeakGuard": true}
+            }
+        }))
+        .unwrap();
+        assert!(
+            !config
+                .resolve("/dfcache/a/v1/messages")
+                .return_request_model
+        );
+        assert!(
+            config
+                .resolve("/dfcache/b/v1/messages")
+                .return_request_model
+        );
+        let global_off: RouteFeaturesConfig = serde_json::from_value(serde_json::json!({
+            "defaults": {"returnRequestModel": false},
+            "pathOverrides": {"/dfcache/a": {"returnRequestModel": true}}
+        }))
+        .unwrap();
+        assert!(
+            global_off
+                .resolve("/dfcache/a/v1/messages")
+                .return_request_model
+        );
+        assert!(!global_off.resolve("/cc/v1/messages").return_request_model);
+    }
 
     #[test]
     fn partial_config_fills_missing_items_with_built_in_defaults() {

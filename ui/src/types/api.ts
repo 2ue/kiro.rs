@@ -2204,6 +2204,8 @@ export interface RouteFeatureSet {
   channelLeakGuard: boolean
   channelLeakGuardStream: boolean
   modelDrivenWebSearch: boolean
+  /** 外部池返回给调用方的 model 用请求原值（默认开）；关闭时透传上游返回的模型。 */
+  returnRequestModel: boolean
 }
 
 export type RouteFeatureOverride = Partial<RouteFeatureSet>

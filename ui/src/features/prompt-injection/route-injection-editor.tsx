@@ -130,6 +130,11 @@ const GROUPS: Group[] = [
     desc: '上游没有输出时的重试。',
     rows: [{ kind: 'item', id: 'emptyTurnNudge' }],
   },
+  {
+    title: '响应',
+    desc: '返回给调用方的内容怎么处理。',
+    rows: [{ kind: 'feature', key: 'returnRequestModel' }],
+  },
 ]
 
 const FEATURE_TEXT: Record<Exclude<keyof RouteFeatureSet, 'thinkingTrigger'>, { label: string; desc: string }> = {
@@ -148,6 +153,10 @@ const FEATURE_TEXT: Record<Exclude<keyof RouteFeatureSet, 'thinkingTrigger'>, { 
   modelDrivenWebSearch: {
     label: 'WebSearch 模型驱动',
     desc: '由模型决定搜索词并写带引用的回答；每次搜索多调用 1 次模型，token 计入本次 usage。关闭时沿用模板回答。',
+  },
+  returnRequestModel: {
+    label: '返回请求模型',
+    desc: '外部池响应里的 model 用调用方请求的模型，不暴露映射后或上游实际返回的模型；关闭时透传上游返回的模型（会暴露映射后的模型）。用量记录里的上游返回模型不受影响；本地账号本来就返回请求模型。',
   },
 }
 
