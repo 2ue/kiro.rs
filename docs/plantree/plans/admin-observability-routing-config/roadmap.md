@@ -35,7 +35,7 @@
 
 ## In Progress
 
-- None.
+- [库存身份去重与模型列表交互](topics/inventory-identity-and-model-editing.md)：统一密钥查重，保留上游模型 ID、统一清空/撤销草稿交互；main 与 forced-main 发布，claude-main 仅同步模型部分。
 
 ## Next
 
