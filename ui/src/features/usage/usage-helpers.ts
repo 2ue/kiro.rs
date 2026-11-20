@@ -135,6 +135,14 @@ export function upstreamModelLabel(record: UsageRecord): string {
   return `${model}${source}`
 }
 
+/** 上游实际返回的模型与发给上游的模型不一致（忽略大小写）时返回上游返回值，否则返回 null。 */
+export function upstreamResponseModelMismatch(record: UsageRecord): string | null {
+  const returned = record.upstreamResponseModel?.trim()
+  if (!returned) return null
+  const sent = record.externalOutboundModel || record.upstreamModel || record.model
+  return returned.toLowerCase() === (sent || '').trim().toLowerCase() ? null : returned
+}
+
 export function resolvedModelLabel(record: UsageRecord): string {
   const model = record.upstreamModel || record.model || '-'
   const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''

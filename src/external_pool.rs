@@ -107,10 +107,14 @@ mod body_pipeline;
 mod early_commit;
 #[path = "external_pool/model_pipeline.rs"]
 mod model_pipeline;
+#[path = "external_pool/response_model.rs"]
+mod response_model;
 #[path = "external_pool/retry_pipeline.rs"]
 mod retry_pipeline;
 #[path = "external_pool/usage_projection.rs"]
 mod usage_projection;
+#[path = "external_pool/zero_usage_repair.rs"]
+mod zero_usage_repair;
 
 use early_commit::EarlyCommitTaskGuard;
 pub use early_commit::ExternalEarlyCommitDownstream;
@@ -1133,6 +1137,10 @@ pub struct ExternalRouteRequest {
     pub payload: Option<MessagesRequest>,
     pub body_mode_filter: Option<ExternalPoolRequestBodyMode>,
     pub model_hint: Option<String>,
+    /// 调用方请求体里的原始模型名；返回给调用方的 `model` 一律用它，不暴露映射后或上游实际的模型。
+    pub client_model: Option<String>,
+    /// 路由缓存策略里的零用量估算规则。
+    pub zero_usage_repair: crate::model::config::ZeroUsageRepairPolicy,
     pub stream_hint: Option<bool>,
     pub request_input_tokens: i32,
     pub upstream_model: Option<String>,
@@ -1901,6 +1909,10 @@ struct ExternalUsageCapture {
     stream_error_message: Option<String>,
     raw_upstream_error: Option<RawUpstreamError>,
     stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+    /// 上游 usage 输入或输出为 0 时的估算修复；外部池透传上游 usage 或路由关闭时为 `None`。
+    zero_usage_repair: Option<zero_usage_repair::ZeroUsageRepairContext>,
+    /// 上游实际返回的模型（改写成调用方模型之前）。
+    upstream_response_model: Option<String>,
     debug_stream: ExternalUsageDebugStreamCapture,
     wire_debug: ExternalWireDebugCapture,
 }
@@ -7477,6 +7489,7 @@ impl ExternalPoolManager {
             let upstream_chunk_index =
                 crate::diagnostics::capture::is_active().then(|| Arc::new(AtomicU64::new(0)));
             let stream_plan = ExternalStreamProcessingPlan::for_pool(pool, config);
+            let client_model: Option<Arc<str>> = route.client_model.as_deref().map(Arc::from);
             let projection_context = build_external_usage_projection_context(
                 route,
                 pool,
@@ -7491,6 +7504,11 @@ impl ExternalPoolManager {
             let stream_usage_projection = projection_context.clone();
             let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
                 stream_response_mode: Some(stream_plan.response_mode),
+                zero_usage_repair: zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+                    route,
+                    pool,
+                    projection_context.as_ref(),
+                ),
                 ..ExternalUsageCapture::default()
             }));
             let stream_usage_capture = usage_capture.clone();
@@ -7603,6 +7621,7 @@ impl ExternalPoolManager {
                     let latency_trace = latency_trace.clone();
                     let stream_error_mask = stream_error_mask.clone();
                     let transcript_state = transcript_state.clone();
+                    let client_model = client_model.clone();
                     let early_commit_downstream = early_commit_downstream.clone();
                     let upstream_chunk_index = upstream_chunk_index.clone();
                     let capture_request_id = capture_request_id.clone();
@@ -7635,6 +7654,7 @@ impl ExternalPoolManager {
                                 Some(stream_error_mask.as_ref()),
                                 stream_plan,
                                 Some(&mut transcript_state.lock()),
+                                client_model.as_deref(),
                             );
                             if !projected.is_empty() {
                                 last_keepalive_at = Instant::now();
@@ -7674,6 +7694,7 @@ impl ExternalPoolManager {
                                                 Some(stream_error_mask.as_ref()),
                                                 stream_plan,
                                                 Some(&mut transcript_state.lock()),
+                                                client_model.as_deref(),
                                             );
                                             if !projected.is_empty() {
                                                 last_keepalive_at = Instant::now();
@@ -7753,6 +7774,7 @@ impl ExternalPoolManager {
                                                     Some(stream_error_mask.as_ref()),
                                                     stream_plan,
                                                     Some(&mut transcript_state.lock()),
+                                                    client_model.as_deref(),
                                                 )
                                             };
                                             {
@@ -7947,11 +7969,16 @@ impl ExternalPoolManager {
                     })
                 },
             );
-            let projected = process_non_stream_response_usage(
+            let projected = process_non_stream_response_usage_with_repair(
                 bytes,
                 Some(route),
                 projection_context.as_ref(),
                 known_tool_names.iter().cloned(),
+                zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+                    route,
+                    pool,
+                    projection_context.as_ref(),
+                ),
             );
             external_pool_usage_debug_non_stream_record(ExternalUsageDebugNonStreamRecordContext {
                 config,
@@ -7986,7 +8013,10 @@ impl ExternalPoolManager {
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
             let upstream_declared_sse = response_headers_look_like_sse(&response_headers);
-            let downstream_body = projected.body;
+            let downstream_body = match route.client_model.as_deref() {
+                Some(model) => response_model::rewrite_body_model(projected.body, model),
+                None => projected.body,
+            };
             crate::diagnostics::capture::record("client_response", Some(&route.request_id), || {
                 serde_json::json!({
                     "kind": "external",
@@ -9937,6 +9967,7 @@ impl ExternalPoolManager {
             UsageErrorDiagnostics::default(),
             billing,
             downstream_stop_reason,
+            None,
         );
     }
 
@@ -9965,6 +9996,7 @@ impl ExternalPoolManager {
                 public_error: None,
                 raw_upstream_error: None,
             },
+            None,
             None,
             None,
         );
@@ -10002,6 +10034,7 @@ impl ExternalPoolManager {
             Some(error_message.to_string()),
             Some(error_detail),
             diagnostics,
+            None,
             None,
             None,
         );
@@ -10120,7 +10153,14 @@ impl ExternalPoolManager {
         error_diagnostics: UsageErrorDiagnostics,
         billing: Option<ExternalPoolBilling>,
         downstream_stop_reason: Option<String>,
+        upstream_response_model: Option<String>,
     ) {
+        // 失败或断开的流没有计费明细，上游模型由调用方从采集状态直接给出。
+        let upstream_response_model = upstream_response_model.or_else(|| {
+            billing
+                .as_ref()
+                .and_then(|billing| billing.upstream_response_model.clone())
+        });
         let request_input_tokens = if route.request_input_tokens > 0 {
             route.request_input_tokens
         } else {
@@ -10175,6 +10215,7 @@ impl ExternalPoolManager {
             downstream_stop_reason,
             upstream_model: route.upstream_model.clone(),
             external_outbound_model,
+            upstream_response_model,
             model_resolution_source: route.model_resolution_source.clone(),
             model_resolution_note: route.model_resolution_note.clone(),
             conversation_id: route.stable_conversation_id(),
@@ -10376,6 +10417,12 @@ fn record_external_stream_end(
 }
 
 impl ExternalStreamUsageGuard {
+    fn upstream_response_model(&self) -> Option<String> {
+        self.usage_capture
+            .as_ref()
+            .and_then(|capture| capture.lock().upstream_response_model.clone())
+    }
+
     fn record_downstream_chunk(&mut self, chunk: &Bytes) {
         self.downstream_chunks_forwarded = self.downstream_chunks_forwarded.saturating_add(1);
         self.downstream_bytes_forwarded = self
@@ -10493,6 +10540,7 @@ impl ExternalStreamUsageGuard {
                 },
                 None,
                 None,
+                self.upstream_response_model(),
             );
             self.completed = true;
             return;
@@ -10635,6 +10683,7 @@ impl ExternalStreamUsageGuard {
             },
             None,
             None,
+            self.upstream_response_model(),
         );
         self.completed = true;
     }
@@ -10699,6 +10748,7 @@ impl ExternalStreamUsageGuard {
             },
             None,
             None,
+            self.upstream_response_model(),
         );
         self.completed = true;
     }
@@ -11849,6 +11899,7 @@ where
                 Some(stream_error_mask),
                 stream_plan,
                 Some(&mut transcript_state.lock()),
+                route.client_model.as_deref(),
             ));
             if prefix.len() > EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES {
                 tracing::warn!(
@@ -13924,11 +13975,22 @@ fn maybe_project_non_stream_usage_with_tools(
     process_non_stream_response_usage(bytes, None, projection, known_tool_names)
 }
 
+#[cfg(test)]
 fn process_non_stream_response_usage(
     bytes: Bytes,
     route: Option<&ExternalRouteRequest>,
     projection: Option<&ExternalUsageProjectionContext>,
     known_tool_names: impl IntoIterator<Item = String>,
+) -> ProjectedNonStreamBody {
+    process_non_stream_response_usage_with_repair(bytes, route, projection, known_tool_names, None)
+}
+
+fn process_non_stream_response_usage_with_repair(
+    bytes: Bytes,
+    route: Option<&ExternalRouteRequest>,
+    projection: Option<&ExternalUsageProjectionContext>,
+    known_tool_names: impl IntoIterator<Item = String>,
+    zero_repair: Option<zero_usage_repair::ZeroUsageRepairContext>,
 ) -> ProjectedNonStreamBody {
     let mut usage_capture = ExternalUsageCapture::default();
     usage_capture.request_input_tokens =
@@ -13946,6 +14008,7 @@ fn process_non_stream_response_usage(
         return ProjectedNonStreamBody::without_protocol_contamination(bytes, usage_capture);
     };
     usage_capture.downstream_stop_reason = external_stop_reason_from_value(&value);
+    usage_capture.upstream_response_model = response_model::body_declared_model(&value);
     let sanitization = sanitize_response_content(&mut value, known_tool_names);
     let sanitized = sanitization.blocks > 0;
 
@@ -13963,9 +14026,25 @@ fn process_non_stream_response_usage(
                 };
             };
             let normalized = normalize_external_usage_value(usage);
-            usage_capture.raw = normalized.usage;
-            usage_capture.reported = normalized.usage;
-            changed |= normalized.changed;
+            let repaired = zero_repair
+                .map(|ctx| {
+                    zero_usage_repair::repair_usage_value(
+                        usage,
+                        None,
+                        response_output_estimate.unwrap_or(0),
+                        &ctx.with_known_request_input_tokens(usage_capture.request_input_tokens),
+                    )
+                })
+                .unwrap_or_default();
+            let raw_usage = if repaired.any() {
+                zero_usage_repair::mark_estimated(&mut usage_capture, repaired);
+                cache_usage_from_any_value(usage)
+            } else {
+                normalized.usage
+            };
+            usage_capture.raw = raw_usage;
+            usage_capture.reported = raw_usage;
+            changed |= normalized.changed || repaired.any();
 
             if let Some(projected) =
                 project_usage_value(usage, projection, true, response_output_estimate)
@@ -14014,6 +14093,13 @@ fn process_non_stream_response_usage(
             &mut value,
             anthropic_usage_value_for_body(estimated.reported, estimated.projected),
         );
+        if let Some(ctx) = zero_repair.as_ref() {
+            zero_usage_repair::apply_fallback_to_estimated_body(
+                &mut value,
+                &mut usage_capture,
+                ctx,
+            );
+        }
         let body = serde_json::to_vec(&value)
             .map(Bytes::from)
             .unwrap_or_else(|_| bytes.clone());
@@ -15548,6 +15634,7 @@ fn process_sse_event_with_plan(
         stream_error_mask,
         plan,
         None,
+        None,
     )
 }
 
@@ -15558,6 +15645,7 @@ fn process_sse_event_with_plan_and_transcript(
     stream_error_mask: Option<&ExternalStreamErrorMask>,
     plan: ExternalStreamProcessingPlan,
     transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
+    client_model: Option<&str>,
 ) -> Vec<u8> {
     record_external_usage_debug_sse_event(event, capture, plan);
     record_external_wire_debug_sse_bytes(
@@ -15566,6 +15654,8 @@ fn process_sse_event_with_plan_and_transcript(
         plan,
         ExternalWireDebugStreamSide::RawUpstream,
     );
+    let repaired = capture.and_then(|capture| zero_usage_repair::repair_sse_event(event, capture));
+    let event: &[u8] = repaired.as_deref().unwrap_or(event);
     let masked = plan
         .mask_errors
         .then(|| maybe_mask_external_stream_error_event(event, capture, stream_error_mask))
@@ -15589,6 +15679,11 @@ fn process_sse_event_with_plan_and_transcript(
             processed
         }
     };
+    let model_rewrite = response_model::process_sse_event_model(&output, client_model);
+    if let (Some(model), Some(capture)) = (model_rewrite.upstream_model, capture) {
+        capture.lock().upstream_response_model.get_or_insert(model);
+    }
+    let output = model_rewrite.rewritten.unwrap_or(output);
     record_external_wire_debug_sse_bytes(
         &output,
         capture,
@@ -15641,12 +15736,21 @@ fn drain_sse_events(
     stream_error_mask: Option<&ExternalStreamErrorMask>,
     plan: ExternalStreamProcessingPlan,
 ) -> Vec<u8> {
-    drain_sse_events_with_transcript(buffer, projection, capture, stream_error_mask, plan, None)
+    drain_sse_events_with_transcript(
+        buffer,
+        projection,
+        capture,
+        stream_error_mask,
+        plan,
+        None,
+        None,
+    )
 }
 
 /// 提交后流的 SSE 处理：普通模式等同 `drain_sse_events_with_transcript`；提前提交模式下额外
 /// 丢弃重复的 message_start（下游已经收到过），并用上游真实 message_start 的输入侧用量补全
 /// message_delta 缺失的字段（下游收到的 message_start 用量已清零）。
+#[allow(clippy::too_many_arguments)]
 fn drain_sse_events_for_downstream(
     early_commit: Option<&ExternalEarlyCommitDownstream>,
     buffer: &mut Vec<u8>,
@@ -15655,6 +15759,7 @@ fn drain_sse_events_for_downstream(
     stream_error_mask: Option<&ExternalStreamErrorMask>,
     plan: ExternalStreamProcessingPlan,
     mut transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
+    client_model: Option<&str>,
 ) -> Vec<u8> {
     let Some(early_commit) = early_commit else {
         return drain_sse_events_with_transcript(
@@ -15664,6 +15769,7 @@ fn drain_sse_events_for_downstream(
             stream_error_mask,
             plan,
             transcript_state,
+            client_model,
         );
     };
     let mut out = Vec::new();
@@ -15677,6 +15783,7 @@ fn drain_sse_events_for_downstream(
             stream_error_mask,
             plan,
             transcript_state.as_deref_mut(),
+            client_model,
         );
         if early_commit.message_start_sent() && early_commit::sse_event_is_message_start(&processed)
         {
@@ -15700,6 +15807,7 @@ fn drain_sse_events_with_transcript(
     stream_error_mask: Option<&ExternalStreamErrorMask>,
     plan: ExternalStreamProcessingPlan,
     mut transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
+    client_model: Option<&str>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
@@ -15712,6 +15820,7 @@ fn drain_sse_events_with_transcript(
             stream_error_mask,
             plan,
             transcript_state.as_deref_mut(),
+            client_model,
         ));
     }
     out
@@ -16718,6 +16827,7 @@ fn external_pool_billing_from_capture(
     billing.usage_candidate_path = capture.usage_candidate_path;
     billing.body_usage_projection_applied =
         capture.body_usage_projection_applied || capture.projected;
+    billing.upstream_response_model = capture.upstream_response_model;
     Some(billing)
 }
 
@@ -16766,6 +16876,7 @@ fn external_pool_billing_from_stream_estimate(
     billing.usage_estimate_reason = Some("missing_stream_usage".to_string());
     billing.usage_candidate_path = Some("$stream.estimated".to_string());
     billing.body_usage_projection_applied = estimated.projected;
+    billing.upstream_response_model = capture.upstream_response_model;
     Some(billing)
 }
 
@@ -16811,6 +16922,7 @@ fn external_pool_billing(
 
     ExternalPoolBilling {
         request_input_tokens: request_input_tokens.map(|tokens| tokens.max(0)),
+        upstream_response_model: None,
         raw_usage: external_usage_snapshot(raw_usage),
         shaped_usage: external_usage_snapshot(shaped_usage),
         reported_usage: external_usage_snapshot(reported_usage),

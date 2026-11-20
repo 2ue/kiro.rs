@@ -8231,6 +8231,7 @@ mod tests {
             downstream_stop_reason: None,
             upstream_model: None,
             external_outbound_model: None,
+            upstream_response_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
             conversation_id: Some("redis-dashboard-session".to_string()),
@@ -8960,6 +8961,7 @@ mod tests {
         external.external_pool_name = Some("backup-a".to_string());
         external.external_pool_billing = Some(ExternalPoolBilling {
             request_input_tokens: None,
+            upstream_response_model: None,
             raw_usage: ExternalPoolUsageSnapshot::default(),
             shaped_usage: ExternalPoolUsageSnapshot::default(),
             reported_usage: ExternalPoolUsageSnapshot::default(),

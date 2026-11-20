@@ -25,6 +25,7 @@ import {
   statusLabel,
   statusTone,
   upstreamModelLabel,
+  upstreamResponseModelMismatch,
 } from './usage-helpers'
 import { UsageCostBreakdown, UsageCostTiles, usageRecordCostModel } from './usage-billing'
 import { RequestApiKeyIdDisplay } from './request-api-key-id'
@@ -350,6 +351,14 @@ export function UsageDetailModal({
             <DetailField label="会话 ID" value={record.conversationId || '-'} mono />
             <DetailField label="模型（请求）" value={record.model} />
             <DetailField label="模型（上游）" value={upstreamModelLabel(record)} />
+            {record.upstreamResponseModel && (
+              <DetailField
+                label="模型（上游返回）"
+                value={upstreamResponseModelMismatch(record)
+                  ? `${record.upstreamResponseModel}（与发出的模型不一致，返回给调用方的仍是请求模型）`
+                  : record.upstreamResponseModel}
+              />
+            )}
             {showExternalResolvedModel && (
               <DetailField label="模型（本地解析）" value={resolvedModelLabel(record)} />
             )}

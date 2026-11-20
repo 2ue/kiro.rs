@@ -913,6 +913,7 @@ struct ExternalFallbackContext {
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_route_namespace: Option<String>,
     cache_ttl_mode: crate::model::config::CacheTtlMode,
+    zero_usage_repair: crate::model::config::ZeroUsageRepairPolicy,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -1316,6 +1317,7 @@ impl RequestRuntimeConfig {
             cold_request_guard: crate::model::config::ColdRequestGuardPolicy::default(),
             kiro_rs_tool_plus: crate::model::config::KiroRsToolPlusCachePolicy::default(),
             cache_ttl: crate::model::config::CacheTtlPolicy::default(),
+            zero_usage_repair: crate::model::config::ZeroUsageRepairPolicy::default(),
         }
         .normalized()
     }
@@ -2000,6 +2002,8 @@ fn raw_external_route_request_with_hints(
         endpoint: endpoint.to_string(),
         payload: None,
         body_mode_filter: Some(ExternalPoolRequestBodyMode::RawPassthrough),
+        client_model: model_hint.clone(),
+        zero_usage_repair: policy.zero_usage_repair,
         model_hint,
         stream_hint,
         request_input_tokens: 0,
@@ -2095,6 +2099,7 @@ fn build_external_fallback_context(
         prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
         prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
         cache_ttl_mode: policy.cache_ttl.external_pool,
+        zero_usage_repair: policy.zero_usage_repair,
         prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
         prompt_cache_token_scale: policy.simulation.token_scale,
         prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
@@ -2593,6 +2598,13 @@ impl ExternalFallbackContext {
             endpoint: self.endpoint.clone(),
             payload: Some(self.payload.clone()),
             body_mode_filter: external_fallback_body_mode_filter(self.requires_normalized_body),
+            // 调用方原值：取原始请求体探测结果，不用已规范化（小写）的解析模型。
+            client_model: self
+                .effective_raw_probe
+                .model
+                .clone()
+                .or_else(|| Some(self.payload.model.clone())),
+            zero_usage_repair: self.zero_usage_repair,
             model_hint: None,
             stream_hint: None,
             request_input_tokens: self.request_input_tokens.max(0),
@@ -5568,6 +5580,7 @@ impl CredentialUsageContext {
             model: self.request.model.clone(),
             upstream_model: self.request.upstream_model.clone(),
             external_outbound_model: None,
+            upstream_response_model: None,
             model_resolution_source: self.request.model_resolution_source.clone(),
             model_resolution_note: self.request.model_resolution_note.clone(),
             requested_max_tokens: (self.request.requested_max_tokens > 0)

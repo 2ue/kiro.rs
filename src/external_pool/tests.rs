@@ -2499,6 +2499,11 @@ async fn external_pool_stream_error_after_content_start_does_not_replay_request(
     assert_eq!(record.status, UsageRecordStatus::StreamError);
     assert_eq!(record.error_type.as_deref(), Some("stream_error"));
     assert_eq!(record.external_attempts.len(), 1);
+    // 流式出错的记录没有计费明细，上游返回的模型仍从采集状态记下。
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
     assert_eq!(record.external_attempts[0].action, "success");
     assert_eq!(
         record.external_attempts[0].pool_name,
@@ -12056,6 +12061,8 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         }),
         body_mode_filter: Some(ExternalPoolRequestBodyMode::Normalized),
         model_hint: None,
+        client_model: None,
+        zero_usage_repair: Default::default(),
         stream_hint: None,
         request_input_tokens: 1,
         upstream_model: None,
@@ -13331,6 +13338,8 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         payload: Some(payload),
         body_mode_filter: Some(ExternalPoolRequestBodyMode::Normalized),
         model_hint: None,
+        client_model: None,
+        zero_usage_repair: Default::default(),
         stream_hint: None,
         request_input_tokens,
         upstream_model: Some(model.to_string()),
@@ -18738,6 +18747,7 @@ fn process_external_transcript_stream_one_byte_at_a_time(stream: &[u8]) -> Vec<u
             None,
             plan,
             Some(&mut state),
+            None,
         ));
     }
     assert!(buffer.is_empty());
@@ -19189,6 +19199,7 @@ fn external_sse_atomic_overflow_records_stream_failure_and_stops_terminal_succes
             None,
             plan,
             Some(&mut state),
+            None,
         ));
     }
     let output = String::from_utf8(output).unwrap();
@@ -22466,4 +22477,514 @@ async fn early_commit_with_current_path_usage_projection_still_zeroes_message_st
     let record = wait_for_usage_record(&recorder, request_id).await;
     assert_eq!(record.status, UsageRecordStatus::Success);
     postgres.drop_test_schema().await.unwrap();
+}
+
+/// 调用方请求的模型和上游实际返回的模型不一致（账号映射、模型目录兜底或上游自己换了模型）时，
+/// 返回给调用方的 `model` 必须是调用方请求的原值，不能漏出上游模型。
+const CLIENT_REQUESTED_MODEL: &str = "claude-fable-5-2";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_stream_returns_client_model_instead_of_upstream_model() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_client_model_stream",
+        "hello",
+        12,
+        3,
+    ))
+    .await;
+    let mut request = create_pool_request("client-model-stream", 1, true);
+    request.base_url = upstream.base_url.clone();
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    postgres.create_external_pool(request).await.unwrap();
+    let (mut route, recorder) =
+        external_stream_route("req_client_model_stream", "err_client_model_stream");
+    route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
+
+    let response = forward_early_commit(&manager, external_stream_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(!body.contains("claude-sonnet-4-6"), "{body}");
+    let events = parse_downstream_sse(&body);
+    let starts = downstream_events_named(&events, "message_start");
+    assert_eq!(starts.len(), 1, "{body}");
+    assert_eq!(starts[0]["message"]["model"], CLIENT_REQUESTED_MODEL);
+    assert_eq!(starts[0]["message"]["id"], "msg_client_model_stream");
+    assert_eq!(starts[0]["message"]["usage"]["input_tokens"], 12);
+    // 用量记录保留上游实际返回的模型。
+    let record = wait_for_usage_record(&recorder, "req_client_model_stream").await;
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_stream_returns_client_model_instead_of_upstream_model() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_client_model_early",
+        "hello",
+        12,
+        3,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "client-model-early", 1, &upstream.base_url).await;
+    let (mut route, recorder) =
+        external_stream_route("req_client_model_early", "err_client_model_early");
+    route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
+
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(!body.contains("claude-sonnet-4-6"), "{body}");
+    let events = parse_downstream_sse(&body);
+    let starts = downstream_events_named(&events, "message_start");
+    assert_eq!(starts.len(), 1, "{body}");
+    assert_eq!(starts[0]["message"]["model"], CLIENT_REQUESTED_MODEL);
+    let record = wait_for_usage_record(&recorder, "req_client_model_early").await;
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_non_stream_returns_client_model_instead_of_mapped_or_upstream_model() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    // 账号把 claude-fable-5-2 映射成 claude-opus-4-8 发出去，上游又回了 claude-sonnet-4-6。
+    let fake =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("model-ok"))
+            .await;
+    let mut pool_request = create_pool_request("client-model-non-stream", 1, true);
+    pool_request.base_url = fake.base_url.clone();
+    pool_request.model_mapping_mode = ExternalPoolModelMappingMode::DirectMapping;
+    pool_request.model_mapping_rules = vec![model_rule(CLIENT_REQUESTED_MODEL, "claude-opus-4-8")];
+    postgres.create_external_pool(pool_request).await.unwrap();
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 4,
+        external_pool_retry_max_attempts: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route(CLIENT_REQUESTED_MODEL);
+    route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
+    route.request_id = "req_client_model_non_stream".to_string();
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(16));
+    route.recorder = recorder.clone();
+
+    let response = match manager.forward_with_failover_result(config, route).await {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("account dispatch should succeed: {}", error.message)
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_response_body_text_allow_error(response).await.0;
+    assert!(!body.contains("claude-sonnet-4-6"), "{body}");
+    assert!(!body.contains("claude-opus-4-8"), "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["model"], CLIENT_REQUESTED_MODEL);
+    assert_eq!(value["content"][0]["text"], "model-ok");
+    let sent: serde_json::Value = serde_json::from_slice(&fake.request_bodies()[0]).unwrap();
+    assert_eq!(sent["model"], "claude-opus-4-8");
+    // 记录里三个模型各归其位：调用方请求、映射后发出、上游实际返回。
+    let record = wait_for_usage_record(&recorder, "req_client_model_non_stream").await;
+    assert_eq!(record.model, CLIENT_REQUESTED_MODEL);
+    assert_eq!(
+        record.external_outbound_model.as_deref(),
+        Some("claude-opus-4-8")
+    );
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+fn zero_repair_pool() -> ExternalPool {
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    pool
+}
+
+const ZERO_USAGE_REPLY_TEXT: &str =
+    "Distributed consensus lets replicas agree on one ordered log even when some nodes fail.";
+
+#[test]
+fn non_stream_partial_zero_usage_is_estimated_when_route_keeps_upstream_usage() {
+    let route = test_route("claude-sonnet-4-6");
+    let pool = zero_repair_pool();
+    let request_estimate = estimated_external_request_input_tokens(&route, None);
+    assert!(request_estimate > 0);
+    let repair = || zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pool, None);
+
+    // 输入为 0、输出正常：只补输入。
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":25}}"#,
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        repair(),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    assert_eq!(value["usage"]["input_tokens"], request_estimate);
+    assert_eq!(value["usage"]["output_tokens"], 25);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_input")
+    );
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    assert!(billing.usage_estimated);
+    assert_eq!(billing.raw_usage.input_tokens, request_estimate);
+    assert_eq!(billing.raw_usage.output_tokens, 25);
+
+    // 输入正常、输出为 0：按回复内容估算输出。
+    let body = Bytes::from(
+        serde_json::json!({
+            "type": "message",
+            "content": [{"type": "text", "text": ZERO_USAGE_REPLY_TEXT}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 300, "output_tokens": 0}
+        })
+        .to_string(),
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        repair(),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    assert_eq!(value["usage"]["input_tokens"], 300);
+    let output = value["usage"]["output_tokens"].as_i64().unwrap();
+    assert!(output > 0, "{value}");
+    assert_eq!(
+        i64::from(projected.usage_capture.raw.unwrap().output_tokens),
+        output
+    );
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_output")
+    );
+}
+
+#[test]
+fn non_stream_partial_zero_usage_is_untouched_for_pass_through_accounts_or_disabled_route() {
+    let mut route = test_route("claude-sonnet-4-6");
+    let pass_through = test_pool("http://pool.example.com", false);
+    assert!(
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pass_through, None)
+            .is_none()
+    );
+    route.zero_usage_repair.input.enabled = false;
+    route.zero_usage_repair.output.enabled = false;
+    assert!(
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &zero_repair_pool(), None)
+            .is_none()
+    );
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":0,"output_tokens":25}}"#,
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body.clone(),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        None,
+    );
+    assert_eq!(projected.body, body);
+    assert!(!projected.usage_capture.usage_estimated);
+}
+
+#[test]
+fn non_stream_all_zero_usage_with_empty_reply_uses_output_fallback() {
+    let mut route = test_route("claude-sonnet-4-6");
+    route.zero_usage_repair.output.fallback = crate::model::config::ZeroUsageFallback::Range;
+    route.zero_usage_repair.output.min_tokens = 4;
+    route.zero_usage_repair.output.max_tokens = 6;
+    let pool = zero_repair_pool();
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}"#,
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pool, None),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    let output = value["usage"]["output_tokens"].as_i64().unwrap();
+    assert!((4..=6).contains(&output), "{value}");
+    assert!(value["usage"]["input_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(
+        i64::from(projected.usage_capture.raw.unwrap().output_tokens),
+        output
+    );
+    assert_eq!(
+        i64::from(projected.usage_capture.reported.unwrap().output_tokens),
+        output
+    );
+
+    // 兜底为保持估算时与现状一致：输出仍是 0。
+    let mut keep_route = test_route("claude-sonnet-4-6");
+    keep_route.zero_usage_repair.output.fallback = crate::model::config::ZeroUsageFallback::Keep;
+    let projected = process_non_stream_response_usage_with_repair(
+        Bytes::from_static(
+            br#"{"type":"message","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0}}"#,
+        ),
+        Some(&keep_route),
+        None,
+        std::iter::empty::<String>(),
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&keep_route, &pool, None),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).unwrap();
+    assert_eq!(value["usage"]["output_tokens"], 0);
+}
+
+#[test]
+fn non_stream_zero_output_repair_feeds_route_shaping() {
+    let mut route = test_route("claude-sonnet-4-6");
+    configure_usage_projection_test_path(&mut route, ReportedUsagePathPolicy::default());
+    let pool = zero_repair_pool();
+    let projection = projection_context(&route, &pool, 0).expect("route shaping projection");
+    let ctx =
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pool, Some(&projection))
+            .expect("repair context");
+    let body = Bytes::from(
+        serde_json::json!({
+            "type": "message",
+            "content": [{"type": "text", "text": ZERO_USAGE_REPLY_TEXT}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
+        })
+        .to_string(),
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        Some(&projection),
+        std::iter::empty::<String>(),
+        Some(ctx.clone()),
+    );
+    assert!(projected.usage_capture.projected);
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    assert!(reported.output_tokens > 0, "{reported:?}");
+    assert!(reported.total_input_tokens > 0, "{reported:?}");
+
+    // 只有输出为 0：补出来的输出作为原始用量参与整形。
+    let body = Bytes::from(
+        serde_json::json!({
+            "type": "message",
+            "content": [{"type": "text", "text": ZERO_USAGE_REPLY_TEXT}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 900, "output_tokens": 0}
+        })
+        .to_string(),
+    );
+    let projected = process_non_stream_response_usage_with_repair(
+        body,
+        Some(&route),
+        Some(&projection),
+        std::iter::empty::<String>(),
+        Some(ctx),
+    );
+    assert!(projected.usage_capture.projected);
+    let raw = projected.usage_capture.raw.expect("raw usage");
+    assert_eq!(raw.input_tokens, 900);
+    assert!(raw.output_tokens > 0);
+    assert!(projected.usage_capture.reported.unwrap().output_tokens > 0);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_output")
+    );
+}
+
+#[test]
+fn stream_zero_usage_repairs_only_the_final_usage_event() {
+    let mut route = test_route("claude-sonnet-4-6");
+    payload_mut(&mut route).stream = true;
+    refresh_test_route_derived_state(&mut route);
+    let pool = zero_repair_pool();
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        zero_usage_repair: zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+            &route, &pool, None,
+        ),
+        ..ExternalUsageCapture::default()
+    }));
+    let plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+    let message_start = external_sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {"id": "m", "type": "message", "role": "assistant", "content": [],
+                        "model": "claude-sonnet-4-6", "usage": {"input_tokens": 0, "output_tokens": 0}}
+        }),
+    );
+    let message_delta = external_sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 0}
+        }),
+    );
+    let mut downstream = Vec::new();
+    for event in [
+        message_start.clone(),
+        external_sse_text_start(),
+        external_sse_text_delta(ZERO_USAGE_REPLY_TEXT),
+        external_sse_text_stop(),
+        message_delta,
+    ] {
+        downstream.push(process_sse_event_with_plan_and_transcript(
+            event.as_bytes(),
+            None,
+            Some(&capture),
+            None,
+            plan,
+            None,
+            None,
+        ));
+    }
+    assert_eq!(downstream[0], message_start.as_bytes());
+    let delta = event_data_value(&downstream[4]);
+    let request_estimate = estimated_external_request_input_tokens(&route, None);
+    assert_eq!(delta["usage"]["input_tokens"], request_estimate);
+    assert!(
+        delta["usage"]["output_tokens"].as_i64().unwrap() > 0,
+        "{delta}"
+    );
+    assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+    let capture = capture.lock();
+    let raw = capture.raw.expect("raw usage");
+    assert_eq!(raw.input_tokens, request_estimate);
+    assert!(raw.output_tokens > 0);
+    assert_eq!(
+        capture.usage_estimate_reason.as_deref(),
+        Some("zero_upstream_input_output")
+    );
+}
+
+#[test]
+fn stream_normal_usage_is_not_reparsed_or_changed() {
+    let route = test_route("claude-sonnet-4-6");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        zero_usage_repair: zero_usage_repair::ZeroUsageRepairContext::for_attempt(
+            &route,
+            &zero_repair_pool(),
+            None,
+        ),
+        ..ExternalUsageCapture::default()
+    }));
+    let plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+    for event in external_stream_success_steps("msg_normal", "hello", 120, 9)
+        .into_iter()
+        .filter_map(|step| match step {
+            ExternalStreamFakeStep::Chunk(bytes) => Some(bytes),
+            _ => None,
+        })
+    {
+        let out = process_sse_event_with_plan_and_transcript(
+            &event,
+            None,
+            Some(&capture),
+            None,
+            plan,
+            None,
+            None,
+        );
+        assert_eq!(out, event);
+    }
+    assert!(!capture.lock().usage_estimated);
+}
+
+#[test]
+fn upstream_response_model_is_captured_before_rewrite_and_reaches_billing() {
+    let route = test_route("claude-sonnet-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+    let message_start = external_sse_message_start("msg_model", 40);
+    let out = process_sse_event_with_plan_and_transcript(
+        message_start.as_bytes(),
+        None,
+        Some(&capture),
+        None,
+        plan,
+        None,
+        Some("claude-fable-5-2"),
+    );
+    assert_eq!(
+        event_data_value(&out)["message"]["model"],
+        "claude-fable-5-2"
+    );
+    // 换号重放的第二个 message_start 不覆盖第一次记下的值。
+    let second = message_start.replace("claude-sonnet-4-6", "claude-opus-4-8");
+    process_sse_event_with_plan_and_transcript(
+        second.as_bytes(),
+        None,
+        Some(&capture),
+        None,
+        plan,
+        None,
+        Some("claude-fable-5-2"),
+    );
+    assert_eq!(
+        capture.lock().upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+    process_sse_event_with_plan_and_transcript(
+        external_sse_message_delta(40, 3).as_bytes(),
+        None,
+        Some(&capture),
+        None,
+        plan,
+        None,
+        Some("claude-fable-5-2"),
+    );
+    let billing = external_pool_billing_from_capture_ref(&route, &pool, &capture).expect("billing");
+    assert_eq!(
+        billing.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+    // 只用于记录顶层字段，不随计费明细序列化。
+    assert!(
+        !serde_json::to_string(&billing)
+            .unwrap()
+            .contains("upstreamResponseModel")
+    );
+
+    let projected = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"type":"message","model":"claude-opus-4-8","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"output_tokens":2}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        projected.usage_capture.upstream_response_model.as_deref(),
+        Some("claude-opus-4-8")
+    );
 }

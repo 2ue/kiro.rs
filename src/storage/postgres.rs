@@ -15535,6 +15535,7 @@ mod tests {
             downstream_stop_reason: None,
             upstream_model: None,
             external_outbound_model: None,
+            upstream_response_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
@@ -18906,6 +18907,7 @@ mod tests {
             downstream_stop_reason: None,
             upstream_model: Some("claude-sonnet-4-5".to_string()),
             external_outbound_model: Some("claude-sonnet-4-5".to_string()),
+            upstream_response_model: None,
             model_resolution_source: Some("exact".to_string()),
             model_resolution_note: None,
             conversation_id: Some(format!("external-session-{}", id)),
@@ -18947,6 +18949,7 @@ mod tests {
             usage_projection_applied: Some(true),
             external_pool_billing: Some(ExternalPoolBilling {
                 request_input_tokens: None,
+                upstream_response_model: None,
                 raw_usage,
                 shaped_usage,
                 reported_usage,

@@ -841,8 +841,9 @@ function canonicalCachePolicyPath(prefix: string): string {
   return normalized
 }
 
+/** 所有字段都没写才算空补丁；漏掉字段会让只配了该字段的路径在规整时被丢掉。 */
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.kiroRsToolPlus && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.kiroRsToolPlus && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard && !policy.cacheTtl && !policy.zeroUsageRepair
 }
 
 export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
