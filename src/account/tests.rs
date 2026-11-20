@@ -21874,12 +21874,14 @@ async fn external_non_stream_returns_client_model_instead_of_mapped_or_upstream_
     let Some((manager, postgres)) = test_account_manager().await else {
         return;
     };
-    // 上游返回 claude-sonnet-4-6；本系统把请求映射成 claude-opus-4-8 发出去。
+    // 账号把 claude-fable-5-2 映射成 claude-opus-4-8 发出去，上游又回了 claude-sonnet-4-6。
     let fake =
         ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("model-ok"))
             .await;
     let mut pool_request = create_pool_request("client-model-non-stream", 1, true);
     pool_request.base_url = fake.base_url.clone();
+    pool_request.model_mapping_mode = ModelMappingMode::DirectMapping;
+    pool_request.model_mapping_rules = vec![model_rule(CLIENT_REQUESTED_MODEL, "claude-opus-4-8")];
     postgres.create_account(pool_request).await.unwrap();
     let config = AccountsConfig {
         enabled: true,
@@ -21889,7 +21891,6 @@ async fn external_non_stream_returns_client_model_instead_of_mapped_or_upstream_
     };
     let mut route = test_route(CLIENT_REQUESTED_MODEL);
     route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
-    route.upstream_model = Some("claude-opus-4-8".to_string());
 
     let response = match manager.forward_with_failover_result(config, route).await {
         AccountForwardOutcome::Response(response) => response,
