@@ -249,6 +249,7 @@ pub(crate) fn migrate(legacy: LegacyPromptFields, profile: CompatProfile) -> Mig
             channel_leak_guard: no_match_identity.enabled && no_match_identity.output_guard.enabled,
             channel_leak_guard_stream: no_match_identity.output_guard.stream_enabled,
             model_driven_web_search: web_search.enabled,
+            return_request_model: true,
         },
         path_overrides: feature_overrides,
     }

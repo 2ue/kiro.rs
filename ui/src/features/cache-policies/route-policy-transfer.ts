@@ -80,7 +80,7 @@ const INJECTION_IDS: InjectionId[] = [
   'emptyTurnNudge',
 ]
 
-const FEATURE_BOOL_KEYS = ['thinkingModelName', 'channelLeakGuard', 'channelLeakGuardStream', 'modelDrivenWebSearch'] as const
+const FEATURE_BOOL_KEYS = ['thinkingModelName', 'channelLeakGuard', 'channelLeakGuardStream', 'modelDrivenWebSearch', 'returnRequestModel'] as const
 const THINKING_TRIGGERS: ThinkingTriggerMode[] = ['real_request', 'always', 'off']
 
 /** Version 1 files carried identity masking and WebSearch in their own shapes. */

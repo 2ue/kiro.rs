@@ -1755,6 +1755,14 @@ export function RuntimePage() {
                   </div>
                   <div className="space-y-1.5">
                     <TogField
+                      label="返回请求模型（默认值）"
+                      desc="外部池响应里的 model 用调用方请求的模型，不暴露映射后或上游实际返回的模型；关闭时透传上游返回的模型。路由选“跟随默认”时用这里的值，用量记录里的上游返回模型不受影响。"
+                      checked={draft.routeFeatures.defaults.returnRequestModel ?? true}
+                      onChange={setRouteFeatureDefault('returnRequestModel')}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <TogField
                       label="模型列表只显示 Claude"
                       desc="/v1/models 只列出 Claude 模型，避免非 Claude 的上游模型目录暴露渠道。直接请求未列出的模型不受影响。"
                       checked={draft.claudeModelsOnly}

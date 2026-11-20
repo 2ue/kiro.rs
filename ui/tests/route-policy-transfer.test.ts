@@ -41,3 +41,19 @@ test('缓存写入时长随路由策略导出导入，不再在导入时丢失',
   assert.deepEqual(roundTrip({ cacheType: 'kiro_rs_tool', cacheTtl }).cacheTtl, cacheTtl)
   assert.match(importError({ cacheType: 'kiro_rs_tool', cacheTtl: ['force_1h'] }), /cacheTtl/)
 })
+
+test('返回请求模型随路由功能导出导入，类型不对时报错', () => {
+  const parsed = parseRoutePolicyImport(
+    JSON.stringify(buildRoutePolicyFile('/dfcache/team-a', { cacheType: 'no_cache' }, {}, { returnRequestModel: false })),
+  )
+  if (!parsed.ok) assert.fail(`expected ok, got: ${parsed.error}`)
+  assert.deepEqual(parsed.features, { returnRequestModel: false })
+  const bad = parseRoutePolicyImport(JSON.stringify({
+    format: ROUTE_POLICY_FORMAT,
+    version: ROUTE_POLICY_VERSION,
+    cachePolicy: { cacheType: 'no_cache' },
+    features: { returnRequestModel: 'off' },
+  }))
+  assert.equal(bad.ok, false)
+  assert.match((bad as { error: string }).error, /returnRequestModel/)
+})
