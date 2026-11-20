@@ -162,6 +162,9 @@ pub struct ExternalPoolUsageSnapshot {
 pub struct ExternalPoolBilling {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_input_tokens: Option<i32>,
+    /// 上游实际返回的模型，只用于写用量记录顶层的 `upstreamResponseModel`，不随计费明细保存。
+    #[serde(skip)]
+    pub upstream_response_model: Option<String>,
     pub raw_usage: ExternalPoolUsageSnapshot,
     #[serde(default)]
     pub shaped_usage: ExternalPoolUsageSnapshot,
@@ -490,6 +493,10 @@ pub struct UsageRecord {
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_outbound_model: Option<String>,
+    /// 上游实际返回的模型（外部池：流式取 message_start、非流式取响应体顶层）；返回给调用方的
+    /// 是调用方请求的模型，这里保留上游原值用于核对。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_response_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_resolution_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,6 +710,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
         downstream_stop_reason: None,
         upstream_model: request_context.upstream_model,
         external_outbound_model: None,
+        upstream_response_model: None,
         model_resolution_source: request_context.model_resolution_source,
         model_resolution_note: request_context.model_resolution_note,
         conversation_id: None,
@@ -4802,6 +4810,7 @@ mod tests {
             downstream_stop_reason: None,
             upstream_model: None,
             external_outbound_model: None,
+            upstream_response_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),

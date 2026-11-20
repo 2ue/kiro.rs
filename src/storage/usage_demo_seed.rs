@@ -254,6 +254,7 @@ pub async fn seed_usage_demo(
                     raw_cost_usd,
                     Some(ExternalPoolBilling {
                         request_input_tokens: Some(total_input_tokens),
+                        upstream_response_model: None,
                         raw_usage: snapshot,
                         shaped_usage: snapshot,
                         reported_usage: snapshot,
@@ -321,6 +322,7 @@ pub async fn seed_usage_demo(
                 downstream_stop_reason: Some("end_turn".to_string()),
                 upstream_model: Some(model.to_string()),
                 external_outbound_model: external_pool_id.map(|_| model.to_string()),
+                upstream_response_model: None,
                 model_resolution_source: Some("demo".to_string()),
                 model_resolution_note: None,
                 conversation_id: Some(format!("demo-conv-{}", rng.u64(0..900_000))),

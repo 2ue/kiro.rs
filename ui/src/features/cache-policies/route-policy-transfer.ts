@@ -59,6 +59,8 @@ const CACHE_OBJECT_KEYS: Array<keyof CacheRoutePolicyPatch> = [
   'stableSegment',
   'hitShaping',
   'coldRequestGuard',
+  'cacheTtl',
+  'zeroUsageRepair',
 ]
 
 const INJECTION_IDS: InjectionId[] = [

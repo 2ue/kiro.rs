@@ -83,6 +83,7 @@ import {
   formatAttemptChain,
   formatExternalAttemptChain,
   upstreamModelLabel,
+  upstreamResponseModelMismatch,
 } from './usage-helpers'
 import { UsageDetailModal } from './usage-detail-modal'
 import { UsageCleanupModal } from './usage-cleanup-modal'
@@ -237,6 +238,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'endpoint',
     'requested_model',
     'upstream_model',
+    'upstream_response_model',
     'route_kind',
     'route_subtype',
     'credential_id',
@@ -269,6 +271,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.endpoint,
     record.model,
     upstreamModelLabel(record) === '-' ? '' : upstreamModelLabel(record),
+    record.upstreamResponseModel ?? '',
     record.routeKind,
     record.routeSubtype,
     record.credentialId,
@@ -1003,6 +1006,7 @@ function RecordsView({
                     const targetLabel = routeAccountLabel(record, label)
                     const resolvedModel = upstreamModelLabel(record)
                     const hasModelChange = resolvedModel !== '-' && resolvedModel !== record.model
+                    const responseModelMismatch = upstreamResponseModelMismatch(record)
                     return (
                       <TableRow key={record.id} className="cursor-pointer" onClick={() => onViewDetail(record)}>
                         {/* 时间 / 状态 */}
@@ -1044,7 +1048,23 @@ function RecordsView({
                           >
                             实际 {hasModelChange ? resolvedModel : '同请求模型'}
                           </div>
+                          {responseModelMismatch && (
+                            <div
+                              className="max-w-[220px] truncate font-mono text-[0.62rem] text-warning"
+                              title={`上游实际返回 ${responseModelMismatch}，返回给调用方的仍是请求模型`}
+                            >
+                              上游返回 {responseModelMismatch}
+                            </div>
+                          )}
                           <div className="mt-1 flex flex-wrap gap-1">
+                            {responseModelMismatch && (
+                              <Badge
+                                tone="warning"
+                                title={`发出 ${record.externalOutboundModel || record.upstreamModel || record.model}，上游返回 ${responseModelMismatch}；返回给调用方的仍是请求模型`}
+                              >
+                                上游模型不一致
+                              </Badge>
+                            )}
                             <Badge title={record.endpoint || '-'}>{record.endpoint || '-'}</Badge>
                             {record.stickyBound && <Badge tone="secondary">sticky</Badge>}
                             {record.fallbackFromSticky && <Badge tone="warning">sticky回退</Badge>}

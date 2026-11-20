@@ -950,6 +950,8 @@ export interface UsageRecord {
   requestedMaxTokens?: number
   upstreamModel?: string
   externalOutboundModel?: string
+  /** 上游实际返回的模型；返回给调用方的是请求模型，这里保留上游原值。 */
+  upstreamResponseModel?: string
   modelResolutionSource?: string
   modelResolutionNote?: string
   conversationId?: string
@@ -2028,6 +2030,8 @@ export interface CacheRoutePolicyPatch {
   hitShaping?: CacheHitShapingPolicyPatch
   coldRequestGuard?: ColdRequestGuardPolicyPatch
   cacheTtl?: CacheTtlPolicyPatch
+  /** 零用量估算：所有策略（含 no_cache）都生效。 */
+  zeroUsageRepair?: ZeroUsageRepairPolicyPatch | null
 }
 
 /**
@@ -2050,6 +2054,23 @@ export interface CacheTtlPolicyPatch {
 /** 冷请求 usage 约束：默认关闭，关闭时与未引入该约束的行为一致。 */
 export interface ColdRequestGuardPolicyPatch {
   enabled?: boolean
+}
+
+/** 估算结果仍为 0 时的兜底：保持 0、在范围内随机、按另一侧用量的比例生成。 */
+export type ZeroUsageFallback = 'keep' | 'range' | 'ratio'
+
+export interface ZeroUsageSidePolicyPatch {
+  enabled?: boolean | null
+  fallback?: ZeroUsageFallback | null
+  minTokens?: number | null
+  maxTokens?: number | null
+  ratioPercent?: number | null
+}
+
+/** 上游 200 但 usage 输入或输出为 0 时的估算修复，输入、输出分开设置。 */
+export interface ZeroUsageRepairPolicyPatch {
+  input?: ZeroUsageSidePolicyPatch | null
+  output?: ZeroUsageSidePolicyPatch | null
 }
 
 export interface CacheHitShapingPolicyPatch {
