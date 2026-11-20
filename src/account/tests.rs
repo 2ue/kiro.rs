@@ -20418,6 +20418,11 @@ async fn account_stream_error_after_content_start_does_not_replay_request() {
     assert_eq!(record.status, UsageRecordStatus::StreamError);
     assert_eq!(record.error_type.as_deref(), Some("stream_error"));
     assert_eq!(record.external_attempts.len(), 1);
+    // 流式出错的记录没有计费明细，上游返回的模型仍从采集状态记下。
+    assert_eq!(
+        record.upstream_response_model.as_deref(),
+        Some("claude-sonnet-4-6")
+    );
     assert_eq!(record.external_attempts[0].action, "success");
     assert_eq!(
         record.external_attempts[0].pool_name,

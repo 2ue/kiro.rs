@@ -10314,6 +10314,7 @@ impl AccountManager {
             UsageErrorDiagnostics::default(),
             billing,
             downstream_stop_reason,
+            None,
         );
     }
 
@@ -10342,6 +10343,7 @@ impl AccountManager {
                 public_error: None,
                 raw_upstream_error: None,
             },
+            None,
             None,
             None,
         );
@@ -10379,6 +10381,7 @@ impl AccountManager {
             Some(error_message.to_string()),
             Some(error_detail),
             diagnostics,
+            None,
             None,
             None,
         );
@@ -10497,7 +10500,14 @@ impl AccountManager {
         error_diagnostics: UsageErrorDiagnostics,
         billing: Option<AccountBilling>,
         downstream_stop_reason: Option<String>,
+        upstream_response_model: Option<String>,
     ) {
+        // 失败或断开的流没有计费明细，上游模型由调用方从采集状态直接给出。
+        let upstream_response_model = upstream_response_model.or_else(|| {
+            billing
+                .as_ref()
+                .and_then(|billing| billing.upstream_response_model.clone())
+        });
         let request_input_tokens = if route.request_input_tokens > 0 {
             route.request_input_tokens
         } else {
@@ -10562,9 +10572,7 @@ impl AccountManager {
             downstream_stop_reason,
             upstream_model: route.upstream_model.clone(),
             external_outbound_model,
-            upstream_response_model: billing
-                .as_ref()
-                .and_then(|billing| billing.upstream_response_model.clone()),
+            upstream_response_model,
             model_resolution_source: route.model_resolution_source.clone(),
             model_resolution_note: route.model_resolution_note.clone(),
             conversation_id: route.stable_conversation_id(),
@@ -10760,6 +10768,12 @@ fn record_external_stream_end(
 }
 
 impl ExternalStreamUsageGuard {
+    fn upstream_response_model(&self) -> Option<String> {
+        self.usage_capture
+            .as_ref()
+            .and_then(|capture| capture.lock().upstream_response_model.clone())
+    }
+
     fn record_downstream_chunk(&mut self, chunk: &Bytes) {
         self.downstream_chunks_forwarded = self.downstream_chunks_forwarded.saturating_add(1);
         self.downstream_bytes_forwarded = self
@@ -10877,6 +10891,7 @@ impl ExternalStreamUsageGuard {
                 },
                 None,
                 None,
+                self.upstream_response_model(),
             );
             self.completed = true;
             return;
@@ -11017,6 +11032,7 @@ impl ExternalStreamUsageGuard {
             },
             None,
             None,
+            self.upstream_response_model(),
         );
         self.completed = true;
     }
@@ -11081,6 +11097,7 @@ impl ExternalStreamUsageGuard {
             },
             None,
             None,
+            self.upstream_response_model(),
         );
         self.completed = true;
     }

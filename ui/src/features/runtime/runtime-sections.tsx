@@ -1963,7 +1963,8 @@ export function pathPolicyWithStrategyDefaults(
   policy: CacheRoutePolicyPatch
 ): CacheRoutePolicyPatch {
   const cacheType = policy.cacheType ?? 'no_cache'
-  if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
+  // 无缓存路由仍要带上已保存的零用量估算，否则编辑卡片显示默认值、改一侧会冲掉另一侧。
+  if (cacheType === 'no_cache') return { cacheType: 'no_cache', ...pickDefinedRoutePolicyFields(policy, ['zeroUsageRepair']) }
   if (cacheType === 'prefix_tool_plus') {
     const plusTemplate = cachePolicyForStrategyTemplate(cachePolicy.prefixToolPlus ?? {}, 'prefix_tool_plus')
     return {
