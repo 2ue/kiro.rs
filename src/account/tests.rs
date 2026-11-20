@@ -1460,6 +1460,7 @@ pub(crate) fn test_route(model: &str) -> AccountRouteRequest {
         payload: Some(payload),
 
         model_hint: None,
+        client_model: None,
         stream_hint: None,
         request_input_tokens,
         upstream_model: Some(model.to_string()),
@@ -1704,6 +1705,7 @@ fn process_external_transcript_stream_one_byte_at_a_time(stream: &[u8]) -> Vec<u
             None,
             plan,
             Some(&mut state),
+            None,
         ));
     }
     assert!(buffer.is_empty());
@@ -2645,6 +2647,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         }),
 
         model_hint: None,
+        client_model: None,
         stream_hint: None,
         request_input_tokens: 1,
         upstream_model: None,
@@ -11628,6 +11631,7 @@ fn external_sse_atomic_overflow_records_stream_failure_and_stops_terminal_succes
             None,
             plan,
             Some(&mut state),
+            None,
         ));
     }
     let output = String::from_utf8(output).unwrap();
@@ -21526,6 +21530,7 @@ fn passthrough_response_history_sanitizer_is_route_optional() {
             None,
             plan,
             None,
+            None,
         );
         assert_eq!(off, event.as_bytes());
         cleaned.extend(process_sse_event_with_plan_and_transcript(
@@ -21535,6 +21540,7 @@ fn passthrough_response_history_sanitizer_is_route_optional() {
             None,
             plan,
             Some(&mut state),
+            None,
         ));
     }
     cleaned.extend(state.finish());
@@ -21792,6 +21798,114 @@ async fn cooldown_markers_give_up_on_a_stalled_redis_instead_of_holding_the_fail
         models_elapsed >= ACCOUNT_COOLDOWN_REDIS_TIMEOUT && models_elapsed < Duration::from_secs(3),
         "model cooldowns must share one Redis deadline for the whole list: {models_elapsed:?}"
     );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+/// 调用方请求的模型和上游实际返回的模型不一致（账号映射、模型目录兜底或上游自己换了模型）时，
+/// 返回给调用方的 `model` 必须是调用方请求的原值，不能漏出上游模型。
+const CLIENT_REQUESTED_MODEL: &str = "claude-fable-5-2";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_stream_returns_client_model_instead_of_upstream_model() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_client_model_stream",
+        "hello",
+        12,
+        3,
+    ))
+    .await;
+    let mut request = create_pool_request("client-model-stream", 1, true);
+    request.base_url = upstream.base_url.clone();
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    postgres.create_account(request).await.unwrap();
+    let (mut route, _recorder) =
+        external_stream_route("req_client_model_stream", "err_client_model_stream");
+    route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
+
+    let response = forward_early_commit(&manager, external_stream_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(!body.contains("claude-sonnet-4-6"), "{body}");
+    let events = parse_downstream_sse(&body);
+    let starts = downstream_events_named(&events, "message_start");
+    assert_eq!(starts.len(), 1, "{body}");
+    assert_eq!(starts[0]["message"]["model"], CLIENT_REQUESTED_MODEL);
+    assert_eq!(starts[0]["message"]["id"], "msg_client_model_stream");
+    assert_eq!(starts[0]["message"]["usage"]["input_tokens"], 12);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_commit_stream_returns_client_model_instead_of_upstream_model() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_client_model_early",
+        "hello",
+        12,
+        3,
+    ))
+    .await;
+    create_early_commit_pool(&postgres, "client-model-early", 1, &upstream.base_url).await;
+    let (mut route, _recorder) =
+        external_stream_route("req_client_model_early", "err_client_model_early");
+    route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
+
+    let response = forward_early_commit(&manager, early_commit_config_for_test(), route).await;
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(!body.contains("claude-sonnet-4-6"), "{body}");
+    let events = parse_downstream_sse(&body);
+    let starts = downstream_events_named(&events, "message_start");
+    assert_eq!(starts.len(), 1, "{body}");
+    assert_eq!(starts[0]["message"]["model"], CLIENT_REQUESTED_MODEL);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_non_stream_returns_client_model_instead_of_mapped_or_upstream_model() {
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    // 上游返回 claude-sonnet-4-6；本系统把请求映射成 claude-opus-4-8 发出去。
+    let fake =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("model-ok"))
+            .await;
+    let mut pool_request = create_pool_request("client-model-non-stream", 1, true);
+    pool_request.base_url = fake.base_url.clone();
+    postgres.create_account(pool_request).await.unwrap();
+    let config = AccountsConfig {
+        enabled: true,
+        global_max_concurrent_requests: 4,
+        retry_max_attempts: 0,
+        ..AccountsConfig::default()
+    };
+    let mut route = test_route(CLIENT_REQUESTED_MODEL);
+    route.client_model = Some(CLIENT_REQUESTED_MODEL.to_string());
+    route.upstream_model = Some("claude-opus-4-8".to_string());
+
+    let response = match manager.forward_with_failover_result(config, route).await {
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(error) => {
+            panic!("account dispatch should succeed: {}", error.message)
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_response_body_text_allow_error(response).await.0;
+    assert!(!body.contains("claude-sonnet-4-6"), "{body}");
+    assert!(!body.contains("claude-opus-4-8"), "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["model"], CLIENT_REQUESTED_MODEL);
+    assert_eq!(value["content"][0]["text"], "model-ok");
+    let sent: serde_json::Value = serde_json::from_slice(&fake.request_bodies()[0]).unwrap();
+    assert_eq!(sent["model"], "claude-opus-4-8");
 
     postgres.drop_test_schema().await.unwrap();
 }

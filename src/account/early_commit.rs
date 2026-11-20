@@ -384,6 +384,7 @@ where
                     Some(stream_error_mask),
                     stream_plan,
                     transcript_state.lock().as_mut(),
+                    route.client_model.as_deref(),
                 );
                 if !downstream.forward_message_start(&processed).await {
                     return Ok(EarlyCommitPreRead::DownstreamGone);
@@ -402,6 +403,7 @@ where
                 Some(stream_error_mask),
                 stream_plan,
                 transcript_state.lock().as_mut(),
+                route.client_model.as_deref(),
             );
             prefix.extend(
                 downstream

@@ -1063,6 +1063,7 @@ fn external_route_request_raw(
         endpoint: endpoint.to_string(),
         payload: projection_payload,
         history_sanitize_enabled: false,
+        client_model: model_hint.clone(),
         model_hint,
         stream_hint,
         request_input_tokens: 0,
@@ -1172,6 +1173,13 @@ async fn post_messages_inner(
         ingress_id,
         effective_raw_probe,
     );
+    // 路由补丁改过请求体时，对外模型名以调用方发来的原始请求体为准。
+    let body_unchanged = raw_body.len() == route.effective_raw_body.len()
+        && (raw_body.as_ptr() == route.effective_raw_body.as_ptr()
+            || raw_body == route.effective_raw_body);
+    if !body_unchanged {
+        route.client_model = probe_raw_messages_body(&raw_body).model;
+    }
     route.raw_body = raw_body;
     route.history_sanitize_enabled = features.history_sanitize;
     route.payload_guard_retry_config = features
