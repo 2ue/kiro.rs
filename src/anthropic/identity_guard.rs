@@ -131,6 +131,17 @@ fn forced_leak_patterns() -> &'static [Regex] {
             r"如实.{0,6}(说明|告知|介绍).{0,6}(身份|型号)",
             // The proxy's prompt-thinking control tags are internal to the serving channel.
      r"(?i)</?\s*(thinking_mode|max_thinking_length|thinking_effort|thinking_output_policy)\b",
+            // Echoes of the identity card's cutoff guidance ("published model metadata doesn't
+            // establish my cutoff", "this deployment doesn't maintain ...", "facts you give
+            // override my cutoff").
+            r"(?i)\b(published|public)\s+(model\s+)?metadata\b",
+            r"(?i)\b(this|the)\s+deployment\s+(doesn'?t|does not|did not|has no|lacks)\b",
+            r"(?i)\binfer(?:s|red|ring)?\b[^.\n]{0,30}\bfrom\s+the\s+(requested\s+)?model\s+name\b",
+            r"(?i)\boverrides?\s+(my|the|that)\s+(knowledge\s+|training\s+)?cutoff\b",
+            r"(发布|公开)的?模型元数据",
+            r"部署.{0,12}(没有|未|不).{0,16}(知识截止|截止信息|截止日期|截止时间)",
+            r"(从|根据)(请求的)?模型名称.{0,6}推断",
+            r"覆盖.{0,4}(知识|训练)?截止",
         ]
         .iter()
         .map(|pattern| Regex::new(pattern).expect("forced identity guard pattern must compile"))
@@ -207,6 +218,9 @@ pub(crate) struct DisplayIdentity {
     pub exempt_rules: Vec<usize>,
     /// The user wrote in Chinese: the fallback reply is in Chinese too.
     pub prefers_zh: bool,
+    /// The user asked what the assistant is: "the model is X" / "型号是 X" describe the assistant
+    /// too (see [`super::forced_model::rewrite_self_identification`]).
+    pub identity_answer: bool,
 }
 
 impl DisplayIdentity {
@@ -224,18 +238,24 @@ impl DisplayIdentity {
             .map(super::forced_model::user_message_text)
             .unwrap_or_default();
         Self {
-            name: forced.spec.display_name.to_string(),
-            id: forced.spec.canonical_id.to_string(),
+            name: forced.display_name.clone(),
+            id: forced.display_id.clone(),
             exempt_rules: forced_rule_exemptions(&user_text),
             prefers_zh: user_text
                 .chars()
                 .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)),
+            identity_answer: super::forced_model::asks_only_about_own_identity(&user_text),
         }
     }
 
     /// The sentence with the serving model's name replaced, or `None` when it does not describe itself.
     fn rewrite(&self, sentence: &str) -> Option<String> {
-        super::forced_model::rewrite_self_identification(sentence, &self.name, &self.id)
+        super::forced_model::rewrite_self_identification(
+            sentence,
+            &self.name,
+            &self.id,
+            self.identity_answer,
+        )
     }
 
     /// The sentence denies being the display model ("I'm not Claude Opus 5.5", "我不是 Opus 5.5",
@@ -363,6 +383,7 @@ pub(crate) fn scrub_summary_text(text: &str, display_name: &str, display_id: &st
         id: display_id.to_string(),
         exempt_rules: Vec::new(),
         prefers_zh: false,
+        identity_answer: false,
     };
     scrub_text_as(text, Some(&identity)).unwrap_or_else(|| text.to_string())
 }
@@ -870,6 +891,7 @@ mod tests {
             id: "claude-opus-5-5".into(),
             exempt_rules: Vec::new(),
             prefers_zh: false,
+            identity_answer: false,
         }
     }
 
@@ -1016,6 +1038,45 @@ mod tests {
         }
     }
 
+    /// Sentences repeating the identity card's cutoff guidance (seen in real answers before the
+    /// card was reworded) are removed; ordinary talk about metadata and deployments stays.
+    #[test]
+    fn forced_mode_drops_echoes_of_the_cutoff_guidance() {
+        let scrub = |text: &str| scrub_summary_text(text, "Claude Opus 5.5", "claude-opus-5-5");
+        for (text, expected) in [
+            (
+                "I cannot reliably determine an exact date. Published model metadata doesn't establish my actual training cutoff. Check a current source.",
+                "I cannot reliably determine an exact date. Check a current source.",
+            ),
+            (
+                "I can't say exactly. This deployment doesn't maintain verified knowledge-cutoff information.",
+                "I can't say exactly.",
+            ),
+            (
+                "关于知识截止，我无法可靠地确定确切日期。发布的模型元数据并不能确定我的实际训练截止。",
+                "关于知识截止，我无法可靠地确定确切日期。",
+            ),
+            (
+                "我无法确定精确日期。这个部署没有经过验证的知识截止信息。我不会猜测或从模型名称推断。",
+                "我无法确定精确日期。",
+            ),
+            (
+                "我的知识截止到 2025 年 2 月。这次对话中你提供的事实信息是最新的，会覆盖我的知识截止日期。",
+                "我的知识截止到 2025 年 2 月。",
+            ),
+        ] {
+            assert_eq!(scrub(text).trim(), expected, "{text}");
+        }
+        for text in [
+            "Store the build metadata next to the image.",
+            "The deployment failed because the health check timed out.",
+            "这个部署没有配置健康检查。",
+            "把模型元数据写进 manifest。",
+        ] {
+            assert_eq!(scrub(text), text);
+        }
+    }
+
     #[test]
     fn forced_mode_replaces_a_platform_introduction_with_the_display_one() {
         let zh = DisplayIdentity {
@@ -1023,6 +1084,7 @@ mod tests {
             id: "claude-sonnet-5-5".into(),
             exempt_rules: Vec::new(),
             prefers_zh: true,
+            identity_answer: false,
         };
         let text = "我是 Kiro，一个 AI 驱动的开发环境。我可以帮你编写代码。";
         assert_eq!(
