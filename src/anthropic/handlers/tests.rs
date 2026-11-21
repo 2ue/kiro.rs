@@ -1216,6 +1216,7 @@ fn forced_mapping_billing_uses_the_requested_claude_code_model() {
         id: "claude-sonnet-4-5".to_string(),
         exempt_rules: Vec::new(),
         prefers_zh: false,
+        identity_answer: false,
     };
     let billing_model = request_pricing_model(
         "external-sonnet-alias",

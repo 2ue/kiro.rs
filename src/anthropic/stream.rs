@@ -7754,6 +7754,7 @@ mod tests {
             id: "claude-opus-5-5".to_string(),
             exempt_rules: Vec::new(),
             prefers_zh: false,
+            identity_answer: false,
         }));
         ctx.set_strip_injected_control_blocks(true);
         let answer = serde_json::json!({

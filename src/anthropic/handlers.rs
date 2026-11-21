@@ -8263,8 +8263,8 @@ async fn forced_request_pipeline(
             forced: None,
             ..model_resolution.clone()
         },
-        display_name: forced.spec.display_name.to_string(),
-        display_id: forced.spec.canonical_id.to_string(),
+        display_name: forced.display_name.clone(),
+        display_id: forced.display_id.clone(),
     };
     // On-demand compaction (top-level `compaction`): the response is the summary itself.
     if let Some(instructions) = on_demand_compaction {
