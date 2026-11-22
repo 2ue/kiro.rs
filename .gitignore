@@ -30,3 +30,7 @@ catch-test/
 # local secrets for project skills (cctest etc.)
 /.env
 /.env.local
+
+# local admin key and Python caches
+/adminApiKey
+__pycache__/
