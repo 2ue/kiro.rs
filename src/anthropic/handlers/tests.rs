@@ -2059,6 +2059,7 @@ async fn test_account_manager_for_handlers(base_url: &str) -> Option<Arc<Account
             enabled: true,
             priority: 1,
             max_concurrent_requests: 10,
+            raw_usage_source: Default::default(),
             usage_projection_mode: UsageProjectionMode::CurrentPathPolicy,
             stream_response_mode: None,
 

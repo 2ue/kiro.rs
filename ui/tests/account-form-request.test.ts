@@ -86,3 +86,11 @@ test('新建账号整份生成请求：空代理为 null，继承的 SSE 方式�
   assert.deepEqual(request.tags, ['a', 'b'])
   assert.deepEqual(request.overrides, {})
 })
+
+test('原始用量开关默认旧模式，编辑只提交当前账号的模式变化', () => {
+  assert.equal(defaultAccountForm().rawUsageSource, 'legacy_max')
+  const draft = accountFormFromAccount({ ...account, rawUsageSource: 'upstream_last' })
+  assert.equal(buildAccountRequest(draft).rawUsageSource, 'upstream_last')
+  const changes = diffAccountRequest(draft, { ...draft, rawUsageSource: 'legacy_max' })
+  assert.deepEqual(changes, { rawUsageSource: 'legacy_max' })
+})

@@ -7,3 +7,5 @@ pub(crate) mod runtime_lag;
 pub(crate) mod upstream_error;
 
 pub(crate) mod storage_task;
+
+pub mod upstream_usage;

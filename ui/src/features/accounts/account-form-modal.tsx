@@ -307,6 +307,9 @@ export function AccountFormModal({
             {number("priority", "优先级", { description: "数字越小越靠前；同优先级再按容量和状态分配" })}
             {number("maxConcurrentRequests", "单账号最大并发", { min: 1, unit: "个请求", description: "当前账号同时处理的最大请求数，不是 RPM" })}
             {number("costMultiplier", "成本倍率", { step: "0.01", min: 0, unit: "×", description: "账号成本 = 上游原始成本 × 倍率" })}
+            <Field label="原始用量按上游最后返回值记录" description="默认关闭，沿用当前最大值口径。开启后各字段采用上游最后明确返回的有效值，缺失字段保留前值；只影响后续请求的原始统计。">
+              <Switch checked={draft.rawUsageSource === "upstream_last"} disabled={saving} onCheckedChange={(v) => set("rawUsageSource", v ? "upstream_last" : "legacy_max")} />
+            </Field>
             {choice("usageProjectionMode", "下游 usage", USAGE_PROJECTION_MODE_OPTIONS)}
             {choice("autoDisablePolicy", "自动禁用策略", AUTO_DISABLE_POLICY_OPTIONS)}
           </FieldGrid>

@@ -1,3 +1,4 @@
+use crate::common::upstream_usage::{RawUsageSource, UpstreamUsage};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
@@ -608,6 +609,8 @@ pub struct Account {
     pub priority: i32,
     pub max_concurrent_requests: u32,
     pub usage_projection_mode: UsageProjectionMode,
+    #[serde(default)]
+    pub raw_usage_source: RawUsageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_response_mode: Option<StreamResponseMode>,
     pub auto_disable_policy: AutoDisablePolicy,
@@ -738,6 +741,8 @@ pub struct CreateAccountRequest {
     #[serde(default)]
     pub usage_projection_mode: UsageProjectionMode,
     #[serde(default)]
+    pub raw_usage_source: RawUsageSource,
+    #[serde(default)]
     pub stream_response_mode: Option<StreamResponseMode>,
     #[serde(default)]
     pub auto_disable_policy: AutoDisablePolicy,
@@ -798,6 +803,8 @@ pub struct UpdateAccountRequest {
     pub max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub usage_projection_mode: Option<UsageProjectionMode>,
+    #[serde(default)]
+    pub raw_usage_source: Option<RawUsageSource>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_stream_response_mode_update"
@@ -1965,6 +1972,7 @@ struct ExternalUsageCapture {
     estimated_output_tokens: i32,
     downstream_stop_reason: Option<String>,
     raw: Option<CacheUsage>,
+    upstream_usage: UpstreamUsage,
     shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
     projected: bool,
@@ -14354,6 +14362,7 @@ fn process_non_stream_response_usage_with_repair(
         }
         return ProjectedNonStreamBody::without_protocol_contamination(bytes, usage_capture);
     };
+    usage_capture.upstream_usage.observe_response(&value);
     usage_capture.downstream_stop_reason = external_stop_reason_from_value(&value);
     usage_capture.upstream_response_model = response_model::body_declared_model(&value);
     let sanitized = route.is_none_or(|route| route.history_sanitize_enabled)
@@ -16011,6 +16020,9 @@ fn process_sse_event_with_plan_and_transcript(
     transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
     client_model: Option<&str>,
 ) -> Vec<u8> {
+    if let Some(capture) = capture {
+        capture.lock().upstream_usage.observe_sse(event);
+    }
     record_external_usage_debug_sse_event(event, capture, plan);
     record_external_wire_debug_sse_bytes(
         event,
@@ -17159,9 +17171,16 @@ fn account_billing_from_capture(
     pool: &Account,
     capture: ExternalUsageCapture,
 ) -> Option<AccountBilling> {
-    let raw = capture.raw?;
-    let reported = capture.reported.or(capture.raw)?;
-    let shaped = capture.shaped.or(capture.reported).or(capture.raw)?;
+    let raw = match pool.raw_usage_source {
+        RawUsageSource::LegacyMax => capture.raw,
+        RawUsageSource::UpstreamLast => capture.upstream_usage.snapshot().or(capture.raw),
+    }?;
+    let reported = capture.reported.or(capture.raw).unwrap_or(raw);
+    let shaped = capture
+        .shaped
+        .or(capture.reported)
+        .or(capture.raw)
+        .unwrap_or(raw);
     let stream_response_mode = capture
         .stream_response_mode
         .map(|mode| mode.as_str().to_string());
@@ -17276,6 +17295,7 @@ fn account_billing(
     AccountBilling {
         request_input_tokens: request_input_tokens.map(|tokens| tokens.max(0)),
         upstream_response_model: None,
+        raw_usage_source: pool.raw_usage_source,
         raw_usage: external_usage_snapshot(raw_usage),
         shaped_usage: external_usage_snapshot(shaped_usage),
         reported_usage: external_usage_snapshot(reported_usage),

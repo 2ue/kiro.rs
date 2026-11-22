@@ -109,6 +109,8 @@ pub struct AccountBilling {
     /// 上游实际返回的模型，只用于写用量记录顶层的 `upstreamResponseModel`，不随计费明细保存。
     #[serde(skip)]
     pub upstream_response_model: Option<String>,
+    #[serde(default)]
+    pub raw_usage_source: crate::common::upstream_usage::RawUsageSource,
     pub raw_usage: AccountUsageSnapshot,
     #[serde(default)]
     pub shaped_usage: AccountUsageSnapshot,

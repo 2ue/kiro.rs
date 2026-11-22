@@ -1292,6 +1292,7 @@ async fn admin_audit_records_failed_changes_auth_failures_capture_and_export() {
         enabled: true,
         priority: 100,
         max_concurrent_requests: 5,
+        raw_usage_source: Default::default(),
         usage_projection_mode: Default::default(),
         stream_response_mode: None,
         auto_disable_policy: Default::default(),

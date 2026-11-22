@@ -177,6 +177,7 @@ export type AccountFormDraft = {
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
+  rawUsageSource: 'legacy_max' | 'upstream_last'
   usageProjectionMode: NonNullable<CreateAccountRequest['usageProjectionMode']>
   streamResponseMode: AccountStreamResponseDraft
   preOutputStreamRetryMode: AccountStreamRetryDraft
@@ -205,6 +206,7 @@ export const defaultAccountForm = (): AccountFormDraft => ({
   enabled: false,
   priority: 100,
   maxConcurrentRequests: 10,
+  rawUsageSource: 'legacy_max',
   usageProjectionMode: 'current_path_policy',
   streamResponseMode: 'inherit',
   preOutputStreamRetryMode: 'inherit',
@@ -233,6 +235,7 @@ export const accountFormFromAccount = (account: Account): AccountFormDraft => ({
   enabled: account.enabled,
   priority: account.priority,
   maxConcurrentRequests: account.maxConcurrentRequests,
+  rawUsageSource: account.rawUsageSource || 'legacy_max',
   usageProjectionMode: account.usageProjectionMode,
   streamResponseMode: account.streamResponseMode || 'inherit',
   preOutputStreamRetryMode: account.preOutputStreamRetryMode || 'inherit',

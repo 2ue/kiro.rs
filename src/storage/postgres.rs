@@ -1,3 +1,4 @@
+use crate::common::upstream_usage::RawUsageSource;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -47,7 +48,7 @@ use crate::model::model_support::normalize_supported_models;
 
 const ACCOUNT_SELECT_SQL: &str = r#"
 SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-       max_concurrent_requests, usage_projection_mode, stream_response_mode,
+       max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
        auto_disable_policy, pre_output_stream_retry_mode,
        header_profile, append_beta_query, header_overrides,
        wire_profile, tls_profile,
@@ -89,6 +90,10 @@ struct RequiredPostgresColumn {
 }
 
 const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
+    RequiredPostgresColumn {
+        table_name: "accounts",
+        column_name: "raw_usage_source",
+    },
     RequiredPostgresColumn {
         table_name: "accounts",
         column_name: "tags",
@@ -1118,18 +1123,19 @@ impl PostgresStore {
             let mut record = value.clone();
             let fields = record.as_object_mut().unwrap();
             fields.insert("id".into(), serde_json::json!(id));
+            fields.insert("raw_usage_source".into(), serde_json::to_value(request.raw_usage_source)?);
             // 只写明确允许的列；不导入旧表的状态、主键和机器配置。
             sqlx::query(r#"
                 INSERT INTO accounts (
                     id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes
                 ) SELECT id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes
@@ -1142,6 +1148,7 @@ impl PostgresStore {
                     enabled=EXCLUDED.enabled, priority=EXCLUDED.priority,
                     max_concurrent_requests=EXCLUDED.max_concurrent_requests,
                     usage_projection_mode=EXCLUDED.usage_projection_mode,
+                    raw_usage_source=EXCLUDED.raw_usage_source,
                     stream_response_mode=EXCLUDED.stream_response_mode,
                     auto_disable_policy=EXCLUDED.auto_disable_policy,
                     pre_output_stream_retry_mode=EXCLUDED.pre_output_stream_retry_mode,
@@ -1331,18 +1338,19 @@ impl PostgresStore {
             });
             let fields = record.as_object_mut().unwrap();
             fields.insert("id".into(), serde_json::json!(id));
+            fields.insert("raw_usage_source".into(), serde_json::to_value(request.raw_usage_source)?);
             // 只写明确允许的列；不导入旧表的状态、主键和机器配置。
             sqlx::query(r#"
                 INSERT INTO accounts (
                     id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides
                 ) SELECT id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides
@@ -1355,6 +1363,7 @@ impl PostgresStore {
                     enabled=EXCLUDED.enabled, priority=EXCLUDED.priority,
                     max_concurrent_requests=EXCLUDED.max_concurrent_requests,
                     usage_projection_mode=EXCLUDED.usage_projection_mode,
+                    raw_usage_source=EXCLUDED.raw_usage_source,
                     stream_response_mode=EXCLUDED.stream_response_mode,
                     auto_disable_policy=EXCLUDED.auto_disable_policy,
                     pre_output_stream_retry_mode=EXCLUDED.pre_output_stream_retry_mode,
@@ -1558,7 +1567,7 @@ impl PostgresStore {
             r#"
             SELECT id, revision, enabled, base_url,
                    (btrim(api_key) <> '') AS api_key_present,
-                   auth_type, max_concurrent_requests, usage_projection_mode,
+                   auth_type, max_concurrent_requests, usage_projection_mode, raw_usage_source,
                    stream_response_mode,
                    auto_disable_policy, pre_output_stream_retry_mode,
                    header_profile, append_beta_query, header_overrides,
@@ -1611,7 +1620,7 @@ impl PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-                   max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                   max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                    auto_disable_policy, pre_output_stream_retry_mode,
                    header_profile, append_beta_query, header_overrides,
                    wire_profile, tls_profile,
@@ -1713,11 +1722,11 @@ impl PostgresStore {
                 wire_profile, tls_profile,
                 normalize_model_version_dots, model_mapping_mode,
                 model_mapping_require_match, model_mapping_rules, supported_models,
-                route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides, updated_at
+                route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides, raw_usage_source, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -1757,6 +1766,7 @@ impl PostgresStore {
         .bind(request.proxy_url.as_deref().filter(|url| !url.trim().is_empty()))
         .bind(request.cost_multiplier)
         .bind(serde_json::to_value(&request.overrides)?)
+        .bind(request.raw_usage_source.as_str())
         .fetch_one(&self.pool)
         .await?;
         account_from_row(row, mask_secrets)
@@ -1811,6 +1821,7 @@ impl PostgresStore {
         let usage_projection_mode = request
             .usage_projection_mode
             .unwrap_or(current.usage_projection_mode);
+        let raw_usage_source = request.raw_usage_source.unwrap_or(current.raw_usage_source);
         let stream_response_mode = request
             .stream_response_mode
             .unwrap_or(current.stream_response_mode);
@@ -1899,11 +1910,12 @@ impl PostgresStore {
                 route_rules = $24,
                 notes = $25,
                 tags = $26, proxy_url = $27, cost_multiplier = $28, overrides = $29,
+                raw_usage_source = $30,
                 revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -1944,6 +1956,7 @@ impl PostgresStore {
         .bind(proxy_url)
         .bind(cost_multiplier)
         .bind(serde_json::to_value(&overrides)?)
+        .bind(raw_usage_source.as_str())
         .fetch_one(&self.pool)
         .await?;
         Ok(Some(account_from_row(row, mask_secrets)?))
@@ -1982,7 +1995,7 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -2037,7 +2050,7 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -2098,7 +2111,7 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error,
@@ -10122,6 +10135,7 @@ fn account_eligibility_from_row(row: &PgRow) -> anyhow::Result<AccountEligibilit
     if max_concurrent_requests <= 0 {
         anyhow::bail!("max_concurrent_requests 必须为正数");
     }
+    let _raw_usage_source = RawUsageSource::parse(&row.try_get::<String, _>("raw_usage_source")?)?;
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
     UsageProjectionMode::parse_known(&usage_projection_mode)
         .ok_or_else(|| anyhow::anyhow!("usage_projection_mode 值无效"))?;
@@ -10232,6 +10246,7 @@ fn account_from_row_with_policy(
     let revision: i64 = row.try_get("revision")?;
     let api_key: String = row.try_get("api_key")?;
     let auth_type: String = row.try_get("auth_type")?;
+    let raw_usage_source = RawUsageSource::parse(&row.try_get::<String, _>("raw_usage_source")?)?;
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
     let stream_response_mode: Option<String> = if strict_dispatch {
         row.try_get("stream_response_mode")?
@@ -10448,6 +10463,7 @@ fn account_from_row_with_policy(
         priority: row.try_get("priority")?,
         max_concurrent_requests: max_concurrent_requests.max(1) as u32,
         usage_projection_mode,
+        raw_usage_source,
         stream_response_mode,
         auto_disable_policy,
         pre_output_stream_retry_mode,
@@ -10576,6 +10592,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     max_concurrent_requests INTEGER NOT NULL DEFAULT 10,
     usage_projection_mode TEXT NOT NULL DEFAULT 'current_path_policy',
     stream_response_mode TEXT,
+    raw_usage_source TEXT NOT NULL DEFAULT 'legacy_max' CHECK (raw_usage_source IN ('legacy_max', 'upstream_last')),
     skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false,
     auto_disable_policy TEXT NOT NULL DEFAULT 'inherit',
     pre_output_stream_retry_mode TEXT NOT NULL DEFAULT 'inherit',
@@ -10622,6 +10639,9 @@ ALTER TABLE accounts
 
 ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS stream_response_mode TEXT;
+
+ALTER TABLE accounts
+    ADD COLUMN IF NOT EXISTS raw_usage_source TEXT NOT NULL DEFAULT 'legacy_max' CHECK (raw_usage_source IN ('legacy_max', 'upstream_last'));
 
 ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false;
@@ -15795,6 +15815,7 @@ mod tests {
                 cost_floor_applied: uplifted_cost_usd < raw_cost_usd,
                 pricing_available: true,
                 pricing_model: Some("claude-sonnet-4-5".to_string()),
+                raw_usage_source: Default::default(),
                 usage_projection_mode: "current_path_policy".to_string(),
                 stream_response_mode: None,
                 usage_estimated: false,
@@ -15847,6 +15868,7 @@ mod tests {
                 enabled: true,
                 priority: 1,
                 max_concurrent_requests: 2,
+                raw_usage_source: Default::default(),
                 usage_projection_mode: UsageProjectionMode::PassThrough,
                 stream_response_mode: Some(StreamResponseMode::EventPassthrough),
                 auto_disable_policy: AutoDisablePolicy::Inherit,
@@ -16048,6 +16070,65 @@ mod tests {
         assert!(cleared_summary.account_billing.profit_usd.abs() < 0.000001);
         assert!(cleared_summary.total_estimated_cost_usd.abs() < 0.000001);
 
+        store.drop_test_schema().await.unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_raw_usage_source_default_update_copy_reload_and_schema_guard() {
+        let Some(config) = test_config() else {
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let request: CreateAccountRequest = serde_json::from_value(serde_json::json!({
+            "name":"raw-source", "baseUrl":"https://example.com", "apiKey":"test-only"
+        }))
+        .unwrap();
+        let original = store.create_account_unmasked(request).await.unwrap();
+        assert_eq!(original.raw_usage_source, RawUsageSource::LegacyMax);
+        let enabled = store
+            .update_account_unmasked(
+                original.id,
+                serde_json::from_value(serde_json::json!({"rawUsageSource":"upstream_last"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(enabled.raw_usage_source, RawUsageSource::UpstreamLast);
+        let unchanged = store
+            .update_account_unmasked(original.id, UpdateAccountRequest::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.raw_usage_source, RawUsageSource::UpstreamLast);
+        assert!(
+            store
+                .list_account_eligibility()
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.id == original.id)
+        );
+        assert_eq!(
+            store
+                .get_account(original.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .raw_usage_source,
+            RawUsageSource::UpstreamLast
+        );
+        sqlx::query("ALTER TABLE accounts DROP COLUMN raw_usage_source")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .verify_required_schema_compatibility(false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("raw_usage_source")
+        );
         store.drop_test_schema().await.unwrap();
     }
 }

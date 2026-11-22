@@ -33,3 +33,10 @@ test('不带密钥导出能识别出来；带密钥导出的文件能被批量�
 test('文件名带时间戳', () => {
   assert.equal(accountExportFilename(new Date(2026, 10, 19, 8, 5, 9)), 'claude-pool-accounts-20261119-080509.json')
 })
+
+test('原始用量口径随账号导出导入保留，旧格式默认仍沿用旧模式', () => {
+  const exported = pickExportAccounts([{ ...pkgAccounts[0], rawUsageSource: 'upstream_last' }], null)
+  const parsed = parseImportText(JSON.stringify(exported))
+  const rows = buildImportPlan([{ origin: 'export.json', entries: parsed.entries }], initialImportDefaults(), [])
+  assert.equal(rows[0].request?.rawUsageSource, 'upstream_last')
+})
