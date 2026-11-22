@@ -269,6 +269,7 @@ pub async fn seed_usage_demo(
                         cost_floor_applied: floor,
                         pricing_available,
                         pricing_model: Some(model.to_string()),
+                        raw_usage_source: Default::default(),
                         usage_projection_mode: "demo_normalized".to_string(),
                         stream_response_mode: None,
                         usage_estimated: false,

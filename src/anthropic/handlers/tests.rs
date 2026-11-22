@@ -1550,6 +1550,7 @@ async fn test_external_pool_manager_for_handlers(
             enabled: true,
             priority: 1,
             max_concurrent_requests: 10,
+            raw_usage_source: Default::default(),
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
             stream_response_mode: None,
             request_body_mode: body_mode,

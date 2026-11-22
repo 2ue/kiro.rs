@@ -1049,6 +1049,7 @@ export interface ExternalPoolBilling {
   costFloorApplied: boolean
   pricingAvailable: boolean
   pricingModel?: string
+  rawUsageSource?: 'legacy_max' | 'upstream_last'
   usageProjectionMode: string
   streamResponseMode?: ExternalPoolStreamResponseMode
   usageEstimated?: boolean
@@ -2434,6 +2435,7 @@ export interface ExternalPool {
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
+  rawUsageSource: 'legacy_max' | 'upstream_last'
   usageProjectionMode: ExternalPoolUsageProjectionMode
   streamResponseMode?: ExternalPoolStreamResponseMode
   requestBodyMode: ExternalPoolRequestBodyMode
@@ -2503,6 +2505,7 @@ export interface CreateExternalPoolRequest {
   enabled?: boolean
   priority?: number
   maxConcurrentRequests?: number
+  rawUsageSource?: 'legacy_max' | 'upstream_last'
   usageProjectionMode?: ExternalPoolUsageProjectionMode
   streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode
@@ -2533,6 +2536,7 @@ export interface UpdateExternalPoolRequest {
   enabled?: boolean
   priority?: number
   maxConcurrentRequests?: number
+  rawUsageSource?: 'legacy_max' | 'upstream_last'
   usageProjectionMode?: ExternalPoolUsageProjectionMode
   streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode

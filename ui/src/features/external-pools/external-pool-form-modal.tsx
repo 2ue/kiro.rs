@@ -254,6 +254,13 @@ export function ExternalPoolFormModal({
             </div>
           </FormSection>
 
+          <FormSection title="原始用量统计" description="只决定当前账号的 rawUsage 和上游原始成本的记录依据。">
+            <div className="space-y-3">
+              <ToggleRow label="原始用量按上游最后返回值记录" checked={draft.rawUsageSource === 'upstream_last'} disabled={saving} onChange={(v) => set('rawUsageSource', v ? 'upstream_last' : 'legacy_max')} />
+              <HintBox>默认关闭，沿用当前逐字段取最大值的记录方式。开启后，各字段采用上游最后明确返回的有效值；未返回的字段保留前值。仅影响后续请求的原始统计。</HintBox>
+            </div>
+          </FormSection>
+
           <FormSection title="下游 usage 口径" description="只决定当前外部账号返回给下游的 usage 是透传上游，还是按当前入口路径整理；非 usage 内容不受影响。">
             <div className="space-y-3">
               <SelectBox label="下游 usage" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as ExternalPoolFormDraft['usageProjectionMode'])}>

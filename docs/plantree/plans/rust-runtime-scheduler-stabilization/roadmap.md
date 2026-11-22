@@ -287,6 +287,8 @@ Last reviewed: 2026-11-14 Asia/Shanghai
 
 ## Next
 
+- Implement the [account-level rawUsage source](topics/upstream-raw-usage-accounting.md), defaulting to existing behavior; validate main, forced-main and the separately ported claude-main.
+
 1. Collect the production-only redacted configuration and request timeline needed to
    attribute the concurrency backlog; no production load or policy change.
 2. Perform read-only `v0.0.134` production observation and update the issue/evidence

@@ -170,6 +170,7 @@ export function UsageCostBreakdown({
   return (
     <div>
       <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">计费口径</div>
+      {billing && <div className="mb-3 text-xs text-muted-foreground">原始用量依据：{billing.rawUsageSource === 'upstream_last' ? '上游最后明确返回值' : '原有最大值口径'}</div>}
       {billing ? (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <CostMetric
