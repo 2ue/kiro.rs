@@ -22403,3 +22403,42 @@ fn raw_usage_source_default_and_copy_are_backward_compatible() {
             .is_err()
     );
 }
+
+#[test]
+fn raw_usage_source_all_zero_stream_keeps_legacy_estimation_and_billable_cost() {
+    let route = test_route("claude-sonnet-4-6");
+    let mut pool = test_pool("https://example.com", true);
+    let mut capture = ExternalUsageCapture::default();
+    capture
+        .upstream_usage
+        .observe(&json!({"input_tokens":0,"output_tokens":0}));
+    let capture = Arc::new(SyncMutex::new(capture));
+    let mut results = Vec::new();
+    for source in [RawUsageSource::LegacyMax, RawUsageSource::UpstreamLast] {
+        pool.raw_usage_source = source;
+        assert!(account_billing_from_capture_ref(&route, &pool, &capture).is_none());
+        results
+            .push(account_billing_from_stream_estimate(&route, &pool, &capture, None, 7).unwrap());
+    }
+    assert!(results[0].raw_cost_usd > 0.0);
+    assert_eq!(results[1].raw_usage.input_tokens, 0);
+    assert_eq!(results[1].raw_usage.output_tokens, 0);
+    assert!(results[1].usage_estimated);
+    let mut old = serde_json::to_value(&results[0]).unwrap();
+    let mut new = serde_json::to_value(&results[1]).unwrap();
+    for key in [
+        "rawUsageSource",
+        "rawUsage",
+        "rawCostUsd",
+        "profitUsd",
+        "costFloorDeltaUsd",
+        "costFloorApplied",
+    ] {
+        old.as_object_mut().unwrap().remove(key);
+        new.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(
+        old, new,
+        "missing-usage fallback must keep shaped/reported/billable values"
+    );
+}

@@ -17171,10 +17171,12 @@ fn account_billing_from_capture(
     pool: &Account,
     capture: ExternalUsageCapture,
 ) -> Option<AccountBilling> {
+    // Keep the legacy decision to estimate missing usage before choosing raw statistics.
+    let legacy_raw = capture.raw?;
     let raw = match pool.raw_usage_source {
-        RawUsageSource::LegacyMax => capture.raw,
-        RawUsageSource::UpstreamLast => capture.upstream_usage.snapshot().or(capture.raw),
-    }?;
+        RawUsageSource::LegacyMax => legacy_raw,
+        RawUsageSource::UpstreamLast => capture.upstream_usage.snapshot().unwrap_or(legacy_raw),
+    };
     let reported = capture.reported.or(capture.raw).unwrap_or(raw);
     let shaped = capture
         .shaped
@@ -17236,7 +17238,12 @@ fn account_billing_from_stream_estimate(
         route,
         pool,
         Some(estimated.request_input_tokens),
-        estimated.raw,
+        match pool.raw_usage_source {
+            RawUsageSource::LegacyMax => estimated.raw,
+            RawUsageSource::UpstreamLast => {
+                capture.upstream_usage.snapshot().unwrap_or(estimated.raw)
+            }
+        },
         estimated.shaped,
         estimated.reported,
         estimated.projected,
