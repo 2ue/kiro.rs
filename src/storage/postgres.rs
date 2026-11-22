@@ -1123,7 +1123,10 @@ impl PostgresStore {
             let mut record = value.clone();
             let fields = record.as_object_mut().unwrap();
             fields.insert("id".into(), serde_json::json!(id));
-            fields.insert("raw_usage_source".into(), serde_json::to_value(request.raw_usage_source)?);
+            fields.insert(
+                "raw_usage_source".into(),
+                serde_json::to_value(request.raw_usage_source)?,
+            );
             // 只写明确允许的列；不导入旧表的状态、主键和机器配置。
             sqlx::query(r#"
                 INSERT INTO accounts (
@@ -1338,7 +1341,10 @@ impl PostgresStore {
             });
             let fields = record.as_object_mut().unwrap();
             fields.insert("id".into(), serde_json::json!(id));
-            fields.insert("raw_usage_source".into(), serde_json::to_value(request.raw_usage_source)?);
+            fields.insert(
+                "raw_usage_source".into(),
+                serde_json::to_value(request.raw_usage_source)?,
+            );
             // 只写明确允许的列；不导入旧表的状态、主键和机器配置。
             sqlx::query(r#"
                 INSERT INTO accounts (
