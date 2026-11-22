@@ -8976,6 +8976,7 @@ mod tests {
             cost_floor_applied: false,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
+            raw_usage_source: Default::default(),
             usage_projection_mode: "current_path_policy".to_string(),
             stream_response_mode: None,
             usage_estimated: false,

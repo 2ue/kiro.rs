@@ -2677,6 +2677,7 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExtern
         enabled,
         priority,
         max_concurrent_requests: 1,
+        raw_usage_source: Default::default(),
         usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
         stream_response_mode: None,
         request_body_mode: ExternalPoolRequestBodyMode::Normalized,
@@ -12593,6 +12594,7 @@ fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
         enabled: true,
         priority: 10,
         max_concurrent_requests: 10,
+        raw_usage_source: Default::default(),
         usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
         stream_response_mode: None,
         request_body_mode: ExternalPoolRequestBodyMode::Normalized,
@@ -22986,5 +22988,102 @@ fn upstream_response_model_is_captured_before_rewrite_and_reaches_billing() {
     assert_eq!(
         projected.usage_capture.upstream_response_model.as_deref(),
         Some("claude-opus-4-8")
+    );
+}
+
+#[test]
+fn raw_usage_source_changes_only_raw_statistics_for_chunked_stream() {
+    let route = test_route("claude-sonnet-4-6");
+    let mut pool = test_pool("https://example.com", true);
+    let mut results = Vec::new();
+    for source in [RawUsageSource::LegacyMax, RawUsageSource::UpstreamLast] {
+        pool.raw_usage_source = source;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let plan = ExternalStreamProcessingPlan::from_mode(
+            ExternalPoolStreamResponseMode::EventPassthrough,
+        );
+        let input = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":262393,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":1,\"output_tokens\":75,\"cache_read_input_tokens\":97321,\"cache_creation_input_tokens\":20816,\"cache_creation\":{\"ephemeral_1h_input_tokens\":20816}}}\n\n";
+        let mut buffer = Vec::new();
+        let mut output = Vec::new();
+        for chunk in input.chunks(13) {
+            buffer.extend_from_slice(chunk);
+            output.extend(drain_sse_events(
+                &mut buffer,
+                None,
+                Some(&capture),
+                None,
+                plan,
+            ));
+        }
+        assert!(buffer.is_empty());
+        assert_eq!(output, input);
+        let billing = external_pool_billing_from_capture_ref(&route, &pool, &capture).unwrap();
+        assert_eq!(billing.raw_usage_source, source);
+        results.push(billing);
+    }
+    assert_eq!(results[0].raw_usage.input_tokens, 262393);
+    assert_eq!(results[1].raw_usage.input_tokens, 1);
+    assert!(results[0].raw_cost_usd > results[1].raw_cost_usd);
+    let mut old = serde_json::to_value(&results[0]).unwrap();
+    let mut new = serde_json::to_value(&results[1]).unwrap();
+    for key in [
+        "rawUsageSource",
+        "rawUsage",
+        "rawCostUsd",
+        "profitUsd",
+        "costFloorDeltaUsd",
+        "costFloorApplied",
+    ] {
+        old.as_object_mut().unwrap().remove(key);
+        new.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(
+        old, new,
+        "shaped/reported/billable values must remain identical"
+    );
+}
+
+#[test]
+fn raw_usage_source_preserves_zero_before_non_stream_repair_and_shaping() {
+    let route = test_route("claude-sonnet-4-6");
+    let mut pool = zero_repair_pool();
+    let projected = process_non_stream_response_usage_with_repair(
+        Bytes::from_static(br#"{"type":"message","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":0,"output_tokens":25}}"#),
+        Some(&route), None, std::iter::empty::<String>(),
+        zero_usage_repair::ZeroUsageRepairContext::for_attempt(&route, &pool, None));
+    let old =
+        external_pool_billing_from_capture(&route, &pool, projected.usage_capture.clone()).unwrap();
+    pool.raw_usage_source = RawUsageSource::UpstreamLast;
+    let new = external_pool_billing_from_capture(&route, &pool, projected.usage_capture).unwrap();
+    assert!(old.raw_usage.input_tokens > 0);
+    assert_eq!(new.raw_usage.input_tokens, 0);
+    assert_eq!(
+        old.reported_usage.input_tokens,
+        new.reported_usage.input_tokens
+    );
+    assert_eq!(old.billable_cost_usd, new.billable_cost_usd);
+    assert_eq!(old.shaped_cost_usd, new.shaped_cost_usd);
+}
+
+#[test]
+fn raw_usage_source_default_and_copy_are_backward_compatible() {
+    let request: CreateExternalPoolRequest = serde_json::from_value(
+        json!({"name":"test","baseUrl":"https://example.com","apiKey":"test-only"}),
+    )
+    .unwrap();
+    assert_eq!(request.raw_usage_source, RawUsageSource::LegacyMax);
+    let update: UpdateExternalPoolRequest = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(update.raw_usage_source, None);
+    assert!(
+        serde_json::from_value::<UpdateExternalPoolRequest>(json!({"rawUsageSource":"unknown"}))
+            .is_err()
+    );
+    let mut pool = test_pool("https://example.com", true);
+    pool.raw_usage_source = RawUsageSource::UpstreamLast;
+    assert_eq!(
+        CreateExternalPoolRequest::copy_of(&pool, "copy".into())
+            .unwrap()
+            .raw_usage_source,
+        RawUsageSource::UpstreamLast
     );
 }

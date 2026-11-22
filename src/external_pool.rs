@@ -1,3 +1,4 @@
+use crate::common::upstream_usage::{RawUsageSource, UpstreamUsage};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
@@ -607,6 +608,8 @@ pub struct ExternalPool {
     pub priority: i32,
     pub max_concurrent_requests: u32,
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
+    #[serde(default)]
+    pub raw_usage_source: RawUsageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
     #[serde(default)]
@@ -737,6 +740,8 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
     #[serde(default)]
+    pub raw_usage_source: RawUsageSource,
+    #[serde(default)]
     pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
     #[serde(default)]
     pub request_body_mode: ExternalPoolRequestBodyMode,
@@ -787,6 +792,7 @@ impl CreateExternalPoolRequest {
             priority: source.priority,
             max_concurrent_requests: source.max_concurrent_requests,
             usage_projection_mode: source.usage_projection_mode,
+            raw_usage_source: source.raw_usage_source,
             stream_response_mode: source.stream_response_mode,
             request_body_mode: source.request_body_mode,
             raw_model_mode: source.raw_model_mode,
@@ -866,6 +872,8 @@ pub struct UpdateExternalPoolRequest {
     pub max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub usage_projection_mode: Option<ExternalPoolUsageProjectionMode>,
+    #[serde(default)]
+    pub raw_usage_source: Option<RawUsageSource>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_stream_response_mode_update"
@@ -1899,6 +1907,7 @@ struct ExternalUsageCapture {
     estimated_output_tokens: i32,
     downstream_stop_reason: Option<String>,
     raw: Option<CacheUsage>,
+    upstream_usage: UpstreamUsage,
     shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
     projected: bool,
@@ -14007,6 +14016,7 @@ fn process_non_stream_response_usage_with_repair(
         }
         return ProjectedNonStreamBody::without_protocol_contamination(bytes, usage_capture);
     };
+    usage_capture.upstream_usage.observe_response(&value);
     usage_capture.downstream_stop_reason = external_stop_reason_from_value(&value);
     usage_capture.upstream_response_model = response_model::body_declared_model(&value);
     let sanitization = sanitize_response_content(&mut value, known_tool_names);
@@ -15647,6 +15657,9 @@ fn process_sse_event_with_plan_and_transcript(
     transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
     client_model: Option<&str>,
 ) -> Vec<u8> {
+    if let Some(capture) = capture {
+        capture.lock().upstream_usage.observe_sse(event);
+    }
     record_external_usage_debug_sse_event(event, capture, plan);
     record_external_wire_debug_sse_bytes(
         event,
@@ -16806,9 +16819,16 @@ fn external_pool_billing_from_capture(
     pool: &ExternalPool,
     capture: ExternalUsageCapture,
 ) -> Option<ExternalPoolBilling> {
-    let raw = capture.raw?;
-    let reported = capture.reported.or(capture.raw)?;
-    let shaped = capture.shaped.or(capture.reported).or(capture.raw)?;
+    let raw = match pool.raw_usage_source {
+        RawUsageSource::LegacyMax => capture.raw,
+        RawUsageSource::UpstreamLast => capture.upstream_usage.snapshot().or(capture.raw),
+    }?;
+    let reported = capture.reported.or(capture.raw).unwrap_or(raw);
+    let shaped = capture
+        .shaped
+        .or(capture.reported)
+        .or(capture.raw)
+        .unwrap_or(raw);
     let stream_response_mode = capture
         .stream_response_mode
         .map(|mode| mode.as_str().to_string());
@@ -16923,6 +16943,7 @@ fn external_pool_billing(
     ExternalPoolBilling {
         request_input_tokens: request_input_tokens.map(|tokens| tokens.max(0)),
         upstream_response_model: None,
+        raw_usage_source: pool.raw_usage_source,
         raw_usage: external_usage_snapshot(raw_usage),
         shaped_usage: external_usage_snapshot(shaped_usage),
         reported_usage: external_usage_snapshot(reported_usage),
@@ -17116,6 +17137,7 @@ mod copy_tests {
             enabled: true,
             priority: 3,
             max_concurrent_requests: 7,
+            raw_usage_source: Default::default(),
             usage_projection_mode: ExternalPoolUsageProjectionMode::CurrentPathPolicy,
             stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
             request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,

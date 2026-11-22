@@ -139,6 +139,7 @@ export type ExternalPoolFormDraft = {
   maxConcurrentRequests: number
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
+  rawUsageSource: 'legacy_max' | 'upstream_last'
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
   streamResponseMode: ExternalPoolStreamResponseDraft
   preOutputStreamRetryMode: ExternalPoolStreamRetryDraft
@@ -169,6 +170,7 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   maxConcurrentRequests: 10,
   requestBodyMode: 'normalized',
   rawModelMode: 'none',
+  rawUsageSource: 'legacy_max',
   usageProjectionMode: 'pass_through',
   streamResponseMode: 'inherit',
   preOutputStreamRetryMode: 'inherit',
@@ -199,6 +201,7 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   maxConcurrentRequests: pool.maxConcurrentRequests,
   requestBodyMode: pool.requestBodyMode || 'normalized',
   rawModelMode: pool.rawModelMode || 'none',
+  rawUsageSource: pool.rawUsageSource || 'legacy_max',
   usageProjectionMode: pool.usageProjectionMode,
   streamResponseMode: pool.streamResponseMode || 'inherit',
   preOutputStreamRetryMode: pool.preOutputStreamRetryMode || 'inherit',
