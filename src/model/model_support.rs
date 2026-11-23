@@ -4,6 +4,49 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFilterMode {
+    #[default]
+    Allowlist,
+    Denylist,
+}
+
+impl ModelFilterMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowlist => "allowlist",
+            Self::Denylist => "denylist",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "allowlist" => Ok(Self::Allowlist),
+            "denylist" => Ok(Self::Denylist),
+            _ => anyhow::bail!("model_filter_mode 值无效: {value}"),
+        }
+    }
+
+    pub fn allows(self, models: &[String], candidates: &[Option<&str>]) -> bool {
+        match self {
+            Self::Allowlist => model_is_supported_by_list(models, candidates),
+            Self::Denylist => {
+                models.is_empty()
+                    || candidates
+                        .iter()
+                        .flatten()
+                        .all(|model| model.trim().is_empty())
+                    || !model_is_supported_by_list(models, candidates)
+            }
+        }
+    }
+}
+
 pub fn normalize_model_id(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -718,6 +761,35 @@ mod tests {
             assert_eq!(subscription_tier_key(Some("KIRO POWER")), "power");
             assert_eq!(subscription_tier_key(Some("KIRO PRO+")), "pro_plus");
             assert_eq!(subscription_tier_key(Some("KIRO PRO")), "pro");
+        }
+    }
+}
+
+#[cfg(test)]
+mod filter_mode_tests {
+    use super::*;
+    #[test]
+    fn model_filter_modes_are_exclusive_and_legacy_defaults_allowlist() {
+        assert_eq!(ModelFilterMode::default(), ModelFilterMode::Allowlist);
+        assert!(serde_json::from_str::<ModelFilterMode>("\"both\"").is_err());
+        let models = vec!["claude-sonnet-4.5".into()];
+        for (candidates, matched) in [
+            (vec![Some("claude-sonnet-4-5")], true),
+            (vec![Some("other"), Some("claude-sonnet-4.5")], true),
+            (vec![Some("fable-5")], false),
+        ] {
+            assert_eq!(
+                ModelFilterMode::Allowlist.allows(&models, &candidates),
+                matched
+            );
+            assert_eq!(
+                ModelFilterMode::Denylist.allows(&models, &candidates),
+                !matched
+            );
+        }
+        for mode in [ModelFilterMode::Allowlist, ModelFilterMode::Denylist] {
+            assert!(mode.allows(&[], &[Some("future-model")]));
+            assert!(mode.allows(&models, &[None]));
         }
     }
 }

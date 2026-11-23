@@ -1978,6 +1978,7 @@ mod tests {
             effective_auth_region: "us-east-1".to_string(),
             effective_api_region: "us-east-1".to_string(),
             subscription_class: class.to_string(),
+            model_filter_mode: Default::default(),
             supported_models: Vec::new(),
         }
     }

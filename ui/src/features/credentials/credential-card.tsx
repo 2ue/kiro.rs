@@ -339,8 +339,9 @@ function MetaItem({ label, value, detail, error }: {
   )
 }
 
-function supportedModelsSummary(models?: string[]) {
-  if (!models || models.length === 0) return '不限制'
+function supportedModelsSummary(models: string[], mode = 'allowlist') {
+  if (!models.length) return mode === 'denylist' ? '黑名单：不排除模型' : '白名单：继承订阅等级'
+  if (mode === 'denylist') return `黑名单：禁止 ${models.join(', ')}`
   if (models.length <= 2) return models.join(', ')
   return `${models[0]}, ${models[1]} 等 ${models.length} 个`
 }
@@ -407,6 +408,8 @@ export function CredentialCard({
   const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
   const [apiRegionValue, setApiRegionValue] = useState(credential.apiRegion || '')
   const [supportedModelsDraft, setSupportedModelsDraft] = useState<string[]>(supportedModels)
+  const [modelFilterModeDraft, setModelFilterModeDraft] = useState(credential.modelFilterMode ?? 'allowlist')
+  const [discoveredModelOptions, setDiscoveredModelOptions] = useState<string[]>([])
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -478,7 +481,8 @@ export function CredentialCard({
   }, [credential.id, credential.region, credential.authRegion, credential.apiRegion])
   useEffect(() => {
     setSupportedModelsDraft(supportedModels)
-  }, [credential.id, supportedModels])
+    setModelFilterModeDraft(credential.modelFilterMode ?? 'allowlist')
+  }, [credential.id, supportedModels, credential.modelFilterMode])
   useEffect(() => {
     if (!showDiagnostics || !diagnostics.data) return
     setDiagnosticRecords((current) => diagnosticsPage === 1
@@ -582,7 +586,7 @@ export function CredentialCard({
 
   const saveSupportedModels = () => {
     const supportedModels = mergeSupportedModels([], supportedModelsDraft)
-    setCredentialSupportedModels.mutate({ id: credential.id, request: { supportedModels } }, {
+    setCredentialSupportedModels.mutate({ id: credential.id, request: { supportedModels, modelFilterMode: modelFilterModeDraft } }, {
       onSuccess: (res) => {
         toast.success(`已保存 ${res.count} 个支持模型`)
         setSupportedModelsDraft(res.supportedModels)
@@ -596,7 +600,8 @@ export function CredentialCard({
     discoverCredentialSupportedModels.mutate(credential.id, {
       onSuccess: (res) => {
         toast.success(`已获取 ${res.count} 个模型，保存后生效`)
-        setSupportedModelsDraft(res.supportedModels)
+        setDiscoveredModelOptions(res.supportedModels)
+        if (modelFilterModeDraft === 'allowlist') setSupportedModelsDraft(res.supportedModels)
       },
       onError: (e) => toast.error(`模型发现失败: ${extractErrorMessage(e)}`),
     })
@@ -996,7 +1001,7 @@ export function CredentialCard({
                 {routeSummary ?? '全部入口'}
               </DetailRow>
               <DetailRow label="支持模型" onEdit={() => setEditingSupportedModels(true)}>
-                <span title={supportedModels.join('\n') || undefined}>{supportedModelsSummary(supportedModels)}</span>
+                <span title={supportedModels.join('\n') || undefined}>{supportedModelsSummary(supportedModels, credential.modelFilterMode)}</span>
               </DetailRow>
               <DetailRow label="429 自动禁用">
                 <span className="inline-flex items-center gap-2">
@@ -1250,22 +1255,27 @@ export function CredentialCard({
       </ModalShell>
 
       {/* ── Supported Models Modal ── */}
-      <ModalShell open={editingSupportedModels} title={`支持模型：${displayCredentialLabel}`} width="max-w-xl"
+      <ModalShell open={editingSupportedModels} title={`模型筛选：${displayCredentialLabel}`} width="max-w-xl"
         onClose={() => {
           if (setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending) return
           setSupportedModelsDraft(supportedModels)
+          setModelFilterModeDraft(credential.modelFilterMode ?? 'allowlist')
           setEditingSupportedModels(false)
         }}>
         <div className="space-y-3">
           <div className="rounded-lg bg-muted/30 px-3 py-2 text-sm">
             <div className="flex justify-between gap-2">
               <span className="text-muted-foreground">当前限制</span>
-              <span className="font-semibold">{supportedModelsDraft.length > 0 ? `${supportedModelsDraft.length} 个模型` : '不限制'}</span>
+              <span className="font-semibold">{supportedModelsSummary(supportedModelsDraft, modelFilterModeDraft)}</span>
             </div>
-            <div className="mt-1 text-xs text-muted-foreground">保存空列表表示该账号可参与任意模型调度；非空时只允许精确匹配模型调用该账号。</div>
+            <div className="mt-1 text-xs text-muted-foreground">白名单只允许列表内模型，空白名单继承订阅等级；黑名单只禁止列表内模型，空黑名单不限制。</div>
           </div>
-          <Field label="支持模型" description="从当前账号获取上游模型 ID 并替换列表；可清空、增删，保存后生效。">
+          <Field label="模型列表" description="白名单下获取上游模型会填入草稿；黑名单下仅补充候选。模式互斥，切换后当前列表按新模式解释。">
             <SupportedModelTagsEditor
+              mode={modelFilterModeDraft}
+              onModeChange={setModelFilterModeDraft}
+              options={discoveredModelOptions}
+              inheritTier
               value={supportedModelsDraft}
               disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}
               onChange={setSupportedModelsDraft}

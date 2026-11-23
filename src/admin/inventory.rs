@@ -413,6 +413,7 @@ pub struct OriginSnapshot {
     pub rpm: Option<u32>,
     pub max_concurrent_requests: Option<u32>,
     pub supported_models: Vec<String>,
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
     pub tags: Vec<String>,
     pub endpoint: Option<String>,
     pub had_proxy: bool,
@@ -455,6 +456,7 @@ impl OriginSnapshot {
             rpm: item.rpm_override,
             max_concurrent_requests: item.max_concurrent_requests_override,
             supported_models: item.supported_models.clone(),
+            model_filter_mode: item.model_filter_mode,
             tags: item.tags.clone(),
             endpoint: Some(item.endpoint.clone()).filter(|endpoint| !endpoint.is_empty()),
             had_proxy: item.has_proxy,
@@ -502,6 +504,7 @@ impl OriginSnapshot {
         request.rpm = self.rpm;
         request.max_concurrent_requests = self.max_concurrent_requests;
         request.supported_models = self.supported_models.clone();
+        request.model_filter_mode = self.model_filter_mode;
         request.tags = self.tags.clone();
     }
 }

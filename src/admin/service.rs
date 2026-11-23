@@ -1496,7 +1496,14 @@ impl AdminService {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models_unmasked(id, supported_models)
+                .update_external_pool_unmasked(
+                    id,
+                    crate::external_pool::UpdateExternalPoolRequest {
+                        supported_models: Some(supported_models),
+                        model_filter_mode: request.model_filter_mode,
+                        ..Default::default()
+                    },
+                )
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1512,6 +1519,7 @@ impl AdminService {
         self.invalidate_external_pool_admin_cache_with_pool("supported_models", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
+            model_filter_mode: pool.model_filter_mode,
             supported_models: pool.supported_models,
         })
     }
@@ -1528,7 +1536,16 @@ impl AdminService {
         let supported_models_for_store = supported_models.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models_unmasked(id, supported_models_for_store)
+                .update_external_pool_unmasked(
+                    id,
+                    crate::external_pool::UpdateExternalPoolRequest {
+                        supported_models: Some(supported_models_for_store),
+                        model_filter_mode: Some(
+                            crate::model::model_support::ModelFilterMode::Allowlist,
+                        ),
+                        ..Default::default()
+                    },
+                )
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1546,6 +1563,7 @@ impl AdminService {
         self.invalidate_external_pool_admin_cache_with_pool("supported_models_sync", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
+            model_filter_mode: pool.model_filter_mode,
             supported_models: pool.supported_models,
         })
     }
@@ -1561,6 +1579,7 @@ impl AdminService {
             .await?;
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
+            model_filter_mode: crate::model::model_support::ModelFilterMode::Allowlist,
             supported_models,
         })
     }
@@ -1990,6 +2009,7 @@ impl AdminService {
             email: req.email,
             subscription_title: None,
             supported_models: req.supported_models,
+            model_filter_mode: req.model_filter_mode,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -3070,7 +3090,7 @@ impl AdminService {
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
             .token_manager
-            .set_credential_supported_models(id, req.supported_models)
+            .set_credential_model_filter(id, req.model_filter_mode, req.supported_models)
             .map_err(|e| self.classify_error(e, id))?;
         self.audit(
             "set_credential_supported_models",
@@ -3082,6 +3102,10 @@ impl AdminService {
         );
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
+            model_filter_mode: self
+                .token_manager
+                .credential_model_filter_mode(id)
+                .map_err(|e| self.classify_error(e, id))?,
             supported_models,
         })
     }
@@ -3096,7 +3120,11 @@ impl AdminService {
             .await?;
         let supported_models = self
             .token_manager
-            .set_credential_supported_models(id, supported_models)
+            .set_credential_model_filter(
+                id,
+                Some(crate::model::model_support::ModelFilterMode::Allowlist),
+                supported_models,
+            )
             .map_err(|e| self.classify_error(e, id))?;
         self.audit(
             "sync_credential_supported_models",
@@ -3108,6 +3136,7 @@ impl AdminService {
         );
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
+            model_filter_mode: crate::model::model_support::ModelFilterMode::Allowlist,
             supported_models,
         })
     }
@@ -3122,6 +3151,7 @@ impl AdminService {
             .await?;
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
+            model_filter_mode: crate::model::model_support::ModelFilterMode::Allowlist,
             supported_models,
         })
     }
@@ -4042,6 +4072,7 @@ impl AdminService {
 
         if auto_discover_supported_models
             && new_cred.is_api_key_credential()
+            && new_cred.model_filter_mode == crate::model::model_support::ModelFilterMode::Allowlist
             && new_cred.supported_models.is_empty()
         {
             match self
@@ -4196,6 +4227,8 @@ impl AdminService {
         {
             let current_credential = ctx.credentials;
             if current_credential.is_api_key_credential()
+                && current_credential.model_filter_mode
+                    == crate::model::model_support::ModelFilterMode::Allowlist
                 && current_credential.supported_models.is_empty()
             {
                 match block_on_admin_store(
@@ -4973,6 +5006,7 @@ impl AdminService {
             && req.rate_limit_auto_disable.is_none()
             && req.proxy.is_none()
             && req.proxy_resource_ids.is_empty()
+            && req.model_filter.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
                 "没有选择任何要修改的账号字段".to_string(),
@@ -4997,6 +5031,7 @@ impl AdminService {
         let concurrency = req.concurrency.map(|value| value.max_concurrent_requests);
         let rpm = req.rpm.map(|value| value.rpm);
         let rate_limit_auto_disable = req.rate_limit_auto_disable.map(|value| value.enabled);
+        let model_filter = req.model_filter;
         let proxy = match req.proxy {
             Some(proxy) => Some((
                 proxy.proxy_resource_id,
@@ -5022,6 +5057,15 @@ impl AdminService {
         let mut success = 0usize;
         for id in ids {
             let mut error: Option<String> = None;
+            if let Some(filter) = &model_filter
+                && let Err(err) = self.token_manager.set_credential_model_filter(
+                    id,
+                    filter.model_filter_mode,
+                    filter.supported_models.clone(),
+                )
+            {
+                error = Some(err.to_string());
+            }
 
             if let Some(priority) = priority {
                 if let Err(err) = self
@@ -6125,7 +6169,9 @@ impl AdminService {
             );
             let count = counts.entry(tier).or_default();
             count.0 += 1;
-            if entry.supported_models.is_empty() {
+            if entry.model_filter_mode == crate::model::model_support::ModelFilterMode::Allowlist
+                && entry.supported_models.is_empty()
+            {
                 count.1 += 1;
             }
         }
@@ -9231,6 +9277,7 @@ fn apply_batch_import_defaults(
     if credential.supported_models.is_empty() {
         if let Some(supported_models) = &defaults.supported_models {
             credential.supported_models = supported_models.clone();
+            credential.model_filter_mode = defaults.model_filter_mode.unwrap_or_default();
         }
     }
     if credential.tags.is_empty() {
@@ -9424,6 +9471,7 @@ fn credential_status_item_from_snapshot(
         success_count: entry.success_count,
         last_used_at: entry.last_used_at,
         supported_models: entry.supported_models,
+        model_filter_mode: entry.model_filter_mode,
         has_proxy: entry.has_proxy,
         proxy_url: entry.proxy_url,
         proxy_username: entry.proxy_username,
@@ -9503,6 +9551,7 @@ fn credential_list_item_from_base(
         subscription_title: credential.subscription_title,
         tags: credential.tags,
         supported_models: credential.supported_models,
+        model_filter_mode: credential.model_filter_mode,
         has_proxy: credential.has_proxy,
         proxy_url: credential.proxy_url,
         proxy_username: credential.proxy_username,
@@ -9571,6 +9620,7 @@ fn credential_runtime_item_from_snapshot(
         scheduler_selection_pressure: credential.scheduler_selection_pressure,
         scheduler_score: credential.scheduler_score,
         supported_models: credential.supported_models,
+        model_filter_mode: credential.model_filter_mode,
     }
 }
 

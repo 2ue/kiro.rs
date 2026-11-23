@@ -146,6 +146,7 @@ export type ExternalPoolFormDraft = {
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   preservePath: boolean
   normalizeModelVersionDots: boolean
+  modelFilterMode: 'allowlist' | 'denylist'
   supportedModelsText: string
   routeMode: NonNullable<CreateExternalPoolRequest['routeMode']>
   routeRules: string[]
@@ -177,6 +178,7 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   autoDisablePolicy: 'inherit',
   preservePath: true,
   normalizeModelVersionDots: false,
+  modelFilterMode: 'allowlist',
   supportedModelsText: '',
   routeMode: 'allow_all',
   routeRules: [],
@@ -208,6 +210,7 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   autoDisablePolicy: pool.autoDisablePolicy,
   preservePath: pool.preservePath !== false,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
+  modelFilterMode: pool.modelFilterMode ?? 'allowlist',
   supportedModelsText: joinRules(pool.supportedModels || []),
   routeMode: pool.routeMode || 'allow_all',
   routeRules: [...(pool.routeRules || [])],
@@ -328,7 +331,8 @@ export function tlsProfileDescription(profile: ExternalPool['tlsProfile'] | unde
 
 export function poolSupportedModelsSummary(pool: ExternalPool): string {
   const models = pool.supportedModels || []
-  if (models.length === 0) return '支持：不限制'
+  if (pool.modelFilterMode === 'denylist') return models.length ? `黑名单：禁止 ${models.join(', ')}` : '黑名单：不排除模型'
+  if (models.length === 0) return '白名单：不限制'
   if (models.length <= 2) return `支持：${models.join(', ')}`
   return `支持：${models[0]}, ${models[1]} 等 ${models.length} 个`
 }

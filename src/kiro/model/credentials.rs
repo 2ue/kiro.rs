@@ -177,6 +177,8 @@ pub struct KiroCredentials {
     /// 凭据支持的模型列表。空列表表示不限制模型调度。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
 
     /// 凭据级代理 URL（可选）
     /// 支持 http/https/socks5 协议
@@ -504,6 +506,7 @@ impl KiroCredentials {
             && self.email == other.email
             && self.subscription_title == other.subscription_title
             && self.supported_models == other.supported_models
+            && self.model_filter_mode == other.model_filter_mode
             && self.proxy_url == other.proxy_url
             && self.proxy_username == other.proxy_username
             && self.proxy_password == other.proxy_password
@@ -708,7 +711,8 @@ impl KiroCredentials {
     }
 
     pub fn supports_model(&self, candidates: &[Option<&str>]) -> bool {
-        model_is_supported_by_list(&self.supported_models, candidates)
+        self.model_filter_mode
+            .allows(&self.supported_models, candidates)
     }
 
     /// Subscription tier of this account (`free`, `pro`, `power`, ...; `unknown` before the
@@ -725,7 +729,9 @@ impl KiroCredentials {
         candidates: &[Option<&str>],
         tier_lists: &SubscriptionModelLists,
     ) -> bool {
-        if !self.supported_models.is_empty() {
+        if self.model_filter_mode == crate::model::model_support::ModelFilterMode::Denylist
+            || !self.supported_models.is_empty()
+        {
             return self.supports_model(candidates);
         }
         match self.tier_models(tier_lists) {
@@ -736,7 +742,9 @@ impl KiroCredentials {
 
     /// The tier list that applies to this account: only when the account has no list of its own.
     pub fn tier_models<'a>(&self, tier_lists: &'a SubscriptionModelLists) -> Option<&'a [String]> {
-        if !self.supported_models.is_empty() {
+        if self.model_filter_mode == crate::model::model_support::ModelFilterMode::Denylist
+            || !self.supported_models.is_empty()
+        {
             return None;
         }
         tier_lists
@@ -948,6 +956,7 @@ mod tests {
             fingerprint_version: Some("account-v2".to_string()),
             email: Some("email-sensitive-value@example.invalid".to_string()),
             subscription_title: Some("subscription-sensitive-value".to_string()),
+            model_filter_mode: Default::default(),
             supported_models: vec!["model-sensitive-value".to_string()],
             proxy_url: Some("http://proxy-user:proxy-pass@example.invalid".to_string()),
             proxy_username: Some("proxy-username-sensitive-value".to_string()),

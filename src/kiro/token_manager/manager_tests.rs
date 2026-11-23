@@ -17355,3 +17355,92 @@ async fn degraded_credential_takes_overflow_when_healthy_ones_are_full() {
         ctx.release_in_flight();
     }
 }
+
+#[tokio::test]
+async fn model_filter_denylist_never_falls_through_when_supporter_is_busy_or_excluded() {
+    use crate::model::model_support::ModelFilterMode;
+    for mode in [
+        "priority",
+        "balanced",
+        "health_balanced",
+        "weighted_least_inflight",
+    ] {
+        let mut config = Config::default();
+        config.load_balancing_mode = mode.into();
+        let mut denied = test_access_token_credential("deny-fable", "Pro");
+        denied.model_filter_mode = ModelFilterMode::Denylist;
+        denied.supported_models = vec!["fable-5".into()];
+        denied.priority = 0;
+        let mut supporter = test_access_token_credential("allow-fable", "Pro");
+        supporter.supported_models = vec!["fable-5".into()];
+        supporter.priority = 1;
+        supporter.max_concurrent_requests = Some(1);
+        let manager =
+            MultiTokenManager::new(config, vec![denied, supporter], None, None, false).unwrap();
+        let mut active = manager
+            .acquire_context_for_session(
+                Some("fable-5"),
+                Some("model-filter-session"),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active.id, 2, "{mode}");
+        assert_eq!(
+            manager.local_pool_route_state(Some("fable-5")).model_usable,
+            1
+        );
+        assert!(!manager.has_alternate_usable_credential_cached(
+            Some("fable-5"),
+            &HashSet::new(),
+            2
+        ));
+        assert!(manager.usable_explicit_model_catalog().is_none());
+        assert!(
+            manager
+                .acquire_context_for_session(
+                    Some("fable-5"),
+                    Some("model-filter-session"),
+                    &HashSet::from([2])
+                )
+                .await
+                .is_err()
+        );
+        active.release_in_flight();
+        manager
+            .set_credential_model_filter(1, Some(ModelFilterMode::Denylist), vec![])
+            .unwrap();
+        assert_eq!(
+            manager.local_pool_route_state(Some("fable-5")).model_usable,
+            2
+        );
+        manager
+            .set_credential_supported_models(1, vec!["fable-5".into()])
+            .unwrap();
+        assert_eq!(
+            manager.credential_model_filter_mode(1).unwrap(),
+            ModelFilterMode::Denylist
+        );
+        assert_eq!(
+            manager.local_pool_route_state(Some("fable-5")).model_usable,
+            1
+        );
+    }
+}
+
+#[test]
+fn model_filter_explicit_denylist_replaces_inherited_tier_list() {
+    use crate::model::model_support::ModelFilterMode;
+    let mut account = test_access_token_credential("tier-deny", "KIRO FREE");
+    let lists =
+        std::collections::BTreeMap::from([("free".into(), tier_list(&["claude-haiku-4.5"]))]);
+    assert!(!account.supports_model_with_tier_lists(&[Some("fable-5")], &lists));
+    account.model_filter_mode = ModelFilterMode::Denylist;
+    assert!(account.supports_model_with_tier_lists(&[Some("fable-5")], &lists));
+    account.supported_models = vec!["fable-5".into()];
+    assert!(
+        !account.supports_model_with_tier_lists(&[Some("allowed-alias"), Some("FABLE-5")], &lists)
+    );
+    assert!(account.supports_model_with_tier_lists(&[Some("other-model")], &lists));
+    assert!(account.supports_model_with_tier_lists(&[None], &lists));
+}

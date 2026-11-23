@@ -1,3 +1,5 @@
+export type ModelFilterMode = 'allowlist' | 'denylist'
+
 export interface CredentialsStatusResponse {
   total: number
   available: number
@@ -172,6 +174,7 @@ export interface CredentialStatusItem {
   lastErrorReason?: string
   lastErrorAtMs?: number | null
   supportedModels?: string[]
+  modelFilterMode?: ModelFilterMode
   tags?: string[]
   inProbation?: boolean
   probationRemainingSecs?: number
@@ -604,6 +607,7 @@ export interface BatchUpdateCredentialsRequest {
   proxy?: SetCredentialProxyRequest
   /** Proxy resources assigned in turn in the order of `ids`; replaces `proxy` when non-empty. */
   proxyResourceIds?: number[]
+  modelFilter?: SetSupportedModelsRequest
 }
 
 export interface BatchUpdateCredentialItem {
@@ -650,6 +654,7 @@ export interface AddCredentialRequest {
   kiroApiKey?: string
   endpoint?: string
   supportedModels?: string[]
+  modelFilterMode?: ModelFilterMode
   tags?: string[]
   autoDiscoverSupportedModels?: boolean | null
 }
@@ -2381,6 +2386,7 @@ export interface ExternalPool {
   modelMappingRequireMatch: boolean
   modelMappingRules: ExternalPoolModelMappingRule[]
   supportedModels: string[]
+  modelFilterMode?: ModelFilterMode
   routeMode: ExternalPoolRouteMode
   routeRules: string[]
   notes?: string
@@ -2446,6 +2452,7 @@ export interface CreateExternalPoolRequest {
   modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
   supportedModels?: string[]
+  modelFilterMode?: ModelFilterMode
   routeMode?: ExternalPoolRouteMode
   routeRules?: string[]
   notes?: string
@@ -2477,6 +2484,7 @@ export interface UpdateExternalPoolRequest {
   modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
   supportedModels?: string[]
+  modelFilterMode?: ModelFilterMode
   routeMode?: ExternalPoolRouteMode
   routeRules?: string[]
   notes?: string
@@ -2484,6 +2492,7 @@ export interface UpdateExternalPoolRequest {
 
 export interface SetSupportedModelsRequest {
   supportedModels: string[]
+  modelFilterMode?: ModelFilterMode
 }
 
 export interface DiscoverExternalPoolSupportedModelsRequest {
@@ -2494,6 +2503,7 @@ export interface DiscoverExternalPoolSupportedModelsRequest {
 
 export interface SupportedModelsResponse {
   supportedModels: string[]
+  modelFilterMode?: ModelFilterMode
   count: number
 }
 
@@ -3026,6 +3036,7 @@ export interface BatchCredentialImportDefaults {
   warmupRemaining?: number
   enableOverageAfterImport?: boolean
   supportedModels?: string[]
+  modelFilterMode?: ModelFilterMode
   tags?: string[]
 }
 
@@ -3124,6 +3135,7 @@ export interface InventoryOrigin {
   rpm?: number | null
   maxConcurrentRequests?: number | null
   supportedModels?: string[]
+  modelFilterMode?: ModelFilterMode
   tags?: string[]
   endpoint?: string | null
   hadProxy?: boolean

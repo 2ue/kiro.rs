@@ -6528,7 +6528,10 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| !entry.disabled && !entry.account_quota_blocked)
         {
-            if entry.credentials.supported_models.is_empty() {
+            if entry.credentials.model_filter_mode
+                == crate::model::model_support::ModelFilterMode::Denylist
+                || entry.credentials.supported_models.is_empty()
+            {
                 return None;
             }
             any_usable = true;
@@ -9543,6 +9546,15 @@ impl MultiTokenManager {
     ) -> anyhow::Result<KiroCredentials> {
         if base.id != requested.id || base.id != current.id {
             anyhow::bail!("凭据 CAS 三方合并的 id 不一致");
+        }
+        let base_filter = (base.model_filter_mode, &base.supported_models);
+        let requested_filter = (requested.model_filter_mode, &requested.supported_models);
+        let current_filter = (current.model_filter_mode, &current.supported_models);
+        if requested_filter != base_filter
+            && current_filter != base_filter
+            && current_filter != requested_filter
+        {
+            anyhow::bail!("账号模型筛选已被其他实例并发修改");
         }
         let base_value = serde_json::to_value(base)?;
         let requested_value = serde_json::to_value(requested)?;
@@ -14304,6 +14316,7 @@ impl MultiTokenManager {
                     .to_ascii_lowercase(),
                 subscription_class: normalize(credentials.subscription_title.as_deref(), "unknown"),
                 supported_models,
+                model_filter_mode: credentials.model_filter_mode,
             };
             cohorts.entry(key).or_default().push(entry.id);
         }
@@ -14839,13 +14852,37 @@ impl MultiTokenManager {
     /// 设置凭据支持模型列表（Admin API）。
     ///
     /// 空列表表示不限制该凭据可调度的模型。
+    pub fn credential_model_filter_mode(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<crate::model::model_support::ModelFilterMode> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.credentials.model_filter_mode)
+            .ok_or_else(|| anyhow::anyhow!("账号不存在: {id}"))
+    }
+
     pub fn set_credential_supported_models(
         &self,
         id: u64,
         supported_models: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
+        self.set_credential_model_filter(id, None, supported_models)
+    }
+
+    pub fn set_credential_model_filter(
+        &self,
+        id: u64,
+        model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
+        supported_models: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
         let saved = self.persist_credential_mutation(id, |credential| {
             credential.supported_models = supported_models;
+            if let Some(mode) = model_filter_mode {
+                credential.model_filter_mode = mode;
+            }
             credential.normalize_supported_models();
             Ok(())
         })?;
