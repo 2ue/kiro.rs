@@ -256,8 +256,12 @@ export function ExternalPoolFormModal({
 
           <FormSection title="原始用量统计" description="只决定当前账号的 rawUsage 和上游原始成本的记录依据。">
             <div className="space-y-3">
-              <ToggleRow label="原始用量按上游最后返回值记录" checked={draft.rawUsageSource === 'upstream_last'} disabled={saving} onChange={(v) => set('rawUsageSource', v ? 'upstream_last' : 'legacy_max')} />
-              <HintBox>默认关闭，沿用当前逐字段取最大值的记录方式。开启后，各字段采用上游最后明确返回的有效值；未返回的字段保留前值。仅影响后续请求的原始统计。</HintBox>
+              <SelectBox label="原始用量记录与成本计算" value={draft.rawUsageSource} disabled={saving} onChange={(v) => set('rawUsageSource', v as ExternalPoolFormDraft['rawUsageSource'])}>
+                <SelectItem value="legacy_max">最大值记录，最大值计算（默认）</SelectItem>
+                <SelectItem value="upstream_last">最终值记录，最终值计算</SelectItem>
+                <SelectItem value="upstream_last_max_cost">最终值记录，最大值计算</SelectItem>
+              </SelectBox>
+              <HintBox>最终值按字段采用上游最后明确返回的有效值，缺失字段保留前值；最大值计算沿用原有成本口径。仅影响后续请求的原始统计。</HintBox>
             </div>
           </FormSection>
 

@@ -2,7 +2,7 @@
 
 Role: 原始用量统计的兼容性设计与验收契约
 
-Status: `In Progress / execute-ready`，已授权实施和三个分支发布
+Status: `In Progress / execute-ready`，三模式增量实现
 
 Date: 2026-11-23
 
@@ -23,12 +23,12 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 - 在外部池/外部账号的新建、编辑表单增加开关：**原始用量按上游最后返回值记录**，默认关闭。
 - 关闭：保持现有 rawUsage 采集、修复与逐字段最大值合并行为。
 - 开启：原始统计使用上游原始响应中各字段最后一次明确给出的有效数值。
-- API 拟使用 `rawUsageSource: "legacy_max" | "upstream_last"`，缺省为 `legacy_max`；界面用开关展示这两个状态。该字段独立于 `usageProjectionMode`。
+- API 使用 `rawUsageSource: "legacy_max" | "upstream_last"`，缺省为 `legacy_max`；界面用开关展示这两个状态。该字段独立于 `usageProjectionMode`。
 - 配置归属于每一个已保存的外部池/账号条目；不按站点、域名、账号类型或分组隐式共享。`main`/`forced-main` 使用 `ExternalPool`；`claude-main` 使用 `Account`。
 - 新建遗漏字段使用旧行为；已有账号迁移为旧行为；编辑遗漏字段保留当前值；复制账号继承源配置；已有导入导出路径中保留该字段，旧格式缺省旧行为。未知枚举值应明确校验失败。
 - 每次上游 attempt 在发出请求前使用权威账号快照固定策略，处理中编辑账号不改变该 attempt；重试/切池重新取对应账号策略，各 attempt 的状态互相隔离。
 - 通过现有数据库迁移机制增加账号策略列与默认值，并更新 schema 兼容性检查、CRUD、复制和已有缓存失效路径。这是账号持久开关所需的 schema 扩展，不修改 usage 记录表结构、不迁移历史用量。
-- 用量详情的外部池计费元数据拟追加本次生效的 `rawUsageSource`；历史记录缺省按旧行为解释，后续改开关不重解释历史记录。
+- 用量详情的外部池计费元数据追加本次生效的 `rawUsageSource`；历史记录缺省按旧行为解释，后续改开关不重解释历史记录。
 
 ## upstream_last 的合并语义
 
@@ -80,4 +80,21 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 
 ## 当前进度
 
-main 的账号配置、默认兼容迁移、CRUD/复制、表单、计费来源快照及隔离采集已实现。新增 8 项测试和 UI 88 项合同通过；外部池扩展验证 429 通过、7 忽略、1 项准备门禁 1 秒超时，待独立重跑。forced 合并、claude 独立移植验证及三分支发布仍在进行，未声称发布完成。
+三个分支实现完成并已推送：main `b5135f3c`、forced-main `57b68820`、claude-main `111f94f5`。main 合入 forced；claude 为对应代码独立移植。
+
+- 三个分支默认及无默认特性的专项回归各 9 项通过，含全零流式用量保持原估算/可计费值的边界。
+- 171 条脱敏回放通过：16 条 ddpapi 流式采用最后明确值，155 条一致。
+- main 最新完整 CI：默认/无默认各 `3179 passed / 18 ignored`，loadtest `31 passed`，时序专项 `10 passed`，Clippy `742 <= 849`；[检查记录](https://github.com/2ue/kiro.rs/actions/runs/45048531200)。
+- claude 最新完整 CI：默认/无默认各 `1245 passed / 12 ignored`，时序专项 `8 passed`，Clippy `598 <= 625`；[检查记录](https://github.com/2ue/kiro.rs/actions/runs/45048531489)。
+- UI：main/forced 各 89 项、claude 170 项通过，三个 UI 构建通过；Cargo 临时目录、预留和引用进程均已清零。
+- 最初的三个候选标签已推送，但发布前发现全零流式统计可能绕过旧计费估算；已取消发布并补齐隔离与回归。注册表确认 `0.0.262`、`0.0.271`、`1.0.15` 均未生成镜像。三个既有候选标签仍指向修复前提交，等待明确授权后仅重建这三个标签，再等待完整镜像发布。
+- 17 机器运行时 usage/wire debug 均关闭，无抓包进程；171 个证据文件共 1,072,214 字节，多次核对无增长，最后写入 `2026-11-22T16:01:43Z`。
+- 未部署远端服务、未启用账号开关、未回填历史。
+
+## 2026-11-23 增量：最终记录、最大值计算
+
+已发布 `v0.0.262`、`forced-v0.0.271`、`claude-v1.0.15`，三个发布工作流全部成功。17 机器 k1–k3 已更新为 main `0.0.262`；k1 的 sub2api-b 29 个启用账号已恢复、实际请求成功，抓包关闭。该已完成部署与下述新增模式分开记录。
+
+新增 `upstream_last_max_cost`：rawUsage 采用最后明确字段，rawCostUsd/originalCostUsd 沿用 legacy_max 的成本计算输入。现有 legacy_max、upstream_last 两模式语义不变，默认 legacy_max 不变。表单由开关改为三选一，保持编辑回显、复制、导入导出。所有新记录统一同时保存 rawUsage 与 rawCostUsage：记录口径与计算口径只在模式选择时确定；成本统一读取 rawCostUsage。旧 JSON 只在反序列化边界将缺少的 rawCostUsage 补成 rawUsage，业务计算没有模式补丁。详情三种模式都展示两个字段。
+
+最大值成本沿用当前 legacy_max 处理链（包括原有缺失用量估算），不会重新定义整形、零用量修复或 billable 结果。专项验收：真实下降样本、显式零、全零流估算、缺失用量、缓存 TTL、非流式；新模式记录与 upstream_last 一致、所有成本与 legacy_max 一致；DB 从旧两值 CHECK 迁移到三值，复制和旧数据兼容。main 实现后合入 forced，claude 独立移植，分别验证并按各自下一 patch 发布。账号默认和当前生产开关保持原值，历史不回填。

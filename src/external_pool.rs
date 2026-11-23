@@ -16821,10 +16821,9 @@ fn external_pool_billing_from_capture(
 ) -> Option<ExternalPoolBilling> {
     // Keep the legacy decision to estimate missing usage before choosing raw statistics.
     let legacy_raw = capture.raw?;
-    let raw = match pool.raw_usage_source {
-        RawUsageSource::LegacyMax => legacy_raw,
-        RawUsageSource::UpstreamLast => capture.upstream_usage.snapshot().unwrap_or(legacy_raw),
-    };
+    let (raw, raw_cost_usage) = pool
+        .raw_usage_source
+        .select(legacy_raw, capture.upstream_usage.snapshot());
     let reported = capture.reported.or(capture.raw).unwrap_or(raw);
     let shaped = capture
         .shaped
@@ -16839,6 +16838,7 @@ fn external_pool_billing_from_capture(
         pool,
         capture.request_input_tokens,
         raw,
+        raw_cost_usage,
         shaped,
         reported,
         capture.projected,
@@ -16882,16 +16882,15 @@ fn external_pool_billing_from_stream_estimate(
         projection,
         true,
     );
+    let (raw, raw_cost_usage) = pool
+        .raw_usage_source
+        .select(estimated.raw, capture.upstream_usage.snapshot());
     let mut billing = external_pool_billing(
         route,
         pool,
         Some(estimated.request_input_tokens),
-        match pool.raw_usage_source {
-            RawUsageSource::LegacyMax => estimated.raw,
-            RawUsageSource::UpstreamLast => {
-                capture.upstream_usage.snapshot().unwrap_or(estimated.raw)
-            }
-        },
+        raw,
+        raw_cost_usage,
         estimated.shaped,
         estimated.reported,
         estimated.projected,
@@ -16912,6 +16911,7 @@ fn external_pool_billing(
     pool: &ExternalPool,
     request_input_tokens: Option<i32>,
     raw_usage: CacheUsage,
+    raw_cost_usage: CacheUsage,
     shaped_usage: CacheUsage,
     reported_usage: CacheUsage,
     usage_projection_applied: bool,
@@ -16922,7 +16922,9 @@ fn external_pool_billing(
         .or(route.model_hint.as_deref())
         .or_else(|| route.payload.as_ref().map(|payload| payload.model.as_str()))
         .unwrap_or("unknown");
-    let raw_estimate = route.pricing_catalog.estimate(pricing_model, raw_usage);
+    let raw_estimate = route
+        .pricing_catalog
+        .estimate(pricing_model, raw_cost_usage);
     let shaped_estimate = route.pricing_catalog.estimate(pricing_model, shaped_usage);
     let reported_estimate = route
         .pricing_catalog
@@ -16952,6 +16954,7 @@ fn external_pool_billing(
         upstream_response_model: None,
         raw_usage_source: pool.raw_usage_source,
         raw_usage: external_usage_snapshot(raw_usage),
+        raw_cost_usage: external_usage_snapshot(raw_cost_usage),
         shaped_usage: external_usage_snapshot(shaped_usage),
         reported_usage: external_usage_snapshot(reported_usage),
         usage_projection_applied,

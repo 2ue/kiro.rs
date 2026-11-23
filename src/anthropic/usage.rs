@@ -158,7 +158,7 @@ pub struct ExternalPoolUsageSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "ExternalPoolBillingWire")]
 pub struct ExternalPoolBilling {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_input_tokens: Option<i32>,
@@ -168,6 +168,7 @@ pub struct ExternalPoolBilling {
     #[serde(default)]
     pub raw_usage_source: crate::common::upstream_usage::RawUsageSource,
     pub raw_usage: ExternalPoolUsageSnapshot,
+    pub raw_cost_usage: ExternalPoolUsageSnapshot,
     #[serde(default)]
     pub shaped_usage: ExternalPoolUsageSnapshot,
     pub reported_usage: ExternalPoolUsageSnapshot,
@@ -202,6 +203,86 @@ pub struct ExternalPoolBilling {
     pub usage_candidate_path: Option<String>,
     #[serde(default)]
     pub body_usage_projection_applied: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalPoolBillingWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_input_tokens: Option<i32>,
+    /// 上游实际返回的模型，只用于写用量记录顶层的 `upstreamResponseModel`，不随计费明细保存。
+    #[serde(skip)]
+    pub upstream_response_model: Option<String>,
+    #[serde(default)]
+    pub raw_usage_source: crate::common::upstream_usage::RawUsageSource,
+    pub raw_usage: ExternalPoolUsageSnapshot,
+    #[serde(default)]
+    pub raw_cost_usage: Option<ExternalPoolUsageSnapshot>,
+    #[serde(default)]
+    pub shaped_usage: ExternalPoolUsageSnapshot,
+    pub reported_usage: ExternalPoolUsageSnapshot,
+    #[serde(default)]
+    pub usage_projection_applied: bool,
+    pub raw_cost_usd: f64,
+    #[serde(default)]
+    pub shaped_cost_usd: f64,
+    #[serde(default)]
+    pub uplifted_cost_usd: f64,
+    #[serde(default)]
+    pub profit_usd: f64,
+    #[serde(default)]
+    pub reported_cost_usd: f64,
+    #[serde(default)]
+    pub billable_cost_usd: f64,
+    #[serde(default)]
+    pub cost_floor_delta_usd: f64,
+    #[serde(default)]
+    pub cost_floor_applied: bool,
+    pub pricing_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_model: Option<String>,
+    pub usage_projection_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_response_mode: Option<String>,
+    #[serde(default)]
+    pub usage_estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_estimate_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_candidate_path: Option<String>,
+    #[serde(default)]
+    pub body_usage_projection_applied: bool,
+}
+
+impl From<ExternalPoolBillingWire> for ExternalPoolBilling {
+    fn from(value: ExternalPoolBillingWire) -> Self {
+        Self {
+            request_input_tokens: value.request_input_tokens,
+            upstream_response_model: value.upstream_response_model,
+            raw_usage_source: value.raw_usage_source,
+            raw_usage: value.raw_usage,
+            raw_cost_usage: value.raw_cost_usage.unwrap_or(value.raw_usage),
+            shaped_usage: value.shaped_usage,
+            reported_usage: value.reported_usage,
+            usage_projection_applied: value.usage_projection_applied,
+            raw_cost_usd: value.raw_cost_usd,
+            shaped_cost_usd: value.shaped_cost_usd,
+            uplifted_cost_usd: value.uplifted_cost_usd,
+            profit_usd: value.profit_usd,
+            reported_cost_usd: value.reported_cost_usd,
+            billable_cost_usd: value.billable_cost_usd,
+            cost_floor_delta_usd: value.cost_floor_delta_usd,
+            cost_floor_applied: value.cost_floor_applied,
+            pricing_available: value.pricing_available,
+            pricing_model: value.pricing_model,
+            usage_projection_mode: value.usage_projection_mode,
+            stream_response_mode: value.stream_response_mode,
+            usage_estimated: value.usage_estimated,
+            usage_estimate_reason: value.usage_estimate_reason,
+            usage_candidate_path: value.usage_candidate_path,
+            body_usage_projection_applied: value.body_usage_projection_applied,
+        }
+    }
 }
 
 impl ExternalPoolBilling {

@@ -139,7 +139,7 @@ export type ExternalPoolFormDraft = {
   maxConcurrentRequests: number
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
-  rawUsageSource: 'legacy_max' | 'upstream_last'
+  rawUsageSource: 'legacy_max' | 'upstream_last' | 'upstream_last_max_cost'
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
   streamResponseMode: ExternalPoolStreamResponseDraft
   preOutputStreamRetryMode: ExternalPoolStreamRetryDraft
