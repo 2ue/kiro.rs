@@ -4,6 +4,11 @@ Last reviewed: 2026-11-14 Asia/Shanghai
 
 ## Done
 
+- Account-level raw usage accounting: all three modes persist both `rawUsage` and
+  `rawCostUsage`; the default remains `legacy_max`. Main `v0.0.263`, forced
+  `forced-v0.0.272`, and independently ported `claude-v1.0.16` passed full quality
+  gates and published amd64/arm64 manifests. See [contract and release evidence](topics/upstream-raw-usage-accounting.md).
+
 - Model catalog and pricing source separation: Kiro capability discovery remains independent
   from Claude/LiteLLM pricing; base prices and manual overrides persist in separate tables,
   legacy manual rows migrate idempotently, and deleting an override restores the latest base
@@ -286,8 +291,6 @@ Last reviewed: 2026-11-14 Asia/Shanghai
     `runtime-validated / cli-pass`。服务已停止、`19023` 无残留。
 
 ## Next
-
-- Implement the [account-level rawUsage source](topics/upstream-raw-usage-accounting.md), defaulting to existing behavior; validate main, forced-main and the separately ported claude-main.
 
 1. Collect the production-only redacted configuration and request timeline needed to
    attribute the concurrency backlog; no production load or policy change.

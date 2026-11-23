@@ -2,6 +2,9 @@
 
 Last reviewed: 2026-11-11 Asia/Shanghai
 
+2026-11-23 completed follow-up: [账号级 rawUsage 统一双字段及发布证据](topics/upstream-raw-usage-accounting.md#最终交付与发布证据2026-11-23).
+三模式已完成 main/forced/claude 的完整质量检查及镜像发布；生产 k1–k3 仍为上一轮 `0.0.262`，抓包关闭。本项无剩余实现或发布 TODO。
+
 ## 本次交接：模型目录与价格来源分离（2026-11-15）
 
 - 实现和验证记录见[模型目录与价格来源专题](topics/model-catalog-and-pricing-sources.md)。Kiro 能力目录、Claude/LiteLLM 价格目录、内置基价和手动覆盖现已分开维护；手动价格覆盖优先，删除后恢复基础价格，缺价只在同 Claude 模型系列内回退。

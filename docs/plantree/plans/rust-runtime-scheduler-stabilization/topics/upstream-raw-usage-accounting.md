@@ -2,7 +2,7 @@
 
 Role: 原始用量统计的兼容性设计与验收契约
 
-Status: `In Progress / execute-ready`，三模式增量实现
+Status: `Done / Released`，三模式统一字段已完成三个分支的完整回归及双架构镜像发布
 
 Date: 2026-11-23
 
@@ -20,10 +20,17 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 
 ## 账号配置与默认值
 
-- 在外部池/外部账号的新建、编辑表单增加开关：**原始用量按上游最后返回值记录**，默认关闭。
-- 关闭：保持现有 rawUsage 采集、修复与逐字段最大值合并行为。
-- 开启：原始统计使用上游原始响应中各字段最后一次明确给出的有效数值。
-- API 使用 `rawUsageSource: "legacy_max" | "upstream_last"`，缺省为 `legacy_max`；界面用开关展示这两个状态。该字段独立于 `usageProjectionMode`。
+- 外部池/外部账号的新建、编辑表单使用“原始用量记录与成本计算”三选一，默认 `legacy_max`；该字段独立于 `usageProjectionMode`。
+- API 使用 `rawUsageSource: "legacy_max" | "upstream_last" | "upstream_last_max_cost"`。三种模式都生成必备的 `rawUsage` 与 `rawCostUsage` 两个强类型字段，只在来源选择入口决定取值，成本函数统一读取 `rawCostUsage`。
+
+| 模式 | `rawUsage`：记录用量 | `rawCostUsage`：原始成本计算用量 |
+| --- | --- | --- |
+| `legacy_max`（默认） | 旧处理链的逐字段最大值 | 同一旧处理链的逐字段最大值 |
+| `upstream_last` | 上游各字段最后明确返回的有效值 | 同一最终字段快照 |
+| `upstream_last_max_cost` | 上游各字段最后明确返回的有效值 | 旧处理链的逐字段最大值 |
+
+- “最大值”完整沿用旧处理链及既有缺失用量估算；“最终值”不是只读取最后一帧，而是保留各字段最后一次明确返回的有效值。完全没有可用上游用量时沿用原有估算，显式零按零记录。
+- 新记录永远同时序列化两个字段；旧 JSON 仅在反序列化边界将缺失的 `rawCostUsage` 补为旧 `rawUsage`，业务成本计算不判断模式、不事后覆盖快照。
 - 配置归属于每一个已保存的外部池/账号条目；不按站点、域名、账号类型或分组隐式共享。`main`/`forced-main` 使用 `ExternalPool`；`claude-main` 使用 `Account`。
 - 新建遗漏字段使用旧行为；已有账号迁移为旧行为；编辑遗漏字段保留当前值；复制账号继承源配置；已有导入导出路径中保留该字段，旧格式缺省旧行为。未知枚举值应明确校验失败。
 - 每次上游 attempt 在发出请求前使用权威账号快照固定策略，处理中编辑账号不改变该 attempt；重试/切池重新取对应账号策略，各 attempt 的状态互相隔离。
@@ -50,11 +57,11 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 
 保留现有 `capture.raw` 和 `merge_external_usage`，继续供整形、零用量修复及回退判断使用；新增仅供原始统计使用的上游字段状态。不要直接修改共用 max 合并函数。
 
-账号模式只在最终生成统计快照时选择原始统计来源。旧模式完整走原有统计路径；新模式仅替换统计中的 rawUsage 及对应价格计算输入，不反向输入投影、整形、成本兜底或客户端回包。`reported`/`shaped` 的回退仍以原处理链状态为依据。
+账号模式只在最终生成统计快照时统一选择 `(rawUsage, rawCostUsage)`。成本函数只从 `rawCostUsage` 计算 `rawCostUsd`，不再按模式覆盖已构造的 rawUsage 或成本。两个原始统计字段均不反向输入投影、整形、成本兜底或客户端回包。`reported`/`shaped` 的回退仍以原处理链状态为依据。
 
 允许随模式改变：
 
-- `rawUsage` / 顶层 `raw_usage`。
+- `rawUsage` / 顶层 `raw_usage`，以及独立的 `rawCostUsage`。
 - `rawCostUsd` / `originalCostUsd` 与上游原始成本汇总，仍按现有价格目录计算，不读取站点账单金额。
 - 原始成本派生的利润、成本差额及成本对比标志。
 - `claude-main` 的 `account_cost_usd = raw_cost_usd * cost_multiplier`；倍率及公式保持原样。
@@ -78,7 +85,7 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 6. 业务提交与版本提交分开；发布前刷新远端分支、tag 和真实发布产物，分别确定 `v*`、`forced-v*`、`claude-v*` 的下一 patch；等待质量检查、amd64/arm64 和 manifest 成功再认定发布完成。
 7. 发版后已有账号仍全部保持旧模式，不自动开启 ddpapi 或其它账号，不自动升级生产实例。启用只影响后续采用新策略的 attempt，不回填历史数据；关闭开关可恢复后续请求的原统计方式。
 
-## 当前进度
+## 首轮两模式实现与验证（历史）
 
 三个分支实现完成并已推送：main `b5135f3c`、forced-main `57b68820`、claude-main `111f94f5`。main 合入 forced；claude 为对应代码独立移植。
 
@@ -87,9 +94,9 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 - main 最新完整 CI：默认/无默认各 `3179 passed / 18 ignored`，loadtest `31 passed`，时序专项 `10 passed`，Clippy `742 <= 849`；[检查记录](https://github.com/2ue/kiro.rs/actions/runs/45048531200)。
 - claude 最新完整 CI：默认/无默认各 `1245 passed / 12 ignored`，时序专项 `8 passed`，Clippy `598 <= 625`；[检查记录](https://github.com/2ue/kiro.rs/actions/runs/45048531489)。
 - UI：main/forced 各 89 项、claude 170 项通过，三个 UI 构建通过；Cargo 临时目录、预留和引用进程均已清零。
-- 最初的三个候选标签已推送，但发布前发现全零流式统计可能绕过旧计费估算；已取消发布并补齐隔离与回归。注册表确认 `0.0.262`、`0.0.271`、`1.0.15` 均未生成镜像。三个既有候选标签仍指向修复前提交，等待明确授权后仅重建这三个标签，再等待完整镜像发布。
+- 首次候选在发布前发现全零流式统计可能绕过旧计费估算，已取消并补齐回归；随后重建候选并成功发布 `v0.0.262`、`forced-v0.0.271`、`claude-v1.0.15`，最终源码提交为本节开头所列版本。
 - 17 机器运行时 usage/wire debug 均关闭，无抓包进程；171 个证据文件共 1,072,214 字节，多次核对无增长，最后写入 `2026-11-22T16:01:43Z`。
-- 未部署远端服务、未启用账号开关、未回填历史。
+- 首轮发布后按后续明确要求，将 17 机器 k1–k3 更新为 `0.0.262`；账号模式仍全部为默认值，未回填历史。
 
 ## 2026-11-23 增量：最终记录、最大值计算
 
@@ -98,3 +105,33 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 新增 `upstream_last_max_cost`：rawUsage 采用最后明确字段，rawCostUsd/originalCostUsd 沿用 legacy_max 的成本计算输入。现有 legacy_max、upstream_last 两模式语义不变，默认 legacy_max 不变。表单由开关改为三选一，保持编辑回显、复制、导入导出。所有新记录统一同时保存 rawUsage 与 rawCostUsage：记录口径与计算口径只在模式选择时确定；成本统一读取 rawCostUsage。旧 JSON 只在反序列化边界将缺少的 rawCostUsage 补成 rawUsage，业务计算没有模式补丁。详情三种模式都展示两个字段。
 
 最大值成本沿用当前 legacy_max 处理链（包括原有缺失用量估算），不会重新定义整形、零用量修复或 billable 结果。专项验收：真实下降样本、显式零、全零流估算、缺失用量、缓存 TTL、非流式；新模式记录与 upstream_last 一致、所有成本与 legacy_max 一致；DB 从旧两值 CHECK 迁移到三值，复制和旧数据兼容。main 实现后合入 forced，claude 独立移植，分别验证并按各自下一 patch 发布。账号默认和当前生产开关保持原值，历史不回填。
+
+## 最终交付与发布证据（2026-11-23）
+
+| 分支 | 版本 / 镜像 | 发布源码 | 完整质量检查 | 发布工作流 |
+| --- | --- | --- | --- | --- |
+| main | `v0.0.263` / `ghcr.io/2ue/kiro-rs:0.0.263` | `22568577a6fd40ca3607db5fbaae88e2b4a24cef` | [45096986363](https://github.com/2ue/kiro.rs/actions/runs/45096986363) | [45097094681](https://github.com/2ue/kiro.rs/actions/runs/45097094681) |
+| forced-main | `forced-v0.0.272` / `ghcr.io/2ue/kiro-rs-forced:0.0.272` | `58f8bb173c164347fe04930568f758718da949d0` | 发布工作流内完整质量检查 | [45097094651](https://github.com/2ue/kiro.rs/actions/runs/45097094651) |
+| claude-main | `claude-v1.0.16` / `ghcr.io/2ue/claude-pool:1.0.16` | `a70e9c6b4e8afdf53754ee1d90a70c712324034f` | [45096984737](https://github.com/2ue/kiro.rs/actions/runs/45096984737) | [45097094222](https://github.com/2ue/kiro.rs/actions/runs/45097094222) |
+
+三个发布工作流均为 `completed / success`，质量、amd64、arm64、manifest 均已通过。注册表直接核验两个平台的 OCI version/revision 标签与上表源码一致；不是仅以 Git tag 推送判断发布成功。
+
+已核验的多架构 manifest digest：
+
+- main：`sha256:0f9123f5ab5cbe66162ca9f4bba4b5732a37fdb2fe49ffa8ea0490feb8892b93`。
+- forced-main：`sha256:5250223624c77b6b7ff457efaacba70eb8fe53f7a70b6c06a0c6d877a62c4e0b`。
+- claude-main：`sha256:30f7188673894932bd31458e0930843065409afc9149b523aec4c33bf83b2b17`。
+
+| 验证 | main | forced-main | claude-main |
+| --- | --- | --- | --- |
+| Rust 默认 / 无默认特性（各） | 3183 通过，18 忽略 | 3346 通过，18 忽略 | 1249 通过，12 忽略 |
+| loadtest 单元测试（各特性） | 31 通过 | 31 通过 | 不适用 |
+| 时序专项 | 10 通过 | 10 通过 | 8 通过 |
+| Clippy 当前 / 基线 | 742 / 849 | 736 / 849 | 598 / 625 |
+| 本地 UI 测试 | 90 通过 | 90 通过 | 172 通过 |
+
+三个分支默认及无默认特性的原始用量专项各 13 项通过，含 171 条脱敏真实响应回放；UI 生产构建通过。构建产物清点为 0 targets / 0 reservations / 0 target processes / 0 blockers。
+
+输入字段先为 262393、最终明确为 1 时，新模式保存 `rawUsage.inputTokens=1`、`rawCostUsage.inputTokens=262393`，原始成本按后者及现有价格目录计算。显式零、字段缺失、缓存 TTL 修订和旧 JSON 兼容均有回归覆盖。
+
+17 机器 k1–k3 当前仍运行已完成部署的 `0.0.262`；本轮三模式版本仅通过 GitHub 发布，没有再次重启生产。最终只读核验三个实例均 health=ok / ready=ready / restartCount=0，usage/wire debug 均关闭，无 tcpdump/tshark/dumpcap/mitmdump 进程。k1 前次更新后已恢复 sub2api-b 的 29 个启用账号，保留手动停用账号与分组。
