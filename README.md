@@ -28,7 +28,7 @@ pnpm --dir ui build
 cargo build --release --locked --bin claude-pool
 ```
 
-默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。发布前核对 CLI 版本，预期输出 `claude-pool 1.0.14`：
+默认产物位于 `target/release/claude-pool`；如果本地 `.cargo/config.toml` 配置了共享 target，使用该目录下的 `release/claude-pool`。下文用 `cargo run --release --locked --bin claude-pool --` 启动，兼容两种目录布局。发布前核对 CLI 版本，预期输出 `claude-pool 1.0.19`：
 
 ```bash
 cargo run --release --locked --bin claude-pool -- --version
@@ -129,7 +129,7 @@ CLAUDE_POOL_IMAGE=claude-pool CLAUDE_POOL_VERSION=1.0.14 \
 | 项 | `claude-main` | `main`（kiro-rs） |
 |---|---|---|
 | 包名 / 二进制 | `claude-pool` | `kiro-rs` |
-| 版本来源 | `Cargo.toml`（当前 `1.0.14`） | `Cargo.toml` |
+| 版本来源 | `Cargo.toml`（当前 `1.0.19`） | `Cargo.toml` |
 | 发布 tag | `claude-vMAJOR.MINOR.PATCH` | `vMAJOR.MINOR.PATCH` |
 | 镜像 | `ghcr.io/2ue/claude-pool`、`docker.io/<user>/claude-pool` | `ghcr.io/2ue/kiro-rs` |
 | 质量门禁 | 对 `claude-main` 的 push / PR 跑全量门禁 | 对 `main` |
