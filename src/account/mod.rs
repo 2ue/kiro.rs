@@ -16683,7 +16683,7 @@ fn project_usage_value(
     let projected = apply_account_usage_cost_floor(projected, raw_for_floor, projection);
     let projected = apply_account_bounded_final_caps(projected, controlled, projection);
     // The route's cache TTL mode decides the final 5m/1h split, after every shaping step.
-    let write_ttl = projection.resolve_write_ttl(upstream_raw_usage.as_ref(), commit_cache_state);
+    let write_ttl = projection.resolve_write_ttl(upstream_raw_usage.as_ref());
     let projected = projected.with_cache_creation_ttl(write_ttl);
     let projected_json = projected.to_anthropic_usage_json();
     let obj = usage.as_object_mut()?;

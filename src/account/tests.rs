@@ -3975,14 +3975,18 @@ fn account_cache_ttl_only_changes_downstream_usage_and_upstream_is_always_5m() {
         Force1h,
         UpstreamThenRequestDefault5m,
     ] {
-        for request_ttl in ["5m", "1h"] {
+        for request_ttl in [None, Some("5m"), Some("1h")] {
+            let mut marker = json!({"type":"ephemeral"});
+            if let Some(ttl) = request_ttl {
+                marker["ttl"] = json!(ttl);
+            }
             for stream in [false, true] {
                 let raw = Bytes::from(
                     serde_json::to_vec(&json!({
                         "model":"claude-opus-4-8","max_tokens":512,"stream":stream,
-                        "cache_control":{"type":"ephemeral","ttl":request_ttl},
+                        "cache_control":marker,
                         "system":[{"type":"text","text":"stable cache prompt ".repeat(8000),
-                            "cache_control":{"type":"ephemeral","ttl":request_ttl}}],
+                            "cache_control":marker}],
                         "messages":[{"role":"user","content":"hello"}]
                     }))
                     .unwrap(),
@@ -4038,7 +4042,14 @@ fn account_cache_ttl_only_changes_downstream_usage_and_upstream_is_always_5m() {
                         continue;
                     }
                     assert!(projection.is_some());
-                    let hour = mode == Force1h || (mode != Force5m && request_ttl == "1h");
+                    assert_eq!(
+                        projection.as_ref().unwrap().prompt_cache_bounds.write_ttl,
+                        Some(Duration::from_secs(300)),
+                        "display TTL must not change cache state lifetime"
+                    );
+                    let hour = mode == Force1h
+                        || (mode != Force5m && request_ttl == Some("1h"))
+                        || (mode == FollowRequestDefault1h && request_ttl.is_none());
                     let key = if hour {
                         "ephemeral_1h_input_tokens"
                     } else {
@@ -4047,7 +4058,7 @@ fn account_cache_ttl_only_changes_downstream_usage_and_upstream_is_always_5m() {
                     assert!(usage["cache_creation_input_tokens"].as_i64().unwrap() > 0);
                     assert_eq!(
                         usage["cache_creation"][key], usage["cache_creation_input_tokens"],
-                        "{mode:?}/{request_ttl}/{stream}"
+                        "{mode:?}/{request_ttl:?}/{stream}"
                     );
                     let billing = billing.unwrap();
                     assert_eq!(billing.raw_cost_usage.cache_creation_5m_input_tokens, 2000);
@@ -14895,7 +14906,7 @@ fn raw_passthrough_failure_keeps_estimated_total_input_but_zeroes_billable_usage
 }
 
 #[test]
-fn raw_passthrough_keeps_body_but_still_applies_usage_projection() {
+fn raw_passthrough_pins_cache_ttl_and_still_applies_usage_projection() {
     // Top-level cache_control (automatic caching) over a prefix above the minimum.
     let raw = serde_json::json!({
         "model": "claude-sonnet-4-5",
@@ -14918,7 +14929,13 @@ fn raw_passthrough_keeps_body_but_still_applies_usage_projection() {
     pool.usage_projection_mode = UsageProjectionMode::CurrentPathPolicy;
 
     let prepared = account_prepare_request(&route, &pool).unwrap();
-    assert_eq!(prepared.body, Bytes::copy_from_slice(raw));
+    let mut expected: serde_json::Value = serde_json::from_slice(raw).unwrap();
+    expected["cache_control"]["ttl"] = json!("5m");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&prepared.body).unwrap(),
+        expected
+    );
+    assert_eq!(route.effective_raw_body, Bytes::copy_from_slice(raw));
 
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":5,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
