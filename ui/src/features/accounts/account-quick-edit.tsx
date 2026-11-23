@@ -61,6 +61,8 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
   )
   const [routeMode, setRouteMode] = useState<RouteRuleMode>(account?.routeMode || 'allow_all')
   const [routeRules, setRouteRules] = useState<string[]>(() => [...(account?.routeRules ?? [])])
+  const [modelFilterMode, setModelFilterMode] = useState<'allowlist' | 'denylist'>(account?.modelFilterMode ?? 'allowlist')
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
   const [models, setModels] = useState<string[]>(() => [...(account?.supportedModels ?? [])])
   const [saving, setSaving] = useState(false)
   const [discovering, setDiscovering] = useState(false)
@@ -104,7 +106,7 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
       if (routeMode === 'allow_list' && rules.length === 0) return toast.error('只允许模式至少需要一条路由，否则这个账号不会承接任何请求')
       return save({ routeMode, routeRules: rules }, '路由限制已保存')
     }
-    if (field === 'supportedModels') return save({ supportedModels: models }, models.length ? `支持模型已保存（${models.length} 个）` : '已改为不限制模型')
+    if (field === 'supportedModels') return save({ supportedModels: models, modelFilterMode }, models.length ? `支持模型已保存（${models.length} 个）` : '已改为不限制模型')
     const url = text.trim()
     if (!url) return toast.error('请填写代理地址；要去掉代理请点“清除代理”')
     if (url === (account.proxyUrl ?? '').trim()) {
@@ -120,7 +122,7 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
     try {
       const found = (await discoverStoredAccountSupportedModels(account.id)).supportedModels
       const removed = models.filter((model) => !found.includes(model))
-      if (removed.length > 0) {
+      if (modelFilterMode === 'allowlist' && removed.length > 0) {
         const ok = await confirm({
           title: '用上游结果覆盖当前列表？',
           message: `上游返回 ${found.length} 个模型，会移除当前列表里的 ${removed.length} 个：${removed.join('、')}。保存后该账号不再承接这些模型。`,
@@ -129,7 +131,8 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
         })
         if (!ok) return
       }
-      setModels(found)
+      setDiscoveredModels(found)
+      if (modelFilterMode === 'allowlist') setModels(found)
       toast.success(`已获取 ${found.length} 个模型，保存后生效`)
     } catch (error) {
       toast.error(extractErrorMessage(error))
@@ -226,9 +229,9 @@ export function AccountQuickEditModal({ target, status, onClose, onSaved }: {
         {field === 'supportedModels' && (
           <>
             <InfoBox rows={[['编辑后限制', models.length ? `${models.length} 个模型` : '不限制']]}>
-              只决定该账号是否允许承接某些模型；空列表表示不限制。不改变请求体里的 model，也不影响模型映射规则。清空或获取模型后，保存才会生效。
+              只决定该账号是否允许承接某些模型；白名单只允许列表内模型，黑名单只禁止列表内模型；两种模式互斥，空列表不限制。不改变请求体里的 model，也不影响模型映射规则。清空或获取模型后，保存才会生效。
             </InfoBox>
-            <SupportedModelTagsEditor value={models} disabled={busy} onChange={setModels} />
+            <SupportedModelTagsEditor mode={modelFilterMode} onModeChange={setModelFilterMode} options={discoveredModels} value={models} disabled={busy} onChange={setModels} />
           </>
         )}
         {field === 'proxy' && (

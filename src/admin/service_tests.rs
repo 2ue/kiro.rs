@@ -1301,6 +1301,7 @@ async fn admin_audit_records_failed_changes_auth_failures_capture_and_export() {
         model_mapping_mode: Default::default(),
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
+        model_filter_mode: Default::default(),
         supported_models: Vec::new(),
         route_mode: Default::default(),
         route_rules: Vec::new(),

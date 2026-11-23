@@ -1175,6 +1175,7 @@ impl AdminService {
             model_mapping_require_match: source.model_mapping_require_match,
             model_mapping_rules: source.model_mapping_rules.clone(),
             supported_models: source.supported_models.clone(),
+            model_filter_mode: source.model_filter_mode,
             route_mode: source.route_mode,
             route_rules: source.route_rules.clone(),
             notes: source.notes.clone(),
@@ -1263,7 +1264,14 @@ impl AdminService {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_account_supported_models_unmasked(id, supported_models)
+                .update_account_unmasked(
+                    id,
+                    crate::account::UpdateAccountRequest {
+                        supported_models: Some(supported_models),
+                        model_filter_mode: request.model_filter_mode,
+                        ..Default::default()
+                    },
+                )
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1279,6 +1287,7 @@ impl AdminService {
         self.invalidate_account_admin_cache_with_pool("supported_models", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
+            model_filter_mode: pool.model_filter_mode,
             supported_models: pool.supported_models,
         })
     }
@@ -1295,7 +1304,16 @@ impl AdminService {
         let supported_models_for_store = supported_models.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_account_supported_models_unmasked(id, supported_models_for_store)
+                .update_account_unmasked(
+                    id,
+                    crate::account::UpdateAccountRequest {
+                        supported_models: Some(supported_models_for_store),
+                        model_filter_mode: Some(
+                            crate::model::model_support::ModelFilterMode::Allowlist,
+                        ),
+                        ..Default::default()
+                    },
+                )
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1313,6 +1331,7 @@ impl AdminService {
         self.invalidate_account_admin_cache_with_pool("supported_models_sync", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
+            model_filter_mode: pool.model_filter_mode,
             supported_models: pool.supported_models,
         })
     }
@@ -1327,6 +1346,11 @@ impl AdminService {
             .await
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or_else(|| AdminServiceError::InvalidCredential("账号不存在".into()))?;
+        if pool.model_filter_mode == crate::model::model_support::ModelFilterMode::Denylist {
+            return Err(AdminServiceError::InvalidCredential(
+                "黑名单不代表账号支持的模型，不能提升为系统目录".into(),
+            ));
+        }
         let promoted = self
             .postgres_store
             .promote_account_models(&pool.supported_models)
@@ -1350,6 +1374,7 @@ impl AdminService {
         );
         Ok(SupportedModelsResponse {
             count: promoted.len(),
+            model_filter_mode: crate::model::model_support::ModelFilterMode::Allowlist,
             supported_models: promoted,
         })
     }
@@ -1365,6 +1390,7 @@ impl AdminService {
             .await?;
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
+            model_filter_mode: crate::model::model_support::ModelFilterMode::Allowlist,
             supported_models,
         })
     }
@@ -4850,6 +4876,7 @@ fn probe_account(
         model_mapping_mode: Default::default(),
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
+        model_filter_mode: Default::default(),
         supported_models: Vec::new(),
         route_mode: Default::default(),
         route_rules: Vec::new(),

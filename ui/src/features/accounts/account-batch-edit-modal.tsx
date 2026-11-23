@@ -79,6 +79,7 @@ const initialValues = () => ({
   routeMode: 'allow_all' as RouteRuleMode,
   routeRules: [] as string[],
   modelsMode: 'replace' as SupportedModelsEditMode,
+  modelFilterMode: 'allowlist' as 'allowlist' | 'denylist',
   models: [] as string[],
   proxyMode: 'set' as 'set' | 'clear',
   proxyUrl: '',
@@ -150,7 +151,7 @@ export function AccountBatchEditModal({ open, count, tagOptions, submitting = fa
     if (fields.preOutputStreamRetryMode) draft.preOutputStreamRetryMode = values.preOutputStreamRetryMode
     if (fields.tags) draft.tags = { add: values.tagsAdd, remove: values.tagsRemove }
     if (fields.route) draft.route = { routeMode: values.routeMode, routeRules: values.routeMode === 'allow_all' ? [] : values.routeRules }
-    if (fields.supportedModels) draft.supportedModels = { mode: values.modelsMode, models: values.modelsMode === 'clear' ? [] : values.models }
+    if (fields.supportedModels) draft.supportedModels = { modelFilterMode: values.modelFilterMode, mode: values.modelsMode, models: values.modelsMode === 'clear' ? [] : values.models }
     if (fields.proxy) draft.proxy = { mode: values.proxyMode, url: values.proxyUrl }
     const overrides: NonNullable<BatchEditDraft['overrides']> = {}
     for (const [key, label] of ACCOUNT_OVERRIDE_FIELDS) {
@@ -281,10 +282,16 @@ export function AccountBatchEditModal({ open, count, tagOptions, submitting = fa
                   </SelectContent>
                 </Select>
               </Field>
+              <Field label="模型筛选模式">
+                <select className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm" value={values.modelFilterMode} onChange={(event) => { set('modelFilterMode', event.target.value as 'allowlist' | 'denylist'); set('modelsMode', 'replace') }}>
+                  <option value="allowlist">白名单：只允许列表内模型</option><option value="denylist">黑名单：只禁止列表内模型</option>
+                </select>
+                <p className="text-xs text-muted-foreground">同一账号仅启用一种模式。切换模式须替换或清空列表；追加/移除仅适用于已有相同模式的账号。</p>
+              </Field>
               <Field label="模型">
                 {values.modelsMode === 'clear'
                   ? <p className="flex min-h-9 items-center text-xs text-muted-foreground">保存后这些账号可承接任意模型</p>
-                  : <SupportedModelTagsEditor value={values.models} onChange={(v) => set('models', v)} />}
+                  : <SupportedModelTagsEditor mode={values.modelFilterMode} value={values.models} onChange={(v) => set('models', v)} />}
               </Field>
             </div>
           ) : <p className="text-xs text-muted-foreground">不修改</p>}

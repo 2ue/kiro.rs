@@ -186,3 +186,13 @@ test('提交前校验', () => {
   assert.match(validateBatchEditDraft({ overrides: { requestTimeoutSecs: -1 } })!, /非负整数/)
   assert.equal(countBatchEditFields({ priority: 1, overrides: { requestTimeoutSecs: 1, streamIdleTimeoutSecs: null } }), 3)
 })
+
+test('模型筛选切换模式要求替换或清空，追加不反转旧名单', () => {
+  const account = { ...base, modelFilterMode: 'allowlist', supportedModels: ['old-model'] } as Account
+  assert.throws(() => buildBatchUpdate(account, { supportedModels: { mode: 'append', modelFilterMode: 'denylist', models: ['fable-5'] } }), /切换白名单/)
+  const replacement = buildBatchUpdate(account, { supportedModels: { mode: 'replace', modelFilterMode: 'denylist', models: ['fable-5'] } })
+  assert.equal(replacement.update.modelFilterMode, 'denylist')
+  assert.deepEqual(replacement.update.supportedModels, ['fable-5'])
+  const sameMode = buildBatchUpdate({ ...account, modelFilterMode: 'denylist' }, { supportedModels: { mode: 'append', modelFilterMode: 'denylist', models: ['fable-5'] } })
+  assert.deepEqual(sameMode.update.supportedModels, ['old-model', 'fable-5'])
+})

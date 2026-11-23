@@ -126,7 +126,7 @@ export interface BatchEditDraft {
   preOutputStreamRetryMode?: StreamRetryMode
   tags?: { add: string[]; remove: string[] }
   route?: { routeMode: RouteRuleMode; routeRules: string[] }
-  supportedModels?: { mode: SupportedModelsEditMode; models: string[] }
+  supportedModels?: { mode: SupportedModelsEditMode; models: string[]; modelFilterMode?: 'allowlist' | 'denylist' }
   proxy?: { mode: 'set' | 'clear'; url: string }
   overrides?: Partial<Record<OverrideKey, number | boolean | null>>
 }
@@ -247,6 +247,15 @@ export function buildBatchUpdate(account: Account, draft: BatchEditDraft): Batch
   }
   if (draft.supportedModels) {
     const current = account.supportedModels ?? []
+    const mode = draft.supportedModels.modelFilterMode ?? account.modelFilterMode ?? 'allowlist'
+    const currentMode = account.modelFilterMode ?? 'allowlist'
+    if (mode !== currentMode && !['replace', 'clear'].includes(draft.supportedModels.mode)) {
+      throw new Error('切换白名单/黑名单时请使用替换或清空，避免反转原列表含义')
+    }
+    if (mode !== currentMode) {
+      update.modelFilterMode = mode
+      changes.push(mode === 'denylist' ? '切换黑名单' : '切换白名单')
+    }
     const next = applySupportedModelsEdit(current, draft.supportedModels)
     if (!sameList(current, next)) {
       update.supportedModels = next

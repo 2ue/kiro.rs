@@ -48,7 +48,7 @@ use crate::model::model_support::normalize_supported_models;
 
 const ACCOUNT_SELECT_SQL: &str = r#"
 SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-       max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+       max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
        auto_disable_policy, pre_output_stream_retry_mode,
        header_profile, append_beta_query, header_overrides,
        wire_profile, tls_profile,
@@ -90,6 +90,10 @@ struct RequiredPostgresColumn {
 }
 
 const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
+    RequiredPostgresColumn {
+        table_name: "accounts",
+        column_name: "model_filter_mode",
+    },
     RequiredPostgresColumn {
         table_name: "accounts",
         column_name: "raw_usage_source",
@@ -1131,6 +1135,10 @@ impl PostgresStore {
             let fields = record.as_object_mut().unwrap();
             fields.insert("id".into(), serde_json::json!(id));
             fields.insert(
+                "model_filter_mode".into(),
+                serde_json::to_value(request.model_filter_mode)?,
+            );
+            fields.insert(
                 "raw_usage_source".into(),
                 serde_json::to_value(request.raw_usage_source)?,
             );
@@ -1139,13 +1147,13 @@ impl PostgresStore {
                 INSERT INTO accounts (
                     id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes
                 ) SELECT id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes
@@ -1166,6 +1174,7 @@ impl PostgresStore {
                     model_mapping_mode=EXCLUDED.model_mapping_mode,
                     model_mapping_require_match=EXCLUDED.model_mapping_require_match,
                     model_mapping_rules=EXCLUDED.model_mapping_rules, supported_models=EXCLUDED.supported_models,
+                    model_filter_mode=EXCLUDED.model_filter_mode,
                     route_mode=EXCLUDED.route_mode, route_rules=EXCLUDED.route_rules, notes=EXCLUDED.notes,
                     tags='{}', proxy_url=NULL, cost_multiplier=1, overrides='{}',
                     auto_disabled=false, auto_disabled_reason=NULL, auto_disabled_at=NULL,
@@ -1342,12 +1351,17 @@ impl PostgresStore {
                 "model_mapping_require_match": request.model_mapping_require_match,
                 "model_mapping_rules": request.model_mapping_rules,
                 "supported_models": request.supported_models,
+                "model_filter_mode": request.model_filter_mode,
                 "route_mode": request.route_mode,
                 "route_rules": request.route_rules,
                 "notes": request.notes
             });
             let fields = record.as_object_mut().unwrap();
             fields.insert("id".into(), serde_json::json!(id));
+            fields.insert(
+                "model_filter_mode".into(),
+                serde_json::to_value(request.model_filter_mode)?,
+            );
             fields.insert(
                 "raw_usage_source".into(),
                 serde_json::to_value(request.raw_usage_source)?,
@@ -1357,13 +1371,13 @@ impl PostgresStore {
                 INSERT INTO accounts (
                     id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides
                 ) SELECT id, name, base_url, api_key, auth_type, header_profile, append_beta_query,
                     header_overrides, wire_profile, tls_profile, enabled, priority,
-                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                    max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                     auto_disable_policy, pre_output_stream_retry_mode, normalize_model_version_dots,
                     model_mapping_mode, model_mapping_require_match, model_mapping_rules,
                     supported_models, route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides
@@ -1384,6 +1398,7 @@ impl PostgresStore {
                     model_mapping_mode=EXCLUDED.model_mapping_mode,
                     model_mapping_require_match=EXCLUDED.model_mapping_require_match,
                     model_mapping_rules=EXCLUDED.model_mapping_rules, supported_models=EXCLUDED.supported_models,
+                    model_filter_mode=EXCLUDED.model_filter_mode,
                     route_mode=EXCLUDED.route_mode, route_rules=EXCLUDED.route_rules, notes=EXCLUDED.notes,
                     tags=EXCLUDED.tags, proxy_url=EXCLUDED.proxy_url, cost_multiplier=EXCLUDED.cost_multiplier, overrides=EXCLUDED.overrides,
                     auto_disabled=false, auto_disabled_reason=NULL, auto_disabled_at=NULL,
@@ -1586,7 +1601,7 @@ impl PostgresStore {
                    header_profile, append_beta_query, header_overrides,
                    wire_profile, tls_profile, model_mapping_mode,
                    model_mapping_require_match, model_mapping_rules,
-                   auto_disabled, auto_disabled_until, supported_models,
+                   auto_disabled, auto_disabled_until, supported_models, model_filter_mode, normalize_model_version_dots,
                    route_mode, route_rules
             FROM accounts
             WHERE deleted_at IS NULL
@@ -1633,7 +1648,7 @@ impl PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-                   max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                   max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                    auto_disable_policy, pre_output_stream_retry_mode,
                    header_profile, append_beta_query, header_overrides,
                    wire_profile, tls_profile,
@@ -1735,11 +1750,11 @@ impl PostgresStore {
                 wire_profile, tls_profile,
                 normalize_model_version_dots, model_mapping_mode,
                 model_mapping_require_match, model_mapping_rules, supported_models,
-                route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides, raw_usage_source, updated_at
+                route_mode, route_rules, notes, tags, proxy_url, cost_multiplier, overrides, raw_usage_source, model_filter_mode, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -1780,6 +1795,7 @@ impl PostgresStore {
         .bind(request.cost_multiplier)
         .bind(serde_json::to_value(&request.overrides)?)
         .bind(request.raw_usage_source.as_str())
+        .bind(request.model_filter_mode.as_str())
         .fetch_one(&self.pool)
         .await?;
         account_from_row(row, mask_secrets)
@@ -1835,6 +1851,9 @@ impl PostgresStore {
             .usage_projection_mode
             .unwrap_or(current.usage_projection_mode);
         let raw_usage_source = request.raw_usage_source.unwrap_or(current.raw_usage_source);
+        let model_filter_mode = request
+            .model_filter_mode
+            .unwrap_or(current.model_filter_mode);
         let stream_response_mode = request
             .stream_response_mode
             .unwrap_or(current.stream_response_mode);
@@ -1924,11 +1943,12 @@ impl PostgresStore {
                 notes = $25,
                 tags = $26, proxy_url = $27, cost_multiplier = $28, overrides = $29,
                 raw_usage_source = $30,
+                model_filter_mode = $31,
                 revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -1970,6 +1990,7 @@ impl PostgresStore {
         .bind(cost_multiplier)
         .bind(serde_json::to_value(&overrides)?)
         .bind(raw_usage_source.as_str())
+        .bind(model_filter_mode.as_str())
         .fetch_one(&self.pool)
         .await?;
         Ok(Some(account_from_row(row, mask_secrets)?))
@@ -2008,7 +2029,7 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -2063,7 +2084,7 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       header_profile, append_beta_query, header_overrides,
                       wire_profile, tls_profile,
@@ -2124,7 +2145,7 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode, raw_usage_source, model_filter_mode,
                       auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error,
@@ -10216,6 +10237,15 @@ fn account_eligibility_from_row(row: &PgRow) -> anyhow::Result<AccountEligibilit
         enabled: row.try_get("enabled")?,
         auto_disabled: row.try_get("auto_disabled")?,
         auto_disabled_until: row.try_get("auto_disabled_until")?,
+        model_filter_mode: crate::model::model_support::ModelFilterMode::parse(
+            &row.try_get::<String, _>("model_filter_mode")?,
+        )?,
+        model_mapping_mode: ModelMappingMode::parse_known(
+            &row.try_get::<String, _>("model_mapping_mode")?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid model mapping mode"))?,
+        model_mapping_rules: Arc::new(model_mapping_rules),
+        normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
         supported_models: Arc::new(supported_models),
         route_mode,
         route_rules: Arc::new(route_rules),
@@ -10489,6 +10519,9 @@ fn account_from_row_with_policy(
         model_mapping_mode,
         model_mapping_require_match,
         model_mapping_rules: normalize_account_model_mapping_rules(model_mapping_rules),
+        model_filter_mode: crate::model::model_support::ModelFilterMode::parse(
+            &row.try_get::<String, _>("model_filter_mode")?,
+        )?,
         supported_models,
         route_mode,
         route_rules,
@@ -10623,6 +10656,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     model_mapping_mode TEXT NOT NULL DEFAULT 'passthrough_mapping',
     model_mapping_require_match BOOLEAN NOT NULL DEFAULT false,
     model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
+    model_filter_mode TEXT NOT NULL DEFAULT 'allowlist' CHECK (model_filter_mode IN ('allowlist','denylist')),
     supported_models JSONB NOT NULL DEFAULT '[]'::jsonb,
     route_mode TEXT NOT NULL DEFAULT 'allow_all',
     route_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -10631,6 +10665,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ
 );
+
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS model_filter_mode TEXT NOT NULL DEFAULT 'allowlist' CHECK (model_filter_mode IN ('allowlist','denylist'));
 
 ALTER TABLE accounts
     ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
@@ -15901,6 +15937,7 @@ mod tests {
                     kind: Default::default(),
                     note: None,
                 }],
+                model_filter_mode: Default::default(),
                 supported_models: Vec::new(),
                 route_mode: RouteRuleMode::AllowList,
                 route_rules: vec!["/CC".to_string(), "/ha".to_string()],
@@ -16185,6 +16222,77 @@ mod tests {
                 .unwrap()
                 .raw_usage_source,
             RawUsageSource::UpstreamLastMaxCost
+        );
+        store.drop_test_schema().await.unwrap();
+    }
+    #[tokio::test]
+    async fn model_filter_postgres_default_update_reload_and_upgrade() {
+        use crate::model::model_support::ModelFilterMode;
+        let Some(config) = test_config() else {
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let request: CreateAccountRequest = serde_json::from_value(serde_json::json!({"name":"model-filter", "baseUrl":"https://example.test", "apiKey":"test-only"})).unwrap();
+        let original = store.create_account_unmasked(request).await.unwrap();
+        assert_eq!(original.model_filter_mode, ModelFilterMode::Allowlist);
+        let changed = store
+            .update_account_unmasked(
+                original.id,
+                serde_json::from_value(
+                    serde_json::json!({"modelFilterMode":"denylist","supportedModels":["fable-5"]}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.model_filter_mode, ModelFilterMode::Denylist);
+        let unchanged = store
+            .update_account_unmasked(original.id, UpdateAccountRequest::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.model_filter_mode, ModelFilterMode::Denylist);
+        assert_eq!(unchanged.supported_models, ["fable-5"]);
+        assert_eq!(
+            store
+                .get_account(original.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .model_filter_mode,
+            ModelFilterMode::Denylist
+        );
+        assert!(
+            store
+                .list_account_eligibility()
+                .await
+                .unwrap()
+                .iter()
+                .any(|pool| pool.id == original.id
+                    && pool.model_filter_mode == ModelFilterMode::Denylist)
+        );
+        sqlx::query("ALTER TABLE accounts DROP COLUMN model_filter_mode")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .verify_required_schema_compatibility(false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("model_filter_mode")
+        );
+        store.migrate_with_options(false).await.unwrap();
+        assert_eq!(
+            store
+                .get_account(original.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .model_filter_mode,
+            ModelFilterMode::Allowlist
         );
         store.drop_test_schema().await.unwrap();
     }

@@ -19,6 +19,8 @@ use crate::model::config::{
 pub struct SetSupportedModelsRequest {
     #[serde(default)]
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
 }
 
 /// 使用账号兼容 /v1/models 接口发现支持模型。创建态需要传 baseUrl/apiKey；
@@ -38,6 +40,8 @@ pub struct DiscoverAccountSupportedModelsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SupportedModelsResponse {
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
     pub count: usize,
 }
 

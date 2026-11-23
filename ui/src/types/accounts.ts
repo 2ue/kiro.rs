@@ -1,3 +1,4 @@
+export type ModelFilterMode = 'allowlist' | 'denylist'
 import type {
   ModelMappingMode,
   RawUpstreamError,
@@ -248,6 +249,7 @@ export interface Account {
   modelMappingMode: ModelMappingMode;
   modelMappingRequireMatch: boolean;
   modelMappingRules: AccountModelMappingRule[];
+  modelFilterMode?: ModelFilterMode;
   supportedModels: string[];
   routeMode: RouteRuleMode;
   routeRules: string[];
@@ -325,6 +327,7 @@ export interface CreateAccountRequest {
   modelMappingMode?: ModelMappingMode;
   modelMappingRequireMatch?: boolean;
   modelMappingRules?: AccountModelMappingRule[];
+  modelFilterMode?: ModelFilterMode;
   supportedModels?: string[];
   routeMode?: RouteRuleMode;
   routeRules?: string[];
@@ -357,6 +360,7 @@ export interface UpdateAccountRequest {
   modelMappingMode?: ModelMappingMode;
   modelMappingRequireMatch?: boolean;
   modelMappingRules?: AccountModelMappingRule[];
+  modelFilterMode?: ModelFilterMode;
   supportedModels?: string[];
   routeMode?: RouteRuleMode;
   routeRules?: string[];
@@ -364,6 +368,7 @@ export interface UpdateAccountRequest {
 }
 
 export interface SetSupportedModelsRequest {
+  modelFilterMode?: ModelFilterMode;
   supportedModels: string[];
 }
 
@@ -374,6 +379,7 @@ export interface DiscoverAccountSupportedModelsRequest {
 }
 
 export interface SupportedModelsResponse {
+  modelFilterMode?: ModelFilterMode;
   supportedModels: string[];
   count: number;
 }

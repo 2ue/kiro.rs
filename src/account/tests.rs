@@ -1152,6 +1152,7 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateAccoun
         model_mapping_mode: ModelMappingMode::PassthroughMapping,
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
+        model_filter_mode: Default::default(),
         supported_models: Vec::new(),
         route_mode: RouteRuleMode::AllowAll,
         route_rules: Vec::new(),
@@ -1403,6 +1404,7 @@ pub(crate) fn test_pool(base_url: &str, _legacy_path: bool) -> Account {
         model_mapping_mode: ModelMappingMode::PassthroughMapping,
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
+        model_filter_mode: Default::default(),
         supported_models: Vec::new(),
         route_mode: RouteRuleMode::AllowAll,
         route_rules: Vec::new(),
@@ -22507,4 +22509,48 @@ fn raw_usage_source_hybrid_all_zero_estimate_keeps_max_cost_and_final_record() {
     assert_eq!(hybrid.raw_cost_usage, legacy.raw_cost_usage);
     assert_eq!(hybrid.raw_cost_usd, legacy.raw_cost_usd);
     assert_eq!(hybrid.billable_cost_usd, legacy.billable_cost_usd);
+}
+
+#[test]
+fn model_filter_denylist_authoritative_and_eligibility_agree_and_block_mapping() {
+    use crate::model::model_support::ModelFilterMode;
+    let mut pool = test_pool("https://example.test", true);
+    pool.model_filter_mode = ModelFilterMode::Denylist;
+    pool.supported_models = vec!["fable-5".into()];
+    pool.model_mapping_rules = vec![ModelMappingRule {
+        enabled: true,
+        source: "public-alias".into(),
+        target: "fable-5".into(),
+        kind: Default::default(),
+        note: None,
+    }];
+    for (model, expected) in [
+        ("fable-5", false),
+        ("FABLE-5", false),
+        ("public-alias", false),
+        ("other-model", true),
+    ] {
+        let candidates = normalize_account_support_candidates([model]);
+        assert_eq!(
+            account_matches_supported_models_normalized(&pool, Some(&candidates)),
+            expected,
+            "{model}"
+        );
+        assert_eq!(
+            account_eligibility_matches_supported_models(
+                &account_eligibility_from_pool(&pool),
+                Some(&candidates)
+            ),
+            expected,
+            "{model}"
+        );
+    }
+    assert!(account_matches_supported_models_normalized(&pool, None));
+    pool.supported_models.clear();
+    assert!(account_matches_supported_models_normalized(
+        &pool,
+        Some(&["fable-5".into()])
+    ));
+    let copied = serde_json::from_value::<CreateAccountRequest>(serde_json::json!({"name":"copy","baseUrl":"https://example.test","apiKey":"test","modelFilterMode":"denylist"})).unwrap();
+    assert_eq!(copied.model_filter_mode, ModelFilterMode::Denylist);
 }

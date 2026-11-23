@@ -220,3 +220,10 @@ test('删除后的账号从勾选里去掉；没有变化时返回同一个对�
   assert.deepEqual([...pruneSelection(selected, [1, 3, 4])], [1, 3])
   assert.equal(pruneSelection(selected, [1, 2, 3, 4]), selected)
 })
+
+test('模型黑名单筛选只排除命中项，缺省白名单保持兼容', () => {
+  assert.equal(accountSupportsModel({ supportedModels: ['fable-5'], modelFilterMode: 'denylist' }, 'fable-5'), false)
+  assert.equal(accountSupportsModel({ supportedModels: ['fable-5'], modelFilterMode: 'denylist' }, 'other-model'), true)
+  assert.equal(accountSupportsModel({ supportedModels: [], modelFilterMode: 'denylist' }, 'fable-5'), true)
+  assert.equal(accountSupportsModel({ supportedModels: ['fable-5'] }, 'other-model'), false)
+})

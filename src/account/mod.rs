@@ -636,6 +636,8 @@ pub struct Account {
     #[serde(default)]
     pub supported_models: Vec<String>,
     #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
+    #[serde(default)]
     pub route_mode: RouteRuleMode,
     #[serde(default)]
     pub route_rules: Vec<String>,
@@ -656,6 +658,10 @@ pub(crate) struct AccountEligibility {
     /// 原始 `supportedModels` 列表；匹配时经 [`supported_models_match`] 的线程局部缓存展开，
     /// 与权威 `Account` 路径同一套 allowlist 规则（含家族别名），避免快照与权威判定不一致。
     pub(crate) supported_models: Arc<Vec<String>>,
+    pub(crate) model_filter_mode: crate::model::model_support::ModelFilterMode,
+    pub(crate) model_mapping_mode: ModelMappingMode,
+    pub(crate) model_mapping_rules: Arc<Vec<ModelMappingRule>>,
+    pub(crate) normalize_model_version_dots: bool,
     pub(crate) route_mode: RouteRuleMode,
     pub(crate) route_rules: Arc<Vec<String>>,
 }
@@ -677,6 +683,10 @@ fn account_eligibility_from_pool(pool: &Account) -> AccountEligibility {
         auto_disabled: pool.auto_disabled,
         auto_disabled_until: pool.auto_disabled_until,
         supported_models: Arc::new(pool.supported_models.clone()),
+        model_filter_mode: pool.model_filter_mode,
+        model_mapping_mode: pool.model_mapping_mode,
+        model_mapping_rules: Arc::new(pool.model_mapping_rules.clone()),
+        normalize_model_version_dots: pool.normalize_model_version_dots,
         route_mode: pool.route_mode,
         route_rules: Arc::new(normalize_route_rules(&pool.route_rules)),
     }
@@ -759,6 +769,8 @@ pub struct CreateAccountRequest {
     #[serde(default)]
     pub supported_models: Vec<String>,
     #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
+    #[serde(default)]
     pub route_mode: RouteRuleMode,
     #[serde(default)]
     pub route_rules: Vec<String>,
@@ -824,6 +836,8 @@ pub struct UpdateAccountRequest {
     pub model_mapping_rules: Option<Vec<ModelMappingRule>>,
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
     #[serde(default)]
     pub route_mode: Option<RouteRuleMode>,
     #[serde(default)]
@@ -12827,11 +12841,65 @@ fn push_account_model_variant(variants: &mut Vec<String>, model: String) {
     variants.push(model);
 }
 
+fn account_model_filter_allows(
+    mode: crate::model::model_support::ModelFilterMode,
+    models: &[String],
+    candidates: Option<&[String]>,
+    mapping_mode: ModelMappingMode,
+    mapping_rules: &[ModelMappingRule],
+    normalize_dots: bool,
+) -> bool {
+    use crate::model::model_support::ModelFilterMode;
+    let listed = models;
+    if listed.is_empty() {
+        return true;
+    }
+    let Some(candidates) = candidates else {
+        return mode == ModelFilterMode::Denylist;
+    };
+    let matches = |values: &[String]| supported_models_match(listed, Some(values));
+    let matched = matches(candidates);
+    if mode == ModelFilterMode::Allowlist {
+        return matched;
+    }
+    if matched {
+        return false;
+    }
+    // 仅黑名单检查映射目标，保留旧白名单对请求模型的解释。
+    !candidates.iter().any(|candidate| {
+        process_model(
+            ModelProcessingInput {
+                original_model: Some(candidate),
+                processed_model: Some(candidate),
+            },
+            ModelProcessingConfig {
+                mode: mapping_mode.processing_mode(),
+                rules: mapping_rules,
+                require_mapping_match: false,
+                fallback_transform: normalize_dots
+                    .then_some(model_pipeline::normalize_outbound_model as fn(&str) -> String),
+            },
+        )
+        .is_ok_and(|result| {
+            matches(&normalize_account_support_candidates([result
+                .model
+                .as_str()]))
+        })
+    })
+}
+
 fn account_matches_supported_models_normalized(
     pool: &Account,
     model_candidates: Option<&[String]>,
 ) -> bool {
-    supported_models_match(&pool.supported_models, model_candidates)
+    account_model_filter_allows(
+        pool.model_filter_mode,
+        &pool.supported_models,
+        model_candidates,
+        pool.model_mapping_mode,
+        &pool.model_mapping_rules,
+        pool.normalize_model_version_dots,
+    )
 }
 
 /// 调度每次扫描都要问每个账号"是否支持本次请求的模型"，而账号的 `supportedModels` 列表通常
@@ -12938,7 +13006,14 @@ fn account_eligibility_matches_supported_models(
     pool: &AccountEligibility,
     model_candidates: Option<&[String]>,
 ) -> bool {
-    supported_models_match(&pool.supported_models, model_candidates)
+    account_model_filter_allows(
+        pool.model_filter_mode,
+        &pool.supported_models,
+        model_candidates,
+        pool.model_mapping_mode,
+        &pool.model_mapping_rules,
+        pool.normalize_model_version_dots,
+    )
 }
 
 fn deterministic_duration_jitter(base: Duration, percent: u8, seed: u64) -> Duration {
@@ -12993,7 +13068,7 @@ fn account_matches_supported_models(
         return true;
     }
     let Some(model_candidates) = model_candidates else {
-        return false;
+        return account_matches_supported_models_normalized(pool, None);
     };
     let normalized =
         normalize_account_support_candidates(model_candidates.iter().flatten().copied());

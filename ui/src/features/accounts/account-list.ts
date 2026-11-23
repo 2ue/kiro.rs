@@ -141,11 +141,12 @@ export function normalizeModelName(model: string): string {
 }
 
 /** 账号能否承接这个模型：支持模型列表为空表示不限制。 */
-export function accountSupportsModel(account: Pick<Account, 'supportedModels'>, model: string): boolean {
+export function accountSupportsModel(account: Pick<Account, 'supportedModels' | 'modelFilterMode'>, model: string): boolean {
   const models = account.supportedModels ?? []
   if (models.length === 0) return true
   const target = normalizeModelName(model)
-  return models.some((item) => normalizeModelName(item) === target)
+  const matched = models.some((item) => normalizeModelName(item) === target)
+  return account.modelFilterMode === 'denylist' ? !matched : matched
 }
 
 /** 模型筛选的候选：账号列表里出现过的模型 + 模型目录，按口径去重后排序。 */

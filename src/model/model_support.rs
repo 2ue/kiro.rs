@@ -1,3 +1,46 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFilterMode {
+    #[default]
+    Allowlist,
+    Denylist,
+}
+
+impl ModelFilterMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowlist => "allowlist",
+            Self::Denylist => "denylist",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "allowlist" => Ok(Self::Allowlist),
+            "denylist" => Ok(Self::Denylist),
+            _ => anyhow::bail!("model_filter_mode 值无效: {value}"),
+        }
+    }
+
+    pub fn allows(self, models: &[String], candidates: &[Option<&str>]) -> bool {
+        match self {
+            Self::Allowlist => model_is_supported_by_list(models, candidates),
+            Self::Denylist => {
+                models.is_empty()
+                    || candidates
+                        .iter()
+                        .flatten()
+                        .all(|model| model.trim().is_empty())
+                    || !model_is_supported_by_list(models, candidates)
+            }
+        }
+    }
+}
+
 pub fn normalize_model_id(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {

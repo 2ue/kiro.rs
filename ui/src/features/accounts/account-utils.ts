@@ -183,6 +183,7 @@ export type AccountFormDraft = {
   preOutputStreamRetryMode: AccountStreamRetryDraft
   autoDisablePolicy: NonNullable<CreateAccountRequest['autoDisablePolicy']>
   normalizeModelVersionDots: boolean
+  modelFilterMode: 'allowlist' | 'denylist'
   supportedModelsText: string
   routeMode: NonNullable<CreateAccountRequest['routeMode']>
   routeRules: string[]
@@ -212,6 +213,7 @@ export const defaultAccountForm = (): AccountFormDraft => ({
   preOutputStreamRetryMode: 'inherit',
   autoDisablePolicy: 'inherit',
   normalizeModelVersionDots: false,
+  modelFilterMode: 'allowlist',
   supportedModelsText: '',
   routeMode: 'allow_all',
   routeRules: [],
@@ -241,6 +243,7 @@ export const accountFormFromAccount = (account: Account): AccountFormDraft => ({
   preOutputStreamRetryMode: account.preOutputStreamRetryMode || 'inherit',
   autoDisablePolicy: account.autoDisablePolicy,
   normalizeModelVersionDots: Boolean(account.normalizeModelVersionDots),
+  modelFilterMode: account.modelFilterMode ?? 'allowlist',
   supportedModelsText: joinRules(account.supportedModels || []),
   routeMode: account.routeMode || 'allow_all',
   routeRules: [...(account.routeRules || [])],
@@ -402,6 +405,7 @@ export function tlsProfileDescription(profile: Account['tlsProfile'] | undefined
 
 export function accountSupportedModelsSummary(account: Account): string {
   const models = account.supportedModels || []
+  if (account.modelFilterMode === 'denylist') return models.length ? `黑名单：禁止 ${models.join(', ')}` : '黑名单：不排除模型'
   if (models.length === 0) return '支持：不限制'
   if (models.length <= 2) return `支持：${models.join(', ')}`
   return `支持：${models[0]}, ${models[1]} 等 ${models.length} 个`

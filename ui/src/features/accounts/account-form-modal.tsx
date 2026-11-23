@@ -126,6 +126,7 @@ export function AccountFormModal({
     queryFn: getRouteScenarioOptions,
     enabled: open,
   });
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
   const [discovering, setDiscovering] = useState(false);
   const discoveryGeneration = useRef(0);
   const [quickImportText, setQuickImportText] = useState("");
@@ -377,7 +378,7 @@ export function AccountFormModal({
                   const current = draftRef.current.supportedModelsText.split("\n").filter(Boolean);
                   const removed = current.filter((m) => !found.includes(m));
                   // 表单里已经填了列表且发现结果会去掉其中一些：先确认再覆盖，避免手填的资格被悄悄抹掉。
-                  if (removed.length > 0) {
+                  if (draftRef.current.modelFilterMode === "allowlist" && removed.length > 0) {
                     const ok = await confirm({
                       title: "用上游结果覆盖当前列表？",
                       message: `上游返回 ${found.length} 个模型，会移除当前列表里的 ${removed.length} 个：${removed.join("、")}。保存后该账号不再承接这些模型。`,
@@ -386,7 +387,8 @@ export function AccountFormModal({
                     });
                     if (!ok || generation !== discoveryGeneration.current) return;
                   }
-                  set("supportedModelsText", found.join("\n"));
+                  setDiscoveredModels(found);
+                  if (draftRef.current.modelFilterMode === "allowlist") set("supportedModelsText", found.join("\n"));
                   toast.success(`已获取 ${found.length} 个模型，保存后生效`);
                 } catch {
                   // 发现失败的提示由调用方给出，这里只负责不改表单。
@@ -401,6 +403,9 @@ export function AccountFormModal({
           }
         >
           <SupportedModelTagsEditor
+            mode={draft.modelFilterMode}
+            onModeChange={(mode) => set("modelFilterMode", mode)}
+            options={discoveredModels}
             value={draft.supportedModelsText.split("\n").filter(Boolean)}
             disabled={saving || discovering}
             onChange={(v) => set("supportedModelsText", v.join("\n"))}

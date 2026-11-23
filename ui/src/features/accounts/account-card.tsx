@@ -240,7 +240,7 @@ export function AccountCard({
                   <Route />路由限制<span className="ml-auto text-xs text-muted-foreground">{routeLimited ? (account.routeMode === 'allow_list' ? '只允许' : '排除') : '全部入口'}</span>
                 </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => onQuickEdit('supportedModels')}>
-                  <Boxes />支持模型<span className="ml-auto text-xs text-muted-foreground">{supportedCount ? `${supportedCount} 个` : '不限制'}</span>
+                  <Boxes />{account.modelFilterMode === 'denylist' ? '模型黑名单' : '模型白名单'}<span className="ml-auto text-xs text-muted-foreground">{supportedCount ? `${supportedCount} 个` : '不限制'}</span>
                 </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => onQuickEdit('proxy')}>
                   <Router />代理<span className="ml-auto text-xs text-muted-foreground">{account.proxyUrl ? '已配置' : '未配置'}</span>

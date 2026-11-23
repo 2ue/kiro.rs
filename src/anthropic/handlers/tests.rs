@@ -2070,6 +2070,7 @@ async fn test_account_manager_for_handlers(base_url: &str) -> Option<Arc<Account
             model_mapping_mode: ModelMappingMode::PassthroughMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
+            model_filter_mode: Default::default(),
             supported_models: Vec::new(),
             route_mode: crate::model::config::RouteRuleMode::AllowAll,
             route_rules: Vec::new(),

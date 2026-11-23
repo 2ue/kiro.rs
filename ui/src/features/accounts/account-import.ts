@@ -32,6 +32,7 @@ export const ACCOUNT_REQUEST_FIELDS = [
   'modelMappingRequireMatch',
   'modelMappingRules',
   'supportedModels',
+  'modelFilterMode',
   'routeMode',
   'routeRules',
   'notes',
@@ -281,6 +282,7 @@ export function accountFromJsonObject(value: unknown, position: number): ParsedI
     if (tags) account.tags = normalizeTags(tags)
     else delete account.tags
   }
+  if (source.modelFilterMode !== undefined && !['allowlist', 'denylist'].includes(String(source.modelFilterMode))) return { position, error: 'modelFilterMode 只能是 allowlist 或 denylist', warnings }
   if (source.supportedModels !== undefined) {
     const models = toStringList(source.supportedModels)
     if (models) account.supportedModels = models
