@@ -184,6 +184,7 @@ export function credentialFlags(
     | 'effectiveProxySource'
     | 'proxyResourceName'
     | 'supportedModels'
+    | 'modelFilterMode'
     | 'rateLimitAutoDisableEnabled'
     | 'hasProfileArn'
   > & Partial<Pick<CredentialStatusItem, 'lastUsedAt'>>,
@@ -202,7 +203,7 @@ export function credentialFlags(
   if (route) flags.push({ key: 'route', kind: 'config', label: route, tone: 'secondary', title: `路由限制：${route}` })
   if (c.hasProxy) flags.push({ key: 'proxy', kind: 'config', label: '代理', tone: 'info', title: `代理：${proxySummary(c)}` })
   const models = c.supportedModels ?? []
-  if (models.length > 0) flags.push({ key: 'models', kind: 'config', label: `模型 ${models.length}`, tone: 'secondary', count: models.length, title: `只调度 ${models.length} 个模型：${models.join('、')}` })
+  if (models.length > 0) flags.push({ key: 'models', kind: 'config', label: `${c.modelFilterMode === 'denylist' ? '禁用模型' : '模型'} ${models.length}`, tone: 'secondary', count: models.length, title: `${c.modelFilterMode === 'denylist' ? '禁止调度' : '只调度'} ${models.length} 个模型：${models.join('、')}` })
   if (c.rateLimitAutoDisableEnabled === false) {
     flags.push({ key: 'rate-limit', kind: 'config', label: '429仅冷却', tone: 'warning', title: '遇到 429 只冷却，不自动禁用' })
   }

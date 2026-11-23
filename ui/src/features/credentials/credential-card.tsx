@@ -588,7 +588,7 @@ export function CredentialCard({
     const supportedModels = mergeSupportedModels([], supportedModelsDraft)
     setCredentialSupportedModels.mutate({ id: credential.id, request: { supportedModels, modelFilterMode: modelFilterModeDraft } }, {
       onSuccess: (res) => {
-        toast.success(`已保存 ${res.count} 个支持模型`)
+        toast.success(`已保存${res.modelFilterMode === 'denylist' ? '黑名单' : '白名单'}，${res.count} 个模型`)
         setSupportedModelsDraft(res.supportedModels)
         setEditingSupportedModels(false)
       },
@@ -903,7 +903,7 @@ export function CredentialCard({
               )}
               {supportedModels.length === 0 && (
                 <DropdownMenuItem onSelect={() => setEditingSupportedModels(true)}>
-                  <Boxes /> 支持模型<span className="ml-auto text-xs text-muted-foreground">不限制</span>
+                  <Boxes /> 模型筛选<span className="ml-auto text-xs text-muted-foreground">不限制</span>
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem disabled={setWarmup.isPending} onSelect={toggleWarmup}>
@@ -1000,7 +1000,7 @@ export function CredentialCard({
               <DetailRow label="路由限制" onEdit={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }} editLabel="修改路由限制">
                 {routeSummary ?? '全部入口'}
               </DetailRow>
-              <DetailRow label="支持模型" onEdit={() => setEditingSupportedModels(true)}>
+              <DetailRow label="模型筛选" onEdit={() => setEditingSupportedModels(true)}>
                 <span title={supportedModels.join('\n') || undefined}>{supportedModelsSummary(supportedModels, credential.modelFilterMode)}</span>
               </DetailRow>
               <DetailRow label="429 自动禁用">
