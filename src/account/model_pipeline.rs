@@ -25,14 +25,6 @@ fn process_account_model(
     original_model: Option<&str>,
     processed_model: Option<&str>,
 ) -> Result<Option<String>, AccountError> {
-    let fallback_transform = (pool.normalize_model_version_dots
-        && matches!(
-            pool.model_mapping_mode,
-            ModelMappingMode::PassthroughMapping
-                | ModelMappingMode::DirectMapping
-                | ModelMappingMode::ProcessedMapping
-        ))
-    .then_some(normalize_outbound_model as fn(&str) -> String);
     let result = process_model(
         ModelProcessingInput {
             original_model,
@@ -42,7 +34,6 @@ fn process_account_model(
             mode: pool.model_mapping_mode.processing_mode(),
             rules: &pool.model_mapping_rules,
             require_mapping_match: pool.model_mapping_require_match,
-            fallback_transform,
         },
     )
     .map_err(|err| model_processing_error(pool, err))?;
@@ -62,29 +53,6 @@ pub(crate) fn normalize_mapping_rules(rules: Vec<ModelMappingRule>) -> Vec<Model
             (!rule.source.is_empty() && !rule.target.is_empty()).then_some(rule)
         })
         .collect()
-}
-
-pub(super) fn normalize_outbound_model(model: &str) -> String {
-    let trimmed = model.trim();
-    if !trimmed.starts_with("claude-") || !trimmed.contains('.') {
-        return trimmed.to_string();
-    }
-
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut out = String::with_capacity(trimmed.len());
-    for (idx, ch) in chars.iter().enumerate() {
-        if *ch == '.'
-            && idx > 0
-            && idx + 1 < chars.len()
-            && chars[idx - 1].is_ascii_digit()
-            && chars[idx + 1].is_ascii_digit()
-        {
-            out.push('-');
-        } else {
-            out.push(*ch);
-        }
-    }
-    out
 }
 
 fn model_processing_error(pool: &Account, err: ModelProcessingError) -> AccountError {

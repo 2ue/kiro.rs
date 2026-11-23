@@ -19,7 +19,6 @@ pub struct ModelProcessingConfig<'a> {
     pub mode: ModelProcessingMode,
     pub rules: &'a [ModelMappingRule],
     pub require_mapping_match: bool,
-    pub fallback_transform: Option<fn(&str) -> String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +106,7 @@ fn mapped_or_fallback(
         });
     }
     Ok(ModelProcessingResult {
-        model: transform_fallback(fallback_model, config),
+        model: fallback_model.to_string(),
         source: fallback_source,
         mapping_applied: false,
     })
@@ -123,13 +122,6 @@ fn processed_model(input: ModelProcessingInput<'_>) -> Option<&str> {
 
 fn clean_model(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|model| !model.is_empty())
-}
-
-fn transform_fallback(model: &str, config: ModelProcessingConfig<'_>) -> String {
-    match config.fallback_transform {
-        Some(transform) => transform(model),
-        None => model.to_string(),
-    }
 }
 
 fn model_mapping_target(rules: &[ModelMappingRule], model: &str) -> Option<String> {
@@ -168,19 +160,14 @@ mod tests {
         }
     }
 
-    fn dash_numeric_dot(model: &str) -> String {
-        model.replace("4.8", "4-8")
-    }
-
     #[test]
-    fn passthrough_keeps_original_model_without_mapping_or_transform() {
+    fn passthrough_keeps_original_model_without_mapping() {
         let result = process_model(
             input("claude-opus-4.8", "claude-opus-4.7"),
             ModelProcessingConfig {
                 mode: ModelProcessingMode::Passthrough,
                 rules: &[rule("claude-opus-4.8", "external-opus")],
                 require_mapping_match: true,
-                fallback_transform: Some(dash_numeric_dot),
             },
         )
         .unwrap();
@@ -191,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_mapping_maps_hit_and_preserves_original_on_miss_without_transform() {
+    fn passthrough_mapping_maps_hit_and_preserves_original_on_miss() {
         let rules = [rule("claude-opus-4.8", "external-opus")];
         let hit = process_model(
             input("claude-opus-4.8", "claude-opus-4.7"),
@@ -199,7 +186,6 @@ mod tests {
                 mode: ModelProcessingMode::PassthroughMapping,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: None,
             },
         )
         .unwrap();
@@ -209,7 +195,6 @@ mod tests {
                 mode: ModelProcessingMode::PassthroughMapping,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: None,
             },
         )
         .unwrap();
@@ -221,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_mapping_maps_hit_and_transforms_original_on_miss_when_configured() {
+    fn passthrough_mapping_maps_hit_without_rewriting_misses() {
         let rules = [rule("claude-opus-4.8", "external-opus")];
         let hit = process_model(
             input("claude-opus-4.8", "claude-opus-4.7"),
@@ -229,7 +214,6 @@ mod tests {
                 mode: ModelProcessingMode::PassthroughMapping,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: Some(dash_numeric_dot),
             },
         )
         .unwrap();
@@ -239,14 +223,13 @@ mod tests {
                 mode: ModelProcessingMode::PassthroughMapping,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: Some(dash_numeric_dot),
             },
         )
         .unwrap();
 
         assert_eq!(hit.model, "external-opus");
         assert!(hit.mapping_applied);
-        assert_eq!(miss.model, "claude-sonnet-4-8");
+        assert_eq!(miss.model, "claude-sonnet-4.8");
         assert_eq!(miss.source, ModelProcessingSource::Original);
     }
 
@@ -258,7 +241,6 @@ mod tests {
                 mode: ModelProcessingMode::PassthroughMapping,
                 rules: &[rule("claude-opus-4.8", "external-opus")],
                 require_mapping_match: true,
-                fallback_transform: None,
             },
         )
         .unwrap_err();
@@ -272,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn processed_then_mapping_maps_processed_model_and_falls_back_to_processed_transform() {
+    fn processed_then_mapping_maps_processed_model_and_falls_back_to_processed_model() {
         let rules = [rule("claude-opus-4.7", "external-opus")];
         let hit = process_model(
             input("claude-opus-4.8", "claude-opus-4.7"),
@@ -280,7 +262,6 @@ mod tests {
                 mode: ModelProcessingMode::ProcessedThenMapping,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: Some(dash_numeric_dot),
             },
         )
         .unwrap();
@@ -290,19 +271,18 @@ mod tests {
                 mode: ModelProcessingMode::ProcessedThenMapping,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: Some(dash_numeric_dot),
             },
         )
         .unwrap();
 
         assert_eq!(hit.model, "external-opus");
         assert!(hit.mapping_applied);
-        assert_eq!(miss.model, "claude-sonnet-4-8");
+        assert_eq!(miss.model, "claude-sonnet-4.8");
         assert_eq!(miss.source, ModelProcessingSource::Processed);
     }
 
     #[test]
-    fn mapping_then_processed_maps_original_and_falls_back_to_processed_transform() {
+    fn mapping_then_processed_maps_original_and_falls_back_to_processed_model() {
         let rules = [rule("claude-opus-4.8", "external-opus")];
         let hit = process_model(
             input("claude-opus-4.8", "claude-opus-4.7"),
@@ -310,7 +290,6 @@ mod tests {
                 mode: ModelProcessingMode::MappingThenProcessed,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: Some(dash_numeric_dot),
             },
         )
         .unwrap();
@@ -320,13 +299,12 @@ mod tests {
                 mode: ModelProcessingMode::MappingThenProcessed,
                 rules: &rules,
                 require_mapping_match: false,
-                fallback_transform: Some(dash_numeric_dot),
             },
         )
         .unwrap();
 
         assert_eq!(hit.model, "external-opus");
-        assert_eq!(miss.model, "claude-sonnet-4-8");
+        assert_eq!(miss.model, "claude-sonnet-4.8");
         assert_eq!(miss.source, ModelProcessingSource::Processed);
     }
 }

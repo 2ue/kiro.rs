@@ -110,15 +110,11 @@ fn claude_base_model_variants(model: &str) -> Vec<String> {
     let mut out = Vec::new();
 
     if let Some((family, major, minor, date)) = parse_modern_claude_model(&parts) {
-        let dot = minor.map(|minor| format!("claude-{family}-{major}.{minor}"));
         let dash = minor.map(|minor| format!("claude-{family}-{major}-{minor}"));
         let base = minor
             .map(|minor| format!("claude-{family}-{major}-{minor}"))
             .unwrap_or_else(|| format!("claude-{family}-{major}"));
 
-        if let Some(dot) = dot.as_deref() {
-            push_unique_model(&mut out, dot.to_string());
-        }
         if let Some(dash) = dash.as_deref() {
             push_unique_model(&mut out, dash.to_string());
         }
@@ -135,7 +131,6 @@ fn claude_base_model_variants(model: &str) -> Vec<String> {
 
     if let Some((family, date)) = parse_legacy_claude_35_model(&parts) {
         push_unique_model(&mut out, format!("claude-3-5-{family}"));
-        push_unique_model(&mut out, format!("claude-3.5-{family}"));
         if let Some(date) = date {
             push_unique_model(&mut out, format!("claude-3-5-{family}-{date}"));
         }
@@ -155,14 +150,6 @@ fn parse_modern_claude_model<'a>(
         return None;
     }
     let version = parts.get(2).copied()?;
-    if let Some((major, minor)) = version.split_once('.') {
-        if major.chars().all(|ch| ch.is_ascii_digit())
-            && minor.chars().all(|ch| ch.is_ascii_digit())
-        {
-            return Some((family, major, Some(minor), None));
-        }
-        return None;
-    }
     if !version.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
@@ -193,12 +180,6 @@ fn parse_modern_claude_model<'a>(
 fn parse_legacy_claude_35_model<'a>(parts: &'a [&str]) -> Option<(&'a str, Option<&'a str>)> {
     if parts.len() < 3 || parts.first().copied() != Some("claude") {
         return None;
-    }
-    if parts.get(1).copied() == Some("3.5") {
-        let family = parts.get(2).copied()?;
-        if matches!(family, "sonnet" | "haiku") {
-            return Some((family, None));
-        }
     }
     if parts.get(1).copied() == Some("3") && parts.get(2).copied() == Some("5") {
         let family = parts.get(3).copied()?;
@@ -293,39 +274,38 @@ mod tests {
     #[test]
     fn thinking_and_1m_suffixes_schedule_on_the_base_model_catalog() {
         let catalog = vec![
-            "claude-sonnet-4.6".to_string(),
+            "claude-sonnet-4-6".to_string(),
             "claude-sonnet-5".to_string(),
-            "claude-sonnet-5.5".to_string(),
-            "claude-opus-4.8".to_string(),
-            "claude-opus-5.5".to_string(),
+            "claude-sonnet-5-5".to_string(),
+            "claude-opus-4-8".to_string(),
+            "claude-opus-5-5".to_string(),
             "claude-fable-5".to_string(),
-            "claude-fable-5.1".to_string(),
-            "claude-haiku-5.5".to_string(),
+            "claude-fable-5-1".to_string(),
+            "claude-haiku-5-5".to_string(),
             "claude-haiku-4-5-20251001".to_string(),
         ];
         for candidate in [
             "claude-sonnet-4-6-thinking",
-            "claude-sonnet-4.6-thinking",
             "claude-sonnet-4-6[1m]",
             "claude-sonnet-4-6-thinking[1m]",
             "claude-sonnet-4-6[1m]-thinking",
             "claude-sonnet-5-thinking",
             "claude-sonnet-5[1m]",
             "claude-sonnet-5-5-thinking",
-            "claude-sonnet-5.5[1m]-thinking",
+            "claude-sonnet-5-5[1m]-thinking",
             "claude-opus-4-8-thinking",
-            "claude-opus-4.8[1m]",
+            "claude-opus-4-8[1m]",
             "claude-opus-5-5-thinking",
-            "claude-opus-5.5-thinking[1m]",
+            "claude-opus-5-5-thinking[1m]",
             "claude-fable-5-thinking",
             "claude-fable-5[1m]-thinking",
             "claude-fable-5-1-thinking",
-            "claude-fable-5.1[1m]-thinking",
+            "claude-fable-5-1[1m]-thinking",
             "claude-haiku-5-5-thinking",
-            "claude-haiku-5.5[1m]-thinking",
+            "claude-haiku-5-5[1m]-thinking",
             "claude-haiku-4-5-thinking",
             "claude-haiku-4-5-20251001-thinking",
-            "claude-haiku-4.5[1m]",
+            "claude-haiku-4-5[1m]",
         ] {
             assert!(
                 model_is_supported_by_list(&catalog, &[Some(candidate)]),
@@ -354,16 +334,11 @@ mod tests {
     fn expands_pool_claude_models_to_common_official_request_forms() {
         assert_eq!(
             expand_claude_supported_model_variants(vec![
-                "claude-sonnet-4.5".to_string(),
-                "claude-opus-4.8".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "claude-opus-4-8".to_string(),
                 "auto".to_string(),
             ]),
-            vec![
-                "claude-sonnet-4.5",
-                "claude-sonnet-4-5",
-                "claude-opus-4.8",
-                "claude-opus-4-8",
-            ]
+            vec!["claude-sonnet-4-5", "claude-opus-4-8",]
         );
     }
 
@@ -376,11 +351,9 @@ mod tests {
             ]),
             vec![
                 "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4.5",
                 "claude-sonnet-4-5",
                 "claude-3-5-haiku-20241022",
                 "claude-3-5-haiku",
-                "claude-3.5-haiku",
             ]
         );
     }
@@ -389,26 +362,22 @@ mod tests {
     fn expands_thinking_suffix_without_family_fallback() {
         assert_eq!(
             expand_claude_supported_model_variants(vec![
-                "claude-opus-4.8-thinking".to_string(),
+                "claude-opus-4-8-thinking".to_string(),
                 "claude-sonnet-5".to_string(),
             ]),
-            vec![
-                "claude-opus-4.8-thinking",
-                "claude-opus-4-8-thinking",
-                "claude-sonnet-5",
-            ]
+            vec!["claude-opus-4-8-thinking", "claude-sonnet-5",]
         );
     }
 
     #[test]
     fn empty_supported_models_allows_any_model() {
         assert!(model_is_supported_by_list(&[], &[Some("anything")]));
-        let listed = vec!["claude-haiku-4.5".to_string()];
+        let listed = vec!["claude-haiku-4-5".to_string()];
         assert!(model_is_supported_by_list(&listed, &[None]));
         assert!(model_is_supported_by_list(&listed, &[Some("  ")]));
         assert!(!model_is_supported_by_list(
             &listed,
-            &[Some("claude-opus-4.8")]
+            &[Some("claude-opus-4-8")]
         ));
     }
 
@@ -428,12 +397,12 @@ mod tests {
     #[test]
     fn supported_models_match_version_equivalent_claude_aliases() {
         assert!(model_is_supported_by_list(
-            &["claude-opus-4.8".to_string()],
+            &["claude-opus-4-8".to_string()],
             &[Some("claude-opus-4-8")]
         ));
         assert!(model_is_supported_by_list(
             &["claude-opus-4-8".to_string()],
-            &[Some("claude-opus-4.8")]
+            &[Some("claude-opus-4-8")]
         ));
     }
 
@@ -453,10 +422,10 @@ mod tests {
     fn supported_models_match_thinking_and_dated_sonnet_haiku_aliases() {
         assert!(model_is_supported_by_list(
             &["claude-sonnet-4-5-20250929".to_string()],
-            &[Some("claude-sonnet-4.5-thinking")]
+            &[Some("claude-sonnet-4-5-thinking")]
         ));
         assert!(model_is_supported_by_list(
-            &["claude-haiku-4.5-thinking".to_string()],
+            &["claude-haiku-4-5-thinking".to_string()],
             &[Some("claude-haiku-4-5-20251001")]
         ));
     }
@@ -464,12 +433,43 @@ mod tests {
     #[test]
     fn supported_models_do_not_use_family_fallback() {
         assert!(!model_is_supported_by_list(
-            &["claude-sonnet-4.6".to_string()],
-            &[Some("claude-sonnet-4.5")]
+            &["claude-sonnet-4-6".to_string()],
+            &[Some("claude-sonnet-4-5")]
         ));
         assert!(!model_is_supported_by_list(
-            &["claude-opus-4.8".to_string()],
-            &[Some("claude-sonnet-4.6")]
+            &["claude-opus-4-8".to_string()],
+            &[Some("claude-sonnet-4-6")]
         ));
+    }
+
+    #[test]
+    fn dotted_models_are_exact_only_and_never_generate_dash_variants() {
+        for (dotted, dashed) in [
+            ("claude-sonnet-4.5", "claude-sonnet-4-5"),
+            ("claude-opus-5.5", "claude-opus-5-5"),
+            ("claude-3.5-haiku", "claude-3-5-haiku"),
+        ] {
+            assert!(!model_is_supported_by_list(
+                &[dotted.to_string()],
+                &[Some(dashed)]
+            ));
+            assert!(!model_is_supported_by_list(
+                &[dashed.to_string()],
+                &[Some(dotted)]
+            ));
+            assert!(model_is_supported_by_list(
+                &[dotted.to_string()],
+                &[Some(dotted)]
+            ));
+            assert_eq!(
+                expand_claude_supported_model_variants([dotted.to_string()]),
+                vec![dotted]
+            );
+            assert!(
+                expand_claude_supported_model_variants([dashed.to_string()])
+                    .iter()
+                    .all(|m| !m.contains('.'))
+            );
+        }
     }
 }

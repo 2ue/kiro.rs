@@ -1147,8 +1147,6 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateAccoun
 
         auto_disable_policy: AutoDisablePolicy::Inherit,
         pre_output_stream_retry_mode: StreamRetryMode::Inherit,
-
-        normalize_model_version_dots: false,
         model_mapping_mode: ModelMappingMode::PassthroughMapping,
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
@@ -1400,7 +1398,6 @@ pub(crate) fn test_pool(base_url: &str, _legacy_path: bool) -> Account {
         auto_disabled_at: None,
         auto_disabled_until: None,
         auto_disabled_last_error: None,
-        normalize_model_version_dots: false,
         model_mapping_mode: ModelMappingMode::PassthroughMapping,
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
@@ -1422,12 +1419,6 @@ fn model_rule(source: &str, target: &str) -> ModelMappingRule {
         kind: Default::default(),
         note: None,
     }
-}
-
-fn test_pool_with_model_dot_normalization() -> Account {
-    let mut pool = test_pool("https://example.com/v1", true);
-    pool.normalize_model_version_dots = true;
-    pool
 }
 
 fn test_account_outbound_body(route: &AccountRouteRequest, pool: &Account) -> Bytes {
@@ -6663,7 +6654,7 @@ fn account_mapping_rules_normalize_and_match_on_call_path() {
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
     pool.model_mapping_rules = normalize_account_model_mapping_rules(vec![
         model_rule("  CLAUDE-SONNET-4.5  ", "  CLAUDE-SONNET-4-5  "),
@@ -6686,7 +6677,7 @@ fn account_mapping_supports_common_direct_date_to_dot_rule() {
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::DirectMapping;
     pool.model_mapping_rules = vec![model_rule("claude-opus-4-5-20251101", "claude-opus-4.5")];
 
@@ -7398,7 +7389,7 @@ async fn account_one_wave_all_pools_transient_502_does_not_blackout_recovery() {
 #[test]
 fn account_outbound_body_applies_model_mapping_and_preserves_thinking() {
     let mut route = test_route("claude-opus-4-5-20251101");
-    route.upstream_model = Some("claude-opus-4.5".to_string());
+    route.upstream_model = Some("claude-opus-4-5".to_string());
     route.model_resolution_source = Some("alias".to_string());
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
@@ -7416,7 +7407,7 @@ fn account_outbound_body_applies_model_mapping_and_preserves_thinking() {
     route.effective_raw_body = route.raw_body.clone();
     route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
 
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
     let outbound = test_account_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
@@ -7430,13 +7421,13 @@ fn account_outbound_body_applies_model_mapping_and_preserves_thinking() {
 #[test]
 fn account_outbound_body_applies_resolved_upstream_model() {
     let mut route = test_route("claude-sonnet-4-5-20250929");
-    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.upstream_model = Some("claude-sonnet-4-5".to_string());
     route.model_resolution_source = Some("alias".to_string());
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
 
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
     let outbound = test_account_outbound_body(&route, &pool);
     let prepared = account_prepare_request(&route, &pool).unwrap();
@@ -7457,7 +7448,7 @@ fn account_outbound_body_direct_mapping_uses_original_model() {
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::DirectMapping;
     pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
 
@@ -7472,11 +7463,11 @@ fn account_outbound_body_direct_mapping_uses_original_model() {
 #[test]
 fn account_outbound_body_mapping_miss_falls_back_to_existing_conversion() {
     let mut route = test_route("claude-sonnet-4-5-20250929");
-    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.upstream_model = Some("claude-sonnet-4-5".to_string());
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::DirectMapping;
     pool.model_mapping_rules = vec![model_rule("claude-opus-4.8", "external-opus")];
 
@@ -7493,7 +7484,7 @@ fn account_outbound_body_mapping_target_is_final() {
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
     pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "claude-sonnet-4.5")];
 
@@ -7504,15 +7495,15 @@ fn account_outbound_body_mapping_target_is_final() {
 }
 
 #[test]
-fn account_outbound_body_normalizes_payload_claude_model_without_mapping() {
+fn account_outbound_body_keeps_payload_claude_model_without_mapping() {
     let route = test_route("claude-haiku-4.5");
 
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
     let outbound = test_account_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
 
-    assert_eq!(value["model"], "claude-haiku-4-5");
+    assert_eq!(value["model"], "claude-haiku-4.5");
 }
 
 #[test]
@@ -7524,7 +7515,7 @@ fn account_outbound_body_passthrough_mapping_maps_hit_and_keeps_original_on_miss
         );
     route.effective_raw_body = route.raw_body.clone();
     route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
     pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
 
@@ -7547,7 +7538,7 @@ fn account_outbound_body_passthrough_uses_original_request_model() {
         );
     route.effective_raw_body = route.raw_body.clone();
     route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::Passthrough;
     pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "custom-sonnet")];
 
@@ -7603,7 +7594,7 @@ fn account_outbound_body_processed_mapping_uses_upstream_model() {
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
     pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "external-sonnet")];
 
@@ -7617,7 +7608,7 @@ fn account_outbound_body_processed_mapping_uses_upstream_model() {
 fn account_outbound_body_require_mapping_match_rejects_miss_before_send() {
     let mut route = test_route("claude-sonnet-4-5-20250929");
     route.upstream_model = Some("claude-sonnet-4.5".to_string());
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::PassthroughMapping;
     pool.model_mapping_require_match = true;
     pool.model_mapping_rules = vec![model_rule("claude-opus-4-8", "external-opus")];
@@ -7684,7 +7675,7 @@ fn account_outbound_body_preserves_budget_tokens_for_disabled_thinking() {
 #[test]
 fn account_outbound_body_uses_final_bytes_and_ignores_typed_payload() {
     let mut route = test_route("claude-sonnet-4-5-20250929");
-    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+    route.upstream_model = Some("claude-sonnet-4-5".to_string());
     route.model_resolution_source = Some("alias".to_string());
     payload_mut(&mut route).messages = vec![Message {
         role: "user".to_string(),
@@ -7704,7 +7695,7 @@ fn account_outbound_body_uses_final_bytes_and_ignores_typed_payload() {
     route.effective_raw_body = route.raw_body.clone();
     route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
 
-    let mut pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool("https://example.com/v1", true);
     pool.model_mapping_mode = ModelMappingMode::ProcessedMapping;
     let outbound = test_account_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
@@ -7721,41 +7712,32 @@ fn account_outbound_body_uses_final_bytes_and_ignores_typed_payload() {
 }
 
 #[test]
-fn account_outbound_model_normalization_only_changes_claude_numeric_versions() {
-    assert_eq!(
-        normalize_account_outbound_model("claude-opus-4.8"),
-        "claude-opus-4-8"
-    );
-    assert_eq!(
-        normalize_account_outbound_model("claude-opus-4.8-thinking"),
-        "claude-opus-4-8-thinking"
-    );
-    assert_eq!(
-        normalize_account_outbound_model(" claude-sonnet-4.5[1m] "),
-        "claude-sonnet-4-5[1m]"
-    );
-    assert_eq!(
-        normalize_account_outbound_model("deepseek-3.2"),
-        "deepseek-3.2"
-    );
+fn retired_dot_normalization_setting_is_ignored_and_not_exposed() {
+    let request: CreateAccountRequest = serde_json::from_value(serde_json::json!({
+        "name": "legacy", "baseUrl": "https://example.com/v1", "apiKey": "secret",
+        "normalizeModelVersionDots": true
+    }))
+    .unwrap();
+    assert_eq!(request.model_mapping_mode, ModelMappingMode::PassthroughMapping);
+    let value = serde_json::to_value(test_pool("https://example.com/v1", true)).unwrap();
+    assert!(value.get("normalizeModelVersionDots").is_none());
 }
 
 #[test]
-fn account_passthrough_mapping_normalizes_dot_model_on_miss_when_enabled() {
+fn account_mapping_miss_preserves_opaque_dotted_model() {
     let route = test_route("claude-haiku-4.5");
-    let pool = test_pool_with_model_dot_normalization();
-
-    assert_eq!(
-        pool.model_mapping_mode,
-        ModelMappingMode::PassthroughMapping
-    );
-
-    let prepared = account_prepare_request(&route, &pool).unwrap();
-    let value: serde_json::Value =
-        serde_json::from_slice(&prepared.body).expect("parse outbound body");
-
-    assert_eq!(value["model"], "claude-haiku-4-5");
-    assert_eq!(prepared.outbound_model.as_deref(), Some("claude-haiku-4-5"));
+    for mode in [
+        ModelMappingMode::PassthroughMapping,
+        ModelMappingMode::DirectMapping,
+        ModelMappingMode::ProcessedMapping,
+    ] {
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.model_mapping_mode = mode;
+        let prepared = account_prepare_request(&route, &pool).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(value["model"], "claude-haiku-4.5");
+        assert_eq!(prepared.outbound_model.as_deref(), Some("claude-haiku-4.5"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16119,7 +16101,7 @@ fn supported_model_filter_bridges_claude_code_aliases_to_pool_models() {
     let mut pool = test_pool("https://example.com/v1", true);
     let route = test_route("haiku");
 
-    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    pool.supported_models = vec!["claude-haiku-4-5".to_string()];
     assert!(account_matches_supported_models(
         &pool,
         Some(&route.model_candidates_for_support())
@@ -16131,7 +16113,7 @@ fn supported_model_filter_bridges_claude_code_aliases_to_pool_models() {
         Some(&route.model_candidates_for_support())
     ));
 
-    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    pool.supported_models = vec!["claude-sonnet-4-5".to_string()];
     assert!(!account_matches_supported_models(
         &pool,
         Some(&route.model_candidates_for_support())
@@ -16139,32 +16121,31 @@ fn supported_model_filter_bridges_claude_code_aliases_to_pool_models() {
 }
 
 #[test]
-fn supported_model_filter_bridges_dotted_dashed_and_dated_claude_forms() {
+fn supported_model_filter_keeps_dates_but_does_not_bridge_numeric_dots() {
     let mut pool = test_pool("https://example.com/v1", true);
     let route = test_route("claude-sonnet-4-5-20250929");
-
-    pool.supported_models = vec!["sonnet-4.5".to_string()];
-    assert!(account_matches_supported_models(
-        &pool,
-        Some(&route.model_candidates_for_support())
-    ));
-
+    for listed in ["sonnet-4.5", "claude-sonnet-4.5", "claude-sonnet-4.6"] {
+        pool.supported_models = vec![listed.to_string()];
+        assert!(
+            !account_matches_supported_models(&pool, Some(&route.model_candidates_for_support())),
+            "{listed}"
+        );
+    }
     pool.supported_models = vec!["sonnet-4-5".to_string()];
     assert!(account_matches_supported_models(
         &pool,
         Some(&route.model_candidates_for_support())
     ));
-
-    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
-    assert!(account_matches_supported_models(
-        &pool,
-        Some(&route.model_candidates_for_support())
+    let eligibility = account_eligibility_from_pool(&pool);
+    let dotted = normalize_account_support_candidates(["claude-sonnet-4.5"]);
+    assert!(!account_eligibility_matches_supported_models(
+        &eligibility,
+        Some(&dotted)
     ));
-
-    pool.supported_models = vec!["claude-sonnet-4.6".to_string()];
-    assert!(!account_matches_supported_models(
+    pool.model_filter_mode = crate::model::model_support::ModelFilterMode::Denylist;
+    assert!(account_matches_supported_models_normalized(
         &pool,
-        Some(&route.model_candidates_for_support())
+        Some(&dotted)
     ));
 }
 
@@ -16269,19 +16250,19 @@ fn supported_model_filter_preserves_thinking_and_one_m_suffixes() {
     let mut pool = test_pool("https://example.com/v1", true);
     let route = test_route("sonnet-thinking[1m]");
 
-    pool.supported_models = vec!["claude-sonnet-4.6-thinking[1m]".to_string()];
+    pool.supported_models = vec!["claude-sonnet-4-6-thinking[1m]".to_string()];
     assert!(account_matches_supported_models(
         &pool,
         Some(&route.model_candidates_for_support())
     ));
 
-    pool.supported_models = vec!["claude-sonnet-4.6-thinking".to_string()];
+    pool.supported_models = vec!["claude-sonnet-4-6-thinking".to_string()];
     assert!(!account_matches_supported_models(
         &pool,
         Some(&route.model_candidates_for_support())
     ));
 
-    pool.supported_models = vec!["claude-sonnet-4.6[1m]".to_string()];
+    pool.supported_models = vec!["claude-sonnet-4-6[1m]".to_string()];
     assert!(!account_matches_supported_models(
         &pool,
         Some(&route.model_candidates_for_support())

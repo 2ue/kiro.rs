@@ -34,7 +34,6 @@ const account = {
   streamResponseMode: null,
   autoDisablePolicy: 'inherit',
   preOutputStreamRetryMode: 'inherit',
-  normalizeModelVersionDots: false,
   modelMappingMode: 'processed_mapping',
   modelMappingRequireMatch: false,
   modelMappingRules: [{ enabled: true, source: 'claude-sonnet-4.5', target: 'claude-sonnet-4-5', kind: 'alias' }],
@@ -100,4 +99,21 @@ test('最终记录最大计算模式只修改当前账号的原始口径', () =>
   const request = buildAccountRequest(draft)
   assert.equal(request.rawUsageSource, 'upstream_last_max_cost')
   assert.deepEqual(diffAccountRequest({ ...request, rawUsageSource: 'legacy_max' }, request), { rawUsageSource: 'upstream_last_max_cost' })
+})
+
+
+test('模型映射预设只生成标准横杠 ID', async () => {
+  const { DIRECT_MODEL_MAPPING_PRESETS, PROCESSED_MODEL_MAPPING_PRESETS } = await import('../src/features/accounts/account-utils.ts')
+  for (const rules of [DIRECT_MODEL_MAPPING_PRESETS, PROCESSED_MODEL_MAPPING_PRESETS]) {
+    assert.equal(new Set(rules.map((r) => r.source)).size, rules.length)
+    assert.ok(rules.every((r) => !r.source.includes('.') && !r.target.includes('.')))
+  }
+})
+
+
+test('测试模型选项不再把点号 ID 转成横杠', async () => {
+  const { toAccountTestModelName } = await import('../src/lib/test-models.ts')
+  assert.equal(toAccountTestModelName('claude-opus-4.6'), null)
+  assert.equal(toAccountTestModelName('opus-4.6'), null)
+  assert.equal(toAccountTestModelName('claude-sonnet-4-5-20250929'), 'claude-sonnet-4-5-20250929')
 })

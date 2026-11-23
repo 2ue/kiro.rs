@@ -5,12 +5,12 @@ export interface TestModelOption {
 
 // Account tests send 上游 upstream model names.
 export const TEST_MODELS: TestModelOption[] = [
-  { id: 'claude-sonnet-4.5', label: 'Claude Sonnet 4.5 (上游)' },
-  { id: 'claude-haiku-4.5', label: 'Claude Haiku 4.5 (上游)' },
-  { id: 'claude-opus-4.5', label: 'Claude Opus 4.5 (上游)' },
-  { id: 'claude-sonnet-4.6', label: 'Claude Sonnet 4.6 (上游)' },
-  { id: 'claude-opus-4.6', label: 'Claude Opus 4.6 (上游)' },
-  { id: 'claude-opus-4.7', label: 'Claude Opus 4.7 (上游)' },
+  { id: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5 (上游)' },
+  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5 (上游)' },
+  { id: 'claude-opus-4-5', label: 'Claude Opus 4.5 (上游)' },
+  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (上游)' },
+  { id: 'claude-opus-4-6', label: 'Claude Opus 4.6 (上游)' },
+  { id: 'claude-opus-4-7', label: 'Claude Opus 4.7 (上游)' },
 ]
 
 export const DEFAULT_TEST_MODEL = TEST_MODELS[0].id
@@ -77,8 +77,8 @@ export const ACCOUNT_TEST_MODELS: TestModelOption[] = [
 export const DEFAULT_ACCOUNT_TEST_MODEL = 'claude-sonnet-4-5'
 
 /**
- * Standard Claude Code model id for any spelling of a Claude model, or `null` when the value
- * is not a Claude model. `claude-opus-4.6`, `opus-4.6`, `claude-opus-4-6-thinking` and
+ * Standard Claude Code model id, or `null` for unsupported spellings.
+ * `opus-4-6`, `claude-opus-4-6-thinking` and
  * `claude-opus-4-6[1m]` all become `claude-opus-4-6`; dated ids keep their date.
  */
 export function toAccountTestModelName(model: string): string | null {
@@ -86,9 +86,9 @@ export function toAccountTestModelName(model: string): string | null {
   if (!value) return null
   if (value.endsWith('[1m]')) value = value.slice(0, -4)
   if (value.endsWith('-thinking')) value = value.slice(0, -9)
-  const legacy = value.match(/^claude-3[.-]5-(sonnet|haiku)(?:-(\d{8}))?$/)
+  const legacy = value.match(/^claude-3-5-(sonnet|haiku)(?:-(\d{8}))?$/)
   if (legacy) return `claude-3-5-${legacy[1]}${legacy[2] ? `-${legacy[2]}` : ''}`
-  const match = value.match(/^(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d{1,2}))?(?:-(\d{8}))?$/)
+  const match = value.match(/^(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2}))?(?:-(\d{8}))?$/)
   if (!match) return null
   const [, family, major, minor, date] = match
   return `claude-${family}-${major}${minor ? `-${minor}` : ''}${date ? `-${date}` : ''}`

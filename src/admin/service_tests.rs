@@ -1297,7 +1297,6 @@ async fn admin_audit_records_failed_changes_auth_failures_capture_and_export() {
         stream_response_mode: None,
         auto_disable_policy: Default::default(),
         pre_output_stream_retry_mode: Default::default(),
-        normalize_model_version_dots: false,
         model_mapping_mode: Default::default(),
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),

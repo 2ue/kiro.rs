@@ -1346,7 +1346,7 @@ impl PostgresStore {
                 "stream_response_mode": request.stream_response_mode,
                 "auto_disable_policy": request.auto_disable_policy,
                 "pre_output_stream_retry_mode": request.pre_output_stream_retry_mode,
-                "normalize_model_version_dots": request.normalize_model_version_dots,
+                "normalize_model_version_dots": false,
                 "model_mapping_mode": request.model_mapping_mode,
                 "model_mapping_require_match": request.model_mapping_require_match,
                 "model_mapping_rules": request.model_mapping_rules,
@@ -1782,7 +1782,7 @@ impl PostgresStore {
         .bind(header_overrides_value)
         .bind(request.wire_profile.as_str())
         .bind(request.tls_profile.as_str())
-        .bind(request.normalize_model_version_dots)
+        .bind(false)
         .bind(request.model_mapping_mode.as_str())
         .bind(request.model_mapping_require_match)
         .bind(model_mapping_rules_value)
@@ -1875,9 +1875,6 @@ impl PostgresStore {
         let header_overrides_value = serde_json::to_value(&header_overrides)?;
         let wire_profile = request.wire_profile.unwrap_or(current.wire_profile);
         let tls_profile = request.tls_profile.unwrap_or(current.tls_profile);
-        let normalize_model_version_dots = request
-            .normalize_model_version_dots
-            .unwrap_or(current.normalize_model_version_dots);
         let model_mapping_mode = request
             .model_mapping_mode
             .unwrap_or(current.model_mapping_mode);
@@ -1977,7 +1974,7 @@ impl PostgresStore {
         .bind(header_overrides_value)
         .bind(wire_profile.as_str())
         .bind(tls_profile.as_str())
-        .bind(normalize_model_version_dots)
+        .bind(false)
         .bind(model_mapping_mode.as_str())
         .bind(model_mapping_require_match)
         .bind(model_mapping_rules_value)
@@ -10236,7 +10233,6 @@ fn account_eligibility_from_row(row: &PgRow) -> anyhow::Result<AccountEligibilit
         )
         .ok_or_else(|| anyhow::anyhow!("invalid model mapping mode"))?,
         model_mapping_rules: Arc::new(model_mapping_rules),
-        normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
         supported_models: Arc::new(supported_models),
         route_mode,
         route_rules: Arc::new(route_rules),
@@ -10506,7 +10502,6 @@ fn account_from_row_with_policy(
         auto_disabled_at: row.try_get("auto_disabled_at")?,
         auto_disabled_until: row.try_get("auto_disabled_until")?,
         auto_disabled_last_error: row.try_get("auto_disabled_last_error")?,
-        normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
         model_mapping_mode,
         model_mapping_require_match,
         model_mapping_rules: normalize_account_model_mapping_rules(model_mapping_rules),
@@ -15918,7 +15913,6 @@ mod tests {
                 stream_response_mode: Some(StreamResponseMode::EventPassthrough),
                 auto_disable_policy: AutoDisablePolicy::Inherit,
                 pre_output_stream_retry_mode: StreamRetryMode::Enabled,
-                normalize_model_version_dots: false,
                 model_mapping_mode: ModelMappingMode::PassthroughMapping,
                 model_mapping_require_match: false,
                 model_mapping_rules: vec![ModelMappingRule {

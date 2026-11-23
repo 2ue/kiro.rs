@@ -3501,7 +3501,7 @@ impl ModelResolutionMode {
 /// 模型映射规则类型。
 ///
 /// `version_equivalent` 表示同一上游小版本的不同写法，例如
-/// `claude-opus-4-8` -> `claude-opus-4.8`。`alias` 表示短别名或显式别名，
+/// `claude-opus-4-5-20251101` -> `claude-opus-4-5`。`alias` 表示短别名或显式别名，
 /// 例如 `sonnet` -> 当前可用 Sonnet。`fallback` 表示兜底规则，只在精确和
 /// 版本等价都没有命中后生效。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3560,7 +3560,7 @@ pub struct ModelMappingConfig {
     /// 允许已知 Claude 模型在同族内跨小版本解析到当前可用模型。
     ///
     /// 例如请求一个已下线的 dated Sonnet 4，目录只有 Sonnet 4.5 时，
-    /// 可以选择将请求解析到 4.5。关闭后仍保留同版本的点号/短横线兼容。
+    /// 可以选择将请求解析到 4.5。关闭后仍保留同版本的日期别名兼容。
     #[serde(default = "default_true")]
     pub allow_version_fallback: bool,
     /// 允许在请求模型所属族完全没有可用模型时跨 Claude 族兜底。

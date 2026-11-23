@@ -89,62 +89,57 @@ export type AccountModelMappingPreset = {
 export const DIRECT_MODEL_MAPPING_PRESETS: AccountModelMappingPreset[] = [
   { label: 'Sonnet 4 完整ID→4', source: 'claude-sonnet-4-20250514', target: 'claude-sonnet-4', tone: 'blue' },
   { label: 'Sonnet 4 原样', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
-  { label: 'Sonnet 4.5 完整ID→4.5', source: 'claude-sonnet-4-5-20250929', target: 'claude-sonnet-4.5', tone: 'blue' },
-  { label: 'Sonnet 4.5→4.5', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4.5', tone: 'blue' },
-  { label: 'Sonnet 4.6→4.6', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4.6', tone: 'cyan' },
-  { label: 'Sonnet 4.6 点号', source: 'claude-sonnet-4.6', target: 'claude-sonnet-4.6', tone: 'cyan' },
-  { label: 'Sonnet 4.7→4.7', source: 'claude-sonnet-4-7', target: 'claude-sonnet-4.7', tone: 'cyan' },
-  { label: 'Sonnet 4.8→4.8', source: 'claude-sonnet-4-8', target: 'claude-sonnet-4.8', tone: 'cyan' },
-  { label: 'Opus 4.5 完整ID→4.5', source: 'claude-opus-4-5-20251101', target: 'claude-opus-4.5', tone: 'purple' },
-  { label: 'Opus 4.5→4.5', source: 'claude-opus-4-5', target: 'claude-opus-4.5', tone: 'purple' },
-  { label: 'Opus 4.6→4.6', source: 'claude-opus-4-6', target: 'claude-opus-4.6', tone: 'purple' },
-  { label: 'Opus 4.7→4.7', source: 'claude-opus-4-7', target: 'claude-opus-4.7', tone: 'purple' },
-  { label: 'Opus 4.8→4.8', source: 'claude-opus-4-8', target: 'claude-opus-4.8', tone: 'purple' },
-  { label: 'Haiku 4.5 完整ID→4.5', source: 'claude-haiku-4-5-20251001', target: 'claude-haiku-4.5', tone: 'emerald' },
-  { label: 'Haiku 4.5→4.5', source: 'claude-haiku-4-5', target: 'claude-haiku-4.5', tone: 'emerald' },
+  { label: 'Sonnet 4.5 完整ID→4.5', source: 'claude-sonnet-4-5-20250929', target: 'claude-sonnet-4-5', tone: 'blue' },
+  { label: 'Sonnet 4.5 原样', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4-5', tone: 'blue' },
+  { label: 'Sonnet 4.6 原样', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4-6', tone: 'cyan' },
+  { label: 'Sonnet 4.7 原样', source: 'claude-sonnet-4-7', target: 'claude-sonnet-4-7', tone: 'cyan' },
+  { label: 'Sonnet 4.8 原样', source: 'claude-sonnet-4-8', target: 'claude-sonnet-4-8', tone: 'cyan' },
+  { label: 'Opus 4.5 完整ID→4.5', source: 'claude-opus-4-5-20251101', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4.5 原样', source: 'claude-opus-4-5', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4.6 原样', source: 'claude-opus-4-6', target: 'claude-opus-4-6', tone: 'purple' },
+  { label: 'Opus 4.7 原样', source: 'claude-opus-4-7', target: 'claude-opus-4-7', tone: 'purple' },
+  { label: 'Opus 4.8 原样', source: 'claude-opus-4-8', target: 'claude-opus-4-8', tone: 'purple' },
+  { label: 'Haiku 4.5 完整ID→4.5', source: 'claude-haiku-4-5-20251001', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: 'Haiku 4.5 原样', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
   { label: 'Sonnet 5 原样', source: 'claude-sonnet-5', target: 'claude-sonnet-5', tone: 'cyan' },
-  { label: 'Sonnet 5.5→5.5', source: 'claude-sonnet-5-5', target: 'claude-sonnet-5.5', tone: 'cyan' },
+  { label: 'Sonnet 5.5 原样', source: 'claude-sonnet-5-5', target: 'claude-sonnet-5-5', tone: 'cyan' },
   { label: 'Opus 5 原样', source: 'claude-opus-5', target: 'claude-opus-5', tone: 'purple' },
-  { label: 'Opus 5.5→5.5', source: 'claude-opus-5-5', target: 'claude-opus-5.5', tone: 'purple' },
-  { label: 'Haiku 5.5→5.5', source: 'claude-haiku-5-5', target: 'claude-haiku-5.5', tone: 'emerald' },
+  { label: 'Opus 5.5 原样', source: 'claude-opus-5-5', target: 'claude-opus-5-5', tone: 'purple' },
+  { label: 'Haiku 5.5 原样', source: 'claude-haiku-5-5', target: 'claude-haiku-5-5', tone: 'emerald' },
   { label: 'Fable 5 原样', source: 'claude-fable-5', target: 'claude-fable-5', tone: 'rose' },
-  { label: 'Fable 5.1→5.1', source: 'claude-fable-5-1', target: 'claude-fable-5.1', tone: 'rose' },
-  { label: 'Fable 5.2→5.2', source: 'claude-fable-5-2', target: 'claude-fable-5.2', tone: 'rose' },
+  { label: 'Fable 5.1 原样', source: 'claude-fable-5-1', target: 'claude-fable-5-1', tone: 'rose' },
+  { label: 'Fable 5.2 原样', source: 'claude-fable-5-2', target: 'claude-fable-5-2', tone: 'rose' },
   { label: 'Mythos 5 原样', source: 'claude-mythos-5', target: 'claude-mythos-5', tone: 'rose' },
-  { label: 'Mythos 5.1→5.1', source: 'claude-mythos-5-1', target: 'claude-mythos-5.1', tone: 'rose' },
-  { label: 'Mythos 5.2→5.2', source: 'claude-mythos-5-2', target: 'claude-mythos-5.2', tone: 'rose' },
-  { label: '3.5 Sonnet 完整ID', source: 'claude-3-5-sonnet-20241022', target: 'claude-3.5-sonnet', tone: 'amber' },
-  { label: '3.5 Haiku 完整ID', source: 'claude-3-5-haiku-20241022', target: 'claude-3.5-haiku', tone: 'emerald' },
+  { label: 'Mythos 5.1 原样', source: 'claude-mythos-5-1', target: 'claude-mythos-5-1', tone: 'rose' },
+  { label: 'Mythos 5.2 原样', source: 'claude-mythos-5-2', target: 'claude-mythos-5-2', tone: 'rose' },
+  { label: '3.5 Sonnet 完整ID', source: 'claude-3-5-sonnet-20241022', target: 'claude-3-5-sonnet', tone: 'amber' },
+  { label: '3.5 Haiku 完整ID', source: 'claude-3-5-haiku-20241022', target: 'claude-3-5-haiku', tone: 'emerald' },
 ]
 
 export const PROCESSED_MODEL_MAPPING_PRESETS: AccountModelMappingPreset[] = [
   { label: 'Sonnet 4 原样', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
-  { label: 'Sonnet 4.5→4-5', source: 'claude-sonnet-4.5', target: 'claude-sonnet-4-5', tone: 'cyan' },
-  { label: 'Sonnet 4-5 原样', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4-5', tone: 'cyan' },
-  { label: 'Sonnet 4.6→4-6', source: 'claude-sonnet-4.6', target: 'claude-sonnet-4-6', tone: 'cyan' },
-  { label: 'Sonnet 4-6 原样', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4-6', tone: 'cyan' },
-  { label: 'Sonnet 4.7→4-7', source: 'claude-sonnet-4.7', target: 'claude-sonnet-4-7', tone: 'cyan' },
-  { label: 'Sonnet 4.8→4-8', source: 'claude-sonnet-4.8', target: 'claude-sonnet-4-8', tone: 'cyan' },
-  { label: 'Opus 4.5→4-5', source: 'claude-opus-4.5', target: 'claude-opus-4-5', tone: 'purple' },
-  { label: 'Opus 4-5 原样', source: 'claude-opus-4-5', target: 'claude-opus-4-5', tone: 'purple' },
-  { label: 'Opus 4.6→4-6', source: 'claude-opus-4.6', target: 'claude-opus-4-6', tone: 'purple' },
-  { label: 'Opus 4.7→4-7', source: 'claude-opus-4.7', target: 'claude-opus-4-7', tone: 'purple' },
-  { label: 'Opus 4.8→4-8', source: 'claude-opus-4.8', target: 'claude-opus-4-8', tone: 'purple' },
-  { label: 'Haiku 4.5→4-5', source: 'claude-haiku-4.5', target: 'claude-haiku-4-5', tone: 'emerald' },
-  { label: 'Haiku 4-5 原样', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: 'Sonnet 4.5 原样', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4-5', tone: 'cyan' },
+  { label: 'Sonnet 4.6 原样', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4-6', tone: 'cyan' },
+  { label: 'Sonnet 4.7 原样', source: 'claude-sonnet-4-7', target: 'claude-sonnet-4-7', tone: 'cyan' },
+  { label: 'Sonnet 4.8 原样', source: 'claude-sonnet-4-8', target: 'claude-sonnet-4-8', tone: 'cyan' },
+  { label: 'Opus 4.5 原样', source: 'claude-opus-4-5', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4.6 原样', source: 'claude-opus-4-6', target: 'claude-opus-4-6', tone: 'purple' },
+  { label: 'Opus 4.7 原样', source: 'claude-opus-4-7', target: 'claude-opus-4-7', tone: 'purple' },
+  { label: 'Opus 4.8 原样', source: 'claude-opus-4-8', target: 'claude-opus-4-8', tone: 'purple' },
+  { label: 'Haiku 4.5 原样', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
   { label: 'Sonnet 5 原样', source: 'claude-sonnet-5', target: 'claude-sonnet-5', tone: 'cyan' },
-  { label: 'Sonnet 5.5→5-5', source: 'claude-sonnet-5.5', target: 'claude-sonnet-5-5', tone: 'cyan' },
+  { label: 'Sonnet 5.5 原样', source: 'claude-sonnet-5-5', target: 'claude-sonnet-5-5', tone: 'cyan' },
   { label: 'Opus 5 原样', source: 'claude-opus-5', target: 'claude-opus-5', tone: 'purple' },
-  { label: 'Opus 5.5→5-5', source: 'claude-opus-5.5', target: 'claude-opus-5-5', tone: 'purple' },
-  { label: 'Haiku 5.5→5-5', source: 'claude-haiku-5.5', target: 'claude-haiku-5-5', tone: 'emerald' },
+  { label: 'Opus 5.5 原样', source: 'claude-opus-5-5', target: 'claude-opus-5-5', tone: 'purple' },
+  { label: 'Haiku 5.5 原样', source: 'claude-haiku-5-5', target: 'claude-haiku-5-5', tone: 'emerald' },
   { label: 'Fable 5 原样', source: 'claude-fable-5', target: 'claude-fable-5', tone: 'rose' },
-  { label: 'Fable 5.1→5-1', source: 'claude-fable-5.1', target: 'claude-fable-5-1', tone: 'rose' },
-  { label: 'Fable 5.2→5-2', source: 'claude-fable-5.2', target: 'claude-fable-5-2', tone: 'rose' },
+  { label: 'Fable 5.1 原样', source: 'claude-fable-5-1', target: 'claude-fable-5-1', tone: 'rose' },
+  { label: 'Fable 5.2 原样', source: 'claude-fable-5-2', target: 'claude-fable-5-2', tone: 'rose' },
   { label: 'Mythos 5 原样', source: 'claude-mythos-5', target: 'claude-mythos-5', tone: 'rose' },
-  { label: 'Mythos 5.1→5-1', source: 'claude-mythos-5.1', target: 'claude-mythos-5-1', tone: 'rose' },
-  { label: 'Mythos 5.2→5-2', source: 'claude-mythos-5.2', target: 'claude-mythos-5-2', tone: 'rose' },
-  { label: '3.5 Sonnet→3-5', source: 'claude-3.5-sonnet', target: 'claude-3-5-sonnet', tone: 'amber' },
-  { label: '3.5 Haiku→3-5', source: 'claude-3.5-haiku', target: 'claude-3-5-haiku', tone: 'emerald' },
+  { label: 'Mythos 5.1 原样', source: 'claude-mythos-5-1', target: 'claude-mythos-5-1', tone: 'rose' },
+  { label: 'Mythos 5.2 原样', source: 'claude-mythos-5-2', target: 'claude-mythos-5-2', tone: 'rose' },
+  { label: '3.5 Sonnet→3-5', source: 'claude-3-5-sonnet', target: 'claude-3-5-sonnet', tone: 'amber' },
+  { label: '3.5 Haiku→3-5', source: 'claude-3-5-haiku', target: 'claude-3-5-haiku', tone: 'emerald' },
 ]
 
 /** 单账号可覆盖的全局参数：键、名称、单位；账号表单和批量修改共用。 */
@@ -182,7 +177,6 @@ export type AccountFormDraft = {
   streamResponseMode: AccountStreamResponseDraft
   preOutputStreamRetryMode: AccountStreamRetryDraft
   autoDisablePolicy: NonNullable<CreateAccountRequest['autoDisablePolicy']>
-  normalizeModelVersionDots: boolean
   modelFilterMode: 'allowlist' | 'denylist'
   supportedModelsText: string
   routeMode: NonNullable<CreateAccountRequest['routeMode']>
@@ -212,7 +206,6 @@ export const defaultAccountForm = (): AccountFormDraft => ({
   streamResponseMode: 'inherit',
   preOutputStreamRetryMode: 'inherit',
   autoDisablePolicy: 'inherit',
-  normalizeModelVersionDots: false,
   modelFilterMode: 'allowlist',
   supportedModelsText: '',
   routeMode: 'allow_all',
@@ -242,7 +235,6 @@ export const accountFormFromAccount = (account: Account): AccountFormDraft => ({
   streamResponseMode: account.streamResponseMode || 'inherit',
   preOutputStreamRetryMode: account.preOutputStreamRetryMode || 'inherit',
   autoDisablePolicy: account.autoDisablePolicy,
-  normalizeModelVersionDots: Boolean(account.normalizeModelVersionDots),
   modelFilterMode: account.modelFilterMode ?? 'allowlist',
   supportedModelsText: joinRules(account.supportedModels || []),
   routeMode: account.routeMode || 'allow_all',
@@ -342,8 +334,8 @@ export function appendModelMappingPresets(currentText: string, presets: AccountM
   return appendModelMappingRules(currentText, presets.map((p) => ({ enabled: true, source: p.source, target: p.target, kind: 'alias' })))
 }
 
-export function modelMappingDescription(mode: Account['modelMappingMode'] | undefined, normalizeFallback: boolean): string {
-  const processedFallback = normalizeFallback ? '未命中后使用内部处理模型，并把数字点号转横杠。' : '未命中后使用内部处理模型。'
+export function modelMappingDescription(mode: Account['modelMappingMode'] | undefined): string {
+  const processedFallback = '未命中后使用内部处理模型。'
   if (mode === 'passthrough') return '直接使用客户端请求里的模型，不应用映射规则和兜底转换。'
   if (mode === 'passthrough_mapping') return '先用客户端请求模型匹配规则；未命中时仍使用原请求模型。'
   if (mode === 'direct_mapping') return `用客户端请求模型匹配规则；${processedFallback}`
@@ -358,7 +350,7 @@ export function accountModelMappingSummary(account: Account): string {
     : account.modelMappingMode === 'direct_mapping'
       ? '映射+内部'
       : '内部+映射'
-  const fallback = account.modelMappingRequireMatch ? '必须命中' : account.normalizeModelVersionDots ? '未命中4.8->4-8' : '允许未命中'
+  const fallback = account.modelMappingRequireMatch ? '必须命中' : '允许未命中'
   return `${mode}${count ? ` ${count}条` : ''} · ${fallback}`
 }
 

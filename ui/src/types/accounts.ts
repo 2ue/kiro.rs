@@ -245,7 +245,6 @@ export interface Account {
   autoDisabledAt?: string;
   autoDisabledUntil?: string;
   autoDisabledLastError?: string;
-  normalizeModelVersionDots: boolean;
   modelMappingMode: ModelMappingMode;
   modelMappingRequireMatch: boolean;
   modelMappingRules: AccountModelMappingRule[];
@@ -323,7 +322,6 @@ export interface CreateAccountRequest {
   streamResponseMode?: StreamResponseMode | null;
   autoDisablePolicy?: AutoDisablePolicy;
   preOutputStreamRetryMode?: StreamRetryMode;
-  normalizeModelVersionDots?: boolean;
   modelMappingMode?: ModelMappingMode;
   modelMappingRequireMatch?: boolean;
   modelMappingRules?: AccountModelMappingRule[];
@@ -356,7 +354,6 @@ export interface UpdateAccountRequest {
   streamResponseMode?: StreamResponseMode | null;
   autoDisablePolicy?: AutoDisablePolicy;
   preOutputStreamRetryMode?: StreamRetryMode;
-  normalizeModelVersionDots?: boolean;
   modelMappingMode?: ModelMappingMode;
   modelMappingRequireMatch?: boolean;
   modelMappingRules?: AccountModelMappingRule[];

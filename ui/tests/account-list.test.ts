@@ -46,7 +46,6 @@ function account(id: number, patch: Partial<Account> = {}): Account {
     autoDisablePolicy: 'inherit',
     preOutputStreamRetryMode: 'inherit',
     autoDisabled: false,
-    normalizeModelVersionDots: false,
     modelMappingMode: 'processed_mapping',
     modelMappingRequireMatch: false,
     modelMappingRules: [],
@@ -150,12 +149,12 @@ test('分段计数口径对齐 main credential_filter_facets：启用状态去�
   assert.deepEqual(facets({ runtime: ['cooldown', 'probation'] }).runtime, facets({}).runtime)
 })
 
-test('模型口径忽略大小写、版本点号与横杠视为相同；列表为空表示不限制', () => {
-  assert.equal(normalizeModelName('Claude-Sonnet-4.5'), 'claude-sonnet-4-5')
-  assert.equal(accountSupportsModel(a1, 'claude-sonnet-4.5'), true)
+test('模型口径忽略大小写、点号与横杠保持不同；列表为空表示不限制', () => {
+  assert.equal(normalizeModelName('Claude-Sonnet-4.5'), 'claude-sonnet-4.5')
+  assert.equal(accountSupportsModel(a1, 'claude-sonnet-4.5'), false)
   assert.equal(accountSupportsModel(a1, 'claude-opus-4-6'), false)
   assert.equal(accountSupportsModel(a2, 'anything'), true)
-  assert.deepEqual(modelFilterOptions(accounts, ['claude-opus-4-6', 'auto', 'claude-haiku-4-5']), ['claude-haiku-4-5', 'claude-opus-4.6', 'claude-sonnet-4-5'])
+  assert.deepEqual(modelFilterOptions(accounts, ['claude-opus-4-6', 'auto', 'claude-haiku-4-5']), ['claude-haiku-4-5', 'claude-opus-4-6', 'claude-opus-4.6', 'claude-sonnet-4-5'])
 })
 
 test('关键字："#3" 精确定位，其它按名称/地址/标签模糊匹配', () => {
@@ -172,7 +171,7 @@ test('筛选：启用状态、运行状态取交集、按模型、按代理、�
   assert.deepEqual(ids({ enabled: 'disabled' }), [2])
   assert.deepEqual(ids({ runtime: ['probation', 'concurrency_full'] }), [4])
   assert.deepEqual(ids({ runtime: ['probation', 'cooldown'] }), [])
-  assert.deepEqual(ids({ model: 'claude-opus-4-6' }), [2, 3, 4])
+  assert.deepEqual(ids({ model: 'claude-opus-4-6' }), [2, 3])
   assert.deepEqual(ids({ model: MODEL_FILTER_UNRESTRICTED }), [2, 3])
   assert.deepEqual(ids({ proxy: 'with_proxy' }), [1])
   assert.deepEqual(ids({ proxy: 'without_proxy' }), [2, 3, 4])
@@ -226,4 +225,11 @@ test('模型黑名单筛选只排除命中项，缺省白名单保持兼容', ()
   assert.equal(accountSupportsModel({ supportedModels: ['fable-5'], modelFilterMode: 'denylist' }, 'other-model'), true)
   assert.equal(accountSupportsModel({ supportedModels: [], modelFilterMode: 'denylist' }, 'fable-5'), true)
   assert.equal(accountSupportsModel({ supportedModels: ['fable-5'] }, 'other-model'), false)
+})
+
+
+test('点号和横杠在黑名单中也不自动互换', () => {
+  const account = { supportedModels: ['claude-opus-4-6'], modelFilterMode: 'denylist' as const }
+  assert.equal(accountSupportsModel(account, 'claude-opus-4-6'), false)
+  assert.equal(accountSupportsModel(account, 'claude-opus-4.6'), true)
 })

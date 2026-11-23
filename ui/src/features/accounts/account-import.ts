@@ -27,7 +27,6 @@ export const ACCOUNT_REQUEST_FIELDS = [
   'streamResponseMode',
   'autoDisablePolicy',
   'preOutputStreamRetryMode',
-  'normalizeModelVersionDots',
   'modelMappingMode',
   'modelMappingRequireMatch',
   'modelMappingRules',

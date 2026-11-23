@@ -626,8 +626,6 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_disabled_last_error: Option<String>,
     #[serde(default)]
-    pub normalize_model_version_dots: bool,
-    #[serde(default)]
     pub model_mapping_mode: ModelMappingMode,
     #[serde(default)]
     pub model_mapping_require_match: bool,
@@ -661,7 +659,6 @@ pub(crate) struct AccountEligibility {
     pub(crate) model_filter_mode: crate::model::model_support::ModelFilterMode,
     pub(crate) model_mapping_mode: ModelMappingMode,
     pub(crate) model_mapping_rules: Arc<Vec<ModelMappingRule>>,
-    pub(crate) normalize_model_version_dots: bool,
     pub(crate) route_mode: RouteRuleMode,
     pub(crate) route_rules: Arc<Vec<String>>,
 }
@@ -686,7 +683,6 @@ fn account_eligibility_from_pool(pool: &Account) -> AccountEligibility {
         model_filter_mode: pool.model_filter_mode,
         model_mapping_mode: pool.model_mapping_mode,
         model_mapping_rules: Arc::new(pool.model_mapping_rules.clone()),
-        normalize_model_version_dots: pool.normalize_model_version_dots,
         route_mode: pool.route_mode,
         route_rules: Arc::new(normalize_route_rules(&pool.route_rules)),
     }
@@ -759,8 +755,6 @@ pub struct CreateAccountRequest {
     #[serde(default)]
     pub pre_output_stream_retry_mode: StreamRetryMode,
     #[serde(default)]
-    pub normalize_model_version_dots: bool,
-    #[serde(default)]
     pub model_mapping_mode: ModelMappingMode,
     #[serde(default)]
     pub model_mapping_require_match: bool,
@@ -826,8 +820,6 @@ pub struct UpdateAccountRequest {
     pub auto_disable_policy: Option<AutoDisablePolicy>,
     #[serde(default)]
     pub pre_output_stream_retry_mode: Option<StreamRetryMode>,
-    #[serde(default)]
-    pub normalize_model_version_dots: Option<bool>,
     #[serde(default)]
     pub model_mapping_mode: Option<ModelMappingMode>,
     #[serde(default)]
@@ -2457,7 +2449,6 @@ fn account_wire_debug_route_context(
             "streamResponseModeSource": stream_response_mode_source,
             "preOutputStreamRetryMode": pool.pre_output_stream_retry_mode.as_str(),
             "effectivePreOutputStreamRetryEnabled": effective_account_pre_output_stream_retry_enabled(pool, config),
-            "normalizeModelVersionDots": pool.normalize_model_version_dots,
             "modelMappingMode": pool.model_mapping_mode.as_str(),
             "modelMappingRequireMatch": pool.model_mapping_require_match,
         },
@@ -12736,7 +12727,7 @@ fn account_model_variants(model: &str, add_family_alias: bool) -> Vec<String> {
     };
 
     // Accounts use their own Claude Code mapping rules. This helper only
-    // expands protocol spellings (dot/dash, dated/base, thinking and [1m]);
+    // expands dated/base, thinking and [1m] spellings;
     // it must never select a local 上游 model version.
     add_base_variants(&base);
 
@@ -12756,17 +12747,10 @@ fn is_account_official_claude_model(model: &str) -> bool {
     let parts = rest.split('-').collect::<Vec<_>>();
     let is_family = |value: &str| matches!(value, "opus" | "sonnet" | "haiku");
     let all_digits = |value: &str| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit());
-    let valid_version = |value: &str| {
-        if let Some((major, minor)) = value.split_once('.') {
-            all_digits(major) && all_digits(minor)
-        } else {
-            all_digits(value)
-        }
-    };
+    let valid_version = all_digits;
     let valid_date = |value: &str| is_yyyymmdd(value);
 
     match parts.as_slice() {
-        ["3.5", family] => is_family(family),
         ["3", "5", family] => is_family(family),
         ["3", "5", family, date] => is_family(family) && valid_date(date),
         [family, version] => is_family(family) && valid_version(version),
@@ -12863,7 +12847,6 @@ fn account_model_filter_allows(
     candidates: Option<&[String]>,
     mapping_mode: ModelMappingMode,
     mapping_rules: &[ModelMappingRule],
-    normalize_dots: bool,
 ) -> bool {
     use crate::model::model_support::ModelFilterMode;
     let listed = models;
@@ -12892,8 +12875,6 @@ fn account_model_filter_allows(
                 mode: mapping_mode.processing_mode(),
                 rules: mapping_rules,
                 require_mapping_match: false,
-                fallback_transform: normalize_dots
-                    .then_some(model_pipeline::normalize_outbound_model as fn(&str) -> String),
             },
         )
         .is_ok_and(|result| {
@@ -12922,7 +12903,6 @@ fn account_matches_supported_models_normalized(
         model_candidates,
         pool.model_mapping_mode,
         &pool.model_mapping_rules,
-        pool.normalize_model_version_dots,
     )
 }
 
@@ -13036,7 +13016,6 @@ fn account_eligibility_matches_supported_models(
         model_candidates,
         pool.model_mapping_mode,
         &pool.model_mapping_rules,
-        pool.normalize_model_version_dots,
     )
 }
 
@@ -13232,11 +13211,6 @@ pub fn normalize_account_model_mapping_rules(
     rules: Vec<ModelMappingRule>,
 ) -> Vec<ModelMappingRule> {
     model_pipeline::normalize_mapping_rules(rules)
-}
-
-#[cfg(test)]
-fn normalize_account_outbound_model(model: &str) -> String {
-    model_pipeline::normalize_outbound_model(model)
 }
 
 const ACCOUNT_HEADER_OVERRIDE_MAX_ENTRIES: usize = 64;

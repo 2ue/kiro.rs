@@ -705,11 +705,11 @@ mod tests {
                 true,
             ),
             ("claude-opus-*", "claude-sonnet-4-5", false),
-            ("claude-sonnet-4-5", "claude-sonnet-4.5", true),
+            ("claude-sonnet-4-5", "claude-sonnet-4.5", false),
             (
                 "claude-sonnet-4-5-thinking",
                 "claude-sonnet-4.5-thinking",
-                true,
+                false,
             ),
             ("claude-sonnet-4-5", "claude-opus-4-6", false),
             ("*", "arbitrary-model", true),

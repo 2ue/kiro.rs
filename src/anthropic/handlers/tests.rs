@@ -2065,8 +2065,6 @@ async fn test_account_manager_for_handlers(base_url: &str) -> Option<Arc<Account
 
             auto_disable_policy: AutoDisablePolicy::Inherit,
             pre_output_stream_retry_mode: StreamRetryMode::Inherit,
-
-            normalize_model_version_dots: false,
             model_mapping_mode: ModelMappingMode::PassthroughMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),

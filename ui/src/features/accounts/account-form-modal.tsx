@@ -234,7 +234,7 @@ export function AccountFormModal({
     );
   };
 
-  const toggle = (key: "enabled" | "appendBetaQuery" | "normalizeModelVersionDots" | "modelMappingRequireMatch", label: string, description?: string) => (
+  const toggle = (key: "enabled" | "appendBetaQuery" | "modelMappingRequireMatch", label: string, description?: string) => (
     <Field label={label} htmlFor={`account-${key}`} description={description}>
       <div className="flex min-h-9 items-center gap-2">
         <Switch id={`account-${key}`} checked={draft[key]} onCheckedChange={(v) => set(key, v)} />
@@ -416,7 +416,6 @@ export function AccountFormModal({
           <FieldGrid min="16rem">
             {choice("modelMappingMode", "映射模式", MODEL_MAPPING_MODE_OPTIONS)}
             {toggle("modelMappingRequireMatch", "必须命中映射", "未命中任何规则时直接拒绝，而不是用原模型名")}
-            {toggle("normalizeModelVersionDots", "未命中时点号转横杠", "未命中映射规则时，自动将版本号点号替换为横杠")}
           </FieldGrid>
           {draft.modelMappingMode !== "passthrough" && (
             <>

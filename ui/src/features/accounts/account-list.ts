@@ -135,9 +135,9 @@ export function accountFacetCounts(
   return counts
 }
 
-/** 模型名比较口径：忽略大小写，版本号里的点号与横杠视为相同（claude-sonnet-4.5 = claude-sonnet-4-5）。 */
+/** 模型名仅忽略首尾空白和大小写。 */
 export function normalizeModelName(model: string): string {
-  return model.trim().toLowerCase().replace(/(\d)\.(\d)/g, '$1-$2')
+  return model.trim().toLowerCase()
 }
 
 /** 账号能否承接这个模型：支持模型列表为空表示不限制。 */
