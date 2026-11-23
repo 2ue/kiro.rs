@@ -17365,10 +17365,8 @@ async fn model_filter_denylist_never_falls_through_when_supporter_is_busy_or_exc
         "health_balanced",
         "weighted_least_inflight",
     ] {
-        let config = Config {
-            load_balancing_mode: mode.into(),
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        mode.clone_into(&mut config.load_balancing_mode);
         let mut denied = test_access_token_credential("deny-fable", "Pro");
         denied.model_filter_mode = ModelFilterMode::Denylist;
         denied.supported_models = vec!["fable-5".into()];
