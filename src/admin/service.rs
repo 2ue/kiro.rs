@@ -10188,7 +10188,11 @@ fn credential_matches_query(
     }
 
     if let Some(model) = query.model.as_deref() {
-        if !credential_models_match(&credential.supported_models, model) {
+        if !credential_models_match(
+            &credential.supported_models,
+            credential.model_filter_mode,
+            model,
+        ) {
             return false;
         }
     }
@@ -10366,7 +10370,11 @@ fn credential_base_matches_query(
     }
 
     if let Some(model) = query.model.as_deref() {
-        if !credential_models_match(&credential.supported_models, model) {
+        if !credential_models_match(
+            &credential.supported_models,
+            credential.model_filter_mode,
+            model,
+        ) {
             return false;
         }
     }
@@ -10502,15 +10510,25 @@ fn credential_text_fields_match<'a>(
         .any(|value| value.trim().to_lowercase().contains(needle))
 }
 
-fn credential_models_match(supported_models: &[String], model: &str) -> bool {
+fn credential_models_match(
+    supported_models: &[String],
+    mode: crate::model::model_support::ModelFilterMode,
+    model: &str,
+) -> bool {
     let model = model.trim().to_lowercase();
     if model.is_empty() {
         return true;
     }
-    supported_models.is_empty()
-        || supported_models
-            .iter()
-            .any(|value| value.to_lowercase().contains(&model))
+    if supported_models.is_empty() {
+        return true;
+    }
+    let matched = supported_models
+        .iter()
+        .any(|value| value.to_lowercase().contains(&model));
+    match mode {
+        crate::model::model_support::ModelFilterMode::Allowlist => matched,
+        crate::model::model_support::ModelFilterMode::Denylist => !matched,
+    }
 }
 
 fn credential_subscription_title(credential: &CredentialStatusItem) -> Option<String> {
