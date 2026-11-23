@@ -2307,3 +2307,29 @@ fn credential_facets_respect_search_without_changing_snapshot() {
     assert_eq!(facets.health_by_id.get(&5), Some(&"normal"));
     assert_eq!(credentials[4].failure_count, 0);
 }
+
+#[test]
+fn model_filter_admin_model_search_uses_current_policy() {
+    use crate::model::model_support::ModelFilterMode;
+    let models = vec!["fable-5".into()];
+    assert!(credential_models_match(
+        &models,
+        ModelFilterMode::Allowlist,
+        "fable"
+    ));
+    assert!(!credential_models_match(
+        &models,
+        ModelFilterMode::Denylist,
+        "fable"
+    ));
+    assert!(credential_models_match(
+        &models,
+        ModelFilterMode::Denylist,
+        "other"
+    ));
+    assert!(credential_models_match(
+        &[],
+        ModelFilterMode::Denylist,
+        "fable"
+    ));
+}
