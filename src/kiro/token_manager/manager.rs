@@ -14899,6 +14899,19 @@ impl MultiTokenManager {
         model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
         supported_models: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
+        let saved =
+            self.set_credential_model_filter_deferred(id, model_filter_mode, supported_models)?;
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("credential_supported_models_updated");
+        Ok(saved)
+    }
+
+    pub(crate) fn set_credential_model_filter_deferred(
+        &self,
+        id: u64,
+        model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
+        supported_models: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
         let saved = self.persist_credential_mutation(id, |credential| {
             credential.supported_models = supported_models;
             if let Some(mode) = model_filter_mode {
@@ -14908,8 +14921,6 @@ impl MultiTokenManager {
             Ok(())
         })?;
 
-        self.notify_dispatch_state_changed();
-        self.publish_credentials_changed("credential_supported_models_updated");
         Ok(saved.supported_models)
     }
 

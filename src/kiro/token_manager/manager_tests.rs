@@ -17483,3 +17483,36 @@ fn model_filter_explicit_denylist_replaces_inherited_tier_list() {
     assert!(account.supports_model_with_tier_lists(&[Some("other-model")], &lists));
     assert!(account.supports_model_with_tier_lists(&[None], &lists));
 }
+
+#[test]
+fn model_filter_batch_mutations_coalesce_dispatch_wakeups() {
+    use crate::model::model_support::ModelFilterMode;
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![
+            test_access_token_credential("batch-a", "Pro"),
+            test_access_token_credential("batch-b", "Pro"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let epoch = manager.capacity_signal.capacity_epoch();
+    for id in [1, 2] {
+        manager
+            .set_credential_model_filter_deferred(
+                id,
+                Some(ModelFilterMode::Denylist),
+                vec!["fable-5".into()],
+            )
+            .unwrap();
+    }
+    assert_eq!(manager.capacity_signal.capacity_epoch(), epoch);
+    assert_eq!(
+        manager.local_pool_route_state(Some("fable-5")).model_usable,
+        0
+    );
+    manager.notify_dispatch_state_changed();
+    assert_eq!(manager.capacity_signal.capacity_epoch(), epoch + 1);
+}

@@ -659,7 +659,7 @@ pub(crate) struct ExternalPoolEligibility {
     pub(crate) enabled: bool,
     pub(crate) auto_disabled: bool,
     pub(crate) auto_disabled_until: Option<DateTime<Utc>>,
-    pub(crate) supported_models: Arc<HashSet<String>>,
+    pub(crate) supported_models: Arc<Vec<String>>,
     pub(crate) model_filter_mode: crate::model::model_support::ModelFilterMode,
     pub(crate) model_mapping_mode: ExternalPoolModelMappingMode,
     pub(crate) model_mapping_rules: Arc<Vec<ModelMappingRule>>,
@@ -688,11 +688,7 @@ fn external_pool_eligibility_from_pool(pool: &ExternalPool) -> ExternalPoolEligi
         model_mapping_mode: pool.model_mapping_mode,
         model_mapping_rules: Arc::new(pool.model_mapping_rules.clone()),
         normalize_model_version_dots: pool.normalize_model_version_dots,
-        supported_models: Arc::new(
-            normalize_supported_models(pool.supported_models.clone())
-                .into_iter()
-                .collect::<HashSet<_>>(),
-        ),
+        supported_models: Arc::new(normalize_supported_models(pool.supported_models.clone())),
         route_mode: pool.route_mode,
         route_rules: Arc::new(normalize_route_rules(&pool.route_rules)),
     }
@@ -12521,23 +12517,83 @@ fn push_external_pool_model_variant(variants: &mut Vec<String>, model: String) {
     variants.push(model);
 }
 
-fn external_pool_model_filter_allows<'a>(
+thread_local! {
+    static MODEL_FILTER_LIST_CACHE: std::cell::RefCell<ModelFilterListCache> =
+        std::cell::RefCell::new(ModelFilterListCache::default());
+}
+
+/// 每线程最多缓存多少份不同的 `supportedModels` 列表；超过就整体重建（列表种类通常个位数）。
+const MODEL_FILTER_LIST_CACHE_MAX_LISTS: usize = 128;
+
+#[derive(Default)]
+struct ModelFilterListCache {
+    /// 上一次命中的列表：连续扫描的账号大多共用同一份，先比它省去哈希。
+    last: Option<std::rc::Rc<ExpandedModelFilterList>>,
+    lists: HashMap<u64, Vec<std::rc::Rc<ExpandedModelFilterList>>>,
+}
+
+struct ExpandedModelFilterList {
+    models: Vec<String>,
+    variants: HashSet<String>,
+}
+
+impl ModelFilterListCache {
+    fn expanded(&mut self, models: &[String]) -> std::rc::Rc<ExpandedModelFilterList> {
+        if let Some(last) = self.last.as_ref().filter(|last| last.models == models) {
+            return last.clone();
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            models.hash(&mut hasher);
+            hasher.finish()
+        };
+        let cached = self
+            .lists
+            .get(&key)
+            .and_then(|bucket| bucket.iter().find(|list| list.models == models))
+            .cloned();
+        let list = cached.unwrap_or_else(|| {
+            if self.lists.len() >= MODEL_FILTER_LIST_CACHE_MAX_LISTS {
+                self.lists.clear();
+            }
+            let list = std::rc::Rc::new(ExpandedModelFilterList {
+                models: models.to_vec(),
+                variants: normalize_external_pool_allowlist_models(
+                    models.iter().map(String::as_str),
+                )
+                .into_iter()
+                .collect(),
+            });
+            self.lists.entry(key).or_default().push(list.clone());
+            list
+        });
+        self.last = Some(list.clone());
+        list
+    }
+}
+
+fn external_pool_model_filter_allows(
     mode: crate::model::model_support::ModelFilterMode,
-    models: impl Iterator<Item = &'a str>,
+    models: &[String],
     candidates: Option<&[String]>,
     mapping_mode: ExternalPoolModelMappingMode,
     mapping_rules: &[ModelMappingRule],
     normalize_dots: bool,
 ) -> bool {
     use crate::model::model_support::ModelFilterMode;
-    let listed = normalize_external_pool_allowlist_models(models);
-    if listed.is_empty() {
+    let listed = MODEL_FILTER_LIST_CACHE.with(|cache| cache.borrow_mut().expanded(models));
+    if listed.variants.is_empty() {
         return true;
     }
     let Some(candidates) = candidates else {
         return mode == ModelFilterMode::Denylist;
     };
-    let matches = |values: &[String]| values.iter().any(|candidate| listed.contains(candidate));
+    let matches = |values: &[String]| {
+        values
+            .iter()
+            .any(|candidate| listed.variants.contains(candidate))
+    };
     let matched = matches(candidates);
     if mode == ModelFilterMode::Allowlist {
         return matched;
@@ -12582,7 +12638,7 @@ fn external_pool_matches_supported_models_normalized(
 ) -> bool {
     external_pool_model_filter_allows(
         pool.model_filter_mode,
-        pool.supported_models.iter().map(String::as_str),
+        &pool.supported_models,
         model_candidates,
         pool.model_mapping_mode,
         &pool.model_mapping_rules,
@@ -12626,7 +12682,7 @@ fn external_pool_eligibility_matches_supported_models(
 ) -> bool {
     external_pool_model_filter_allows(
         pool.model_filter_mode,
-        pool.supported_models.iter().map(String::as_str),
+        &pool.supported_models,
         model_candidates,
         pool.model_mapping_mode,
         &pool.model_mapping_rules,

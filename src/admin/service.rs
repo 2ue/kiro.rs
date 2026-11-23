@@ -5165,16 +5165,18 @@ impl AdminService {
 
         let mut items = Vec::with_capacity(ids.len());
         let mut success = 0usize;
+        let mut model_filter_changed = false;
         for id in ids {
             let mut error: Option<String> = None;
-            if let Some(filter) = &model_filter
-                && let Err(err) = self.token_manager.set_credential_model_filter(
+            if let Some(filter) = &model_filter {
+                match self.token_manager.set_credential_model_filter_deferred(
                     id,
                     filter.model_filter_mode,
                     filter.supported_models.clone(),
-                )
-            {
-                error = Some(err.to_string());
+                ) {
+                    Ok(_) => model_filter_changed = true,
+                    Err(err) => error = Some(err.to_string()),
+                }
             }
 
             if let Some(priority) = priority {
@@ -5300,6 +5302,11 @@ impl AdminService {
             });
         }
 
+        if model_filter_changed {
+            self.token_manager.notify_dispatch_state_changed();
+            self.token_manager
+                .publish_admin_credentials_changed("credential_model_filter_batch_updated");
+        }
         let failed = items.len().saturating_sub(success);
         self.audit(
             "batch_update_credentials",
@@ -5315,6 +5322,7 @@ impl AdminService {
                 "regions": regions.is_some(),
                 "concurrency": concurrency.is_some(),
                 "rpm": rpm.is_some(),
+                "modelFilter": model_filter.is_some(),
                 "rateLimitAutoDisable": rate_limit_auto_disable.is_some(),
                 "proxy": proxy.is_some() || !rotation.is_empty(),
                 "proxyRotation": rotation,
