@@ -2059,15 +2059,6 @@ impl PostgresStore {
             .await
     }
 
-    pub(crate) async fn set_account_supported_models_unmasked(
-        &self,
-        id: u64,
-        supported_models: Vec<String>,
-    ) -> anyhow::Result<Option<Account>> {
-        self.set_account_supported_models_with_secret_policy(id, supported_models, false)
-            .await
-    }
-
     async fn set_account_supported_models_with_secret_policy(
         &self,
         id: u64,

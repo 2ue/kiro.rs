@@ -26,19 +26,6 @@ impl ModelFilterMode {
         }
     }
 
-    pub fn allows(self, models: &[String], candidates: &[Option<&str>]) -> bool {
-        match self {
-            Self::Allowlist => model_is_supported_by_list(models, candidates),
-            Self::Denylist => {
-                models.is_empty()
-                    || candidates
-                        .iter()
-                        .flatten()
-                        .all(|model| model.trim().is_empty())
-                    || !model_is_supported_by_list(models, candidates)
-            }
-        }
-    }
 }
 
 pub fn normalize_model_id(value: &str) -> Option<String> {

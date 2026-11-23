@@ -154,7 +154,7 @@ tag 推送后 `Publish Claude Pool Docker Images` 工作流会校验 tag 与 Car
 ### 账号
 
 一个 `baseUrl + apiKey` 上游接入点，账号记录保存在 PostgreSQL。
-账号保存优先级、并发上限、支持模型和允许路由。
+账号保存优先级、并发上限、模型白名单或黑名单和允许路由。每个账号只启用一种模型筛选模式，缺省白名单；空列表不限制。
 `overrides` 中的超时与 usage 放大参数覆盖全局账号默认值，未设置的字段继承全局。
 
 ### 路由
@@ -276,7 +276,7 @@ tag 推送后 `Publish Claude Pool Docker Images` 工作流会校验 tag 与 Car
 }
 ```
 
-请求地址为 `/dfcache/team/v1/messages`。`accountRule.rules` 写实际账号 ID；`allow_list` 的空列表拒绝全部，`deny_list` 的空列表允许全部。模型限制与账号 `supportedModels` 取交集；账号列表为空表示不限。模型解析、映射与目录管理见 [06](docs/claude-pool-refactor/06-模型目录映射与限制.md)。
+请求地址为 `/dfcache/team/v1/messages`。`accountRule.rules` 写实际账号 ID；`allow_list` 的空列表拒绝全部，`deny_list` 的空列表允许全部。模型限制与账号筛选策略取交集；`modelFilterMode=allowlist` 时只允许 `supportedModels` 内模型，`denylist` 时只禁止列表内模型；空列表不限。模型解析、映射与目录管理见 [06](docs/claude-pool-refactor/06-模型目录映射与限制.md)。
 
 ## API 端点
 
