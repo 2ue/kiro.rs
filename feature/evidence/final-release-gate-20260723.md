@@ -174,7 +174,7 @@ Command:
 
 ```text
 KIRO_THINKING_CAPTURE_ROUNDS=5 \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/bin/claude \
+KIRO_CLAUDE_BINARY=../../../.volta/bin/claude \
 node feature/tests/thinking-effort-claude-cli-capture.mjs
 ```
 

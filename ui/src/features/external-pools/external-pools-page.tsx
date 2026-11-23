@@ -71,6 +71,7 @@ import {
   splitRules,
   whole,
 } from './external-pool-utils'
+import { ExternalPoolModelBatchModal } from './external-pool-model-batch-modal'
 import { ExternalPoolFormModal } from './external-pool-form-modal'
 import { RouteSelector } from '@/features/route-scenarios/route-selector'
 import { ExternalPoolTestModal } from './external-pool-test-modal'
@@ -154,6 +155,9 @@ export function ExternalPoolsPage() {
   const [copiedFrom, setCopiedFrom] = useState<{ id: number; name: string } | null>(null)
   const [copyingPoolId, setCopyingPoolId] = useState<number | null>(null)
   const [testingPool, setTestingPool] = useState<ExternalPool | null>(null)
+  const [selectedPoolIds, setSelectedPoolIds] = useState<number[]>([])
+  const [modelBatchOpen, setModelBatchOpen] = useState(false)
+  const selectedIds = selectedPoolIds.filter((id) => pools.data?.pools.some((pool) => pool.id === id))
   const [savingPool, setSavingPool] = useState(false)
   const [createForm, setCreateForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
   const [editForm, setEditForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
@@ -686,10 +690,12 @@ export function ExternalPoolsPage() {
       <SectionCard
         title="外部账号列表"
         description="单个外部账号配置只影响自身；全局调度、冷却、补偿策略在上方统一保存。"
-        actions={
+        actions={<div className="flex flex-wrap gap-2">
+          <Button variant="outline" size="sm" disabled={!pools.data?.pools.length} onClick={() => setSelectedPoolIds(selectedIds.length === pools.data?.pools.length ? [] : pools.data?.pools.map((pool) => pool.id) ?? [])}>{selectedIds.length === pools.data?.pools.length ? '取消全选' : '全选'}</Button>
+          <Button variant="outline" size="sm" disabled={!selectedIds.length} onClick={() => setModelBatchOpen(true)}>批量模型筛选（{selectedIds.length}）</Button>
           <Button size="sm" onClick={() => { setCreateForm(defaultPoolForm()); setCreateOpen(true) }}>
             <Plus className="h-4 w-4" />添加外部账号
-          </Button>
+          </Button></div>
         }
       >
         {pools.isLoading ? (
@@ -708,6 +714,7 @@ export function ExternalPoolsPage() {
                 <div key={pool.id} className="rounded-lg bg-card p-4 shadow-sm">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                     <div className="flex items-start gap-3">
+                      <input type="checkbox" aria-label={`选择外部账号 ${pool.name}`} checked={selectedIds.includes(pool.id)} onChange={(event) => setSelectedPoolIds((current) => event.target.checked ? [...current.filter((id) => id !== pool.id), pool.id] : current.filter((id) => id !== pool.id))} className="mt-3" />
                       <ProgressRing
                         value={usePct}
                         size={44}
@@ -764,6 +771,7 @@ export function ExternalPoolsPage() {
         )}
       </SectionCard>
 
+      {modelBatchOpen && <ExternalPoolModelBatchModal ids={selectedIds} onClose={() => setModelBatchOpen(false)} onSaved={(succeeded) => { invalidate(); setSelectedPoolIds((current) => current.filter((id) => !succeeded.includes(id))); toast.success(`已更新 ${succeeded.length} 个账号`) }} />}
       <ExternalPoolFormModal
         mode="create"
         open={createOpen}

@@ -1,6 +1,6 @@
 # 项目分析：`Kiro-account-manager`
 
-路径：`/Users/yuanfeijie/Desktop/procode/Kiro-account-manager`  
+路径：`../Kiro-account-manager`\
 最新本地提交：`447adcd`，2026-06-11  
 相关度：中
 

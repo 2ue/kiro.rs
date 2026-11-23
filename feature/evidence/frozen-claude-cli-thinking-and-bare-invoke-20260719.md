@@ -137,7 +137,7 @@ KIRO_RS_BINARY=/tmp/kiro-frozen-20260719-r2/kiro-rs \
 KIRO_VALIDATION_ARTIFACT_DIR=/private/tmp/kiro-validation-artifacts-bare_<run> \
 KIRO_BARE_INVOKE_POSTGRES_URL=<caller-created-empty-db> \
 KIRO_BARE_INVOKE_REDIS_URL=redis://127.0.0.1:50892 \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/bin/claude \
+KIRO_CLAUDE_BINARY=../../../.volta/bin/claude \
 node feature/tests/bare-invoke-claude-cli.mjs
 ```
 
@@ -230,13 +230,13 @@ The runner needs a canonical `psql` executable. The host PATH has no native `psq
 
 Important CLI path note:
 
-- `/Users/yuanfeijie/.volta/bin/claude` is a Volta shim symlink.
+- `../../../.volta/bin/claude` is a Volta shim symlink.
 - `thinking-effort-kiro-wire.mjs` canonicalizes executable paths before running them.
 - Passing the shim made the runner execute the real shim path as `volta-shim`, which failed.
 - The successful run therefore used the canonical package executable:
 
 ```text
-/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+../../../.volta/tools/image/packages/@anthropic-ai/claude-code/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
 ```
 
 Runner matrix:
@@ -288,7 +288,7 @@ Result summary:
 The same 60-case Kiro wire gate was rerun against r8. Because the host still has no native `psql`, the harness used a temporary canonical wrapper under `/tmp` to invoke psql inside the current-project PostgreSQL container. The wrapper, two caller-owned databases and artifact root were deleted after summary extraction. The successful Claude executable path was the canonical package binary:
 
 ```text
-/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude
+../../../.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude
 ```
 
 Result summary:

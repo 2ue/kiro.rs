@@ -2,7 +2,7 @@
 
 Status: `focused PASS / isolated-Redis and normal scheduler-burst PASS / faulted-combined-chaos and release NO-GO`
 
-Repository: `/Users/yuanfeijie/Desktop/procode/kiro.rs`
+Repository: `.`
 
 HEAD: `401473ca1649997bdeccf4468e3add1bdb187248` (`v0.0.109`, dirty tree)
 

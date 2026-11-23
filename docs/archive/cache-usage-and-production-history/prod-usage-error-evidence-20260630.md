@@ -1087,7 +1087,7 @@ public error 检查
 
 本地 Rust 链接器注意事项:
 
-- 本机 `/Users/yuanfeijie/.volta/bin/cc` 会干扰 Rust 链接。
+- 本机 `../../../.volta/bin/cc` 会干扰 Rust 链接。
 - 测试使用了系统 clang:
 
 ```bash

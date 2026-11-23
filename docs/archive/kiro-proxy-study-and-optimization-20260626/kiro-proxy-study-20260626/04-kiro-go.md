@@ -1,6 +1,6 @@
 # 项目分析：`Kiro-Go`
 
-路径：`/Users/yuanfeijie/Desktop/procode/Kiro-Go`  
+路径：`../Kiro-Go`\
 最新本地提交：`feb3437`，2026-06-18  
 相关度：高
 

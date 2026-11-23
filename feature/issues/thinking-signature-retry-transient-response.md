@@ -98,7 +98,7 @@ public_status=502
 
 ## 代码变更
 
-- [src/kiro/provider.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/kiro/provider.rs)
+- [src/kiro/provider.rs](../../src/kiro/provider.rs)
   - 签名 retry 第二响应新增 `retry_after` 提取。
   - 第二响应 `408/429/5xx` 改为普通 transient 分类与冷却。
   - 第二响应其他 client error 改为普通 invalid request。

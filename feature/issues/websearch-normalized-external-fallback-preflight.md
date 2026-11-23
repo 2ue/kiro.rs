@@ -102,9 +102,9 @@ maybe_local_pool_preflight_external_response(
 
 ## 代码变更
 
-- [src/anthropic/handlers.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/anthropic/handlers.rs): native WebSearch MCP 分支前新增 typed local-pool preflight external takeover。
-- [src/anthropic/handlers.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/anthropic/handlers.rs): WebSearch MCP failure 后置 external fallback 新增 `selectionFailure` 分类，避免把 no-credentials/all-disabled/capacity full 误写成 Redis degraded。
-- [src/anthropic/handlers/tests.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/anthropic/handlers/tests.rs): 新增 handler 级真实 HTTP 回归：
+- [src/anthropic/handlers.rs](../../src/anthropic/handlers.rs): native WebSearch MCP 分支前新增 typed local-pool preflight external takeover。
+- [src/anthropic/handlers.rs](../../src/anthropic/handlers.rs): WebSearch MCP failure 后置 external fallback 新增 `selectionFailure` 分类，避免把 no-credentials/all-disabled/capacity full 误写成 Redis degraded。
+- [src/anthropic/handlers/tests.rs](../../src/anthropic/handlers/tests.rs): 新增 handler 级真实 HTTP 回归：
   - fake Kiro MCP upstream；
   - fake external Anthropic `/v1/messages` upstream；
   - 本地 Kiro credentials 为空；

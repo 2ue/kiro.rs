@@ -16,7 +16,7 @@
 本次分析对照了：
 
 - 当前项目 `src/kiro/endpoint`、`src/kiro/provider.rs`、`src/kiro/retry_pipeline.rs`、`src/model/config.rs`、Admin 类型与两个管理前端；
-- 本地参考目录 `/Users/yuanfeijie/Desktop/procode/kiro-rs-mata` 的 `src/kiro/provider.rs`、`src/model/config.rs`、Admin API 和设置页面；
+- 本地参考目录 `../kiro-rs-mata` 的 `src/kiro/provider.rs`、`src/model/config.rs`、Admin API 和设置页面；
 - 当前项目已有的账号身份与上游调度分析文档 `docs/kiro-account-identity-and-upstream-scheduling-v161-v167-20260920.md`。
 
 这份文档记录代码结构和行为判断，没有引入实现改动。
@@ -93,11 +93,11 @@ ide -> codewhisperer -> amazonq -> runtime
 
 对应参考代码：
 
-- `/Users/yuanfeijie/Desktop/procode/kiro-rs-mata/src/kiro/provider.rs:717-790`：构造端点顺序；
-- `/Users/yuanfeijie/Desktop/procode/kiro-rs-mata/src/kiro/provider.rs:793-801`：网络错误和 HTTP 状态的 fallback 判定；
-- `/Users/yuanfeijie/Desktop/procode/kiro-rs-mata/src/kiro/provider.rs:1227-1405`：同一凭据内逐个发送并记录每一跳；
-- `/Users/yuanfeijie/Desktop/procode/kiro-rs-mata/src/model/config.rs:259-279`：配置字段和默认值；
-- `/Users/yuanfeijie/Desktop/procode/kiro-rs-mata/admin-ui/src/components/settings-page.tsx:82-160`：管理页面的首选端点和 fallback 开关。
+- `../kiro-rs-mata/src/kiro/provider.rs:717-790`：构造端点顺序；
+- `../kiro-rs-mata/src/kiro/provider.rs:793-801`：网络错误和 HTTP 状态的 fallback 判定；
+- `../kiro-rs-mata/src/kiro/provider.rs:1227-1405`：同一凭据内逐个发送并记录每一跳；
+- `../kiro-rs-mata/src/model/config.rs:259-279`：配置字段和默认值；
+- `../kiro-rs-mata/admin-ui/src/components/settings-page.tsx:82-160`：管理页面的首选端点和 fallback 开关。
 
 mata 的一次请求大致是：
 

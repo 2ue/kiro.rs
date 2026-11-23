@@ -274,7 +274,7 @@ directly loses the `claude` argv0 identity.
 Fix applied to validation harness:
 
 - use the real Claude package entrypoint:
-  `/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`;
+  `../../../.volta/tools/image/packages/@anthropic-ai/claude-code/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`;
 - set `KIRO_EXPECTED_CLAUDE_VERSION=2.1.220`;
 - classify Claude CLI `2.1.220` probe `HEAD /cc/api/hello` as the expected `cc_head_probe`.
 

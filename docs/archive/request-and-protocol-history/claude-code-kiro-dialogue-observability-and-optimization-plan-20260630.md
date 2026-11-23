@@ -41,7 +41,7 @@
 当前会话 transcript：
 
 ```text
-/Users/yuanfeijie/.claude/projects/-Users-yuanfeijie-Desktop-procode-kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl
+../../../.claude/projects/kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl
 ```
 
 关键事实：
@@ -52,7 +52,7 @@
 - 全局历史也记录了这条输入：
 
 ```text
-/Users/yuanfeijie/.claude/history.jsonl:4404
+../../../.claude/history.jsonl:4404
 ```
 
 ### 1.2 queue 输入未被消费的具体表现
@@ -306,7 +306,7 @@ scripts/analyze_claude_transcript_queue.js
 
 ```text
 --transcript /Users/.../77cfa36b-...jsonl
---history /Users/yuanfeijie/.claude/history.jsonl
+--history ../../../.claude/history.jsonl
 ```
 
 检测规则：

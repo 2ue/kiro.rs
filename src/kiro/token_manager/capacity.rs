@@ -26,6 +26,8 @@ pub(super) fn credential_is_usable_for_model(
 /// passes the usable check as "unknown".
 pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
     model.is_some_and(|model| !model.trim().is_empty())
+        && entry.credentials.model_filter_mode
+            == crate::model::model_support::ModelFilterMode::Allowlist
         && !entry.credentials.supported_models.is_empty()
         && entry.credentials.supports_model(&[model])
 }

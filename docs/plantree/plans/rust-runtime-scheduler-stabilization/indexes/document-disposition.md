@@ -4,7 +4,7 @@ Last reviewed: 2026-07-28 Asia/Shanghai
 
 Scope:
 
-- 只包含当前项目 `/Users/yuanfeijie/Desktop/procode/kiro.rs` 内的文档。
+- 只包含当前项目 `.` 内的文档。
 - 不扫描整台机器，不处理其他项目文档。
 - 本文已经升级为当前计划的文档处置索引。当前变更迁移了当前有效 TODO 到本 plan，并已按批次归档明确过时的历史分析/旧专题目录；不删除任何文件。
 

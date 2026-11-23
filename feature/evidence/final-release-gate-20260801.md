@@ -16,7 +16,7 @@ Release target: `v0.0.126` after a dedicated Cargo package version bump.
   - SHA-256: `bca03a67e3744685e19f95e49b7601fd7d744575e421f140a9d895b1a7c8f3a6`.
   - Built through scoped Cargo wrapper, copied outside repository `target`, then all scoped build artifacts were removed.
 - Claude Code CLI:
-  - Real executable: `/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude`.
+  - Real executable: `../../../.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude`.
   - Version: `2.1.220`.
 
 The candidate binary was built before the release version bump while `Cargo.toml` was still `0.0.125`. Because `src/admin/handlers.rs` embeds `CARGO_PKG_VERSION`, the release bump must be followed by release-tag version validation and a fresh release build before tagging.
@@ -94,7 +94,7 @@ Runner:
 ```bash
 KIRO_RS_BINARY=/tmp/kiro-cli-candidate.NZWBnG/kiro-rs \
 KIRO_VALIDATION_ARTIFACT_DIR=/tmp/kiro-cli-artifacts.1DsCpM \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
+KIRO_CLAUDE_BINARY=../../../.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
 KIRO_VALIDATION_PROGRESS=1 \
 feature/tests/run-claude-cli-release-suite-local.sh
 ```
@@ -106,7 +106,7 @@ After the version-policy fix:
 ```bash
 KIRO_RS_BINARY=/tmp/kiro-cli-candidate.NZWBnG/kiro-rs \
 KIRO_VALIDATION_ARTIFACT_DIR=/tmp/kiro-cli-artifacts.1DsCpM \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
+KIRO_CLAUDE_BINARY=../../../.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
 KIRO_VALIDATION_PROGRESS=1 \
 KIRO_CLI_SUITE_ONLY=thinking \
 feature/tests/run-claude-cli-release-suite-local.sh

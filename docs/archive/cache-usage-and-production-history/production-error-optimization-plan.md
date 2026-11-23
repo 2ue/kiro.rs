@@ -48,7 +48,7 @@
 
 本地仓库上下文：
 
-- 本地路径：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+- 本地路径：`.`
 - 主分支：`main`
 - `Cargo.toml` 当前本地版本曾查询为 `0.0.40`
 - 本地工作区存在未提交的外部池 output uplift 相关改动；这些改动不等于现网已生效。

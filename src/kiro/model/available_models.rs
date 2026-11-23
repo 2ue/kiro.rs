@@ -39,6 +39,8 @@ pub struct KiroModelCapabilityCohortKey {
     pub effective_api_region: String,
     pub subscription_class: String,
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

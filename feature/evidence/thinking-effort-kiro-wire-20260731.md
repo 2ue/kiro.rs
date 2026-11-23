@@ -17,7 +17,7 @@ cross-instance scheduler behavior, or the final release.
   `00b318aa66fa139e876acd88f7472388c7da4358aa2fef21e925c5f240cb27d7`
 - Claude Code CLI: `2.1.220`
 - Claude executable used:
-  `/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude`
+  `../../../.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude`
 - Service and fake Kiro upstream used caller-owned loopback PostgreSQL/Redis
   resources and temporary ports.
 - Existing `127.0.0.1:9022` was not restarted or modified. It remained PID
@@ -54,7 +54,7 @@ and request/response accounting for both endpoints.
 
 ## Initial failure and root cause
 
-The first attempt used `/Users/yuanfeijie/.volta/bin/claude`. The runner
+The first attempt used `../../../.volta/bin/claude`. The runner
 canonicalized that symlink to the `volta-shim` executable, and Volta rejects
 direct invocation of `volta-shim`. The resulting `volta-shim failed or timed
 out` was a validation-runner environment failure, not a Kiro protocol

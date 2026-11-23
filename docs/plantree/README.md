@@ -10,6 +10,8 @@ Read when: Starting architecture, implementation, validation, release, or plan-m
 
 This directory is the single durable planning entrypoint for active architecture and validation work in this repository. A live user instruction governs the work in that conversation, but any requirement or exception that must survive the conversation must be recorded in the relevant requirement, decision, roadmap, or history document before the work is considered durably specified.
 
+文档中的本机路径使用相对路径；不写入含本机用户名的绝对路径。项目内文件链接相对于当前文档，命令和普通路径说明以仓库根目录为基准。
+
 ## Durable Authority By Question
 
 | Question | Primary authority | Supporting material |

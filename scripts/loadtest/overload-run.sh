@@ -37,7 +37,7 @@ LEASE_MAX_SECS=${LEASE_MAX_SECS:-900}
 CASES=${CASES:-steady_ok}
 OUT_DIR=${OUT_DIR:-$D/results}
 PGPW=$(docker exec kiro-rs-postgres-local printenv POSTGRES_PASSWORD)
-NODE=${NODE:-"/Users/yuanfeijie/.volta/bin/volta run --node 22.23.0 node"}
+NODE=${NODE:-"volta run --node 22.23.0 node"}
 mkdir -p "$D" "$OUT_DIR" && chmod 700 "$D"
 cp "$BIN" "$D/kiro-rs"
 

@@ -42,8 +42,8 @@
 
 - **后端 API 与业务逻辑一律不动**。所有模块基于现有端点。需要后端配合的项已在 [05-roadmap.md](./05-roadmap.md) 单独列出，不要擅自实现。
 - 前端构建/类型检查用 node 22：
-  - 类型检查：`/Users/yuanfeijie/.volta/bin/volta run --node 22.23.0 pnpm check`
-  - 构建：`/Users/yuanfeijie/.volta/bin/volta run --node 22.23.0 pnpm build`
+  - 类型检查：`../../../.volta/bin/volta run --node 22.23.0 pnpm check`
+  - 构建：`../../../.volta/bin/volta run --node 22.23.0 pnpm build`
   - 默认 shell 的 node 是 16，会失败。工作目录 `ui/`。
 - 复用层不要改：`@/api/*`、`@/hooks/*`、`@/types/api`、`@/lib/*`（`@/` = `ui/src/`）。
   - **例外**：本方案需要**新增** `getUsageWriterStats` 的 api 封装与对应 hook、type（见 00 与 02），属"补齐缺失封装"，不是改动现有逻辑。

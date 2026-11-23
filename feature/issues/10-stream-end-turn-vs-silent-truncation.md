@@ -71,7 +71,7 @@ Claude Code 会把会话落到本地 JSONL：
 
 2026-07-14 复核本次会话 JSONL：
 
-- 会话文件：`~/.claude/projects/-Users-yuanfeijie-Desktop-procode-kiro-rs/4633d467-317c-4620-9545-a26f2d81eb66.jsonl`
+- 会话文件：`~/.claude/projects/kiro-rs/4633d467-317c-4620-9545-a26f2d81eb66.jsonl`
 - assistant 记录数：327。
 - `requestId` 缺失数：0。
 - 含日文假名的 assistant 文本：4 条，其中用户贴出的 `続けて本体を追記する。` 在第 875 行。

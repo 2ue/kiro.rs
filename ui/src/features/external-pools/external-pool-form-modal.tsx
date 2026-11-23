@@ -88,6 +88,7 @@ export function ExternalPoolFormModal({
     : '外部账号的请求密钥，保存后只显示脱敏值。'
   const [quickImportText, setQuickImportText] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
+  const [discoveredModelOptions, setDiscoveredModelOptions] = useState<string[]>([])
   const discoveryGeneration = useRef(0)
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
   const scenarioOptions = useQuery({ queryKey: ['route-scenario-options'], queryFn: getRouteScenarioOptions, enabled: open })
@@ -135,7 +136,8 @@ export function ExternalPoolFormModal({
     try {
       const supportedModels = await onDiscoverSupportedModels()
       if (generation !== discoveryGeneration.current) return
-      onDraftChange((prev) => ({ ...prev, supportedModelsText: supportedModels.join('\n') }))
+      setDiscoveredModelOptions(supportedModels)
+      if (draft.modelFilterMode === 'allowlist') onDraftChange((prev) => ({ ...prev, supportedModelsText: supportedModels.join('\n') }))
       toast.success(`已获取 ${supportedModels.length} 个模型，保存后生效`)
     } catch (error) {
       if (generation === discoveryGeneration.current) toast.error(error instanceof Error ? error.message : '获取模型失败')
@@ -311,6 +313,9 @@ export function ExternalPoolFormModal({
         <FormSection title="调度资格" description="只决定该外部账号是否允许承接某些模型；不改变请求体里的 model，也不影响模型映射规则。">
           <div className="space-y-3">
             <SupportedModelTagsEditor
+              mode={draft.modelFilterMode}
+              onModeChange={(mode) => set('modelFilterMode', mode)}
+              options={discoveredModelOptions}
               value={parseSupportedModelItems(draft.supportedModelsText)}
               disabled={saving || syncingModels}
               placeholder="claude-sonnet-5 claude-opus-4-8"
@@ -318,7 +323,7 @@ export function ExternalPoolFormModal({
             />
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs leading-5 text-muted-foreground">
-                获取后替换当前列表，保留上游模型 ID；清空表示不限制，保存后生效。
+                白名单获取后填入列表；黑名单获取后仅增加候选，由你选择要禁止的模型。名单模式互斥，保存后生效。
               </div>
               <Button type="button" variant="outline" size="sm" disabled={saving || syncingModels || !onDiscoverSupportedModels} onClick={syncSupportedModels}>
                 {syncingModels && <Loader2 className="h-4 w-4 animate-spin" />}从上游获取

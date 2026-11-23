@@ -16,7 +16,7 @@ Related: [Roadmap](../roadmap.md)、[存储与状态边界](../../../baseline/st
 
 2026-11-22 对 k1 的 171 条请求进行了脱敏上游 usage 与数据库对照：jinnyapi-kiro 82 条、zslnh-kiro4 71 条一致；ddpapi-kiro 18 条中的 16 条流式请求不一致，2 条非流式一致。典型流式请求先给出 `input_tokens=262393`，随后明确给出 `input_tokens=1`，现有 rawUsage 仍保存 262393。该样本按相同价格计算的原始成本分别为 `$1.2370642` 与 `$0.1874962`。
 
-脱敏审计报告位于本机 `/Users/yuanfeijie/Downloads/k1-external-pool-usage-audit-20261122/核验报告.md`。该路径是外部证据位置，不是仓库内已提交的测试 fixture；实施时只抽取必要 usage 字段，不携带正文和凭据。
+脱敏审计报告位于本机 `../../../Downloads/k1-external-pool-usage-audit-20261122/核验报告.md`。该路径是外部证据位置，不是仓库内已提交的测试 fixture；实施时只抽取必要 usage 字段，不携带正文和凭据。
 
 ## 账号配置与默认值
 

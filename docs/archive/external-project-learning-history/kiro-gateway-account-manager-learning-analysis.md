@@ -2,7 +2,7 @@
 
 日期：2026-05-29
 
-当前项目：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+当前项目：`.`
 
 对照项目：
 

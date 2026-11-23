@@ -219,6 +219,8 @@ pub struct CredentialRuntimeItem {
     pub scheduler_score: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -418,6 +420,8 @@ pub struct CredentialListItem {
     pub warmup_remaining: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
@@ -607,6 +611,8 @@ pub struct CredentialStatusItem {
     /// 凭据支持的模型列表。空列表表示不限制模型调度。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
     /// 账号标签。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -752,6 +758,8 @@ pub struct SetCredentialRateLimitAutoDisableRequest {
 pub struct SetSupportedModelsRequest {
     #[serde(default)]
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
 }
 
 /// 使用外部池兼容 /v1/models 接口发现支持模型。创建态需要传 baseUrl/apiKey；
@@ -771,6 +779,8 @@ pub struct DiscoverExternalPoolSupportedModelsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SupportedModelsResponse {
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
     pub count: usize,
 }
 
@@ -1067,6 +1077,8 @@ pub struct AddCredentialRequest {
     /// 凭据支持的模型列表。空列表表示不限制模型调度。
     #[serde(default)]
     pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
 
     /// API Key 凭据新增时是否自动请求上游模型列表并写入 supported_models。
     ///
@@ -1257,6 +1269,8 @@ pub struct BatchCredentialImportDefaults {
     pub enable_overage_after_import: Option<bool>,
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
     /// 批量导入时为未显式设置标签的账号补充的账号属性标签。
     #[serde(default, alias = "labels")]
     pub tags: Vec<String>,
@@ -1525,6 +1539,8 @@ pub struct BatchUpdateCredentialsRequest {
     /// Proxy resources assigned round-robin in the order of `ids`; replaces `proxy` when non-empty.
     #[serde(default, alias = "proxy_resource_ids")]
     pub proxy_resource_ids: Vec<u64>,
+    #[serde(default)]
+    pub model_filter: Option<SetSupportedModelsRequest>,
 }
 
 #[derive(Debug, Clone, Serialize)]

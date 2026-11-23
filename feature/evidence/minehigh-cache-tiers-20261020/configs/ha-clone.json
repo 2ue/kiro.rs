@@ -1,0 +1,71 @@
+{
+  "path": "/dfcache/ha-clone",
+  "policy": {
+    "cacheType": "current_high_cache",
+    "routeNamespace": true,
+    "simulation": {
+      "enabled": true,
+      "tokenScale": 2.05,
+      "targetReadRatio": 0.99,
+      "capJitterMaxTokens": 24000,
+      "capJitterMinTokens": 12000,
+      "scaleMinInputTokens": 10000,
+      "maxSimulatedInputTokens": 300000
+    },
+    "creationControl": {
+      "enabled": true,
+      "scopeMode": "conversation_model",
+      "expireAfterIdleSecs": 3600,
+      "minCreationDeltaTokens": 12000,
+      "minCreationIntervalSecs": 6,
+      "creationBudgetWindowSecs": 300,
+      "maxCreationTokensPerEvent": 30000,
+      "maxCreationTokensPerWindow": 120000,
+      "minSuccessfulRequestsBetweenCreation": 0
+    },
+    "reportedUsage": {
+      "enabled": true,
+      "input": {
+        "mode": "sample-max",
+        "maxTokens": 1500,
+        "targetTokens": 0,
+        "normalMaxMultiplier": 1.1,
+        "moveDeltaToCacheRead": true
+      },
+      "output": {
+        "mode": "raw",
+        "maxTokens": 0,
+        "targetTokens": 0,
+        "normalMaxMultiplier": 1.1,
+        "moveDeltaToCacheRead": false
+      },
+      "cacheRead": {
+        "mode": "preserve",
+        "maxTokens": 0,
+        "targetTokens": 0,
+        "normalMaxMultiplier": 1.1,
+        "moveDeltaToCacheRead": false
+      },
+      "cacheCreation": {
+        "mode": "sample-target",
+        "maxTokens": 0,
+        "targetTokens": 150000,
+        "normalMaxMultiplier": 1.5,
+        "moveDeltaToCacheRead": false
+      },
+      "outputUpliftPercent": 70,
+      "outputUpliftMinTokens": 1000,
+      "finalOutputGuardEnabled": true,
+      "finalOutputMaxTokens": 600000,
+      "finalOutputJitterMinTokens": 23456,
+      "finalOutputJitterMaxTokens": 54321,
+      "finalCacheReadMaxTokens": 600000,
+      "finalCacheReadJitterMinTokens": 40342,
+      "finalCacheReadJitterMaxTokens": 60256,
+      "finalCacheCreationMaxTokens": 300000,
+      "finalCacheCreationJitterMinTokens": 23456,
+      "finalCacheCreationJitterMaxTokens": 54321,
+      "skipNonStreamUsageProjection": false
+    }
+  }
+}

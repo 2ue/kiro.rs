@@ -1,3 +1,4 @@
+import { SupportedModelTagsEditor } from '@/features/shared/supported-model-tags'
 import {
   CheckCircle2,
   Download,
@@ -915,7 +916,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   })
   const [proxyAssignment, setProxyAssignment] = useState<ProxyAssignmentValue>(() => initialProxyAssignment('round_robin'))
   const [rateLimitAutoDisableEnabled, setRateLimitAutoDisableEnabled] = useState(true)
-  const [enableFields, setEnableFields] = useState({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+  const [enableFields, setEnableFields] = useState({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false, modelFilter: false })
   const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>('allow_all')
   const [routeRulesDraft, setRouteRulesDraft] = useState<string[]>([])
   const scenarioOptions = useQuery({ queryKey: ['route-scenario-options'], queryFn: getRouteScenarioOptions, enabled: open })
@@ -929,9 +930,11 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       setFields({ priority: '', fast: '', concurrency: '', rpm: '', region: '', authRegion: '', apiRegion: '' })
       setProxyAssignment(initialProxyAssignment('round_robin'))
       setRateLimitAutoDisableEnabled(true)
-      setEnableFields({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+      setEnableFields({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false, modelFilter: false })
       setRouteModeDraft('allow_all')
       setRouteRulesDraft([])
+      setModelFilterMode('allowlist')
+      setModelFilterModels([])
     }
   }, [open])
 
@@ -939,6 +942,9 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
     setFields((p) => ({ ...p, priority: '', concurrency: '', rpm: '' }))
     setEnableFields((p) => ({ ...p, priority: true, concurrency: true, rpm: true }))
   }
+
+  const [modelFilterMode, setModelFilterMode] = useState<'allowlist' | 'denylist'>('allowlist')
+  const [modelFilterModels, setModelFilterModels] = useState<string[]>([])
 
   const submit = async () => {
     if (!ids.length) { toast.error('没有选中账号'); return }
@@ -1016,6 +1022,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
     if (enableFields.rateLimitAutoDisable) {
       req.rateLimitAutoDisable = { enabled: rateLimitAutoDisableEnabled }
     }
+    if (enableFields.modelFilter) req.modelFilter = { modelFilterMode, supportedModels: modelFilterModels }
     batchUpdate.mutate(req, {
       onSuccess: (res) => {
         toast.success(`批量修改完成：成功 ${res.success}，失败 ${res.failed}`)
@@ -1045,6 +1052,9 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       )}
     >
       <div className="space-y-4">
+        <FormSection title={<SectionToggle id="batch-model-filter" checked={enableFields.modelFilter} onChange={(value) => setEnableFields((previous) => ({ ...previous, modelFilter: value }))}>模型筛选</SectionToggle>}>
+          {enableFields.modelFilter ? <SupportedModelTagsEditor mode={modelFilterMode} onModeChange={setModelFilterMode} value={modelFilterModels} onChange={setModelFilterModels} inheritTier disabled={batchUpdate.isPending} /> : <p className="text-xs text-muted-foreground">不修改</p>}
+        </FormSection>
         <FormSection
           title="调度"
           description="勾选左侧的框才会修改该项。"

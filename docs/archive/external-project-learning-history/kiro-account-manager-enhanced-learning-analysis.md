@@ -2,7 +2,7 @@
 
 本文档分析本地外部项目：
 
-`/Users/yuanfeijie/Desktop/procode/kiro-account-manager-3460-enhanced-20260524`
+`../kiro-account-manager-3460-enhanced-20260524`
 
 分析目标：
 
@@ -16,8 +16,8 @@
 
 | 项目 | 路径 | 版本/状态 |
 | --- | --- | --- |
-| 当前项目 | `/Users/yuanfeijie/Desktop/procode/kiro.rs` | branch `main`，HEAD `dcf1b1f`，工作区有未提交改动 |
-| 外部项目 | `/Users/yuanfeijie/Desktop/procode/kiro-account-manager-3460-enhanced-20260524` | `package.json` 版本 `kiro-account-manager@1.6.8`，本地目录不是 git 仓库 |
+| 当前项目 | `.` | branch `main`，HEAD `dcf1b1f`，工作区有未提交改动 |
+| 外部项目 | `../kiro-account-manager-3460-enhanced-20260524` | `package.json` 版本 `kiro-account-manager@1.6.8`，本地目录不是 git 仓库 |
 
 ## 结论
 

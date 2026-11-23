@@ -18765,7 +18765,9 @@ impl KiroProvider {
         if matches!(
             reason,
             "model_unavailable_bad_request" | "model_invalid_bad_request"
-        ) && ctx.credentials.supported_models.is_empty()
+        ) && (ctx.credentials.model_filter_mode
+            == crate::model::model_support::ModelFilterMode::Denylist
+            || ctx.credentials.supported_models.is_empty())
             && self
                 .token_manager
                 .has_alternate_catalog_listed_credential_cached(model, &HashSet::new(), ctx.id)

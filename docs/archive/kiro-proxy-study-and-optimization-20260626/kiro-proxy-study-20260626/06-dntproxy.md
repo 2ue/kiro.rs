@@ -1,6 +1,6 @@
 # 项目分析：`dntproxy`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kiro-research/dungnt1312__dntproxy`  
+路径：`../kiro-research/dungnt1312__dntproxy`\
 最新本地提交：`14d1252`，2026-06-26  
 相关度：中
 

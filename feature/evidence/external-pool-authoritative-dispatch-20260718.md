@@ -121,7 +121,7 @@ runner 先解析所有 target 并检查端口，再进行任何 TCP probe；因�
 - 每轮测试使用独立临时 database；失败/通过后 drop database；
 - Redis 使用当前隔离 DB，并在本批开始前清空；
 - 未使用、探测或影响 `127.0.0.1:9022`；
-- 未清理另一个本机同名项目 `/Users/yuanfeijie/Desktop/project/kiro.rs` 正在使用的 `kiro-rs-scheduler-gate-*-a1` 容器。
+- 未清理另一个本机同名项目 `../../project/kiro.rs` 正在使用的 `kiro-rs-scheduler-gate-*-a1` 容器。
 
 有效最终门禁：
 

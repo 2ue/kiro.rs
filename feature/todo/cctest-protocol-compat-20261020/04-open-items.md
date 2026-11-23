@@ -13,7 +13,7 @@
 
 ## 下一步执行清单
 
-1. [ ] 进入 `/Users/yuanfeijie/Desktop/procode/2ue_kiro.rs-compat`，确认 `feat/protocol-compat` 仍基于最新 `main`，如果有新提交先 rebase。
+1. [ ] 进入 `../2ue_kiro.rs-compat`，确认 `feat/protocol-compat` 仍基于最新 `main`，如果有新提交先 rebase。
 2. [ ] 重启隔离实例 `127.0.0.1:19322`（启动前先检查是否已在运行），跑一遍 `artifacts/probe.py` 确认基线没有变化。
 3. [ ] P1：查齐所有 tool_use id 的生成和发出点，实现确定性映射，补单元测试。
 4. [ ] P2：在 converter 中解析 `output_config.format`，注入内部工具；在流式和非流式响应里还原成 JSON 文本，补单元测试。

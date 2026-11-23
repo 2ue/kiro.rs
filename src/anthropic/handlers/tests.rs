@@ -1562,6 +1562,7 @@ async fn test_external_pool_manager_for_handlers(
             model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
+            model_filter_mode: Default::default(),
             supported_models: Vec::new(),
             route_mode: crate::model::config::ExternalPoolRouteMode::AllowAll,
             route_rules: Vec::new(),

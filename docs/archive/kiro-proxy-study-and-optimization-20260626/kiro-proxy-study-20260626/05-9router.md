@@ -1,6 +1,6 @@
 # 项目分析：`9router`
 
-路径：`/Users/yuanfeijie/Desktop/procode/9router`  
+路径：`../9router`\
 最新本地提交：`d1e98d9`，2026-06-26  
 相关度：中高
 

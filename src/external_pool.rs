@@ -640,6 +640,8 @@ pub struct ExternalPool {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
     #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
+    #[serde(default)]
     pub route_mode: ExternalPoolRouteMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_rules: Vec<String>,
@@ -658,6 +660,10 @@ pub(crate) struct ExternalPoolEligibility {
     pub(crate) auto_disabled: bool,
     pub(crate) auto_disabled_until: Option<DateTime<Utc>>,
     pub(crate) supported_models: Arc<HashSet<String>>,
+    pub(crate) model_filter_mode: crate::model::model_support::ModelFilterMode,
+    pub(crate) model_mapping_mode: ExternalPoolModelMappingMode,
+    pub(crate) model_mapping_rules: Arc<Vec<ModelMappingRule>>,
+    pub(crate) normalize_model_version_dots: bool,
     pub(crate) route_mode: ExternalPoolRouteMode,
     pub(crate) route_rules: Arc<Vec<String>>,
 }
@@ -678,6 +684,10 @@ fn external_pool_eligibility_from_pool(pool: &ExternalPool) -> ExternalPoolEligi
         enabled: pool.enabled,
         auto_disabled: pool.auto_disabled,
         auto_disabled_until: pool.auto_disabled_until,
+        model_filter_mode: pool.model_filter_mode,
+        model_mapping_mode: pool.model_mapping_mode,
+        model_mapping_rules: Arc::new(pool.model_mapping_rules.clone()),
+        normalize_model_version_dots: pool.normalize_model_version_dots,
         supported_models: Arc::new(
             normalize_supported_models(pool.supported_models.clone())
                 .into_iter()
@@ -764,6 +774,8 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub supported_models: Vec<String>,
     #[serde(default)]
+    pub model_filter_mode: crate::model::model_support::ModelFilterMode,
+    #[serde(default)]
     pub route_mode: ExternalPoolRouteMode,
     #[serde(default)]
     pub route_rules: Vec<String>,
@@ -804,6 +816,7 @@ impl CreateExternalPoolRequest {
             model_mapping_require_match: source.model_mapping_require_match,
             model_mapping_rules: source.model_mapping_rules.clone(),
             supported_models: source.supported_models.clone(),
+            model_filter_mode: source.model_filter_mode,
             route_mode: source.route_mode,
             route_rules: source.route_rules.clone(),
             notes: source.notes.clone(),
@@ -899,6 +912,8 @@ pub struct UpdateExternalPoolRequest {
     pub model_mapping_rules: Option<Vec<ModelMappingRule>>,
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_filter_mode: Option<crate::model::model_support::ModelFilterMode>,
     #[serde(default)]
     pub route_mode: Option<ExternalPoolRouteMode>,
     #[serde(default)]
@@ -12491,21 +12506,65 @@ fn push_external_pool_model_variant(variants: &mut Vec<String>, model: String) {
     variants.push(model);
 }
 
+fn external_pool_model_filter_allows<'a>(
+    mode: crate::model::model_support::ModelFilterMode,
+    models: impl Iterator<Item = &'a str>,
+    candidates: Option<&[String]>,
+    mapping_mode: ExternalPoolModelMappingMode,
+    mapping_rules: &[ModelMappingRule],
+    normalize_dots: bool,
+) -> bool {
+    use crate::model::model_support::ModelFilterMode;
+    let listed = normalize_external_pool_allowlist_models(models);
+    if listed.is_empty() {
+        return true;
+    }
+    let Some(candidates) = candidates else {
+        return mode == ModelFilterMode::Denylist;
+    };
+    let matches = |values: &[String]| values.iter().any(|candidate| listed.contains(candidate));
+    let matched = matches(candidates);
+    if mode == ModelFilterMode::Allowlist {
+        return matched;
+    }
+    if matched {
+        return false;
+    }
+    // 仅黑名单检查映射目标，保留旧白名单对请求模型的解释。
+    !candidates.iter().any(|candidate| {
+        process_model(
+            ModelProcessingInput {
+                original_model: Some(candidate),
+                processed_model: Some(candidate),
+            },
+            ModelProcessingConfig {
+                mode: mapping_mode.processing_mode(),
+                rules: mapping_rules,
+                require_mapping_match: false,
+                fallback_transform: normalize_dots
+                    .then_some(model_pipeline::normalize_outbound_model as fn(&str) -> String),
+            },
+        )
+        .is_ok_and(|result| {
+            matches(&normalize_external_pool_support_candidates([result
+                .model
+                .as_str()]))
+        })
+    })
+}
+
 fn external_pool_matches_supported_models_normalized(
     pool: &ExternalPool,
     model_candidates: Option<&[String]>,
 ) -> bool {
-    if pool.supported_models.is_empty() {
-        return true;
-    }
-    let Some(model_candidates) = model_candidates else {
-        return false;
-    };
-    let supported_models =
-        normalize_external_pool_allowlist_models(pool.supported_models.iter().map(String::as_str));
-    model_candidates
-        .iter()
-        .any(|candidate| supported_models.iter().any(|model| model == candidate))
+    external_pool_model_filter_allows(
+        pool.model_filter_mode,
+        pool.supported_models.iter().map(String::as_str),
+        model_candidates,
+        pool.model_mapping_mode,
+        &pool.model_mapping_rules,
+        pool.normalize_model_version_dots,
+    )
 }
 
 fn external_pool_route_policy_allows(
@@ -12542,17 +12601,14 @@ fn external_pool_eligibility_matches_supported_models(
     pool: &ExternalPoolEligibility,
     model_candidates: Option<&[String]>,
 ) -> bool {
-    if pool.supported_models.is_empty() {
-        return true;
-    }
-    let Some(model_candidates) = model_candidates else {
-        return false;
-    };
-    let supported_models =
-        normalize_external_pool_allowlist_models(pool.supported_models.iter().map(String::as_str));
-    model_candidates
-        .iter()
-        .any(|candidate| supported_models.iter().any(|model| model == candidate))
+    external_pool_model_filter_allows(
+        pool.model_filter_mode,
+        pool.supported_models.iter().map(String::as_str),
+        model_candidates,
+        pool.model_mapping_mode,
+        &pool.model_mapping_rules,
+        pool.normalize_model_version_dots,
+    )
 }
 
 fn deterministic_duration_jitter(base: Duration, percent: u8, seed: u64) -> Duration {
@@ -12607,7 +12663,7 @@ fn external_pool_matches_supported_models(
         return true;
     }
     let Some(model_candidates) = model_candidates else {
-        return false;
+        return external_pool_matches_supported_models_normalized(pool, None);
     };
     let normalized =
         normalize_external_pool_support_candidates(model_candidates.iter().flatten().copied());
@@ -17167,6 +17223,7 @@ mod copy_tests {
                 kind: Default::default(),
                 note: Some("note".to_string()),
             }],
+            model_filter_mode: Default::default(),
             supported_models: vec!["claude-sonnet-4-5".to_string()],
             route_mode: ExternalPoolRouteMode::AllowList,
             route_rules: vec!["/cc".to_string()],

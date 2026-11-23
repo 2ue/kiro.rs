@@ -1,0 +1,47 @@
+{
+  "hank9999/kiro.rs": {
+    "revision": "8fb3dd691d1cedf437bd6a4e9ef9f60b3f217fdd",
+    "branch": "master"
+  },
+  "Quorinex/Kiro-Go": {
+    "revision": "f8f6071c9298a4266ad3e0c7e483d4a2510cbcaf",
+    "branch": "main"
+  },
+  "ZyphrZero/kiro.rs": {
+    "revision": "c37fe5afe7ee3adba836abfcee9a97aba5ea54f9",
+    "branch": "master"
+  },
+  "liuran001/kiro.rs-admin": {
+    "revision": "f9d8401a094a44c50a6305fa01db06fd75ce1d38",
+    "branch": "master"
+  },
+  "TsinHzl/kiro2cc-proxy": {
+    "revision": "4dd9b67884f79669efbb3a8aa66b9e94b876e56d",
+    "branch": "master"
+  },
+  "hj01857655/Kiro-Go": {
+    "revision": "d035fe81bf3c59ad34ce20831bb6204adc7294ae",
+    "branch": "feature/react-admin"
+  },
+  "freebattle/kiro.rs": {
+    "revision": "b19a70982df378b97bdbd1869a9d227f52622503",
+    "branch": "master"
+  },
+  "ykn1002/kiro.rs": {
+    "revision": "7a1d90383231064ab8a96d4b97539a0ad13b6e8d",
+    "branch": "master"
+  },
+  "ndycode/kiro-rs": {
+    "revision": "529fc2f852d4a5895457652721b75157948f1981",
+    "branch": "main",
+    "remoteVerified": true
+  },
+  "hank9999/kiro.rs refactor/v2": {
+    "revision": "932a89fb13d66ec18794e64f459326365af09b12",
+    "branch": "refactor/v2"
+  },
+  "Quorinex/Kiro-Go dev": {
+    "revision": "d42f42e6e7a86b311f2c3c1315a31e626a7e5971",
+    "branch": "dev"
+  }
+}

@@ -63,7 +63,7 @@ headings in older issue files; the current diff does not touch those files.
 
 - PID `91239` listening on `127.0.0.1:19023` was a `kiro-rs` binary under this repository's
   `tmp/thinking-budget-local/runtime-cli-real-20260924-224113/` directory.
-- Its cwd was `/Users/yuanfeijie/Desktop/procode/2ue_kiro.rs` and command line used
+- Its cwd was `.` and command line used
   `-c tmp/thinking-budget-local/config.json`.
 - The first probe used `/health` and returned 404; source inspection showed the readiness
   endpoint is `/readyz`. The corrected probe returned
