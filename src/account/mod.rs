@@ -6639,6 +6639,7 @@ impl AccountManager {
             && !enabled.iter().any(|pool| {
                 route_account_allowed(&config, pool.id, Some(&route.endpoint), Some(&models))
                     && account_route_allowed(pool, Some(&route.endpoint))
+                    && account_resolved_model_allowed(pool, &route)
                     && account_matches_supported_models_normalized(pool, Some(&models))
             })
         {
@@ -8288,6 +8289,19 @@ impl AccountManager {
             route.model_candidates_for_support().into_iter().flatten(),
         );
         let cooldown_candidates = route.model_cooldown_candidates();
+        let filtered = authoritative_pools
+            .iter()
+            .any(|pool| !account_resolved_model_allowed(pool, route))
+            .then(|| {
+                Arc::new(
+                    authoritative_pools
+                        .iter()
+                        .filter(|pool| account_resolved_model_allowed(pool, route))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            });
+        let authoritative_pools = filtered.as_ref().unwrap_or(authoritative_pools);
         self.scan_pool_availability_from_snapshot(
             authoritative_pools,
             excluded,
@@ -8323,6 +8337,7 @@ impl AccountManager {
                         Some(&support_candidates),
                     )
                     && account_route_allowed(pool, Some(&route.endpoint))
+                    && account_resolved_model_allowed(pool, route)
                     && account_matches_supported_models_normalized(pool, Some(&support_candidates))
             })
             .cloned()
@@ -11983,6 +11998,7 @@ fn route_prefers_early_commit(
                     Some(&support_candidates),
                 )
                 && account_route_allowed(pool, Some(&route.endpoint))
+                && account_resolved_model_allowed(pool, route)
                 && account_matches_supported_models_normalized(pool, Some(&support_candidates))
         })
         .collect::<Vec<_>>();
@@ -12886,6 +12902,14 @@ fn account_model_filter_allows(
                 .as_str()]))
         })
     })
+}
+
+fn account_resolved_model_allowed(pool: &Account, route: &AccountRouteRequest) -> bool {
+    if pool.model_filter_mode != crate::model::model_support::ModelFilterMode::Denylist {
+        return true;
+    }
+    let candidates = normalize_account_support_candidates(route.upstream_model.as_deref());
+    account_matches_supported_models_normalized(pool, Some(&candidates))
 }
 
 fn account_matches_supported_models_normalized(

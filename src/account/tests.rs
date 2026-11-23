@@ -22554,3 +22554,18 @@ fn model_filter_denylist_authoritative_and_eligibility_agree_and_block_mapping()
     let copied = serde_json::from_value::<CreateAccountRequest>(serde_json::json!({"name":"copy","baseUrl":"https://example.test","apiKey":"test","modelFilterMode":"denylist"})).unwrap();
     assert_eq!(copied.model_filter_mode, ModelFilterMode::Denylist);
 }
+
+#[test]
+fn model_filter_blacklist_checks_explicit_resolved_model_without_changing_whitelist() {
+    use crate::model::model_support::ModelFilterMode;
+    let mut pool = test_pool("https://example.test", true);
+    pool.supported_models = vec!["fable-5".into()];
+    let mut route = test_route("custom-alias");
+    route.upstream_model = Some("fable-5".into());
+    route.model_resolution_source = Some("explicit".into());
+    assert!(account_resolved_model_allowed(&pool, &route));
+    pool.model_filter_mode = ModelFilterMode::Denylist;
+    assert!(!account_resolved_model_allowed(&pool, &route));
+    route.upstream_model = Some("other-model".into());
+    assert!(account_resolved_model_allowed(&pool, &route));
+}
