@@ -4,6 +4,11 @@ Last reviewed: 2026-11-11 Asia/Shanghai
 
 ## Done
 
+- Account model allowlist/denylist modes: mutually exclusive account policies, single/batch editors,
+  system catalog choices, bounded cache and coalesced batch dispatch notifications released in
+  `v0.0.264`, `forced-v0.0.273`, and independently ported `claude-v1.0.17`.
+  See [contract](topics/account-model-filter-modes.md) and [evidence](../../../../feature/evidence/account-model-filter-modes-20261123.md).
+
 - Account-level raw usage accounting: all three modes persist both `rawUsage` and
   `rawCostUsage`; the default remains `legacy_max`. Main `v0.0.263`, forced
   `forced-v0.0.272`, and independently ported `claude-v1.0.16` passed full quality
