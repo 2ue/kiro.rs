@@ -3960,6 +3960,104 @@ data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cac
     assert_eq!(split(CacheTtlMode::Force1h, Some("5m"), channel_5m), "1h");
 }
 
+#[test]
+fn account_cache_ttl_only_changes_downstream_usage_and_upstream_is_always_5m() {
+    use crate::model::config::CacheTtlMode::*;
+    let response = json!({
+        "type":"message", "content":[],
+        "usage":{"input_tokens":12,"output_tokens":135,"cache_creation_input_tokens":2000,
+            "cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":2000,"ephemeral_1h_input_tokens":0}}
+    });
+    for mode in [
+        FollowRequestDefault5m,
+        FollowRequestDefault1h,
+        Force5m,
+        Force1h,
+        UpstreamThenRequestDefault5m,
+    ] {
+        for request_ttl in ["5m", "1h"] {
+            for stream in [false, true] {
+                let raw = Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "model":"claude-opus-4-8","max_tokens":512,"stream":stream,
+                        "cache_control":{"type":"ephemeral","ttl":request_ttl},
+                        "system":[{"type":"text","text":"stable cache prompt ".repeat(8000),
+                            "cache_control":{"type":"ephemeral","ttl":request_ttl}}],
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .unwrap(),
+                );
+                let mut route = raw_test_route(&raw);
+                route.cache_ttl_mode = mode;
+                for projection_mode in [
+                    UsageProjectionMode::CurrentPathPolicy,
+                    UsageProjectionMode::PassThrough,
+                ] {
+                    let mut pool = test_pool("http://pool.example.com", false);
+                    pool.usage_projection_mode = projection_mode;
+                    let prepared = account_prepare_request(&route, &pool).unwrap();
+                    let outbound: serde_json::Value =
+                        serde_json::from_slice(&prepared.body).unwrap();
+                    assert_eq!(outbound["cache_control"]["ttl"], "5m");
+                    assert_eq!(outbound["system"][0]["cache_control"]["ttl"], "5m");
+                    assert_eq!(route.effective_raw_body, raw);
+                    let projection = projection_context(&route, &pool, 0);
+                    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+                    let (usage, billing) = if stream {
+                        let event = format!(
+                            "event: message_delta\ndata: {}\n\n",
+                            json!({"type":"message_delta","usage":response["usage"]})
+                        );
+                        let rewritten = rewrite_sse_event_usage(
+                            event.as_bytes(),
+                            projection.as_ref(),
+                            Some(&capture),
+                        );
+                        (
+                            event_data_value(&rewritten)["usage"].clone(),
+                            account_billing_from_capture_ref(&route, &pool, &capture),
+                        )
+                    } else {
+                        let body = process_non_stream_response_usage(
+                            Bytes::from(serde_json::to_vec(&response).unwrap()),
+                            Some(&route),
+                            projection.as_ref(),
+                            std::iter::empty::<String>(),
+                        );
+                        let usage = serde_json::from_slice::<serde_json::Value>(&body.body)
+                            .unwrap()["usage"]
+                            .clone();
+                        (
+                            usage,
+                            account_billing_from_capture(&route, &pool, body.usage_capture),
+                        )
+                    };
+                    if projection_mode == UsageProjectionMode::PassThrough {
+                        assert!(projection.is_none());
+                        assert_eq!(usage, response["usage"]);
+                        continue;
+                    }
+                    assert!(projection.is_some());
+                    let hour = mode == Force1h || (mode != Force5m && request_ttl == "1h");
+                    let key = if hour {
+                        "ephemeral_1h_input_tokens"
+                    } else {
+                        "ephemeral_5m_input_tokens"
+                    };
+                    assert!(usage["cache_creation_input_tokens"].as_i64().unwrap() > 0);
+                    assert_eq!(
+                        usage["cache_creation"][key], usage["cache_creation_input_tokens"],
+                        "{mode:?}/{request_ttl}/{stream}"
+                    );
+                    let billing = billing.unwrap();
+                    assert_eq!(billing.raw_cost_usage.cache_creation_5m_input_tokens, 2000);
+                    assert_eq!(billing.raw_cost_usage.cache_creation_1h_input_tokens, 0);
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn account_cached_immediate_availability_is_no_wait_under_pg_lock_for_five_rounds() {
     let Some((manager, postgres)) = test_account_manager().await else {

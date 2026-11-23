@@ -80,6 +80,16 @@ usage 整形只由路由挂载的策略决定（C2、R7）：
 
 第 13 步"成本下限"在 `current_high_cache` 链路里可以突破 input 上限（这是旧的已知行为，memory 记录现网出现过上限 500 被补到 8198）。本方案**不改这个行为**：用户此前明确要求旧策略行为不动，新语义一律做成新策略（`bounded_high_cache` 就是为此而生）。需要上下限绝对约束的路由挂 `bounded_high_cache`。
 
+### 3.3 上游请求 TTL 与下游展示 TTL
+
+路由 `cacheTtl.account` 仅决定按路由整形时，下游 usage 的缓存写入归入 5m 或 1h，以及该份 usage 对应的展示计费。账号透传上游 usage 时不重新拆分。账号选择、优先级、并发、排队和重试不读取这项设置。
+
+发往上游的有效 `cache_control.type=ephemeral` 标记统一使用 `ttl="5m"`，包括顶层自动缓存、system、tools、消息内容及 tool_result 的嵌套内容。已有 1h 或其他 TTL 改为 5m，未指定 TTL 的已有标记补 5m；没有缓存标记时不新增断点。这项转发规则同时适用于整形和透传账号，不随下游展示时长变化。
+
+归一化发生在账号请求准备边界，仅定点修改出站字节；客户端原始请求和探测结果保留。因此“跟随请求”仍读取客户端原始 TTL，即使上游始终收到 5m，下游仍可按客户端的 1h 标记展示。原始 usage 与原始成本继续采用上游实际响应。工具输入、JSON schema、metadata 和文本里的同名字段不作为缓存协议标记处理。
+
+本地验收：Rust 1.92 的 TTL 专项 10 项通过（含 5 种展示模式 × 客户端 5m/1h × 流式/非流式 × 整形/透传的 40 组出站与 usage 联合校验）；前端缓存时长与策略导入导出 19 项通过，TypeScript 检查通过。验证构建目录已由 scoped wrapper 清理。尚未发布或部署。
+
 ## 4. 输入类型
 
 现有 `cache.rs:5` 引用 `kiro::model::events::MetadataTokenUsage`（字段：`uncached_input_tokens`、`output_tokens`、`total_tokens`、`cache_read_input_tokens`、`cache_write_input_tokens`）。替换为 `shaping::UpstreamUsage`：
@@ -104,7 +114,7 @@ pub struct UpstreamUsage {
 ## 6. 删除的部分
 
 - `handlers.rs:3537-4126`、`4542-5645` 本地 Kiro 链路的整套整形编排（`RequestUsageContext`、`CredentialUsageContext`）。账号侧已有等价实现。
-- `cachePolicy.*.cachePoint`（`config.rs:1782-1810`）：Anthropic cache_control 转 Kiro cachePoint，与 Anthropic 上游无关。请求里的 `cache_control` 原样透传给上游。
+- `cachePolicy.*.cachePoint`（`config.rs:1782-1810`）：Anthropic cache_control 转 Kiro cachePoint，与 Anthropic 上游无关。请求已有的缓存断点保留，上游 TTL 固定为 5m（见 3.3）。
 - `cacheTtl.local`：只剩 `cacheTtl.externalPool` 一份，改名 `cacheTtl`。
 - `usageProjectionMode` 为 `pass_through` 时的 OpenAI 字段归一（随 OpenAI 入口删除）。
 

@@ -1450,7 +1450,8 @@ impl CacheHitShapingPolicy {
     }
 }
 
-/// 缓存写入时长（5 分钟 / 1 小时）。整次请求的写入只归一种时长：最终下游 usage 的
+/// 下游 usage 缓存写入时长（5 分钟 / 1 小时），上游请求缓存标记固定为 5 分钟。
+/// 整次请求的写入只归一种时长：最终下游 usage 的
 /// `cache_creation_input_tokens` 全部记入 `cache_creation.ephemeral_5m_input_tokens` 或
 /// `ephemeral_1h_input_tokens`。"请求标记"指客户端任一 `cache_control.ttl` 写了 `"1h"`（或大于
 /// 5 分钟）或 `"5m"`；只写 `cache_control` 不写 `ttl` 视为未指定。

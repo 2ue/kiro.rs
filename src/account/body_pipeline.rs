@@ -1,5 +1,6 @@
 use super::{model_pipeline, *};
 use crate::anthropic::body_patch::BodyPatchSet;
+use crate::anthropic::request_facts::rewrite_upstream_cache_ttl_5m;
 
 pub(super) struct PreparedExternalRequest {
     pub(super) body: Bytes,
@@ -28,8 +29,19 @@ pub(super) fn prepare_request(
     {
         patches.set("/model", serde_json::Value::from(model), "model_mapping");
     }
+    let body = rewrite_upstream_cache_ttl_5m(&patches.apply(&route.effective_raw_body)).map_err(
+        |error| AccountError {
+            status: Some(StatusCode::BAD_REQUEST),
+            message: format!("invalid upstream cache TTL request body: {error}"),
+            retryable: false,
+            auto_disable_reason: None,
+            cooldown: None,
+            protocol_error: None,
+            raw_upstream_error: None,
+        },
+    )?;
     Ok(PreparedExternalRequest {
-        body: patches.apply(&route.effective_raw_body),
+        body,
         outbound_model,
     })
 }
