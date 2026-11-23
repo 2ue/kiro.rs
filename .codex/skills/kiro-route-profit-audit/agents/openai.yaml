@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kiro Route Profit Audit"
+  short_description: "Per-route profit and keep/disable ranking for a claude-pool behind sub2api"
+  default_prompt: "Use $kiro-route-profit-audit to compute real per-route profit (supplier cost 0.3x official list, sub2api actual_cost as revenue, admin and internal traffic excluded) and recommend which dfcache routes to keep or disable."
