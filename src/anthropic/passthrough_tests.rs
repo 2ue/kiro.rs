@@ -87,7 +87,12 @@ async fn passthrough_default_bytes_and_headers_reach_mock_upstream() {
             .unwrap();
         let captured = captures.lock().unwrap();
         let (upstream_headers, upstream_body) = captured.last().unwrap();
-        assert_eq!(upstream_body, &raw);
+        let expected = Bytes::from(String::from_utf8_lossy(&raw).replace(
+            "\"cache_control\":{\"type\":\"ephemeral\"}",
+            "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"5m\"}",
+        ));
+        assert_eq!(upstream_body, &expected);
+        assert_eq!(route.effective_raw_body, raw);
         for name in ["content-type", "x-test-custom", "anthropic-beta"] {
             assert_eq!(upstream_headers.get(name), headers.get(name));
         }
