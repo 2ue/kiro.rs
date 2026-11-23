@@ -1,0 +1,12 @@
+Rust tests (default features)	Run tests	2026-11-23T01:57:12.5922379Z test anthropic::converter::tests::native_reasoning_uses_discovered_reasoning_path_and_preserves_max ... ok
+Rust tests (default features)	Run tests	2026-11-23T01:57:12.6103090Z test anthropic::converter::tests::test_map_model_public_fable_and_opus_55_variants ... ok
+Rust tests (default features)	Run tests	2026-11-23T01:57:12.6122449Z test anthropic::converter::tests::test_process_message_content_extracts_images_from_tool_results ... ok
+Rust tests (default features)	Run tests	2026-11-23T01:57:36.0533877Z test anthropic::handlers::tests::handler_thinking_display_follows_official_defaults ... ok
+Rust tests (default features)	Run tests	2026-11-23T01:57:45.8620988Z test anthropic::model_capabilities::tests::fable_models_are_listed_only_after_real_upstream_catalog_sync ... ok
+Rust tests (default features)	Run tests	2026-11-23T01:57:45.8781854Z test anthropic::model_capabilities::tests::resolver_matches_synced_fable_models_from_official_request_forms ... ok
+Rust tests (no default features)	Run tests	2026-11-23T01:56:18.8857150Z test anthropic::converter::tests::native_reasoning_uses_discovered_reasoning_path_and_preserves_max ... ok
+Rust tests (no default features)	Run tests	2026-11-23T01:56:18.9008435Z test anthropic::converter::tests::test_map_model_public_fable_and_opus_55_variants ... ok
+Rust tests (no default features)	Run tests	2026-11-23T01:56:18.9030835Z test anthropic::converter::tests::test_process_message_content_extracts_images_from_tool_results ... ok
+Rust tests (no default features)	Run tests	2026-11-23T01:56:41.7475473Z test anthropic::handlers::tests::handler_thinking_display_follows_official_defaults ... ok
+Rust tests (no default features)	Run tests	2026-11-23T01:56:51.1054319Z test anthropic::model_capabilities::tests::fable_models_are_listed_only_after_real_upstream_catalog_sync ... ok
+Rust tests (no default features)	Run tests	2026-11-23T01:56:51.1213646Z test anthropic::model_capabilities::tests::resolver_matches_synced_fable_models_from_official_request_forms ... ok

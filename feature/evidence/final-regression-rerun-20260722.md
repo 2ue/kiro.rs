@@ -291,8 +291,8 @@ Process evidence:
 ```text
 PID 84264 COMMAND ./target/release/kiro-rs -c config.json --credentials credentials.json
 LISTEN 127.0.0.1:9022
-txt /Users/yuanfeijie/Desktop/procode/kiro.rs/target/release/kiro-rs
-stdout/stderr /Users/yuanfeijie/Desktop/procode/kiro.rs/target/local-verify/kiro-rs-9022.log
+txt ./target/release/kiro-rs
+stdout/stderr ./target/local-verify/kiro-rs-9022.log
 ```
 
 This is not a scoped validation target leak. The target was not deleted because it is still referenced by a live process. Disk after cleanup: filesystem free space about `98GiB`; repo `target/` about `911MiB`.

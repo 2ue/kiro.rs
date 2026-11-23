@@ -6,11 +6,11 @@
 
 分析对象：
 
-1. 当前仓库：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+1. 当前仓库：`.`
    - branch：`main`
    - version：`v0.0.15`
    - commit：`3a7c99d`
-2. 对比仓库：`/Users/yuanfeijie/Desktop/procode/kiro.rs-foxfishc`
+2. 对比仓库：`../kiro.rs-foxfishc`
    - branch：`master`
    - version：`v1.1.34`
    - commit：`cf86b1f`

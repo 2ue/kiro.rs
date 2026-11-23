@@ -586,7 +586,7 @@ RefreshResult   { access_token, refresh_token, expires_at, profile_arn }
 
 - Kiro-Go：`/tmp/kiro-go-latest/proxy/handler.go`、`/tmp/kiro-go-latest/proxy/kiro_api.go`、`/tmp/kiro-go-latest/proxy/kiro.go`；
 - Kiro-account-manager：`/tmp/kam-latest/Kiro-account-manager/src/main/index.ts`、`src/main/kiroAuthSync.ts`；
-- kiro-manager-lite：`/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/kiroApi.ts`、`src/main/accountService.ts`、`src/renderer/src/utils/transfer.ts`；
-- `kiro-rs-mata`：`/Users/yuanfeijie/Desktop/procode/kiro-rs-mata/src/kiro/provider.rs` 的同账号协议端点候选链。
+- kiro-manager-lite：`../kiro-manager-lite/src/main/kiroApi.ts`、`src/main/accountService.ts`、`src/renderer/src/utils/transfer.ts`；
+- `kiro-rs-mata`：`../kiro-rs-mata/src/kiro/provider.rs` 的同账号协议端点候选链。
 
 本文件不记录任何真实 refresh token、access token、API Key、Client Secret 或本地凭据内容。

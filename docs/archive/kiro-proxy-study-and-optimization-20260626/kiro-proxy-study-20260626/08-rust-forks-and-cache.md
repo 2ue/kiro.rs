@@ -2,17 +2,17 @@
 
 本篇覆盖：
 
-- `/Users/yuanfeijie/Desktop/procode/kiro-research/pluto2sun__kiro2api`
-- `/Users/yuanfeijie/Desktop/procode/kiro-research/TsinHzl__kiro2cc-proxy`
-- `/Users/yuanfeijie/Desktop/procode/kiro-research/ndycode__kiro-rs`
-- `/Users/yuanfeijie/Desktop/procode/kiro-research/cp-coder9__kiro-gateway`
+- `../kiro-research/pluto2sun__kiro2api`
+- `../kiro-research/TsinHzl__kiro2cc-proxy`
+- `../kiro-research/ndycode__kiro-rs`
+- `../kiro-research/cp-coder9__kiro-gateway`
 - 其他低相关轻量 fork
 
 这些项目大多不能整体替代当前项目，但有局部设计值得学习。
 
 ## `pluto2sun/kiro2api`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kiro-research/pluto2sun__kiro2api`  
+路径：`../kiro-research/pluto2sun__kiro2api`\
 最新提交：`53abfd6`，2026-06-19
 
 ### 关键文件
@@ -80,7 +80,7 @@
 
 ## `TsinHzl/kiro2cc-proxy`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kiro-research/TsinHzl__kiro2cc-proxy`  
+路径：`../kiro-research/TsinHzl__kiro2cc-proxy`\
 最新提交：`44d3985`，2026-06-26
 
 它与当前项目结构相近，包含：
@@ -105,7 +105,7 @@
 
 ## `ndycode/kiro-rs`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kiro-research/ndycode__kiro-rs`  
+路径：`../kiro-research/ndycode__kiro-rs`\
 最新提交：`529fc2f`，2026-06-11
 
 ### 关键结构
@@ -139,7 +139,7 @@
 
 ## `cp-coder9/kiro-gateway`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kiro-research/cp-coder9__kiro-gateway`  
+路径：`../kiro-research/cp-coder9__kiro-gateway`\
 最新提交：`3d78e0a`，2026-06-25
 
 这是 Python gateway，生产调度能力不如当前项目，但测试组织很值得学习。

@@ -31,7 +31,11 @@ if len(sys.argv) > 2:
         MODES[name] = (placeholder.replace("\\n", "\n"), flag)
 
 SESSIONS = ["15cfed4d", "b252e4a8", "6938a407", "449f23ea", "agent-a7"]
-PROJECTS = ["-Users-yuanfeijie-Desktop-procode-2ue-kiro-rs", "-Users-yuanfeijie-Desktop-procode-kiro-rs"]
+REPOSITORY_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.."))
+PROJECTS = [
+    os.path.abspath(os.path.join(REPOSITORY_ROOT, relative)).replace(os.sep, "-")
+    for relative in (".", "../kiro.rs")
+]
 
 # Stand-in for the Claude Code system prompt: the parts that matter here are the instruction to
 # report injected instructions in tool results and the user's language setting.

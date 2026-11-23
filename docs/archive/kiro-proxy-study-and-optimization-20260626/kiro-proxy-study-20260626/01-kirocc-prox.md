@@ -1,6 +1,6 @@
 # 项目分析：`kirocc-prox`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kirocc-prox`  
+路径：`../kirocc-prox`\
 最新本地提交：`6acfa81`，2026-06-07  
 相关度：很高
 

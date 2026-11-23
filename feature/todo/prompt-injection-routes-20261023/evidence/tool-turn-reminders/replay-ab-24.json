@@ -9,7 +9,7 @@
         "case": "b252e4a8#882",
         "kind": "text",
         "match": "占位",
-        "context": "alid_reasoning_protocol` 是否相关需要采集样本确认。 3. **工具 input 空字符串 key 清洗**：只有 AIClient2API 一行注释提及，没有错误样本，先等采集数据。  **2ue 已经做得更好的**： - 工具 ID 字符清洗、工具定义占位、input 类型规整 - 图片格式验证和字节级完整性检查、5 MB 上限 - 流结束完整性检查（4 种情况区分）  详细对比已写入 `/Users/yuanfeijie/Desktop/procode/kiro-rs-reference/analysis/protocol-co"
+        "context": "alid_reasoning_protocol` 是否相关需要采集样本确认。 3. **工具 input 空字符串 key 清洗**：只有 AIClient2API 一行注释提及，没有错误样本，先等采集数据。  **2ue 已经做得更好的**： - 工具 ID 字符清洗、工具定义占位、input 类型规整 - 图片格式验证和字节级完整性检查、5 MB 上限 - 流结束完整性检查（4 种情况区分）  详细对比已写入 `../kiro-rs-reference/analysis/protocol-co"
       },
       {
         "case": "b252e4a8#2",

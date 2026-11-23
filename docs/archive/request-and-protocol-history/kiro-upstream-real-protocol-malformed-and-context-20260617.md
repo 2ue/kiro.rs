@@ -240,7 +240,7 @@ cargo test --locked --no-default-features classifies_bad_request_protocol_reason
 Full:
 
 ```text
-PATH=/Users/yuanfeijie/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin \
+PATH=../../../.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin \
   cargo test --locked --no-default-features --quiet
 598 passed
 ```
@@ -249,7 +249,7 @@ Local toolchain note:
 
 ```text
 The first local cargo test attempts failed before running tests because PATH resolved `cc`
-to `/Users/yuanfeijie/.volta/bin/cc` instead of Apple clang. The failing linker/build-script
+to `../../../.volta/bin/cc` instead of Apple clang. The failing linker/build-script
 errors were `unknown command .../symbols.o` and `unknown option '-O0'` from the Volta shim.
 Pinning PATH so `cc` resolves to `/usr/bin/cc` made the same test suite pass.
 ```
@@ -365,8 +365,8 @@ explicit temporary Claude Code settings file if the output token cap must be enf
 
 This section compares the current `kiro.rs` implementation with:
 
-- `/Users/yuanfeijie/Desktop/procode/Kiro-account-manager/Kiro-account-manager`
-- `/Users/yuanfeijie/Desktop/procode/freedom-kirors`
+- `../Kiro-account-manager/Kiro-account-manager`
+- `../freedom-kirors`
 
 The comparison is about Kiro upstream protocol compatibility, not general code style.
 

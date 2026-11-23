@@ -3,8 +3,8 @@
 日期：2026-08-16
 
 范围：
-- 当前仓库：`/Users/yuanfeijie/Desktop/project/2ue_kiro.rs`，本地 `main` 已同步到 `origin/main`，工作区在分析前为干净状态。
-- 对比仓库：`/Users/yuanfeijie/Desktop/procode/sub2api`。
+- 当前仓库：`../../project/2ue_kiro.rs`，本地 `main` 已同步到 `origin/main`，工作区在分析前为干净状态。
+- 对比仓库：`../sub2api`。
 - 分析重点：在 sub2api 中接入 Claude/Claude Code 兼容上游的 `base_url` 和 key 后，请求如何转发到上游，包含 URL、认证、header、Claude Code 指纹、TLS 指纹、body 处理、重试/冷却、流式响应和诊断；再与当前 `2ue_kiro.rs` 的外部池实现对比。
 
 ## 总结

@@ -26,7 +26,7 @@
 
 本地代码：
 
-- 当前项目：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+- 当前项目：`.`
 - 对比项目：`../sub2api`，已 `git pull --ff-only` 到 `6f43986c`
 - 对比项目：`../kiro-go`，已确认 up to date
 - 当前本机 Claude Code CLI：`2.1.197 (Claude Code)`
@@ -82,7 +82,7 @@ MCP / Claude Desktop / Remote Control 相关边界：
 
 Cursor 旧版 Claude Code SDK 类型中有：
 
-- `includePartialMessages?: boolean`：`/Users/yuanfeijie/.cursor/extensions/anthropic.claude-code-2.0.1-universal/resources/claude-code/sdk.d.ts:240`
+- `includePartialMessages?: boolean`：`../../../.cursor/extensions/anthropic.claude-code-2.0.1-universal/resources/claude-code/sdk.d.ts:240`
 - `SDKPartialAssistantMessage`：`type: 'stream_event'; event: RawMessageStreamEvent`，见 `sdk.d.ts:351`
 
 SDK 运行时会以 `--output-format stream-json --input-format stream-json` 启动 Claude Code，并在 `includePartialMessages` 为 true 时追加 `--include-partial-messages`，见 `sdk.mjs:6391` 到 `sdk.mjs:6450`。

@@ -1,6 +1,6 @@
 # 项目分析：本地 `kiro2api`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kiro2api`  
+路径：`../kiro2api`\
 相关度：高
 
 本地 `kiro2api` 的价值主要在协议转换层：Anthropic/OpenAI 到 Kiro request 的转换、Kiro EventStream 到 Anthropic SSE 的转换、thinking/tag 处理、真实 cachePoint、工具结果格式。它不像当前项目那样生产化，但协议层实现有很多可学习点。

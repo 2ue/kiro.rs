@@ -10,7 +10,7 @@
 
 | 项目 | 路径 | 语言 | 当前 HEAD | 最近提交 |
 |---|---|---|---|---|
-| 当前项目 | `/Users/yuanfeijie/Desktop/procode/2ue_kiro.rs` | Rust | `08751f28590013d95ae9c2c34ad00e8f1527c1fa` | `2026-09-15 17:47:13 +0800 style: satisfy rustfmt in warmup batch regression test` |
+| 当前项目 | `.` | Rust | `08751f28590013d95ae9c2c34ad00e8f1527c1fa` | `2026-09-15 17:47:13 +0800 style: satisfy rustfmt in warmup batch regression test` |
 | 对比项目 | `../sub2api-kiro` | Go | `7a4b4fe999c71a24a6b018d977081ef57a1a43bb` | `2026-09-15 01:25:44 +0800 feat(cursor): 纯文本导入支持 refresh token，并修正账号命名` |
 
 两个工作区在本次核对开始时均为干净状态。本文结论只针对上述 commit，不自动代表两个仓库未来版本。

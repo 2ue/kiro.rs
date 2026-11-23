@@ -4,7 +4,7 @@
 
 分析对象：
 
-1. 当前仓库：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+1. 当前仓库：`.`
 2. 参考 Rust 项目：用户提到的 `../kiro.rs_new` 在本机不存在，实际可对比路径为 `../kiro.rs-new.rs`
 3. 参考 Go 项目：`~/Desktop/procode/Kiro-Go`
 
@@ -176,7 +176,7 @@ Provider 对错误做了区分：
 
 ## `../kiro.rs-new.rs` 可借鉴点
 
-实际路径是 `/Users/yuanfeijie/Desktop/procode/kiro.rs-new.rs`。
+实际路径是 `../kiro.rs-new.rs`。
 
 ### 轻量 cache_control 检测
 

@@ -70,7 +70,7 @@ The old behavior still had several high-concurrency gaps:
 
 ## sub2api reference points
 
-The reference implementation in `/Users/yuanfeijie/Desktop/procode/sub2api` confirmed several
+The reference implementation in `../sub2api` confirmed several
 useful patterns:
 
 - account schedulability should be decided by hard filters before scoring;

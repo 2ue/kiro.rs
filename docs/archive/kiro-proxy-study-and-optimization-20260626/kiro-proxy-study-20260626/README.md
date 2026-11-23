@@ -25,15 +25,15 @@
 
 远端项目已下载到：
 
-`/Users/yuanfeijie/Desktop/procode/kiro-research`
+`../kiro-research`
 
 同时分析本地已有目录：
 
-- `/Users/yuanfeijie/Desktop/procode/9router`
-- `/Users/yuanfeijie/Desktop/procode/Kiro-Go`
-- `/Users/yuanfeijie/Desktop/procode/Kiro-account-manager`
-- `/Users/yuanfeijie/Desktop/procode/kiro2api`
-- `/Users/yuanfeijie/Desktop/procode/kirocc-prox`
+- `../9router`
+- `../Kiro-Go`
+- `../Kiro-account-manager`
+- `../kiro2api`
+- `../kirocc-prox`
 
 ## 总体判断
 

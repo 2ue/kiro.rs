@@ -8,7 +8,7 @@
 
 ## 参考版本与源码状态
 
-- 本地参考仓库：`/Users/yuanfeijie/Desktop/procode/kiro-manager-lite`
+- 本地参考仓库：`../kiro-manager-lite`
 - 版本：`v1.0.49`
 - HEAD：`f7c233af98a052a45ad043ed915e55bfecf0e4d1`
 - 工作树：干净
@@ -170,11 +170,11 @@ version_generation
 
 ## 依据
 
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/shared/kiroVersion.ts`
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/scripts/kiro-sdk-versions.sh`
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/kiroEndpoints.ts`
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/proxyUpstream.ts`
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/kiroApi.ts`
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/kiroChat.ts`
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/store.ts`
-- `/Users/yuanfeijie/Desktop/procode/kiro-manager-lite/src/main/updater.ts`
+- `../kiro-manager-lite/src/shared/kiroVersion.ts`
+- `../kiro-manager-lite/scripts/kiro-sdk-versions.sh`
+- `../kiro-manager-lite/src/main/kiroEndpoints.ts`
+- `../kiro-manager-lite/src/main/proxyUpstream.ts`
+- `../kiro-manager-lite/src/main/kiroApi.ts`
+- `../kiro-manager-lite/src/main/kiroChat.ts`
+- `../kiro-manager-lite/src/main/store.ts`
+- `../kiro-manager-lite/src/main/updater.ts`

@@ -40,6 +40,8 @@ Authority:
    - [端点轮换与 Kiro 客户端版本生命周期设计](topics/endpoint-rotation-and-client-version-lifecycle.md)
    - [导入账号标签属性](topics/credential-import-tags.md)
    - [账号级 rawUsage 记录依据](topics/upstream-raw-usage-accounting.md)
+   - [账号模型白名单与黑名单](topics/account-model-filter-modes.md)
+   - [Fable 协议兼容及上游/fork 对照](../../../analysis/fable-protocol-compatibility-20261123.md)：已校对，官方按现有 Kiro 合同开放后可沿用目录发现与转换链路，无需预先添加专项改造。
    - [官方 Claude Code / Anthropic 与 Kiro 协议互操作审计](topics/official-claude-code-kiro-protocol-audit-20260928.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Decisions:

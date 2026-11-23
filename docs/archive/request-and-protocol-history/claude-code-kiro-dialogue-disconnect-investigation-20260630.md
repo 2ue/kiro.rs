@@ -78,13 +78,13 @@
 当前分析使用的 Claude Code 本地 transcript：
 
 ```text
-/Users/yuanfeijie/.claude/projects/-Users-yuanfeijie-Desktop-procode-kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl
+../../../.claude/projects/kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl
 ```
 
 已知 session 元信息：
 
 - `sessionId`: `77cfa36b-9ed8-4165-a416-4e61015605dd`
-- `cwd`: `/Users/yuanfeijie/Desktop/procode/kiro.rs`
+- `cwd`: `.`
 - `entrypoint`: `cli`
 - `version`: `2.1.196`
 - `gitBranch`: `main`
@@ -497,7 +497,7 @@ src/anthropic/usage.rs
 ```bash
 node - <<'NODE'
 const fs = require('fs');
-const path = '/Users/yuanfeijie/.claude/projects/-Users-yuanfeijie-Desktop-procode-kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl';
+const path = '../../../.claude/projects/kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl';
 const lines = fs.readFileSync(path, 'utf8').trim().split('\n');
 for (let i = 0; i < lines.length; i++) {
   let o;
@@ -520,7 +520,7 @@ NODE
 ```bash
 node - <<'NODE'
 const fs = require('fs');
-const path = '/Users/yuanfeijie/.claude/projects/-Users-yuanfeijie-Desktop-procode-kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl';
+const path = '../../../.claude/projects/kiro-rs/77cfa36b-9ed8-4165-a416-4e61015605dd.jsonl';
 const wanted = new Set([94,96,100,101,102,103,104,105,106,107,108,112,113,114,115,119,120,121,125,126,131,134,137,377,379,408]);
 const lines = fs.readFileSync(path, 'utf8').trim().split('\n');
 for (const n of [...wanted].sort((a, b) => a - b)) {

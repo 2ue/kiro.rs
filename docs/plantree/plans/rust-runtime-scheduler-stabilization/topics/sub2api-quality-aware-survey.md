@@ -1,6 +1,6 @@
 # sub2api 质量感知调度：现状勘察与方案修正
 
-> 勘察时间：2026-09-15，代码基线 `/Users/yuanfeijie/Desktop/procode/sub2api`。
+> 勘察时间：2026-09-15，代码基线 `../sub2api`。
 > 结论：**sub2api 的现状与最初方案假设差异很大**，不能照搬 kiro.rs 的实现。
 
 ## 1. 最重要的发现：OpenAI 路径已经有质量感知调度了

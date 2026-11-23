@@ -31,4 +31,4 @@ Optional low-volume real-upstream smoke remains evidence that may be collected o
 
 ## Historical Environment Note
 
-The local PATH resolved `cc` to `/Users/yuanfeijie/.volta/bin/cc`, which broke Rust linking. Verification used command-level Xcode `SDKROOT`, `CC`, `HOST_CC`, target linker, and linker flags. No project configuration was changed for that workaround.
+The local PATH resolved `cc` to `../../../.volta/bin/cc`, which broke Rust linking. Verification used command-level Xcode `SDKROOT`, `CC`, `HOST_CC`, target linker, and linker flags. No project configuration was changed for that workaround.

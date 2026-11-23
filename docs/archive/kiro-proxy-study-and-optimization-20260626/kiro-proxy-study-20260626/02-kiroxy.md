@@ -1,6 +1,6 @@
 # 项目分析：`kiroxy`
 
-路径：`/Users/yuanfeijie/Desktop/procode/kiro-research/nopperabbo__kiroxy`  
+路径：`../kiro-research/nopperabbo__kiroxy`\
 最新本地提交：`2ac2ea9`，2026-05-23  
 相关度：高
 
