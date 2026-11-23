@@ -12840,11 +12840,7 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
         model_mapping_mode,
         model_mapping_rules: Arc::new(model_mapping_rules),
         normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
-        supported_models: Arc::new(
-            normalize_supported_models(supported_models)
-                .into_iter()
-                .collect::<HashSet<_>>(),
-        ),
+        supported_models: Arc::new(normalize_supported_models(supported_models)),
         route_mode,
         route_rules: Arc::new(route_rules),
     })
