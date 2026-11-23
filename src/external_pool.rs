@@ -8109,7 +8109,18 @@ impl ExternalPoolManager {
             route.model_candidates_for_support().into_iter().flatten(),
         );
         let cooldown_candidates = route.model_cooldown_candidates();
-        let filtered = authoritative_pools.iter().any(|pool| !external_pool_resolved_model_allowed(pool, route)).then(|| Arc::new(authoritative_pools.iter().filter(|pool| external_pool_resolved_model_allowed(pool, route)).cloned().collect::<Vec<_>>()));
+        let filtered = authoritative_pools
+            .iter()
+            .any(|pool| !external_pool_resolved_model_allowed(pool, route))
+            .then(|| {
+                Arc::new(
+                    authoritative_pools
+                        .iter()
+                        .filter(|pool| external_pool_resolved_model_allowed(pool, route))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            });
         let authoritative_pools = filtered.as_ref().unwrap_or(authoritative_pools);
         self.scan_pool_availability_from_snapshot(
             authoritative_pools,
@@ -11659,7 +11670,7 @@ fn route_prefers_early_commit(pools: &[ExternalPool], route: &ExternalRouteReque
             pool.enabled
                 && !pool.is_auto_disabled_now()
                 && external_pool_route_allowed(pool, Some(&route.endpoint))
-                    && external_pool_resolved_model_allowed(pool, route)
+                && external_pool_resolved_model_allowed(pool, route)
                 && external_pool_matches_supported_models_normalized(
                     pool,
                     Some(&support_candidates),
@@ -12558,7 +12569,9 @@ fn external_pool_model_filter_allows<'a>(
 }
 
 fn external_pool_resolved_model_allowed(pool: &ExternalPool, route: &ExternalRouteRequest) -> bool {
-    if pool.model_filter_mode != crate::model::model_support::ModelFilterMode::Denylist { return true; }
+    if pool.model_filter_mode != crate::model::model_support::ModelFilterMode::Denylist {
+        return true;
+    }
     let candidates = normalize_external_pool_support_candidates(route.upstream_model.as_deref());
     external_pool_matches_supported_models_normalized(pool, Some(&candidates))
 }
