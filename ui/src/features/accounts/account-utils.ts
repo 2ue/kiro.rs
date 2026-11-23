@@ -177,7 +177,7 @@ export type AccountFormDraft = {
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
-  rawUsageSource: 'legacy_max' | 'upstream_last'
+  rawUsageSource: 'legacy_max' | 'upstream_last' | 'upstream_last_max_cost'
   usageProjectionMode: NonNullable<CreateAccountRequest['usageProjectionMode']>
   streamResponseMode: AccountStreamResponseDraft
   preOutputStreamRetryMode: AccountStreamRetryDraft

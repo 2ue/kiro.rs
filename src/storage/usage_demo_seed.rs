@@ -170,6 +170,7 @@ pub async fn seed_usage_demo(
                     Some(AccountBilling {
                         request_input_tokens: Some(total_input_tokens),
                         upstream_response_model: None,
+                        raw_cost_usage: snapshot,
                         raw_usage: snapshot,
                         shaped_usage: snapshot,
                         reported_usage: snapshot,

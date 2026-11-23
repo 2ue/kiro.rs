@@ -94,3 +94,10 @@ test('原始用量开关默认旧模式，编辑只提交当前账号的模式�
   const changes = diffAccountRequest(draft, { ...draft, rawUsageSource: 'legacy_max' })
   assert.deepEqual(changes, { rawUsageSource: 'legacy_max' })
 })
+
+test('最终记录最大计算模式只修改当前账号的原始口径', () => {
+  const draft = accountFormFromAccount({ ...account, rawUsageSource: 'upstream_last_max_cost' })
+  const request = buildAccountRequest(draft)
+  assert.equal(request.rawUsageSource, 'upstream_last_max_cost')
+  assert.deepEqual(diffAccountRequest({ ...request, rawUsageSource: 'legacy_max' }, request), { rawUsageSource: 'upstream_last_max_cost' })
+})

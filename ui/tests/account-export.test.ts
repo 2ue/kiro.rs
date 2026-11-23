@@ -40,3 +40,10 @@ test('原始用量口径随账号导出导入保留，旧格式默认仍沿用�
   const rows = buildImportPlan([{ origin: 'export.json', entries: parsed.entries }], initialImportDefaults(), [])
   assert.equal(rows[0].request?.rawUsageSource, 'upstream_last')
 })
+
+test('最终记录最大计算模式随账号导出导入保留', () => {
+  const exported = pickExportAccounts([{ ...pkgAccounts[0], rawUsageSource: 'upstream_last_max_cost' }], null)
+  const parsed = parseImportText(JSON.stringify(exported))
+  const rows = buildImportPlan([{ origin: 'export.json', entries: parsed.entries }], initialImportDefaults(), [])
+  assert.equal(rows[0].request?.rawUsageSource, 'upstream_last_max_cost')
+})

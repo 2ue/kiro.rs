@@ -259,8 +259,8 @@ export function accountFromJsonObject(value: unknown, position: number): ParsedI
     if (!auth) return { position, error: `authType 只能是 bearer 或 x_api_key（读到 ${String(account.authType)}）`, warnings }
     account.authType = auth
   }
-  if (account.rawUsageSource !== undefined && !['legacy_max', 'upstream_last'].includes(account.rawUsageSource)) {
-    return { position, error: 'rawUsageSource 只能是 legacy_max 或 upstream_last', warnings }
+  if (account.rawUsageSource !== undefined && !['legacy_max', 'upstream_last', 'upstream_last_max_cost'].includes(account.rawUsageSource)) {
+    return { position, error: 'rawUsageSource 只能是 legacy_max、upstream_last 或 upstream_last_max_cost', warnings }
   }
   if (account.usageProjectionMode !== undefined && !USAGE_MODES.includes(account.usageProjectionMode)) {
     return { position, error: `usageProjectionMode 只能是 pass_through 或 current_path_policy`, warnings }

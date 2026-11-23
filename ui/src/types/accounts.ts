@@ -31,7 +31,8 @@ export interface AccountBilling {
   costFloorApplied: boolean;
   pricingAvailable: boolean;
   pricingModel?: string;
-  rawUsageSource?: 'legacy_max' | 'upstream_last';
+  rawCostUsage: AccountUsageSnapshot;
+  rawUsageSource?: 'legacy_max' | 'upstream_last' | 'upstream_last_max_cost';
   usageProjectionMode: string;
   streamResponseMode?: StreamResponseMode;
   usageEstimated?: boolean;
@@ -233,7 +234,7 @@ export interface Account {
   enabled: boolean;
   priority: number;
   maxConcurrentRequests: number;
-  rawUsageSource: 'legacy_max' | 'upstream_last';
+  rawUsageSource: 'legacy_max' | 'upstream_last' | 'upstream_last_max_cost';
   usageProjectionMode: UsageProjectionMode;
   streamResponseMode?: StreamResponseMode;
   autoDisablePolicy: AutoDisablePolicy;
@@ -315,7 +316,7 @@ export interface CreateAccountRequest {
   enabled?: boolean;
   priority?: number;
   maxConcurrentRequests?: number;
-  rawUsageSource?: 'legacy_max' | 'upstream_last';
+  rawUsageSource?: 'legacy_max' | 'upstream_last' | 'upstream_last_max_cost';
   usageProjectionMode?: UsageProjectionMode;
   streamResponseMode?: StreamResponseMode | null;
   autoDisablePolicy?: AutoDisablePolicy;
@@ -347,7 +348,7 @@ export interface UpdateAccountRequest {
   enabled?: boolean;
   priority?: number;
   maxConcurrentRequests?: number;
-  rawUsageSource?: 'legacy_max' | 'upstream_last';
+  rawUsageSource?: 'legacy_max' | 'upstream_last' | 'upstream_last_max_cost';
   usageProjectionMode?: UsageProjectionMode;
   streamResponseMode?: StreamResponseMode | null;
   autoDisablePolicy?: AutoDisablePolicy;

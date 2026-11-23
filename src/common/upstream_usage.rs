@@ -9,6 +9,7 @@ pub enum RawUsageSource {
     #[default]
     LegacyMax,
     UpstreamLast,
+    UpstreamLastMaxCost,
 }
 
 impl RawUsageSource {
@@ -16,6 +17,20 @@ impl RawUsageSource {
         match self {
             Self::LegacyMax => "legacy_max",
             Self::UpstreamLast => "upstream_last",
+            Self::UpstreamLastMaxCost => "upstream_last_max_cost",
+        }
+    }
+
+    pub(crate) fn select(
+        self,
+        legacy: CacheUsage,
+        upstream: Option<CacheUsage>,
+    ) -> (CacheUsage, CacheUsage) {
+        let final_usage = upstream.unwrap_or(legacy);
+        match self {
+            Self::LegacyMax => (legacy, legacy),
+            Self::UpstreamLast => (final_usage, final_usage),
+            Self::UpstreamLastMaxCost => (final_usage, legacy),
         }
     }
 
@@ -23,6 +38,7 @@ impl RawUsageSource {
         match value {
             "legacy_max" => Ok(Self::LegacyMax),
             "upstream_last" => Ok(Self::UpstreamLast),
+            "upstream_last_max_cost" => Ok(Self::UpstreamLastMaxCost),
             _ => anyhow::bail!("raw_usage_source 值无效: {value}"),
         }
     }
@@ -258,5 +274,42 @@ mod replay_tests {
             }
         }
         assert_eq!(changed, 16);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn raw_usage_source_selection_has_two_values_for_every_mode_and_fallback() {
+        let mut legacy = UpstreamUsage::default();
+        legacy.observe(&json!({"input_tokens":100,"output_tokens":20}));
+        let legacy = legacy.snapshot().unwrap();
+        let mut final_usage = UpstreamUsage::default();
+        final_usage.observe(&json!({"input_tokens":0,"output_tokens":2}));
+        let final_usage = final_usage.snapshot().unwrap();
+        for mode in [
+            RawUsageSource::LegacyMax,
+            RawUsageSource::UpstreamLast,
+            RawUsageSource::UpstreamLastMaxCost,
+        ] {
+            assert_eq!(mode.select(legacy, None), (legacy, legacy));
+            assert_eq!(mode.select(legacy, Some(legacy)), (legacy, legacy));
+            assert_eq!(RawUsageSource::parse(mode.as_str()).unwrap(), mode);
+        }
+        assert_eq!(
+            RawUsageSource::LegacyMax.select(legacy, Some(final_usage)),
+            (legacy, legacy)
+        );
+        assert_eq!(
+            RawUsageSource::UpstreamLast.select(legacy, Some(final_usage)),
+            (final_usage, final_usage)
+        );
+        assert_eq!(
+            RawUsageSource::UpstreamLastMaxCost.select(legacy, Some(final_usage)),
+            (final_usage, legacy)
+        );
     }
 }

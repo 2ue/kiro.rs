@@ -22352,6 +22352,7 @@ fn raw_usage_source_changes_only_raw_statistics_for_chunked_stream() {
     let mut old = serde_json::to_value(&results[0]).unwrap();
     let mut new = serde_json::to_value(&results[1]).unwrap();
     for key in [
+        "rawCostUsage",
         "rawUsageSource",
         "rawUsage",
         "rawCostUsd",
@@ -22427,6 +22428,7 @@ fn raw_usage_source_all_zero_stream_keeps_legacy_estimation_and_billable_cost() 
     let mut old = serde_json::to_value(&results[0]).unwrap();
     let mut new = serde_json::to_value(&results[1]).unwrap();
     for key in [
+        "rawCostUsage",
         "rawUsageSource",
         "rawUsage",
         "rawCostUsd",
@@ -22441,4 +22443,68 @@ fn raw_usage_source_all_zero_stream_keeps_legacy_estimation_and_billable_cost() 
         old, new,
         "missing-usage fallback must keep shaped/reported/billable values"
     );
+}
+
+#[test]
+fn raw_usage_source_three_modes_separate_recorded_and_cost_usage_uniformly() {
+    let route = test_route("claude-sonnet-4-6");
+    let mut pool = test_pool("https://example.com", true);
+    let legacy =
+        cache_usage_from_any_value(&json!({"input_tokens":262393,"output_tokens":75})).unwrap();
+    let mut upstream = UpstreamUsage::default();
+    upstream.observe(&json!({"input_tokens":1,"output_tokens":75}));
+    let capture = ExternalUsageCapture {
+        raw: Some(legacy),
+        shaped: Some(legacy),
+        reported: Some(legacy),
+        upstream_usage: upstream,
+        ..Default::default()
+    };
+    let mut results = Vec::new();
+    for mode in [
+        RawUsageSource::LegacyMax,
+        RawUsageSource::UpstreamLast,
+        RawUsageSource::UpstreamLastMaxCost,
+    ] {
+        pool.raw_usage_source = mode;
+        results.push(account_billing_from_capture(&route, &pool, capture.clone()).unwrap());
+    }
+    assert_eq!(results[0].raw_usage, results[0].raw_cost_usage);
+    assert_eq!(results[1].raw_usage, results[1].raw_cost_usage);
+    assert_eq!(results[2].raw_usage, results[1].raw_usage);
+    assert_eq!(results[2].raw_cost_usage, results[0].raw_cost_usage);
+    assert_eq!(results[2].raw_cost_usd, results[0].raw_cost_usd);
+    assert_eq!(results[2].profit_usd, results[0].profit_usd);
+    for billing in &results {
+        assert_eq!(billing.billable_cost_usd, results[0].billable_cost_usd);
+        assert_eq!(billing.shaped_usage, results[0].shaped_usage);
+        let value = serde_json::to_value(billing).unwrap();
+        assert!(value.get("rawUsage").is_some());
+        assert!(value.get("rawCostUsage").is_some());
+        let decoded: AccountBilling = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(&decoded, billing);
+        let mut old = value;
+        old.as_object_mut().unwrap().remove("rawCostUsage");
+        let decoded: AccountBilling = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.raw_cost_usage, decoded.raw_usage);
+    }
+}
+
+#[test]
+fn raw_usage_source_hybrid_all_zero_estimate_keeps_max_cost_and_final_record() {
+    let route = test_route("claude-sonnet-4-6");
+    let mut pool = test_pool("https://example.com", true);
+    let mut capture = ExternalUsageCapture::default();
+    capture
+        .upstream_usage
+        .observe(&json!({"input_tokens":0,"output_tokens":0}));
+    let capture = Arc::new(SyncMutex::new(capture));
+    let legacy = account_billing_from_stream_estimate(&route, &pool, &capture, None, 7).unwrap();
+    pool.raw_usage_source = RawUsageSource::UpstreamLastMaxCost;
+    let hybrid = account_billing_from_stream_estimate(&route, &pool, &capture, None, 7).unwrap();
+    assert_eq!(hybrid.raw_usage.input_tokens, 0);
+    assert_eq!(hybrid.raw_usage.output_tokens, 0);
+    assert_eq!(hybrid.raw_cost_usage, legacy.raw_cost_usage);
+    assert_eq!(hybrid.raw_cost_usd, legacy.raw_cost_usd);
+    assert_eq!(hybrid.billable_cost_usd, legacy.billable_cost_usd);
 }
