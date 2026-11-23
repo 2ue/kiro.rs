@@ -2,8 +2,10 @@
 
 Last reviewed: 2026-11-11 Asia/Shanghai
 
+2026-11-23 completed follow-up: [账号模型白名单/黑名单及防风暴](topics/account-model-filter-modes.md)。三个分支已实现并发布；精确源码及全量检查见[发布证据](../../../../feature/evidence/account-model-filter-modes-20261123.md)。本项无剩余实现或发布 TODO。
+
 2026-11-23 completed follow-up: [账号级 rawUsage 统一双字段及发布证据](topics/upstream-raw-usage-accounting.md#最终交付与发布证据2026-11-23).
-三模式已完成 main/forced/claude 的完整质量检查及镜像发布；生产 k1–k3 仍为上一轮 `0.0.262`，抓包关闭。本项无剩余实现或发布 TODO。
+三模式已完成 main/forced/claude 的完整质量检查及镜像发布；生产 k1–k3 已按后续指令更新到 `0.0.263`，抓包关闭。本项无剩余实现或发布 TODO。
 
 ## 本次交接：模型目录与价格来源分离（2026-11-15）
 

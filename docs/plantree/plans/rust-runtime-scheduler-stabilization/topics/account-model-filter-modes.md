@@ -2,7 +2,7 @@
 
 Role: 本地账号、外部池账号与硬分叉账号模型筛选的实施契约
 
-Status: In Progress / execute-ready
+Status: Released / main v0.0.264, forced-v0.0.273, claude-v1.0.17
 
 Date: 2026-11-23
 
@@ -45,12 +45,9 @@ Related: [Roadmap](../roadmap.md)、[Fable 协议校对](../../../../analysis/fa
 - 本地账号模式与列表同次持久化，CAS 合并以整组检查冲突。外部池在同次 SQL 更新中写入两字段，缓存失效与跨实例通知沿用现有机制。
 - 外部池黑名单同时检查模型请求候选与池内映射目标，资格预判与实际选择共用同一实现。沿用原模型名兼容规则，不引入通配符匹配。
 
-## 当前验证
+## 最终验证与发布
 
-- main：UI 构建及 90 项既有测试通过；Rust 编译检查通过，完整存储/调度回归进行中。
-- claude-main：独立移植完成，UI 构建及 173 项测试通过；Rust 编译检查通过，完整存储回归进行中。
-- forced-main：待同步与分支验证。
-
+三个分支均完成实现、两种特性全量测试、独立时间敏感门禁、格式/Clippy、前端与发布构建，并已推送 GitHub 发布双架构镜像。实际源码、测试数量、registry 清单和清理记录见[验证证据](../../../../../feature/evidence/account-model-filter-modes-20261123.md)。
 
 ## 防止调度风暴的门禁
 
