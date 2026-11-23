@@ -170,14 +170,15 @@ export function UsageCostBreakdown({
   return (
     <div>
       <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">计费口径</div>
-      {billing && <div className="mb-3 text-xs text-muted-foreground">原始用量依据：{billing.rawUsageSource === 'upstream_last' ? '上游最后明确返回值' : '原有最大值口径'}</div>}
+      {billing && <div className="mb-3 text-xs text-muted-foreground">原始用量依据：{billing.rawUsageSource === 'upstream_last_max_cost' ? '最终值记录 / 最大值计算' : billing.rawUsageSource === 'upstream_last' ? '最终值记录 / 最终值计算' : '最大值记录 / 最大值计算'}</div>}
       {billing ? (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <CostMetric
             label="上游原始 usage 成本"
             value={formatUsdDetailed(billing.rawCostUsd)}
-            detail={formatUsageSnapshot(billing.rawUsage)}
+            detail={formatUsageSnapshot(billing.rawCostUsage)}
           />
+          <CostMetric label="原始记录用量" value={formatUsageSnapshot(billing.rawUsage)} detail="记录按账号选择的用量口径保存" />
           <CostMetric
             label="展示计费"
             value={formatUsdDetailed(shapedCost)}

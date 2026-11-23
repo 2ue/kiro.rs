@@ -8962,6 +8962,7 @@ mod tests {
         external.external_pool_billing = Some(ExternalPoolBilling {
             request_input_tokens: None,
             upstream_response_model: None,
+            raw_cost_usage: ExternalPoolUsageSnapshot::default(),
             raw_usage: ExternalPoolUsageSnapshot::default(),
             shaped_usage: ExternalPoolUsageSnapshot::default(),
             reported_usage: ExternalPoolUsageSnapshot::default(),

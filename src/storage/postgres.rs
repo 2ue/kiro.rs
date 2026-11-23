@@ -999,6 +999,13 @@ impl PostgresStore {
             .collect();
 
         let mut missing = required_postgres_schema_missing_columns(&present);
+        let raw_source_constraint_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'external_upstream_pools'::regclass AND conname = 'external_upstream_pools_raw_usage_source_check' AND pg_get_constraintdef(oid) LIKE '%upstream_last_max_cost%')"
+        ).fetch_one(&self.pool).await?;
+        if !raw_source_constraint_current {
+            missing.push("external_upstream_pools.raw_usage_source_check".to_string());
+        }
+
         if !self
             .usage_cleanup_batch_size_constraint_is_current()
             .await?
@@ -13789,7 +13796,7 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     max_concurrent_requests INTEGER NOT NULL DEFAULT 10,
     usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through',
     stream_response_mode TEXT,
-    raw_usage_source TEXT NOT NULL DEFAULT 'legacy_max' CHECK (raw_usage_source IN ('legacy_max', 'upstream_last')),
+    raw_usage_source TEXT NOT NULL DEFAULT 'legacy_max' CHECK (raw_usage_source IN ('legacy_max', 'upstream_last', 'upstream_last_max_cost')),
     skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false,
     request_body_mode TEXT NOT NULL DEFAULT 'normalized',
     raw_model_mode TEXT NOT NULL DEFAULT 'none',
@@ -13841,7 +13848,14 @@ ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS stream_response_mode TEXT;
 
 ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS raw_usage_source TEXT NOT NULL DEFAULT 'legacy_max' CHECK (raw_usage_source IN ('legacy_max', 'upstream_last'));
+    ADD COLUMN IF NOT EXISTS raw_usage_source TEXT NOT NULL DEFAULT 'legacy_max' CHECK (raw_usage_source IN ('legacy_max', 'upstream_last', 'upstream_last_max_cost'));
+
+ALTER TABLE external_upstream_pools
+    DROP CONSTRAINT IF EXISTS external_upstream_pools_raw_usage_source_check;
+ALTER TABLE external_upstream_pools
+    ADD CONSTRAINT external_upstream_pools_raw_usage_source_check
+    CHECK (raw_usage_source IN ('legacy_max', 'upstream_last', 'upstream_last_max_cost'));
+
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false;
@@ -19100,6 +19114,7 @@ mod tests {
             external_pool_billing: Some(ExternalPoolBilling {
                 request_input_tokens: None,
                 upstream_response_model: None,
+                raw_cost_usage: raw_usage,
                 raw_usage,
                 shaped_usage,
                 reported_usage,
@@ -23070,6 +23085,25 @@ mod tests {
                 .raw_usage_source,
             RawUsageSource::UpstreamLast
         );
+        let hybrid = store
+            .update_external_pool_unmasked(
+                original.id,
+                serde_json::from_value(
+                    serde_json::json!({"rawUsageSource":"upstream_last_max_cost"}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hybrid.raw_usage_source, RawUsageSource::UpstreamLastMaxCost);
+        let copy = store
+            .create_external_pool_unmasked(
+                CreateExternalPoolRequest::copy_of(&hybrid, "hybrid-copy".into()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(copy.raw_usage_source, RawUsageSource::UpstreamLastMaxCost);
         sqlx::query("ALTER TABLE external_upstream_pools DROP COLUMN raw_usage_source")
             .execute(&store.pool)
             .await
@@ -23081,6 +23115,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("raw_usage_source")
+        );
+        store.drop_test_schema().await.unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_raw_usage_source_migrates_existing_two_value_constraint() {
+        let Some(config) = test_config() else {
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        sqlx::raw_sql("ALTER TABLE external_upstream_pools DROP CONSTRAINT external_upstream_pools_raw_usage_source_check; ALTER TABLE external_upstream_pools ADD CONSTRAINT external_upstream_pools_raw_usage_source_check CHECK(raw_usage_source IN ('legacy_max','upstream_last'))").execute(&store.pool).await.unwrap();
+        assert!(
+            store
+                .verify_required_schema_compatibility(false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("raw_usage_source_check")
+        );
+        store.migrate_with_options(false).await.unwrap();
+        let request:CreateExternalPoolRequest=serde_json::from_value(serde_json::json!({"name":"hybrid-migrated","baseUrl":"https://example.com","apiKey":"test-only","rawUsageSource":"upstream_last_max_cost"})).unwrap();
+        assert_eq!(
+            store
+                .create_external_pool(request)
+                .await
+                .unwrap()
+                .raw_usage_source,
+            RawUsageSource::UpstreamLastMaxCost
         );
         store.drop_test_schema().await.unwrap();
     }

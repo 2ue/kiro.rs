@@ -9,3 +9,8 @@ test('外部账号原始用量模式默认兼容旧数据，编辑回显账号�
   assert.equal(poolFormFromPool(legacy).rawUsageSource, 'legacy_max')
   assert.equal(poolFormFromPool({ ...legacy, rawUsageSource: 'upstream_last' }).rawUsageSource, 'upstream_last')
 })
+
+test('最终值记录与最大值计算模式可以独立回显', () => {
+  const pool = { modelMappingRules: [], supportedModels: [], routeRules: [], rawUsageSource: 'upstream_last_max_cost' } as unknown as ExternalPool
+  assert.equal(poolFormFromPool(pool).rawUsageSource, 'upstream_last_max_cost')
+})
