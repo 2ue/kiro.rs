@@ -25,7 +25,6 @@ impl ModelFilterMode {
             _ => anyhow::bail!("model_filter_mode 值无效: {value}"),
         }
     }
-
 }
 
 pub fn normalize_model_id(value: &str) -> Option<String> {

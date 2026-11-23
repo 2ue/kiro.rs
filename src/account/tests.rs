@@ -22569,3 +22569,107 @@ fn model_filter_blacklist_checks_explicit_resolved_model_without_changing_whitel
     route.upstream_model = Some("other-model".into());
     assert!(account_resolved_model_allowed(&pool, &route));
 }
+
+#[test]
+fn model_filter_cache_reuses_identical_lists_is_bounded_and_observes_edits() {
+    let mut cache = SupportedModelsCache::default();
+    let models = vec!["fable-5".into()];
+    let initial = cache.expanded(&models);
+    for _ in 0..1000 {
+        assert!(std::rc::Rc::ptr_eq(&initial, &cache.expanded(&models)));
+    }
+    assert_eq!(cache.lists.len(), 1);
+    let edited = cache.expanded(&["other-model".into()]);
+    assert!(!edited.variants.contains("fable-5"));
+    for index in 0..256 {
+        cache.expanded(&[format!("model-{index}")]);
+    }
+    assert!(cache.lists.len() <= SUPPORTED_MODELS_CACHE_MAX_LISTS);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_filter_rejected_bursts_have_no_capacity_io_or_cache_reload_fanout() {
+    use crate::model::model_support::ModelFilterMode;
+    let Some((manager, postgres)) = test_account_manager().await else {
+        return;
+    };
+    let manager = manager.with_static_pool_snapshot_ttl(Duration::from_secs(30));
+    let mut request = create_pool_request("model-filter-denied", 0, true);
+    request.model_filter_mode = ModelFilterMode::Denylist;
+    request.supported_models = vec!["fable-5".into()];
+    let pool = postgres.create_account(request).await.unwrap();
+    let pool_id = pool.id;
+    let pools = Arc::new(vec![pool]);
+    let config = AccountsConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    assert!(
+        !manager
+            .has_eligible_pool_for_model(&config, "fable-5")
+            .await
+    );
+    let loads = manager.static_pool_snapshot_pg_loads_for_test();
+    manager.redis.reset_account_hot_path_round_trips();
+    for concurrency in [1usize, 16, 64] {
+        let results = futures::future::join_all((0..concurrency).map(|_| {
+            let manager = manager.clone();
+            let config = config.clone();
+            let pools = pools.clone();
+            async move {
+                assert!(
+                    !manager
+                        .has_eligible_pool_for_model(&config, "fable-5")
+                        .await
+                );
+                for model in ["fable-5", "public-alias"] {
+                    let mut route = test_route(model);
+                    route.upstream_model = Some("fable-5".into());
+                    route.model_resolution_source = Some("explicit".into());
+                    let selection = manager
+                        .select_pool_for_route_from_snapshot(
+                            &pools,
+                            &HashSet::new(),
+                            &config,
+                            &route,
+                        )
+                        .await;
+                    assert!(selection.selected_pool.is_none());
+                    assert_eq!(selection.availability.eligible_pools, 0);
+                    assert!(!selection.availability.has_temporary_unavailable_pool());
+                }
+            }
+        }))
+        .await;
+        assert_eq!(results.len(), concurrency);
+    }
+    assert_eq!(manager.static_pool_snapshot_pg_loads_for_test(), loads);
+    assert_eq!(manager.redis.account_hot_path_round_trips(), 0);
+
+    postgres
+        .update_account_unmasked(
+            pool_id,
+            serde_json::from_value(
+                serde_json::json!({"modelFilterMode":"allowlist","supportedModels":["fable-5"]}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    manager.invalidate_static_pool_snapshot();
+    let refreshed = futures::future::join_all((0..64).map(|_| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            manager
+                .has_eligible_pool_for_model(&config, "fable-5")
+                .await
+        }
+    }))
+    .await;
+    assert!(refreshed.iter().all(|allowed| *allowed));
+    assert_eq!(manager.static_pool_snapshot_pg_loads_for_test(), loads + 1);
+    assert_eq!(manager.redis.account_hot_path_round_trips(), 0);
+    postgres.drop_test_schema().await.unwrap();
+}
