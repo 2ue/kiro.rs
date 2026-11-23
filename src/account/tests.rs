@@ -7718,7 +7718,10 @@ fn retired_dot_normalization_setting_is_ignored_and_not_exposed() {
         "normalizeModelVersionDots": true
     }))
     .unwrap();
-    assert_eq!(request.model_mapping_mode, ModelMappingMode::PassthroughMapping);
+    assert_eq!(
+        request.model_mapping_mode,
+        ModelMappingMode::PassthroughMapping
+    );
     let value = serde_json::to_value(test_pool("https://example.com/v1", true)).unwrap();
     assert!(value.get("normalizeModelVersionDots").is_none());
 }

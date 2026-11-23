@@ -1062,7 +1062,11 @@ fn pick_family_available(
         }
     }
     if allow_cross_family_fallback {
-        let mut candidates = available.iter().filter(|model| !model.contains('.')).cloned().collect::<Vec<_>>();
+        let mut candidates = available
+            .iter()
+            .filter(|model| !model.contains('.'))
+            .cloned()
+            .collect::<Vec<_>>();
         candidates.sort_by(|a, b| {
             family_candidate_key(a)
                 .cmp(&family_candidate_key(b))
@@ -1449,7 +1453,12 @@ mod tests {
         assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4-8"));
         let result = resolve_model_with_catalog("claude-opus-4.8", &models);
         assert_eq!(result.source, ModelResolutionSource::ExactUpstream);
-        assert_eq!(resolve_model_with_catalog("opus", &models).upstream_model.as_deref(), Some("opus"));
+        assert_eq!(
+            resolve_model_with_catalog("opus", &models)
+                .upstream_model
+                .as_deref(),
+            Some("opus")
+        );
         let models = vec!["claude-opus-4-8".to_string()];
         let result = resolve_model_with_catalog("claude-opus-4.8", &models);
         assert_eq!(result.source, ModelResolutionSource::PassThrough);
